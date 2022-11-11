@@ -89,6 +89,7 @@ int runModule(std::unique_ptr<llvm::MemoryBuffer> ownedBuffer,
   auto *funcBody = &funcOp.getFunctionBody();
   Region *loopBody = nullptr;
   Operation *forOp = nullptr;
+  Operation *lastOp = nullptr;
   if (!funcBody->getOps<scf::ForOp>().empty()) {
     forOp = *funcBody->getOps<scf::ForOp>().begin();
     loopBody = &(*funcBody->getOps<scf::ForOp>().begin()).getLoopBody();
@@ -128,32 +129,28 @@ int runModule(std::unique_ptr<llvm::MemoryBuffer> ownedBuffer,
     }
     return mlir::TypeSwitch<Operation *, WalkResult>(op)
         .Case<AddIOp>([&](Operation *combOp) {
-          // Some known combinational ops.
+          // Add can be combinational
           problem.setLinkedOperatorType(combOp, addOpr);
           return WalkResult::advance();
         })
         .Case<AffineLoadOp, memref::LoadOp>([&](Operation *seqOp) {
-          // Some known sequential ops. In certain cases, reads may be
-          // combinational in Calyx, but taking advantage of that is left as
-          // a future enhancement.
+          // Make loads 2 cycles
           problem.setLinkedOperatorType(seqOp, ldOpr);
           return WalkResult::advance();
         })
         .Case<AffineStoreOp, memref::StoreOp>([&](Operation *seqOp) {
-          // Some known sequential ops. In certain cases, reads may be
-          // combinational in Calyx, but taking advantage of that is left as
-          // a future enhancement.
+          // Stores only 1 cycle
           problem.setLinkedOperatorType(seqOp, stOpr);
           return WalkResult::advance();
         })
         .Case<MulIOp>([&](Operation *mcOp) {
-          // Some known multi-cycle ops.
+          // Multiply cause why not
           problem.setLinkedOperatorType(mcOp, mulOpr);
           return WalkResult::advance();
         })
         .Case<AffineYieldOp>([&](Operation *yieldOp) {
-          // Some known multi-cycle ops.
-          problem.setLinkedOperatorType(yieldOp, chainOpr);
+          // set last op to yield.
+          lastOp = yieldOp;
           return WalkResult::advance();
         })
         .Default([&](Operation *badOp) {
@@ -166,7 +163,7 @@ int runModule(std::unique_ptr<llvm::MemoryBuffer> ownedBuffer,
   if (result.wasInterrupted())
     forOp->emitError("unsupported operation ");
 
-  assert(scheduleList(problem, nullptr).succeeded());
+  assert(scheduleList(problem, lastOp).succeeded());
 
   auto scheduleOps = problem.getOperations();
   for (auto *schedOp : scheduleOps) {

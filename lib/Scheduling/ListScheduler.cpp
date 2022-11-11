@@ -13,70 +13,113 @@
 #include "circt/Scheduling/Algorithms.h"
 #include "circt/Scheduling/Utilities.h"
 #include "mlir/IR/Operation.h"
+#include <algorithm>
 #include <cassert>
+#include <map>
+#include <utility>
 #include <vector>
 
 using namespace circt;
 using namespace circt::scheduling;
 
-const int globalPortLimit = 2;
-
-void appendReservTable(std::vector<int> &vec, unsigned int cycle) {
-  while (vec.size() < cycle + 1) {
-    vec.push_back(globalPortLimit);
+bool getReservation(
+    std::map<std::pair<std::string, unsigned int>, int> &reservationTable,
+    SharedOperatorsProblem &prob, Operation *op, unsigned int cycle) {
+  auto operatorType = prob.getLinkedOperatorType(op);
+  assert(operatorType.has_value());
+  if (!prob.getLimit(operatorType.value()).has_value()) {
+    return true;
   }
+
+  auto typeLimit = prob.getLimit(operatorType.value()).value();
+  assert(typeLimit > 0);
+  auto key = std::pair(operatorType.value().str(), cycle);
+  if (reservationTable.count(key) == 0) {
+    reservationTable.insert(std::pair(key, (int)typeLimit - 1));
+    return true;
+  }
+  reservationTable[key]--;
+  return reservationTable[key] >= 0;
 }
 
-bool reservePort(std::vector<int> &vec, unsigned int atCycle) {
-  appendReservTable(vec, atCycle);
-  vec[atCycle]--;
-  return vec[atCycle] >= 0;
+bool testReservation(
+    std::map<std::pair<std::string, unsigned int>, int> &reservationTable,
+    SharedOperatorsProblem &prob, Operation *op, unsigned int cycle) {
+  auto operatorType = prob.getLinkedOperatorType(op);
+  assert(operatorType.has_value());
+  if (!prob.getLimit(operatorType.value()).has_value()) {
+    return true;
+  }
+
+  auto typeLimit = prob.getLimit(operatorType.value()).value();
+  assert(typeLimit > 0);
+  auto key = std::pair(operatorType.value().str(), cycle);
+  if (reservationTable.count(key) == 0) {
+    reservationTable.insert(std::pair(key, (int)typeLimit));
+    return true;
+  }
+  return reservationTable[key] > 0;
 }
 
 LogicalResult scheduling::scheduleList(SharedOperatorsProblem &prob,
                                        Operation *lastOp) {
 
-  std::vector<int> portReservations;
-  return handleOperationsInTopologicalOrder(prob, [&](Operation *op) {
-    // Operations with no predecessors are scheduled at time step 0
-    assert(prob.getLinkedOperatorType(op).has_value());
-    auto operatorType = prob.getLinkedOperatorType(op).value().str();
+  std::map<std::pair<std::string, unsigned int>, int> reservationTable;
+
+  SmallVector<Operation *> unscheduledOps;
+  unsigned int totalLatency = 0;
+
+  // Schedule Ops with no Dependencies
+  for (auto it = prob.getOperations().rbegin();
+       it != prob.getOperations().rend(); it++) {
+    auto *op = *it;
+    if (op == lastOp)
+      continue;
     if (prob.getDependences(op).empty()) {
-
-      if (operatorType == "ld" || operatorType == "st") {
-        if (reservePort(portReservations, 0))
-          prob.setStartTime(op, 0);
-        else
-          return failure();
-      } else {
+      if (getReservation(reservationTable, prob, op, 0)) {
         prob.setStartTime(op, 0);
+      } else {
+        unscheduledOps.push_back(op);
       }
-
-      return success();
-    }
-
-    // op has at least one predecessor. Compute start time as:
-    //   max_{p : preds} startTime[p] + latency[linkedOpr[p]]
-    unsigned startTime = 0;
-    for (auto &dep : prob.getDependences(op)) {
-      Operation *pred = dep.getSource();
-      auto predStart = prob.getStartTime(pred);
-      if (!predStart)
-        // pred is not yet scheduled, give up and try again later
-        return failure();
-
-      // pred is already scheduled
-      auto predOpr = *prob.getLinkedOperatorType(pred);
-      startTime = std::max(startTime, *predStart + *prob.getLatency(predOpr));
-    }
-    if (operatorType == "ld" || operatorType == "st") {
-      if (reservePort(portReservations, startTime))
-        prob.setStartTime(op, startTime);
-      else
-        return failure();
     } else {
-      prob.setStartTime(op, startTime);
+      // Dependencies are not fulfilled
+      unscheduledOps.push_back(op);
     }
-    return success();
-  });
+  }
+
+  while (!unscheduledOps.empty()) {
+    SmallVector<Operation *> worklist;
+    worklist.insert(worklist.begin(), unscheduledOps.rbegin(),
+                    unscheduledOps.rend());
+    unscheduledOps.clear();
+
+    for (auto *op : worklist) {
+      unsigned int schedCycle = 0;
+      bool ready = true;
+      for (auto dep : prob.getDependences(op)) {
+        auto depStart = prob.getStartTime(dep.getSource());
+        if (!depStart.has_value()) {
+          unscheduledOps.push_back(op);
+          ready = false;
+          break;
+        }
+        schedCycle = std::max(
+            schedCycle,
+            depStart.value() +
+                prob.getLatency(
+                        prob.getLinkedOperatorType(dep.getSource()).value())
+                    .value());
+      }
+      if (ready) {
+        unsigned int earliest = schedCycle;
+        while (!testReservation(reservationTable, prob, op, earliest))
+          earliest++;
+        getReservation(reservationTable, prob, op, earliest);
+        prob.setStartTime(op, earliest);
+        totalLatency = std::max(totalLatency, earliest);
+      }
+    }
+  }
+  prob.setStartTime(lastOp, totalLatency);
+  return success();
 }
