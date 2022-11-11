@@ -1,0 +1,77 @@
+set(LLVM_LINK_COMPONENTS
+  Support
+)
+
+add_llvm_tool(sched-dump
+  sched-dump.cpp
+)
+llvm_update_compile_flags(sched-dump)
+target_link_libraries(sched-dump
+  PRIVATE
+  
+  CIRCTAffineToPipeline
+  CIRCTAnalysisTestPasses
+  CIRCTCalyx
+  CIRCTCalyxToHW
+  CIRCTCalyxToFSM
+  CIRCTCalyxTransforms
+  CIRCTESI
+  CIRCTExportChiselInterface
+  CIRCTExportVerilog
+  CIRCTFIRRTL
+  CIRCTFIRRTLToHW
+  CIRCTFIRRTLTransforms
+  CIRCTFSM
+  CIRCTFSMTransforms
+  CIRCTFSMToSV
+  CIRCTHandshake
+  CIRCTHandshakeToFIRRTL
+  CIRCTHandshakeToHW
+  CIRCTHandshakeTransforms
+  CIRCTLLHD
+  CIRCTLLHDToLLVM
+  CIRCTHWToLLVM
+  CIRCTCombToLLVM
+  CIRCTLLHDTransforms
+  CIRCTMoore
+  CIRCTMooreToCore
+  CIRCTMSFT
+  CIRCTMSFTTransforms
+  CIRCTHW
+  CIRCTHWArith
+  CIRCTHWArithToHW
+  CIRCTInteropDialect
+  CIRCTHWToLLHD
+  CIRCTHWToSystemC
+  CIRCTHWTransforms
+  CIRCTSCFToCalyx
+  CIRCTSCFToSTG
+  CIRCTScheduling
+  CIRCTSchedulingTestPasses
+  CIRCTSeq
+  CIRCTSeqTransforms
+  CIRCTSSP
+  CIRCTStandardToHandshake
+  CIRCTPipelineOps
+  CIRCTSTGOps
+  CIRCTPipelineToHW
+  CIRCTPipelineTransforms
+  CIRCTPipelineToCalyx
+  CIRCTSV
+  CIRCTSVTransforms
+  CIRCTHWArith
+  CIRCTSystemC
+  CIRCTSystemCTransforms
+  CIRCTTransforms
+  
+  MLIRIR
+  MLIRLLVMDialect
+  MLIRMemRefDialect
+  MLIROptLib
+  MLIRParser
+  MLIRFuncDialect
+  MLIRSupport
+  MLIRTransforms
+  MLIRSCFDialect
+  MLIREmitCDialect
+)
