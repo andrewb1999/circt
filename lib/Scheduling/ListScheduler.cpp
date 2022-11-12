@@ -22,7 +22,7 @@
 using namespace circt;
 using namespace circt::scheduling;
 
-bool getReservation(
+bool takeReservation(
     std::map<std::pair<std::string, unsigned int>, int> &reservationTable,
     SharedOperatorsProblem &prob, Operation *op, unsigned int cycle) {
   auto operatorType = prob.getLinkedOperatorType(op);
@@ -61,6 +61,33 @@ bool testReservation(
   return reservationTable[key] > 0;
 }
 
+bool testSchedule(
+    std::map<std::pair<std::string, unsigned int>, int> &reservationTable,
+    SharedOperatorsProblem &prob, Operation *op, unsigned int cycle) {
+  auto operatorType = prob.getLinkedOperatorType(op);
+  assert(operatorType.has_value());
+  auto operatorLatency = prob.getLatency(operatorType.value());
+  assert(operatorLatency.has_value());
+  bool result = testReservation(reservationTable, prob, op, cycle);
+  for (unsigned int i = cycle + 1; i < cycle + operatorLatency.value(); i++)
+    result &= testReservation(reservationTable, prob, op, i);
+
+  return result;
+}
+
+void takeSchedule(
+    std::map<std::pair<std::string, unsigned int>, int> &reservationTable,
+    SharedOperatorsProblem &prob, Operation *op, unsigned int cycle) {
+  auto operatorType = prob.getLinkedOperatorType(op);
+  assert(operatorType.has_value());
+  auto operatorLatency = prob.getLatency(operatorType.value());
+  assert(operatorLatency.has_value());
+  takeReservation(reservationTable, prob, op, cycle);
+  for (unsigned int i = cycle + 1; i < cycle + operatorLatency.value(); i++)
+    takeReservation(reservationTable, prob, op, i);
+  prob.setStartTime(op, cycle);
+}
+
 LogicalResult scheduling::scheduleList(SharedOperatorsProblem &prob,
                                        Operation *lastOp) {
 
@@ -76,8 +103,8 @@ LogicalResult scheduling::scheduleList(SharedOperatorsProblem &prob,
     if (op == lastOp)
       continue;
     if (prob.getDependences(op).empty()) {
-      if (getReservation(reservationTable, prob, op, 0)) {
-        prob.setStartTime(op, 0);
+      if (testSchedule(reservationTable, prob, op, 0)) {
+        takeSchedule(reservationTable, prob, op, 0);
       } else {
         unscheduledOps.push_back(op);
       }
@@ -112,10 +139,9 @@ LogicalResult scheduling::scheduleList(SharedOperatorsProblem &prob,
       }
       if (ready) {
         unsigned int earliest = schedCycle;
-        while (!testReservation(reservationTable, prob, op, earliest))
+        while (!testSchedule(reservationTable, prob, op, earliest))
           earliest++;
-        getReservation(reservationTable, prob, op, earliest);
-        prob.setStartTime(op, earliest);
+        takeSchedule(reservationTable, prob, op, earliest);
         totalLatency = std::max(totalLatency, earliest);
       }
     }
