@@ -87,6 +87,7 @@ int runModule(std::unique_ptr<llvm::MemoryBuffer> ownedBuffer,
     return error;
   auto funcOp = *module->getOps<func::FuncOp>().begin();
   auto *funcBody = &funcOp.getFunctionBody();
+  OpBuilder rewriter(funcOp);
   Region *loopBody = nullptr;
   Operation *forOp = nullptr;
   Operation *lastOp = nullptr;
@@ -172,11 +173,10 @@ int runModule(std::unique_ptr<llvm::MemoryBuffer> ownedBuffer,
   auto scheduleOps = problem.getOperations();
   for (auto *schedOp : scheduleOps) {
     assert(problem.getStartTime(schedOp).has_value());
-    llvm::errs() << schedOp->getName() << ": "
-                 << std::to_string(problem.getStartTime(schedOp).value())
-                 << "\n";
+    schedOp->setAttr("startTime", rewriter.getI64IntegerAttr(
+                                      problem.getStartTime(schedOp).value()));
   }
-
+  funcOp.dump();
   return 0;
 }
 
