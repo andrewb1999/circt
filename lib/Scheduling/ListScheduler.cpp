@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <cassert>
 #include <map>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -88,18 +90,86 @@ void takeSchedule(
   prob.setStartTime(op, cycle);
 }
 
+std::map<Operation *, int> getALAPPriorities(Problem::OperationSet opSet,
+                                             Problem &prob, Operation *lastOp) {
+  std::map<Operation *, int> map;
+  std::map<Operation *, bool> isSink;
+  assert(opSet.contains(lastOp));
+  for (auto *op : opSet)
+    isSink.insert(std::pair(op, true));
+  SmallVector<Operation *> reverseTopoSort;
+  SmallVector<Operation *> unhandledOps;
+  unhandledOps.insert(unhandledOps.begin(), opSet.begin(), opSet.end());
+  const unsigned int fSize = opSet.size();
+  while (reverseTopoSort.size() < fSize) {
+    Problem::OperationSet workList;
+    for (auto it = unhandledOps.rbegin(); it != unhandledOps.rend(); it++)
+      workList.insert(*it);
+
+    unhandledOps.clear();
+
+    for (auto *op : workList) {
+      bool noDep = (lastOp != op && prob.getDependences(op).empty()) ||
+                   (lastOp == op && workList.size() == 1);
+      if (!noDep && lastOp != op) {
+        bool depsAdded = true;
+        for (auto pred : prob.getDependences(op)) {
+          assert(opSet.contains(pred.getSource()));
+          isSink[pred.getSource()] = false;
+          depsAdded &= !workList.contains(pred.getSource());
+        }
+        noDep |= depsAdded;
+      }
+      if (noDep) {
+        reverseTopoSort.push_back(op);
+      } else {
+        unhandledOps.push_back(op);
+      }
+    }
+  }
+
+  for (int i = reverseTopoSort.size() - 1; i >= 0; i--) {
+    auto *op = reverseTopoSort.data()[i];
+    int priority = opSet.size();
+    if (isSink[op]) {
+      map.insert(std::pair(op, opSet.size()));
+    } else {
+      for (auto *sop : opSet) {
+        for (auto dep : prob.getDependences(sop)) {
+          if (dep.getSource() == op) {
+            assert(map.count(dep.getDestination()) == 1);
+            priority = std::min(priority, map[dep.getDestination()]);
+          }
+        }
+      }
+      map.insert(std::pair(op, priority - 1));
+    }
+  }
+
+  return map;
+}
+
+bool priorityCmp(std::pair<Operation *, int> &a,
+                 std::pair<Operation *, int> &b) {
+  return a.second < b.second;
+}
+
 LogicalResult scheduling::scheduleList(SharedOperatorsProblem &prob,
                                        Operation *lastOp) {
 
   std::map<std::pair<std::string, unsigned int>, int> reservationTable;
-
   SmallVector<Operation *> unscheduledOps;
   unsigned int totalLatency = 0;
-
+  auto map = getALAPPriorities(prob.getOperations(), prob, lastOp);
+  SmallVector<std::pair<Operation *, int>> mapSet;
+  mapSet.insert(mapSet.begin(), map.begin(), map.end());
+  // sort by low priority to high priority, high priority == sinks
+  std::sort(mapSet.begin(), mapSet.end(), priorityCmp);
   // Schedule Ops with no Dependencies
-  for (auto it = prob.getOperations().rbegin();
-       it != prob.getOperations().rend(); it++) {
-    auto *op = *it;
+  for (auto &pair : mapSet) {
+    auto *op = pair.first;
+    // llvm::errs() << op->getName() << ": " << std::to_string(pair.second) <<
+    // "\n";
     if (op == lastOp)
       continue;
     if (prob.getDependences(op).empty()) {
@@ -116,11 +186,12 @@ LogicalResult scheduling::scheduleList(SharedOperatorsProblem &prob,
 
   while (!unscheduledOps.empty()) {
     SmallVector<Operation *> worklist;
-    worklist.insert(worklist.begin(), unscheduledOps.rbegin(),
-                    unscheduledOps.rend());
+    worklist.insert(worklist.begin(), unscheduledOps.begin(),
+                    unscheduledOps.end());
     unscheduledOps.clear();
 
     for (auto *op : worklist) {
+      // llvm::errs() << op->getName() << "\n";
       unsigned int schedCycle = 0;
       bool ready = true;
       for (auto dep : prob.getDependences(op)) {

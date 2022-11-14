@@ -115,6 +115,10 @@ int runModule(std::unique_ptr<llvm::MemoryBuffer> ownedBuffer,
   Problem::OperatorType chainOpr = problem.getOrInsertOperatorType("chain");
   problem.setLatency(chainOpr, 0);
 
+  // Let's say only 1 ld and st per cycle just for testing purposes
+  problem.setLimit(ldOpr, 1);
+  problem.setLimit(stOpr, 1);
+
   WalkResult result = loopBody->walk([&](Operation *op) {
     problem.insertOperation(op);
     auto opDep = dependences.getDependences(op);
