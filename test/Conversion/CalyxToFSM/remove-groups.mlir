@@ -51,9 +51,9 @@
 // CHECK:           %[[VAL_14:.*]] = hw.constant 1 : i8
 // CHECK:           %[[VAL_15:.*]] = hw.constant 0 : i8
 // CHECK:           %[[VAL_16:.*]] = hw.constant true
-// CHECK:           %[[VAL_10]], %[[VAL_17:.*]], %[[VAL_18:.*]], %[[VAL_19:.*]], %[[VAL_20:.*]], %[[VAL_21:.*]] = calyx.register @a : i8, i1, i1, i1, i8, i1
-// CHECK:           %[[VAL_9]], %[[VAL_22:.*]], %[[VAL_23:.*]], %[[VAL_24:.*]], %[[VAL_25:.*]], %[[VAL_26:.*]] = calyx.register @b : i8, i1, i1, i1, i8, i1
-// CHECK:           %[[VAL_27:.*]], %[[VAL_28:.*]], %[[VAL_29:.*]], %[[VAL_30:.*]], %[[VAL_31:.*]], %[[VAL_32:.*]] = calyx.register @c : i8, i1, i1, i1, i8, i1
+// CHECK:           %[[VAL_10]], %[[VAL_17:.*]], %[[VAL_18:.*]], %[[VAL_19:.*]], %[[VAL_20:.*]], %[[VAL_21:.*]] = calyx.register @a : i8
+// CHECK:           %[[VAL_9]], %[[VAL_22:.*]], %[[VAL_23:.*]], %[[VAL_24:.*]], %[[VAL_25:.*]], %[[VAL_26:.*]] = calyx.register @b : i8
+// CHECK:           %[[VAL_27:.*]], %[[VAL_28:.*]], %[[VAL_29:.*]], %[[VAL_30:.*]], %[[VAL_31:.*]], %[[VAL_32:.*]] = calyx.register @c : i8
 // CHECK:           calyx.wires {
 // CHECK:             %[[VAL_33:.*]] = calyx.undef : i1
 // CHECK:             calyx.assign %[[VAL_3]] = %[[VAL_6]]#3 : i1
@@ -76,9 +76,9 @@ calyx.component @main(%go: i1 {go}, %reset: i1 {reset}, %clk: i1 {clk}) -> (%don
   %c1_i8 = hw.constant 1 : i8
   %c0_i8 = hw.constant 0 : i8
   %true = hw.constant true
-  %a.in, %a.write_en, %a.clk, %a.reset, %a.out, %a.done = calyx.register @a : i8, i1, i1, i1, i8, i1
-  %b.in, %b.write_en, %b.clk, %b.reset, %b.out, %b.done = calyx.register @b : i8, i1, i1, i1, i8, i1
-  %c.in, %c.write_en, %c.clk, %c.reset, %c.out, %c.done = calyx.register @c : i8, i1, i1, i1, i8, i1
+  %a.in, %a.write_en, %a.clk, %a.reset, %a.out, %a.done = calyx.register @a : i8
+  %b.in, %b.write_en, %b.clk, %b.reset, %b.out, %b.done = calyx.register @b : i8
+  %c.in, %c.write_en, %c.clk, %c.reset, %c.out, %c.done = calyx.register @c : i8
   calyx.wires {
     %0 = calyx.undef : i1
     calyx.group @A {

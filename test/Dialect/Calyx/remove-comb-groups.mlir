@@ -2,7 +2,7 @@
 
 // CHECK-LABEL: calyx.component @main
 calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-  %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+  %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
   %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
   %c1_1 = hw.constant 1 : i1
   calyx.wires {
@@ -48,7 +48,7 @@ calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%don
 // Test the case where cells are shared across combinational groups.
 
 calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-  %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+  %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
   %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
   %c1_1 = hw.constant 1 : i1
   calyx.wires {

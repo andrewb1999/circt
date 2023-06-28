@@ -1771,7 +1771,17 @@ SmallVector<DictionaryAttr> RegisterOp::portAttributes() {
   };
 }
 
-bool RegisterOp::isCombinational() { return false; }
+LogicalResult RegisterOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> location, ValueRange operands,
+    DictionaryAttr attributes, mlir::OpaqueProperties properties,
+    mlir::RegionRange regions, SmallVectorImpl<Type> &inferredReturnTypes) {
+  // auto in = attributes.;
+  // llvm::errs() << ;
+  // in.dump();
+  // unsigned resultWidth = getTotalWidth(operands);
+  // results.push_back(IntegerType::get(context, resultWidth));
+  return success();
+}
 
 //===----------------------------------------------------------------------===//
 // MemoryOp

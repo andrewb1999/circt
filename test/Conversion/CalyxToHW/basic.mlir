@@ -65,7 +65,7 @@
     // CHECK-DAG:  %buf = sv.wire
     // CHECK-DAG:  sv.assign %buf, %[[BUF_REG]]
     // CHECK-DAG:  %[[BUF_VAL:.+]] = sv.read_inout %buf
-    %buf.in, %buf.write_en, %buf.clk, %buf.reset, %buf.out, %buf.done = calyx.register @buf : i32, i1, i1, i1, i32, i1
+    %buf.in, %buf.write_en, %buf.clk, %buf.reset, %buf.out, %buf.done = calyx.register @buf : i32
 
     // CHECK-DAG:  %g0_go = sv.wire
     // CHECK-DAG:  %[[G0_GO_VAL:.+]] = sv.read_inout %g0_go

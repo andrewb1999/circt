@@ -36,9 +36,9 @@ calyx.component @main(%go: i1 {go}, %reset: i1 {reset}, %clk: i1 {clk}) -> (%don
   %c1_i8 = hw.constant 1 : i8
   %c0_i8 = hw.constant 0 : i8
   %true = hw.constant true
-  %a.in, %a.write_en, %a.clk, %a.reset, %a.out, %a.done = calyx.register @a : i8, i1, i1, i1, i8, i1
-  %b.in, %b.write_en, %b.clk, %b.reset, %b.out, %b.done = calyx.register @b : i8, i1, i1, i1, i8, i1
-  %c.in, %c.write_en, %c.clk, %c.reset, %c.out, %c.done = calyx.register @c : i8, i1, i1, i1, i8, i1
+  %a.in, %a.write_en, %a.clk, %a.reset, %a.out, %a.done = calyx.register @a : i8
+  %b.in, %b.write_en, %b.clk, %b.reset, %b.out, %b.done = calyx.register @b : i8
+  %c.in, %c.write_en, %c.clk, %c.reset, %c.out, %c.done = calyx.register @c : i8
   calyx.wires {
     %0 = calyx.undef : i1
     calyx.group @A {

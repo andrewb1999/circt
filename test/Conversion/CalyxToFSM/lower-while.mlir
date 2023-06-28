@@ -75,8 +75,8 @@ calyx.component @main(%go: i1 {go}, %reset: i1 {reset}, %clk: i1 {clk}) -> (%don
   %c1_i32 = hw.constant 1 : i32
   %c5_i32 = hw.constant 5 : i32
   %c4_i32 = hw.constant 4 : i32
-  %lt_reg.in, %lt_reg.write_en, %lt_reg.clk, %lt_reg.reset, %lt_reg.out, %lt_reg.done = calyx.register @lt_reg : i1, i1, i1, i1, i1, i1
-  %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i32, i1, i1, i1, i32, i1
+  %lt_reg.in, %lt_reg.write_en, %lt_reg.clk, %lt_reg.reset, %lt_reg.out, %lt_reg.done = calyx.register @lt_reg : i1
+  %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i32
   %add.left, %add.right, %add.out = calyx.std_add @add : i32, i32, i32
   %lt.left, %lt.right, %lt.out = calyx.std_lt @lt : i32, i32, i1
   calyx.wires {

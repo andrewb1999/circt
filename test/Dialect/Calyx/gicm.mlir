@@ -3,7 +3,7 @@
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
     %add.left, %add.right, %add.out = calyx.std_add @add : i8, i8, i8
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8, i1, i1, i1, i8, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8
 
     %c9_i8 = hw.constant 9 : i8
     %true = hw.constant 1 : i1

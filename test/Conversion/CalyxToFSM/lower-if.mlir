@@ -55,9 +55,9 @@
 calyx.component @main(%go: i1 {go}, %reset: i1 {reset}, %clk: i1 {clk}) -> (%done: i1 {done}) {
   %false = hw.constant false
   %true = hw.constant true
-  %lt_reg.in, %lt_reg.write_en, %lt_reg.clk, %lt_reg.reset, %lt_reg.out, %lt_reg.done = calyx.register @lt_reg : i1, i1, i1, i1, i1, i1
-  %t.in, %t.write_en, %t.clk, %t.reset, %t.out, %t.done = calyx.register @t : i1, i1, i1, i1, i1, i1
-  %f.in, %f.write_en, %f.clk, %f.reset, %f.out, %f.done = calyx.register @f : i1, i1, i1, i1, i1, i1
+  %lt_reg.in, %lt_reg.write_en, %lt_reg.clk, %lt_reg.reset, %lt_reg.out, %lt_reg.done = calyx.register @lt_reg : i1
+  %t.in, %t.write_en, %t.clk, %t.reset, %t.out, %t.done = calyx.register @t : i1
+  %f.in, %f.write_en, %f.clk, %f.reset, %f.out, %f.done = calyx.register @f : i1
   %lt.left, %lt.right, %lt.out = calyx.std_lt @lt : i1, i1, i1
   calyx.wires {
     %0 = calyx.undef : i1

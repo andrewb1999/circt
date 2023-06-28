@@ -173,7 +173,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.group @A {
@@ -194,7 +194,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       // expected-error @+1 {{'calyx.group' op with name: "Group1" is unused in the control execution schedule}}
@@ -213,7 +213,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @A(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out: i1, %done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8, i1, i1, i1, i8, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8
     calyx.wires {
       calyx.assign %done = %r.done : i1
     }
@@ -221,7 +221,7 @@ module attributes {calyx.entrypoint = "main"} {
   }
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
     %c0.go, %c0.clk, %c0.reset, %c0.out, %c0.done = calyx.instance @c0 of @A : i1, i1, i1, i1, i1
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.comb_group @Group1 {
@@ -255,7 +255,7 @@ module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
     %c1_1 = hw.constant 1 : i1
     %c0.go, %c0.clk, %c0.reset, %c0.out, %c0.done = calyx.instance @c0 of @A : i1, i1, i1, i1, i1
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     calyx.wires {
       calyx.group @Group2 {
         calyx.assign %r.in = %c1_1 : i1
@@ -282,7 +282,7 @@ module attributes {calyx.entrypoint = "main"} {
   }
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
     %c0.in, %c0.go, %c0.clk, %c0.reset, %c0.out, %c0.done = calyx.instance @c0 of @A : i1, i1, i1, i1, i1, i1
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.comb_group @Group1 {}
@@ -336,7 +336,7 @@ module attributes {calyx.entrypoint = "main"} {
   }
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
     %c0.in, %c0.go, %c0.clk, %c0.reset, %c0.out, %c0.done = calyx.instance @c0 of @A : i1, i1, i1, i1, i1, i1
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.comb_group @Group1 { }
@@ -420,7 +420,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8, i1, i1, i1, i8, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8
     calyx.wires {
       // expected-error @+1 {{'calyx.assign' op has a component port as the source with the incorrect direction.}}
       calyx.assign %r.write_en = %done : i1
@@ -433,7 +433,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8, i1, i1, i1, i8, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8
     calyx.wires {
       // expected-error @+1 {{'calyx.assign' op has a cell port as the source with the incorrect direction.}}
       calyx.assign %done = %r.write_en : i1
@@ -446,7 +446,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8, i1, i1, i1, i8, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8
     calyx.wires {
       // expected-error @+1 {{'calyx.assign' op has a cell port as the destination with the incorrect direction.}}
       calyx.assign %r.done = %go : i1
@@ -459,7 +459,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.group @A {
@@ -480,7 +480,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.group @A {
@@ -508,7 +508,7 @@ module attributes {calyx.entrypoint = "main"} {
     calyx.control {}
   }
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c0.go, %c0.clk, %c0.reset, %c0.out, %c0.done = calyx.instance @c0 of @A : i1, i1, i1, i1, i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
@@ -537,7 +537,7 @@ module attributes {calyx.entrypoint = "main"} {
   }
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
     %c0.go, %c0.clk, %c0.reset, %c0.out, %c0.done = calyx.instance @c0 of @A : i1, i1, i1, i1, i1
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.group @Group1 {
@@ -593,7 +593,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       // expected-error @+1 {{'calyx.group' op with cell: calyx.register "r" is performing a write and failed to drive all necessary ports.}}
@@ -628,7 +628,7 @@ module attributes {calyx.entrypoint = "main"} {
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
     %gt.left, %gt.right, %gt.out = calyx.std_gt @gt : i8, i8, i1
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_i8 = hw.constant 1 : i8
     %c1_i1 = hw.constant 1 : i1
     calyx.wires {
@@ -649,7 +649,7 @@ module attributes {calyx.entrypoint = "main"} {
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
     %m.addr0, %m.addr1, %m.write_data, %m.write_en, %m.clk, %m.read_data, %m.done = calyx.memory @m <[64, 64] x 8> [6, 6] : i6, i6, i8, i1, i1, i8, i1
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8, i1, i1, i1, i8, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8
     %c1_i1 = hw.constant 1 : i1
     calyx.wires {
       // expected-error @+1 {{'calyx.group' op with cell: calyx.memory "m" is having a read performed upon it, and failed to drive all necessary ports.}}
@@ -667,7 +667,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       // expected-error @+1 {{'calyx.comb_group' op with register: "r" is conducting a memory store. This is not combinational.}}
@@ -696,7 +696,7 @@ module attributes {calyx.entrypoint = "main"} {
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
     %m.addr0, %m.addr1, %m.write_data, %m.write_en, %m.clk, %m.read_data, %m.done = calyx.memory @m <[64, 64] x 8> [6, 6] : i6, i6, i8, i1, i1, i8, i1
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_i8 = hw.constant 1 : i8
     %c0_i6 = hw.constant 0 : i6
     %c1_i1 = hw.constant 1 : i1
@@ -728,7 +728,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.group @A {
@@ -747,7 +747,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.group @A {
@@ -766,7 +766,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.group @A {
@@ -864,7 +864,7 @@ module attributes {calyx.entrypoint = "main"} {
     %std_lt_0.left, %std_lt_0.right, %std_lt_0.out = calyx.std_lt @std_lt_0 : i32, i32, i1
     %c64_i32 = hw.constant 64 : i32
     %c42_i32 = hw.constant 42 : i32
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     calyx.wires {
       calyx.assign %std_lt_0.left = %c64_i32 : i32
       calyx.group @A {
@@ -891,7 +891,7 @@ module attributes {calyx.entrypoint = "main"} {
     %std_lt_0.left, %std_lt_0.right, %std_lt_0.out = calyx.std_lt @std_lt_0 : i32, i32, i1
     %c64_i32 = hw.constant 64 : i32
     %c42_i32 = hw.constant 42 : i32
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     calyx.wires {
     }
     calyx.control {

@@ -3,7 +3,7 @@
 // Nested SeqOps are collapsed.
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.group @A {
@@ -32,7 +32,7 @@ module attributes {calyx.entrypoint = "main"} {
 // Nested ParOps are collapsed.
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.group @A {
@@ -61,7 +61,7 @@ module attributes {calyx.entrypoint = "main"} {
 // IfOp nested in SeqOp removes common tail from within SeqOps.
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
@@ -122,7 +122,7 @@ module attributes {calyx.entrypoint = "main"} {
 // IfOp nested in ParOp removes common tails from within ParOps.
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
@@ -192,7 +192,7 @@ module attributes {calyx.entrypoint = "main"} {
 // here is ensuring the removed EnableOps are still computed sequentially.
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
@@ -256,7 +256,7 @@ module attributes {calyx.entrypoint = "main"} {
 // here is ensuring the removed EnableOps are still computed in parallel.
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
@@ -327,7 +327,7 @@ module attributes {calyx.entrypoint = "main"} {
 // Empty Then and Else regions lead to the removal of the IfOp (as well as unused cells and groups).
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     // CHECK-NOT: %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
     %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
     %c1_1 = hw.constant 1 : i1
@@ -369,7 +369,7 @@ module attributes {calyx.entrypoint = "main"} {
 // Empty Then region and no Else region leads to removal of IfOp (as well as unused cells).
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     // CHECK-NOT: %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
     %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
     %c1_1 = hw.constant 1 : i1
@@ -399,7 +399,7 @@ module attributes {calyx.entrypoint = "main"} {
 // Empty body leads to removal of WhileOp (as well as unused cells and groups).
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     // CHECK: %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
     %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i1, i1, i1
     %c1_1 = hw.constant 1 : i1
@@ -435,7 +435,7 @@ module attributes {calyx.entrypoint = "main"} {
 // Empty ParOp and SeqOp are removed.
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.group @A {
@@ -464,7 +464,7 @@ module attributes {calyx.entrypoint = "main"} {
 // Unary control operations are collapsed.
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i1
     %c1_1 = hw.constant 1 : i1
     calyx.wires {
       calyx.group @A {

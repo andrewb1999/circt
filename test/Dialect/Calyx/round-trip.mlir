@@ -18,8 +18,8 @@ module attributes {calyx.entrypoint = "main"} {
 
   // CHECK-LABEL:   calyx.component @main(%clk: i1 {clk}, %go: i1 {go}, %reset: i1 {reset}) -> (%done: i1 {done}) {
   calyx.component @main(%clk: i1 {clk}, %go: i1 {go}, %reset: i1 {reset}) -> (%done: i1 {done}) {
-    // CHECK:      %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8, i1, i1, i1, i8, i1
-    // CHECK-NEXT: %r2.in, %r2.write_en, %r2.clk, %r2.reset, %r2.out, %r2.done = calyx.register @r2 : i1, i1, i1, i1, i1, i1
+    // CHECK:      %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8
+    // CHECK-NEXT: %r2.in, %r2.write_en, %r2.clk, %r2.reset, %r2.out, %r2.done = calyx.register @r2 : i1
     // CHECK-NEXT: %mu.clk, %mu.reset, %mu.go, %mu.left, %mu.right, %mu.out, %mu.done = calyx.std_mult_pipe @mu : i1, i1, i1, i32, i32, i32, i1
     // CHECK-NEXT: %du.clk, %du.reset, %du.go, %du.left, %du.right, %du.out_quotient, %du.done = calyx.std_divu_pipe @du : i1, i1, i1, i32, i32, i32, i1
     // CHECK-NEXT: %m.addr0, %m.addr1, %m.write_data, %m.write_en, %m.clk, %m.read_data, %m.done = calyx.memory @m <[64, 64] x 8> [6, 6] : i6, i6, i8, i1, i1, i8, i1
@@ -32,8 +32,8 @@ module attributes {calyx.entrypoint = "main"} {
     // CHECK-NEXT: %slice.in, %slice.out = calyx.std_slice @slice : i8, i7
     // CHECK-NEXT: %not.in, %not.out = calyx.std_not @not : i1, i1
     // CHECK-NEXT: %wire.in, %wire.out = calyx.std_wire @wire : i8, i8
-    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8, i1, i1, i1, i8, i1
-    %r2.in, %r2.write_en, %r2.clk, %r2.reset, %r2.out, %r2.done = calyx.register @r2 : i1, i1, i1, i1, i1, i1
+    %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8
+    %r2.in, %r2.write_en, %r2.clk, %r2.reset, %r2.out, %r2.done = calyx.register @r2 : i1
     %mu.clk, %mu.reset, %mu.go, %mu.lhs, %mu.rhs, %mu.out, %mu.done = calyx.std_mult_pipe @mu : i1, i1, i1, i32, i32, i32, i1
     %du.clk, %du.reset, %du.go, %du.left, %du.right, %du.out, %du.done = calyx.std_divu_pipe @du : i1, i1, i1, i32, i32, i32, i1
     %m.addr0, %m.addr1, %m.write_data, %m.write_en, %m.clk, %m.read_data, %m.done = calyx.memory @m <[64, 64] x 8> [6, 6] : i6, i6, i8, i1, i1, i8, i1
