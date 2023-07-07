@@ -44,7 +44,8 @@ private:
   DenseSet<AffineMapAccessInterface> updateMemoryOps(AffineForOp affineFor);
   uint64_t getMinDepDistance(AffineForOp affineFor);
   std::optional<uint64_t> consumePragma(AffineForOp affineFor);
-  AffineForOp cloneIntoNewBlock(AffineForOp affineFor, IRMapping &irMapping);
+  AffineForOp cloneIntoNewBlock(AffineForOp affineFor, IRMapping &irMapping,
+                                DenseSet<Operation *> &dontTouchSet);
   LogicalResult unrollForDataParallel(AffineForOp affineFor);
   std::pair<SmallVector<AffineForOp>, unsigned>
   getDeepestNestedForOps(std::pair<SmallVector<AffineForOp>, unsigned> pair);
@@ -158,8 +159,10 @@ UnrollForLoopSchedule::consumePragma(AffineForOp affineFor) {
 
 // Clone an affine loop into its own isolated block. Not all values in scope are
 // copied over
-AffineForOp UnrollForLoopSchedule::cloneIntoNewBlock(AffineForOp affineFor,
-                                                     IRMapping &irMapping) {
+AffineForOp
+UnrollForLoopSchedule::cloneIntoNewBlock(AffineForOp affineFor,
+                                         IRMapping &irMapping,
+                                         DenseSet<Operation *> &dontTouchSet) {
 
   OpBuilder builder(affineFor);
   auto originalPt = builder.saveInsertionPoint();
@@ -178,6 +181,7 @@ AffineForOp UnrollForLoopSchedule::cloneIntoNewBlock(AffineForOp affineFor,
     auto *clonedOp = builder.clone(op, irMapping);
     if (isa<AffineForOp>(op) && cast<AffineForOp>(op) == affineFor)
       return cast<AffineForOp>(*clonedOp);
+    dontTouchSet.insert(clonedOp);
   }
 
   assert(false && "unreachable");
@@ -218,7 +222,8 @@ UnrollForLoopSchedule::unrollForDataParallel(AffineForOp affineFor) {
   // Since the unrolled loop may be optimized/promoted away, I put the for
   // loop in its own block to isolated the new anchoring ForOp
   IRMapping irMapping;
-  auto tmpFor = cloneIntoNewBlock(affineFor, irMapping);
+  DenseSet<Operation *> dontTouchSet;
+  auto tmpFor = cloneIntoNewBlock(affineFor, irMapping, dontTouchSet);
   auto *tmpBlk = tmpFor->getBlock();
 
   if (loopUnrollUpToFactor(tmpFor, unrollFactor).failed())
@@ -228,7 +233,10 @@ UnrollForLoopSchedule::unrollForDataParallel(AffineForOp affineFor) {
   // the ops that can be trivially fused together
   Block *blockToRead =
       loopIsPromoted ? tmpBlk : &tmpFor.getLoopBody().getBlocks().front();
-  SmallVector<AffineForOp> innerLoops(blockToRead->getOps<AffineForOp>());
+  SmallVector<AffineForOp> innerLoops;
+  for (auto loop : blockToRead->getOps<AffineForOp>())
+    if (!dontTouchSet.contains(loop))
+      innerLoops.push_back(loop);
 
   // Check if memory dependencies limit fusion, if so abandon our work
   auto *tmpDependence = &getAnalysis<MemoryDependenceAnalysis>();
@@ -259,14 +267,16 @@ UnrollForLoopSchedule::unrollForDataParallel(AffineForOp affineFor) {
   // loop body
   SmallVector<Operation *> operationsToMove;
   for (auto *op : operations) {
-    if (!isa<AffineForOp>(*op)) {
+    if (!isa<AffineForOp>(*op) || dontTouchSet.contains(op)) {
       operationsToMove.push_back(op);
       continue;
     }
 
     auto srcLoop = cast<AffineForOp>(*op);
-    if (srcLoop == destLoop)
+    if (srcLoop == destLoop) {
+      operationsToMove.clear();
       continue;
+    }
 
     // Move the dominating ops to above the destLoop
     for (auto &opToMove : operationsToMove)
@@ -300,7 +310,7 @@ UnrollForLoopSchedule::unrollForDataParallel(AffineForOp affineFor) {
     if (isa<AffineForOp>(op) && cast<AffineForOp>(op) == destLoop) {
       break;
     }
-    if (op.getUses().empty())
+    if (op.getUses().empty() && !dontTouchSet.contains(&op))
       prologueToDelete.push_back(&op);
   }
 
