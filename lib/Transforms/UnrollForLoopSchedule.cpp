@@ -213,13 +213,13 @@ UnrollForLoopSchedule::cloneIntoNewBlock(AffineForOp affineFor,
 LogicalResult
 UnrollForLoopSchedule::unrollForDataParallel(AffineForOp affineFor) {
 
-  if (affineFor.getOps<AffineForOp>().empty())
-    return success();
+  // if (affineFor.getOps<AffineForOp>().empty())
+  //   return success();
 
   std::optional<uint64_t> maxUnrollFactor = consumePragma(affineFor);
 
-  if (usesExternalMemory(affineFor))
-    return success();
+  // if (usesExternalMemory(affineFor))
+  //   return success();
 
   // We are not checking for loop-carried dependencies
   // Looking for perfect-nesting so just use max value

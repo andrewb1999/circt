@@ -57,6 +57,9 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
 
   // Insert memory dependences into the problem.
   forOp.getBody()->walk([&](Operation *op) {
+    if (isa<scf::IfOp, scf::YieldOp>(op))
+      return;
+    // op->dump();
     // Insert every operation into the problem.
     problem.insertOperation(op);
 
@@ -69,7 +72,7 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
       if (!hasDependence(memoryDep.dependenceType))
         continue;
 
-      memoryDep.source->dump();
+      // memoryDep.source->dump();
       // Insert a dependence into the problem.
       Problem::Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
@@ -87,51 +90,80 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
   });
 
   // Insert conditional dependences into the problem.
-  forOp.getBody()->walk([&](Operation *op) {
-    Block *thenBlock = nullptr;
-    Block *elseBlock = nullptr;
-    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-      thenBlock = ifOp.thenBlock();
-      elseBlock = ifOp.elseBlock();
-    } else if (auto ifOp = dyn_cast<AffineIfOp>(op)) {
-      thenBlock = ifOp.getThenBlock();
-      if (ifOp.hasElse())
-        elseBlock = ifOp.getElseBlock();
-    } else {
-      return WalkResult::advance();
-    }
+  // forOp.getBody()->walk([&](Operation *op) {
+  //   Block *thenBlock = nullptr;
+  //   Block *elseBlock = nullptr;
+  //   if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+  //     thenBlock = ifOp.thenBlock();
+  //     elseBlock = ifOp.elseBlock();
+  //   } else if (auto ifOp = dyn_cast<AffineIfOp>(op)) {
+  //     thenBlock = ifOp.getThenBlock();
+  //     if (ifOp.hasElse())
+  //       elseBlock = ifOp.getElseBlock();
+  //   } else {
+  //     return WalkResult::advance();
+  //   }
 
-    // No special handling required for control-only `if`s.
-    if (op->getNumResults() == 0)
-      return WalkResult::skip();
+  //   // thenBlock->walk([&](Operation *innerOp) {
+  //   //   if (isa<AffineYieldOp, scf::YieldOp>(innerOp))
+  //   //     return;
+  //   //   Problem::Dependence dep(innerOp, op);
+  //   //   auto depInserted = problem.insertDependence(dep);
+  //   //   assert(succeeded(depInserted));
+  //   //   (void)depInserted;
+  //   // });
 
-    // Model the implicit value flow from the `yield` to the `if`'s result(s).
-    Problem::Dependence depThen(thenBlock->getTerminator(), op);
-    auto depInserted = problem.insertDependence(depThen);
-    assert(succeeded(depInserted));
-    (void)depInserted;
+  //   // if (elseBlock) {
+  //   //   elseBlock->walk([&](Operation *innerOp) {
+  //   //     if (isa<AffineYieldOp, scf::YieldOp>(innerOp))
+  //   //       return;
+  //   //     Problem::Dependence dep(innerOp, op);
+  //   //     auto depInserted = problem.insertDependence(dep);
+  //   //     assert(succeeded(depInserted));
+  //   //     (void)depInserted;
+  //   //   });
+  //   // }
 
-    if (elseBlock) {
-      Problem::Dependence depElse(elseBlock->getTerminator(), op);
-      depInserted = problem.insertDependence(depElse);
-      assert(succeeded(depInserted));
-      (void)depInserted;
-    }
+  //   // No special handling required for control-only `if`s.
+  //   if (op->getNumResults() == 0)
+  //     return WalkResult::skip();
 
-    return WalkResult::advance();
-  });
+  //   // Model the implicit value flow from the `yield` to the `if`'s result(s).
+  //   Problem::Dependence depThen(thenBlock->getTerminator(), op);
+  //   auto depInserted = problem.insertDependence(depThen);
+  //   assert(succeeded(depInserted));
+  //   (void)depInserted;
+
+  //   if (elseBlock) {
+  //     Problem::Dependence depElse(elseBlock->getTerminator(), op);
+  //     depInserted = problem.insertDependence(depElse);
+  //     assert(succeeded(depInserted));
+  //     (void)depInserted;
+  //   }
+
+  //   return WalkResult::advance();
+  // });
 
   // Set the anchor for scheduling. Insert dependences from all stores to the
   // terminator to ensure the problem schedules them before the terminator.
   auto *anchor = forOp.getBody()->getTerminator();
   forOp.getBody()->walk([&](Operation *op) {
-    if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface>(op))
+    if (op == anchor || !problem.hasOperation(op))
       return;
+    // if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface, 
+    //     scf::YieldOp, AffineYieldOp, scf::IfOp>(op))
+    //   return;
     Problem::Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
   });
+
+  llvm::errs() << "here=========================\n";
+  // for (auto *op : problem.getOperations()) {
+  //   op->dump();
+  // }
+  // llvm::errs() << "=================\n";
 
   // Handle explicitly computed loop-carried values, i.e. excluding the
   // induction variable. Insert inter-iteration dependences from the definers of
@@ -145,6 +177,7 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
         continue;
 
       for (Operation *iterArgUser : iterArgs[i].getUsers()) {
+        iterArgUser->dump();
         Problem::Dependence dep(iterArgDefiner, iterArgUser);
         auto depInserted = problem.insertDependence(dep);
         assert(succeeded(depInserted));
@@ -155,6 +188,7 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
       }
     }
   }
+
 
   // Store the partially complete problem.
   problems.insert(std::pair<Operation *, CyclicProblem>(forOp, problem));

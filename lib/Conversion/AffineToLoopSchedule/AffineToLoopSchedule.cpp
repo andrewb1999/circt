@@ -33,6 +33,7 @@
 #include "mlir/IR/Value.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 #include "llvm/ADT/STLExtras.h"
@@ -97,6 +98,7 @@ ModuloProblem AffineToLoopSchedule::getModuloProblem(CyclicProblem &prob) {
       if (latency.has_value())
         modProb.setLatency(opr.value(), latency.value());
     }
+    // op->dump();
     modProb.insertOperation(op);
   }
 
@@ -248,10 +250,15 @@ void AffineToLoopSchedule::runOnOperation() {
   // Schedule all pipelined loops first
   for (auto loop : llvm::make_early_inc_range(loops)) {
 
+    // llvm::errs() << "========\n";
+    // for (auto *op : schedulingAnalysis->getProblem(loop).getOperations()) {
+    //   op->dump();
+    // }
     // getOperation().dump();
     // Populate the target operator types.
     ModuloProblem moduloProblem =
         getModuloProblem(schedulingAnalysis->getProblem(loop));
+
 
     // Insert memory dependences into the problem.
     loop.getBody()->walk([&](Operation *op) {
@@ -556,6 +563,18 @@ struct IfOpHoisting : OpConversionPattern<IfOp> {
   LogicalResult
   matchAndRewrite(IfOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    auto noSideEffect = true;
+    op.thenBlock()->walk([&](Operation *op) {
+      noSideEffect &= isMemoryEffectFree(op);
+    });
+    if (op.elseBlock()) {
+      op.elseBlock()->walk([&](Operation *op) {
+        noSideEffect &= isMemoryEffectFree(op);
+      });
+    }
+    if (!noSideEffect)
+      return failure();
+
     rewriter.updateRootInPlace(op, [&]() {
       if (!op.thenBlock()->without_terminator().empty()) {
         rewriter.splitBlock(op.thenBlock(), --op.thenBlock()->end());
@@ -573,8 +592,9 @@ struct IfOpHoisting : OpConversionPattern<IfOp> {
 
 /// Helper to determine if an scf::IfOp is in mux-like form.
 static bool ifOpLegalityCallback(IfOp op) {
-  return op.thenBlock()->without_terminator().empty() &&
-         (!op.elseBlock() || op.elseBlock()->without_terminator().empty());
+  auto noSideEffect = isMemoryEffectFree(op);
+  return !noSideEffect || (op.thenBlock()->without_terminator().empty() &&
+         (!op.elseBlock() || op.elseBlock()->without_terminator().empty()));
 }
 
 /// Helper to mark AffineYieldOp legal, unless it is inside a partially
@@ -607,14 +627,14 @@ LogicalResult AffineToLoopSchedule::lowerAffineStructures(
   target.addIllegalOp<AffineIfOp, AffineLoadOp, AffineStoreOp, AffineApplyOp>();
   target.markUnknownOpDynamicallyLegal(
       schedulableAffineInterfaceLegalityCallback);
-  target.addDynamicallyLegalOp<IfOp>(ifOpLegalityCallback);
+  // target.addDynamicallyLegalOp<IfOp>(ifOpLegalityCallback);
   target.addDynamicallyLegalOp<AffineYieldOp>(yieldOpLegalityCallback);
 
   RewritePatternSet patterns(context);
   populateAffineToStdConversionPatterns(patterns);
   patterns.add<AffineLoadLowering>(context, dependenceAnalysis);
   patterns.add<AffineStoreLowering>(context, dependenceAnalysis);
-  patterns.add<IfOpHoisting>(context);
+  // patterns.add<IfOpHoisting>(context);
   patterns.add<SchedulableAffineReadInterfaceLowering>(context,
                                                        dependenceAnalysis);
   patterns.add<SchedulableAffineWriteInterfaceLowering>(context,
@@ -657,6 +677,9 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
         op->getParentOfType<LoopSchedulePipelineOp>() != nullptr) {
       return WalkResult::advance();
     }
+
+    if (isa<IfOp, YieldOp>(op))
+      return WalkResult::advance();
 
     return TypeSwitch<Operation *, WalkResult>(op)
         .Case<IfOp, AffineYieldOp, arith::ConstantOp, CmpIOp, IndexCastOp,
@@ -775,20 +798,22 @@ LogicalResult AffineToLoopSchedule::solveModuloProblem(AffineForOp &loop,
   LLVM_DEBUG(forOp.dump());
 
   // Optionally debug problem inputs.
-  LLVM_DEBUG(forOp.getBody()->walk<WalkOrder::PreOrder>([&](Operation *op) {
-    if (auto parent = op->getParentOfType<LoopInterface>(); parent)
-      return;
-    llvm::dbgs() << "Modulo scheduling inputs for " << *op;
-    auto opr = problem.getLinkedOperatorType(op);
-    llvm::dbgs() << "\n  opr = " << opr;
-    llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
-    llvm::dbgs() << "\n  limit = " << problem.getLimit(*opr);
-    for (auto dep : problem.getDependences(op))
-      if (dep.isAuxiliary())
-        llvm::dbgs() << "\n  dep = { distance = " << problem.getDistance(dep)
-                     << ", source = " << *dep.getSource() << " }";
-    llvm::dbgs() << "\n\n";
-  }));
+  LLVM_DEBUG(
+    for (auto *op : problem.getOperations()) {
+      if (auto parent = op->getParentOfType<LoopInterface>(); parent)
+        continue;
+      llvm::dbgs() << "Modulo scheduling inputs for " << *op;
+      auto opr = problem.getLinkedOperatorType(op);
+      llvm::dbgs() << "\n  opr = " << opr;
+      llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
+      llvm::dbgs() << "\n  limit = " << problem.getLimit(*opr);
+      for (auto dep : problem.getDependences(op))
+        if (dep.isAuxiliary())
+          llvm::dbgs() << "\n  dep = { distance = " << problem.getDistance(dep)
+                       << ", source = " << *dep.getSource() << " }";
+      llvm::dbgs() << "\n\n";
+    }
+  );
 
   // Verify and solve the problem.
   if (failed(problem.check()))
@@ -806,13 +831,13 @@ LogicalResult AffineToLoopSchedule::solveModuloProblem(AffineForOp &loop,
   LLVM_DEBUG({
     llvm::dbgs() << "Scheduled initiation interval = "
                  << problem.getInitiationInterval() << "\n\n";
-    forOp.getBody()->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    for (auto *op : problem.getOperations()) {
       if (auto parent = op->getParentOfType<LoopInterface>(); parent)
-        return;
+        continue;
       llvm::dbgs() << "Scheduling outputs for " << *op;
       llvm::dbgs() << "\n  start = " << problem.getStartTime(op);
       llvm::dbgs() << "\n\n";
-    });
+    }
   });
 
   return success();

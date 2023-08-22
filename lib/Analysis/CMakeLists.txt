@@ -1,6 +1,7 @@
 set(LLVM_OPTIONAL_SOURCES
   DependenceAnalysis.cpp
   SchedulingAnalysis.cpp
+  PredicationAnalysis.cpp
   TestPasses.cpp
   )
 
@@ -15,6 +16,16 @@ add_circt_library(CIRCTDependenceAnalysis
 
 add_circt_library(CIRCTSchedulingAnalysis
   SchedulingAnalysis.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRAffineDialect
+  MLIRIR
+  CIRCTDependenceAnalysis
+  CIRCTScheduling
+  )
+
+add_circt_library(CIRCTPredicationAnalysis
+  PredicationAnalysis.cpp
 
   LINK_LIBS PUBLIC
   MLIRAffineDialect
