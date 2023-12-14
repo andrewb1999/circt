@@ -36,6 +36,7 @@
 #include "mlir/IR/Visitors.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 #include "llvm/ADT/STLExtras.h"
@@ -734,10 +735,11 @@ struct MulStrengthReduction : OpConversionPattern<MulIOp> {
         auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
         rewriter.replaceOpWithNewOp<arith::ShLIOp>(op, op.getLhs(),
                                                    shift.getResult());
+        return success();
       }
     }
 
-    return success();
+    return failure();
   }
 };
 
@@ -758,10 +760,11 @@ struct RemUIStrengthReduction : OpConversionPattern<RemUIOp> {
         auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
         rewriter.replaceOpWithNewOp<arith::AndIOp>(op, op.getLhs(),
                                                    shift.getResult());
+        return success();
       }
     }
 
-    return success();
+    return failure();
   }
 };
 
@@ -794,10 +797,11 @@ struct DivSIStrengthReduction : OpConversionPattern<DivSIOp> {
         auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
         rewriter.replaceOpWithNewOp<arith::ShRUIOp>(op, op.getLhs(),
                                                     shift.getResult());
+        return success();
       }
     }
 
-    return success();
+    return failure();
   }
 };
 
@@ -848,7 +852,8 @@ static bool mulLegalityCallback(Operation *op) {
     auto *rhsDef = mulOp.getRhs().getDefiningOp();
 
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2()) {
+      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
+          -1) {
         return false;
       }
     }
@@ -861,7 +866,8 @@ static bool DivSIOpLegalityCallback(Operation *op) {
     auto *rhsDef = mulOp.getRhs().getDefiningOp();
 
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2()) {
+      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
+          -1) {
         return false;
       }
     }
@@ -874,7 +880,8 @@ static bool remUILegalityCallback(Operation *op) {
     auto *rhsDef = remOp.getRhs().getDefiningOp();
 
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2()) {
+      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
+          -1) {
         return false;
       }
     }
@@ -888,7 +895,7 @@ static bool remSILegalityCallback(Operation *op) {
 
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
       auto rhsValue = cast<IntegerAttr>(constOp.getValue());
-      if (rhsValue.getValue().exactLogBase2()) {
+      if (rhsValue.getValue().exactLogBase2() != -1) {
         if (rhsValue.getInt() >= 0)
           return false;
       }
