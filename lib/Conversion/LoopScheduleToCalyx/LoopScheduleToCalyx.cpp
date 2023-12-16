@@ -1729,6 +1729,29 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
           rewriter.create<calyx::AssignOp>(stage.getLoc(),
                                            counterAdd.getRight(), one);
 
+          // II counter init group
+          std::string groupName =
+              getState<ComponentLoweringState>().getUniqueName(
+                  "ii_" + std::to_string(pipeline.getII()) + "_counter_init");
+          auto iiGroup = calyx::createStaticGroup(rewriter, getComponent(),
+                                                  phase.getLoc(), groupName, 1);
+          getState<ComponentLoweringState>().addLoopInitGroup(
+              LoopWrapper(pipeline), iiGroup);
+          {
+            PatternRewriter::InsertionGuard insertGuard(rewriter);
+            rewriter.setInsertionPointToEnd(iiGroup.getBodyBlock());
+
+            // Set II counter to zero before loop runs
+            auto zero = calyx::createConstant(stage.getLoc(), rewriter,
+                                              getComponent(), bitwidth, 0);
+            auto oneI1 = calyx::createConstant(stage.getLoc(), rewriter,
+                                               getComponent(), 1, 1);
+            rewriter.create<calyx::AssignOp>(stage.getLoc(), counterReg.getIn(),
+                                             zero);
+            rewriter.create<calyx::AssignOp>(stage.getLoc(),
+                                             counterReg.getWriteEn(), oneI1);
+          }
+
           // Check if counter = II - 1
           auto counterEq =
               getState<ComponentLoweringState>()
