@@ -293,7 +293,6 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
     /// We walk the operations of the funcOp to ensure that all def's have
     /// been visited before their uses.
     bool opBuiltSuccessfully = true;
-    llvm::errs() << "here\n";
     funcOp.walk([&](Operation *op) {
       opBuiltSuccessfully &=
           TypeSwitch<mlir::Operation *, bool>(op)
@@ -1410,14 +1409,6 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
         }
         if (isIterArg)
           continue;
-
-        if (!isa<LoopSchedulePipelineOp>(phase->getParentOp()) &&
-            isa<PhaseInterface>(value.getDefiningOp())) {
-          auto reg = regMap[value];
-          getState<ComponentLoweringState>().addPhaseReg(phase, reg, i);
-          regMap[phaseResult] = reg;
-          continue;
-        }
 
         // If value is produced by a sequential op just pass it
         // on to next phase.

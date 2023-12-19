@@ -116,7 +116,6 @@ AffineToLoopSchedule::getModuloProblem(affine::AffineForOp forOp) {
       if (!forOp->isAncestor(memoryDep.source))
         continue;
 
-      // memoryDep.source->dump();
       // Insert a dependence into the problem.
       Problem::Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
@@ -209,7 +208,6 @@ AffineToLoopSchedule::getSharedOperatorsProblem(affine::AffineForOp forOp) {
         continue;
 
       assert(memoryDep.source != nullptr);
-      // memoryDep.source->getParentOp()->dump();
       if (!forOp->isAncestor(memoryDep.source))
         continue;
 
@@ -486,7 +484,7 @@ void AffineToLoopSchedule::runOnOperation() {
   //   }
   // }
 
-  // getOperation()->getParentOfType<ModuleOp>().dump();
+  getOperation()->getParentOfType<ModuleOp>().dump();
 
   // getOperation().walk([&](Operation *op) {
   //   ArrayRef<MemoryDependence> dependences =
@@ -1744,9 +1742,41 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
       endTime = *startTime;
   }
 
+  auto hasLaterUse = [&](Operation *op, uint32_t resTime) {
+    for (uint32_t i = resTime + 1; i < endTime; ++i) {
+      if (startGroups.contains(i)) {
+        auto startGroup = startGroups[i];
+        for (auto *operation : startGroup) {
+          for (auto &operand : operation->getOpOperands()) {
+            if (operand.get().getDefiningOp() == op)
+              return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  // Must re-register return values of memories if they are used later
+  for (auto *op : problem.getOperations()) {
+    if (isa<LoadOp, AffineLoadOp>(op)) {
+      auto startTime = problem.getStartTime(op);
+      auto resTime = *startTime + 1;
+      if (hasLaterUse(op, resTime) && !startGroups.contains(resTime)) {
+        startGroups[resTime] = SmallVector<Operation *>();
+      }
+    }
+    if (auto load = dyn_cast<LoadInterface>(op)) {
+      auto startTime = problem.getStartTime(op);
+      auto resTime = *startTime + *load.getLatency();
+      if (hasLaterUse(op, resTime) && !startGroups.contains(resTime)) {
+        startGroups[resTime] = SmallVector<Operation *>();
+      }
+    }
+  }
+
   Block &scheduleBlock = sequential.getScheduleBlock();
 
-  // llvm::errs() << "here\n";
   assert(loop.getLoopRegions().size() == 1);
   if (!loop.getLoopRegions().front()->getArgument(0).getUsers().empty()) {
     // llvm::errs() << "Add extra start group\n";
@@ -1780,6 +1810,8 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
     startTimes.push_back(group.first);
   llvm::sort(startTimes);
 
+  DenseMap<uint32_t, SmallVector<Value>> reregisterValues;
+
   LoopScheduleStepOp lastStep;
   DominanceInfo dom(getOperation());
   for (auto i : enumerate(startTimes)) {
@@ -1809,6 +1841,10 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
           }
         }
       }
+    }
+
+    for (auto val : reregisterValues[startTime]) {
+      stepTypes.push_back(val.getType());
     }
 
     if (i.index() == startTimes.size() - 1) {
@@ -1845,6 +1881,14 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
       }
     }
 
+    // Reregister values
+    for (auto val : reregisterValues[startTime]) {
+      unsigned resultIndex = stepTerminator->getNumOperands();
+      stepTerminator->insertOperands(resultIndex, valueMap.lookup(val));
+      auto newValue = step->getResult(resultIndex);
+      valueMap.map(val, newValue);
+    }
+
     // Add the step results to the value map for the original op.
     for (auto tuple : movedOps) {
       Operation *op = std::get<0>(tuple);
@@ -1854,6 +1898,20 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
         auto newValue = step->getResult(resultIndex + i);
         auto oldValue = op->getResult(i);
         valueMap.map(oldValue, newValue);
+      }
+    }
+
+    // Add values that need to be reregistered in the future
+    for (auto *op : group) {
+      if (auto load = dyn_cast<LoadOp>(op)) {
+        if (hasLaterUse(op, startTime + 1)) {
+          reregisterValues[startTime + 1].push_back(load.getResult());
+        }
+      } else if (auto load = dyn_cast<LoadInterface>(op)) {
+        if (hasLaterUse(op, startTime + *load.getLatency())) {
+          auto resTime = startTime + *load.getLatency();
+          reregisterValues[resTime].push_back(load.getResult());
+        }
       }
     }
 
@@ -2077,8 +2135,6 @@ AffineToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
       }
     }
   }
-
-  // getOperation().dump();
 
   // Update return with correct values
   auto *returnOp = funcOp.getBody().back().getTerminator();

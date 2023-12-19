@@ -551,7 +551,8 @@ LogicalResult LoopScheduleStepOp::verify() {
       for (auto *user : res.getUsers()) {
         auto *ancestor = nextStep.getBodyBlock().findAncestorOpInBlock(*user);
         if (ancestor == nullptr)
-          return emitOpError("multi-cycle ops can only be used in next step");
+          return emitOpError("load results can only be used in next step (must "
+                             "be reregistered if used later in schedule)");
       }
     }
   }
