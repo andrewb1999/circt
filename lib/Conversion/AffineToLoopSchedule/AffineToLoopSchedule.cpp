@@ -484,7 +484,7 @@ void AffineToLoopSchedule::runOnOperation() {
   //   }
   // }
 
-  getOperation()->getParentOfType<ModuleOp>().dump();
+  // getOperation()->getParentOfType<ModuleOp>().dump();
 
   // getOperation().walk([&](Operation *op) {
   //   ArrayRef<MemoryDependence> dependences =
