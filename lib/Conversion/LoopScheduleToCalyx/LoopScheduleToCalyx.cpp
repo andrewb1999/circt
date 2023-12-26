@@ -34,6 +34,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <cassert>
 #include <iterator>
@@ -298,9 +299,9 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
       opBuiltSuccessfully &=
           TypeSwitch<mlir::Operation *, bool>(op)
               .template Case<arith::ConstantOp, ReturnOp, BranchOpInterface,
-                             /// memref
-                             memref::AllocOp, memref::AllocaOp, memref::LoadOp,
-                             memref::StoreOp,
+                             /// memory ops
+                             memref::AllocOp, memref::AllocaOp, LoopScheduleLoadOp,
+                             LoopScheduleStoreOp,
                              /// memory interface
                              calyx::StoreLoweringInterface,
                              calyx::LoadLoweringInterface,
@@ -358,8 +359,8 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, IndexCastOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::AllocOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::AllocaOp op) const;
-  LogicalResult buildOp(PatternRewriter &rewriter, memref::LoadOp op) const;
-  LogicalResult buildOp(PatternRewriter &rewriter, memref::StoreOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, LoopScheduleLoadOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, LoopScheduleStoreOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter,
                         calyx::LoadLoweringInterface op) const;
   LogicalResult buildOp(PatternRewriter &rewriter,
@@ -543,7 +544,7 @@ private:
 };
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
-                                     memref::LoadOp loadOp) const {
+                                     LoopScheduleLoadOp loadOp) const {
   Value memref = loadOp.getMemref();
   Block *block = loadOp->getBlock();
 
@@ -581,9 +582,9 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   // We refrain from replacing the loadOp result with
   // memoryInterface.readData, since multiple loadOp's need to be converted
   // to a single memory's ReadData. If this replacement is done now, we lose
-  // the link between which SSA memref::LoadOp values map to which groups for
+  // the link between which SSA LoopScheduleLoadOp values map to which groups for
   // loading a value from the Calyx memory. At this point of lowering, we
-  // keep the memref::LoadOp SSA value, and do value replacement _after_
+  // keep the LoopScheduleLoadOp SSA value, and do value replacement _after_
   // control has been generated (see LateSSAReplacement). This is *vital* for
   // things such as InlineCombGroups to be able to properly track which
   // memory assignment groups belong to which accesses.
@@ -595,7 +596,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 }
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
-                                     memref::StoreOp storeOp) const {
+                                     LoopScheduleStoreOp storeOp) const {
   auto memoryInterface = getState<ComponentLoweringState>().getMemoryInterface(
       storeOp.getMemref());
 
@@ -865,10 +866,14 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     auto incrGroup = calyx::createStaticGroup(
         rewriter, getState<ComponentLoweringState>().getComponentOp(),
         op->getLoc(), groupName, 1);
+    auto pipeline = cast<LoopSchedulePipelineOp>(loop.getOperation());
+    auto tripCount = pipeline.getTripCount();
+    auto bitwidth = tripCount.has_value() ? 
+      llvm::Log2_64_Ceil(*tripCount * pipeline.getII() + pipeline.getBodyLatency() - 1) : 32;
     auto incrReg =
-        createRegister(op.getLoc(), rewriter, getComponent(), 32,
+        createRegister(op.getLoc(), rewriter, getComponent(), bitwidth,
                        getState<ComponentLoweringState>().getUniqueName("idx"));
-    auto width = rewriter.getI32Type();
+    auto width = rewriter.getIntegerType(bitwidth);
     auto addOp = getState<ComponentLoweringState>()
                      .getNewLibraryOpInstance<calyx::AddLibOp>(
                          rewriter, op.getLoc(), {width, width, width});
@@ -876,7 +881,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     rewriter.create<calyx::AssignOp>(op.getLoc(), addOp.getLeft(),
                                      incrReg.getOut());
     auto constant =
-        calyx::createConstant(op.getLoc(), rewriter, getComponent(), 32, 1);
+        calyx::createConstant(op.getLoc(), rewriter, getComponent(), bitwidth, 1);
     rewriter.create<calyx::AssignOp>(op.getLoc(), addOp.getRight(), constant);
     rewriter.create<calyx::AssignOp>(op.getLoc(), incrReg.getIn(),
                                      addOp.getOut());
@@ -898,17 +903,12 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
         op->getLoc(), initName, 1);
     rewriter.setInsertionPointToEnd(incrInit.getBodyBlock());
     auto zero =
-        calyx::createConstant(op.getLoc(), rewriter, getComponent(), 32, 0);
+        calyx::createConstant(op.getLoc(), rewriter, getComponent(), bitwidth, 0);
     rewriter.create<calyx::AssignOp>(op.getLoc(), incrReg.getIn(), zero);
     rewriter.create<calyx::AssignOp>(op.getLoc(), incrReg.getWriteEn(), oneI1);
     getState<ComponentLoweringState>().addLoopInitGroup(loop, incrInit);
 
-    // Set pipeline iter value stuff
-    auto pipeline = cast<LoopSchedulePipelineOp>(loop.getOperation());
-    // if (pipeline.getII() != 1) {
-    //   return pipeline.emitOpError("LoopScheduleToCalyx currently does not "
-    //                               "support pipelines with II > 1");
-    // }
+    // Set pipeline iterValue and incrGroup
     getState<ComponentLoweringState>().setIncrGroup(pipeline, incrGroup);
     getState<ComponentLoweringState>().setLoopIterValue(pipeline,
                                                         addOp.getOut());
@@ -1469,7 +1469,7 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
           continue;
         }
 
-        if (isa<memref::LoadOp, calyx::LoadLoweringInterface>(
+        if (isa<LoopScheduleLoadOp, calyx::LoadLoweringInterface>(
                 value.getDefiningOp())) {
           getState<ComponentLoweringState>().addPhaseReg(phase, value, i);
           continue;
@@ -2221,7 +2221,7 @@ class LateSSAReplacement : public calyx::FuncOpPartialLoweringPattern {
 
   LogicalResult partiallyLowerFuncToComp(FuncOp funcOp,
                                          PatternRewriter &) const override {
-    funcOp.walk([&](memref::LoadOp loadOp) {
+    funcOp.walk([&](LoopScheduleLoadOp loadOp) {
       /// In buildOpGroups we did not replace loadOp's results, to ensure a
       /// link between evaluating groups (which fix the input addresses of a
       /// memory op) and a readData result. Now, we may replace these SSA

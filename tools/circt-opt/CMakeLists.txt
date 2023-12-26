@@ -64,6 +64,7 @@ target_link_libraries(circt-opt
   CIRCTHWToSV
   CIRCTHWTransforms
   CIRCTLoopSchedule
+  CIRCTLoopScheduleTransforms
   CIRCTLoopScheduleToCalyx
   CIRCTLTL
   CIRCTSCFToCalyx

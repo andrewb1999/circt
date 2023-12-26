@@ -413,7 +413,7 @@ def LoopScheduleLoadOp : LoopScheduleOp<"load",
 
   let arguments = (ins Arg<AnyMemRef, "the reference to load from",
                            [MemRead]>:$memref,
-                       Variadic<Index>:$indices,
+                       Variadic<AnyTypeOf<[AnyInteger, Index]>>:$indices,
                        DefaultValuedOptionalAttr<BoolAttr, "false">:$nontemporal);
   let results = (outs AnyType:$result);
 
@@ -426,9 +426,9 @@ def LoopScheduleLoadOp : LoopScheduleOp<"load",
   }];
 
   /* let hasFolder = 1; */
-  /* let hasVerifier = 1; */
+  let hasVerifier = 1;
 
-  let assemblyFormat = "$memref `[` $indices `]` attr-dict `:` type($memref)";
+  let assemblyFormat = "$memref `[` $indices `:` type($indices) `]` attr-dict `:` type($memref)";
 }
 
 def LoopScheduleStoreOp : LoopScheduleOp<"store",
@@ -443,7 +443,7 @@ def LoopScheduleStoreOp : LoopScheduleOp<"store",
   let arguments = (ins AnyType:$value,
                        Arg<AnyMemRef, "the reference to store to",
                            [MemWrite]>:$memref,
-                       Variadic<Index>:$indices,
+                       Variadic<AnyTypeOf<[AnyInteger, Index]>>:$indices,
                        DefaultValuedOptionalAttr<BoolAttr, "false">:$nontemporal);
 
   let builders = [
@@ -463,10 +463,10 @@ def LoopScheduleStoreOp : LoopScheduleOp<"store",
   }];
 
   /* let hasFolder = 1; */
-  /* let hasVerifier = 1; */
+  let hasVerifier = 1;
 
   let assemblyFormat = [{
-    $value `,` $memref `[` $indices `]` attr-dict `:` type($memref)
+    $value `,` $memref `[` $indices `:` type($indices) `]` attr-dict `:` type($memref)
   }];
 }
 

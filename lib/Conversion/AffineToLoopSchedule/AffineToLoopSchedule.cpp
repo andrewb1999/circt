@@ -27,6 +27,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
@@ -1323,6 +1324,31 @@ LogicalResult AffineToLoopSchedule::solveSharedOperatorsProblem(
   return success();
 }
 
+// Replaces memref loads/stores with loopschedule loads/stores
+Operation *cloneOrReplace(OpBuilder builder, Operation *op, IRMapping valueMap) {
+  if (auto load = dyn_cast<memref::LoadOp>(op)) {
+    SmallVector<Value> indices;
+    auto memref = valueMap.lookupOrDefault(load.getMemRef());
+    auto returnType = cast<MemRefType>(memref.getType()).getElementType();
+    for (auto opValue : load.getIndices())
+     indices.push_back(valueMap.lookupOrDefault(opValue));
+    return builder.create<LoopScheduleLoadOp>(op->getLoc(), returnType, 
+              memref, indices);
+  }
+
+  if (auto store = dyn_cast<memref::StoreOp>(op)) {
+    SmallVector<Value> indices;
+    auto memref = valueMap.lookupOrDefault(store.getMemRef());
+    auto valToStore = valueMap.lookupOrDefault(store.getValueToStore());
+    for (auto opValue : store.getIndices())
+     indices.push_back(valueMap.lookupOrDefault(opValue));
+    return builder.create<LoopScheduleStoreOp>(op->getLoc(), valToStore, 
+              memref, indices);
+  }
+
+  return builder.clone(*op, valueMap);
+}
+
 /// Create the pipeline op for a loop nest.
 LogicalResult
 AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
@@ -1335,11 +1361,33 @@ AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
       &loop->getParentOfType<FuncOp>().getBody().front());
 
   // Create Values for the loop's lower and upper bounds.
-  Value lowerBound = lowerAffineLowerBound(loop, builder);
-  Value upperBound = lowerAffineUpperBound(loop, builder);
+  Value lowerBound;
+  Value upperBound;
+  Type boundType = builder.getIndexType();
+  if (loop.hasConstantBounds()) {
+    auto lower = loop.getConstantLowerBound();
+    auto upper = loop.getConstantUpperBound();
+    int64_t largestValue;
+    // bool isSigned;
+    if (lower >= 0 && upper >= 0) {
+      // isSigned = false;
+      largestValue = std::max(lower, upper);
+    } else {
+      assert(false && "not handling negative affine bounds yet");
+    }
+    int bitwidth = llvm::Log2_64_Ceil(largestValue);
+    boundType = builder.getIntegerType(bitwidth);
+    lowerBound = builder.create<arith::ConstantOp>(
+        IntegerAttr::get(boundType, lower));
+    upperBound = builder.create<arith::ConstantOp>(
+        IntegerAttr::get(boundType, upper));
+  } else {
+    lowerBound = lowerAffineLowerBound(loop, builder);
+    upperBound = lowerAffineUpperBound(loop, builder);
+  }
   int64_t stepValue = loop.getStep().getSExtValue();
   auto step = builder.create<arith::ConstantOp>(
-      IntegerAttr::get(builder.getIndexType(), stepValue));
+      IntegerAttr::get(boundType, stepValue));
 
   builder.setInsertionPoint(loop);
 
@@ -1591,7 +1639,7 @@ AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
     builder.setInsertionPointToStart(&stageBlock);
 
     for (auto *op : group) {
-      auto *newOp = builder.clone(*op, stageValueMaps[startTime]);
+      auto *newOp = cloneOrReplace(builder, op, stageValueMaps[startTime]);
       // llvm::errs() << memAnalysis.getDependences(op).size() << "\n";
       // llvm::errs() << "before\n";
       // op->dump();
@@ -1959,7 +2007,7 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
     SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
     for (auto *op : group) {
       unsigned resultIndex = stepTerminator->getNumOperands();
-      auto *newOp = builder.clone(*op, valueMap);
+      auto *newOp = cloneOrReplace(builder, op, valueMap);
       dependenceAnalysis->replaceOp(op, newOp);
       std::queue<Operation *> oldOps;
       op->walk([&](Operation *op) { oldOps.push(op); });
@@ -2209,7 +2257,7 @@ AffineToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
     SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
     for (auto *op : group) {
       unsigned resultIndex = stageTerminator->getNumOperands();
-      auto *newOp = builder.clone(*op, valueMap);
+      auto *newOp = cloneOrReplace(builder, op, valueMap);
       dependenceAnalysis->replaceOp(op, newOp);
       if (opsWithReturns.contains(op)) {
         stageTerminator->insertOperands(resultIndex, newOp->getResults());
