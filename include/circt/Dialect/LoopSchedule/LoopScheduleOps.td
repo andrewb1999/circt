@@ -126,7 +126,8 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
 
 def LoopSchedulePipelineStageOp : LoopScheduleOp<"pipeline.stage",
     [HasParent<"LoopSchedulePipelineOp">,
-     PhaseOpInterface]> {
+     PhaseOpInterface,
+     SingleBlockImplicitTerminator<"LoopScheduleRegisterOp">]> {
   let summary = "LoopSchedule dialect pipeline stage.";
   let description = [{
     This operation has a single-block region which dictates the operations that
@@ -192,6 +193,7 @@ def LoopSchedulePipelineStageOp : LoopScheduleOp<"pipeline.stage",
     std::optional<uint64_t> getStartTime() {
       return getStart();
     }
+    LoopScheduleRegisterOp getRegisterOp();
   }];
 }
 
@@ -345,6 +347,7 @@ def LoopScheduleStepOp : LoopScheduleOp<"step",
     std::optional<uint64_t> getStartTime() {
       return std::nullopt;
     }
+    LoopScheduleRegisterOp getRegisterOp();
   }];
 }
 

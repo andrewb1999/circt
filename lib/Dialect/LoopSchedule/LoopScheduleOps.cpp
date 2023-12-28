@@ -388,6 +388,10 @@ unsigned LoopSchedulePipelineStageOp::getStageNumber() {
   return number;
 }
 
+LoopScheduleRegisterOp LoopSchedulePipelineStageOp::getRegisterOp() {
+  return cast<LoopScheduleRegisterOp>(this->getBodyBlock().getTerminator());
+}
+
 //===----------------------------------------------------------------------===//
 // LoopScheduleSequentialOp
 //===----------------------------------------------------------------------===//
@@ -590,6 +594,10 @@ unsigned LoopScheduleStepOp::getStepNumber() {
     step = step->getNextNode();
   }
   return number;
+}
+
+LoopScheduleRegisterOp LoopScheduleStepOp::getRegisterOp() {
+  return cast<LoopScheduleRegisterOp>(this->getBodyBlock().getTerminator());
 }
 
 //===----------------------------------------------------------------------===//
