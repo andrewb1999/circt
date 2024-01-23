@@ -15,9 +15,9 @@
 
 include "mlir/Pass/PassBase.td"
 
-def BitwidthMinimization : Pass<"bitwidth-minimization", "mlir::func::FuncOp"> {
-  let summary = "Minimize the bitwidth of loopschedule registers.";
-  let constructor =  "circt::loopschedule::createBitwidthMinimization()";
-}
+/* def BitwidthMinimization : Pass<"bitwidth-minimization", "mlir::func::FuncOp"> { */
+/*   let summary = "Minimize the bitwidth of loopschedule registers."; */
+/*   let constructor =  "circt::loopschedule::createBitwidthMinimization()"; */
+/* } */
 
 #endif // CIRCT_DIALECT_LOOPSCHEDULE_PASSES_TD

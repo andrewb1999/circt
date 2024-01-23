@@ -11,6 +11,7 @@
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
+#include "circt/Dialect/LoopSchedule/Utils.h"
 #include "circt/Dialect/SSP/SSPInterfaces.h"
 #include "circt/Scheduling/Algorithms.h"
 #include "circt/Scheduling/Problems.h"
@@ -71,14 +72,12 @@ namespace {
 
 struct AffineToLoopSchedule
     : public AffineToLoopScheduleBase<AffineToLoopSchedule> {
+  AffineToLoopSchedule(bool disableBitwidthMinimization) {
+    this->disableBitwidthMinimization = disableBitwidthMinimization;
+  }
   void runOnOperation() override;
 
 private:
-  ModuloProblem getModuloProblem(affine::AffineForOp forOp);
-  SharedOperatorsProblem getSharedOperatorsProblem(affine::AffineForOp forOp);
-  SharedOperatorsProblem getSharedOperatorsProblem(func::FuncOp funcOp);
-  LogicalResult lowerAffineStructures();
-  LogicalResult unrollSubLoops(AffineForOp &forOp);
   LogicalResult populateOperatorTypes(Operation *op, Region &loopBody,
                                       SharedOperatorsProblem &problem);
   LogicalResult solveModuloProblem(AffineForOp &loop, ModuloProblem &problem);
@@ -96,347 +95,9 @@ private:
 
 } // namespace
 
-ModuloProblem
-AffineToLoopSchedule::getModuloProblem(affine::AffineForOp forOp) {
-  // Create a modulo scheduling problem.
-  ModuloProblem problem = ModuloProblem::get(forOp);
-
-  // Insert memory dependences into the problem.
-  forOp.getBody()->walk([&](Operation *op) {
-    // Insert every operation into the problem.
-    problem.insertOperation(op);
-
-    ArrayRef<MemoryDependence> dependences =
-        dependenceAnalysis->getDependences(op);
-    if (dependences.empty())
-      return;
-
-    for (MemoryDependence memoryDep : dependences) {
-      // Don't insert a dependence into the problem if there is no dependence.
-      if (!hasDependence(memoryDep.dependenceType))
-        continue;
-      if (!forOp->isAncestor(memoryDep.source))
-        continue;
-
-      // Insert a dependence into the problem.
-      Problem::Dependence dep(memoryDep.source, op);
-      auto depInserted = problem.insertDependence(dep);
-      assert(succeeded(depInserted));
-      (void)depInserted;
-
-      // Use the lower bound of the innermost loop for this dependence. This
-      // assumes outer loops execute sequentially, i.e. one iteration of the
-      // inner loop completes before the next iteration is initiated. With
-      // proper analysis and lowerings, this can be relaxed.
-      unsigned distance = *memoryDep.dependenceComponents.back().lb;
-      if (distance > 0)
-        problem.setDistance(dep, distance);
-    }
-  });
-
-  // Set the anchor for scheduling. Insert dependences from all stores to the
-  // terminator to ensure the problem schedules them before the terminator.
-  auto *anchor = forOp.getBody()->getTerminator();
-  forOp.getBody()->walk([&](Operation *op) {
-    if (op == anchor || !problem.hasOperation(op))
-      return;
-    Problem::Dependence dep(op, anchor);
-    auto depInserted = problem.insertDependence(dep);
-    assert(succeeded(depInserted));
-    (void)depInserted;
-  });
-
-  // Handle explicitly computed loop-carried values, i.e. excluding the
-  // induction variable. Insert inter-iteration dependences from the definers of
-  // "iter_args" to their users.
-  if (unsigned nIterArgs = anchor->getNumOperands(); nIterArgs > 0) {
-    auto iterArgs = forOp.getRegionIterArgs();
-    for (unsigned i = 0; i < nIterArgs; ++i) {
-      Operation *iterArgDefiner = anchor->getOperand(i).getDefiningOp();
-      // If it's not an operation, we don't need to model the dependence.
-      if (!iterArgDefiner)
-        continue;
-
-      for (Operation *iterArgUser : iterArgs[i].getUsers()) {
-        Problem::Dependence dep(iterArgDefiner, iterArgUser);
-        auto depInserted = problem.insertDependence(dep);
-        assert(succeeded(depInserted));
-        (void)depInserted;
-
-        // Values always flow between subsequent iterations.
-        problem.setDistance(dep, 1);
-      }
-    }
-  }
-
-  return problem;
-}
-
-SharedOperatorsProblem
-AffineToLoopSchedule::getSharedOperatorsProblem(affine::AffineForOp forOp) {
-  SharedOperatorsProblem problem = SharedOperatorsProblem::get(forOp);
-
-  // Insert memory dependences into the problem.
-  assert(forOp.getLoopRegions().size() == 1);
-  forOp.getLoopRegions().front()->walk([&](Operation *op) {
-    if (op->getParentOfType<LoopInterface>() != nullptr)
-      return;
-
-    // Insert every operation into the problem.
-    problem.insertOperation(op);
-
-    if (auto loop = dyn_cast<LoopInterface>(op)) {
-      loop.getBodyBlock()->walk([&](Operation *innerOp) {
-        for (auto &operand : innerOp->getOpOperands()) {
-          auto *definingOp = operand.get().getDefiningOp();
-          if (definingOp && definingOp->getParentOp() == forOp) {
-            Problem::Dependence dep(definingOp, op);
-            auto depInserted = problem.insertDependence(dep);
-            assert(succeeded(depInserted));
-            (void)depInserted;
-          }
-        }
-      });
-    }
-
-    ArrayRef<MemoryDependence> dependences =
-        dependenceAnalysis->getDependences(op);
-    if (dependences.empty())
-      return;
-
-    for (const MemoryDependence &memoryDep : dependences) {
-      // Don't insert a dependence into the problem if there is no dependence.
-      if (!hasDependence(memoryDep.dependenceType))
-        continue;
-
-      assert(memoryDep.source != nullptr);
-      if (!forOp->isAncestor(memoryDep.source))
-        continue;
-
-      // Do not consider inter-iteration deps for seq loops
-      auto distance = memoryDep.dependenceComponents.back().lb;
-      if (distance.has_value())
-        continue;
-
-      // Insert a dependence into the problem.
-      Problem::Dependence dep(memoryDep.source, op);
-      auto depInserted = problem.insertDependence(dep);
-      assert(succeeded(depInserted));
-      (void)depInserted;
-    }
-  });
-
-  // DenseMap<Operation *, SmallVector<LoopInterface>> memOps;
-  // for (auto loop : forOp.getOps<LoopInterface>()) {
-  //   loop.getBodyBlock()->walk([&](Operation *op) {
-  //     if (isa<AffineLoadOp, AffineStoreOp, memref::LoadOp, memref::StoreOp,
-  //             LoadInterface, StoreInterface>(op)) {
-  //       memOps[op].push_back(loop);
-  //     }
-  //   });
-  // }
-
-  // for (auto loop : forOp.getOps<LoopInterface>()) {
-  //   for (auto it : memOps) {
-  //     auto *memOp = it.getFirst();
-  //     auto dependences = dependenceAnalysis->getDependences(memOp);
-  //     for (const MemoryDependence &memoryDep : dependences) {
-  //       if (!hasDependence(memoryDep.dependenceType))
-  //         continue;
-  //       for (auto otherLoop : memOps.lookup(memoryDep.source)) {
-  //         if (loop == otherLoop || !loop->isBeforeInBlock(otherLoop))
-  //           continue;
-  //         for (auto comp : memoryDep.dependenceComponents) {
-  //           if (!comp.lb.has_value() || comp.lb == 0)
-  //             continue;
-  //           llvm::errs() << "op: ";
-  //           memOp->dump();
-  //           llvm::errs() << "otherOp: ";
-  //           memoryDep.source->dump();
-  //           Problem::Dependence dep(loop, otherLoop);
-  //           auto depInserted = problem.insertDependence(dep);
-  //           assert(succeeded(depInserted));
-  //         }
-  //       }
-  //     }
-  //   }
-  // }
-
-  // Set the anchor for scheduling. Insert dependences from all stores to the
-  // terminator to ensure the problem schedules them before the terminator.
-  assert(forOp.getLoopRegions().size() == 1);
-  auto *anchor = forOp.getLoopRegions().front()->back().getTerminator();
-  forOp.getLoopRegions().front()->walk([&](Operation *op) {
-    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
-        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr)
-      return;
-    if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface>(op))
-      return;
-    Problem::Dependence dep(op, anchor);
-    auto depInserted = problem.insertDependence(dep);
-    assert(succeeded(depInserted));
-    (void)depInserted;
-  });
-
-  return problem;
-}
-
-SharedOperatorsProblem
-AffineToLoopSchedule::getSharedOperatorsProblem(func::FuncOp funcOp) {
-  SharedOperatorsProblem problem = SharedOperatorsProblem::get(funcOp);
-
-  // for (auto op : getOperation().getOps<LoopInterface>()){
-  //   ArrayRef<MemoryDependence> dependences =
-  //       dependenceAnalysis->getDependences(op);
-  //   if (dependences.empty())
-  //     continue;
-  //   op->dump();
-  //   llvm::errs() << "===============================\n";
-  //   for (auto &memoryDep : dependences) {
-  //     if (!hasDependence(memoryDep.dependenceType))
-  //       continue;
-  //     // llvm::errs() << "deps: ";
-  //     // memoryDep.source->dump();
-  //   }
-  // }
-
-  // Insert memory dependences into the problem.
-  funcOp.getBody().walk([&](Operation *op) {
-    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
-        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr)
-      return;
-
-    // Insert every operation into the problem.
-    problem.insertOperation(op);
-
-    ArrayRef<MemoryDependence> dependences =
-        dependenceAnalysis->getDependences(op);
-    if (dependences.empty())
-      return;
-
-    // op->dump();
-
-    for (const MemoryDependence &memoryDep : dependences) {
-      // Don't insert a dependence into the problem if there is no dependence.
-      if (!hasDependence(memoryDep.dependenceType))
-        continue;
-      if (!funcOp->isAncestor(memoryDep.source))
-        continue;
-      if (memoryDep.dependenceComponents.back().lb.has_value())
-        continue;
-      // Insert a dependence into the problem.
-      Problem::Dependence dep(memoryDep.source, op);
-      auto depInserted = problem.insertDependence(dep);
-      assert(succeeded(depInserted));
-      (void)depInserted;
-    }
-  });
-
-  // DenseMap<Operation *, SmallVector<LoopInterface>> memOps;
-  // for (auto loop : funcOp.getOps<LoopInterface>()) {
-  //   loop.getBodyBlock()->walk([&](Operation *op) {
-  //     if (isa<AffineLoadOp, AffineStoreOp, memref::LoadOp, memref::StoreOp,
-  //             LoadInterface, StoreInterface>(op)) {
-  //       memOps[op].push_back(loop);
-  //     }
-  //   });
-  // }
-
-  // for (auto loop : funcOp.getOps<LoopInterface>()) {
-  //   for (auto it : memOps) {
-  //     auto *memOp = it.getFirst();
-  //     auto dependences = dependenceAnalysis->getDependences(memOp);
-  //     // memOp->dump();
-  //     for (const MemoryDependence &memoryDep : dependences) {
-  //       // llvm::errs() << "dep: \n";
-  //       // memoryDep.source->dump();
-  //       if (!hasDependence(memoryDep.dependenceType))
-  //         continue;
-  //       for (auto otherLoop : memOps.lookup(memoryDep.source)) {
-  //         if (loop == otherLoop || !loop->isBeforeInBlock(otherLoop))
-  //           continue;
-  //         // llvm::errs() << "loop dep\n";
-  //         // loop.dump();
-  //         // otherLoop.dump();
-  //         Problem::Dependence dep(loop, otherLoop);
-  //         auto depInserted = problem.insertDependence(dep);
-  //         assert(succeeded(depInserted));
-  //       }
-  //     }
-  //   }
-  // }
-
-  // Set the anchor for scheduling. Insert dependences from all stores to the
-  // terminator to ensure the problem schedules them before the terminator.
-  auto *anchor = funcOp.getBody().back().getTerminator();
-  funcOp.getBody().walk([&](Operation *op) {
-    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
-        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr)
-      return;
-    Problem::Dependence dep(op, anchor);
-    auto depInserted = problem.insertDependence(dep);
-    assert(succeeded(depInserted));
-    (void)depInserted;
-  });
-
-  return problem;
-}
-
-LogicalResult AffineToLoopSchedule::unrollSubLoops(AffineForOp &forOp) {
-  auto result = forOp.getBody()->walk<WalkOrder::PostOrder>([](AffineForOp op) {
-    if (loopUnrollFull(op).failed())
-      return WalkResult::interrupt();
-    return WalkResult::advance();
-  });
-
-  if (result.wasInterrupted()) {
-    forOp.emitOpError("Could not unroll sub loops");
-    return failure();
-  }
-
-  return success();
-}
-
-Value getMemref(Operation *op) {
-  Value memref = isa<AffineStoreOp>(*op)  ? cast<AffineStoreOp>(*op).getMemRef()
-                 : isa<AffineLoadOp>(*op) ? cast<AffineLoadOp>(*op).getMemRef()
-                 : isa<memref::StoreOp>(*op)
-                     ? cast<memref::StoreOp>(*op).getMemRef()
-                     : cast<memref::LoadOp>(*op).getMemRef();
-  return memref;
-}
-
-bool oneIsStore(Operation *op, Operation *otherOp) {
-  auto firstIsStore = isa<AffineStoreOp, memref::StoreOp, StoreInterface>(*op);
-  auto secondIsStore =
-      isa<AffineStoreOp, memref::StoreOp, StoreInterface>(*otherOp);
-  return firstIsStore || secondIsStore;
-}
-
-bool hasMemoryDependence(Operation *op, Operation *otherOp) {
-  if (isa<LoadInterface, StoreInterface>(op)) {
-    if (!isa<LoadInterface, StoreInterface>(otherOp)) {
-      return false;
-    }
-
-    if (auto load = dyn_cast<LoadInterface>(op)) {
-      return load.hasDependence(otherOp);
-    }
-
-    auto store = dyn_cast<StoreInterface>(op);
-    return store.hasDependence(otherOp);
-  }
-
-  if (isa<LoadInterface, StoreInterface>(otherOp)) {
-    return false;
-  }
-
-  auto memref = getMemref(op);
-  auto otherMemref = getMemref(otherOp);
-  return memref == otherMemref && oneIsStore(op, otherOp);
-}
-
 void AffineToLoopSchedule::runOnOperation() {
+
+  getOperation()->getParentOfType<ModuleOp>().dump();
   // Collect loops to pipeline and work on them.
   SmallVector<AffineForOp> loops;
 
@@ -504,14 +165,26 @@ void AffineToLoopSchedule::runOnOperation() {
   // });
 
   // After dependence analysis, materialize affine structures.
-  if (failed(lowerAffineStructures()))
+  if (failed(lowerAffineStructures(getContext(), getOperation(),
+                                   *dependenceAnalysis)))
     return signalPassFailure();
+
+  if (failed(postLoweringOptimizations(getContext(), getOperation())))
+    return signalPassFailure();
+
+  if (failed(replaceMemoryAccesses(getContext(), getOperation(), *dependenceAnalysis)))
+    return signalPassFailure();
+
+  if (!disableBitwidthMinimization) {
+    if (failed(bitwidthMinimization(getContext(), getOperation(), *dependenceAnalysis)))
+      return signalPassFailure();
+  }
 
   // Schedule all pipelined loops first
   for (auto loop : llvm::make_early_inc_range(loops)) {
 
     // Populate the target operator types.
-    ModuloProblem moduloProblem = getModuloProblem(loop);
+    ModuloProblem moduloProblem = getModuloProblem(loop, *dependenceAnalysis);
 
     if (failed(populateOperatorTypes(loop.getOperation(), loop.getRegion(),
                                      moduloProblem)))
@@ -534,12 +207,13 @@ void AffineToLoopSchedule::runOnOperation() {
     return WalkResult::advance();
   });
 
+
   // Schedule loops
   for (auto loop : seqLoops) {
     // getOperation().dump();
     // loop.dump();
     assert(loop.getLoopRegions().size() == 1);
-    auto problem = getSharedOperatorsProblem(loop);
+    auto problem = getSharedOperatorsProblem(loop, *dependenceAnalysis);
 
     // Populate the target operator types.
     if (failed(populateOperatorTypes(loop.getOperation(),
@@ -560,7 +234,7 @@ void AffineToLoopSchedule::runOnOperation() {
 
   // Schedule whole function
   auto funcOp = cast<FuncOp>(getOperation());
-  auto problem = getSharedOperatorsProblem(funcOp);
+  auto problem = getSharedOperatorsProblem(funcOp, *dependenceAnalysis);
 
   // Populate the target operator types.
   if (failed(populateOperatorTypes(funcOp.getOperation(), funcOp.getBody(),
@@ -576,483 +250,6 @@ void AffineToLoopSchedule::runOnOperation() {
     return signalPassFailure();
 
   // getOperation().dump();
-}
-
-/// Apply the affine map from an 'affine.load' operation to its operands, and
-/// feed the results to a newly created 'memref.load' operation (which replaces
-/// the original 'affine.load').
-/// Also replaces the affine load with the memref load in dependenceAnalysis.
-/// TODO(mikeurbach): this is copied from AffineToStandard, see if we can reuse.
-class AffineLoadLowering : public OpConversionPattern<AffineLoadOp> {
-public:
-  AffineLoadLowering(MLIRContext *context,
-                     MemoryDependenceAnalysis &dependenceAnalysis)
-      : OpConversionPattern(context), dependenceAnalysis(dependenceAnalysis) {}
-
-  LogicalResult
-  matchAndRewrite(AffineLoadOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    // Expand affine map from 'affineLoadOp'.
-    SmallVector<Value, 8> indices(op.getMapOperands());
-    auto resultOperands =
-        expandAffineMap(rewriter, op.getLoc(), op.getAffineMap(), indices);
-    if (!resultOperands.has_value())
-      return failure();
-
-    // Build memref.load memref[expandedMap.results].
-    auto memrefLoad = rewriter.replaceOpWithNewOp<memref::LoadOp>(
-        op, op.getMemRef(), *resultOperands);
-
-    dependenceAnalysis.replaceOp(op, memrefLoad);
-
-    return success();
-  }
-
-private:
-  MemoryDependenceAnalysis &dependenceAnalysis;
-};
-
-/// Apply the affine map from an 'affine.store' operation to its operands, and
-/// feed the results to a newly created 'memref.store' operation (which replaces
-/// the original 'affine.store').
-/// Also replaces the affine store with the memref store in dependenceAnalysis.
-/// TODO(mikeurbach): this is copied from AffineToStandard, see if we can reuse.
-class AffineStoreLowering : public OpConversionPattern<AffineStoreOp> {
-public:
-  AffineStoreLowering(MLIRContext *context,
-                      MemoryDependenceAnalysis &dependenceAnalysis)
-      : OpConversionPattern(context), dependenceAnalysis(dependenceAnalysis) {}
-
-  LogicalResult
-  matchAndRewrite(AffineStoreOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    // Expand affine map from 'affineStoreOp'.
-    SmallVector<Value, 8> indices(op.getMapOperands());
-    auto maybeExpandedMap =
-        expandAffineMap(rewriter, op.getLoc(), op.getAffineMap(), indices);
-    if (!maybeExpandedMap.has_value())
-      return failure();
-
-    // Build memref.store valueToStore, memref[expandedMap.results].
-    auto memrefStore = rewriter.replaceOpWithNewOp<memref::StoreOp>(
-        op, op.getValueToStore(), op.getMemRef(), *maybeExpandedMap);
-
-    dependenceAnalysis.replaceOp(op, memrefStore);
-
-    return success();
-  }
-
-private:
-  MemoryDependenceAnalysis &dependenceAnalysis;
-};
-
-class SchedulableAffineReadInterfaceLowering : public mlir::RewritePattern {
-public:
-  SchedulableAffineReadInterfaceLowering(
-      MLIRContext *context, MemoryDependenceAnalysis &dependenceAnalysis)
-      : RewritePattern(MatchAnyOpTypeTag(), 1, context),
-        dependenceAnalysis(dependenceAnalysis) {}
-
-  LogicalResult matchAndRewrite(Operation *op,
-                                PatternRewriter &rewriter) const override {
-    if (auto readOp = dyn_cast<AffineReadOpInterface>(*op)) {
-      // Expand affine map from 'affineWriteOpInterface'.
-      SmallVector<Value, 8> indices(readOp.getMapOperands());
-      auto maybeExpandedMap = expandAffineMap(rewriter, readOp.getLoc(),
-                                              readOp.getAffineMap(), indices);
-      if (!maybeExpandedMap.has_value())
-        return failure();
-
-      if (auto schedulableOp =
-              dyn_cast<loopschedule::SchedulableAffineInterface>(*op)) {
-        // Build memref.store valueToStore, memref[expandedMap.results].
-        auto *newOp =
-            schedulableOp.createNonAffineOp(rewriter, *maybeExpandedMap);
-        rewriter.replaceOp(op, newOp->getResults());
-
-        dependenceAnalysis.replaceOp(op, newOp);
-
-        return success();
-      }
-    }
-    return failure();
-  }
-
-private:
-  MemoryDependenceAnalysis &dependenceAnalysis;
-};
-
-class SchedulableAffineWriteInterfaceLowering : public mlir::RewritePattern {
-public:
-  SchedulableAffineWriteInterfaceLowering(
-      MLIRContext *context, MemoryDependenceAnalysis &dependenceAnalysis)
-      : RewritePattern(MatchAnyOpTypeTag(), 1, context),
-        dependenceAnalysis(dependenceAnalysis) {}
-
-  LogicalResult matchAndRewrite(Operation *op,
-                                PatternRewriter &rewriter) const override {
-    if (auto writeOp = dyn_cast<AffineWriteOpInterface>(*op)) {
-      // Expand affine map from 'affineWriteOpInterface'.
-      SmallVector<Value, 8> indices(writeOp.getMapOperands());
-      auto maybeExpandedMap = expandAffineMap(rewriter, writeOp.getLoc(),
-                                              writeOp.getAffineMap(), indices);
-      if (!maybeExpandedMap.has_value())
-        return failure();
-
-      if (auto schedulableOp =
-              dyn_cast<loopschedule::SchedulableAffineInterface>(*op)) {
-        // Build memref.store valueToStore, memref[expandedMap.results].
-        auto *newOp =
-            schedulableOp.createNonAffineOp(rewriter, *maybeExpandedMap);
-        rewriter.replaceOp(op, newOp->getResults());
-
-        dependenceAnalysis.replaceOp(op, newOp);
-
-        return success();
-      }
-    }
-    return failure();
-  }
-
-private:
-  MemoryDependenceAnalysis &dependenceAnalysis;
-};
-
-template <typename OpTy>
-struct FoldSign : OpConversionPattern<OpTy> {
-  using OpConversionPattern<OpTy>::OpConversionPattern;
-
-  static std::optional<IntegerType> operandIsExtended(Value operand) {
-    auto *definingOp = operand.getDefiningOp();
-    if (!definingOp)
-      return std::nullopt;
-
-    if (!isa<IntegerType>(operand.getType()))
-      return std::nullopt;
-
-    if (auto extOp = dyn_cast<arith::ExtSIOp>(*definingOp))
-      return cast<IntegerType>(extOp->getOperand(0).getType());
-    if (auto extOp = dyn_cast<arith::ExtUIOp>(*definingOp))
-      return cast<IntegerType>(extOp->getOperand(0).getType());
-
-    return std::nullopt;
-  }
-
-  static std::optional<IntegerType>
-  valIsTruncated(TypedValue<IntegerType> val) {
-    if (!val.hasOneUse())
-      return std::nullopt;
-    auto *op = *val.getUsers().begin();
-    if (auto trunc = dyn_cast<arith::TruncIOp>(*op))
-      if (auto truncType = dyn_cast<IntegerType>(trunc.getType()))
-        return truncType;
-
-    return std::nullopt;
-  }
-
-  static bool opIsLegal(OpTy op) {
-    if (op->getNumResults() != 1)
-      return true;
-    if (op->getNumOperands() <= 0)
-      return true;
-    if (!isa<IntegerType>(op->getResultTypes().front()))
-      return true;
-
-    auto outType =
-        valIsTruncated(cast<TypedValue<IntegerType>>(op->getResult(0)));
-    if (!outType.has_value())
-      return true;
-
-    auto operandType = operandIsExtended(op->getOperand(0));
-    if (!operandType.has_value() || operandType != outType)
-      return true;
-
-    // Extension and trunc should be opt away
-    SmallVector<Value> operands;
-    for (auto operand : op->getOperands()) {
-      auto oW = operandIsExtended(operand);
-      if (oW != operandType)
-        return true;
-    }
-    return false;
-  }
-
-  LogicalResult
-  matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-
-    if (opIsLegal(op))
-      return failure();
-
-    auto outType =
-        valIsTruncated(cast<TypedValue<IntegerType>>(op->getResult(0)));
-
-    // Extension and trunc should be opt away
-    SmallVector<Value> operands;
-    for (auto operand : op->getOperands())
-      operands.push_back(operand.getDefiningOp()->getOperand(0));
-
-    SmallVector<Type> resultTypes = {*outType};
-    auto newOp = rewriter.create<OpTy>(op.getLoc(), resultTypes, operands);
-    auto trunc = *op->getUsers().begin();
-    trunc->getResult(0).replaceAllUsesWith(newOp->getResult(0));
-    trunc->erase();
-    rewriter.eraseOp(op);
-
-    return success();
-  }
-};
-
-struct MulStrengthReduction : OpConversionPattern<MulIOp> {
-  using OpConversionPattern<MulIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(MulIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto *lhsDef = op.getLhs().getDefiningOp();
-    auto *rhsDef = op.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto val = cast<IntegerAttr>(constOp.getValue());
-      if (llvm::isPowerOf2_32(val.getInt())) {
-        auto log = val.getValue().exactLogBase2();
-        auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), log);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
-        rewriter.replaceOpWithNewOp<arith::ShLIOp>(op, op.getLhs(),
-                                                   shift.getResult());
-        return success();
-      }
-    }
-
-    return failure();
-  }
-};
-
-struct RemUIStrengthReduction : OpConversionPattern<RemUIOp> {
-  using OpConversionPattern<RemUIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(RemUIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto *lhsDef = op.getLhs().getDefiningOp();
-    auto *rhsDef = op.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto val = cast<IntegerAttr>(constOp.getValue());
-      if (llvm::isPowerOf2_32(val.getInt())) {
-        auto shifted = val.getValue() - 1;
-        auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), shifted);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
-        rewriter.replaceOpWithNewOp<arith::AndIOp>(op, op.getLhs(),
-                                                   shift.getResult());
-        return success();
-      }
-    }
-
-    return failure();
-  }
-};
-
-struct RemSIStrengthReduction : OpConversionPattern<RemSIOp> {
-  using OpConversionPattern<RemSIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(RemSIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<arith::RemUIOp>(op, op.getLhs(), op.getRhs());
-
-    return success();
-  }
-};
-
-struct DivSIStrengthReduction : OpConversionPattern<DivSIOp> {
-  using OpConversionPattern<DivSIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(DivSIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto *lhsDef = op.getLhs().getDefiningOp();
-    auto *rhsDef = op.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto val = cast<IntegerAttr>(constOp.getValue());
-      if (llvm::isPowerOf2_32(val.getInt())) {
-        auto log = val.getValue().exactLogBase2();
-        auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), log);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
-        rewriter.replaceOpWithNewOp<arith::ShRUIOp>(op, op.getLhs(),
-                                                    shift.getResult());
-        return success();
-      }
-    }
-
-    return failure();
-  }
-};
-
-/// Helper to hoist computation out of scf::IfOp branches, turning it into a
-/// mux-like operation, and exposing potentially concurrent execution of its
-/// branches.
-struct IfOpHoisting : OpConversionPattern<IfOp> {
-  using OpConversionPattern<IfOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(IfOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.updateRootInPlace(op, [&]() {
-      if (!op.thenBlock()->without_terminator().empty()) {
-        rewriter.splitBlock(op.thenBlock(), --op.thenBlock()->end());
-        rewriter.inlineBlockBefore(&op.getThenRegion().front(), op);
-      }
-      if (op.elseBlock() && !op.elseBlock()->without_terminator().empty()) {
-        rewriter.splitBlock(op.elseBlock(), --op.elseBlock()->end());
-        rewriter.inlineBlockBefore(&op.getElseRegion().front(), op);
-      }
-    });
-
-    return success();
-  }
-};
-
-/// Helper to determine if an scf::IfOp is in mux-like form.
-static bool ifOpLegalityCallback(IfOp op) {
-  return op.thenBlock()->without_terminator().empty() &&
-         (!op.elseBlock() || op.elseBlock()->without_terminator().empty());
-}
-
-/// Helper to mark AffineYieldOp legal, unless it is inside a partially
-/// converted scf::IfOp.
-static bool yieldOpLegalityCallback(AffineYieldOp op) {
-  return !op->getParentOfType<IfOp>();
-}
-
-static bool schedulableAffineInterfaceLegalityCallback(Operation *op) {
-  return !(
-      isa<loopschedule::SchedulableAffineInterface>(*op) &&
-      (isa<AffineReadOpInterface>(*op) || isa<AffineWriteOpInterface>(*op)));
-}
-
-static bool mulLegalityCallback(Operation *op) {
-  if (auto mulOp = dyn_cast<arith::MulIOp>(op)) {
-    auto *rhsDef = mulOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
-          -1) {
-        return false;
-      }
-    }
-    return FoldSign<arith::MulIOp>::opIsLegal(mulOp);
-  }
-  return true;
-}
-
-static bool DivSIOpLegalityCallback(Operation *op) {
-  if (auto mulOp = dyn_cast<arith::DivSIOp>(op)) {
-    auto *rhsDef = mulOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
-          -1) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-static bool remUILegalityCallback(Operation *op) {
-  if (auto remOp = dyn_cast<arith::RemUIOp>(op)) {
-    auto *rhsDef = remOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
-          -1) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-static bool remSILegalityCallback(Operation *op) {
-  if (auto remOp = dyn_cast<arith::RemSIOp>(op)) {
-    auto *rhsDef = remOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto rhsValue = cast<IntegerAttr>(constOp.getValue());
-      if (rhsValue.getValue().exactLogBase2() != -1) {
-        if (rhsValue.getInt() >= 0)
-          return false;
-      }
-    }
-  }
-  return true;
-}
-
-/// After analyzing memory dependences, and before creating the schedule, we
-/// want to materialize affine operations with arithmetic, scf, and memref
-/// operations, which make the condition computation of addresses, etc.
-/// explicit. This is important so the schedule can consider potentially complex
-/// computations in the condition of ifs, or the addresses of loads and stores.
-/// The dependence analysis will be updated so the dependences from the affine
-/// loads and stores are now on the memref loads and stores.
-LogicalResult AffineToLoopSchedule::lowerAffineStructures() {
-  auto *context = &getContext();
-  auto op = getOperation();
-
-  ConversionTarget target(*context);
-  target.addLegalDialect<AffineDialect, ArithDialect, MemRefDialect,
-                         SCFDialect>();
-  target.addIllegalOp<AffineIfOp, AffineLoadOp, AffineStoreOp>();
-  target.markUnknownOpDynamicallyLegal(
-      schedulableAffineInterfaceLegalityCallback);
-  target.addDynamicallyLegalOp<IfOp>(ifOpLegalityCallback);
-  target.addDynamicallyLegalOp<AffineYieldOp>(yieldOpLegalityCallback);
-
-  RewritePatternSet patterns(context);
-  patterns.add<AffineLoadLowering>(context, *dependenceAnalysis);
-  patterns.add<AffineStoreLowering>(context, *dependenceAnalysis);
-  patterns.add<IfOpHoisting>(context);
-  patterns.add<SchedulableAffineReadInterfaceLowering>(context,
-                                                       *dependenceAnalysis);
-  patterns.add<SchedulableAffineWriteInterfaceLowering>(context,
-                                                        *dependenceAnalysis);
-
-  if (failed(applyPartialConversion(op, target, std::move(patterns))))
-    return failure();
-
-  patterns.clear();
-  populateAffineToStdConversionPatterns(patterns);
-  target.addIllegalOp<AffineApplyOp>();
-  patterns.add<FoldSign<arith::AddIOp>>(context);
-  patterns.add<FoldSign<arith::SubIOp>>(context);
-  patterns.add<FoldSign<arith::MulIOp>>(context);
-  patterns.add<MulStrengthReduction>(context);
-  patterns.add<DivSIStrengthReduction>(context);
-  patterns.add<RemUIStrengthReduction>(context);
-  patterns.add<RemSIStrengthReduction>(context);
-
-  target.addDynamicallyLegalOp<AddIOp>(FoldSign<AddIOp>::opIsLegal);
-  target.addDynamicallyLegalOp<SubIOp>(FoldSign<SubIOp>::opIsLegal);
-  target.addDynamicallyLegalOp<MulIOp>(mulLegalityCallback);
-  target.addDynamicallyLegalOp<DivSIOp>(DivSIOpLegalityCallback);
-  target.addDynamicallyLegalOp<RemUIOp>(remUILegalityCallback);
-  target.addDynamicallyLegalOp<RemSIOp>(remSILegalityCallback);
-
-  if (failed(applyPartialConversion(op, target, std::move(patterns))))
-    return failure();
-
-  // Loop invariant code motion to hoist produced constants out of loop
-  op->walk(
-      [&](LoopLikeOpInterface loopLike) { moveLoopInvariantCode(loopLike); });
-
-  mlir::PassManager pm(context);
-  pm.addPass(arith::createIntRangeOptimizationsPass());
-  if (failed(pm.run(op)))
-    signalPassFailure();
-
-  return success();
 }
 
 /// Populate the schedling problem operator types for the dialect we are
@@ -1106,8 +303,8 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
           problem.setLinkedOperatorType(loopOp, loopOpr);
           auto loop = cast<LoopInterface>(loopOp);
           loop.getBodyBlock()->walk([&](Operation *op) {
-            if (isa<AffineLoadOp, AffineStoreOp, memref::LoadOp,
-                    memref::StoreOp>(op)) {
+            if (isa<AffineLoadOp, AffineStoreOp, LoopScheduleLoadOp,
+                    LoopScheduleStoreOp>(op)) {
               Value memRef = getMemref(op);
               Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
                   "mem_" + std::to_string(hash_value(memRef)));
@@ -1139,13 +336,13 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
           });
           return WalkResult::advance();
         })
-        .Case<memref::StoreOp, AffineStoreOp>([&](Operation *memOp) {
+        .Case<LoopScheduleStoreOp, AffineStoreOp>([&](Operation *memOp) {
           // Some known sequential ops. In certain cases, reads may be
           // combinational in Calyx, but taking advantage of that is left as
           // a future enhancement.
           Value memRef = isa<AffineStoreOp>(*memOp)
                              ? cast<AffineStoreOp>(*memOp).getMemRef()
-                             : cast<memref::StoreOp>(*memOp).getMemRef();
+                             : cast<LoopScheduleStoreOp>(*memOp).getMemRef();
           Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
               "mem_" + std::to_string(hash_value(memRef)));
           problem.setLatency(memOpr, 1);
@@ -1153,13 +350,13 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
           problem.setLinkedOperatorType(memOp, memOpr);
           return WalkResult::advance();
         })
-        .Case<memref::LoadOp, AffineLoadOp>([&](Operation *memOp) {
+        .Case<LoopScheduleLoadOp, AffineLoadOp>([&](Operation *memOp) {
           // Some known sequential ops. In certain cases, reads may be
           // combinational in Calyx, but taking advantage of that is left as
           // a future enhancement.
           Value memRef = isa<AffineLoadOp>(*memOp)
                              ? cast<AffineLoadOp>(*memOp).getMemRef()
-                             : cast<memref::LoadOp>(*memOp).getMemRef();
+                             : cast<LoopScheduleLoadOp>(*memOp).getMemRef();
           Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
               "mem_" + std::to_string(hash_value(memRef)));
           problem.setLatency(memOpr, 1);
@@ -1326,25 +523,25 @@ LogicalResult AffineToLoopSchedule::solveSharedOperatorsProblem(
 
 // Replaces memref loads/stores with loopschedule loads/stores
 Operation *cloneOrReplace(OpBuilder builder, Operation *op, IRMapping valueMap) {
-  if (auto load = dyn_cast<memref::LoadOp>(op)) {
-    SmallVector<Value> indices;
-    auto memref = valueMap.lookupOrDefault(load.getMemRef());
-    auto returnType = cast<MemRefType>(memref.getType()).getElementType();
-    for (auto opValue : load.getIndices())
-     indices.push_back(valueMap.lookupOrDefault(opValue));
-    return builder.create<LoopScheduleLoadOp>(op->getLoc(), returnType, 
-              memref, indices);
-  }
+  // if (auto load = dyn_cast<memref::LoadOp>(op)) {
+  //   SmallVector<Value> indices;
+  //   auto memref = valueMap.lookupOrDefault(load.getMemRef());
+  //   auto returnType = cast<MemRefType>(memref.getType()).getElementType();
+  //   for (auto opValue : load.getIndices())
+  //    indices.push_back(valueMap.lookupOrDefault(opValue));
+  //   return builder.create<LoopScheduleLoadOp>(op->getLoc(), returnType, 
+  //             memref, indices);
+  // }
 
-  if (auto store = dyn_cast<memref::StoreOp>(op)) {
-    SmallVector<Value> indices;
-    auto memref = valueMap.lookupOrDefault(store.getMemRef());
-    auto valToStore = valueMap.lookupOrDefault(store.getValueToStore());
-    for (auto opValue : store.getIndices())
-     indices.push_back(valueMap.lookupOrDefault(opValue));
-    return builder.create<LoopScheduleStoreOp>(op->getLoc(), valToStore, 
-              memref, indices);
-  }
+  // if (auto store = dyn_cast<memref::StoreOp>(op)) {
+  //   SmallVector<Value> indices;
+  //   auto memref = valueMap.lookupOrDefault(store.getMemRef());
+  //   auto valToStore = valueMap.lookupOrDefault(store.getValueToStore());
+  //   for (auto opValue : store.getIndices())
+  //    indices.push_back(valueMap.lookupOrDefault(opValue));
+  //   return builder.create<LoopScheduleStoreOp>(op->getLoc(), valToStore, 
+  //             memref, indices);
+  // }
 
   return builder.clone(*op, valueMap);
 }
@@ -1367,16 +564,15 @@ AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
   if (loop.hasConstantBounds()) {
     auto lower = loop.getConstantLowerBound();
     auto upper = loop.getConstantUpperBound();
-    int64_t largestValue;
-    // bool isSigned;
-    if (lower >= 0 && upper >= 0) {
-      // isSigned = false;
-      largestValue = std::max(lower, upper);
-    } else {
-      assert(false && "not handling negative affine bounds yet");
-    }
-    int bitwidth = llvm::Log2_64_Ceil(largestValue);
-    boundType = builder.getIntegerType(bitwidth);
+    // int64_t largestValue;
+    // // bool isSigned;
+    // if (lower >= 0 && upper >= 0) {
+    //   // isSigned = false;
+    //   largestValue = std::max(lower, upper);
+    // } else {
+    //   assert(false && "not handling negative affine bounds yet");
+    // }
+    boundType = loop.getInductionVar().getType();
     lowerBound = builder.create<arith::ConstantOp>(
         IntegerAttr::get(boundType, lower));
     upperBound = builder.create<arith::ConstantOp>(
@@ -1488,11 +684,6 @@ AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
           pipeEndTime = std::max(pipeEndTime, userStartTime + 1);
       }
 
-      // Make sure a stage exists for every time between startTime and
-      // pipeEndTime
-      // for (unsigned i = startTime; i < pipeEndTime; ++i)
-      //   newStartTimes.insert(i);
-
       // Insert the range of pipeline stages the value needs to be valid for
       for (auto res : op->getResults())
         pipeTimes[res] = std::pair(startTime, pipeEndTime);
@@ -1502,8 +693,20 @@ AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
         registerValues.push_back(SmallVector<Value>());
 
       // Keep a collection of this stages results as keys to our valueMaps
-      for (auto result : op->getResults())
-        registerValues[startTime].push_back(result);
+      for (auto result : op->getResults()) {
+        for (auto *user : result.getUsers()) {
+          auto inThisGroup = false;
+          for (auto *op : group) {
+            if (user == op) {
+              inThisGroup = true;
+            }
+          }
+          if (!inThisGroup) {
+            registerValues[startTime].push_back(result);
+            break;
+          }
+        }
+      }
 
       // Other stages that use the value will need these values as keys too
       unsigned firstUse = std::max(
@@ -1785,11 +988,32 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
       &loop->getParentOfType<FuncOp>().getBody().front());
 
   // Create Values for the loop's lower and upper bounds.
-  Value lowerBound = lowerAffineLowerBound(loop, builder);
-  Value upperBound = lowerAffineUpperBound(loop, builder);
+  Value lowerBound;
+  Value upperBound;
+  Type boundType = builder.getIndexType();
+  if (loop.hasConstantBounds()) {
+    auto lower = loop.getConstantLowerBound();
+    auto upper = loop.getConstantUpperBound();
+    // int64_t largestValue;
+    // // bool isSigned;
+    // if (lower >= 0 && upper >= 0) {
+    //   // isSigned = false;
+    //   largestValue = std::max(lower, upper);
+    // } else {
+    //   assert(false && "not handling negative affine bounds yet");
+    // }
+    boundType = loop.getInductionVar().getType();
+    lowerBound = builder.create<arith::ConstantOp>(
+        IntegerAttr::get(boundType, lower));
+    upperBound = builder.create<arith::ConstantOp>(
+        IntegerAttr::get(boundType, upper));
+  } else {
+    lowerBound = lowerAffineLowerBound(loop, builder);
+    upperBound = lowerAffineUpperBound(loop, builder);
+  }
   int64_t stepValue = loop.getStep().getSExtValue();
   auto incr = builder.create<arith::ConstantOp>(
-      IntegerAttr::get(builder.getIndexType(), stepValue));
+      IntegerAttr::get(boundType, stepValue));
 
   builder.setInsertionPoint(loop);
 
@@ -2007,7 +1231,7 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
     SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
     for (auto *op : group) {
       unsigned resultIndex = stepTerminator->getNumOperands();
-      auto *newOp = cloneOrReplace(builder, op, valueMap);
+      auto *newOp = builder.clone(*op, valueMap);
       dependenceAnalysis->replaceOp(op, newOp);
       std::queue<Operation *> oldOps;
       op->walk([&](Operation *op) { oldOps.push(op); });
@@ -2020,6 +1244,11 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
         stepTerminator->insertOperands(resultIndex, newOp->getResults());
         movedOps.emplace_back(op, newOp, resultIndex);
       }
+      // All further uses in this stage should used the cloned-version of values
+      // So we update the mapping in this stage
+      for (auto result : op->getResults())
+        valueMap.map(
+            result, newOp->getResult(result.getResultNumber()));
     }
 
     // Reregister values
@@ -2263,6 +1492,11 @@ AffineToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
         stageTerminator->insertOperands(resultIndex, newOp->getResults());
         movedOps.emplace_back(op, newOp, resultIndex);
       }
+      // All further uses in this step should used the cloned-version of values
+      // So we update the mapping in this stage
+      for (auto result : op->getResults())
+        valueMap.map(
+            result, newOp->getResult(result.getResultNumber()));
     }
 
     // Add the stage results to the value map for the original op.
@@ -2318,6 +1552,6 @@ AffineToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
   return success();
 }
 
-std::unique_ptr<mlir::Pass> circt::createAffineToLoopSchedule() {
-  return std::make_unique<AffineToLoopSchedule>();
+std::unique_ptr<mlir::Pass> circt::createAffineToLoopSchedule(bool disableBitwidthMinimization) {
+  return std::make_unique<AffineToLoopSchedule>(disableBitwidthMinimization);
 }

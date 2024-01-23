@@ -35,6 +35,10 @@ def AffineToLoopSchedule : Pass<"convert-affine-to-loopschedule", "mlir::func::F
     "mlir::scf::SCFDialect",
     "mlir::func::FuncDialect"
   ];
+  let options = [
+    Option<"disableBitwidthMinimization", "disable-bitwidth-minimization", "bool",
+            "false", "Bool to determine if bitwidth minimization should be disabled">
+   ];
 }
 
 //===----------------------------------------------------------------------===//
