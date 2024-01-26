@@ -496,6 +496,8 @@ static bool remSILegalityCallback(Operation *op) {
 
 LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
                                         mlir::Operation *op) {
+  llvm::errs() << "post lowering opt\n";
+  op->getParentOfType<ModuleOp>().dump();
   ConversionTarget target(context);
   target.addLegalDialect<AffineDialect, ArithDialect, memref::MemRefDialect,
                          scf::SCFDialect>();
@@ -517,6 +519,9 @@ LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
   target.addDynamicallyLegalOp<DivSIOp>(divSIOpLegalityCallback);
   target.addDynamicallyLegalOp<RemUIOp>(remUILegalityCallback);
   target.addDynamicallyLegalOp<RemSIOp>(remSILegalityCallback);
+  target.addLegalOp<LoopScheduleLoadOp>();
+  target.addLegalOp<LoopScheduleStoreOp>();
+  target.markUnknownOpDynamicallyLegal([](Operation *op) { return true; });
 
   if (failed(applyPartialConversion(op, target, std::move(patterns))))
     return failure();
@@ -914,6 +919,11 @@ struct LoadCleanupPattern : OpRewritePattern<LoopScheduleLoadOp> {
       } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
         idx.set(extSI.getIn());
         updated = true;
+      } else if (auto unreal = dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
+        if (unreal.getInputs().size() != 1)
+          continue;
+        idx.set(unreal.getInputs().front());
+        updated = true;
       }
     }
     
@@ -942,6 +952,39 @@ struct StoreCleanupPattern : OpRewritePattern<LoopScheduleStoreOp> {
       } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
         idx.set(extSI.getIn());
         updated = true;
+      } else if (auto unreal = dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
+        if (unreal.getInputs().size() != 1)
+          continue;
+        idx.set(unreal.getInputs().front());
+        updated = true;
+      }
+    }
+    
+    if (!updated)
+      return failure();
+
+    return success();
+  }
+};
+
+struct LoadAddressNarrowingPattern : OpRewritePattern<LoopScheduleLoadOp> {
+  using OpRewritePattern<LoopScheduleLoadOp>::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(LoopScheduleLoadOp op,
+                  PatternRewriter &rewriter) const override {
+    auto indices = op.getIndicesMutable();
+    bool updated = false;
+    for (auto v : llvm::enumerate(indices)) {
+      auto &idx = v.value();
+      auto i = v.index();
+      auto dimSize = op.getMemRefType().getDimSize(i);
+      auto bitwidth = llvm::Log2_64_Ceil(dimSize);
+      auto newType = rewriter.getIntegerType(bitwidth);
+      if (newType != idx.get().getType()) {
+        auto newIdx = rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
+        idx.set(newIdx);
+        updated = true;
       }
     }
     
@@ -961,11 +1004,11 @@ void populateIndexRemovalTypeConverter(
   });
   typeConverter.addTargetMaterialization(
       [](OpBuilder &b, Type target, ValueRange input, Location loc) {
-        return b.create<arith::IndexCastOp>(loc, target, input);
+        return b.create<UnrealizedConversionCastOp>(loc, target, input).getResult(0);
       });
   typeConverter.addSourceMaterialization(
       [](OpBuilder &b, Type source, ValueRange input, Location loc) {
-        return b.create<arith::IndexCastOp>(loc, source, input);
+        return b.create<UnrealizedConversionCastOp>(loc, source, input).getResult(0);
       });
 }
 
@@ -1026,6 +1069,19 @@ public:
     return success();
   }
 };
+
+struct IndexCastRemovalRewritePattern final : public OpConversionPattern<IndexCastOp> {
+public:
+  using OpConversionPattern<IndexCastOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(IndexCastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(op, op.getOut().getType(), op.getIn());
+
+    return success();
+  }
+};
     
 LogicalResult
 bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
@@ -1053,14 +1109,30 @@ bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
       [&typeConverter](Operation *op) {
         return typeConverter.isLegal(op);
       });
-  target.addLegalOp<arith::IndexCastOp>();
+  target.addIllegalOp<arith::IndexCastOp>();
   patterns.clear();
   patterns.add<IndexRemovalRewritePattern>(typeConverter,
                                            &context, dependenceAnalysis);
   patterns.add<ConstIndexRemovalRewritePattern>(typeConverter,
                                            &context);
+  patterns.add<IndexCastRemovalRewritePattern>(typeConverter,
+                                           &context);
+  populateReconcileUnrealizedCastsPatterns(patterns);
   if (failed(applyPartialConversion(op, target, std::move(patterns))))
     return failure();
+
+  // Cleanup extraneous casts after int narrowing
+  patterns.clear();
+  patterns.add<TruncCleanupPattern>(&context);
+  patterns.add<LoadCleanupPattern>(&context);
+  patterns.add<StoreCleanupPattern>(&context);
+
+  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
+    op->emitOpError("Failed to perform bitwidth minimization conversions");
+    return failure();
+  }
+
+  op->getParentOfType<ModuleOp>().dump();
 
   // Apply the core integer narrowing pass
   patterns.clear();
@@ -1079,6 +1151,7 @@ bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
   patterns.add<TruncCleanupPattern>(&context);
   patterns.add<LoadCleanupPattern>(&context);
   patterns.add<StoreCleanupPattern>(&context);
+  patterns.add<LoadAddressNarrowingPattern>(&context);
 
   if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");

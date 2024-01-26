@@ -70,6 +70,8 @@ static Block *getCommonBlockInAffineScope(Operation *opA, Operation *opB) {
 static void checkMemrefDependence(SmallVectorImpl<Operation *> &memoryOps,
                                   unsigned depth,
                                   MemoryDependenceResult &results) {
+  if (memoryOps.empty())
+    return;
 
   auto funcOp = memoryOps.front()->getParentOfType<func::FuncOp>();
 

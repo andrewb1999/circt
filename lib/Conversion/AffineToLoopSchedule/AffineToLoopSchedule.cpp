@@ -180,6 +180,8 @@ void AffineToLoopSchedule::runOnOperation() {
       return signalPassFailure();
   }
 
+  getOperation()->getParentOfType<ModuleOp>().dump();
+
   // Schedule all pipelined loops first
   for (auto loop : llvm::make_early_inc_range(loops)) {
 
@@ -1517,7 +1519,7 @@ AffineToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
   int numOperands = returnOp->getNumOperands();
   for (int i = 0; i < numOperands; ++i) {
     auto operand = returnOp->getOperand(i);
-    auto newValue = valueMap.lookup(operand);
+    auto newValue = valueMap.lookupOrDefault(operand);
     returnOp->setOperand(i, newValue);
   }
 
