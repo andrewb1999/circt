@@ -195,7 +195,7 @@ struct IfOpHoisting : OpConversionPattern<scf::IfOp> {
   LogicalResult
   matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.updateRootInPlace(op, [&]() {
+    rewriter.modifyOpInPlace(op, [&]() {
       if (!op.thenBlock()->without_terminator().empty()) {
         rewriter.splitBlock(op.thenBlock(), --op.thenBlock()->end());
         rewriter.inlineBlockBefore(&op.getThenRegion().front(), op);

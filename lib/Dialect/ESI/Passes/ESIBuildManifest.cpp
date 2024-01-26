@@ -115,14 +115,11 @@ void ESIBuildManifestPass::runOnOperation() {
                     ->getRegion(0)
                     .front()
                     .getTerminator());
-    b.create<CompressedManifestOp>(
-        b.getUnknownLoc(),
-        BlobAttr::get(ctxt, ArrayRef<char>(reinterpret_cast<char *>(
-                                               compressedManifest.data()),
-                                           compressedManifest.size())));
+    b.create<CompressedManifestOp>(b.getUnknownLoc(),
+                                   BlobAttr::get(ctxt, compressedManifest));
   } else {
-    mod->emitError() << "zlib not available but required for manifest support";
-    signalPassFailure();
+    mod->emitWarning()
+        << "zlib not available but required for manifest support";
   }
 }
 

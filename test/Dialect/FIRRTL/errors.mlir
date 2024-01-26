@@ -821,7 +821,7 @@ firrtl.circuit "NLATop" {
 // -----
 
 firrtl.circuit "NLATop1" {
-  // expected-error @+1 {{instance path is incorrect. Expected module: "Aardvark" instead found: "Zebra"}}
+  // expected-error @+1 {{instance path is incorrect. Expected "Aardvark". Instead found: "Zebra"}}
   hw.hierpath private @nla [@NLATop1::@test, @Zebra::@test,@Aardvark::@test]
   hw.hierpath private @nla_1 [@NLATop1::@test,@Aardvark::@test_1, @Zebra]
   firrtl.module @NLATop1() {
@@ -882,7 +882,7 @@ firrtl.circuit "Foo"   {
 firrtl.circuit "Top"   {
  // Legal nla would be:
 //hw.hierpath private @nla [@Top::@mid, @Mid::@leaf, @Leaf::@w]
-  // expected-error @+1 {{instance path is incorrect. Expected module: "Middle" instead found: "Leaf"}}
+  // expected-error @+1 {{instance path is incorrect. Expected "Middle". Instead found: "Leaf"}}
   hw.hierpath private @nla [@Top::@mid, @Leaf::@w]
   firrtl.module @Leaf() {
     %w = firrtl.wire sym @w  {annotations = [{circt.nonlocal = @nla, class = "fake1"}]} : !firrtl.uint<3>
@@ -2215,4 +2215,129 @@ firrtl.circuit "InputProbeExt" {
 firrtl.circuit "InputProbeExt" {
   // expected-error @below {{input probe not allowed on public module}}
   firrtl.extmodule @InputProbeExt(in in : !firrtl.openbundle<b flip: openbundle<p flip: probe<uint<1>>>>)
+}
+
+// -----
+
+firrtl.circuit "InvalidOption" {
+  firrtl.module private @Target() {}
+
+  firrtl.module @InvalidOption() {
+    // expected-error @below {{op option "Bad" does not exist}}
+    firrtl.instance_choice inst @Target alternatives @Bad { @FPGA -> @Target } ()
+  }
+}
+
+// -----
+
+firrtl.circuit "InvalidCase" {
+  firrtl.option @Platform {
+    firrtl.option_case @FPGA
+    firrtl.option_case @ASIC
+  }
+
+  firrtl.module private @Target() {}
+
+  firrtl.module @InvalidCase() {
+    // expected-error @below {{op option "Platform" does not contain option case @Platform::@BAD}}
+    firrtl.instance_choice inst @Target alternatives @Platform { @BAD -> @Target } ()
+  }
+}
+
+// -----
+
+firrtl.circuit "InvalidDefaultTarget" {
+  firrtl.option @Platform {
+    firrtl.option_case @FPGA
+    firrtl.option_case @ASIC
+  }
+
+  firrtl.module private @Target() {}
+
+  firrtl.module @InvalidTarget() {
+    // expected-error @below {{op invalid symbol reference}}
+    firrtl.instance_choice inst @BadTarget alternatives @Platform { @FPGA -> @Target } ()
+  }
+}
+
+// -----
+
+firrtl.circuit "InvalidTarget" {
+  firrtl.option @Platform {
+    firrtl.option_case @FPGA
+    firrtl.option_case @ASIC
+  }
+
+  firrtl.module private @Target() {}
+
+  firrtl.module @InvalidTarget() {
+    // expected-error @below {{op invalid symbol reference}}
+    firrtl.instance_choice inst @Target alternatives @Platform { @FPGA -> @BadTarget } ()
+  }
+}
+
+// -----
+
+firrtl.circuit "InvalidCaseTarget" {
+  firrtl.option @Platform {
+    firrtl.option_case @FPGA
+    firrtl.option_case @ASIC
+  }
+
+  firrtl.module private @Target() {}
+
+  firrtl.module @InvalidCaseTarget() {
+    // expected-error @below {{op option "BadPlatform" does not exist}}
+    firrtl.instance_choice inst @Target alternatives @BadPlatform { @FPGA -> @Target } ()
+  }
+}
+
+// -----
+
+firrtl.circuit "NoCases" {
+  firrtl.module private @Target() {}
+
+  firrtl.module @NoCases() {
+    // expected-error @below {{'firrtl.instance_choice' op must have at least one case}}
+    "firrtl.instance_choice"() {
+      moduleNames = [@Target],
+      caseNames = [],
+      name = "inst",
+      nameKind = #firrtl<name_kind interesting_name>,
+      portDirections = 0 : i0,
+      portNames = [],
+      annotations = [],
+      portAnnotations = []
+    } : () -> ()
+  }
+}
+
+// -----
+
+firrtl.circuit "MismatchedCases" {
+  firrtl.option @Platform {
+    firrtl.option_case @FPGA
+    firrtl.option_case @ASIC
+  }
+
+  firrtl.option @Perf {
+    firrtl.option_case @Fast
+    firrtl.option_case @Slow
+  }
+
+  firrtl.module private @Target() {}
+
+  firrtl.module @MismatchedCases() {
+    // expected-error @below {{op case @Perf::@Fast is not in the same option group as @Platform::@ASIC}}
+    "firrtl.instance_choice"() {
+      moduleNames = [@Target, @Target, @Target],
+      caseNames = [@Platform::@ASIC, @Perf::@Fast],
+      name = "inst",
+      nameKind = #firrtl<name_kind interesting_name>,
+      portDirections = 0 : i0,
+      portNames = [],
+      annotations = [],
+      portAnnotations = []
+    } : () -> ()
+  }
 }

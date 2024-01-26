@@ -31,6 +31,7 @@
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/SV/SVPasses.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
+#include "circt/Dialect/Sim/SimDialect.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
 #include "circt/Support/LoweringOptions.h"
 #include "circt/Support/LoweringOptionsParser.h"
@@ -226,6 +227,11 @@ static cl::opt<std::string> hglddOutputDirectory(
     "hgldd-output-dir", cl::desc("Directory into which to emit HGLDD files"),
     cl::init(""), cl::value_desc("path"), cl::cat(mainCategory));
 
+static cl::opt<bool> hglddOnlyExistingFileLocs(
+    "hgldd-only-existing-file-locs",
+    cl::desc("Only consider locations in files that exist on disk"),
+    cl::init(false), cl::cat(mainCategory));
+
 static cl::opt<bool>
     emitBytecode("emit-bytecode",
                  cl::desc("Emit bytecode when generating MLIR output"),
@@ -269,6 +275,7 @@ static debug::EmitHGLDDOptions getHGLDDOptions() {
   opts.sourceFilePrefix = hglddSourcePrefix;
   opts.outputFilePrefix = hglddOutputPrefix;
   opts.outputDirectory = hglddOutputDirectory;
+  opts.onlyExistingFileLocs = hglddOnlyExistingFileLocs;
   return opts;
 }
 
@@ -588,10 +595,10 @@ static LogicalResult executeFirtool(MLIRContext &context,
 
   // Figure out the input format if unspecified.
   if (inputFormat == InputUnspecified) {
-    if (StringRef(inputFilename).endswith(".fir"))
+    if (StringRef(inputFilename).ends_with(".fir"))
       inputFormat = InputFIRFile;
-    else if (StringRef(inputFilename).endswith(".mlir") ||
-             StringRef(inputFilename).endswith(".mlirbc") ||
+    else if (StringRef(inputFilename).ends_with(".mlir") ||
+             StringRef(inputFilename).ends_with(".mlirbc") ||
              mlir::isBytecode(*input))
       inputFormat = InputMLIRFile;
     else {
@@ -631,7 +638,7 @@ static LogicalResult executeFirtool(MLIRContext &context,
   context.loadDialect<chirrtl::CHIRRTLDialect, firrtl::FIRRTLDialect,
                       hw::HWDialect, comb::CombDialect, seq::SeqDialect,
                       om::OMDialect, sv::SVDialect, verif::VerifDialect,
-                      ltl::LTLDialect, debug::DebugDialect>();
+                      ltl::LTLDialect, debug::DebugDialect, sim::SimDialect>();
 
   // Process the input.
   if (failed(processInput(context, firtoolOptions, ts, std::move(input),
@@ -699,6 +706,7 @@ int main(int argc, char **argv) {
     registerLowerFIRRTLToHWPass();
     registerLegalizeAnonEnumsPass();
     registerLowerSeqToSVPass();
+    registerLowerSimToSVPass();
     registerLowerVerifToSVPass();
   }
 

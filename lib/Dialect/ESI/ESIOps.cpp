@@ -630,10 +630,7 @@ void ESIPureModuleOp::removeAllPortAttrs() {
   emitError("No ports for port attributes)");
 }
 
-SmallVector<Attribute> ESIPureModuleOp::getAllPortAttrs() {
-  SmallVector<Attribute> retval;
-  return retval;
-}
+ArrayRef<Attribute> ESIPureModuleOp::getAllPortAttrs() { return {}; }
 
 void ESIPureModuleOp::setHWModuleType(hw::ModuleType type) {
   emitError("No ports for port types");
@@ -705,6 +702,8 @@ void ServiceRequestRecordOp::getDetails(
       StringAttr::get(ctxt, stringifyBundleDirection(getDirection())));
   results.emplace_back(getBundleTypeAttrName(), getBundleTypeAttr());
   results.emplace_back(getServicePortAttrName(), getServicePortAttr());
+  if (auto stdSvc = getStdServiceAttr())
+    results.emplace_back(getStdServiceAttrName(), getStdServiceAttr());
 }
 
 StringRef SymbolMetadataOp::getManifestClass() { return "sym_info"; }

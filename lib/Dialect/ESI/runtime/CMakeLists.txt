@@ -23,11 +23,11 @@
 ##
 ##===----------------------------------------------------------------------===//
 
-project(ESIRuntime)
 cmake_minimum_required(VERSION 3.20)
+project(ESIRuntime)
 include(FetchContent)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
 # We need zlib to uncompress the manifest.
@@ -44,9 +44,11 @@ include_directories(cpp/include)
 
 set(ESIRuntimeSources
   cpp/lib/Accelerator.cpp
+  cpp/lib/Common.cpp
   cpp/lib/Design.cpp
   cpp/lib/Manifest.cpp
-  cpp/lib/StdServices.cpp
+  cpp/lib/Services.cpp
+  cpp/lib/Ports.cpp
   cpp/lib/Utils.cpp
 
   cpp/lib/backends/Trace.cpp
@@ -58,8 +60,18 @@ set(ESIRuntimeLinkLibraries
 set(ESIPythonRuntimeSources
   python/esi/__init__.py
   python/esi/accelerator.py
+  python/esi/types.py
   python/esi/esiCppAccel.pyi
 )
+set(ESIRuntimeIncludeDirs)
+set(ESIRuntimeCxxFlags)
+set(ESIRuntimeLinkFlags)
+set(ESIRuntimeLibDirs)
+
+IF(MSVC)
+    set(CMAKE_CXX_FLAGS "/EHa")
+    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS 1)
+ENDIF(MSVC)
 
 # If Cap'nProto hasn't been explicitly disabled, find it.
 option(CAPNP_DISABLE "Disable Cap'nProto (needed for cosimulation).")
@@ -98,12 +110,48 @@ if(CapnProto_FOUND)
   )
 endif()
 
+option(XRT_PATH "Path to XRT lib.")
+if (XRT_PATH)
+  message("-- XRT enabled with path ${XRT_PATH}")
+
+  set(ESIRuntimeSources
+    ${ESIRuntimeSources}
+    cpp/lib/backends/Xrt.cpp
+  )
+  set(ESIRuntimeIncludeDirs
+    ${ESIRuntimeIncludeDirs}
+    ${XRT_PATH}/include
+  )
+  set(ESIRuntimeCxxFlags
+    ${ESIRuntimeCxxFlags}
+    -fmessage-length=0
+    -Wno-nested-anon-types
+    -Wno-c++98-compat-extra-semi
+  )
+  set(ESIRuntimeLinkLibraries
+    ${ESIRuntimeLinkLibraries}
+    xrt_coreutil
+  )
+  set(ESIRuntimeLinkFlags
+    ${ESIRuntimeLinkFlags}
+    -pthread
+  )
+  set(ESIRuntimeLibDirs
+    ${ESIRuntimeLibDirs}
+    ${XRT_PATH}/lib
+  )
+endif()
+
 # The core API. For now, compile the backends into it directly.
 # TODO: make this a plugin architecture.
 add_library(ESIRuntime SHARED
   ${ESIRuntimeSources}
 )
 target_link_libraries(ESIRuntime PRIVATE ${ESIRuntimeLinkLibraries})
+target_include_directories(ESIRuntime PRIVATE ${ESIRuntimeIncludeDirs})
+target_compile_options(ESIRuntime PRIVATE ${ESIRuntimeCxxFlags})
+target_link_directories(ESIRuntime PRIVATE ${ESIRuntimeLibDirs})
+target_link_options(ESIRuntime PRIVATE ${ESIRuntimeLinkFlags})
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   target_compile_options(ESIRuntime PRIVATE -Wno-covered-switch-default)
@@ -122,6 +170,12 @@ set(ESIRuntimePath "${CMAKE_CURRENT_BINARY_DIR}"
 # Pybind11 is used to wrap the ESIRuntime APIs.
 find_package(Python COMPONENTS Interpreter Development)
 if(Python_FOUND)
+  IF(MSVC)
+    # Work around an issue with pybind11 and cmake incompatibility on Windows in debug mode.
+    set_target_properties(Python::Module PROPERTIES
+          MAP_IMPORTED_CONFIG_DEBUG ";RELEASE")
+  ENDIF(MSVC)
+
   if(pybind11_DIR)
     message(STATUS "Using explicit pybind11 cmake directory: ${pybind11_DIR} (-Dpybind11_DIR to change)")
   else()

@@ -179,27 +179,38 @@ hw.module @MemoryAccess2Read(in %clk: !seq.clock, in %rst: i1, in %write: !esi.c
 // Check that it doesn't crap out on external modules.
 hw.module.extern @extern()
 
-// CHECK-LABEL:  esi.service.std.func @funcs
+// CONN-LABEL:  esi.service.std.func @funcs
 esi.service.std.func @funcs
 
-// CHECK-LABEL:   hw.module @CallableFunc1(in %func1 : !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>) {
-// CHECK-NEXT:      esi.manifest.req #esi.appid<"func1">, <@funcs::@call>, toClient, !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>
-// CHECK-NEXT:      %arg = esi.bundle.unpack %arg from %func1 : !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>
+// CONN-LABEL:   hw.module @CallableFunc1(in %func1 : !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>) {
+// CONN-NEXT:      esi.manifest.req #esi.appid<"func1">, <@funcs::@call> std "esi.service.std.func", toClient, !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>
+// CONN-NEXT:      %arg = esi.bundle.unpack %arg from %func1 : !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>
 !func1Signature = !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>
 hw.module @CallableFunc1() {
   %call = esi.service.req.to_client <@funcs::@call> (#esi.appid<"func1">) : !func1Signature
   %arg = esi.bundle.unpack %arg from %call : !func1Signature
 }
 
-// CHECK-LABEL:   hw.module @CallableAccel1(in %clk : !seq.clock, in %rst : i1) {
-// CHECK-NEXT:      hw.instance "func1" @CallableFunc1(func1: %bundle: !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>) -> ()
-// CHECK-NEXT:      esi.manifest.service_impl #esi.appid<"funcComms"> svc @funcs by "cosim" with {} {
-// CHECK-NEXT:        esi.manifest.impl_conn [#esi.appid<"func1">] req <@funcs::@call>(!esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>) with {channel_assignments = {arg = "func1.arg", result = "func1.result"}}
-// CHECK-NEXT:      }
-// CHECK-NEXT:      %0 = esi.cosim.from_host %clk, %rst, "func1.arg" : !esi.channel<i16>
-// CHECK-NEXT:      %bundle, %result = esi.bundle.pack %0 : !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>
-// CHECK-NEXT:      esi.cosim.to_host %clk, %rst, %result, "func1.result" : !esi.channel<i16>
+// CONN-LABEL:   hw.module @CallableAccel1(in %clk : !seq.clock, in %rst : i1) {
+// CONN-NEXT:      hw.instance "func1" @CallableFunc1(func1: %bundle: !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>) -> ()
+// CONN-NEXT:      esi.manifest.service_impl #esi.appid<"funcComms"> svc @funcs std "esi.service.std.func" by "cosim" with {} {
+// CONN-NEXT:        esi.manifest.impl_conn [#esi.appid<"func1">] req <@funcs::@call>(!esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>) with {channel_assignments = {arg = "func1.arg", result = "func1.result"}}
+// CONN-NEXT:      }
+// CONN-NEXT:      %0 = esi.cosim.from_host %clk, %rst, "func1.arg" : !esi.channel<i16>
+// CONN-NEXT:      %bundle, %result = esi.bundle.pack %0 : !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>
+// CONN-NEXT:      esi.cosim.to_host %clk, %rst, %result, "func1.result" : !esi.channel<i16>
 hw.module @CallableAccel1(in %clk: !seq.clock, in %rst: i1) {
   hw.instance "func1" @CallableFunc1() -> ()
   esi.service.instance #esi.appid<"funcComms"> svc @funcs impl as "cosim" (%clk, %rst) : (!seq.clock, i1) -> ()
+}
+
+esi.service.std.mmio @mmio
+!mmioReq = !esi.bundle<[!esi.channel<i32> to "offset", !esi.channel<i32> from "data"]>
+
+// CONN-LABEL:  hw.module @MMIOManifest(in %clk : !seq.clock, in %rst : i1, in %manifest : !esi.bundle<[!esi.channel<i32> to "offset", !esi.channel<i32> from "data"]>) {
+// CONN-NEXT:     esi.manifest.req #esi.appid<"manifest">, <@mmio::@read> std "esi.service.std.mmio", toClient, !esi.bundle<[!esi.channel<i32> to "offset", !esi.channel<i32> from "data"]>
+// CONN-NEXT:     %offset = esi.bundle.unpack %offset from %manifest : !esi.bundle<[!esi.channel<i32> to "offset", !esi.channel<i32> from "data"]>
+hw.module @MMIOManifest(in %clk: !seq.clock, in %rst: i1) {
+  %req = esi.service.req.to_client <@mmio::@read> (#esi.appid<"manifest">) : !mmioReq
+  %loopback = esi.bundle.unpack %loopback from %req : !mmioReq
 }

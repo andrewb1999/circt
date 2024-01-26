@@ -20,6 +20,7 @@ add_mlir_public_c_api_library(CIRCTCAPIConversion
   CIRCTHWArithToHW
   CIRCTHWToLLHD
   CIRCTHWToLLVM
+  CIRCTHWToBTOR2
   CIRCTHWToSV
   CIRCTHWToSystemC
   CIRCTLLHDToLLVM
@@ -28,7 +29,7 @@ add_mlir_public_c_api_library(CIRCTCAPIConversion
   CIRCTPipelineToHW
   CIRCTSCFToCalyx
   CIRCTSeqToSV
+  CIRCTSimToSV
   CIRCTCFToHandshake
   CIRCTVerifToSV
 )
-

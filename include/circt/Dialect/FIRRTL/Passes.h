@@ -60,7 +60,8 @@ std::unique_ptr<mlir::Pass> createLowerBundleVectorTypesPass();
 
 std::unique_ptr<mlir::Pass> createLowerCHIRRTLPass();
 
-std::unique_ptr<mlir::Pass> createLowerIntrinsicsPass();
+std::unique_ptr<mlir::Pass>
+createLowerIntrinsicsPass(bool fixupEICGWrapper = false);
 
 std::unique_ptr<mlir::Pass> createIMConstPropPass();
 
@@ -89,6 +90,8 @@ createEmitOMIRPass(mlir::StringRef outputFilename = "");
 std::unique_ptr<mlir::Pass> createLowerMatchesPass();
 
 std::unique_ptr<mlir::Pass> createLowerSignaturesPass();
+
+std::unique_ptr<mlir::Pass> createPassiveWiresPass();
 
 std::unique_ptr<mlir::Pass> createExpandWhensPass();
 
@@ -194,6 +197,8 @@ std::unique_ptr<mlir::Pass> createLayerSinkPass();
 std::unique_ptr<mlir::Pass> createMaterializeDebugInfoPass();
 
 std::unique_ptr<mlir::Pass> createLintingPass();
+
+std::unique_ptr<mlir::Pass> createSpecializeOptionPass();
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION

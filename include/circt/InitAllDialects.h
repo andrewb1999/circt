@@ -40,6 +40,7 @@
 #include "circt/Dialect/STG/STG.h"
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
+#include "circt/Dialect/Sim/SimDialect.h"
 #include "circt/Dialect/SystemC/SystemCDialect.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
 #include "mlir/IR/Dialect.h"
@@ -74,6 +75,7 @@ inline void registerAllDialects(mlir::DialectRegistry &registry) {
     hls::HLSDialect,
     hwarith::HWArithDialect,
     seq::SeqDialect,
+    sim::SimDialect,
     ssp::SSPDialect,
     sv::SVDialect,
     systemc::SystemCDialect,

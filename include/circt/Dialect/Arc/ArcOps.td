@@ -132,7 +132,7 @@ def StateOp : ArcOp<"state", [
   CallOpInterface,
   DeclareOpInterfaceMethods<SymbolUserOpInterface>,
   AttrSizedOperandSegments,
-  DeclareOpInterfaceMethods<ClockedOpInterface, ["isClocked"]>,
+  DeclareOpInterfaceMethods<ClockedOpInterface>,
 ]> {
   let summary = "State transfer arc";
 
@@ -147,7 +147,7 @@ def StateOp : ArcOp<"state", [
 
   let assemblyFormat = [{
     $arc `(` $inputs `)` (`clock` $clock^)? (`enable` $enable^)?
-    (`reset` $reset^)? `lat` $latency attr-dict
+    (`reset` $reset^)? `latency` $latency attr-dict
     `:` functional-type($inputs, results)
   }];
 
@@ -230,6 +230,7 @@ def StateOp : ArcOp<"state", [
 def CallOp : ArcOp<"call", [
   MemRefsNormalizable, Pure,
   CallOpInterface,
+  DeclareOpInterfaceMethods<ClockedOpInterface, ["isClocked", "eraseClock"]>,
   DeclareOpInterfaceMethods<SymbolUserOpInterface>
 ]> {
   let summary = "calls an arc";
@@ -240,6 +241,13 @@ def CallOp : ArcOp<"call", [
   let assemblyFormat = [{
     $arc `(` $inputs `)` attr-dict `:` functional-type(operands, results)
   }];
+
+  let builders = [
+    OpBuilder<(ins "DefineOp":$arc, CArg<"mlir::ValueRange", "{}">:$inputs), [{
+      build($_builder, $_state, arc.getFunctionType().getResults(),
+            mlir::SymbolRefAttr::get(arc), inputs);
+    }]>,
+  ];
 
   let extraClassDeclaration = [{
     operand_range getArgOperands() {
@@ -257,15 +265,6 @@ def CallOp : ArcOp<"call", [
     void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
       (*this)->setAttr(getArcAttrName(), callee.get<mlir::SymbolRefAttr>());
     }
-  }];
-}
-
-def ClockGateOp : ArcOp<"clock_gate", [Pure]> {
-  let summary = "Clock gate";
-  let arguments = (ins ClockType:$input, I1:$enable);
-  let results = (outs ClockType:$output);
-  let assemblyFormat = [{
-    $input `,` $enable attr-dict
   }];
 }
 
@@ -327,7 +326,7 @@ def MemoryWritePortOp : ArcOp<"memory_write_port", [
 
   let assemblyFormat = [{
     $memory `,` $arc  `(` $inputs `)` (`clock` $clock^)?  (`enable` $enable^)?
-    (`mask` $mask^)? `lat` $latency attr-dict `:`
+    (`mask` $mask^)? `latency` $latency attr-dict `:`
     type($memory) `,` type($inputs)
   }];
 
@@ -536,7 +535,7 @@ def StateReadOp : ArcOp<"state_read", [
 ]> {
   let summary = "Get a state's current value";
   let arguments = (ins StateType:$state);
-  let results = (outs AnyInteger:$value);
+  let results = (outs AnyType:$value);
   let assemblyFormat = [{
     $state attr-dict `:` type($state)
   }];
@@ -560,7 +559,7 @@ def StateWriteOp : ArcOp<"state_write", [
     immediately without affecting correctness. This allows later lowering passes
     to treat `arc.state_write` as an immediate assignment (without defering).
   }];
-  let arguments = (ins StateType:$state, AnyInteger:$value,
+  let arguments = (ins StateType:$state, AnyType:$value,
                        Optional<I1>:$condition);
   let assemblyFormat = [{
     $state `=` $value (`if` $condition^)? attr-dict `:` type($state)

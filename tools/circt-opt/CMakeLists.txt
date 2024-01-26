@@ -56,6 +56,7 @@ target_link_libraries(circt-opt
   CIRCTHW
   CIRCTHWArith
   CIRCTHWArithToHW
+  CIRCTHWToBTOR2
   CIRCTIbis
   CIRCTIbisTransforms
   CIRCTInteropDialect
@@ -71,6 +72,7 @@ target_link_libraries(circt-opt
   CIRCTSeq
   CIRCTSeqToSV
   CIRCTSeqTransforms
+  CIRCTSimToSV
   CIRCTSSP
   CIRCTSSPTransforms
   CIRCTCFToHandshake

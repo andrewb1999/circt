@@ -1,4 +1,5 @@
-// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-lower-intrinsics))' %s   | FileCheck %s
+// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-lower-intrinsics))' %s | FileCheck %s --check-prefixes=CHECK,CHECK-NOEICG
+// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-lower-intrinsics{fixup-eicg-wrapper}))' %s | FileCheck %s --check-prefixes=CHECK,CHECK-EICG
 
 // CHECK-LABEL: "Foo"
 firrtl.circuit "Foo" {
@@ -98,6 +99,24 @@ firrtl.circuit "Foo" {
     %in2, %en2, %out2 = firrtl.instance "" @ClockGate1(in in: !firrtl.clock, in en: !firrtl.uint<1>, out out: !firrtl.clock)
     firrtl.strictconnect %in2, %clk : !firrtl.clock
     firrtl.strictconnect %en2, %en : !firrtl.uint<1>
+  }
+
+  // CHECK-NOT: ClockInverter0
+  // CHECK-NOT: ClockInverter1
+  firrtl.extmodule @ClockInverter0(in in: !firrtl.clock, out out: !firrtl.clock) attributes {annotations = [{class = "circt.Intrinsic", intrinsic = "circt.clock_inv"}]}
+  firrtl.intmodule @ClockInverter1(in in: !firrtl.clock, out out: !firrtl.clock) attributes {intrinsic = "circt.clock_inv"}
+
+  // CHECK: ClockInverter
+  firrtl.module @ClockInverter(in %clk: !firrtl.clock) {
+    // CHECK-NOT: ClockInverter0
+    // CHECK: firrtl.int.clock_inv
+    %in1, %out1 = firrtl.instance "" @ClockInverter0(in in: !firrtl.clock, out out: !firrtl.clock)
+    firrtl.strictconnect %in1, %clk : !firrtl.clock
+
+    // CHECK-NOT: ClockInverter1
+    // CHECK: firrtl.int.clock_inv
+    %in2, %out2 = firrtl.instance "" @ClockInverter1(in in: !firrtl.clock, out out: !firrtl.clock)
+    firrtl.strictconnect %in2, %clk : !firrtl.clock
   }
 
   // CHECK-NOT: LTLAnd
@@ -219,5 +238,20 @@ firrtl.circuit "Foo" {
     firrtl.strictconnect %in_reset1, %reset1 : !firrtl.uint<1>
     firrtl.strictconnect %in_reset2, %reset2 : !firrtl.asyncreset
     firrtl.strictconnect %in_reset3, %reset3 : !firrtl.reset
+  }
+
+  // CHECK-NOEICG: LegacyClockGate
+  // CHECK-EICG-NOT: LegacyClockGate
+  firrtl.extmodule @LegacyClockGate(in in: !firrtl.clock, in test_en: !firrtl.uint<1>, in en: !firrtl.uint<1>, out out: !firrtl.clock) attributes {defname = "EICG_wrapper"}
+
+  // CHECK: FixupEICGWrapper
+  firrtl.module @FixupEICGWrapper(in %clock: !firrtl.clock, in %en: !firrtl.uint<1>) {
+    // CHECK-NOEICG: firrtl.instance
+    // CHECK-EICG-NOT: firrtl.instance
+    // CHECK-EICG: firrtl.int.clock_gate
+    %ckg_in, %ckg_test_en, %ckg_en, %ckg_out = firrtl.instance ckg @LegacyClockGate(in in: !firrtl.clock, in test_en: !firrtl.uint<1>, in en: !firrtl.uint<1>, out out: !firrtl.clock)
+    firrtl.strictconnect %ckg_in, %clock : !firrtl.clock
+    firrtl.strictconnect %ckg_test_en, %en : !firrtl.uint<1>
+    firrtl.strictconnect %ckg_en, %en : !firrtl.uint<1>
   }
 }
