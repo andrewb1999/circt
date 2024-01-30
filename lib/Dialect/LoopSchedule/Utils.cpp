@@ -884,6 +884,8 @@ struct TruncCleanupPattern : OpRewritePattern<TruncIOp> {
   LogicalResult
   matchAndRewrite(TruncIOp op,
                   PatternRewriter &rewriter) const override {
+    if (isa<BlockArgument>(op.getIn()))
+      return failure();
     auto *definingOp = op.getIn().getDefiningOp();
     auto outputType = op.getOut().getType();
     Operation *newOp = nullptr;
