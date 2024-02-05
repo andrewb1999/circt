@@ -355,7 +355,8 @@ struct MulStrengthReduction : OpConversionPattern<MulIOp> {
   LogicalResult
   matchAndRewrite(MulIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto *lhsDef = op.getLhs().getDefiningOp();
+    if (isa<BlockArgument>(op.getRhs()))
+      return failure();
     auto *rhsDef = op.getRhs().getDefiningOp();
 
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
@@ -380,7 +381,8 @@ struct RemUIStrengthReduction : OpConversionPattern<RemUIOp> {
   LogicalResult
   matchAndRewrite(RemUIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto *lhsDef = op.getLhs().getDefiningOp();
+    if (isa<BlockArgument>(op.getRhs()))
+      return failure();
     auto *rhsDef = op.getRhs().getDefiningOp();
 
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
@@ -417,7 +419,8 @@ struct DivSIStrengthReduction : OpConversionPattern<DivSIOp> {
   LogicalResult
   matchAndRewrite(DivSIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto *lhsDef = op.getLhs().getDefiningOp();
+    if (isa<BlockArgument>(op.getRhs()))
+      return failure();
     auto *rhsDef = op.getRhs().getDefiningOp();
 
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
@@ -438,6 +441,8 @@ struct DivSIStrengthReduction : OpConversionPattern<DivSIOp> {
 
 static bool mulLegalityCallback(Operation *op) {
   if (auto mulOp = dyn_cast<arith::MulIOp>(op)) {
+    if (isa<BlockArgument>(mulOp.getRhs()))
+      return true;
     auto *rhsDef = mulOp.getRhs().getDefiningOp();
 
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
@@ -452,8 +457,10 @@ static bool mulLegalityCallback(Operation *op) {
 }
 
 static bool divSIOpLegalityCallback(Operation *op) {
-  if (auto mulOp = dyn_cast<arith::DivSIOp>(op)) {
-    auto *rhsDef = mulOp.getRhs().getDefiningOp();
+  if (auto divOp = dyn_cast<arith::DivSIOp>(op)) {
+    if (isa<BlockArgument>(divOp.getRhs()))
+      return true;
+    auto *rhsDef = divOp.getRhs().getDefiningOp();
 
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
       if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
@@ -467,6 +474,8 @@ static bool divSIOpLegalityCallback(Operation *op) {
 
 static bool remUILegalityCallback(Operation *op) {
   if (auto remOp = dyn_cast<arith::RemUIOp>(op)) {
+    if (isa<BlockArgument>(remOp.getRhs()))
+      return true;
     auto *rhsDef = remOp.getRhs().getDefiningOp();
 
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
@@ -481,6 +490,8 @@ static bool remUILegalityCallback(Operation *op) {
 
 static bool remSILegalityCallback(Operation *op) {
   if (auto remOp = dyn_cast<arith::RemSIOp>(op)) {
+    if (isa<BlockArgument>(remOp.getRhs()))
+      return true;
     auto *rhsDef = remOp.getRhs().getDefiningOp();
 
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
@@ -983,10 +994,13 @@ struct LoadAddressNarrowingPattern : OpRewritePattern<LoopScheduleLoadOp> {
       auto dimSize = op.getMemRefType().getDimSize(i);
       auto bitwidth = llvm::Log2_64_Ceil(dimSize);
       auto newType = rewriter.getIntegerType(bitwidth);
-      if (newType != idx.get().getType()) {
-        auto newIdx = rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
-        idx.set(newIdx);
-        updated = true;
+      auto oldType = dyn_cast_or_null<IntegerType>(idx.get().getType());
+      if (oldType) {
+        if (newType.getIntOrFloatBitWidth() < oldType.getIntOrFloatBitWidth()) {
+          auto newIdx = rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
+          idx.set(newIdx);
+          updated = true;
+        }
       }
     }
     

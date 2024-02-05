@@ -286,7 +286,7 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
         .Case<IfOp, AffineYieldOp, arith::ConstantOp, arith::ExtSIOp,
               arith::ExtUIOp, arith::TruncIOp, CmpIOp, IndexCastOp,
               memref::AllocaOp, memref::AllocOp, loopschedule::AllocInterface,
-              YieldOp, func::ReturnOp>([&](Operation *combOp) {
+              YieldOp, func::ReturnOp, arith::SelectOp>([&](Operation *combOp) {
           // Some known combinational ops.
           problem.setLinkedOperatorType(combOp, combOpr);
           return WalkResult::advance();
