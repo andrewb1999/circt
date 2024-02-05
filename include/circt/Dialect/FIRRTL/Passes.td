@@ -96,10 +96,18 @@ def LowerFIRRTLTypes : Pass<"firrtl-lower-types", "firrtl::CircuitOp"> {
 def LowerSignatures : Pass<"firrtl-lower-signatures", "firrtl::CircuitOp"> {
   let summary = "Lower FIRRTL module signatures";
   let description = [{
-    Lower aggregate FIRRTL types in Modules as indicated by the calling 
+    Lower aggregate FIRRTL types in Modules as indicated by the calling
     convention.
   }];
   let constructor = "circt::firrtl::createLowerSignaturesPass()";
+}
+
+def PassiveWires : Pass<"firrtl-passive-wires", "firrtl::FModuleOp"> {
+  let summary = "Make FIRRTL wires have passive type";
+  let description = [{
+    Eliminate flips from aggregate types on wires.
+  }];
+  let constructor = "circt::firrtl::createPassiveWiresPass()";
 }
 
 
@@ -171,6 +179,7 @@ def Inliner : Pass<"firrtl-inliner", "firrtl::CircuitOp"> {
     ```
   }];
   let constructor = "circt::firrtl::createInlinerPass()";
+  let dependentDialects = ["debug::DebugDialect"];
 }
 
 def AddSeqMemPorts : Pass<"firrtl-add-seqmem-ports", "firrtl::CircuitOp"> {
@@ -658,6 +667,10 @@ def LowerIntrinsics : Pass<"firrtl-lower-intrinsics", "firrtl::CircuitOp"> {
     intmodule to their implementation or op.
   }];
   let constructor = "circt::firrtl::createLowerIntrinsicsPass()";
+  let options = [
+    Option<"fixupEICGWrapper", "fixup-eicg-wrapper", "bool", "false",
+      "Lower `EICG_wrapper` modules into clock gate intrinsics">,
+  ];
 }
 
 def LowerOpenAggs : Pass<"firrtl-lower-open-aggs", "firrtl::CircuitOp"> {
@@ -836,6 +849,26 @@ def Lint :
     inferred to be false. The pass emits error on such failing ops.
   }];
   let constructor = "circt::firrtl::createLintingPass()";
+}
+
+def SpecializeOption :
+    Pass<"firrtl-specialize-option", "firrtl::CircuitOp"> {
+  let summary = "Specialize a configurable design for a given option.";
+  let description = [{
+    If the design has option groups, instead of preserving the information
+    up to the emitted SystemVerilog, this pass specializes it early on for a
+    given choice.
+  }];
+  let constructor = "circt::firrtl::createSpecializeOptionPass()";
+
+  let options = [
+    ListOption<"select", "select", "std::string", 
+               "Options to specialize, in option=case format">,
+  ];
+  let statistics = [
+    Statistic<"numInstances", "num-instances",
+      "Number of instances specialized">
+  ];
 }
 
 #endif // CIRCT_DIALECT_FIRRTL_PASSES_TD

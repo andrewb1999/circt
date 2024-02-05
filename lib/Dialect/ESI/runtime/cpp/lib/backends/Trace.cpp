@@ -13,10 +13,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "esi/backends/Trace.h"
-#include "esi/Design.h"
-#include "esi/StdServices.h"
+
+#include "esi/Accelerator.h"
+#include "esi/Services.h"
 #include "esi/Utils.h"
 
+#include <cassert>
 #include <fstream>
 #include <iostream>
 #include <regex>
@@ -83,10 +85,11 @@ void TraceAccelerator::Impl::write(const AppIDPath &id, const string &portName,
   *traceWrite << "write " << id << '.' << portName << ": " << b64data << endl;
 }
 
-unique_ptr<Accelerator> TraceAccelerator::connect(string connectionString) {
+unique_ptr<AcceleratorConnection>
+TraceAccelerator::connect(string connectionString) {
   string modeStr;
   string manifestPath;
-  string traceFile = "trace.json";
+  string traceFile = "trace.log";
 
   // Parse the connection string.
   // <mode>:<manifest path>[:<traceFile>]
@@ -155,9 +158,9 @@ private:
 namespace {
 class WriteTraceChannelPort : public WriteChannelPort {
 public:
-  WriteTraceChannelPort(TraceAccelerator::Impl &impl, const AppIDPath &id,
-                        const string &portName)
-      : impl(impl), id(id), portName(portName) {}
+  WriteTraceChannelPort(TraceAccelerator::Impl &impl, const Type *type,
+                        const AppIDPath &id, const string &portName)
+      : WriteChannelPort(type), impl(impl), id(id), portName(portName) {}
 
   virtual void write(const void *data, size_t size) override {
     impl.write(id, portName, data, size);
@@ -173,13 +176,14 @@ protected:
 namespace {
 class ReadTraceChannelPort : public ReadChannelPort {
 public:
-  ReadTraceChannelPort(TraceAccelerator::Impl &impl) {}
+  ReadTraceChannelPort(TraceAccelerator::Impl &impl, const Type *type)
+      : ReadChannelPort(type) {}
 
-  virtual ssize_t read(void *data, size_t maxSize) override;
+  virtual std::ptrdiff_t read(void *data, size_t maxSize) override;
 };
 } // namespace
 
-ssize_t ReadTraceChannelPort::read(void *data, size_t maxSize) {
+std::ptrdiff_t ReadTraceChannelPort::read(void *data, size_t maxSize) {
   uint8_t *dataPtr = reinterpret_cast<uint8_t *>(data);
   for (size_t i = 0; i < maxSize; ++i)
     dataPtr[i] = rand() % 256;
@@ -195,15 +199,14 @@ public:
       : CustomService(idPath, details, clients), impl(impl) {}
 
   virtual map<string, ChannelPort &>
-  requestChannelsFor(AppIDPath idPath, const BundleType &bundleType,
-                     BundlePort::Direction svcDir) override {
+  requestChannelsFor(AppIDPath idPath, const BundleType *bundleType) override {
     map<string, ChannelPort &> channels;
-    for (auto [name, dir, type] : bundleType.getChannels()) {
+    for (auto [name, dir, type] : bundleType->getChannels()) {
       ChannelPort *port;
-      if (BundlePort::isWrite(dir, svcDir))
-        port = new WriteTraceChannelPort(impl, idPath, name);
+      if (BundlePort::isWrite(dir))
+        port = new WriteTraceChannelPort(impl, type, idPath, name);
       else
-        port = new ReadTraceChannelPort(impl);
+        port = new ReadTraceChannelPort(impl, type);
       channels.emplace(name, *port);
       impl.adoptChannelPort(port);
     }

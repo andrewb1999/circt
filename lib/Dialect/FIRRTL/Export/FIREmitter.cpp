@@ -59,6 +59,8 @@ struct Emitter {
                        Block::BlockArgListType arguments = {});
   void emitModuleParameters(Operation *op, ArrayAttr parameters);
   void emitDeclaration(LayerOp op);
+  void emitDeclaration(OptionOp op);
+  void emitEnabledLayers(ArrayRef<Attribute> layers);
 
   // Statement emission
   void emitStatementsInBlock(Block &block);
@@ -74,6 +76,7 @@ struct Emitter {
   void emitStatement(StrictConnectOp op);
   void emitStatement(PropAssignOp op);
   void emitStatement(InstanceOp op);
+  void emitStatement(InstanceChoiceOp op);
   void emitStatement(AttachOp op);
   void emitStatement(MemOp op);
   void emitStatement(InvalidValueOp op);
@@ -251,6 +254,18 @@ struct Emitter {
                                  [&](Value v) { emitSubExprIBox2(v); });
   }
 
+  /// Emit a (potentially nested) symbol reference as `A.B.C`.
+  void emitSymbol(SymbolRefAttr symbol) {
+    ps.ibox(2, IndentStyle::Block);
+    ps << symbol.getRootReference();
+    for (auto nested : symbol.getNestedReferences()) {
+      ps.zerobreak();
+      ps << ".";
+      ps << nested.getAttr();
+    }
+    ps.end();
+  }
+
 private:
   /// Emit an error and remark that emission failed.
   InFlightDiagnostic emitError(Operation *op, const Twine &message) {
@@ -384,6 +399,7 @@ void Emitter::emitCircuit(CircuitOp op) {
             ps << PP::newline;
           })
           .Case<LayerOp>([&](auto op) { emitDeclaration(op); })
+          .Case<OptionOp>([&](auto op) { emitDeclaration(op); })
           .Default([&](auto op) {
             emitOpError(op, "not supported for emission inside circuit");
           });
@@ -393,11 +409,25 @@ void Emitter::emitCircuit(CircuitOp op) {
   symInfos = std::nullopt;
 }
 
+void Emitter::emitEnabledLayers(ArrayRef<Attribute> layers) {
+  for (auto layer : layers) {
+    ps << PP::space;
+    ps.cbox(2, IndentStyle::Block);
+    ps << "enablelayer" << PP::space;
+    emitSymbol(cast<SymbolRefAttr>(layer));
+    ps << PP::end;
+  }
+}
+
 /// Emit an entire module.
 void Emitter::emitModule(FModuleOp op) {
   startStatement();
-  ps << "module " << PPExtString(legalize(op.getNameAttr())) << " :";
+  ps.cbox(4, IndentStyle::Block);
+  ps << "module " << PPExtString(legalize(op.getNameAttr()));
+  emitEnabledLayers(op.getLayers());
+  ps << PP::nbsp << ":" << PP::end;
   emitLocation(op);
+
   ps.scopedBox(PP::bbox2, [&]() {
     setPendingNewline();
 
@@ -417,8 +447,12 @@ void Emitter::emitModule(FModuleOp op) {
 /// Emit an external module.
 void Emitter::emitModule(FExtModuleOp op) {
   startStatement();
-  ps << "extmodule " << PPExtString(legalize(op.getNameAttr())) << " :";
+  ps.cbox(4, IndentStyle::Block);
+  ps << "extmodule " << PPExtString(legalize(op.getNameAttr()));
+  emitEnabledLayers(op.getLayers());
+  ps << PP::nbsp << ":" << PP::end;
   emitLocation(op);
+
   ps.scopedBox(PP::bbox2, [&]() {
     setPendingNewline();
 
@@ -441,8 +475,12 @@ void Emitter::emitModule(FExtModuleOp op) {
 /// Emit an intrinsic module
 void Emitter::emitModule(FIntModuleOp op) {
   startStatement();
-  ps << "intmodule " << PPExtString(legalize(op.getNameAttr())) << " :";
+  ps.cbox(4, IndentStyle::Block);
+  ps << "intmodule " << PPExtString(legalize(op.getNameAttr()));
+  emitEnabledLayers(op.getLayers());
+  ps << PP::nbsp << ":" << PP::end;
   emitLocation(op);
+
   ps.scopedBox(PP::bbox2, [&]() {
     setPendingNewline();
 
@@ -516,7 +554,7 @@ void Emitter::emitModuleParameters(Operation *op, ArrayAttr parameters) {
 /// Emit a layer definition.
 void Emitter::emitDeclaration(LayerOp op) {
   startStatement();
-  ps << "declgroup " << PPExtString(op.getSymName()) << ", "
+  ps << "layer " << PPExtString(op.getSymName()) << ", "
      << PPExtString(stringifyLayerConvention(op.getConvention())) << " : ";
   emitLocationAndNewLine(op);
   ps.scopedBox(PP::bbox2, [&]() {
@@ -529,6 +567,21 @@ void Emitter::emitDeclaration(LayerOp op) {
           });
     }
   });
+}
+
+/// Emit an option declaration.
+void Emitter::emitDeclaration(OptionOp op) {
+  startStatement();
+  ps << "option " << PPExtString(legalize(op.getSymNameAttr())) << " :";
+  emitLocation(op);
+  ps.scopedBox(PP::bbox2, [&] {
+    for (auto caseOp : op.getBody().getOps<OptionCaseOp>()) {
+      ps << PP::newline;
+      ps << PPExtString(legalize(caseOp.getSymNameAttr()));
+      emitLocation(caseOp);
+    }
+  });
+  ps << PP::newline << PP::newline;
 }
 
 /// Check if an operation is inlined into the emission of their users. For
@@ -546,11 +599,11 @@ void Emitter::emitStatementsInBlock(Block &block) {
     TypeSwitch<Operation *>(&bodyOp)
         .Case<WhenOp, WireOp, RegOp, RegResetOp, NodeOp, StopOp, SkipOp,
               PrintFOp, AssertOp, AssumeOp, CoverOp, ConnectOp, StrictConnectOp,
-              PropAssignOp, InstanceOp, AttachOp, MemOp, InvalidValueOp,
-              SeqMemOp, CombMemOp, MemoryPortOp, MemoryDebugPortOp,
-              MemoryPortAccessOp, RefDefineOp, RefForceOp, RefForceInitialOp,
-              RefReleaseOp, RefReleaseInitialOp, LayerBlockOp>(
-            [&](auto op) { emitStatement(op); })
+              PropAssignOp, InstanceOp, InstanceChoiceOp, AttachOp, MemOp,
+              InvalidValueOp, SeqMemOp, CombMemOp, MemoryPortOp,
+              MemoryDebugPortOp, MemoryPortAccessOp, RefDefineOp, RefForceOp,
+              RefForceInitialOp, RefReleaseOp, RefReleaseInitialOp,
+              LayerBlockOp>([&](auto op) { emitStatement(op); })
         .Default([&](auto op) {
           startStatement();
           ps << "// operation " << PPExtString(op->getName().getStringRef());
@@ -803,6 +856,33 @@ void Emitter::emitStatement(InstanceOp op) {
   }
 }
 
+void Emitter::emitStatement(InstanceChoiceOp op) {
+  startStatement();
+  auto legalName = legalize(op.getNameAttr());
+  ps << "instchoice " << PPExtString(legalName) << " of "
+     << PPExtString(legalize(op.getDefaultTargetAttr().getAttr())) << ", "
+     << PPExtString(legalize(op.getOptionNameAttr())) << " :";
+  emitLocation(op);
+  ps.scopedBox(PP::bbox2, [&] {
+    for (const auto &[optSym, targetSym] : op.getTargetChoices()) {
+      ps << PP::newline;
+      ps << PPExtString(legalize(optSym.getLeafReference()));
+      ps << " => ";
+      ps << PPExtString(legalize(targetSym.getAttr()));
+    }
+  });
+  setPendingNewline();
+
+  SmallString<16> portName(legalName);
+  portName.push_back('.');
+  unsigned baseLen = portName.size();
+  for (unsigned i = 0, e = op.getNumResults(); i < e; ++i) {
+    portName.append(legalize(op.getPortName(i)));
+    addValueName(op.getResult(i), portName);
+    portName.resize(baseLen);
+  }
+}
+
 void Emitter::emitStatement(AttachOp op) {
   emitStatementFunctionOp(PPExtString("attach"), op);
 }
@@ -984,7 +1064,7 @@ void Emitter::emitStatement(RefReleaseInitialOp op) {
 
 void Emitter::emitStatement(LayerBlockOp op) {
   startStatement();
-  ps << "group " << op.getLayerName().getLeafReference() << " :";
+  ps << "layerblock " << op.getLayerName().getLeafReference() << " :";
   emitLocationAndNewLine(op);
   auto *body = op.getBody();
   ps.scopedBox(PP::bbox2, [&]() { emitStatementsInBlock(*body); });
@@ -1332,8 +1412,16 @@ void Emitter::emitType(Type type, bool includeConst) {
         if (type.getForceable())
           ps << "RW";
         ps << "Probe<";
+        ps.cbox(2, IndentStyle::Block);
+        ps.zerobreak();
         emitType(type.getType());
-        ps << ">";
+        if (auto layer = type.getLayer()) {
+          ps << ",";
+          ps.space();
+          emitSymbol(type.getLayer());
+        }
+        ps << BreakToken(0, -2) << ">";
+        ps.end();
       })
       .Case<AnyRefType>([&](AnyRefType type) { ps << "AnyRef"; })
       .Case<StringType>([&](StringType type) { ps << "String"; })

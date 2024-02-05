@@ -104,6 +104,20 @@ def LegalizeAnonEnums : Pass<"legalize-anon-enums", "mlir::ModuleOp"> {
   ];
 }
 
+def HWLowerInstanceChoices : Pass<"hw-lower-instance-choices",
+                                  "mlir::ModuleOp"> {
+  let summary = "Prepare the collateral for instance choice emission";
+  let description = [{
+    This pass runs as part of verilog emission.
+    It introduces the macros & file lists to which instance choices lower to.
+  }];
+
+  let constructor = "createHWLowerInstanceChoicesPass()";
+  let dependentDialects = [
+    "circt::sv::SVDialect", "circt::hw::HWDialect"
+  ];
+}
+
 def PrepareForEmission : Pass<"prepare-for-emission",
                               "hw::HWModuleOp"> {
   let summary = "Prepare IR for ExportVerilog";
@@ -389,7 +403,7 @@ def CalyxRemoveGroupsFromFSM : Pass<"calyx-remove-groups-fsm", "calyx::Component
 //===----------------------------------------------------------------------===//
 
 def ConvertFSMToSV : Pass<"convert-fsm-to-sv", "mlir::ModuleOp"> {
-  let summary = "Convert FSM to HW";
+  let summary = "Convert FSM to SV and HW";
   let constructor = "circt::createConvertFSMToSVPass()";
   let dependentDialects = ["circt::hw::HWDialect", "circt::comb::CombDialect",
                            "circt::seq::SeqDialect", "circt::sv::SVDialect"];
@@ -407,7 +421,8 @@ def LowerFIRRTLToHW : Pass<"lower-firrtl-to-hw", "mlir::ModuleOp"> {
   let constructor = "circt::createLowerFIRRTLToHWPass()";
   let dependentDialects = ["comb::CombDialect", "hw::HWDialect",
                            "seq::SeqDialect", "sv::SVDialect",
-                           "ltl::LTLDialect", "verif::VerifDialect"];
+                           "ltl::LTLDialect", "verif::VerifDialect",
+                           "sim::SimDialect"];
   let options = [
     Option<"enableAnnotationWarning", "warn-on-unprocessed-annotations",
            "bool", "false",
@@ -565,6 +580,21 @@ def LowerHWToSV : Pass<"lower-hw-to-sv", "hw::HWModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// HWToBTOR2
+//===----------------------------------------------------------------------===//
+
+def ConvertHWToBTOR2 : Pass<"convert-hw-to-btor2", "hw::HWModuleOp"> {
+  let summary = "Convert HW to BTOR2";
+  let description = [{
+    This pass converts a HW module into a state transition system that is then
+    directly used to emit btor2. The output of this pass is thus a btor2 string.
+  }];
+  let constructor = "circt::createConvertHWToBTOR2Pass()";
+  let dependentDialects = ["hw::HWDialect", "sv::SVDialect", "comb::CombDialect",
+                           "seq::SeqDialect"];
+}
+
+//===----------------------------------------------------------------------===//
 // VerifToSV
 //===----------------------------------------------------------------------===//
 
@@ -615,6 +645,10 @@ def ConvertToArcs : Pass<"convert-to-arcs", "mlir::ModuleOp"> {
   }];
   let constructor = "circt::createConvertToArcsPass()";
   let dependentDialects = ["circt::arc::ArcDialect"];
+  let options = [
+    Option<"tapRegisters", "tap-registers", "bool", "true",
+      "Make registers observable">,
+  ];
 }
 
 //===----------------------------------------------------------------------===//
@@ -671,6 +705,20 @@ def LowerFirMem : Pass<"lower-seq-firmem", "mlir::ModuleOp"> {
   let summary = "Lower seq.firmem ops to instances of hw.module.generated ops";
   let constructor = "circt::createLowerFirMemPass()";
   let dependentDialects = ["circt::hw::HWDialect"];
+}
+
+//===----------------------------------------------------------------------===//
+// ConvertSimToSV
+//===----------------------------------------------------------------------===//
+
+def LowerSimToSV: Pass<"lower-sim-to-sv",  "hw::HWModuleOp"> {
+  let summary = "Lower simulator-specific `sim` ops to SV.";
+  let constructor = "circt::createLowerSimToSVPass()";
+  let dependentDialects = [
+    "circt::comb::CombDialect",
+    "circt::sv::SVDialect",
+    "circt::hw::HWDialect"
+  ];
 }
 
 #endif // CIRCT_CONVERSION_PASSES_TD

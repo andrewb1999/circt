@@ -18,6 +18,7 @@
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Support/IndentedOstream.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ToolOutputFile.h"
@@ -77,14 +78,22 @@ static void findLocations(Location loc, unsigned level,
 /// Find the best location to report as source location ("HGL", emitted = false)
 /// or as emitted location ("HDL", emitted = true). Returns any non-FIR file it
 /// finds, and only falls back to FIR files if nothing else is found.
-static FileLineColLoc findBestLocation(Location loc, bool emitted) {
+static FileLineColLoc findBestLocation(Location loc, bool emitted,
+                                       bool fileMustExist) {
   SmallVector<FileLineColLoc> locs;
   findLocations(loc, emitted ? 1 : 0, locs);
+  if (fileMustExist) {
+    unsigned tail = 0;
+    for (unsigned head = 0, end = locs.size(); head != end; ++head)
+      if (llvm::sys::fs::exists(locs[head].getFilename().getValue()))
+        locs[tail++] = locs[head];
+    locs.resize(tail);
+  }
   for (auto loc : locs)
-    if (!loc.getFilename().getValue().endswith(".fir"))
+    if (!loc.getFilename().getValue().ends_with(".fir"))
       return loc;
   for (auto loc : locs)
-    if (loc.getFilename().getValue().endswith(".fir"))
+    if (loc.getFilename().getValue().ends_with(".fir"))
       return loc;
   return {};
 }
@@ -105,6 +114,51 @@ struct DenseMapInfo<JValue> {
   static bool isEqual(const JValue &a, const JValue &b) { return a == b; }
 };
 } // namespace llvm
+
+/// Make the given `path` relative to the `relativeTo` path and store the result
+/// in `relativePath`. Returns whether the conversion was successful. Fails if
+/// the `relativeTo` path has a longer prefix of `../` than `path`, or if it
+/// contains any non-prefix `../` components. Does not clear `relativePath`
+/// before appending to it.
+static bool makePathRelative(StringRef path, StringRef relativeTo,
+                             SmallVectorImpl<char> &relativePath) {
+  using namespace llvm::sys;
+  auto sourceIt = path::begin(path);
+  auto outputIt = path::begin(relativeTo);
+  auto sourceEnd = path::end(path);
+  auto outputEnd = path::end(relativeTo);
+
+  // Strip common prefix:
+  // - (), () -> (), ()
+  // - (a/b/c/d), (a/b/e/f) -> (c/d), (e/f)
+  // - (a/b), (a/b/c/d) -> (), (c/d)
+  // - (../a/b), (../a/c) -> (b), (c)
+  while (outputIt != outputEnd && sourceIt != sourceEnd &&
+         *outputIt == *sourceIt) {
+    ++outputIt;
+    ++sourceIt;
+  }
+
+  // For every component in the output path insert a `../` into the source
+  // path. Abort if the output path contains a `../`, because we don't
+  // know where that climbs out to. Consider the changes to the following
+  // output-source pairs as an example:
+  //
+  // - (a/b), (c/d) -> (), (../../c/d)
+  // - (), (a/b) -> (), (a/b)
+  // - (../a), (c/d) -> (../a), (c/d)
+  // - (a/../b), (c/d) -> (../b), (../c/d)
+  for (; outputIt != outputEnd && *outputIt != ".."; ++outputIt)
+    path::append(relativePath, "..");
+  for (; sourceIt != sourceEnd; ++sourceIt)
+    path::append(relativePath, *sourceIt);
+
+  // If there are no more remaining components in the output path, we were
+  // successfully able to translate them into `..` in the source path.
+  // Otherwise the `relativeTo` path contained `../` components that we could
+  // not handle.
+  return outputIt == outputEnd;
+}
 
 //===----------------------------------------------------------------------===//
 // HGLDD File Emission
@@ -156,7 +210,8 @@ struct EmittedExpr {
   operator bool() const { return expr != nullptr && type; }
 };
 
-llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const EmittedType &type) {
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                     const EmittedType &type) {
   if (!type)
     return os << "<null>";
   os << type.name;
@@ -170,7 +225,8 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const EmittedType &type) {
   return os;
 }
 
-llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const EmittedExpr &expr) {
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                     const EmittedExpr &expr) {
   if (!expr)
     return os << "<null>";
   return os << expr.expr << " : " << expr.type;
@@ -183,7 +239,7 @@ struct FileEmitter {
   SmallVector<DIModule *> modules;
   SmallString<64> outputFileName;
   StringAttr hdlFile;
-  SmallMapVector<StringAttr, unsigned, 8> sourceFiles;
+  SmallMapVector<StringAttr, std::pair<StringAttr, unsigned>, 8> sourceFiles;
   Namespace objectNamespace;
   SmallMapVector<JValue, StringRef, 8> structDefs;
   SmallString<128> structNameHint;
@@ -192,35 +248,15 @@ struct FileEmitter {
   void emit(JOStream &json);
   JValue emitLoc(FileLineColLoc loc, FileLineColLoc endLoc, bool emitted);
   void emitModule(JOStream &json, DIModule *module);
+  void emitModuleBody(JOStream &json, DIModule *module);
   void emitInstance(JOStream &json, DIInstance *instance);
   void emitVariable(JOStream &json, DIVariable *variable);
   EmittedExpr emitExpression(Value value);
 
-  /// Get a numeric index for the given `sourceFile`. Populates `sourceFiles`
-  /// with a unique ID assignment for each source file.
-  unsigned getSourceFile(StringAttr sourceFile, bool emitted) {
-    // Apply the source file prefix if this is a source file (emitted = false).
-    if (!emitted && !options->sourceFilePrefix.empty() &&
-        !llvm::sys::path::is_absolute(sourceFile.getValue())) {
-      SmallString<64> buffer;
-      buffer = options->sourceFilePrefix;
-      llvm::sys::path::append(buffer, sourceFile.getValue());
-      sourceFile = StringAttr::get(sourceFile.getContext(), buffer);
-    }
+  unsigned getSourceFile(StringAttr sourceFile, bool emitted);
 
-    // Apply the output file prefix if this is an outpu file (emitted = true).
-    if (emitted && !options->outputFilePrefix.empty() &&
-        !llvm::sys::path::is_absolute(sourceFile.getValue())) {
-      SmallString<64> buffer;
-      buffer = options->outputFilePrefix;
-      llvm::sys::path::append(buffer, sourceFile.getValue());
-      sourceFile = StringAttr::get(sourceFile.getContext(), buffer);
-    }
-
-    auto &slot = sourceFiles[sourceFile];
-    if (slot == 0)
-      slot = sourceFiles.size();
-    return slot;
+  FileLineColLoc findBestLocation(Location loc, bool emitted) {
+    return ::findBestLocation(loc, emitted, options->onlyExistingFileLocs);
   }
 
   /// Find the best location and, if one is found, emit it under the given
@@ -301,6 +337,82 @@ struct FileEmitter {
 
 } // namespace
 
+/// Get a numeric index for the given `sourceFile`. Populates `sourceFiles`
+/// with a unique ID assignment for each source file.
+unsigned FileEmitter::getSourceFile(StringAttr sourceFile, bool emitted) {
+  using namespace llvm::sys;
+
+  // Check if we have already allocated an ID for this source file. If we
+  // have, return it. Otherwise, assign a new ID and normalize the path
+  // according to HGLDD requirements.
+  auto &slot = sourceFiles[sourceFile];
+  if (slot.first)
+    return slot.second;
+  slot.second = sourceFiles.size();
+
+  // If the source file is an absolute path, simply use that unchanged.
+  if (path::is_absolute(sourceFile.getValue())) {
+    slot.first = sourceFile;
+    return slot.second;
+  }
+
+  // If specified, apply the output file prefix if this is an output file
+  // (`emitted` is true), or the source file prefix if this is a source file
+  // (`emitted` is false).
+  StringRef filePrefix =
+      emitted ? options->outputFilePrefix : options->sourceFilePrefix;
+  if (!filePrefix.empty()) {
+    SmallString<64> buffer = filePrefix;
+    path::append(buffer, sourceFile.getValue());
+    slot.first = StringAttr::get(sourceFile.getContext(), buffer);
+    return slot.second;
+  }
+
+  // Otherwise make the path relative to the HGLDD output file.
+
+  // Remove any `./` and `../` inside the path. This has also been applied
+  // to the `outputFileName`. As a result, both paths start with zero or
+  // more `../`, followed by the rest of the path without any `./` or `../`.
+  SmallString<64> sourcePath = sourceFile.getValue();
+  path::remove_dots(sourcePath, true);
+
+  // If the output file is also relative, try to determine the relative path
+  // between them directly.
+  StringRef relativeToDir = path::parent_path(outputFileName);
+  if (!path::is_absolute(outputFileName)) {
+    SmallString<64> buffer;
+    if (makePathRelative(sourcePath, relativeToDir, buffer)) {
+      slot.first = StringAttr::get(sourceFile.getContext(), buffer);
+      return slot.second;
+    }
+  }
+
+  // If the above failed, try to make the output and source paths absolute and
+  // retry computing a relative path. Only do this if conversion to absolute
+  // paths is successful for both paths, and if the resulting paths have at
+  // least the first path component in common. This prevents computing a
+  // relative path between `/home/foo/bar` and `/tmp/baz/noob` as
+  // `../../../tmp/baz/noob`.
+  SmallString<64> outputPath = relativeToDir;
+  fs::make_absolute(sourcePath);
+  fs::make_absolute(outputPath);
+  if (path::is_absolute(sourcePath) && path::is_absolute(outputPath)) {
+    auto firstSourceComponent = *path::begin(path::relative_path(sourcePath));
+    auto firstOutputComponent = *path::begin(path::relative_path(outputPath));
+    if (firstSourceComponent == firstOutputComponent) {
+      SmallString<64> buffer;
+      if (makePathRelative(sourcePath, outputPath, buffer)) {
+        slot.first = StringAttr::get(sourceFile.getContext(), buffer);
+        return slot.second;
+      }
+    }
+  }
+
+  // Otherwise simply use the absolute source file path.
+  slot.first = StringAttr::get(sourceFile.getContext(), sourcePath);
+  return slot.second;
+}
+
 void FileEmitter::emit(llvm::raw_ostream &os) {
   JOStream json(os, 2);
   emit(json);
@@ -333,8 +445,8 @@ void FileEmitter::emit(JOStream &json) {
   json.attributeObject("HGLDD", [&] {
     json.attribute("version", "1.0");
     json.attributeArray("file_info", [&] {
-      for (auto [file, index] : sourceFiles)
-        json.value(file.getValue());
+      for (auto [key, fileAndId] : sourceFiles)
+        json.value(fileAndId.first.getValue());
     });
     if (hdlFileIndex)
       json.attribute("hdl_file_index", *hdlFileIndex);
@@ -414,6 +526,12 @@ void FileEmitter::emitModule(JOStream &json, DIModule *module) {
     findAndEmitLocOrGuess(json, "hgl_loc", op, false);
     findAndEmitLoc(json, "hdl_loc", op->getLoc(), true);
   }
+  emitModuleBody(json, module);
+  json.objectEnd();
+}
+
+/// Emit the debug info for a `DIModule` body.
+void FileEmitter::emitModuleBody(JOStream &json, DIModule *module) {
   json.attributeArray("port_vars", [&] {
     for (auto *var : module->variables)
       emitVariable(json, var);
@@ -422,23 +540,43 @@ void FileEmitter::emitModule(JOStream &json, DIModule *module) {
     for (auto *instance : module->instances)
       emitInstance(json, instance);
   });
-  json.objectEnd();
 }
 
 /// Emit the debug info for a `DIInstance`.
 void FileEmitter::emitInstance(JOStream &json, DIInstance *instance) {
   json.objectBegin();
+
+  // Emit the instance and module name.
   json.attribute("name", instance->name.getValue());
-  auto verilogName = getVerilogInstanceName(*instance);
-  if (verilogName != instance->name)
-    json.attribute("hdl_obj_name", verilogName.getValue());
-  json.attribute("obj_name", instance->module->name.getValue()); // HGL
-  json.attribute("module_name",
-                 getVerilogModuleName(*instance->module).getValue()); // HDL
+  if (!instance->module->isInline) {
+    auto verilogName = getVerilogInstanceName(*instance);
+    if (verilogName != instance->name)
+      json.attribute("hdl_obj_name", verilogName.getValue());
+
+    json.attribute("obj_name", instance->module->name.getValue()); // HGL
+    json.attribute("module_name",
+                   getVerilogModuleName(*instance->module).getValue()); // HDL
+  }
+
   if (auto *op = instance->op) {
     findAndEmitLoc(json, "hgl_loc", op->getLoc(), false);
     findAndEmitLoc(json, "hdl_loc", op->getLoc(), true);
   }
+
+  // Emit the module body inline if this is an inline scope.
+  if (instance->module->isInline) {
+    auto structNameHintLen = structNameHint.size();
+    if (!instance->module->name.empty()) {
+      structNameHint += '_';
+      structNameHint += instance->module->name.getValue();
+    } else if (!instance->name.empty()) {
+      structNameHint += '_';
+      structNameHint += instance->name.getValue();
+    }
+    emitModuleBody(json, instance->module);
+    structNameHint.resize(structNameHintLen);
+  }
+
   json.objectEnd();
 }
 
@@ -526,7 +664,8 @@ EmittedExpr FileEmitter::emitExpression(Value value) {
       instName = instOp.getInstanceNameAttr();
     if (!instName)
       return {};
-    auto *moduleOp = instOp.getReferencedModuleCached(symbolCache);
+    auto *moduleOp =
+        symbolCache->getDefinition(instOp.getReferencedModuleNameAttr());
     auto portName =
         cast<hw::HWModuleLike>(moduleOp)
             .getPort(instOp.getPortIdForOutputId(result.getResultNumber()))
@@ -800,7 +939,7 @@ Emitter::Emitter(Operation *module, const EmitHGLDDOptions &options)
   for (auto [moduleName, module] : di.moduleNodes) {
     StringAttr hdlFile;
     if (module->op)
-      if (auto fileLoc = findBestLocation(module->op->getLoc(), true))
+      if (auto fileLoc = findBestLocation(module->op->getLoc(), true, false))
         hdlFile = fileLoc.getFilename();
     groups[hdlFile].modules.push_back(module);
   }
@@ -819,6 +958,7 @@ Emitter::Emitter(Operation *module, const EmitHGLDDOptions &options)
     else
       llvm::sys::path::append(emitter.outputFileName, fileName);
     llvm::sys::path::replace_extension(emitter.outputFileName, "dd");
+    llvm::sys::path::remove_dots(emitter.outputFileName, true);
     files.push_back(std::move(emitter));
   }
 

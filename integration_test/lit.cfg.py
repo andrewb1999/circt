@@ -172,6 +172,7 @@ if ieee_sims and ieee_sims[-1][1] == config.iverilog_path:
 # Enable ESI runtime tests.
 if config.esi_runtime == "1":
   config.available_features.add('esi-runtime')
+  tools.append('esiquery')
 
   llvm_config.with_environment('PYTHONPATH',
                                [f"{config.esi_runtime_path}/python/"],
@@ -205,6 +206,7 @@ if config.lec_enabled != "":
   config.available_features.add('circt-lec')
   tools.append('circt-lec')
 
+config.substitutions.append(('%driver', f'{config.driver}'))
 llvm_config.add_tool_substitutions(tools, tool_dirs)
 
 # cocotb availability

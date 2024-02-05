@@ -12,7 +12,7 @@
 // Check if printing with very short line length, removing info locators (@[...]), no line is longer than 5x line length.
 // RUN: circt-translate --export-firrtl %s --target-line-length=10 | sed -e 's/ @\[.*\]//' | FileCheck %s --implicit-check-not "{{^(.{50})}}" --check-prefix PRETTY
 
-// CHECK-LABEL: FIRRTL version 3.3.0
+// CHECK-LABEL: FIRRTL version 4.0.0
 // CHECK-LABEL: circuit Foo :
 // PRETTY-LABEL: circuit Foo :
 firrtl.circuit "Foo" {
@@ -685,12 +685,12 @@ firrtl.circuit "Foo" {
 
   // Test optional group declaration and definition emission.
   //
-  // CHECK-LABEL: declgroup GroupA, bind :
-  // CHECK-NEXT:    declgroup GroupB, bind :
-  // CHECK-NEXT:      declgroup GroupC, bind :
-  // CHECK-NEXT:      declgroup GroupD, bind :
-  // CHECK-NEXT:        declgroup GroupE, bind :
-  // CHECK-NEXT:    declgroup GroupF, bind :
+  // CHECK-LABEL: layer GroupA, bind :
+  // CHECK-NEXT:    layer GroupB, bind :
+  // CHECK-NEXT:      layer GroupC, bind :
+  // CHECK-NEXT:      layer GroupD, bind :
+  // CHECK-NEXT:        layer GroupE, bind :
+  // CHECK-NEXT:    layer GroupF, bind :
   firrtl.layer @GroupA bind {
     firrtl.layer @GroupB bind {
       firrtl.layer @GroupC bind {
@@ -704,13 +704,18 @@ firrtl.circuit "Foo" {
     }
   }
   // CHECK:      module ModuleWithGroups :
-  // CHECK-NEXT:   group GroupA :
-  // CHECK-NEXT:     group GroupB :
-  // CHECK-NEXT:       group GroupC :
-  // CHECK-NEXT:       group GroupD :
-  // CHECK-NEXT:         group GroupE :
-  // CHECK-NEXT:     group GroupF :
-  firrtl.module @ModuleWithGroups() {
+  // CHECK-NEXT:   output a : Probe<UInt<1>, GroupA>
+  // CHECK-NEXT:   output b : RWProbe<UInt<1>, GroupA.GroupB>
+  // CHECK:        layerblock GroupA :
+  // CHECK-NEXT:     layerblock GroupB :
+  // CHECK-NEXT:       layerblock GroupC :
+  // CHECK-NEXT:       layerblock GroupD :
+  // CHECK-NEXT:         layerblock GroupE :
+  // CHECK-NEXT:     layerblock GroupF :
+  firrtl.module @ModuleWithGroups(
+    out %a: !firrtl.probe<uint<1>, @GroupA>,
+    out %b: !firrtl.rwprobe<uint<1>, @GroupA::@GroupB>
+  ) {
     firrtl.layerblock @GroupA {
       firrtl.layerblock @GroupA::@GroupB {
         firrtl.layerblock @GroupA::@GroupB::@GroupC {
@@ -724,6 +729,75 @@ firrtl.circuit "Foo" {
       }
     }
   }
+
+  // Test line-breaks for very large layer associations.
+  firrtl.layer @Group1234567890 bind {
+    firrtl.layer @Group1234567890 bind {
+      firrtl.layer @Group1234567890 bind {
+        firrtl.layer @Group1234567890 bind {
+          firrtl.layer @Group1234567890 bind {
+            firrtl.layer @Group1234567890 bind {
+              firrtl.layer @Group1234567890 bind {
+               firrtl.layer @Group1234567890 bind {}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // CHECK: module ModuleWithLongProbeColor
+  // CHECK-NEXT:  output o : Probe<
+  // CHECK-NEXT:    UInt<1>,
+  // CHECK-NEXT:    Group1234567890.Group1234567890.Group1234567890.Group1234567890
+  // CHECK-NEXT:      .Group1234567890.Group1234567890.Group1234567890.Group1234567890
+  // CHECK-NEXT:  >
+  firrtl.module @ModuleWithLongProbeColor(
+    out %o: !firrtl.probe<uint<1>, @Group1234567890::@Group1234567890::@Group1234567890::@Group1234567890::@Group1234567890::@Group1234567890::@Group1234567890::@Group1234567890>
+  ) {}
+
+  // CHECK: module ModuleWithEnabledLayers enablelayer GroupA enablelayer GroupA.GroupB :
+  firrtl.module @ModuleWithEnabledLayers() attributes {
+    layers = [
+      @GroupA,
+      @GroupA::@GroupB
+    ]
+  } {}
+
+  // CHECK:      extmodule ExtModuleWithEnabledLayers
+  // CHECK-NEXT:     enablelayer GroupA
+  // CHECK-NEXT:     enablelayer GroupA.GroupB :
+  firrtl.extmodule @ExtModuleWithEnabledLayers() attributes {
+    layers = [
+      @GroupA,
+      @GroupA::@GroupB
+    ]
+  }
+
+  // CHECK:      intmodule IntModuleWithEnabledLayers
+  // CHECK-NEXT:     enablelayer GroupA
+  // CHECK-NEXT:     enablelayer GroupA.GroupB :
+  firrtl.intmodule @IntModuleWithEnabledLayers() attributes {
+    layers = [
+      @GroupA,
+      @GroupA::@GroupB
+    ]
+  }
+
+  // CHECK:      module ModuleWithLargeEnabledLayers
+  // CHECK-NEXT:     enablelayer Group1234567890.Group1234567890
+  // CHECK-NEXT:     enablelayer
+  // CHECK-NEXT:       Group1234567890.Group1234567890.Group1234567890.Group1234567890
+  // CHECK-NEXT:     enablelayer
+  // CHECK-NEXT:       Group1234567890.Group1234567890.Group1234567890.Group1234567890
+  // CHECK-NEXT:         .Group1234567890.Group1234567890.Group1234567890.Group1234567890 :
+  firrtl.module @ModuleWithLargeEnabledLayers() attributes {
+    layers = [
+      @Group1234567890::@Group1234567890,
+      @Group1234567890::@Group1234567890::@Group1234567890::@Group1234567890,
+      @Group1234567890::@Group1234567890::@Group1234567890::@Group1234567890::@Group1234567890::@Group1234567890::@Group1234567890::@Group1234567890
+    ]} {}
 
   // CHECK: module RWProbe :
   // CHECK-NEXT: input in : { a : UInt<1> }[2]
@@ -743,5 +817,29 @@ firrtl.circuit "Foo" {
     %q, %q_ref = firrtl.node interesting_name %read forceable : !firrtl.uint<1>
     %refcast = firrtl.ref.cast %q_ref : (!firrtl.rwprobe<uint<1>>) -> !firrtl.rwprobe<uint>
     firrtl.ref.define %p2, %refcast : !firrtl.rwprobe<uint>
+  }
+
+  // CHECK-LABEL: option Platform :
+  firrtl.option @Platform {
+    // CHECK-NEXT: FPGA
+    firrtl.option_case @FPGA
+    // CHECK-NEXT: ASIC
+    firrtl.option_case @ASIC
+  }
+
+  // CHECK-LABEL: extmodule DefaultTarget
+  firrtl.extmodule private @DefaultTarget()
+  // CHECK-LABEL: extmodule FPGATarget
+  firrtl.extmodule private @FPGATarget()
+  // CHECK-LABEL: extmodule ASICTarget
+  firrtl.extmodule private @ASICTarget()
+
+  // CHECK-LABEL: module InstChoice :
+  firrtl.module public @InstChoice() {
+    // CHECK: instchoice inst of DefaultTarget, Platform :
+    // CHECK-NEXT:    FPGA => FPGATarget
+    // CHECK-NEXT:    ASIC => ASICTarget
+    firrtl.instance_choice inst @DefaultTarget alternatives @Platform
+      { @FPGA -> @FPGATarget, @ASIC -> @ASICTarget } ()
   }
 }

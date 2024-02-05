@@ -11,11 +11,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "PassDetails.h"
+
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLTypes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLVisitors.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
+#include "circt/Support/Debug.h"
 #include "circt/Support/FieldRef.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Threading.h"
@@ -1008,13 +1010,16 @@ static ExprSolution solveExpr(Expr *expr, SmallPtrSetImpl<Expr *> &seenVars,
 /// present.
 LogicalResult ConstraintSolver::solve() {
   LLVM_DEBUG({
-    llvm::dbgs() << "\n===----- Constraints -----===\n\n";
+    llvm::dbgs() << "\n";
+    debugHeader("Constraints") << "\n\n";
     dumpConstraints(llvm::dbgs());
   });
 
   // Ensure that there are no adverse cycles around.
-  LLVM_DEBUG(
-      llvm::dbgs() << "\n===----- Checking for unbreakable loops -----===\n\n");
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n";
+    debugHeader("Checking for unbreakable loops") << "\n\n";
+  });
   SmallPtrSet<Expr *, 16> seenVars;
   bool anyFailed = false;
 
@@ -1073,7 +1078,10 @@ LogicalResult ConstraintSolver::solve() {
     return failure();
 
   // Iterate over the constraint variables and solve each.
-  LLVM_DEBUG(llvm::dbgs() << "\n===----- Solving constraints -----===\n\n");
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n";
+    debugHeader("Solving constraints") << "\n\n";
+  });
   unsigned defaultWorklistSize = exprs.size() / 2;
   for (auto *expr : exprs) {
     // Only work on variables.
@@ -1386,7 +1394,7 @@ LogicalResult InferenceMapping::mapOperation(Operation *op) {
         // If the constant has a known width, use that. Otherwise pick the
         // smallest number of bits necessary to represent the constant.
         Expr *e;
-        if (auto width = op.getType().get().getWidth())
+        if (auto width = op.getType().base().getWidth())
           e = solver.known(*width);
         else {
           auto v = op.getValue();
@@ -1488,7 +1496,7 @@ LogicalResult InferenceMapping::mapOperation(Operation *op) {
       .Case<DivPrimOp>([&](auto op) {
         auto lhs = getExpr(op.getLhs());
         Expr *e;
-        if (op.getType().get().isSigned()) {
+        if (op.getType().base().isSigned()) {
           e = solver.add(lhs, solver.known(1));
         } else {
           e = lhs;
@@ -1534,7 +1542,7 @@ LogicalResult InferenceMapping::mapOperation(Operation *op) {
       })
       .Case<CvtPrimOp>([&](auto op) {
         auto input = getExpr(op.getInput());
-        auto e = op.getInput().getType().get().isSigned()
+        auto e = op.getInput().getType().base().isSigned()
                      ? input
                      : solver.add(input, solver.known(1));
         setExpr(op.getResult(), e);
@@ -2079,7 +2087,10 @@ private:
 
 /// Update the types throughout a circuit.
 LogicalResult InferenceTypeUpdate::update(CircuitOp op) {
-  LLVM_DEBUG(llvm::dbgs() << "\n===----- Update types -----===\n\n");
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n";
+    debugHeader("Update types") << "\n\n";
+  });
   return mlir::failableParallelForEach(
       op.getContext(), op.getOps<FModuleOp>(), [&](FModuleOp op) {
         // Skip this module if it had no widths to be

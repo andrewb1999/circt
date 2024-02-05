@@ -45,9 +45,15 @@ LogicalResult firtool::populatePreprocessTransforms(mlir::PassManager &pm,
 LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
                                                   const FirtoolOptions &opt,
                                                   StringRef inputFilename) {
-  pm.nest<firrtl::CircuitOp>().addPass(firrtl::createLowerIntrinsicsPass());
+  pm.nest<firrtl::CircuitOp>().addPass(
+      firrtl::createLowerIntrinsicsPass(opt.shouldFixupEICGWrapper()));
+
+  pm.nest<firrtl::CircuitOp>().addPass(firrtl::createLowerSignaturesPass());
 
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createInjectDUTHierarchyPass());
+
+  pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
+      firrtl::createPassiveWiresPass());
 
   pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
       firrtl::createDropNamesPass(opt.getPreserveMode()));
@@ -266,6 +272,7 @@ LogicalResult firtool::populateHWToSV(mlir::PassManager &pm,
        !opt.isRandomEnabled(FirtoolOptions::RandomKind::Mem),
        /*emitSeparateAlwaysBlocks=*/
        opt.shouldEmitSeparateAlwaysBlocks()}));
+  pm.addNestedPass<hw::HWModuleOp>(circt::createLowerSimToSVPass());
   pm.addNestedPass<hw::HWModuleOp>(createLowerVerifToSVPass());
   pm.addPass(seq::createHWMemSimImplPass(
       {/*disableMemRandomization=*/!opt.isRandomEnabled(
@@ -311,7 +318,7 @@ populatePrepareForExportVerilog(mlir::PassManager &pm,
   if (opt.shouldStripFirDebugInfo())
     pm.addPass(circt::createStripDebugInfoWithPredPass([](mlir::Location loc) {
       if (auto fileLoc = loc.dyn_cast<FileLineColLoc>())
-        return fileLoc.getFilename().getValue().endswith(".fir");
+        return fileLoc.getFilename().getValue().ends_with(".fir");
       return false;
     }));
 
@@ -333,8 +340,10 @@ populatePrepareForExportVerilog(mlir::PassManager &pm,
 LogicalResult
 firtool::populateExportVerilog(mlir::PassManager &pm, const FirtoolOptions &opt,
                                std::unique_ptr<llvm::raw_ostream> os) {
-  pm.addPass(createExportVerilogPass(std::move(os)));
+  if (failed(::detail::populatePrepareForExportVerilog(pm, opt)))
+    return failure();
 
+  pm.addPass(createExportVerilogPass(std::move(os)));
   return success();
 }
 
@@ -645,6 +654,11 @@ struct FirtoolCmdOptions {
       "strip-debug-info",
       llvm::cl::desc("Disable source locator information in output Verilog"),
       llvm::cl::init(false)};
+
+  llvm::cl::opt<bool> fixupEICGWrapper{
+      "fixup-eicg-wrapper",
+      llvm::cl::desc("Lower `EICG_wrapper` modules into clock gate intrinsics"),
+      llvm::cl::init(false)};
 };
 } // namespace
 
@@ -678,9 +692,9 @@ circt::firtool::FirtoolOptions::FirtoolOptions()
       etcDisableModuleInlining(false),
       addVivadoRAMAddressConflictSynthesisBugWorkaround(false),
       ckgModuleName("EICG_wrapper"), ckgInputName("in"), ckgOutputName("out"),
-      ckgEnableName("en"), ckgTestEnableName("test_en"),
+      ckgEnableName("en"), ckgTestEnableName("test_en"), ckgInstName("ckg"),
       exportModuleHierarchy(false), stripFirDebugInfo(true),
-      stripDebugInfo(false) {
+      stripDebugInfo(false), fixupEICGWrapper(false) {
   if (!clOptions.isConstructed())
     return;
   outputFilename = clOptions->outputFilename;
@@ -727,4 +741,5 @@ circt::firtool::FirtoolOptions::FirtoolOptions()
   exportModuleHierarchy = clOptions->exportModuleHierarchy;
   stripFirDebugInfo = clOptions->stripFirDebugInfo;
   stripDebugInfo = clOptions->stripDebugInfo;
+  fixupEICGWrapper = clOptions->fixupEICGWrapper;
 }

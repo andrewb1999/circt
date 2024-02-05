@@ -105,7 +105,7 @@ getVerbatimExprAsmResultNames(Operation *op,
   auto isOkCharacter = [](char c) { return llvm::isAlnum(c) || c == '_'; };
   auto name = op->getAttrOfType<StringAttr>("format_string").getValue();
   // Ignore a leading ` in macro name.
-  if (name.startswith("`"))
+  if (name.starts_with("`"))
     name = name.drop_front();
   name = name.take_while(isOkCharacter);
   if (!name.empty())
@@ -1018,14 +1018,14 @@ LogicalResult CaseOp::canonicalize(CaseOp op, PatternRewriter &rewriter) {
 
   if (op.getCaseStyle() == CaseStmtType::CaseXStmt) {
     if (noXZ) {
-      rewriter.updateRootInPlace(op, [&]() {
+      rewriter.modifyOpInPlace(op, [&]() {
         op.setCaseStyleAttr(
             CaseStmtTypeAttr::get(op.getContext(), CaseStmtType::CaseStmt));
       });
       return success();
     }
     if (noX) {
-      rewriter.updateRootInPlace(op, [&]() {
+      rewriter.modifyOpInPlace(op, [&]() {
         op.setCaseStyleAttr(
             CaseStmtTypeAttr::get(op.getContext(), CaseStmtType::CaseZStmt));
       });
@@ -1034,7 +1034,7 @@ LogicalResult CaseOp::canonicalize(CaseOp op, PatternRewriter &rewriter) {
   }
 
   if (op.getCaseStyle() == CaseStmtType::CaseZStmt && noZ) {
-    rewriter.updateRootInPlace(op, [&]() {
+    rewriter.modifyOpInPlace(op, [&]() {
       op.setCaseStyleAttr(
           CaseStmtTypeAttr::get(op.getContext(), CaseStmtType::CaseStmt));
     });
@@ -1632,7 +1632,7 @@ LogicalResult WireOp::canonicalize(WireOp wire, PatternRewriter &rewriter) {
   // If the wire has a name attribute, propagate the name to the expression.
   if (auto *connectedOp = connected.getDefiningOp())
     if (!wire.getName().empty())
-      rewriter.updateRootInPlace(connectedOp, [&] {
+      rewriter.modifyOpInPlace(connectedOp, [&] {
         connectedOp->setAttr("sv.namehint", wire.getNameAttr());
       });
 

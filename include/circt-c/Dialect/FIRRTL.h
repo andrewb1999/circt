@@ -56,6 +56,14 @@ typedef enum FIRRTLEventControl {
 } FIRRTLEventControl;
 
 // NOLINTNEXTLINE(modernize-use-using)
+typedef enum FIRRTLValueFlow {
+  FIRRTL_VALUE_FLOW_NONE,
+  FIRRTL_VALUE_FLOW_SOURCE,
+  FIRRTL_VALUE_FLOW_SINK,
+  FIRRTL_VALUE_FLOW_DUPLEX,
+} FIRRTLValueFlow;
+
+// NOLINTNEXTLINE(modernize-use-using)
 typedef struct FIRRTLBundleField {
   MlirIdentifier name;
   bool isFlip;
@@ -87,9 +95,13 @@ MLIR_CAPI_EXPORTED MlirType firrtlTypeGetAsyncReset(MlirContext ctx);
 MLIR_CAPI_EXPORTED MlirType firrtlTypeGetAnalog(MlirContext ctx, int32_t width);
 MLIR_CAPI_EXPORTED MlirType firrtlTypeGetVector(MlirContext ctx,
                                                 MlirType element, size_t count);
+MLIR_CAPI_EXPORTED bool firrtlTypeIsAOpenBundle(MlirType type);
 MLIR_CAPI_EXPORTED MlirType firrtlTypeGetBundle(
     MlirContext ctx, size_t count, const FIRRTLBundleField *fields);
+MLIR_CAPI_EXPORTED unsigned
+firrtlTypeGetBundleFieldIndex(MlirType type, MlirStringRef fieldName);
 
+MLIR_CAPI_EXPORTED MlirType firrtlTypeGetRef(MlirType target, bool forceable);
 MLIR_CAPI_EXPORTED MlirType firrtlTypeGetAnyRef(MlirContext ctx);
 MLIR_CAPI_EXPORTED MlirType firrtlTypeGetInteger(MlirContext ctx);
 MLIR_CAPI_EXPORTED MlirType firrtlTypeGetDouble(MlirContext ctx);
@@ -133,6 +145,13 @@ MLIR_CAPI_EXPORTED MlirAttribute firrtlAttrGetMemDir(MlirContext ctx,
 
 MLIR_CAPI_EXPORTED MlirAttribute
 firrtlAttrGetEventControl(MlirContext ctx, FIRRTLEventControl eventControl);
+
+//===----------------------------------------------------------------------===//
+// Utility API.
+//===----------------------------------------------------------------------===//
+
+MLIR_CAPI_EXPORTED FIRRTLValueFlow firrtlValueFoldFlow(MlirValue value,
+                                                       FIRRTLValueFlow flow);
 
 #ifdef __cplusplus
 }

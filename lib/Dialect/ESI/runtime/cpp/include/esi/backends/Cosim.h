@@ -29,12 +29,21 @@ namespace backends {
 namespace cosim {
 
 /// Connect to an ESI simulation.
-class CosimAccelerator : public esi::Accelerator {
+class CosimAccelerator : public esi::AcceleratorConnection {
 public:
   struct Impl;
 
   CosimAccelerator(std::string hostname, uint16_t port);
-  static std::unique_ptr<Accelerator> connect(std::string connectionString);
+  static std::unique_ptr<AcceleratorConnection>
+  connect(std::string connectionString);
+
+  // Different ways to retrieve the manifest in Cosimulation.
+  enum ManifestMethod {
+    Cosim, // Use the backdoor cosim interface. Default.
+    MMIO,  // Use MMIO emulation.
+  };
+  // Set the way this connection will retrieve the manifest.
+  void setManifestMethod(ManifestMethod method);
 
 protected:
   virtual Service *createService(Service::Type service, AppIDPath path,
@@ -44,6 +53,7 @@ protected:
 
 private:
   std::unique_ptr<Impl> impl;
+  ManifestMethod manifestMethod = Cosim;
 };
 
 } // namespace cosim

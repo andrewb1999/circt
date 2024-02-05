@@ -81,7 +81,7 @@ class FIRRTLModuleLike<string mnemonic, list<Trait> traits = []> :
 
     size_t $cppClass::getNumInputPorts() {
       size_t count = 0;
-      for (unsigned i = 0, e = getNumPorts(); i < e; ++i)
+      for (size_t i = 0, e = getNumPorts(); i < e; ++i)
         if (getPortDirection(i) == Direction::In)
           ++count;
       return count;
@@ -89,14 +89,14 @@ class FIRRTLModuleLike<string mnemonic, list<Trait> traits = []> :
 
     size_t $cppClass::getNumOutputPorts() {
       size_t count = 0;
-      for (unsigned i = 0, e = getNumPorts(); i < e; ++i)
+      for (size_t i = 0, e = getNumPorts(); i < e; ++i)
         if (getPortDirection(i) == Direction::Out)
           ++count;
       return count;
     }
 
     size_t $cppClass::getPortIdForInputId(size_t idx) {
-      for (unsigned i = 0, e = getNumPorts(); i < e; ++i)
+      for (size_t i = 0, e = getNumPorts(); i < e; ++i)
         if (getPortDirection(i) == Direction::In) {
           if (!idx)
             return i;
@@ -107,7 +107,7 @@ class FIRRTLModuleLike<string mnemonic, list<Trait> traits = []> :
     }
 
     size_t $cppClass::getPortIdForOutputId(size_t idx) {
-      for (unsigned i = 0, e = getNumPorts(); i < e; ++i)
+      for (size_t i = 0, e = getNumPorts(); i < e; ++i)
         if (getPortDirection(i) == Direction::Out) {
           if (!idx)
             return i;
@@ -131,7 +131,8 @@ def FModuleOp : FIRRTLModuleLike<"module", [SingleBlock, NoTerminator]> {
   let arguments =
             (ins ConventionAttr:$convention,
                  ArrayRefAttr:$portLocations,
-                 DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations);
+                 DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations,
+                 DefaultValuedAttr<LayerArrayAttr, "{}">:$layers);
 
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);
@@ -142,7 +143,8 @@ def FModuleOp : FIRRTLModuleLike<"module", [SingleBlock, NoTerminator]> {
   let builders = [
     OpBuilder<(ins "StringAttr":$name, "ConventionAttr":$convention,
                "ArrayRef<PortInfo>":$ports,
-               CArg<"ArrayAttr", "ArrayAttr()">:$annotations)>,
+               CArg<"ArrayAttr", "ArrayAttr()">:$annotations,
+               CArg<"ArrayAttr", "ArrayAttr()">:$layers)>
   ];
 
   let extraModuleClassDeclaration = [{
@@ -188,8 +190,9 @@ def FExtModuleOp : FIRRTLModuleLike<"extmodule"> {
                    ConventionAttr:$convention,
                    ArrayRefAttr:$portLocations,
                    ParamDeclArrayAttr:$parameters,
-                   DefaultValuedAttr<AnnotationArrayAttr,
-                   "ArrayAttr()">:$annotations,
+                   DefaultValuedAttr<
+                    AnnotationArrayAttr, "{}">:$annotations,
+                   DefaultValuedAttr<LayerArrayAttr, "{}">:$layers,
                    OptionalAttr<InternalPathArrayAttr>:$internalPaths
                   );
   let results = (outs);
@@ -203,7 +206,8 @@ def FExtModuleOp : FIRRTLModuleLike<"extmodule"> {
                       CArg<"StringRef", "StringRef()">:$defnamAttr,
                       CArg<"ArrayAttr", "ArrayAttr()">:$annotations,
                       CArg<"ArrayAttr", "ArrayAttr()">:$parameters,
-                      CArg<"ArrayAttr", "ArrayAttr()">:$internalPaths)>
+                      CArg<"ArrayAttr", "ArrayAttr()">:$internalPaths,
+                      CArg<"ArrayAttr", "ArrayAttr()">:$layers)>
   ];
 
   let extraModuleClassDeclaration = [{
@@ -226,7 +230,8 @@ def FIntModuleOp : FIRRTLModuleLike<"intmodule"> {
                    ParamDeclArrayAttr:$parameters,
                    DefaultValuedAttr<AnnotationArrayAttr,
                    "ArrayAttr()">:$annotations,
-                   OptionalAttr<InternalPathArrayAttr>:$internalPaths
+                   OptionalAttr<InternalPathArrayAttr>:$internalPaths,
+                   DefaultValuedAttr<LayerArrayAttr, "{}">:$layers
                   );
   let results = (outs);
   let regions = (region AnyRegion:$body);
@@ -238,7 +243,8 @@ def FIntModuleOp : FIRRTLModuleLike<"intmodule"> {
                       CArg<"StringRef", "StringRef()">:$intrinsicNameAttr,
                       CArg<"ArrayAttr", "ArrayAttr()">:$annotations,
                       CArg<"ArrayAttr", "ArrayAttr()">:$parameters,
-                      CArg<"ArrayAttr", "ArrayAttr()">:$internalPaths)>
+                      CArg<"ArrayAttr", "ArrayAttr()">:$internalPaths,
+                      CArg<"ArrayAttr", "ArrayAttr()">:$layers)>
   ];
 
   let extraModuleClassDeclaration = [{
@@ -266,7 +272,8 @@ def FMemModuleOp : FIRRTLModuleLike<"memmodule"> {
          UI32Attr:$readLatency, UI32Attr:$writeLatency, UI64Attr:$depth,
          ArrayAttr:$extraPorts,
          ArrayRefAttr:$portLocations,
-         AnnotationArrayAttr:$annotations);
+         AnnotationArrayAttr:$annotations,
+         DefaultValuedAttr<LayerArrayAttr, "{}">:$layers);
   let results = (outs);
   let regions = (region AnyRegion:$body);
 
@@ -277,7 +284,8 @@ def FMemModuleOp : FIRRTLModuleLike<"memmodule"> {
                    "uint32_t":$numReadWritePorts, "uint32_t":$dataWidth,
                    "uint32_t":$maskBits, "uint32_t":$readLatency,
                    "uint32_t":$writeLatency, "uint64_t":$depth,
-                   CArg<"ArrayAttr", "ArrayAttr()">:$annotations)>
+                   CArg<"ArrayAttr", "ArrayAttr()">:$annotations,
+                   CArg<"ArrayAttr", "ArrayAttr()">:$layers)>
   ];
 
   let extraModuleClassDeclaration = [{
@@ -294,9 +302,10 @@ def FMemModuleOp : FIRRTLModuleLike<"memmodule"> {
 def ClassOp : FIRRTLModuleLike<"class", [
   SingleBlock, NoTerminator,
   DeclareOpInterfaceMethods<FModuleLike, [
-    // Class Ops do not support port annotations.
-    // Override this method to return an empty array attr.
-    "getPortAnnotationsAttr"]>,
+    // Class Ops do not support port annotations or enabled layers.
+    // Override these methods to return an empty array attr.
+    "getPortAnnotationsAttr",
+    "getLayersAttr"]>,
   DeclareOpInterfaceMethods<ClassLike>,
   DeclareOpInterfaceMethods<Symbol, ["canDiscardOnUseEmpty"]>]> {
   let summary = "FIRRTL Class";
@@ -350,9 +359,10 @@ def ClassOp : FIRRTLModuleLike<"class", [
 
 def ExtClassOp : FIRRTLModuleLike<"extclass", [
   DeclareOpInterfaceMethods<FModuleLike, [
-    // Class Ops do not support port annotations.
-    // Override this method to return an empty array attr.
-    "getPortAnnotationsAttr"]>,
+    // ExtClassOps do not support port annotations or enabled layers.
+    // Override these methods to return an empty array attr.
+    "getPortAnnotationsAttr",
+    "getLayersAttr"]>,
   DeclareOpInterfaceMethods<ClassLike>,
   DeclareOpInterfaceMethods<Symbol, ["canDiscardOnUseEmpty"]>]> {
   let summary = "FIRRTL external class";
@@ -408,6 +418,58 @@ def LayerOp : FIRRTLOp<
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
     $sym_name $convention attr-dict-with-keyword $body
+  }];
+}
+
+def OptionOp : FIRRTLOp<"option", [
+    IsolatedFromAbove,
+    Symbol,
+    SymbolTable,
+    NoTerminator,
+    HasParent<"firrtl::CircuitOp">
+]> {
+  let summary = "An option group definition";
+  let description = [{
+    The `firrtl.option` operation defines a specializable parameter with a
+    known set of values, represented by the `firrtl.option_case` operations
+    nested underneath.
+
+    Operations which support specialization reference the option and its
+    cases to define the specializations they support.
+
+    Example:
+    ```mlir
+
+    firrtl.circuit {
+      firrtl.option @Target {
+        firrtl.option_case @FPGA
+        firrtl.option_case @ASIC
+      }
+    }
+    ```
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let results = (outs);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = [{
+    $sym_name attr-dict-with-keyword $body
+  }];
+}
+
+def OptionCaseOp : FIRRTLOp<
+  "option_case", [Symbol, HasParent<"firrtl::OptionOp">]
+> {
+  let summary = "A configuration option value definition";
+  let description = [{
+    `firrtl.option_case` defines an acceptable value to be provided for an
+    option. Ops reference it to define their behavior when this case is active.
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let results = (outs);
+  let assemblyFormat = [{
+    $sym_name attr-dict
   }];
 }
 

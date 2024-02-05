@@ -436,10 +436,14 @@ circuit MyModule :     ; CHECK: firrtl.circuit "MyModule" {
     assert(clock, pred, en, "X equals Y when Z is valid")
     ; CHECK: firrtl.assert %clock, %pred, %en, "X equals Y when Z is valid" : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1> {eventControl = 0 : i32, isConcurrent = false, name = "assert_0"}
     assert(clock, pred, en, "X equals Y when Z is valid") : assert_0
+    ; CHECK: firrtl.assert %clock, %pred, %en, "pred=%d, en=%d"(%pred, %en) : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1> {eventControl = 0 : i32, isConcurrent = false, name = "assert_1"}
+    assert(clock, pred, en, "pred=%d, en=%d", pred, en) : assert_1
     ; CHECK: firrtl.assume %clock, %pred, %en, "X equals Y when Z is valid" : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1> {eventControl = 0 : i32, isConcurrent = false}
     assume(clock, pred, en, "X equals Y when Z is valid")
     ; CHECK: firrtl.assume %clock, %pred, %en, "X equals Y when Z is valid" : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1> {eventControl = 0 : i32, isConcurrent = false, name = "assume_0"}
     assume(clock, pred, en, "X equals Y when Z is valid") : assume_0
+    ; CHECK: firrtl.assume %clock, %pred, %en, "pred=%d, en=%d"(%pred, %en) : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1> {eventControl = 0 : i32, isConcurrent = false, name = "assume_1"}
+    assume(clock, pred, en, "pred=%d, en=%d", pred, en) : assume_1
     ; CHECK: firrtl.cover %clock, %pred, %en, "X equals Y when Z is valid" : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1> {eventControl = 0 : i32, isConcurrent = false}
     cover(clock, pred, en, "X equals Y when Z is valid")
     ; CHECK: firrtl.cover %clock, %pred, %en, "X equals Y when Z is valid" : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1> {eventControl = 0 : i32, isConcurrent = false, name = "cover_0"}
@@ -1045,7 +1049,7 @@ circuit MyModule :     ; CHECK: firrtl.circuit "MyModule" {
       stop(clock, enable, 1)
     ; CHECK: [[CONDINV:%.+]] = firrtl.not %cond
     ; CHECK: [[TMP1:%.+]] = firrtl.xorr [[CONDINV]]
-    ; CHECK-NEXT: [[TMP2:%.+]] = firrtl.verbatim.expr "{{[{][{]0[}][}]}} === 1'bx"([[TMP1]])
+    ; CHECK-NEXT: [[TMP2:%.+]] = firrtl.int.isX [[TMP1]]
     ; CHECK-NEXT: [[TMP:%.+]] = firrtl.or [[CONDINV]], [[TMP2]]
     ; CHECK-NEXT: firrtl.assert %clock, [[TMP]], %enable, "Hello Assert"(%value) : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<42>
     ; CHECK-SAME: format = "sva"
@@ -1069,7 +1073,7 @@ circuit MyModule :     ; CHECK: firrtl.circuit "MyModule" {
       stop(clock, enable, 1)
     ; CHECK: [[CONDINV:%.+]] = firrtl.not %cond
     ; CHECK: [[TMP1:%.+]] = firrtl.xorr [[CONDINV]]
-    ; CHECK-NEXT: [[TMP2:%.+]] = firrtl.verbatim.expr "{{[{][{]0[}][}]}} === 1'bx"([[TMP1]])
+    ; CHECK-NEXT: [[TMP2:%.+]] = firrtl.int.isX [[TMP1]]
     ; CHECK-NEXT: [[TMP:%.+]] = firrtl.or [[CONDINV]], [[TMP2]]
     ; CHECK-NEXT: firrtl.assume %clock, [[TMP]], %enable, "Hello Assume"(%value) : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<42>
     ; CHECK-SAME: guards = ["USE_UNR_ONLY_CONSTRAINTS", "USE_FORMAL_ONLY_CONSTRAINTS"]
@@ -1195,6 +1199,15 @@ circuit MyModule :     ; CHECK: firrtl.circuit "MyModule" {
     ; CHECK-NEXT: ref.define %rw, %[[NODE_RWREF]]
     define rw = rwprobe(n)
 
+  ; CHECK-LABEL: module private @RefsChildOpenAgg(
+  ; CHECK-SAME: in %in: !firrtl.openbundle<a: uint<1>, rw flip: rwprobe<uint<1>>> sym [<@[[SYM:[^,]+]],1,
+  module RefsChildOpenAgg :
+    input in : { a : UInt<1>, flip rw: RWProbe<UInt<1>> }
+    ; CHECK-NEXT: %[[IN_RW:[^ ]+]] = firrtl.opensubfield %in[rw]
+    ; CHECK-NEXT: %[[RWPROBE_IN_A:[^ ]+]] = firrtl.ref.rwprobe <@RefsChildOpenAgg::@[[SYM]]>
+    ; CHECK-NEXT: firrtl.ref.define %[[IN_RW]], %[[RWPROBE_IN_A]]
+    define in.rw = rwprobe(in.a)
+
   ; CHECK-LABEL: module private @Refs(
   module Refs :
     input in : const UInt<1>
@@ -1275,6 +1288,30 @@ circuit MyModule :     ; CHECK: firrtl.circuit "MyModule" {
     ; CHECK: %[[AGG4_RW_0_b_x:.+]] = firrtl.ref.rwprobe <@Refs::@[[AGG4_0_b_x_SYM]]>
     ; CHECK-NEXT: firrtl.ref.define %field_rw, %[[AGG4_RW_0_b_x]]
     define field_rw = rwprobe(agg4[0].b.x)
+
+   ; CHECK: %inst_rw = firrtl.wire : !firrtl.rwprobe<uint<1>>
+   ; CHECK-NEXT: %inst_rw2 = firrtl.wire : !firrtl.rwprobe<uint<1>>
+   ; CHECK-NEXT: %rc2_in_bounce = firrtl.wire sym @[[RC2_IN_BOUNCE_SYM:[^ ]+]]
+   ; CHECK-NEXT: %rc2_in, %rc2_r, %rc2_rw = firrtl.instance rc2
+   ; CHECK-NEXT: firrtl.strictconnect %rc2_in, %rc2_in_bounce
+    wire inst_rw : RWProbe<UInt<1>>
+    wire inst_rw2 : RWProbe<UInt<1>>
+    inst rc2 of RefsChild
+
+    ; CHECK: %[[IN_CAST:[^ ]+]] = firrtl.constCast %in :
+    ; CHECK: firrtl.strictconnect %rc2_in_bounce, %[[IN_CAST]]
+    rc2.in <= in
+   ; CHECK-NEXT: firrtl.when %rc2_in_bounce :
+   ; CHECK-NEXT:   %[[RWPROBE_RC2_IN_BOUNCE_1:[^ ]+]] = firrtl.ref.rwprobe <@Refs::@[[RC2_IN_BOUNCE_SYM]]>
+   ; CHECK-NEXT:   firrtl.ref.define %inst_rw, %[[RWPROBE_RC2_IN_BOUNCE_1]]
+   ; CHECK-NEXT: }
+    when rc2.in:
+      define inst_rw = rwprobe(rc2.in)
+   ; CHECK-NEXT: firrtl.strictconnect %rc2_in_bounce,
+    rc2.in <= rc.in
+   ; CHECK-NEXT: %[[RWPROBE_RC2_IN_BOUNCE_2:[^ ]+]] = firrtl.ref.rwprobe <@Refs::@[[RC2_IN_BOUNCE_SYM]]>
+   ; CHECK-NEXT: firrtl.ref.define %inst_rw2, %[[RWPROBE_RC2_IN_BOUNCE_2]]
+    define inst_rw2 = rwprobe(rc2.in)
 
   ; CHECK-LABEL: module private @ForceRelease(
   module ForceRelease :
@@ -1638,9 +1675,13 @@ circuit Layers:
     ; CHECK-NEXT:   }
     ; CHECK-NEXT: }
 
-  ; CHECK: firrtl.module @Layers
+  ; CHECK:      firrtl.module @Layers
+  ; CHECK-SAME:   out %b: !firrtl.probe<uint<1>, @A>
+  ; CHECK-SAME:   out %c: !firrtl.rwprobe<uint<1>, @A::@B>
   module Layers:
     input a: UInt<1>
+    output b: Probe<UInt<1>, A>
+    output c: RWProbe<UInt<1>, A.B>
 
     layerblock A:
       node A_a = a
@@ -1875,3 +1916,15 @@ circuit PublicModules:
   module Bar:
   ; CHECK: firrtl.module @PublicModules
   public module PublicModules:
+
+;// -----
+
+FIRRTL version 4.0.0
+; CHECK-LABLE: firrtl.circuit "LayerEnabledModule"
+circuit LayerEnabledModule:
+  layer A, bind:
+  layer B, bind:
+    layer C, bind:
+  ; CHECK: firrtl.module @LayerEnabledModule
+  ; CHECK-SAME: layers = [@A, @B::@C]
+  module LayerEnabledModule enablelayer A enablelayer B.C:

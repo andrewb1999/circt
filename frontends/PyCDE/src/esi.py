@@ -4,16 +4,17 @@
 
 from .common import (AppID, Input, Output, _PyProxy, PortError)
 from .module import Generator, Module, ModuleLikeBuilderBase, PortProxyBase
-from .signals import BundleSignal, ChannelSignal, Signal, _FromCirctValue
+from .signals import BundleSignal, ChannelSignal, Signal, Struct, _FromCirctValue
 from .system import System
-from .types import (Bits, Bundle, BundledChannel, Channel, ChannelDirection,
-                    Type, types, _FromCirctType)
+from .types import (Any, Bits, Bundle, BundledChannel, Channel,
+                    ChannelDirection, StructType, Type, types, UInt,
+                    _FromCirctType)
 
 from .circt import ir
 from .circt.dialects import esi as raw_esi, hw, msft
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 __dir__ = Path(__file__).parent
 
@@ -29,18 +30,6 @@ PortEmptySuffix = "esi.portEmptySuffix"
 class ServiceDecl(_PyProxy):
   """Declare an ESI service interface."""
 
-  class To:
-    """Indicates a service has a 'to server' port with the given bundle type. It is the default."""
-
-    def __init__(self, bundle_type: Bundle):
-      self.bundle_type = bundle_type
-
-  class From:
-    """Indicates a service has a 'from server' port with the given bundle type."""
-
-    def __init__(self, bundle_type: Bundle):
-      self.bundle_type = bundle_type
-
   def __init__(self, cls: type):
     self.name = cls.__name__
     if hasattr(cls, "_op"):
@@ -49,17 +38,10 @@ class ServiceDecl(_PyProxy):
       self._op = raw_esi.CustomServiceDeclOp
     for (attr_name, attr) in vars(cls).items():
       if isinstance(attr, Bundle):
-        setattr(self, attr_name,
-                _RequestToServerConnection(self, attr, attr_name))
-      elif isinstance(attr, ServiceDecl.To):
-        setattr(self, attr_name,
-                _RequestToServerConnection(self, attr.bundle_type, attr_name))
-      elif isinstance(attr, ServiceDecl.From):
-        setattr(self, attr_name,
-                _RequestFromServerConnection(self, attr.bundle_type, attr_name))
+        setattr(self, attr_name, _RequestConnection(self, attr, attr_name))
       elif isinstance(attr, (Input, Output)):
         raise TypeError(
-            "Input and Output are not allowed in ESI service declarations. " +
+            "Input and Output are not allowed in ESI service declarations."
             " Use Bundles instead.")
 
   def _materialize_service_decl(self) -> str:
@@ -82,10 +64,9 @@ class ServiceDecl(_PyProxy):
         ports_block = ir.Block.create_at_start(decl.ports, [])
         with ir.InsertionPoint.at_block_begin(ports_block):
           for (_, attr) in self.__dict__.items():
-            if isinstance(attr, _RequestToServerConnection):
-              raw_esi.ToServerOp(attr._name, ir.TypeAttr.get(attr.type._type))
-            elif isinstance(attr, _RequestFromServerConnection):
-              raw_esi.ToClientOp(attr._name, ir.TypeAttr.get(attr.type._type))
+            if isinstance(attr, _RequestConnection):
+              raw_esi.ServiceDeclPortOp(attr._name,
+                                        ir.TypeAttr.get(attr.type._type))
     return sym_name
 
   def instantiate_builtin(self,
@@ -107,26 +88,7 @@ class ServiceDecl(_PyProxy):
     return [_FromCirctValue(x) for x in impl_results]
 
 
-class _RequestToServerConnection:
-  """Indicates a service with a 'to server' port. Call to create a 'to server'
-  (from client) connection request."""
-
-  def __init__(self, decl: ServiceDecl, type: Bundle, attr_name: str):
-    self.decl = decl
-    self._name = ir.StringAttr.get(attr_name)
-    self.type = type
-
-  @property
-  def service_port(self) -> hw.InnerRefAttr:
-    return hw.InnerRefAttr.get(self.decl.symbol, self._name)
-
-  def __call__(self, bundle: BundleSignal, appid: AppID):
-    self.decl._materialize_service_decl()
-    raw_esi.RequestToServerConnectionOp(self.service_port, bundle.value,
-                                        appid._appid)
-
-
-class _RequestFromServerConnection:
+class _RequestConnection:
   """Indicates a service with a 'from server' port. Call to create a 'from
   server' (to client) connection request."""
 
@@ -139,11 +101,13 @@ class _RequestFromServerConnection:
   def service_port(self) -> hw.InnerRefAttr:
     return hw.InnerRefAttr.get(self.decl.symbol, self._name)
 
-  def __call__(self, appid: AppID):
+  def __call__(self, appid: AppID, type: Optional[Bundle] = None):
+    if type is None:
+      type = self.type
     self.decl._materialize_service_decl()
     return _FromCirctValue(
-        raw_esi.RequestToClientConnectionOp(self.type._type, self.service_port,
-                                            appid._appid).toClient)
+        raw_esi.RequestConnectionOp(type._type, self.service_port,
+                                    appid._appid).toClient)
 
 
 def Cosim(decl: ServiceDecl, clk, rst):
@@ -159,52 +123,46 @@ class NamedChannelValue(ChannelSignal):
     super().__init__(input_chan, _FromCirctType(input_chan.type))
 
 
-class _OutputChannelSetter:
+class _OutputBundleSetter:
   """Return a list of these as a proxy for a 'request to client connection'.
   Users should call the 'assign' method with the `ChannelValue` which they
   have implemented for this request."""
 
-  def __init__(self, req: raw_esi.RequestToClientConnectionOp,
-               old_chan_to_replace: ChannelSignal):
-    self.type = Channel(_FromCirctType(req.toClient.type))
-    self.client_name = req.clientNamePath
-    self._chan_to_replace = old_chan_to_replace
+  def __init__(self, req: raw_esi.ServiceImplementConnReqOp,
+               old_value_to_replace: ir.OpResult):
+    self.type: Bundle = _FromCirctType(req.toClient.type)
+    self.client_name = req.relativeAppIDPath
+    self._bundle_to_replace: Optional[ir.OpResult] = old_value_to_replace
 
   def assign(self, new_value: ChannelSignal):
     """Assign the generated channel to this request."""
-    if self._chan_to_replace is None:
+    if self._bundle_to_replace is None:
       name_str = ".".join(self.client_name)
       raise ValueError(f"{name_str} has already been connected.")
     if new_value.type != self.type:
       raise TypeError(
           f"Channel type mismatch. Expected {self.type}, got {new_value.type}.")
-    msft.replaceAllUsesWith(self._chan_to_replace, new_value.value)
-    self._chan_to_replace = None
+    msft.replaceAllUsesWith(self._bundle_to_replace, new_value.value)
+    self._bundle_to_replace = None
 
 
 class _ServiceGeneratorBundles:
   """Provide access to the bundles which the service generator is responsible
   for connecting up."""
 
-  def __init__(self, mod: Module, req: raw_esi.ServiceImplementReqOp):
+  def __init__(self, mod: ModuleLikeBuilderBase,
+               req: raw_esi.ServiceImplementReqOp):
     self._req = req
     portReqsBlock = req.portReqs.blocks[0]
-
-    # Find the input channel requests and store named versions of the values.
-    self._input_reqs = [
-        NamedChannelValue(x.toServer, x.clientNamePath)
-        for x in portReqsBlock
-        if isinstance(x, raw_esi.RequestToServerConnectionOp)
-    ]
 
     # Find the output channel requests and store the settable proxies.
     num_output_ports = len(mod.outputs)
     to_client_reqs = [
         req for req in portReqsBlock
-        if isinstance(req, raw_esi.RequestToClientConnectionOp)
+        if isinstance(req, raw_esi.ServiceImplementConnReqOp)
     ]
     self._output_reqs = [
-        _OutputChannelSetter(req, self._req.results[num_output_ports + idx])
+        _OutputBundleSetter(req, self._req.results[num_output_ports + idx])
         for idx, req in enumerate(to_client_reqs)
     ]
     assert len(self._output_reqs) == len(req.results) - num_output_ports
@@ -216,12 +174,12 @@ class _ServiceGeneratorBundles:
     return self._input_reqs
 
   @property
-  def to_client_reqs(self) -> List[_OutputChannelSetter]:
+  def to_client_reqs(self) -> List[_OutputBundleSetter]:
     return self._output_reqs
 
   def check_unconnected_outputs(self):
     for req in self._output_reqs:
-      if req._chan_to_replace is not None:
+      if req._bundle_to_replace is not None:
         name_str = ".".join(req.client_name)
         raise ValueError(f"{name_str} has not been connected.")
 
@@ -231,7 +189,7 @@ class ServiceImplementationModuleBuilder(ModuleLikeBuilderBase):
   no distinction between definition and instance -- ESI service providers are
   built where they are instantiated."""
 
-  def instantiate(self, impl, inputs: Dict[str, Signal], appid: AppID = None):
+  def instantiate(self, impl, inputs: Dict[str, Signal], appid: AppID):
     # Each instantiation of the ServiceImplementation has its own
     # registration.
     opts = _service_generator_registry.register(impl)
@@ -260,14 +218,14 @@ class ServiceImplementationModuleBuilder(ModuleLikeBuilderBase):
     with self.GeneratorCtxt(self, ports, serviceReq, generator.loc):
 
       # Run the generator.
-      channels = _ServiceGeneratorChannels(self, serviceReq)
-      rc = generator.gen_func(ports, channels=channels)
+      bundles = _ServiceGeneratorBundles(self, serviceReq)
+      rc = generator.gen_func(ports, bundles=bundles)
       if rc is None:
         rc = True
       elif not isinstance(rc, bool):
         raise ValueError("Generators must a return a bool or None")
       ports._check_unconnected_outputs()
-      channels.check_unconnected_outputs()
+      bundles.check_unconnected_outputs()
 
       # Replace the output values from the service implement request op with
       # the generated values. Erase the service implement request op.
@@ -306,8 +264,9 @@ class _ServiceGeneratorRegistry:
   _registered = False
   _impl_type_name = ir.StringAttr.get("pycde")
 
-  def __init__(self):
-    self._registry: Dict[str, ServiceImplementation] = {}
+  def __init__(self) -> None:
+    self._registry: Dict[ir.StringAttr, Tuple[ServiceImplementation,
+                                              System]] = {}
 
     # Register myself with ESI so I can dispatch to my internal registry.
     assert _ServiceGeneratorRegistry._registered is False, \
@@ -330,6 +289,7 @@ class _ServiceGeneratorRegistry:
       ctr += 1
       name = basename + "_" + str(ctr)
     name_attr = ir.StringAttr.get(name)
+
     self._registry[name_attr] = (service_implementation, System.current())
     return ir.DictAttr.get({"name": name_attr})
 
@@ -343,7 +303,12 @@ class _ServiceGeneratorRegistry:
       return False
     (impl, sys) = self._registry[impl_name]
     with sys:
-      return impl._builder.generate_svc_impl(serviceReq=req.opview)
+      ret = impl._builder.generate_svc_impl(serviceReq=req.opview)
+    # The service implementation generator could have instantiated new modules,
+    # so we need to generate them. Don't run the appID indexer since during a
+    # pass, the IR can be invalid and the indexers assumes it is valid.
+    sys.generate(skip_appid_index=True)
+    return ret
 
 
 _service_generator_registry = _ServiceGeneratorRegistry()
@@ -364,12 +329,12 @@ def DeclareRandomAccessMemory(inner_type: Type,
                                  ('data', inner_type)])
 
     read = Bundle([
-        BundledChannel("address", ChannelDirection.TO, address_type),
-        BundledChannel("data", ChannelDirection.FROM, inner_type)
+        BundledChannel("address", ChannelDirection.FROM, address_type),
+        BundledChannel("data", ChannelDirection.TO, inner_type)
     ])
     write = Bundle([
-        BundledChannel("write", ChannelDirection.TO, write_struct),
-        BundledChannel("ack", ChannelDirection.FROM, Bits(0))
+        BundledChannel("req", ChannelDirection.FROM, write_struct),
+        BundledChannel("ack", ChannelDirection.TO, Bits(0))
     ])
 
     @staticmethod
@@ -477,6 +442,57 @@ class PureModule(Module):
     else:
       type_attr = ir.TypeAttr.get(type._type)
     esi.ESIPureModuleParamOp(name, type_attr)
+
+
+@ServiceDecl
+class MMIO:
+  """ESI standard service to request access to an MMIO region."""
+
+  read = Bundle([
+      BundledChannel("offset", ChannelDirection.TO, Bits(32)),
+      BundledChannel("data", ChannelDirection.FROM, Bits(32))
+  ])
+
+  @staticmethod
+  def _op(sym_name: ir.StringAttr):
+    return raw_esi.MMIOServiceDeclOp(sym_name)
+
+
+class _FuncService(ServiceDecl):
+  """ESI standard service to request execution of a function."""
+
+  def __init__(self):
+    super().__init__(self.__class__)
+
+  def expose(self, name: AppID, arg_type: Type,
+             result: Signal) -> ChannelSignal:
+    """Expose a function to the ESI system. Arguments:
+      'name' is an AppID which is the function name.
+      'arg_type' is the type of the argument to the function.
+      'result' is a Signal which is the result of the function. Typically, it'll
+      be a Wire which gets assigned to later on.
+
+      Returns a Signal of 'arg_type' type which is the argument value from the
+      caller."""
+
+    bundle = Bundle([
+        BundledChannel("arg", ChannelDirection.TO, arg_type),
+        BundledChannel("result", ChannelDirection.FROM, result.type)
+    ])
+    self._materialize_service_decl()
+    func_call = raw_esi.RequestConnectionOp(
+        bundle._type, hw.InnerRefAttr.get(self.symbol,
+                                          ir.StringAttr.get("call")),
+        name._appid)
+    to_funcs = _FromCirctValue(func_call.toClient).unpack(result=result)
+    return to_funcs['arg']
+
+  @staticmethod
+  def _op(sym_name: ir.StringAttr):
+    return raw_esi.FuncServiceDeclOp(sym_name)
+
+
+FuncService = _FuncService()
 
 
 def package(sys: System):

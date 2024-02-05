@@ -14,6 +14,7 @@
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAttributes.h"
+#include "circt/Dialect/FIRRTL/FIRRTLInstanceImplementation.h"
 #include "circt/Dialect/FIRRTL/FIRRTLTypes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLVisitors.h"
@@ -204,7 +205,7 @@ Flow firrtl::foldFlow(Value val, Flow accumulatedFlow) {
       // Registers, Wires, and behavioral memory ports are always Duplex.
       .Case<RegOp, RegResetOp, WireOp, MemoryPortOp>(
           [](auto) { return Flow::Duplex; })
-      .Case<InstanceOp>([&](auto inst) {
+      .Case<InstanceOp, InstanceChoiceOp>([&](auto inst) {
         auto resultNo = cast<OpResult>(val).getResultNumber();
         if (inst.getPortDirection(resultNo) == Direction::Out)
           return accumulatedFlow;
@@ -795,9 +796,10 @@ void FMemModuleOp::insertPorts(ArrayRef<std::pair<unsigned, PortInfo>> ports) {
   ::insertPorts(cast<FModuleLike>((Operation *)*this), ports);
 }
 
-static void buildModule(OpBuilder &builder, OperationState &result,
-                        StringAttr name, ArrayRef<PortInfo> ports,
-                        ArrayAttr annotations, bool withAnnotations = true) {
+static void buildModuleLike(OpBuilder &builder, OperationState &result,
+                            StringAttr name, ArrayRef<PortInfo> ports,
+                            ArrayAttr annotations, ArrayAttr layers,
+                            bool withAnnotations, bool withLayers) {
   // Add an attribute for the name.
   result.addAttribute(::mlir::SymbolTable::getSymbolAttrName(), name);
 
@@ -842,19 +844,34 @@ static void buildModule(OpBuilder &builder, OperationState &result,
                         builder.getArrayAttr(portAnnotations));
   }
 
+  if (withLayers) {
+    if (!layers)
+      layers = builder.getArrayAttr({});
+    result.addAttribute("layers", layers);
+  }
+
   result.addRegion();
 }
 
-static void buildModuleWithoutAnnos(OpBuilder &builder, OperationState &result,
-                                    StringAttr name, ArrayRef<PortInfo> ports) {
-  return buildModule(builder, result, name, ports, {},
-                     /*withAnnotations=*/false);
+static void buildModule(OpBuilder &builder, OperationState &result,
+                        StringAttr name, ArrayRef<PortInfo> ports,
+                        ArrayAttr annotations, ArrayAttr layers) {
+  buildModuleLike(builder, result, name, ports, annotations, layers,
+                  /*withAnnotations=*/true, /*withLayers=*/true);
+}
+
+static void buildClass(OpBuilder &builder, OperationState &result,
+                       StringAttr name, ArrayRef<PortInfo> ports) {
+  return buildModuleLike(builder, result, name, ports, {}, {},
+                         /*withAnnotations=*/false,
+                         /*withLayers=*/false);
 }
 
 void FModuleOp::build(OpBuilder &builder, OperationState &result,
                       StringAttr name, ConventionAttr convention,
-                      ArrayRef<PortInfo> ports, ArrayAttr annotations) {
-  buildModule(builder, result, name, ports, annotations);
+                      ArrayRef<PortInfo> ports, ArrayAttr annotations,
+                      ArrayAttr layers) {
+  buildModule(builder, result, name, ports, annotations, layers);
   result.addAttribute("convention", convention);
 
   // Create a region and a block for the body.
@@ -871,8 +888,8 @@ void FExtModuleOp::build(OpBuilder &builder, OperationState &result,
                          StringAttr name, ConventionAttr convention,
                          ArrayRef<PortInfo> ports, StringRef defnameAttr,
                          ArrayAttr annotations, ArrayAttr parameters,
-                         ArrayAttr internalPaths) {
-  buildModule(builder, result, name, ports, annotations);
+                         ArrayAttr internalPaths, ArrayAttr layers) {
+  buildModule(builder, result, name, ports, annotations, layers);
   result.addAttribute("convention", convention);
   if (!defnameAttr.empty())
     result.addAttribute("defname", builder.getStringAttr(defnameAttr));
@@ -886,8 +903,9 @@ void FExtModuleOp::build(OpBuilder &builder, OperationState &result,
 void FIntModuleOp::build(OpBuilder &builder, OperationState &result,
                          StringAttr name, ArrayRef<PortInfo> ports,
                          StringRef intrinsicNameAttr, ArrayAttr annotations,
-                         ArrayAttr parameters, ArrayAttr internalPaths) {
-  buildModule(builder, result, name, ports, annotations);
+                         ArrayAttr parameters, ArrayAttr internalPaths,
+                         ArrayAttr layers) {
+  buildModule(builder, result, name, ports, annotations, layers);
   result.addAttribute("intrinsic", builder.getStringAttr(intrinsicNameAttr));
   if (!parameters)
     parameters = builder.getArrayAttr({});
@@ -902,9 +920,9 @@ void FMemModuleOp::build(OpBuilder &builder, OperationState &result,
                          uint32_t numReadWritePorts, uint32_t dataWidth,
                          uint32_t maskBits, uint32_t readLatency,
                          uint32_t writeLatency, uint64_t depth,
-                         ArrayAttr annotations) {
+                         ArrayAttr annotations, ArrayAttr layers) {
   auto *context = builder.getContext();
-  buildModule(builder, result, name, ports, annotations);
+  buildModule(builder, result, name, ports, annotations, layers);
   auto ui32Type = IntegerType::get(context, 32, IntegerType::Unsigned);
   auto ui64Type = IntegerType::get(context, 64, IntegerType::Unsigned);
   result.addAttribute("numReadPorts", IntegerAttr::get(ui32Type, numReadPorts));
@@ -1169,6 +1187,11 @@ static void printFModuleLikeOp(OpAsmPrinter &p, FModuleLike op) {
   if (op->getAttrOfType<ArrayAttr>("annotations").empty())
     omittedAttrs.push_back("annotations");
 
+  // If there are no enabled layers, then omit the empty array.
+  if (auto layers = op->getAttrOfType<ArrayAttr>("layers"))
+    if (layers.empty())
+      omittedAttrs.push_back("layers");
+
   p.printOptionalAttrDictWithKeyword(op->getAttrs(), omittedAttrs);
 }
 
@@ -1327,6 +1350,8 @@ ParseResult FModuleOp::parse(OpAsmParser &parser, OperationState &result) {
     result.addAttribute(
         "convention",
         ConventionAttr::get(result.getContext(), Convention::Internal));
+  if (!result.attributes.get("layers"))
+    result.addAttribute("layers", ArrayAttr::get(parser.getContext(), {}));
   return success();
 }
 
@@ -1447,35 +1472,72 @@ LogicalResult FIntModuleOp::verify() {
   return success();
 }
 
+static LogicalResult verifyProbeType(RefType refType, Location loc,
+                                     CircuitOp circuitOp,
+                                     SymbolTableCollection &symbolTable,
+                                     Twine start) {
+  auto layer = refType.getLayer();
+  if (!layer)
+    return success();
+  auto *layerOp = symbolTable.lookupSymbolIn(circuitOp, layer);
+  if (!layerOp)
+    return emitError(loc) << start << " associated with layer '" << layer
+                          << "', but this layer was not defined";
+  if (!isa<LayerOp>(layerOp)) {
+    auto diag = emitError(loc)
+                << start << " associated with layer '" << layer
+                << "', but symbol '" << layer << "' does not refer to a '"
+                << LayerOp::getOperationName() << "' op";
+    return diag.attachNote(layerOp->getLoc()) << "symbol refers to this op";
+  }
+  return success();
+}
+
 static LogicalResult verifyPortSymbolUses(FModuleLike module,
                                           SymbolTableCollection &symbolTable) {
-  auto circuitOp = module->getParentOfType<CircuitOp>();
-
   // verify types in ports.
+  auto circuitOp = module->getParentOfType<CircuitOp>();
   for (size_t i = 0, e = module.getNumPorts(); i < e; ++i) {
     auto type = module.getPortType(i);
-    auto classType = dyn_cast<ClassType>(type);
-    if (!classType)
+
+    if (auto refType = type_dyn_cast<RefType>(type)) {
+      if (failed(verifyProbeType(
+              refType, module.getPortLocation(i), circuitOp, symbolTable,
+              Twine("probe port '") + module.getPortName(i) + "' is")))
+        return failure();
       continue;
+    }
 
-    // verify that the class exists.
-    auto className = classType.getNameAttr();
-    auto classOp = dyn_cast_or_null<ClassLike>(
-        symbolTable.lookupSymbolIn(circuitOp, className));
-    if (!classOp)
-      return module.emitOpError() << "references unknown class " << className;
+    if (auto classType = dyn_cast<ClassType>(type)) {
+      auto className = classType.getNameAttr();
+      auto classOp = dyn_cast_or_null<ClassLike>(
+          symbolTable.lookupSymbolIn(circuitOp, className));
+      if (!classOp)
+        return module.emitOpError() << "references unknown class " << className;
 
-    // verify that the result type agrees with the class definition.
-    if (failed(classOp.verifyType(classType,
-                                  [&]() { return module.emitOpError(); })))
-      return failure();
+      // verify that the result type agrees with the class definition.
+      if (failed(classOp.verifyType(classType,
+                                    [&]() { return module.emitOpError(); })))
+        return failure();
+      continue;
+    }
   }
 
   return success();
 }
 
 LogicalResult FModuleOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  return verifyPortSymbolUses(cast<FModuleLike>(getOperation()), symbolTable);
+  if (failed(
+          verifyPortSymbolUses(cast<FModuleLike>(getOperation()), symbolTable)))
+    return failure();
+
+  auto circuitOp = (*this)->getParentOfType<CircuitOp>();
+  for (auto layer : getLayers()) {
+    if (!symbolTable.lookupSymbolIn(circuitOp, cast<SymbolRefAttr>(layer)))
+      return emitOpError() << "enables unknown layer '" << layer << "'";
+  }
+
+  return success();
 }
 
 LogicalResult
@@ -1728,7 +1790,7 @@ void ClassOp::build(OpBuilder &builder, OperationState &result, StringAttr name,
                    [](const auto &port) { return port.annotations.empty(); }) &&
       "class ports may not have annotations");
 
-  buildModuleWithoutAnnos(builder, result, name, ports);
+  buildClass(builder, result, name, ports);
 
   // Create a region and a block for the body.
   auto *bodyRegion = result.regions[0].get();
@@ -1796,6 +1858,10 @@ ArrayAttr ClassOp::getPortAnnotationsAttr() {
   return ArrayAttr::get(getContext(), {});
 }
 
+ArrayAttr ClassOp::getLayersAttr() { return ArrayAttr::get(getContext(), {}); }
+
+ArrayRef<Attribute> ClassOp::getLayers() { return getLayersAttr(); }
+
 SmallVector<::circt::hw::PortInfo> ClassOp::getPortList() {
   return ::getPortListImpl(*this);
 }
@@ -1826,7 +1892,7 @@ void ExtClassOp::build(OpBuilder &builder, OperationState &result,
                    [](const auto &port) { return port.annotations.empty(); }) &&
       "class ports may not have annotations");
 
-  buildModuleWithoutAnnos(builder, result, name, ports);
+  buildClass(builder, result, name, ports);
 }
 
 void ExtClassOp::print(OpAsmPrinter &p) {
@@ -1866,6 +1932,12 @@ ConventionAttr ExtClassOp::getConventionAttr() {
   return ConventionAttr::get(getContext(), getConvention());
 }
 
+ArrayAttr ExtClassOp::getLayersAttr() {
+  return ArrayAttr::get(getContext(), {});
+}
+
+ArrayRef<Attribute> ExtClassOp::getLayers() { return getLayersAttr(); }
+
 ArrayAttr ExtClassOp::getParameters() { return {}; }
 
 ArrayAttr ExtClassOp::getPortAnnotationsAttr() {
@@ -1888,7 +1960,7 @@ bool ExtClassOp::canDiscardOnUseEmpty() {
 }
 
 //===----------------------------------------------------------------------===//
-// Declarations
+// InstanceOp
 //===----------------------------------------------------------------------===//
 
 SmallVector<::circt::hw::PortInfo> InstanceOp::getPortList() {
@@ -2101,116 +2173,8 @@ InstanceOp::cloneAndInsertPorts(ArrayRef<std::pair<unsigned, PortInfo>> ports) {
 }
 
 LogicalResult InstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  auto module = (*this)->getParentOfType<FModuleOp>();
-  auto referencedModule = symbolTable.lookupNearestSymbolFrom<FModuleLike>(
-      *this, getModuleNameAttr());
-  if (!referencedModule) {
-    return emitOpError("invalid symbol reference");
-  }
-
-  // Check this is not a class.
-  if (isa<ClassOp /* ClassLike */>(referencedModule))
-    return emitOpError("must instantiate a module not a class")
-               .attachNote(referencedModule.getLoc())
-           << "class declared here";
-
-  // Check that this instance doesn't recursively instantiate its wrapping
-  // module.
-  if (referencedModule == module) {
-    auto diag = emitOpError()
-                << "is a recursive instantiation of its containing module";
-    return diag.attachNote(module.getLoc())
-           << "containing module declared here";
-  }
-
-  // Small helper add a note to the original declaration.
-  auto emitNote = [&](InFlightDiagnostic &&diag) -> InFlightDiagnostic && {
-    diag.attachNote(referencedModule->getLoc())
-        << "original module declared here";
-    return std::move(diag);
-  };
-
-  // Check that all the attribute arrays are the right length up front.  This
-  // lets us safely use the port name in error messages below.
-  size_t numResults = getNumResults();
-  size_t numExpected = referencedModule.getNumPorts();
-  if (numResults != numExpected) {
-    return emitNote(emitOpError() << "has a wrong number of results; expected "
-                                  << numExpected << " but got " << numResults);
-  }
-  if (getPortDirections().getBitWidth() != numExpected)
-    return emitNote(emitOpError("the number of port directions should be "
-                                "equal to the number of results"));
-  if (getPortNames().size() != numExpected)
-    return emitNote(emitOpError("the number of port names should be "
-                                "equal to the number of results"));
-  if (getPortAnnotations().size() != numExpected)
-    return emitNote(emitOpError("the number of result annotations should be "
-                                "equal to the number of results"));
-
-  // Check that the port names match the referenced module.
-  if (getPortNamesAttr() != referencedModule.getPortNamesAttr()) {
-    // We know there is an error, try to figure out whats wrong.
-    auto instanceNames = getPortNames();
-    auto moduleNames = referencedModule.getPortNamesAttr();
-    // First compare the sizes:
-    if (instanceNames.size() != moduleNames.size()) {
-      return emitNote(emitOpError()
-                      << "has a wrong number of directions; expected "
-                      << moduleNames.size() << " but got "
-                      << instanceNames.size());
-    }
-    // Next check the values:
-    for (size_t i = 0; i != numResults; ++i) {
-      if (instanceNames[i] != moduleNames[i]) {
-        return emitNote(emitOpError()
-                        << "name for port " << i << " must be "
-                        << moduleNames[i] << ", but got " << instanceNames[i]);
-      }
-    }
-    llvm_unreachable("should have found something wrong");
-  }
-
-  // Check that the types match.
-  for (size_t i = 0; i != numResults; i++) {
-    auto resultType = getResult(i).getType();
-    auto expectedType = referencedModule.getPortType(i);
-    if (resultType != expectedType) {
-      return emitNote(emitOpError()
-                      << "result type for " << getPortName(i) << " must be "
-                      << expectedType << ", but got " << resultType);
-    }
-  }
-
-  // Check that the port directions are consistent with the referenced module's.
-  if (getPortDirectionsAttr() != referencedModule.getPortDirectionsAttr()) {
-    // We know there is an error, try to figure out whats wrong.
-    auto instanceDirectionAttr = getPortDirectionsAttr();
-    auto moduleDirectionAttr = referencedModule.getPortDirectionsAttr();
-    // First compare the sizes:
-    auto expectedWidth = moduleDirectionAttr.getValue().getBitWidth();
-    auto actualWidth = instanceDirectionAttr.getValue().getBitWidth();
-    if (expectedWidth != actualWidth) {
-      return emitNote(emitOpError()
-                      << "has a wrong number of directions; expected "
-                      << expectedWidth << " but got " << actualWidth);
-    }
-    // Next check the values.
-    auto instanceDirs = direction::unpackAttribute(instanceDirectionAttr);
-    auto moduleDirs = direction::unpackAttribute(moduleDirectionAttr);
-    for (size_t i = 0; i != numResults; ++i) {
-      if (instanceDirs[i] != moduleDirs[i]) {
-        return emitNote(emitOpError()
-                        << "direction for " << getPortName(i) << " must be \""
-                        << direction::toString(moduleDirs[i])
-                        << "\", but got \""
-                        << direction::toString(instanceDirs[i]) << "\"");
-      }
-    }
-    llvm_unreachable("should have found something wrong");
-  }
-
-  return success();
+  return instance_like_impl::verifyReferencedModule(*this, symbolTable,
+                                                    getModuleNameAttr());
 }
 
 StringRef InstanceOp::getInstanceName() { return getName(); }
@@ -2331,6 +2295,276 @@ std::optional<size_t> InstanceOp::getTargetResultIndex() {
   // Inner symbols on instance operations target the op not any result.
   return std::nullopt;
 }
+
+// -----------------------------------------------------------------------------
+// InstanceChoiceOp
+// -----------------------------------------------------------------------------
+
+void InstanceChoiceOp::build(
+    OpBuilder &builder, OperationState &result, FModuleLike defaultModule,
+    ArrayRef<std::pair<OptionCaseOp, FModuleLike>> cases, StringRef name,
+    NameKindEnum nameKind, ArrayRef<Attribute> annotations,
+    ArrayRef<Attribute> portAnnotations, StringAttr innerSym) {
+  // Gather the result types.
+  SmallVector<Type> resultTypes;
+  for (Attribute portType : defaultModule.getPortTypes())
+    resultTypes.push_back(cast<TypeAttr>(portType).getValue());
+
+  // Create the port annotations.
+  ArrayAttr portAnnotationsAttr;
+  if (portAnnotations.empty()) {
+    portAnnotationsAttr = builder.getArrayAttr(SmallVector<Attribute, 16>(
+        resultTypes.size(), builder.getArrayAttr({})));
+  } else {
+    portAnnotationsAttr = builder.getArrayAttr(portAnnotations);
+  }
+
+  // Gather the module & case names.
+  SmallVector<Attribute> moduleNames, caseNames;
+  moduleNames.push_back(SymbolRefAttr::get(defaultModule.getModuleNameAttr()));
+  for (auto [caseOption, caseModule] : cases) {
+    auto caseGroup = caseOption->getParentOfType<OptionOp>();
+    caseNames.push_back(SymbolRefAttr::get(caseGroup.getSymNameAttr(),
+                                           {SymbolRefAttr::get(caseOption)}));
+    moduleNames.push_back(SymbolRefAttr::get(caseModule.getModuleNameAttr()));
+  }
+
+  return build(builder, result, resultTypes, builder.getArrayAttr(moduleNames),
+               builder.getArrayAttr(caseNames), builder.getStringAttr(name),
+               NameKindEnumAttr::get(builder.getContext(), nameKind),
+               defaultModule.getPortDirectionsAttr(),
+               defaultModule.getPortNamesAttr(),
+               builder.getArrayAttr(annotations), portAnnotationsAttr,
+               innerSym ? hw::InnerSymAttr::get(innerSym) : hw::InnerSymAttr());
+}
+
+std::optional<size_t> InstanceChoiceOp::getTargetResultIndex() {
+  return std::nullopt;
+}
+
+void InstanceChoiceOp::print(OpAsmPrinter &p) {
+  // Print the instance name.
+  p << " ";
+  p.printKeywordOrString(getName());
+  if (auto attr = getInnerSymAttr()) {
+    p << " sym ";
+    p.printSymbolName(attr.getSymName());
+  }
+  if (getNameKindAttr().getValue() != NameKindEnum::DroppableName)
+    p << ' ' << stringifyNameKindEnum(getNameKindAttr().getValue());
+
+  // Print the attr-dict.
+  SmallVector<StringRef, 9> omittedAttrs = {
+      "moduleNames",     "caseNames", "name",
+      "portDirections",  "portNames", "portTypes",
+      "portAnnotations", "inner_sym", "nameKind"};
+  if (getAnnotations().empty())
+    omittedAttrs.push_back("annotations");
+  p.printOptionalAttrDict((*this)->getAttrs(), omittedAttrs);
+
+  // Print the module name.
+  p << ' ';
+
+  auto moduleNames = getModuleNamesAttr();
+  auto caseNames = getCaseNamesAttr();
+
+  p.printSymbolName(moduleNames[0].cast<FlatSymbolRefAttr>().getValue());
+
+  p << " alternatives ";
+  p.printSymbolName(
+      caseNames[0].cast<SymbolRefAttr>().getRootReference().getValue());
+  p << " { ";
+  for (size_t i = 0, n = caseNames.size(); i < n; ++i) {
+    if (i != 0)
+      p << ", ";
+
+    auto symbol = caseNames[i].cast<SymbolRefAttr>();
+    p.printSymbolName(symbol.getNestedReferences()[0].getValue());
+    p << " -> ";
+    p.printSymbolName(moduleNames[i + 1].cast<FlatSymbolRefAttr>().getValue());
+  }
+
+  p << " } ";
+
+  // Collect all the result types as TypeAttrs for printing.
+  SmallVector<Attribute> portTypes;
+  portTypes.reserve(getNumResults());
+  llvm::transform(getResultTypes(), std::back_inserter(portTypes),
+                  &TypeAttr::get);
+  auto portDirections = direction::unpackAttribute(getPortDirectionsAttr());
+  printModulePorts(p, /*block=*/nullptr, portDirections,
+                   getPortNames().getValue(), portTypes,
+                   getPortAnnotations().getValue(), {}, {});
+}
+
+ParseResult InstanceChoiceOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
+  auto *context = parser.getContext();
+  auto &resultAttrs = result.attributes;
+
+  std::string name;
+  hw::InnerSymAttr innerSymAttr;
+  SmallVector<Attribute> moduleNames;
+  SmallVector<Attribute> caseNames;
+  SmallVector<OpAsmParser::Argument> entryArgs;
+  SmallVector<Direction, 4> portDirections;
+  SmallVector<Attribute, 4> portNames;
+  SmallVector<Attribute, 4> portTypes;
+  SmallVector<Attribute, 4> portAnnotations;
+  SmallVector<Attribute, 4> portSyms;
+  SmallVector<Attribute, 4> portLocs;
+  NameKindEnumAttr nameKind;
+
+  if (parser.parseKeywordOrString(&name))
+    return failure();
+  if (succeeded(parser.parseOptionalKeyword("sym"))) {
+    if (parser.parseCustomAttributeWithFallback(
+            innerSymAttr, Type{},
+            hw::InnerSymbolTable::getInnerSymbolAttrName(),
+            result.attributes)) {
+      return failure();
+    }
+  }
+  if (parseNameKind(parser, nameKind) ||
+      parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  FlatSymbolRefAttr defaultModuleName;
+  if (parser.parseAttribute(defaultModuleName))
+    return failure();
+  moduleNames.push_back(defaultModuleName);
+
+  // alternatives { @opt::@case -> @target, ... }
+  {
+    FlatSymbolRefAttr optionName;
+    if (parser.parseKeyword("alternatives") ||
+        parser.parseAttribute(optionName) || parser.parseLBrace())
+      return failure();
+
+    FlatSymbolRefAttr moduleName;
+    StringAttr caseName;
+    while (succeeded(parser.parseOptionalSymbolName(caseName))) {
+      if (parser.parseArrow() || parser.parseAttribute(moduleName))
+        return failure();
+      moduleNames.push_back(moduleName);
+      caseNames.push_back(SymbolRefAttr::get(
+          optionName.getAttr(), {FlatSymbolRefAttr::get(caseName)}));
+      if (failed(parser.parseOptionalComma()))
+        break;
+    }
+    if (parser.parseRBrace())
+      return failure();
+  }
+
+  if (parseModulePorts(parser, /*hasSSAIdentifiers=*/false,
+                       /*supportsSymbols=*/false, entryArgs, portDirections,
+                       portNames, portTypes, portAnnotations, portSyms,
+                       portLocs))
+    return failure();
+
+  // Add the attributes. We let attributes defined in the attr-dict override
+  // attributes parsed out of the module signature.
+  if (!resultAttrs.get("moduleNames"))
+    result.addAttribute("moduleNames", ArrayAttr::get(context, moduleNames));
+  if (!resultAttrs.get("caseNames"))
+    result.addAttribute("caseNames", ArrayAttr::get(context, caseNames));
+  if (!resultAttrs.get("name"))
+    result.addAttribute("name", StringAttr::get(context, name));
+  result.addAttribute("nameKind", nameKind);
+  if (!resultAttrs.get("portDirections"))
+    result.addAttribute("portDirections",
+                        direction::packAttribute(context, portDirections));
+  if (!resultAttrs.get("portNames"))
+    result.addAttribute("portNames", ArrayAttr::get(context, portNames));
+  if (!resultAttrs.get("portAnnotations"))
+    result.addAttribute("portAnnotations",
+                        ArrayAttr::get(context, portAnnotations));
+
+  // Annotations and LowerToBind are omitted in the printed format if they are
+  // empty and false, respectively.
+  if (!resultAttrs.get("annotations"))
+    resultAttrs.append("annotations", parser.getBuilder().getArrayAttr({}));
+
+  // Add result types.
+  result.types.reserve(portTypes.size());
+  llvm::transform(
+      portTypes, std::back_inserter(result.types),
+      [](Attribute typeAttr) { return cast<TypeAttr>(typeAttr).getValue(); });
+
+  return success();
+}
+
+void InstanceChoiceOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  StringRef base = getName().empty() ? "inst" : getName();
+  for (auto [result, name] : llvm::zip(getResults(), getPortNames()))
+    setNameFn(result, (base + "_" + name.cast<StringAttr>().getValue()).str());
+}
+
+LogicalResult InstanceChoiceOp::verify() {
+  if (getCaseNamesAttr().empty())
+    return emitOpError() << "must have at least one case";
+  if (getModuleNamesAttr().size() != getCaseNamesAttr().size() + 1)
+    return emitOpError() << "number of referenced modules does not match the "
+                            "number of options";
+  return success();
+}
+
+LogicalResult
+InstanceChoiceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto caseNames = getCaseNamesAttr();
+  for (auto moduleName : getModuleNamesAttr()) {
+    if (failed(instance_like_impl::verifyReferencedModule(
+            *this, symbolTable, moduleName.cast<FlatSymbolRefAttr>())))
+      return failure();
+  }
+
+  auto root = caseNames[0].cast<SymbolRefAttr>().getRootReference();
+  for (size_t i = 0, n = caseNames.size(); i < n; ++i) {
+    auto ref = caseNames[i].cast<SymbolRefAttr>();
+    auto refRoot = ref.getRootReference();
+    if (ref.getRootReference() != root)
+      return emitOpError() << "case " << ref
+                           << " is not in the same option group as "
+                           << caseNames[0];
+
+    if (!symbolTable.lookupNearestSymbolFrom<OptionOp>(*this, refRoot))
+      return emitOpError() << "option " << refRoot << " does not exist";
+
+    if (!symbolTable.lookupNearestSymbolFrom<OptionCaseOp>(*this, ref))
+      return emitOpError() << "option " << refRoot
+                           << " does not contain option case " << ref;
+  }
+
+  return success();
+}
+
+FlatSymbolRefAttr
+InstanceChoiceOp::getTargetOrDefaultAttr(OptionCaseOp option) {
+  auto caseNames = getCaseNamesAttr();
+  for (size_t i = 0, n = caseNames.size(); i < n; ++i) {
+    StringAttr caseSym = caseNames[i].cast<SymbolRefAttr>().getLeafReference();
+    if (caseSym == option.getSymName())
+      return getModuleNamesAttr()[i + 1].cast<FlatSymbolRefAttr>();
+  }
+  return getDefaultTargetAttr();
+}
+
+SmallVector<std::pair<SymbolRefAttr, FlatSymbolRefAttr>, 1>
+InstanceChoiceOp::getTargetChoices() {
+  auto caseNames = getCaseNamesAttr();
+  auto moduleNames = getModuleNamesAttr();
+  SmallVector<std::pair<SymbolRefAttr, FlatSymbolRefAttr>, 1> choices;
+  for (size_t i = 0; i < caseNames.size(); ++i) {
+    choices.emplace_back(caseNames[i].cast<SymbolRefAttr>(),
+                         moduleNames[i + 1].cast<FlatSymbolRefAttr>());
+  }
+
+  return choices;
+}
+
+//===----------------------------------------------------------------------===//
+// MemOp
+//===----------------------------------------------------------------------===//
 
 void MemOp::build(OpBuilder &builder, OperationState &result,
                   TypeRange resultTypes, uint32_t readLatency,
@@ -2882,6 +3116,16 @@ void WireOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
 
 std::optional<size_t> WireOp::getTargetResultIndex() { return 0; }
 
+LogicalResult WireOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto refType = type_dyn_cast<RefType>(getType(0));
+  if (!refType)
+    return success();
+
+  return verifyProbeType(
+      refType, getLoc(), getOperation()->getParentOfType<CircuitOp>(),
+      symbolTable, Twine("'") + getOperationName() + "' op is");
+}
+
 void ObjectOp::build(OpBuilder &builder, OperationState &state, ClassLike klass,
                      StringRef name) {
   build(builder, state, klass.getInstanceType(),
@@ -3046,7 +3290,7 @@ static LogicalResult checkConnectConditionality(FConnectLike connect) {
           .Case<SubaccessOp>([&](SubaccessOp op) {
             if (op.getInput()
                     .getType()
-                    .get()
+                    .base()
                     .getElementTypePreservingConst()
                     .isConst())
               originalFieldType = originalFieldType.getConstType(true);
@@ -3175,6 +3419,55 @@ LogicalResult StrictConnectOp::verify() {
   return success();
 }
 
+LogicalResult static verifyLayer(Operation *op, SymbolRefAttr opLayer) {
+  if (!opLayer)
+    return success();
+
+  auto moduleOp = op->getParentOfType<FModuleOp>();
+
+  // All the layers which are currently enabled.
+  SmallVector<Attribute> enabledLayers(moduleOp.getLayers());
+
+  auto layerBlockOp = op->getParentOfType<LayerBlockOp>();
+  if (layerBlockOp)
+    enabledLayers.push_back(layerBlockOp.getLayerName());
+
+  // The dest layer must be the same as the source layer or a parent of it.
+  for (Attribute attr : enabledLayers) {
+    SymbolRefAttr layerPointer = cast<SymbolRefAttr>(attr);
+    for (;;) {
+      if (!layerPointer)
+        break;
+
+      if (layerPointer == opLayer)
+        return success();
+
+      if (layerPointer.getNestedReferences().empty()) {
+        layerPointer = {};
+        continue;
+      }
+      layerPointer =
+          SymbolRefAttr::get(layerPointer.getRootReference(),
+                             layerPointer.getNestedReferences().drop_back());
+    }
+  }
+
+  auto diag = op->emitOpError()
+              << "cannot interact with layer '" << opLayer
+              << "' because it is not inside a '" << moduleOp.getOperationName()
+              << "' or '" << LayerBlockOp::getOperationName()
+              << "' which enables layer '" << opLayer << "' or a child layer";
+
+  if (layerBlockOp)
+    diag.attachNote(layerBlockOp.getLoc())
+        << "the enclosing '" << layerBlockOp.getOperationName()
+        << "' is defined here";
+
+  return diag.attachNote(moduleOp.getLoc())
+         << "the enclosing '" << moduleOp.getOperationName()
+         << "' is defined here";
+}
+
 LogicalResult RefDefineOp::verify() {
   // Check that the flows make sense.
   if (failed(checkConnectFlow(*this)))
@@ -3203,7 +3496,7 @@ LogicalResult RefDefineOp::verify() {
           "destination reference cannot be a cast of another reference");
   }
 
-  return success();
+  return verifyLayer(*this, getDest().getType().getLayer());
 }
 
 LogicalResult PropAssignOp::verify() {
@@ -3409,12 +3702,20 @@ LogicalResult impl::inferReturnTypes(
   return failure();
 }
 
-/// Get an attribute by name from a list of named attributes. Aborts if the
-/// attribute does not exist.
-static Attribute getAttr(ArrayRef<NamedAttribute> attrs, StringRef name) {
+/// Get an attribute by name from a list of named attributes.  Return null if no
+/// attribute is found with that name.
+static Attribute maybeGetAttr(ArrayRef<NamedAttribute> attrs, StringRef name) {
   for (auto attr : attrs)
     if (attr.getName() == name)
       return attr.getValue();
+  return {};
+}
+
+/// Get an attribute by name from a list of named attributes. Aborts if the
+/// attribute does not exist.
+static Attribute getAttr(ArrayRef<NamedAttribute> attrs, StringRef name) {
+  if (auto attr = maybeGetAttr(attrs, name))
+    return attr;
   llvm::report_fatal_error("attribute '" + name + "' not found");
 }
 
@@ -3854,7 +4155,7 @@ ParseResult FEnumCreateOp::parse(OpAsmParser &parser, OperationState &result) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult IsTagOp::verify() {
-  if (getFieldIndex() >= getInput().getType().get().getNumElements())
+  if (getFieldIndex() >= getInput().getType().base().getNumElements())
     return emitOpError("element index is greater than the number of fields in "
                        "the bundle type");
   return success();
@@ -4043,7 +4344,7 @@ LogicalResult OpenSubfieldOp::verify() {
 }
 
 LogicalResult SubtagOp::verify() {
-  if (getFieldIndex() >= getInput().getType().get().getNumElements())
+  if (getFieldIndex() >= getInput().getType().base().getNumElements())
     return emitOpError("subfield element index is greater than the number "
                        "of fields in the bundle type");
   return success();
@@ -4967,7 +5268,7 @@ void VerbatimExprOp::getAsmResultNames(
   auto isOkCharacter = [](char c) { return llvm::isAlnum(c) || c == '_'; };
   auto name = getText();
   // Ignore a leading ` in macro name.
-  if (name.startswith("`"))
+  if (name.starts_with("`"))
     name = name.drop_front();
   name = name.take_while(isOkCharacter);
   if (!name.empty())
@@ -4986,7 +5287,7 @@ void VerbatimWireOp::getAsmResultNames(
   auto isOkCharacter = [](char c) { return llvm::isAlnum(c) || c == '_'; };
   auto name = getText();
   // Ignore a leading ` in macro name.
-  if (name.startswith("`"))
+  if (name.starts_with("`"))
     name = name.drop_front();
   name = name.take_while(isOkCharacter);
   if (!name.empty())
@@ -5507,7 +5808,7 @@ FIRRTLType RefSubOp::inferReturnType(ValueRange operands,
       return RefType::get(
           vectorType.getElementType().getConstType(
               vectorType.isConst() || vectorType.getElementType().isConst()),
-          refType.getForceable());
+          refType.getForceable(), refType.getLayer());
     return emitInferRetTypeError(loc, "out of range index '", fieldIdx,
                                  "' in RefType of vector type ", refType);
   }
@@ -5520,11 +5821,19 @@ FIRRTLType RefSubOp::inferReturnType(ValueRange operands,
     return RefType::get(bundleType.getElement(fieldIdx).type.getConstType(
                             bundleType.isConst() ||
                             bundleType.getElement(fieldIdx).type.isConst()),
-                        refType.getForceable());
+                        refType.getForceable(), refType.getLayer());
   }
 
   return emitInferRetTypeError(
       loc, "ref.sub op requires a RefType of vector or bundle base type");
+}
+
+LogicalResult RefCastOp::verify() {
+  return verifyLayer(*this, getType().getLayer());
+}
+
+LogicalResult RefResolveOp::verify() {
+  return verifyLayer(*this, getRef().getType().getLayer());
 }
 
 LogicalResult RWProbeOp::verifyInnerRefs(hw::InnerRefNamespace &ns) {
@@ -5622,16 +5931,10 @@ LogicalResult LayerBlockOp::verify() {
       // Any value captured from the current layer block is fine.
       if (operand.getParentBlock() == body)
         continue;
-      // Capture of a non-base type, e.g., reference is illegal.
+      // Capture of a non-base type, e.g., reference, is allowed.
       FIRRTLBaseType baseType = dyn_cast<FIRRTLBaseType>(operand.getType());
-      if (!baseType) {
-        auto diag = emitOpError()
-                    << "captures an operand which is not a FIRRTL base type";
-        diag.attachNote(operand.getLoc()) << "operand is defined here";
-        diag.attachNote(op->getLoc()) << "operand is used here";
-        failed = true;
+      if (!baseType)
         return WalkResult::advance();
-      }
       // Capturing a non-passive type is illegal.
       if (!baseType.isPassive()) {
         auto diag = emitOpError()

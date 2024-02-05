@@ -330,7 +330,14 @@ circuit ProbeFlipType:
 
 circuit NestedProbes:
   module NestedProbes:
-    output p : Probe<Probe<UInt>> ; expected-error {{cannot nest reference types}}
+    output p : Probe<Probe<UInt>> ; expected-error {{invalid probe inner type, must be base-type}}
+
+;// -----
+FIRRTL version 3.1.0
+
+circuit ProbeOfProp:
+  module ProbeOfProp:
+    output p : Probe<Integer> ; expected-error {{invalid probe inner type, must be base-type}}
 
 ;// -----
 
@@ -1141,3 +1148,169 @@ circuit PublicNonModule:
   ; expected-error @below {{only modules may be public}}
   public extmodule Foo:
   module PublicNonModule:
+
+;// -----
+circuit RWProbeExprOOB :
+  module RWProbeExprOOB :
+    output p : RWProbe<UInt<1>>
+    wire x : UInt<1>[2]
+    x is invalid
+
+    ; expected-error @below {{out of range index '100' for vector type '!firrtl.vector<uint<1>, 2>'}}
+    define p = rwprobe(x[100])
+
+   input out_0 : SInt<8>[5]
+   out_0[4] <- out_0[5]
+
+;// -----
+
+FIRRTL version 3.9.0
+circuit Foo:
+  ; expected-error @below {{option groups/instance choices are a FIRRTL 4.0.0+ feature}}
+  option Platform:
+    FPGA
+    ASIC
+
+;// -----
+
+FIRRTL version 3.9.0
+circuit Foo:
+
+  module Foo:
+    ; expected-error @below {{option groups/instance choices are a FIRRTL 4.0.0+ feature}}
+    instchoice inst of DefaultTarget Platform :
+      FPGA => FPGATarget
+      ASIC => ASICTarget
+
+;// -----
+
+FIRRTL version 4.0.0
+circuit Foo:
+  option Platform:
+    FPGA
+
+  module DefaultTarget:
+    input clock: Clock
+
+  module FPGATarget:
+    input clock: UInt<1>
+
+  module Foo:
+    ; expected-error @below {{instance case port 'clock' type does not match the default module port}}
+    instchoice inst of DefaultTarget, Platform :
+      FPGA => FPGATarget
+
+;// -----
+
+FIRRTL version 4.0.0
+circuit Foo:
+  option Platform:
+    FPGA
+
+  module DefaultTarget:
+    input clock: Clock
+
+  module FPGATarget:
+    input x: UInt<1>
+
+  module Foo:
+    ; expected-error @below {{instance case module port 'x' does not match the default module port 'clock'}}
+    instchoice inst of DefaultTarget, Platform :
+      FPGA => FPGATarget
+
+;// -----
+
+FIRRTL version 4.0.0
+circuit Foo:
+  option Platform:
+    FPGA
+
+  module DefaultTarget:
+  module FPGATarget:
+
+  module Foo:
+    ; expected-error @below {{use of undefined option case 'ASIC'}}
+    instchoice inst of DefaultTarget, Platform :
+      ASIC => FPGATarget
+
+;// -----
+
+FIRRTL version 4.0.0
+circuit Foo:
+  module DefaultTarget:
+  module FPGATarget:
+
+  module Foo:
+    ; expected-error @below {{use of undefined option group 'Platform'}}
+    instchoice inst of DefaultTarget, Platform :
+      ASIC => FPGATarget
+
+;// -----
+
+FIRRTL version 4.0.0
+circuit Foo:
+  ; expected-error @below {{duplicate option case definition 'FPGA'}}
+  option Platform:
+    FPGA
+    FPGA
+
+;// -----
+FIRRTL version 3.1.0
+circuit Foo:
+
+  module Foo:
+    ; expected-error @below {{colored probes are a FIRRTL 3.2.0+ feature, but the specified FIRRTL version was 3.1.0}}
+    output a: Probe<UInt<1>, A>
+
+;// -----
+FIRRTL version 4.0.0
+circuit Foo:
+  layer A bind:
+  module Foo:
+    output a: Probe<
+    ; expected-error @below {{expected probe data type}}
+;// -----
+FIRRTL version 4.0.0
+circuit Foo:
+  layer A bind:
+  module Foo:
+    ; expected-error @below {{expected '<' in reference type}}
+    output a: Probe X
+
+;// -----
+FIRRTL version 4.0.0
+circuit Foo:
+  layer A bind:
+  module Foo:
+    output a: Probe
+    ; expected-error @below {{expected '<' in reference type}}
+;// -----
+FIRRTL version 4.0.0
+circuit Foo:
+  layer A bind:
+  module Foo:
+    ; expected-error @below {{expected probe data type}}
+    output a: Probe<>
+
+;// -----
+FIRRTL version 4.0.0
+circuit Foo:
+  layer A bind:
+  module Foo:
+    ; expected-error @below {{expected '>' to end reference type}}
+    output a: Probe<UInt<1>
+;// -----
+FIRRTL version 4.0.0
+circuit Foo:
+  layer A bind:
+  module Foo:
+    ; expected-error @below {{expected '>' to end reference type}}
+    output a: Probe<UInt<1> A
+
+;// -----
+FIRRTL version 4.0.0
+circuit Foo:
+  layer A bind:
+  module Foo:
+    ; expected-error @below {{expected layer name}}
+    output a: Probe<UInt<1> A.>
