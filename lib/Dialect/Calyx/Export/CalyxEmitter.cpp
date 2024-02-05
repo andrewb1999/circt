@@ -121,14 +121,14 @@ private:
             })
         .Case<MemoryOp, NotLibOp, AndLibOp, OrLibOp, XorLibOp, SubLibOp,
               GtLibOp, LtLibOp, EqLibOp, NeqLibOp, GeLibOp, LeLibOp, LshLibOp,
-              RshLibOp, SliceLibOp, PadLibOp, ExtSILibOp, MuxLibOp>(
+              RshLibOp, SliceLibOp, PadLibOp, MuxLibOp>(
             [&](auto op) -> FailureOr<StringRef> {
               static constexpr std::string_view sCore = "core";
               return {sCore};
             })
         .Case<SgtLibOp, SltLibOp, SeqLibOp, SneqLibOp, SgeLibOp, SleLibOp,
               SrshLibOp, SeqMultLibOp, SeqRemULibOp, SeqRemSLibOp, SeqDivULibOp,
-              SeqDivSLibOp>([&](auto op) -> FailureOr<StringRef> {
+              SeqDivSLibOp, ExtSILibOp>([&](auto op) -> FailureOr<StringRef> {
           static constexpr std::string_view sBinaryOperators =
               "binary_operators";
           return {sBinaryOperators};
