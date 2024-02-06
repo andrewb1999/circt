@@ -26,13 +26,16 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/AsmState.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <cassert>
 #include <iterator>
@@ -297,7 +300,7 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
       opBuiltSuccessfully &=
           TypeSwitch<mlir::Operation *, bool>(op)
               .template Case<arith::ConstantOp, ReturnOp, BranchOpInterface,
-                             /// memref
+                             /// memory ops
                              memref::AllocOp, memref::AllocaOp, memref::LoadOp,
                              memref::StoreOp,
                              /// memory interface
@@ -859,15 +862,51 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     getState<ComponentLoweringState>().addLoopInitGroup(loop, initGroupOp);
   }
 
+  /// Update iter arg values at end of loop if needed
+  auto termIterArgs = loop.getOperation().getTerminatorIterArgs();
+  for (auto v : llvm::enumerate(termIterArgs)) {
+    auto arg = v.value();
+    auto idx = v.index();
+    auto stepOp = arg.getDefiningOp<LoopScheduleStepOp>();
+    if (stepOp) {
+      auto resNum = cast<OpResult>(arg).getResultNumber();
+      auto regOp = cast<LoopScheduleRegisterOp>(stepOp.getBodyBlock().getTerminator());
+      auto regVal = regOp.getOperand(resNum);
+      auto pipelineStage = regVal.getDefiningOp<LoopSchedulePipelineStageOp>();
+      if (pipelineStage) {
+        auto pipeline = pipelineStage.getParentOp();
+        auto pipelineResNum = cast<OpResult>(regVal).getResultNumber();
+        auto outerReg = getState<ComponentLoweringState>().getLoopIterReg(LoopWrapper {loop}, idx);
+        auto pipelineReg = getState<ComponentLoweringState>().getLoopIterReg(LoopWrapper {pipeline}, pipelineResNum + 1);
+        auto groupName = getState<ComponentLoweringState>().getUniqueName("iter_arg");
+        auto iterArgGroup = calyx::createStaticGroup(
+            rewriter, getState<ComponentLoweringState>().getComponentOp(),
+            op->getLoc(), groupName, 1);
+        rewriter.setInsertionPointToEnd(iterArgGroup.getBodyBlock());
+        rewriter.create<calyx::AssignOp>(loop.getLoc(), outerReg.getIn(), pipelineReg.getOut());
+        auto oneI1 =
+            calyx::createConstant(op.getLoc(), rewriter, getComponent(), 1, 1);
+        rewriter.create<calyx::AssignOp>(loop.getLoc(), outerReg.getWriteEn(), oneI1);
+        auto phases = llvm::SmallVector<PhaseInterface>(loop.getBodyBlock()->getOps<PhaseInterface>());
+        auto lastPhase = cast<PhaseInterface>(phases.back());
+        getState<ComponentLoweringState>().addBlockSchedulable(&lastPhase.getBodyBlock(), iterArgGroup);
+      }
+    }
+  }
+
   if (loop.isPipelined()) {
     auto groupName = getState<ComponentLoweringState>().getUniqueName("incr");
     auto incrGroup = calyx::createStaticGroup(
         rewriter, getState<ComponentLoweringState>().getComponentOp(),
         op->getLoc(), groupName, 1);
+    auto pipeline = cast<LoopSchedulePipelineOp>(loop.getOperation());
+    auto tripCount = pipeline.getTripCount();
+    auto bitwidth = tripCount.has_value() ? 
+      llvm::Log2_64_Ceil(*tripCount * pipeline.getII() + pipeline.getBodyLatency() - 1) : 32;
     auto incrReg =
-        createRegister(op.getLoc(), rewriter, getComponent(), 32,
+        createRegister(op.getLoc(), rewriter, getComponent(), bitwidth,
                        getState<ComponentLoweringState>().getUniqueName("idx"));
-    auto width = rewriter.getI32Type();
+    auto width = rewriter.getIntegerType(bitwidth);
     auto addOp = getState<ComponentLoweringState>()
                      .getNewLibraryOpInstance<calyx::AddLibOp>(
                          rewriter, op.getLoc(), {width, width, width});
@@ -875,7 +914,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     rewriter.create<calyx::AssignOp>(op.getLoc(), addOp.getLeft(),
                                      incrReg.getOut());
     auto constant =
-        calyx::createConstant(op.getLoc(), rewriter, getComponent(), 32, 1);
+        calyx::createConstant(op.getLoc(), rewriter, getComponent(), bitwidth, 1);
     rewriter.create<calyx::AssignOp>(op.getLoc(), addOp.getRight(), constant);
     rewriter.create<calyx::AssignOp>(op.getLoc(), incrReg.getIn(),
                                      addOp.getOut());
@@ -897,17 +936,12 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
         op->getLoc(), initName, 1);
     rewriter.setInsertionPointToEnd(incrInit.getBodyBlock());
     auto zero =
-        calyx::createConstant(op.getLoc(), rewriter, getComponent(), 32, 0);
+        calyx::createConstant(op.getLoc(), rewriter, getComponent(), bitwidth, 0);
     rewriter.create<calyx::AssignOp>(op.getLoc(), incrReg.getIn(), zero);
     rewriter.create<calyx::AssignOp>(op.getLoc(), incrReg.getWriteEn(), oneI1);
     getState<ComponentLoweringState>().addLoopInitGroup(loop, incrInit);
 
-    // Set pipeline iter value stuff
-    auto pipeline = cast<LoopSchedulePipelineOp>(loop.getOperation());
-    // if (pipeline.getII() != 1) {
-    //   return pipeline.emitOpError("LoopScheduleToCalyx currently does not "
-    //                               "support pipelines with II > 1");
-    // }
+    // Set pipeline iterValue and incrGroup
     getState<ComponentLoweringState>().setIncrGroup(pipeline, incrGroup);
     getState<ComponentLoweringState>().setLoopIterValue(pipeline,
                                                         addOp.getOut());
@@ -926,10 +960,10 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   if (op.getOperands().empty())
     return success();
 
-  // Replace the pipeline's result(s) with the terminator's results.
-  auto *pipeline = op->getParentOp();
-  for (size_t i = 0, e = pipeline->getNumResults(); i < e; ++i)
-    pipeline->getResult(i).replaceAllUsesWith(op.getResults()[i]);
+  // Replace the loop's result(s) with the terminator's results.
+  auto *loop = op->getParentOp();
+  for (size_t i = 0, e = loop->getNumResults(); i < e; ++i)
+    loop->getResult(i).replaceAllUsesWith(op.getResults()[i]);
 
   return success();
 }
@@ -1176,13 +1210,13 @@ class BuildConditionChecks : public calyx::FuncOpPartialLoweringPattern {
       auto termArg = term.getIterArgs()[0];
       auto phase = termArg.getDefiningOp<PhaseInterface>();
       auto result = termArg.cast<OpResult>();
-      auto *phaseTerm = phase.getBodyBlock().getTerminator();
-      auto newIterArg = phaseTerm->getOpOperand(result.getResultNumber()).get();
+      auto *phaseReg = phase.getBodyBlock().getTerminator();
+      auto newIterArg = phaseReg->getOpOperand(result.getResultNumber()).get();
       Value newCondValue;
       for (auto &op : loop.getConditionBlock()->getOperations()) {
         if (!isa<LoopScheduleRegisterOp>(op)) {
           auto *clonedOp = rewriter.clone(op);
-          clonedOp->moveBefore(phaseTerm);
+          clonedOp->moveBefore(phaseReg);
           newCondValue = clonedOp->getResult(0);
         }
       }
