@@ -1086,18 +1086,12 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
         .Case<IfOp, AffineYieldOp, arith::ConstantOp, arith::ExtSIOp,
               arith::ExtUIOp, arith::TruncIOp, CmpIOp, IndexCastOp,
               memref::AllocaOp, memref::AllocOp, loopschedule::AllocInterface,
-              YieldOp, func::ReturnOp>([&](Operation *combOp) {
+              YieldOp, func::ReturnOp, AddIOp, SubIOp, ShLIOp, AndIOp, ShRSIOp, 
+              ShRUIOp>([&](Operation *combOp) {
           // Some known combinational ops.
           problem.setLinkedOperatorType(combOp, combOpr);
           return WalkResult::advance();
         })
-        .Case<AddIOp, SubIOp, CmpIOp, ShLIOp, AndIOp, ShRSIOp, ShRUIOp>(
-            [&](Operation *seqOp) {
-              // These ops need to be sequential for now because we do not
-              // have enough information to chain them together yet.
-              problem.setLinkedOperatorType(seqOp, seqOpr);
-              return WalkResult::advance();
-            })
         .Case<LoopInterface>([&](Operation *loopOp) {
           // llvm::errs() << "loopOp\n";
           // loopOp->dump();
