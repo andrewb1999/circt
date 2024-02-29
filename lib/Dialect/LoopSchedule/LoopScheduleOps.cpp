@@ -292,13 +292,13 @@ uint64_t LoopSchedulePipelineOp::getBodyLatency() {
 bool LoopSchedulePipelineOp::canStall() {
   auto mightStallRes = this->walk([&](Operation *op) {
     if (auto load = dyn_cast<LoadInterface>(op)) {
-      if (!load.getLatency().has_value()) {
+      if (load.isDynamic()) {
         return WalkResult::interrupt();
       }
     }
 
     if (auto store = dyn_cast<StoreInterface>(op)) {
-      if (!store.getLatency().has_value()) {
+      if (store.isDynamic()) {
         return WalkResult::interrupt();
       }
     }
@@ -515,13 +515,13 @@ void LoopScheduleSequentialOp::build(OpBuilder &builder, OperationState &state,
 bool LoopScheduleSequentialOp::canStall() {
   auto mightStallRes = this->walk([&](Operation *op) {
     if (auto load = dyn_cast<LoadInterface>(op)) {
-      if (!load.getLatency().has_value()) {
+      if (load.isDynamic()) {
         return WalkResult::interrupt();
       }
     }
 
     if (auto store = dyn_cast<StoreInterface>(op)) {
-      if (!store.getLatency().has_value()) {
+      if (store.isDynamic()) {
         return WalkResult::interrupt();
       }
     }

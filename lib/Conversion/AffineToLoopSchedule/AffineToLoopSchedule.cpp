@@ -1086,7 +1086,7 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
         .Case<IfOp, AffineYieldOp, arith::ConstantOp, arith::ExtSIOp,
               arith::ExtUIOp, arith::TruncIOp, CmpIOp, IndexCastOp,
               memref::AllocaOp, memref::AllocOp, loopschedule::AllocInterface,
-              YieldOp, func::ReturnOp, AddIOp, SubIOp, ShLIOp, AndIOp, ShRSIOp, 
+              YieldOp, func::ReturnOp, AddIOp, SubIOp, ShLIOp, AndIOp, ShRSIOp,
               ShRUIOp>([&](Operation *combOp) {
           // Some known combinational ops.
           problem.setLinkedOperatorType(combOp, combOpr);
@@ -1110,21 +1110,21 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
               problem.addExtraLimitingType(loopOp, memOpr);
             } else if (isa<LoadInterface>(op)) {
               auto loadOp = cast<loopschedule::LoadInterface>(*op);
-              auto latencyOpt = loadOp.getLatency();
+              auto latency = loadOp.getLatency();
               auto limitOpt = loadOp.getLimit();
               Problem::OperatorType portOpr =
                   problem.getOrInsertOperatorType(loadOp.getUniqueId());
-              problem.setLatency(portOpr, latencyOpt.value_or(1));
+              problem.setLatency(portOpr, latency);
               if (limitOpt.has_value())
                 problem.setLimit(portOpr, limitOpt.value());
               problem.addExtraLimitingType(loopOp, portOpr);
             } else if (isa<StoreInterface>(op)) {
               auto storeOp = cast<loopschedule::StoreInterface>(*op);
-              auto latencyOpt = storeOp.getLatency();
+              auto latency = storeOp.getLatency();
               auto limitOpt = storeOp.getLimit();
               Problem::OperatorType portOpr =
                   problem.getOrInsertOperatorType(storeOp.getUniqueId());
-              problem.setLatency(portOpr, latencyOpt.value_or(1));
+              problem.setLatency(portOpr, latency);
               if (limitOpt.has_value())
                 problem.setLimit(portOpr, limitOpt.value());
               problem.addExtraLimitingType(loopOp, portOpr);
@@ -1162,11 +1162,11 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
         })
         .Case<loopschedule::LoadInterface>([&](Operation *op) {
           auto loadOp = cast<loopschedule::LoadInterface>(*op);
-          auto latencyOpt = loadOp.getLatency();
+          auto latency = loadOp.getLatency();
           auto limitOpt = loadOp.getLimit();
           Problem::OperatorType portOpr =
               problem.getOrInsertOperatorType(loadOp.getUniqueId());
-          problem.setLatency(portOpr, latencyOpt.value_or(1));
+          problem.setLatency(portOpr, latency);
           if (limitOpt.has_value())
             problem.setLimit(portOpr, limitOpt.value());
           problem.setLinkedOperatorType(op, portOpr);
@@ -1175,11 +1175,11 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
         })
         .Case<loopschedule::StoreInterface>([&](Operation *op) {
           auto storeOp = cast<loopschedule::StoreInterface>(*op);
-          auto latencyOpt = storeOp.getLatency();
+          auto latency = storeOp.getLatency();
           auto limitOpt = storeOp.getLimit();
           Problem::OperatorType portOpr =
               problem.getOrInsertOperatorType(storeOp.getUniqueId());
-          problem.setLatency(portOpr, latencyOpt.value_or(1));
+          problem.setLatency(portOpr, latency);
           if (limitOpt.has_value())
             problem.setLimit(portOpr, limitOpt.value());
           problem.setLinkedOperatorType(op, portOpr);
@@ -1854,7 +1854,7 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
     }
     if (auto load = dyn_cast<LoadInterface>(op)) {
       auto startTime = problem.getStartTime(op);
-      auto latency = load.getLatency().has_value() ? *load.getLatency() : 1;
+      auto latency = load.getLatency();
       auto resTime = *startTime + latency;
       if (hasLaterUse(op, resTime) && !startGroups.contains(resTime)) {
         startGroups[resTime] = SmallVector<Operation *>();
@@ -1995,7 +1995,7 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
           reregisterValues[startTime + 1].push_back(load.getResult());
         }
       } else if (auto load = dyn_cast<LoadInterface>(op)) {
-        auto latency = load.getLatency().has_value() ? *load.getLatency() : 1;
+        auto latency = load.getLatency();
         if (hasLaterUse(op, startTime + latency)) {
           auto resTime = startTime + latency;
           reregisterValues[resTime].push_back(load.getResult());
