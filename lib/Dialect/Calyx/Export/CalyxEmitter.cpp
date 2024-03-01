@@ -128,8 +128,7 @@ private:
             })
         .Case<SgtLibOp, SltLibOp, SeqLibOp, SneqLibOp, SgeLibOp, SleLibOp,
               SrshLibOp, SeqMultLibOp, SeqRemULibOp, SeqRemSLibOp, SeqDivULibOp,
-              ExtSILibOp, SeqDivSLibOp>(
-            [&](auto op) -> FailureOr<StringRef> {
+              SeqDivSLibOp, ExtSILibOp>([&](auto op) -> FailureOr<StringRef> {
           static constexpr std::string_view sBinaryOperators =
               "binary_operators";
           return {sBinaryOperators};

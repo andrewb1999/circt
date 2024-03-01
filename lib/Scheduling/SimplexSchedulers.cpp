@@ -839,7 +839,19 @@ LogicalResult SimplexScheduler::schedule() {
 
 void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
                                                Problem::Dependence dep) {
-  SimplexSchedulerBase::fillConstraintRow(row, dep);
+  Operation *src = dep.getSource();
+  Operation *dst = dep.getDestination();
+  unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
+  if (auto dist = prob.getDistance(dep)) {
+    // the latency of the last op in a recurrence must be at least 1
+    if (latency == 0)
+      latency = 1;
+  }
+  row[parameter1Column] = -latency; // note the negation
+  if (src != dst) { // note that these coefficients just zero out in self-arcs.
+    row[startTimeLocations[startTimeVariables[src]]] = 1;
+    row[startTimeLocations[startTimeVariables[dst]]] = -1;
+  }
   if (auto dist = prob.getDistance(dep))
     row[parameterTColumn] = *dist;
 }

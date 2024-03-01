@@ -113,8 +113,13 @@ def LoadOpInterface : OpInterface<"LoadInterface"> {
   let methods = [
     InterfaceMethod<
       "This returns the latency of the load.",
-      "std::optional<unsigned int>",
+      "unsigned int",
       "getLatency",
+      (ins)>,
+    InterfaceMethod<
+      "This returns true if the load is dynamic.",
+      "bool",
+      "isDynamic",
       (ins)>,
     InterfaceMethod<
       "This returns the limit of the load.",
@@ -156,8 +161,13 @@ def StoreOpInterface : OpInterface<"StoreInterface"> {
   let methods = [
     InterfaceMethod<
       "This returns the latency of the store.",
-      "std::optional<unsigned int>",
+      "unsigned int",
       "getLatency",
+      (ins)>,
+    InterfaceMethod<
+      "This returns true if the store is dynamic.",
+      "bool",
+      "isDynamic",
       (ins)>,
     InterfaceMethod<
       "This returns the limit of the store.",

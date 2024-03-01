@@ -869,6 +869,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     auto idx = v.index();
     auto stepOp = arg.getDefiningOp<LoopScheduleStepOp>();
     if (stepOp) {
+<<<<<<< HEAD
       llvm::errs() << "here\n";
       stepOp.dump();
       auto resNum = cast<OpResult>(arg).getResultNumber();
@@ -880,6 +881,14 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
         auto pipeline = pipelineStage.getParentOp();
         llvm::errs() << "here1\n";
         pipeline.dump();
+=======
+      auto resNum = cast<OpResult>(arg).getResultNumber();
+      auto regOp = cast<LoopScheduleRegisterOp>(stepOp.getBodyBlock().getTerminator());
+      auto regVal = regOp.getOperand(resNum);
+      auto pipelineStage = regVal.getDefiningOp<LoopSchedulePipelineStageOp>();
+      if (pipelineStage) {
+        auto pipeline = pipelineStage.getParentOp();
+>>>>>>> origin/amc-integration
         auto pipelineResNum = cast<OpResult>(regVal).getResultNumber();
         auto outerReg = getState<ComponentLoweringState>().getLoopIterReg(LoopWrapper {loop}, idx);
         auto pipelineReg = getState<ComponentLoweringState>().getLoopIterReg(LoopWrapper {pipeline}, pipelineResNum + 1);
@@ -894,7 +903,10 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
         rewriter.create<calyx::AssignOp>(loop.getLoc(), outerReg.getWriteEn(), oneI1);
         auto phases = llvm::SmallVector<PhaseInterface>(loop.getBodyBlock()->getOps<PhaseInterface>());
         auto lastPhase = cast<PhaseInterface>(phases.back());
+<<<<<<< HEAD
         lastPhase->dump();
+=======
+>>>>>>> origin/amc-integration
         getState<ComponentLoweringState>().addBlockSchedulable(&lastPhase.getBodyBlock(), iterArgGroup);
       }
     }
