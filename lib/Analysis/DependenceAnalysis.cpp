@@ -576,7 +576,7 @@ void circt::analysis::MemoryDependenceAnalysis::replaceOp(Operation *oldOp,
   // Find any dependences originating from oldOp and make newOp the source.
   // TODO(mikeurbach): consider adding an inverted index to avoid this scan.
   for (auto &it : results)
-    for (auto &dep : it.second)
+    for (auto &dep : it.second) {
       if (OperationEquivalence::isEquivalentTo(
               dep.source, oldOp, OperationEquivalence::IgnoreLocations)) {
         // if (dep.source == oldOp) {
@@ -586,6 +586,7 @@ void circt::analysis::MemoryDependenceAnalysis::replaceOp(Operation *oldOp,
         // dep.source->dump();
         dep.source = newOp;
       }
+    }
 
   // dumpMap(results);
 }

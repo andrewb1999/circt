@@ -132,6 +132,21 @@ def LoadOpInterface : OpInterface<"LoadInterface"> {
       "getMemoryValue",
       (ins)>,
     InterfaceMethod<
+      "This returns the indices for the load.",
+      "OperandRange",
+      "getIndices",
+      (ins)>,
+    InterfaceMethod<
+      "This returns the mutable indices for the load.",
+      "MutableOperandRange",
+      "getIndicesMutable",
+      (ins)>,
+    InterfaceMethod<
+      "This returns the minimum bitwidth of the ith dimension of the memory.",
+      "int64_t",
+      "getDimBitwidth",
+      (ins "int64_t":$idx)>,
+    InterfaceMethod<
       "This returns the result.",
       "Value",
       "getResult",
@@ -179,6 +194,21 @@ def StoreOpInterface : OpInterface<"StoreInterface"> {
       "Value",
       "getMemoryValue",
       (ins)>,
+    InterfaceMethod<
+      "This returns the indices for the load.",
+      "OperandRange",
+      "getIndices",
+      (ins)>,
+    InterfaceMethod<
+      "This returns the mutable indices for the load.",
+      "MutableOperandRange",
+      "getIndicesMutable",
+      (ins)>,
+    InterfaceMethod<
+      "This returns the minimum bitwidth of the ith dimension of the memory.",
+      "int64_t",
+      "getDimBitwidth",
+      (ins "int64_t":$idx)>,
     InterfaceMethod<
       "This returns the result.",
       "bool",
