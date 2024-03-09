@@ -540,7 +540,7 @@ LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
   // Loop invariant code motion to hoist produced constants out of loop
   op->walk(
       [&](LoopLikeOpInterface loopLike) { moveLoopInvariantCode(loopLike); });
-  
+
   mlir::IRRewriter rewriter(&context);
   (void)mlir::runRegionDCE(rewriter, op->getRegions());
 
@@ -548,17 +548,14 @@ LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
 }
 
 Value getMemref(Operation *op) {
-  Value memref = isa<AffineStoreOp>(*op)  
-                 ? cast<AffineStoreOp>(*op).getMemRef()
-                 : isa<AffineLoadOp>(*op) 
-                 ? cast<AffineLoadOp>(*op).getMemRef()
-                 : isa<memref::StoreOp>(*op)
-                 ? cast<memref::StoreOp>(*op).getMemRef()
-                 : isa<memref::LoadOp>(*op) 
-                 ? cast<memref::LoadOp>(*op).getMemRef()
-                 : isa<LoopScheduleLoadOp>(*op) 
-                 ? cast<LoopScheduleLoadOp>(*op).getMemRef()
-                 : cast<LoopScheduleStoreOp>(*op).getMemRef();
+  Value memref =
+      isa<AffineStoreOp>(*op)     ? cast<AffineStoreOp>(*op).getMemRef()
+      : isa<AffineLoadOp>(*op)    ? cast<AffineLoadOp>(*op).getMemRef()
+      : isa<memref::StoreOp>(*op) ? cast<memref::StoreOp>(*op).getMemRef()
+      : isa<memref::LoadOp>(*op)  ? cast<memref::LoadOp>(*op).getMemRef()
+      : isa<LoopScheduleLoadOp>(*op)
+          ? cast<LoopScheduleLoadOp>(*op).getMemRef()
+          : cast<LoopScheduleStoreOp>(*op).getMemRef();
   return memref;
 }
 
@@ -811,14 +808,15 @@ LogicalResult unrollSubLoops(AffineForOp &forOp) {
 struct ReplaceMemrefLoad : OpConversionPattern<memref::LoadOp> {
 public:
   ReplaceMemrefLoad(MLIRContext *context,
-                      MemoryDependenceAnalysis &dependenceAnalysis)
+                    MemoryDependenceAnalysis &dependenceAnalysis)
       : OpConversionPattern(context), dependenceAnalysis(dependenceAnalysis) {}
 
   LogicalResult
   matchAndRewrite(memref::LoadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto newOp = rewriter.replaceOpWithNewOp<LoopScheduleLoadOp>(op.getOperation(), 
-        op.getResult().getType(), op.getMemRef(), op.getIndices());
+    auto newOp = rewriter.replaceOpWithNewOp<LoopScheduleLoadOp>(
+        op.getOperation(), op.getResult().getType(), op.getMemRef(),
+        op.getIndices());
     dependenceAnalysis.replaceOp(op.getOperation(), newOp.getOperation());
     return success();
   }
@@ -830,14 +828,15 @@ private:
 struct ReplaceMemrefStore : OpConversionPattern<memref::StoreOp> {
 public:
   ReplaceMemrefStore(MLIRContext *context,
-                      MemoryDependenceAnalysis &dependenceAnalysis)
+                     MemoryDependenceAnalysis &dependenceAnalysis)
       : OpConversionPattern(context), dependenceAnalysis(dependenceAnalysis) {}
 
   LogicalResult
   matchAndRewrite(memref::StoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto newOp = rewriter.replaceOpWithNewOp<LoopScheduleStoreOp>(op.getOperation(), 
-        op.getValueToStore(), op.getMemRef(), op.getIndices());
+    auto newOp = rewriter.replaceOpWithNewOp<LoopScheduleStoreOp>(
+        op.getOperation(), op.getValueToStore(), op.getMemRef(),
+        op.getIndices());
     dependenceAnalysis.replaceOp(op.getOperation(), newOp.getOperation());
     return success();
   }
@@ -867,9 +866,8 @@ replaceMemoryAccesses(mlir::MLIRContext &context, mlir::Operation *op,
 struct AffineForIterationReduction : OpRewritePattern<AffineForOp> {
   using OpRewritePattern<AffineForOp>::OpRewritePattern;
 
-  LogicalResult
-  matchAndRewrite(AffineForOp op,
-                  PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(AffineForOp op,
+                                PatternRewriter &rewriter) const override {
     if (!op.hasConstantBounds()) {
       return failure();
     }
@@ -882,8 +880,10 @@ struct AffineForIterationReduction : OpRewritePattern<AffineForOp> {
       return failure();
     induction.setType(rewriter.getIntegerType(bitwidth));
     rewriter.setInsertionPointToStart(&op.getRegion().front());
-    auto newExt = rewriter.create<arith::ExtSIOp>(op.getLoc(), rewriter.getI64Type(), induction);
-    // auto newCast = rewriter.create<arith::IndexCastOp>(op.getLoc(), rewriter.getIndexType(), newExt.getOut());
+    auto newExt = rewriter.create<arith::ExtSIOp>(
+        op.getLoc(), rewriter.getI64Type(), induction);
+    // auto newCast = rewriter.create<arith::IndexCastOp>(op.getLoc(),
+    // rewriter.getIndexType(), newExt.getOut());
     rewriter.replaceAllUsesExcept(induction, newExt.getOut(), newExt);
     return success();
   }
@@ -892,9 +892,8 @@ struct AffineForIterationReduction : OpRewritePattern<AffineForOp> {
 struct TruncCleanupPattern : OpRewritePattern<TruncIOp> {
   using OpRewritePattern<TruncIOp>::OpRewritePattern;
 
-  LogicalResult
-  matchAndRewrite(TruncIOp op,
-                  PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(TruncIOp op,
+                                PatternRewriter &rewriter) const override {
     if (isa<BlockArgument>(op.getIn()))
       return failure();
     auto *definingOp = op.getIn().getDefiningOp();
@@ -917,9 +916,8 @@ struct TruncCleanupPattern : OpRewritePattern<TruncIOp> {
 struct LoadCleanupPattern : OpRewritePattern<LoopScheduleLoadOp> {
   using OpRewritePattern<LoopScheduleLoadOp>::OpRewritePattern;
 
-  LogicalResult
-  matchAndRewrite(LoopScheduleLoadOp op,
-                  PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(LoopScheduleLoadOp op,
+                                PatternRewriter &rewriter) const override {
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto &idx : llvm::make_early_inc_range(indices)) {
@@ -932,14 +930,15 @@ struct LoadCleanupPattern : OpRewritePattern<LoopScheduleLoadOp> {
       } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
         idx.set(extSI.getIn());
         updated = true;
-      } else if (auto unreal = dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
+      } else if (auto unreal =
+                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
         if (unreal.getInputs().size() != 1)
           continue;
         idx.set(unreal.getInputs().front());
         updated = true;
       }
     }
-    
+
     if (!updated)
       return failure();
 
@@ -950,9 +949,8 @@ struct LoadCleanupPattern : OpRewritePattern<LoopScheduleLoadOp> {
 struct StoreCleanupPattern : OpRewritePattern<LoopScheduleStoreOp> {
   using OpRewritePattern<LoopScheduleStoreOp>::OpRewritePattern;
 
-  LogicalResult
-  matchAndRewrite(LoopScheduleStoreOp op,
-                  PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(LoopScheduleStoreOp op,
+                                PatternRewriter &rewriter) const override {
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto &idx : llvm::make_early_inc_range(indices)) {
@@ -965,14 +963,15 @@ struct StoreCleanupPattern : OpRewritePattern<LoopScheduleStoreOp> {
       } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
         idx.set(extSI.getIn());
         updated = true;
-      } else if (auto unreal = dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
+      } else if (auto unreal =
+                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
         if (unreal.getInputs().size() != 1)
           continue;
         idx.set(unreal.getInputs().front());
         updated = true;
       }
     }
-    
+
     if (!updated)
       return failure();
 
@@ -983,9 +982,8 @@ struct StoreCleanupPattern : OpRewritePattern<LoopScheduleStoreOp> {
 struct LoadAddressNarrowingPattern : OpRewritePattern<LoopScheduleLoadOp> {
   using OpRewritePattern<LoopScheduleLoadOp>::OpRewritePattern;
 
-  LogicalResult
-  matchAndRewrite(LoopScheduleLoadOp op,
-                  PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(LoopScheduleLoadOp op,
+                                PatternRewriter &rewriter) const override {
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto v : llvm::enumerate(indices)) {
@@ -997,13 +995,14 @@ struct LoadAddressNarrowingPattern : OpRewritePattern<LoopScheduleLoadOp> {
       auto oldType = dyn_cast_or_null<IntegerType>(idx.get().getType());
       if (oldType) {
         if (newType.getIntOrFloatBitWidth() < oldType.getIntOrFloatBitWidth()) {
-          auto newIdx = rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
+          auto newIdx =
+              rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
           idx.set(newIdx);
           updated = true;
         }
       }
     }
-    
+
     if (!updated)
       return failure();
 
@@ -1014,9 +1013,8 @@ struct LoadAddressNarrowingPattern : OpRewritePattern<LoopScheduleLoadOp> {
 struct LoadInterfaceCleanupPattern : OpInterfaceRewritePattern<LoadInterface> {
   using OpInterfaceRewritePattern<LoadInterface>::OpInterfaceRewritePattern;
 
-  LogicalResult
-  matchAndRewrite(LoadInterface op,
-                  PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(LoadInterface op,
+                                PatternRewriter &rewriter) const override {
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto &idx : llvm::make_early_inc_range(indices)) {
@@ -1029,14 +1027,15 @@ struct LoadInterfaceCleanupPattern : OpInterfaceRewritePattern<LoadInterface> {
       } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
         idx.set(extSI.getIn());
         updated = true;
-      } else if (auto unreal = dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
+      } else if (auto unreal =
+                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
         if (unreal.getInputs().size() != 1)
           continue;
         idx.set(unreal.getInputs().front());
         updated = true;
       }
     }
-    
+
     if (!updated)
       return failure();
 
@@ -1044,12 +1043,12 @@ struct LoadInterfaceCleanupPattern : OpInterfaceRewritePattern<LoadInterface> {
   }
 };
 
-struct StoreInterfaceCleanupPattern : OpInterfaceRewritePattern<StoreInterface> {
+struct StoreInterfaceCleanupPattern
+    : OpInterfaceRewritePattern<StoreInterface> {
   using OpInterfaceRewritePattern<StoreInterface>::OpInterfaceRewritePattern;
 
-  LogicalResult
-  matchAndRewrite(StoreInterface op,
-                  PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(StoreInterface op,
+                                PatternRewriter &rewriter) const override {
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto &idx : llvm::make_early_inc_range(indices)) {
@@ -1062,14 +1061,15 @@ struct StoreInterfaceCleanupPattern : OpInterfaceRewritePattern<StoreInterface> 
       } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
         idx.set(extSI.getIn());
         updated = true;
-      } else if (auto unreal = dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
+      } else if (auto unreal =
+                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
         if (unreal.getInputs().size() != 1)
           continue;
         idx.set(unreal.getInputs().front());
         updated = true;
       }
     }
-    
+
     if (!updated)
       return failure();
 
@@ -1077,12 +1077,12 @@ struct StoreInterfaceCleanupPattern : OpInterfaceRewritePattern<StoreInterface> 
   }
 };
 
-struct LoadInterfaceAddressNarrowingPattern : OpInterfaceRewritePattern<LoadInterface> {
+struct LoadInterfaceAddressNarrowingPattern
+    : OpInterfaceRewritePattern<LoadInterface> {
   using OpInterfaceRewritePattern<LoadInterface>::OpInterfaceRewritePattern;
 
-  LogicalResult
-  matchAndRewrite(LoadInterface op,
-                  PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(LoadInterface op,
+                                PatternRewriter &rewriter) const override {
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto v : llvm::enumerate(indices)) {
@@ -1093,13 +1093,14 @@ struct LoadInterfaceAddressNarrowingPattern : OpInterfaceRewritePattern<LoadInte
       auto oldType = dyn_cast_or_null<IntegerType>(idx.get().getType());
       if (oldType) {
         if (newType.getIntOrFloatBitWidth() < oldType.getIntOrFloatBitWidth()) {
-          auto newIdx = rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
+          auto newIdx =
+              rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
           idx.set(newIdx);
           updated = true;
         }
       }
     }
-    
+
     if (!updated)
       return failure();
 
@@ -1107,8 +1108,7 @@ struct LoadInterfaceAddressNarrowingPattern : OpInterfaceRewritePattern<LoadInte
   }
 };
 
-void populateIndexRemovalTypeConverter(
-    TypeConverter &typeConverter) {
+void populateIndexRemovalTypeConverter(TypeConverter &typeConverter) {
   typeConverter.addConversion(
       [](Type type) -> std::optional<Type> { return type; });
   typeConverter.addConversion([](IndexType type) -> std::optional<Type> {
@@ -1116,11 +1116,13 @@ void populateIndexRemovalTypeConverter(
   });
   typeConverter.addTargetMaterialization(
       [](OpBuilder &b, Type target, ValueRange input, Location loc) {
-        return b.create<UnrealizedConversionCastOp>(loc, target, input).getResult(0);
+        return b.create<UnrealizedConversionCastOp>(loc, target, input)
+            .getResult(0);
       });
   typeConverter.addSourceMaterialization(
       [](OpBuilder &b, Type source, ValueRange input, Location loc) {
-        return b.create<UnrealizedConversionCastOp>(loc, source, input).getResult(0);
+        return b.create<UnrealizedConversionCastOp>(loc, source, input)
+            .getResult(0);
       });
 }
 
@@ -1159,7 +1161,8 @@ private:
   MemoryDependenceAnalysis &dependenceAnalysis;
 };
 
-struct ConstIndexRemovalRewritePattern final : public OpConversionPattern<ConstantOp> {
+struct ConstIndexRemovalRewritePattern final
+    : public OpConversionPattern<ConstantOp> {
 public:
   using OpConversionPattern<ConstantOp>::OpConversionPattern;
 
@@ -1175,26 +1178,29 @@ public:
       return failure();
 
     auto intVal = integerAttr.getInt();
-    
-    rewriter.replaceOpWithNewOp<ConstantOp>(op, rewriter.getI64IntegerAttr(intVal));
+
+    rewriter.replaceOpWithNewOp<ConstantOp>(op,
+                                            rewriter.getI64IntegerAttr(intVal));
 
     return success();
   }
 };
 
-struct IndexCastRemovalRewritePattern final : public OpConversionPattern<IndexCastOp> {
+struct IndexCastRemovalRewritePattern final
+    : public OpConversionPattern<IndexCastOp> {
 public:
   using OpConversionPattern<IndexCastOp>::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(IndexCastOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(op, op.getOut().getType(), op.getIn());
+    rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(
+        op, op.getOut().getType(), op.getIn());
 
     return success();
   }
 };
-    
+
 LogicalResult
 bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
                      analysis::MemoryDependenceAnalysis &dependenceAnalysis) {
@@ -1214,13 +1220,9 @@ bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
   populateIndexRemovalTypeConverter(typeConverter);
   ConversionTarget target(context);
   target.addDynamicallyLegalDialect<ArithDialect>(
-      [&typeConverter](Operation *op) {
-        return typeConverter.isLegal(op);
-      });
+      [&typeConverter](Operation *op) { return typeConverter.isLegal(op); });
   target.addDynamicallyLegalDialect<LoopScheduleDialect>(
-      [&typeConverter](Operation *op) {
-        return typeConverter.isLegal(op);
-      });
+      [&typeConverter](Operation *op) { return typeConverter.isLegal(op); });
   target.markUnknownOpDynamicallyLegal(
       [&typeConverter](Operation *op) -> std::optional<bool> {
         if (!isa<LoadInterface>(op) && !isa<StoreInterface>(op))
@@ -1229,12 +1231,10 @@ bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
       });
   target.addIllegalOp<arith::IndexCastOp>();
   patterns.clear();
-  patterns.add<IndexRemovalRewritePattern>(typeConverter,
-                                           &context, dependenceAnalysis);
-  patterns.add<ConstIndexRemovalRewritePattern>(typeConverter,
-                                           &context);
-  patterns.add<IndexCastRemovalRewritePattern>(typeConverter,
-                                           &context);
+  patterns.add<IndexRemovalRewritePattern>(typeConverter, &context,
+                                           dependenceAnalysis);
+  patterns.add<ConstIndexRemovalRewritePattern>(typeConverter, &context);
+  patterns.add<IndexCastRemovalRewritePattern>(typeConverter, &context);
   populateReconcileUnrealizedCastsPatterns(patterns);
   if (failed(applyPartialConversion(op, target, std::move(patterns))))
     return failure();
@@ -1256,7 +1256,8 @@ bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
   for (unsigned i = 1; i <= 128; ++i) {
     bitwidthsSupported.push_back(i);
   }
-  populateArithIntNarrowingPatterns(patterns, ArithIntNarrowingOptions{bitwidthsSupported});
+  populateArithIntNarrowingPatterns(
+      patterns, ArithIntNarrowingOptions{bitwidthsSupported});
   if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");
     return failure();
@@ -1276,7 +1277,7 @@ bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
     op->emitOpError("Failed to perform bitwidth minimization conversions");
     return failure();
   }
-  
+
   // Perform dead code elimination again before scheduling
   mlir::IRRewriter rewriter(&context);
   (void)mlir::runRegionDCE(rewriter, op->getRegions());

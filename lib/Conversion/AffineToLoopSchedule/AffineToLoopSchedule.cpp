@@ -172,11 +172,13 @@ void AffineToLoopSchedule::runOnOperation() {
   if (failed(postLoweringOptimizations(getContext(), getOperation())))
     return signalPassFailure();
 
-  if (failed(replaceMemoryAccesses(getContext(), getOperation(), *dependenceAnalysis)))
+  if (failed(replaceMemoryAccesses(getContext(), getOperation(),
+                                   *dependenceAnalysis)))
     return signalPassFailure();
 
   if (!disableBitwidthMinimization) {
-    if (failed(bitwidthMinimization(getContext(), getOperation(), *dependenceAnalysis)))
+    if (failed(bitwidthMinimization(getContext(), getOperation(),
+                                    *dependenceAnalysis)))
       return signalPassFailure();
   }
 
@@ -208,7 +210,6 @@ void AffineToLoopSchedule::runOnOperation() {
     seqLoops.push_back(loop);
     return WalkResult::advance();
   });
-
 
   // Schedule loops
   for (auto loop : seqLoops) {
@@ -283,10 +284,10 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
     }
 
     return TypeSwitch<Operation *, WalkResult>(op)
-            .Case<IfOp, AffineYieldOp, arith::ConstantOp, arith::ExtSIOp,
+        .Case<IfOp, AffineYieldOp, arith::ConstantOp, arith::ExtSIOp,
               arith::ExtUIOp, arith::TruncIOp, CmpIOp, IndexCastOp,
               memref::AllocaOp, memref::AllocOp, loopschedule::AllocInterface,
-              YieldOp, func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, CmpIOp, 
+              YieldOp, func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, CmpIOp,
               ShLIOp, AndIOp, ShRSIOp, ShRUIOp>([&](Operation *combOp) {
           // Some known combinational ops.
           problem.setLinkedOperatorType(combOp, combOpr);
@@ -518,14 +519,15 @@ LogicalResult AffineToLoopSchedule::solveSharedOperatorsProblem(
 }
 
 // Replaces memref loads/stores with loopschedule loads/stores
-Operation *cloneOrReplace(OpBuilder builder, Operation *op, IRMapping valueMap) {
+Operation *cloneOrReplace(OpBuilder builder, Operation *op,
+                          IRMapping valueMap) {
   // if (auto load = dyn_cast<memref::LoadOp>(op)) {
   //   SmallVector<Value> indices;
   //   auto memref = valueMap.lookupOrDefault(load.getMemRef());
   //   auto returnType = cast<MemRefType>(memref.getType()).getElementType();
   //   for (auto opValue : load.getIndices())
   //    indices.push_back(valueMap.lookupOrDefault(opValue));
-  //   return builder.create<LoopScheduleLoadOp>(op->getLoc(), returnType, 
+  //   return builder.create<LoopScheduleLoadOp>(op->getLoc(), returnType,
   //             memref, indices);
   // }
 
@@ -535,7 +537,7 @@ Operation *cloneOrReplace(OpBuilder builder, Operation *op, IRMapping valueMap) 
   //   auto valToStore = valueMap.lookupOrDefault(store.getValueToStore());
   //   for (auto opValue : store.getIndices())
   //    indices.push_back(valueMap.lookupOrDefault(opValue));
-  //   return builder.create<LoopScheduleStoreOp>(op->getLoc(), valToStore, 
+  //   return builder.create<LoopScheduleStoreOp>(op->getLoc(), valToStore,
   //             memref, indices);
   // }
 
@@ -569,17 +571,17 @@ AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
     //   assert(false && "not handling negative affine bounds yet");
     // }
     boundType = loop.getInductionVar().getType();
-    lowerBound = builder.create<arith::ConstantOp>(
-        IntegerAttr::get(boundType, lower));
-    upperBound = builder.create<arith::ConstantOp>(
-        IntegerAttr::get(boundType, upper));
+    lowerBound =
+        builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, lower));
+    upperBound =
+        builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, upper));
   } else {
     lowerBound = lowerAffineLowerBound(loop, builder);
     upperBound = lowerAffineUpperBound(loop, builder);
   }
   int64_t stepValue = loop.getStep().getSExtValue();
-  auto step = builder.create<arith::ConstantOp>(
-      IntegerAttr::get(boundType, stepValue));
+  auto step =
+      builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, stepValue));
 
   builder.setInsertionPoint(loop);
 
@@ -999,17 +1001,17 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
     //   assert(false && "not handling negative affine bounds yet");
     // }
     boundType = loop.getInductionVar().getType();
-    lowerBound = builder.create<arith::ConstantOp>(
-        IntegerAttr::get(boundType, lower));
-    upperBound = builder.create<arith::ConstantOp>(
-        IntegerAttr::get(boundType, upper));
+    lowerBound =
+        builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, lower));
+    upperBound =
+        builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, upper));
   } else {
     lowerBound = lowerAffineLowerBound(loop, builder);
     upperBound = lowerAffineUpperBound(loop, builder);
   }
   int64_t stepValue = loop.getStep().getSExtValue();
-  auto incr = builder.create<arith::ConstantOp>(
-      IntegerAttr::get(boundType, stepValue));
+  auto incr =
+      builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, stepValue));
 
   builder.setInsertionPoint(loop);
 
@@ -1243,8 +1245,7 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
       // All further uses in this stage should used the cloned-version of values
       // So we update the mapping in this stage
       for (auto result : op->getResults())
-        valueMap.map(
-            result, newOp->getResult(result.getResultNumber()));
+        valueMap.map(result, newOp->getResult(result.getResultNumber()));
     }
 
     // Reregister values
@@ -1491,8 +1492,7 @@ AffineToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
       // All further uses in this step should used the cloned-version of values
       // So we update the mapping in this stage
       for (auto result : op->getResults())
-        valueMap.map(
-            result, newOp->getResult(result.getResultNumber()));
+        valueMap.map(result, newOp->getResult(result.getResultNumber()));
     }
 
     // Add the stage results to the value map for the original op.
@@ -1548,6 +1548,7 @@ AffineToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
   return success();
 }
 
-std::unique_ptr<mlir::Pass> circt::createAffineToLoopSchedule(bool disableBitwidthMinimization) {
+std::unique_ptr<mlir::Pass>
+circt::createAffineToLoopSchedule(bool disableBitwidthMinimization) {
   return std::make_unique<AffineToLoopSchedule>(disableBitwidthMinimization);
 }
