@@ -17,7 +17,8 @@ class Pass;
 } // namespace mlir
 
 namespace circt {
-std::unique_ptr<mlir::Pass> createAffineToLoopSchedule();
+std::unique_ptr<mlir::Pass>
+createAffineToLoopSchedule(bool disableBitwidthMinimization = false);
 } // namespace circt
 
 #endif // CIRCT_CONVERSION_AFFINETOLOOPSCHEDULE_H_

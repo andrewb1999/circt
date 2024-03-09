@@ -388,6 +388,10 @@ unsigned LoopSchedulePipelineStageOp::getStageNumber() {
   return number;
 }
 
+LoopScheduleRegisterOp LoopSchedulePipelineStageOp::getRegisterOp() {
+  return cast<LoopScheduleRegisterOp>(this->getBodyBlock().getTerminator());
+}
+
 //===----------------------------------------------------------------------===//
 // LoopScheduleSequentialOp
 //===----------------------------------------------------------------------===//
@@ -592,6 +596,10 @@ unsigned LoopScheduleStepOp::getStepNumber() {
   return number;
 }
 
+LoopScheduleRegisterOp LoopScheduleStepOp::getRegisterOp() {
+  return cast<LoopScheduleRegisterOp>(this->getBodyBlock().getTerminator());
+}
+
 //===----------------------------------------------------------------------===//
 // LoopScheduleRegisterOp
 //===----------------------------------------------------------------------===//
@@ -653,6 +661,29 @@ LogicalResult LoopScheduleTerminatorOp::verify() {
       return emitOpError(
           "'results' must be defined by a 'loopschedule.pipeline.stage' or "
           "'loopschedule.step'");
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// LoadOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult LoopScheduleLoadOp::verify() {
+  if (static_cast<int64_t>(getIndices().size()) != getMemRefType().getRank()) {
+    return emitOpError("incorrect number of indices for load, expected ")
+           << getMemRefType().getRank() << " but got " << getIndices().size();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// StoreOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult LoopScheduleStoreOp::verify() {
+  if (getNumOperands() != 2 + getMemRefType().getRank())
+    return emitOpError("store index operand count not equal to memref rank");
 
   return success();
 }

@@ -16,6 +16,7 @@
 include "mlir/IR/OpBase.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/IR/RegionKindInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 include "circt/Dialect/LoopSchedule/LoopSchedule.td"
 include "circt/Dialect/LoopSchedule/LoopScheduleInterfaces.td"
 
@@ -125,7 +126,8 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
 
 def LoopSchedulePipelineStageOp : LoopScheduleOp<"pipeline.stage",
     [HasParent<"LoopSchedulePipelineOp">,
-     PhaseOpInterface]> {
+     PhaseOpInterface,
+     SingleBlockImplicitTerminator<"LoopScheduleRegisterOp">]> {
   let summary = "LoopSchedule dialect pipeline stage.";
   let description = [{
     This operation has a single-block region which dictates the operations that
@@ -191,6 +193,7 @@ def LoopSchedulePipelineStageOp : LoopScheduleOp<"pipeline.stage",
     std::optional<uint64_t> getStartTime() {
       return getStart();
     }
+    LoopScheduleRegisterOp getRegisterOp();
   }];
 }
 
@@ -344,6 +347,7 @@ def LoopScheduleStepOp : LoopScheduleOp<"step",
     std::optional<uint64_t> getStartTime() {
       return std::nullopt;
     }
+    LoopScheduleRegisterOp getRegisterOp();
   }];
 }
 
@@ -399,6 +403,74 @@ def LoopScheduleTerminatorOp : LoopScheduleOp<"terminator",
   }];
 
   let hasVerifier = 1;
+}
+
+def LoopScheduleLoadOp : LoopScheduleOp<"load",
+     [TypesMatchWith<"result type matches element type of 'memref'",
+                     "memref", "result",
+                     "::llvm::cast<MemRefType>($_self).getElementType()">
+      ]> {
+  let summary = "load operation";
+  let description = [{
+  }];
+
+  let arguments = (ins Arg<AnyMemRef, "the reference to load from",
+                           [MemRead]>:$memref,
+                       Variadic<AnyTypeOf<[AnyInteger, Index]>>:$indices,
+                       DefaultValuedOptionalAttr<BoolAttr, "false">:$nontemporal);
+  let results = (outs AnyType:$result);
+
+  let extraClassDeclaration = [{
+    Value getMemRef() { return getOperand(0); }
+    void setMemRef(Value value) { setOperand(0, value); }
+    MemRefType getMemRefType() {
+      return ::llvm::cast<MemRefType>(getMemRef().getType());
+    }
+  }];
+
+  /* let hasFolder = 1; */
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$memref `[` $indices `:` type($indices) `]` attr-dict `:` type($memref)";
+}
+
+def LoopScheduleStoreOp : LoopScheduleOp<"store",
+     [TypesMatchWith<"type of 'value' matches element type of 'memref'",
+                     "memref", "value",
+                     "::llvm::cast<MemRefType>($_self).getElementType()">
+      ]> {
+  let summary = "store operation";
+  let description = [{
+  }];
+
+  let arguments = (ins AnyType:$value,
+                       Arg<AnyMemRef, "the reference to store to",
+                           [MemWrite]>:$memref,
+                       Variadic<AnyTypeOf<[AnyInteger, Index]>>:$indices,
+                       DefaultValuedOptionalAttr<BoolAttr, "false">:$nontemporal);
+
+  let builders = [
+    OpBuilder<(ins "Value":$valueToStore, "Value":$memref), [{
+      $_state.addOperands(valueToStore);
+      $_state.addOperands(memref);
+    }]>];
+
+  let extraClassDeclaration = [{
+      Value getValueToStore() { return getOperand(0); }
+
+      Value getMemRef() { return getOperand(1); }
+      void setMemRef(Value value) { setOperand(1, value); }
+      MemRefType getMemRefType() {
+        return ::llvm::cast<MemRefType>(getMemRef().getType());
+      }
+  }];
+
+  /* let hasFolder = 1; */
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $value `,` $memref `[` $indices `:` type($indices) `]` attr-dict `:` type($memref)
+  }];
 }
 
 #endif // CIRCIT_LOOP_SCHEDULE_OPS_TD

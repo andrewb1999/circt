@@ -6,6 +6,7 @@ set(LLVM_OPTIONAL_SOURCES
 
 add_circt_dialect_library(CIRCTLoopSchedule
   LoopScheduleOps.cpp
+  Utils.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include
@@ -20,3 +21,5 @@ add_circt_dialect_library(CIRCTLoopSchedule
   MLIRArithDialect
   MLIRLoopScheduleIncGen
 )
+
+add_subdirectory(Transforms)
