@@ -507,8 +507,8 @@ static bool remSILegalityCallback(Operation *op) {
 
 LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
                                         mlir::Operation *op) {
-  llvm::errs() << "post lowering opt\n";
-  op->getParentOfType<ModuleOp>().dump();
+  // llvm::errs() << "post lowering opt\n";
+  // op->getParentOfType<ModuleOp>().dump();
   ConversionTarget target(context);
   target.addLegalDialect<AffineDialect, ArithDialect, memref::MemRefDialect,
                          scf::SCFDialect>();
@@ -534,8 +534,8 @@ LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
   target.addLegalOp<LoopScheduleStoreOp>();
   target.markUnknownOpDynamicallyLegal([](Operation *op) { return true; });
 
-  // if (failed(applyPartialConversion(op, target, std::move(patterns))))
-  //   return failure();
+  if (failed(applyPartialConversion(op, target, std::move(patterns))))
+    return failure();
 
   // Loop invariant code motion to hoist produced constants out of loop
   op->walk(
