@@ -134,7 +134,7 @@ private:
           return {sBinaryOperators};
         })
         .Case<SeqMemoryOp>([&](auto op) -> FailureOr<StringRef> {
-          static constexpr std::string_view sMemories = "memories";
+          static constexpr std::string_view sMemories = "memories/seq";
           return {sMemories};
         })
         .Case<PipelinedMultLibOp>([&](auto op) -> FailureOr<StringRef> {
