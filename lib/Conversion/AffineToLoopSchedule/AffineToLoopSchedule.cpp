@@ -97,7 +97,6 @@ private:
 
 void AffineToLoopSchedule::runOnOperation() {
 
-  getOperation()->getParentOfType<ModuleOp>().dump();
   // Collect loops to pipeline and work on them.
   SmallVector<AffineForOp> loops;
 
@@ -181,8 +180,6 @@ void AffineToLoopSchedule::runOnOperation() {
                                     *dependenceAnalysis)))
       return signalPassFailure();
   }
-
-  getOperation()->getParentOfType<ModuleOp>().dump();
 
   // Schedule all pipelined loops first
   for (auto loop : llvm::make_early_inc_range(loops)) {
