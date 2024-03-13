@@ -56,7 +56,7 @@ class Cosim_MMIO(Module):
   bresp = Input(Bits(2))
 
 
-def CosimBSP(user_module):
+def CosimBSP(user_module: Module) -> Module:
   """Wrap and return a cosimulation 'board support package' containing
   'user_module'"""
 
@@ -81,9 +81,9 @@ def CosimBSP(user_module):
       # 20-bit address. Other than that, the ports are the same so use some
       # PyCDE magic to wire them together.
       cosim_mmio_wire_inputs = {
-          pn: Wire(ty)
-          for pn, ty in Cosim_MMIO.inputs()
-          if pn != "clk" and pn != "rst"
+          port.name: Wire(port.type)
+          for port in Cosim_MMIO.inputs()
+          if port.name != "clk" and port.name != "rst"
       }
       cosim_mmio = Cosim_MMIO(clk=ports.clk,
                               rst=ports.rst,

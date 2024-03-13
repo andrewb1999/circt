@@ -6,11 +6,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, List, Optional, Set, Tuple, Dict
 
-from .common import (AppID, Clock, Input, Output, PortError, _PyProxy, Reset)
+from .common import (AppID, Clock, Input, ModuleDecl, Output, PortError,
+                     _PyProxy, Reset)
 from .support import (get_user_loc, _obj_to_attribute, create_type_string,
                       create_const_zero)
 from .signals import ClockSignal, Signal, _FromCirctValue
-from .types import ClockType, Type
+from .types import ClockType, Type, _FromCirctType
 
 from .circt import ir, support
 from .circt.dialects import hw
@@ -124,9 +125,11 @@ class PortProxyBase:
   PyCDE developer."""
 
   def __init__(self, block_args, builder):
+    assert builder is not None
     self._block_args = block_args
     if builder.outputs is not None:
-      self._output_values = [None] * len(builder.outputs)
+      self._output_values: List[Optional[Signal]] = [None] * len(
+          builder.outputs)
     self._builder = builder
 
   def _get_input(self, idx):
@@ -137,13 +140,14 @@ class PortProxyBase:
 
   def _set_output(self, idx, signal):
     assert signal is not None
-    pname, ptype = self._builder.outputs[idx]
+    port = self._builder.outputs[idx]
     if isinstance(signal, Signal):
-      if ptype != signal.type:
+      if port.type != signal.type:
         raise PortError(
-            f"Input port {pname} expected type {ptype}, not {signal.type}")
+            f"Input port {port.name} expected type {port.type}, not {signal.type}"
+        )
     else:
-      signal = ptype(signal)
+      signal = port.type(signal)
     self._output_values[idx] = signal
 
   def _set_outputs(self, signal_dict: Dict[str, Signal]):
@@ -191,16 +195,14 @@ class ModuleLikeBuilderBase(_PyProxy):
   `ModuleBuilder`. The correspondence is given by the `BuilderType` class
   variable in `Module`."""
 
-  def __init__(self, cls, cls_dct, loc):
-    from .types import Type
+  def __init__(self, cls: type, cls_dct: Dict[str, object], loc: ir.Location):
     self.modcls = cls
     self.cls_dct = cls_dct
     self.loc = loc
 
-    self.outputs: Optional[List[Tuple[str, Type]]] = None
-    self.inputs: Optional[List[Tuple[str, Type]]] = None
-    self.clocks: Optional[Set[int]] = None
-    self.resets: Optional[Set[int]] = None
+    self.ports: List[ModuleDecl] = []
+    self.clocks: Set[int] = set()
+    self.resets: Set[int] = set()
     self.generators = None
     self.generator_port_proxy = None
     self.parameters = None
@@ -209,6 +211,14 @@ class ModuleLikeBuilderBase(_PyProxy):
             hw.OutputFileAttr.get_from_filename(
                 ir.StringAttr.get(f"{cls.__name__}.sv"), False, True)
     }
+
+  @property
+  def inputs(self) -> List[Input]:
+    return [p for p in self.ports if isinstance(p, Input)]
+
+  @property
+  def outputs(self) -> List[Output]:
+    return [p for p in self.ports if isinstance(p, Output)]
 
   def go(self):
     """Execute the analysis and mutation to make a `ModuleLike` class operate
@@ -222,11 +232,12 @@ class ModuleLikeBuilderBase(_PyProxy):
     """Scan the class for input/output ports and generators. (Most `ModuleLike`
     will use these.) Store the results for later use."""
 
-    input_ports = []
-    output_ports = []
+    ports = []
     clock_ports = set()
     reset_ports = set()
     generators = {}
+    num_inputs = 0
+    num_outputs = 0
     for attr_name, attr in self.cls_dct.items():
       if attr_name.startswith("_"):
         continue
@@ -245,44 +256,55 @@ class ModuleLikeBuilderBase(_PyProxy):
         continue
 
       if isinstance(attr, Clock):
-        clock_ports.add(len(input_ports))
-        input_ports.append((attr_name, attr.type))
+        clock_ports.add(num_inputs)
       elif isinstance(attr, Reset):
-        reset_ports.add(len(input_ports))
-        input_ports.append((attr_name, attr.type))
-      elif isinstance(attr, Input):
-        input_ports.append((attr_name, attr.type))
+        reset_ports.add(num_inputs)
+
+      if isinstance(attr, Input):
+        attr.idx = num_inputs
+        num_inputs += 1
+        attr.name = attr_name
+        ports.append(attr)
       elif isinstance(attr, Output):
-        output_ports.append((attr_name, attr.type))
+        attr.idx = num_outputs
+        num_outputs += 1
+        attr.name = attr_name
+        ports.append(attr)
       elif isinstance(attr, Generator):
         generators[attr_name] = attr
 
-    self.outputs = output_ports
-    self.inputs = input_ports
+    self.ports = ports
     self.clocks = clock_ports
     self.resets = reset_ports
     self.generators = generators
 
-  def create_port_proxy(self):
+  def create_port_proxy(self) -> PortProxyBase:
     """Create a proxy class for generators to use in order to access module
     ports. Instances of this will (usually) be used in place of the `self`
     argument in generator calls.
 
     Replaces the dynamic lookup scheme previously utilized. Should be faster and
     (more importantly) reduces the amount of bookkeeping necessary."""
+    assert self.inputs is not None
+    assert self.outputs is not None
 
-    proxy_attrs = {}
-    for idx, (name, port_type) in enumerate(self.inputs):
-      proxy_attrs[name] = property(lambda self, idx=idx: self._get_input(idx))
+    proxy_attrs: Dict[str, object] = {}
+    for port in self.inputs:
+      assert port.name is not None
+      assert port.idx is not None
+      proxy_attrs[port.name] = property(
+          lambda self, idx=port.idx: self._get_input(idx))
 
     output_port_lookup: Dict[str, int] = {}
-    for idx, (name, port_type) in enumerate(self.outputs):
+    for port in self.outputs:
+      assert port.name is not None
+      assert port.idx is not None
 
-      def fset(self, val, idx=idx):
+      def fset(self, val, idx=port.idx):
         self._set_output(idx, val)
 
-      proxy_attrs[name] = property(fget=None, fset=fset)
-      output_port_lookup[name] = idx
+      proxy_attrs[port.name] = property(fget=None, fset=fset)
+      output_port_lookup[port.name] = port.idx
     proxy_attrs["_output_port_lookup"] = output_port_lookup
     proxy_attrs["_name"] = self.modcls.__name__
 
@@ -292,25 +314,16 @@ class ModuleLikeBuilderBase(_PyProxy):
     """For each port, replace it with a property to provide access to the
     instances output in OTHER generators which are instantiating this module."""
 
-    for idx, (name, port_type) in enumerate(self.inputs):
-
-      def fget(self):
-        raise PortError("Cannot access signal via instance input")
-
-      setattr(self.modcls, name, property(fget=fget))
+    def fgets_dict(s, outs):
+      return {n: g.fget(s) for n, g in outs.items()}
 
     named_outputs = {}
-    for idx, (name, port_type) in enumerate(self.outputs):
-
-      def fget(self, idx=idx):
-        return _FromCirctValue(self.inst.operation.results[idx])
-
-      named_outputs[name] = fget
-      setattr(self.modcls, name, property(fget=fget))
+    for port in self.outputs:
+      assert port.name is not None
+      named_outputs[port.name] = port
     setattr(self.modcls,
             "outputs",
-            lambda self, outputs=named_outputs:
-            {n: g(self) for n, g in outputs.items()})
+            lambda s, outs=named_outputs: fgets_dict(s, outs))
 
   @property
   def name(self):
@@ -326,6 +339,60 @@ class ModuleLikeBuilderBase(_PyProxy):
         f"<pycde.Module: {self.name} inputs: {self.inputs} "
         f"outputs: {self.outputs}>",
         file=out)
+
+  def add_metadata(self, sys, symbol: str, meta: Optional[Metadata]):
+    """Add the metadata to the IR so it potentially gets included in the
+    manifest. (It'll only be included if one of the instances has an appid.) If
+    user did not specify the metadata (or components thereof), attempt to fill
+    them in automatically:
+      - Name defaults to the module name.
+      - Summary defaults to the module docstring.
+      - If GitPython is installed, the commit hash and repo are automatically
+        generated if neither are specified.
+    """
+
+    from .dialects.esi import esi
+
+    if meta is None:
+      meta = Metadata()
+    elif not isinstance(meta, Metadata):
+      raise TypeError("Module metadata must be of type Metadata")
+
+    if meta.name is None:
+      meta.name = self.modcls.__name__
+
+    try:
+      # Attempt to automatically generate repo and commit hash using GitPython.
+      if meta.repo is None and meta.commit_hash is None:
+        import git
+        import inspect
+        modclsmodule = inspect.getmodule(self.modcls)
+        if modclsmodule is not None:
+          r = git.Repo(os.path.dirname(modclsmodule.__file__),
+                       search_parent_directories=True)
+          if r is not None:
+            meta.repo = r.remotes.origin.url
+            meta.commit_hash = r.head.object.hexsha
+    except Exception:
+      pass
+
+    if meta.summary is None and self.modcls.__doc__ is not None:
+      meta.summary = self.modcls.__doc__
+
+    with ir.InsertionPoint(sys.mod.body):
+      meta_op = esi.SymbolMetadataOp(
+          symbolRef=ir.FlatSymbolRefAttr.get(symbol),
+          name=ir.StringAttr.get(meta.name),
+          repo=ir.StringAttr.get(meta.repo) if meta.repo is not None else None,
+          commitHash=ir.StringAttr.get(meta.commit_hash)
+          if meta.commit_hash is not None else None,
+          version=ir.StringAttr.get(meta.version)
+          if meta.version is not None else None,
+          summary=ir.StringAttr.get(meta.summary)
+          if meta.summary is not None else None)
+      if meta.misc is not None:
+        for k, v in meta.misc.items():
+          meta_op.attributes[k] = _obj_to_attribute(v)
 
   class GeneratorCtxt:
     """Provides an context which most genertors need."""
@@ -398,60 +465,6 @@ class ModuleBuilder(ModuleLikeBuilderBase):
       return sys._create_circt_mod(self)
     return ret
 
-  def add_metadata(self, sys, symbol: str, meta: Optional[Metadata]):
-    """Add the metadata to the IR so it potentially gets included in the
-    manifest. (It'll only be included if one of the instances has an appid.) If
-    user did not specify the metadata (or components thereof), attempt to fill
-    them in automatically:
-      - Name defaults to the module name.
-      - Summary defaults to the module docstring.
-      - If GitPython is installed, the commit hash and repo are automatically
-        generated if neither are specified.
-    """
-
-    from .dialects.esi import esi
-
-    if meta is None:
-      meta = Metadata()
-    elif not isinstance(meta, Metadata):
-      raise TypeError("Module metadata must be of type Metadata")
-
-    if meta.name is None:
-      meta.name = self.modcls.__name__
-
-    try:
-      # Attempt to automatically generate repo and commit hash using GitPython.
-      if meta.repo is None and meta.commit_hash is None:
-        import git
-        import inspect
-        modclsmodule = inspect.getmodule(self.modcls)
-        if modclsmodule is not None:
-          r = git.Repo(os.path.dirname(modclsmodule.__file__),
-                       search_parent_directories=True)
-          if r is not None:
-            meta.repo = r.remotes.origin.url
-            meta.commit_hash = r.head.object.hexsha
-    except Exception:
-      pass
-
-    if meta.summary is None and self.modcls.__doc__ is not None:
-      meta.summary = self.modcls.__doc__
-
-    with ir.InsertionPoint(sys.mod.body):
-      meta_op = esi.SymbolMetadataOp(
-          symbolRef=ir.FlatSymbolRefAttr.get(symbol),
-          name=ir.StringAttr.get(meta.name),
-          repo=ir.StringAttr.get(meta.repo) if meta.repo is not None else None,
-          commitHash=ir.StringAttr.get(meta.commit_hash)
-          if meta.commit_hash is not None else None,
-          version=ir.StringAttr.get(meta.version)
-          if meta.version is not None else None,
-          summary=ir.StringAttr.get(meta.summary)
-          if meta.summary is not None else None)
-      if meta.misc is not None:
-        for k, v in meta.misc.items():
-          meta_op.attributes[k] = _obj_to_attribute(v)
-
   def create_op(self, sys, symbol):
     """Callback for creating a module op."""
 
@@ -467,8 +480,8 @@ class ModuleBuilder(ModuleLikeBuilderBase):
       # If this Module has a generator, it's a real module.
       return hw.HWModuleOp(
           symbol,
-          [(n, t._type) for (n, t) in self.inputs],
-          [(n, t._type) for (n, t) in self.outputs],
+          [(p.name, p.type._type) for p in self.inputs],
+          [(p.name, p.type._type) for p in self.outputs],
           attributes=self.attributes,
           loc=self.loc,
           ip=sys._get_ip(),
@@ -490,8 +503,8 @@ class ModuleBuilder(ModuleLikeBuilderBase):
     }
     return hw.HWModuleExternOp(
         symbol,
-        input_ports=[(n, t._type) for (n, t) in self.inputs],
-        output_ports=[(n, t._type) for (n, t) in self.outputs],
+        input_ports=[(p.name, p.type._type) for p in self.inputs],
+        output_ports=[(p.name, p.type._type) for p in self.outputs],
         parameters=paramdecl_list,
         attributes=self.attributes,
         loc=self.loc,
@@ -501,29 +514,29 @@ class ModuleBuilder(ModuleLikeBuilderBase):
   def instantiate(self, module_inst, inputs, instance_name: str):
     """"Instantiate this Module. Check that the input types match expectations."""
 
-    port_input_lookup = {name: ptype for name, ptype in self.inputs}
+    port_input_lookup = {port.name: port for port in self.inputs}
     circt_inputs = {}
     for name, signal in inputs.items():
       if name not in port_input_lookup:
         raise PortError(f"Input port {name} not found in module")
-      ptype = port_input_lookup[name]
+      port = port_input_lookup[name]
       if isinstance(signal, Signal):
         # If the input is a signal, the types must match.
-        if signal.type._type != ptype._type:
+        if signal.type != port.type:
           raise ValueError(
               f"Wrong type on input signal '{name}'. Got '{signal.type}',"
-              f" expected '{ptype}'")
+              f" expected '{port.type}'")
         circt_inputs[name] = signal.value
       elif signal is None:
         if len(self.generators) > 0:
           raise PortError(
               f"Port {name} cannot be None (disconnected ports only allowed "
               "on extern mods.")
-        circt_inputs[name] = create_const_zero(ptype)
+        circt_inputs[name] = create_const_zero(port.type).value
       else:
         # If it's not a signal, assume the user wants to specify a constant and
         # try to convert it to a hardware constant.
-        circt_inputs[name] = ptype(signal).value
+        circt_inputs[name] = port.type(signal).value
 
     missing = list(
         filter(lambda name: name not in circt_inputs, port_input_lookup.keys()))
@@ -577,7 +590,7 @@ class Module(_PyProxy, metaclass=ModuleLikeType):
   instance constructed exclusively for the generator.
   """
 
-  BuilderType = ModuleBuilder
+  BuilderType: type[ModuleLikeBuilderBase] = ModuleBuilder
   _builder: ModuleBuilder
 
   def __init__(self, instance_name: str = None, appid: AppID = None, **inputs):
@@ -723,9 +736,9 @@ def import_hw_module(hw_module: hw.HWModuleOp):
   # Collect input and output ports as named Inputs and Outputs.
   modattrs = {}
   for input_name, block_arg in hw_module.inputs().items():
-    modattrs[input_name] = Input(Type(block_arg.type), input_name)
+    modattrs[input_name] = Input(_FromCirctType(block_arg.type), input_name)
   for output_name, output_type in hw_module.outputs().items():
-    modattrs[output_name] = Output(Type(output_type), output_name)
+    modattrs[output_name] = Output(_FromCirctType(output_type), output_name)
   modattrs["BuilderType"] = ImportedModSpec
   modattrs["hw_module"] = hw_module
 

@@ -100,22 +100,19 @@ void buildAssignmentsForRegisterWrite(OpBuilder &builder,
 // external memories.
 struct MemoryPortsImpl {
   std::optional<Value> readData;
-  std::optional<Value> readEn;
-  std::optional<Value> readDone;
+  std::optional<Value> readOrContentEn;
   std::optional<Value> writeData;
   std::optional<Value> writeEn;
-  std::optional<Value> writeDone;
+  std::optional<Value> done;
   SmallVector<Value> addrPorts;
+  std::optional<bool> isContentEn;
   bool isDynamic;
 
   bool operator==(const MemoryPortsImpl &other) const {
     if (readData != other.readData)
       return false;
 
-    if (readEn != other.readEn)
-      return false;
-
-    if (readDone != other.readDone)
+    if (readOrContentEn != other.readOrContentEn)
       return false;
 
     if (writeData != other.writeData)
@@ -124,10 +121,13 @@ struct MemoryPortsImpl {
     if (writeEn != other.writeEn)
       return false;
 
-    if (writeDone != other.writeDone)
+    if (done != other.done)
       return false;
 
     if (addrPorts != other.addrPorts)
+      return false;
+
+    if (isContentEn != other.isContentEn)
       return false;
 
     if (isDynamic != other.isDynamic)
@@ -153,16 +153,16 @@ struct MemoryInterface {
   // Getter methods for each memory interface port.
   Value readData();
   Value readEn();
-  Value readDone();
+  Value contentEn();
   Value writeData();
   Value writeEn();
-  Value writeDone();
+  Value done();
   std::optional<Value> readDataOpt();
   std::optional<Value> readEnOpt();
-  std::optional<Value> readDoneOpt();
+  std::optional<Value> contentEnOpt();
   std::optional<Value> writeDataOpt();
   std::optional<Value> writeEnOpt();
-  std::optional<Value> writeDoneOpt();
+  std::optional<Value> doneOpt();
   bool isDynamic();
   ValueRange addrPorts();
 

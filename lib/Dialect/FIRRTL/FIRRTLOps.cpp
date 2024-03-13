@@ -494,6 +494,9 @@ LogicalResult CircuitOp::verifyRegions() {
 
   mlir::SymbolTable symtbl(getOperation());
 
+  if (!symtbl.lookup(main))
+    return emitOpError().append("Module with same name as circuit not found");
+
   // Store a mapping of defname to either the first external module
   // that defines it or, preferentially, the first external module
   // that defines it and has no parameters.
@@ -3930,8 +3933,10 @@ ParseResult ConstantOp::parse(OpAsmParser &parser, OperationState &result) {
     } else if (width < value.getBitWidth()) {
       // The parser can return an unnecessarily wide result with leading
       // zeros. This isn't a problem, but truncating off bits is bad.
-      if (value.getNumSignBits() < value.getBitWidth() - width)
-        return parser.emitError(loc, "constant too large for result type ")
+      unsigned neededBits = value.isNegative() ? value.getSignificantBits()
+                                               : value.getActiveBits();
+      if (width < neededBits)
+        return parser.emitError(loc, "constant out of range for result type ")
                << resultType;
       value = value.trunc(width);
     }
@@ -4893,8 +4898,15 @@ FIRRTLType impl::inferBitwiseResult(FIRRTLType lhs, FIRRTLType rhs,
   if (!isSameIntTypeKind(lhs, rhs, lhsWidth, rhsWidth, isConstResult, loc))
     return {};
 
-  if (lhsWidth != -1 && rhsWidth != -1)
+  if (lhsWidth != -1 && rhsWidth != -1) {
     resultWidth = std::max(lhsWidth, rhsWidth);
+    if (lhsWidth == resultWidth && lhs.isConst() == isConstResult &&
+        isa<UIntType>(lhs))
+      return lhs;
+    if (rhsWidth == resultWidth && rhs.isConst() == isConstResult &&
+        isa<UIntType>(rhs))
+      return rhs;
+  }
   return UIntType::get(lhs.getContext(), resultWidth, isConstResult);
 }
 
@@ -5078,6 +5090,8 @@ FIRRTLType NotPrimOp::inferUnaryReturnType(FIRRTLType input,
   auto inputi = type_dyn_cast<IntType>(input);
   if (!inputi)
     return emitInferRetTypeError(loc, "operand must have integer type");
+  if (isa<UIntType>(inputi))
+    return inputi;
   return UIntType::get(input.getContext(), inputi.getWidthOrSentinel(),
                        inputi.isConst());
 }
@@ -5359,8 +5373,11 @@ FIRRTLType ShrPrimOp::inferReturnType(ValueRange operands,
         loc, "shr input must be integer and amount must be >= 0");
 
   int32_t width = inputi.getWidthOrSentinel();
-  if (width != -1)
-    width = std::max<int32_t>(1, width - amount);
+  if (width != -1) {
+    // UInt saturates at 0 bits, SInt at 1 bit
+    int32_t minWidth = inputi.isUnsigned() ? 0 : 1;
+    width = std::max<int32_t>(minWidth, width - amount);
+  }
 
   return IntType::get(input.getContext(), inputi.isSigned(), width,
                       inputi.isConst());
@@ -5748,6 +5765,15 @@ void GTPrimOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
   genericAsmResultNames(*this, setNameFn);
 }
 void HeadPrimOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  genericAsmResultNames(*this, setNameFn);
+}
+void IntegerAddOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  genericAsmResultNames(*this, setNameFn);
+}
+void IntegerMulOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  genericAsmResultNames(*this, setNameFn);
+}
+void IntegerShrOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
   genericAsmResultNames(*this, setNameFn);
 }
 void IsTagOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {

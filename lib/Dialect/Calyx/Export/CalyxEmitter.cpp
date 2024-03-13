@@ -119,9 +119,9 @@ private:
               static constexpr std::string_view sCompile = "compile";
               return {sCompile};
             })
-        .Case<MemoryOp, NotLibOp, AndLibOp, OrLibOp, XorLibOp, SubLibOp,
-              GtLibOp, LtLibOp, EqLibOp, NeqLibOp, GeLibOp, LeLibOp, LshLibOp,
-              RshLibOp, SliceLibOp, PadLibOp, MuxLibOp>(
+        .Case<NotLibOp, AndLibOp, OrLibOp, XorLibOp, SubLibOp, GtLibOp, LtLibOp,
+              EqLibOp, NeqLibOp, GeLibOp, LeLibOp, LshLibOp, RshLibOp,
+              SliceLibOp, PadLibOp, MuxLibOp>(
             [&](auto op) -> FailureOr<StringRef> {
               static constexpr std::string_view sCore = "core";
               return {sCore};
@@ -133,8 +133,12 @@ private:
               "binary_operators";
           return {sBinaryOperators};
         })
+        .Case<MemoryOp>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sMemories = "memories/comb";
+          return {sMemories};
+        })
         .Case<SeqMemoryOp>([&](auto op) -> FailureOr<StringRef> {
-          static constexpr std::string_view sMemories = "memories";
+          static constexpr std::string_view sMemories = "memories/seq";
           return {sMemories};
         })
         .Case<PipelinedMultLibOp>([&](auto op) -> FailureOr<StringRef> {

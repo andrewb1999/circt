@@ -18,6 +18,7 @@
 #include "circt/Dialect/FIRRTL/FIRRTLAttributes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
+#include "circt/Dialect/FIRRTL/Import/FIRAnnotations.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/InnerSymbolNamespace.h"
 #include "circt/Support/LLVM.h"
@@ -168,19 +169,27 @@ struct FIRParser {
   //===--------------------------------------------------------------------===//
 
   ParseResult requireFeature(FIRVersion minimum, StringRef feature) {
+    return requireFeature(minimum, feature, getToken().getLoc());
+  }
+
+  ParseResult requireFeature(FIRVersion minimum, StringRef feature, SMLoc loc) {
     if (version < minimum)
-      return emitError() << feature << " are a FIRRTL " << minimum
-                         << "+ feature, but the specified FIRRTL version was "
-                         << version;
+      return emitError(loc)
+             << feature << " are a FIRRTL " << minimum
+             << "+ feature, but the specified FIRRTL version was " << version;
     return success();
   }
 
   ParseResult removedFeature(FIRVersion removedVersion, StringRef feature) {
+    return removedFeature(removedVersion, feature, getToken().getLoc());
+  }
+
+  ParseResult removedFeature(FIRVersion removedVersion, StringRef feature,
+                             SMLoc loc) {
     if (version >= removedVersion)
-      return emitError() << feature << " were removed in FIRRTL "
-                         << removedVersion
-                         << ", but the specified FIRRTL version was "
-                         << version;
+      return emitError(loc)
+             << feature << " were removed in FIRRTL " << removedVersion
+             << ", but the specified FIRRTL version was " << version;
     return success();
   }
 
@@ -2244,6 +2253,12 @@ ParseResult FIRStmtParser::parsePrimExp(Value &result) {
   case FIRToken::lp_tail:
     attrNames.push_back(getConstants().amountIdentifier);
     break;
+  case FIRToken::lp_integer_add:
+  case FIRToken::lp_integer_mul:
+  case FIRToken::lp_integer_shr:
+    if (requireFeature({4, 0, 0}, "Integer arithmetic expressions", loc))
+      return failure();
+    break;
   }
 
   if (operands.size() != numOperandsExpected) {
@@ -2278,12 +2293,23 @@ ParseResult FIRStmtParser::parsePrimExp(Value &result) {
       return failure();                                                        \
     }                                                                          \
     result = builder.create<CLASS>(resultTy, operands, attrs);                 \
-    return success();                                                          \
+    break;                                                                     \
   }
 #include "FIRTokenKinds.def"
   }
-
-  llvm_unreachable("all cases should return");
+  // Don't add code here, the common cases of these switch statements will be
+  // merged. This allows for fixing up primops after they have been created.
+  switch (kind) {
+  default:
+    break;
+  case FIRToken::lp_shr:
+    // For FIRRTL versions earlier than 4.0.0, insert pad(_, 1) around any
+    // unsigned shr This ensures the minimum width is 1 (but can be greater)
+    if (version < FIRVersion(4, 0, 0) && type_isa<UIntType>(result.getType()))
+      result = builder.create<PadPrimOp>(result, 1);
+    break;
+  }
+  return success();
 }
 
 /// integer-literal-exp ::= 'UInt' optional-width '(' intLit ')'
@@ -2928,6 +2954,7 @@ ParseResult FIRStmtParser::parseWhen(unsigned whenIndent) {
 /// enum-exp ::= enum-type '(' Id ( ',' exp )? ')'
 ParseResult FIRStmtParser::parseEnumExp(Value &value) {
   auto startLoc = getToken().getLoc();
+  locationProcessor.setLoc(startLoc);
   FIRRTLType type;
   if (parseEnumType(type))
     return failure();
@@ -2947,7 +2974,7 @@ ParseResult FIRStmtParser::parseEnumExp(Value &value) {
   if (consumeIf(FIRToken::r_paren)) {
     // If the payload is not specified, we create a 0 bit unsigned integer
     // constant.
-    auto type = IntType::get(builder.getContext(), false, 0);
+    auto type = IntType::get(builder.getContext(), false, 0, true);
     Type attrType = IntegerType::get(getContext(), 0, IntegerType::Unsigned);
     auto attr = builder.getIntegerAttr(attrType, APInt(0, 0, false));
     input = builder.create<ConstantOp>(type, attr);
@@ -2958,7 +2985,6 @@ ParseResult FIRStmtParser::parseEnumExp(Value &value) {
       return failure();
   }
 
-  locationProcessor.setLoc(startLoc);
   value = builder.create<FEnumCreateOp>(enumType, tag, input);
   return success();
 }
@@ -3955,12 +3981,12 @@ ParseResult FIRStmtParser::parseObject() {
   locationProcessor.setLoc(startTok.getLoc());
 
   // Look up the class that is being referenced.
-  auto circuit =
-      builder.getBlock()->getParentOp()->getParentOfType<CircuitOp>();
-  auto referencedClass = circuit.lookupSymbol<ClassLike>(className);
-  if (!referencedClass)
+  const auto &classMap = getConstants().classMap;
+  auto lookup = classMap.find(className);
+  if (lookup == classMap.end())
     return emitError(startTok.getLoc(), "use of undefined class name '" +
                                             className + "' in object");
+  auto referencedClass = lookup->getSecond();
   auto result = builder.create<ObjectOp>(referencedClass, id);
   return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
 }
@@ -4482,7 +4508,8 @@ FIRCircuitParser::importAnnotationsRaw(SMLoc loc, StringRef annotationsStr,
 
   json::Path::Root root;
   llvm::StringMap<ArrayAttr> thisAnnotationMap;
-  if (!fromJSONRaw(annotations.get(), attrs, root, getContext())) {
+  if (!importAnnotationsFromJSONRaw(annotations.get(), attrs, root,
+                                    getContext())) {
     auto diag = emitError(loc, "Invalid/unsupported annotation format");
     std::string jsonErrorMessage =
         "See inline comments for problem area in JSON:\n";
@@ -4640,6 +4667,11 @@ ParseResult FIRCircuitParser::parseRefList(ArrayRef<PortInfo> portList,
   SmallVector<RefStatementInfo> refStatements;
   SmallPtrSet<StringAttr, 8> seenNames;
   SmallPtrSet<StringAttr, 8> seenRefs;
+
+  // Ref statements were removed in 4.0.0, check.
+  if (getToken().is(FIRToken::kw_ref) &&
+      removedFeature({4, 0, 0}, "ref statements"))
+    return failure();
 
   // Parse the ref statements.
   while (consumeIf(FIRToken::kw_ref)) {
@@ -4939,6 +4971,15 @@ ParseResult FIRCircuitParser::parseExtModule(CircuitOp circuit,
   if (parseParameterList(parameters) || parseRefList(portList, internalPaths))
     return failure();
 
+  if (version >= FIRVersion{4, 0, 0}) {
+    for (auto [pi, loc] : llvm::zip_equal(portList, portLocs)) {
+      if (auto ftype = type_dyn_cast<FIRRTLType>(pi.type)) {
+        if (ftype.hasUninferredWidth())
+          return emitError(loc, "extmodule port must have known width");
+      }
+    }
+  }
+
   auto builder = circuit.getBodyBuilder();
   auto isMainModule = (name == circuit.getName());
   auto convention =
@@ -5003,7 +5044,8 @@ ParseResult FIRCircuitParser::parseModule(CircuitOp circuit, bool isPublic,
   SmallVector<PortInfo, 8> portList;
   SmallVector<SMLoc> portLocs;
   ArrayAttr layers;
-  LocWithInfo info(getToken().getLoc(), this);
+  auto modLoc = getToken().getLoc();
+  LocWithInfo info(modLoc, this);
   consumeToken(FIRToken::kw_module);
   if (parseId(name, "expected module name") ||
       parseOptionalEnabledLayers(layers) ||
@@ -5012,7 +5054,23 @@ ParseResult FIRCircuitParser::parseModule(CircuitOp circuit, bool isPublic,
     return failure();
 
   // The main module is implicitly public.
-  isPublic |= name == circuit.getName();
+  if (name == circuit.getName()) {
+    if (!isPublic && removedFeature({4, 0, 0}, "private main modules", modLoc))
+      return failure();
+    isPublic = true;
+  }
+
+  if (isPublic && version >= FIRVersion{4, 0, 0}) {
+    for (auto [pi, loc] : llvm::zip_equal(portList, portLocs)) {
+      if (auto ftype = type_dyn_cast<FIRRTLType>(pi.type)) {
+        if (ftype.hasUninferredWidth())
+          return emitError(loc, "public module port must have known width");
+        if (ftype.hasUninferredReset())
+          return emitError(loc,
+                           "public module port must have concrete reset type");
+      }
+    }
+  }
 
   ArrayAttr annotations = getConstants().emptyArrayAttr;
   auto convention = Convention::Internal;
