@@ -603,8 +603,6 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
       storeOp.getMemref());
 
   getState<ComponentLoweringState>().memoryInterfaceWriteEnSet(memoryInterface);
-  // If we are using an external interface, assert the content_en signal
-  getState<ComponentLoweringState>().memoryInterfaceReadEnSet(memoryInterface);
 
   auto group = createStaticGroupForOp(rewriter, storeOp, 1);
 
@@ -620,10 +618,6 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   auto constant =
       calyx::createConstant(storeOp.getLoc(), rewriter, getComponent(), 1, 1);
   rewriter.create<calyx::AssignOp>(storeOp.getLoc(), memoryInterface.writeEn(),
-                                   constant.getResult());
-
-  // If we are using an external interface, assert the content_en signal
-  rewriter.create<calyx::AssignOp>(storeOp.getLoc(), memoryInterface.readEn(),
                                    constant.getResult());
   // rewriter.create<calyx::GroupDoneOp>(storeOp.getLoc(),
   // memoryInterface.done());
@@ -1987,7 +1981,7 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
         if (done.has_value())
           getState<ComponentLoweringState>().addPhaseDoneValue(nextPhase,
                                                                *done);
-      } else if (auto storeOp = dyn_cast<calyx::StoreLoweringInterface>(op)) {
+      } else if (auto storeOp = dyn_cast<calyx::LoadLoweringInterface>(op)) {
         auto done = getState<ComponentLoweringState>()
                         .getMemoryInterface(storeOp.getMemoryValue())
                         .writeDoneOpt();

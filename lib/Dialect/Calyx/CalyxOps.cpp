@@ -2090,9 +2090,8 @@ SmallVector<StringRef> SeqMemoryOp::portNames() {
         StringAttr::get(this->getContext(), "addr" + std::to_string(i));
     portNames.push_back(nameAttr.getValue());
   }
-  // Changing the order of port names here breaks the memory interface
   portNames.append({"write_data", "write_en", "write_done", clkPort,
-                    "read_data", "content_en", "read_done"});
+                    "read_data", "read_en", "read_done"});
   return portNames;
 }
 
