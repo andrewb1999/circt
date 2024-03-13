@@ -196,21 +196,22 @@ public:
     return stallPorts[loop];
   }
 
-  void memoryInterfaceReadEnSet(const calyx::MemoryInterface &interface) {
-    readEnSet.push_back(interface);
+  void interfaceReadOrContentEnSet(const calyx::MemoryInterface &interface) {
+    readOrContentEnSet.push_back(interface);
   }
 
-  void memoryInterfaceWriteEnSet(const calyx::MemoryInterface &interface) {
+  void interfaceWriteEnSet(const calyx::MemoryInterface &interface) {
     writeEnSet.push_back(interface);
   }
 
-  SmallVector<calyx::MemoryInterface> interfacesReadEnNotSet() {
+  SmallVector<calyx::MemoryInterface> interfacesReadOrContentEnNotSet() {
     SmallVector<calyx::MemoryInterface> interfaces;
 
     for (auto interface : writeEnSet) {
-      if (interface.readEnOpt().has_value()) {
+      if (interface.readEnOpt().has_value() ||
+          interface.contentEnOpt().has_value()) {
         int count = 0;
-        for (const auto &readInterface : readEnSet) {
+        for (const auto &readInterface : readOrContentEnSet) {
           if (readInterface == interface)
             count++;
         }
@@ -225,7 +226,7 @@ public:
   SmallVector<calyx::MemoryInterface> interfacesWriteEnNotSet() {
     SmallVector<calyx::MemoryInterface> interfaces;
 
-    for (auto interface : readEnSet) {
+    for (auto interface : readOrContentEnSet) {
       if (interface.writeEnOpt().has_value()) {
         int count = 0;
         for (const auto &writeInterface : writeEnSet) {
@@ -263,7 +264,7 @@ private:
 
   DenseMap<LoopInterface, SmallVector<Value>> stallPorts;
 
-  SmallVector<calyx::MemoryInterface> readEnSet;
+  SmallVector<calyx::MemoryInterface> readOrContentEnSet;
 
   SmallVector<calyx::MemoryInterface> writeEnSet;
 };
@@ -563,7 +564,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   auto memoryInterface =
       getState<ComponentLoweringState>().getMemoryInterface(memref);
 
-  getState<ComponentLoweringState>().memoryInterfaceReadEnSet(memoryInterface);
+  getState<ComponentLoweringState>().interfaceReadOrContentEnSet(memoryInterface);
 
   // TODO: Check only one access to this memory per cycle
   // Single load from memory; we do not need to write the
@@ -578,8 +579,13 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   rewriter.setInsertionPointToEnd(group.getBodyBlock());
   auto one =
       calyx::createConstant(loadOp.getLoc(), rewriter, getComponent(), 1, 1);
-  rewriter.create<calyx::AssignOp>(loadOp.getLoc(), memoryInterface.readEn(),
-                                   one);
+  if (memoryInterface.readEnOpt().has_value()) {
+    rewriter.create<calyx::AssignOp>(loadOp.getLoc(), memoryInterface.readEn(),
+                                     one);
+  } else if (memoryInterface.contentEnOpt().has_value()) {
+    rewriter.create<calyx::AssignOp>(loadOp.getLoc(), memoryInterface.contentEn(),
+                                     one);
+  }
 
   // We refrain from replacing the loadOp result with
   // memoryInterface.readData, since multiple loadOp's need to be converted
@@ -602,7 +608,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   auto memoryInterface = getState<ComponentLoweringState>().getMemoryInterface(
       storeOp.getMemref());
 
-  getState<ComponentLoweringState>().memoryInterfaceWriteEnSet(memoryInterface);
+  getState<ComponentLoweringState>().interfaceWriteEnSet(memoryInterface);
 
   auto group = createStaticGroupForOp(rewriter, storeOp, 1);
 
@@ -619,8 +625,12 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
       calyx::createConstant(storeOp.getLoc(), rewriter, getComponent(), 1, 1);
   rewriter.create<calyx::AssignOp>(storeOp.getLoc(), memoryInterface.writeEn(),
                                    constant.getResult());
-  // rewriter.create<calyx::GroupDoneOp>(storeOp.getLoc(),
-  // memoryInterface.done());
+  if (memoryInterface.contentEnOpt().has_value()) {
+    // If memory has content enable, it must be asserted when writing
+    rewriter.create<calyx::AssignOp>(
+        storeOp.getLoc(), memoryInterface.contentEn(),
+        constant.getResult());
+  }
 
   // getState<ComponentLoweringState>().registerSinkOperations(storeOp,
   //                                                           group);
@@ -636,7 +646,7 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
   auto memoryInterface =
       getState<ComponentLoweringState>().getMemoryInterface(memref);
 
-  getState<ComponentLoweringState>().memoryInterfaceReadEnSet(memoryInterface);
+  getState<ComponentLoweringState>().interfaceReadOrContentEnSet(memoryInterface);
 
   auto group = createStaticGroupForOp(rewriter, loadOp, 1);
   rewriter.setInsertionPointToEnd(group.getBodyBlock());
@@ -656,7 +666,7 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
   auto memoryInterface = getState<ComponentLoweringState>().getMemoryInterface(
       storeOp.getMemoryValue());
 
-  getState<ComponentLoweringState>().memoryInterfaceWriteEnSet(memoryInterface);
+  getState<ComponentLoweringState>().interfaceWriteEnSet(memoryInterface);
 
   auto group = createStaticGroupForOp(rewriter, storeOp, 1);
 
@@ -1977,14 +1987,14 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       if (auto loadOp = dyn_cast<calyx::LoadLoweringInterface>(op)) {
         auto done = getState<ComponentLoweringState>()
                         .getMemoryInterface(loadOp.getMemoryValue())
-                        .readDoneOpt();
+                        .doneOpt();
         if (done.has_value())
           getState<ComponentLoweringState>().addPhaseDoneValue(nextPhase,
                                                                *done);
-      } else if (auto storeOp = dyn_cast<calyx::LoadLoweringInterface>(op)) {
+      } else if (auto storeOp = dyn_cast<calyx::StoreLoweringInterface>(op)) {
         auto done = getState<ComponentLoweringState>()
                         .getMemoryInterface(storeOp.getMemoryValue())
-                        .writeDoneOpt();
+                        .doneOpt();
         if (done.has_value())
           getState<ComponentLoweringState>().addPhaseDoneValue(nextPhase,
                                                                *done);
@@ -2302,13 +2312,15 @@ class ZeroUnusedMemoryEnables : public calyx::FuncOpPartialLoweringPattern {
     rewriter.setInsertionPointToStart(wiresOp.getBodyBlock());
 
     auto zero = calyx::createConstant(funcOp.getLoc(), rewriter, compOp, 1, 0);
-    auto readEnNotSet =
-        getState<ComponentLoweringState>().interfacesReadEnNotSet();
-    for (auto interface : readEnNotSet) {
-      auto readEn = interface.readEn();
-      if (alreadyAssigned.count(readEn) == 0) {
-        rewriter.create<calyx::AssignOp>(funcOp.getLoc(), readEn, zero);
-        alreadyAssigned.insert(readEn);
+    auto readOrContentEnNotSet =
+        getState<ComponentLoweringState>().interfacesReadOrContentEnNotSet();
+    for (auto interface : readOrContentEnNotSet) {
+      if (interface.readEnOpt().has_value()) {
+        auto readEn = interface.readEn();
+        if (alreadyAssigned.count(readEn) == 0) {
+          rewriter.create<calyx::AssignOp>(funcOp.getLoc(), readEn, zero);
+          alreadyAssigned.insert(readEn);
+        }
       }
     }
 

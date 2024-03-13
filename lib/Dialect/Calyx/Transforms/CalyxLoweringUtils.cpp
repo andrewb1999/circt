@@ -229,7 +229,11 @@ void buildAssignmentsForRegisterWrite(OpBuilder &builder,
 //===----------------------------------------------------------------------===//
 
 MemoryInterface::MemoryInterface() = default;
-MemoryInterface::MemoryInterface(const MemoryPortsImpl &ports) : impl(ports) {}
+MemoryInterface::MemoryInterface(const MemoryPortsImpl &ports) : impl(ports) {
+  if (ports.writeEn.has_value() && ports.readOrContentEn.has_value()) {
+    assert(ports.isContentEn.value());
+  }
+}
 MemoryInterface::MemoryInterface(calyx::MemoryOp memOp) : impl(memOp) {}
 MemoryInterface::MemoryInterface(calyx::SeqMemoryOp memOp) : impl(memOp) {}
 
@@ -245,10 +249,10 @@ Value MemoryInterface::readEn() {
   return readEn.value();
 }
 
-Value MemoryInterface::readDone() {
-  auto readDone = readDoneOpt();
-  assert(readDone.has_value() && "Memory does not have readDone");
-  return readDone.value();
+Value MemoryInterface::contentEn() {
+  auto contentEn = contentEnOpt();
+  assert(contentEn.has_value() && "Memory does not have readEn");
+  return contentEn.value();
 }
 
 Value MemoryInterface::writeData() {
@@ -263,10 +267,10 @@ Value MemoryInterface::writeEn() {
   return writeEn.value();
 }
 
-Value MemoryInterface::writeDone() {
-  auto writeDone = writeDoneOpt();
-  assert(writeDone.has_value() && "Memory doe snot have writeDone");
-  return writeDone.value();
+Value MemoryInterface::done() {
+  auto done = doneOpt();
+  assert(done.has_value() && "Memory does not have done");
+  return done.value();
 }
 
 std::optional<Value> MemoryInterface::readDataOpt() {
@@ -286,21 +290,33 @@ std::optional<Value> MemoryInterface::readEnOpt() {
   }
 
   if (auto *memOp = std::get_if<calyx::SeqMemoryOp>(&impl); memOp) {
-    return memOp->readEn();
+    return std::nullopt;
   }
-  return std::get<MemoryPortsImpl>(impl).readEn;
+
+  if (std::get<MemoryPortsImpl>(impl).readOrContentEn.has_value() &&
+      !std::get<MemoryPortsImpl>(impl).isContentEn.value_or(true)) {
+    return std::get<MemoryPortsImpl>(impl).readOrContentEn;
+  }
+  return std::nullopt;
 }
 
-std::optional<Value> MemoryInterface::readDoneOpt() {
+std::optional<Value> MemoryInterface::contentEnOpt() {
   if (auto *memOp = std::get_if<calyx::MemoryOp>(&impl); memOp) {
     return std::nullopt;
   }
 
   if (auto *memOp = std::get_if<calyx::SeqMemoryOp>(&impl); memOp) {
-    return memOp->readDone();
+    return memOp->contentEn();
   }
-  return std::get<MemoryPortsImpl>(impl).readDone;
+
+  if (std::get<MemoryPortsImpl>(impl).readOrContentEn.has_value() &&
+      std::get<MemoryPortsImpl>(impl).isContentEn.value_or(false)) {
+    assert(std::get<MemoryPortsImpl>(impl).writeEn.has_value());
+    return std::get<MemoryPortsImpl>(impl).readOrContentEn;
+  }
+  return std::nullopt;
 }
+
 std::optional<Value> MemoryInterface::writeDataOpt() {
   if (auto *memOp = std::get_if<calyx::MemoryOp>(&impl); memOp) {
     return memOp->writeData();
@@ -332,15 +348,15 @@ std::optional<Value> MemoryInterface::writeEnOpt() {
   return std::get<MemoryPortsImpl>(impl).writeEn;
 }
 
-std::optional<Value> MemoryInterface::writeDoneOpt() {
+std::optional<Value> MemoryInterface::doneOpt() {
   if (auto *memOp = std::get_if<calyx::MemoryOp>(&impl); memOp) {
     return memOp->done();
   }
 
   if (auto *memOp = std::get_if<calyx::SeqMemoryOp>(&impl); memOp) {
-    return memOp->writeDone();
+    return memOp->done();
   }
-  return std::get<MemoryPortsImpl>(impl).writeDone;
+  return std::get<MemoryPortsImpl>(impl).done;
 }
 
 ValueRange MemoryInterface::addrPorts() {

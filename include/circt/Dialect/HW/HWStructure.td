@@ -17,6 +17,7 @@ include "circt/Dialect/HW/HWAttributes.td"
 include "circt/Dialect/HW/HWDialect.td"
 include "circt/Dialect/HW/HWOpInterfaces.td"
 include "circt/Dialect/HW/HWTypes.td"
+include "circt/Dialect/Emit/EmitOpInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/OpBase.td"
@@ -112,7 +113,8 @@ class HWModuleOpBase<string mnemonic, list<Trait> traits = []> :
 
 def HWModuleOp : HWModuleOpBase<"module",
       [IsolatedFromAbove, RegionKindInterface,
-       SingleBlockImplicitTerminator<"OutputOp">]>{
+       SingleBlockImplicitTerminator<"OutputOp">,
+       Emittable]>{
   let summary = "HW Module";
   let description = [{
     The "hw.module" operation represents a Verilog module, including a given
@@ -122,7 +124,7 @@ def HWModuleOp : HWModuleOpBase<"module",
   let arguments = (ins SymbolNameAttr:$sym_name,
                        TypeAttrOf<ModuleType>:$module_type,
                        OptionalAttr<DictArrayAttr>:$per_port_attrs,
-                       OptionalAttr<LocationArrayAttr>:$port_locs,
+                       OptionalAttr<LocationArrayAttr>:$result_locs,
                        ParamDeclArrayAttr:$parameters,
                        OptionalAttr<StrAttr>:$comment);
   let results = (outs);
@@ -566,7 +568,8 @@ def InstanceChoiceOp : HWInstanceOpBase<"instance_choice", [
 
   let arguments = (ins StrAttr:$instanceName,
                        FlatSymbolRefArrayAttr:$moduleNames,
-                       StrArrayAttr:$targetNames,
+                       StrAttr:$optionName,
+                       StrArrayAttr:$caseNames,
                        Variadic<AnyType>:$inputs,
                        StrArrayAttr:$argNames, StrArrayAttr:$resultNames,
                        ParamDeclArrayAttr:$parameters,

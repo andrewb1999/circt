@@ -447,4 +447,57 @@ def AnyCastOp : OMOp<"any_cast", [Pure]> {
   let assemblyFormat =
      "$input attr-dict `:` functional-type($input, $result)";
 }
+
+class IntegerBinaryArithmeticOp<string mnemonic, list<Trait> traits = []> :
+    OMOp<mnemonic, [
+      Pure,
+      DeclareOpInterfaceMethods<IntegerBinaryArithmeticInterface>
+    ] # traits> {
+  let arguments = (ins OMIntegerType:$lhs, OMIntegerType:$rhs);
+
+  let results = (outs OMIntegerType:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
+}
+
+def IntegerAddOp : IntegerBinaryArithmeticOp<"integer.add", [Commutative]> {
+  let summary = "Add two OMIntegerType values";
+  let description = [{
+    Perform arbitrary precision signed integer addition of two OMIntegerType
+    values.
+
+    Example:
+    ```mlir
+    %2 = om.integer.add %0, %1 : !om.integer
+    ```
+  }];
+}
+
+def IntegerMulOp : IntegerBinaryArithmeticOp<"integer.mul", [Commutative]> {
+  let summary = "Multiply two OMIntegerType values";
+  let description = [{
+    Perform arbitrary prevision signed integer multiplication of two
+    OMIntegerType values.
+
+    Example:
+    ```mlir
+    %2 = om.integer.mul %0, %1 : !om.integer
+    ```
+  }];
+}
+
+def IntegerShrOp : IntegerBinaryArithmeticOp<"integer.shr"> {
+  let summary = "Shift an OMIntegerType value right by an OMIntegerType value";
+  let description = [{
+    Perform arbitrary precision signed integer arithmetic shift right of the lhs
+    OMIntegerType value by the rhs OMIntegerType value. The rhs value must be
+    non-negative.
+
+    Example:
+    ```mlir
+    %2 = om.integer.shr %0, %1 : !om.integer
+    ```
+  }];
+}
+
 #endif // CIRCT_DIALECT_OM_OMOPS_TD

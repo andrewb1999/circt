@@ -15,11 +15,13 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/SV/SVOps.h"
+#include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Dialect/Sim/SimDialect.h"
 #include "circt/Dialect/Sim/SimOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/Threading.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -28,11 +30,27 @@
 using namespace circt;
 using namespace sim;
 
+namespace {
+
+struct SimConversionState {
+  std::atomic<bool> usedSynthesisMacro = false;
+};
+
+template <typename T>
+struct SimConversionPattern : public OpConversionPattern<T> {
+  explicit SimConversionPattern(MLIRContext *context, SimConversionState &state)
+      : OpConversionPattern<T>(context), state(state) {}
+
+  SimConversionState &state;
+};
+
+} // namespace
+
 // Lower `sim.plusargs.test` to a standard SV implementation.
 //
-class PlusArgsTestLowering : public OpConversionPattern<PlusArgsTestOp> {
+class PlusArgsTestLowering : public SimConversionPattern<PlusArgsTestOp> {
 public:
-  using OpConversionPattern<PlusArgsTestOp>::OpConversionPattern;
+  using SimConversionPattern<PlusArgsTestOp>::SimConversionPattern;
 
   LogicalResult
   matchAndRewrite(PlusArgsTestOp op, OpAdaptor adaptor,
@@ -55,9 +73,9 @@ public:
 
 // Lower `sim.plusargs.value` to a standard SV implementation.
 //
-class PlusArgsValueLowering : public OpConversionPattern<PlusArgsValueOp> {
+class PlusArgsValueLowering : public SimConversionPattern<PlusArgsValueOp> {
 public:
-  using OpConversionPattern<PlusArgsValueOp>::OpConversionPattern;
+  using SimConversionPattern<PlusArgsValueOp>::SimConversionPattern;
 
   LogicalResult
   matchAndRewrite(PlusArgsValueOp op, OpAdaptor adaptor,
@@ -72,6 +90,7 @@ public:
     auto regf = rewriter.create<sv::RegOp>(loc, i1ty,
                                            rewriter.getStringAttr("_pargs_f"));
 
+    state.usedSynthesisMacro = true;
     rewriter.create<sv::IfDefOp>(
         loc, "SYNTHESIS",
         [&]() {
@@ -109,23 +128,77 @@ public:
   }
 };
 
+template <typename FromOp, typename ToOp>
+class SimulatorStopLowering : public SimConversionPattern<FromOp> {
+public:
+  using SimConversionPattern<FromOp>::SimConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(FromOp op, typename FromOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    auto loc = op.getLoc();
+
+    Value clockCast = rewriter.create<seq::FromClockOp>(loc, adaptor.getClk());
+
+    this->state.usedSynthesisMacro = true;
+    rewriter.create<sv::IfDefOp>(
+        loc, "SYNTHESIS", [&] {},
+        [&] {
+          rewriter.create<sv::AlwaysOp>(
+              loc, sv::EventControl::AtPosEdge, clockCast, [&] {
+                rewriter.create<sv::IfOp>(loc, adaptor.getCond(),
+                                          [&] { rewriter.create<ToOp>(loc); });
+              });
+        });
+
+    rewriter.eraseOp(op);
+
+    return success();
+  }
+};
+
 namespace {
 struct SimToSVPass : public LowerSimToSVBase<SimToSVPass> {
   void runOnOperation() override {
     auto circuit = getOperation();
     MLIRContext *context = &getContext();
 
-    ConversionTarget target(*context);
-    target.addIllegalDialect<SimDialect>();
-    target.addLegalDialect<sv::SVDialect>();
-    target.addLegalDialect<hw::HWDialect>();
-    target.addLegalDialect<comb::CombDialect>();
+    SimConversionState state;
+    auto lowerModule = [&](hw::HWModuleOp module) {
+      ConversionTarget target(*context);
+      target.addIllegalDialect<SimDialect>();
+      target.addLegalDialect<sv::SVDialect>();
+      target.addLegalDialect<hw::HWDialect>();
+      target.addLegalDialect<seq::SeqDialect>();
+      target.addLegalDialect<comb::CombDialect>();
 
-    RewritePatternSet patterns(context);
-    patterns.add<PlusArgsTestLowering>(context);
-    patterns.add<PlusArgsValueLowering>(context);
-    if (failed(applyPartialConversion(circuit, target, std::move(patterns))))
-      signalPassFailure();
+      RewritePatternSet patterns(context);
+      patterns.add<PlusArgsTestLowering>(context, state);
+      patterns.add<PlusArgsValueLowering>(context, state);
+      patterns.add<SimulatorStopLowering<sim::FinishOp, sv::FinishOp>>(context,
+                                                                       state);
+      patterns.add<SimulatorStopLowering<sim::FatalOp, sv::FatalOp>>(context,
+                                                                     state);
+      return applyPartialConversion(module, target, std::move(patterns));
+    };
+
+    if (failed(mlir::failableParallelForEach(
+            context, circuit.getOps<hw::HWModuleOp>(), lowerModule)))
+      return signalPassFailure();
+
+    if (state.usedSynthesisMacro) {
+      Operation *op = circuit.lookupSymbol("SYNTHESIS");
+      if (op) {
+        if (!isa<sv::MacroDeclOp>(op)) {
+          op->emitOpError("should be a macro declaration");
+          return signalPassFailure();
+        }
+      } else {
+        auto builder = ImplicitLocOpBuilder::atBlockBegin(
+            UnknownLoc::get(context), circuit.getBody());
+        builder.create<sv::MacroDeclOp>("SYNTHESIS");
+      }
+    }
   }
 };
 } // anonymous namespace

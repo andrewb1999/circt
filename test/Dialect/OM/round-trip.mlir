@@ -280,3 +280,18 @@ om.class @Any(%in: !om.class.type<@Empty>) {
   // CHECK: om.class.field @field, %[[CAST]]
   om.class.field @field, %0 : !om.any
 }
+
+// CHECK-LABEL: @IntegerArithmetic
+om.class @IntegerArithmetic() {
+  %0 = om.constant #om.integer<1 : si3> : !om.integer
+  %1 = om.constant #om.integer<2 : si3> : !om.integer
+
+  // CHECK: om.integer.add %0, %1 : !om.integer
+  %2 = om.integer.add %0, %1 : !om.integer
+
+  // CHECK: om.integer.mul %0, %1 : !om.integer
+  %3 = om.integer.mul %0, %1 : !om.integer
+
+  // CHECK: om.integer.shr %0, %1 : !om.integer
+  %4 = om.integer.shr %0, %1 : !om.integer
+}

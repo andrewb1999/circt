@@ -1,6 +1,6 @@
 // RUN: circt-opt %s -verify-diagnostics --lower-seq-to-sv | FileCheck %s --check-prefixes=CHECK,COMMON
-// RUN: circt-opt %s -verify-diagnostics --pass-pipeline="builtin.module(lower-seq-to-sv{disable-reg-randomization})" | FileCheck %s --check-prefix COMMON --implicit-check-not RANDOMIZE_REG
-// RUN: circt-opt %s -verify-diagnostics --pass-pipeline="builtin.module(lower-seq-to-sv{emit-separate-always-blocks})" | FileCheck %s --check-prefixes SEPARATE
+// RUN: circt-opt %s -verify-diagnostics --pass-pipeline="builtin.module(lower-seq-to-sv{disable-reg-randomization})" | FileCheck %s --check-prefixes=COMMON,DISABLED
+// RUN: circt-opt %s -verify-diagnostics --pass-pipeline="builtin.module(lower-seq-to-sv{emit-separate-always-blocks})" | FileCheck %s --check-prefixes=SEPARATE
 
 // COMMON-LABEL: hw.module @lowering
 // SEPARATE-LABEL: hw.module @lowering
@@ -103,16 +103,17 @@ hw.module @lowering(in %clk : !seq.clock, in %rst : i1, in %in : i32, out a : i3
   // SEPARATE-NEXT:   sv.passign %rNoSym, %in : i32
   // SEPARATE-NEXT: }
 
-  // CHECK:      sv.ifdef  "ENABLE_INITIAL_REG_" {
+  // DISABLED-NOT: sv.ifdef.procedural @RANDOMIZE_REG
+  // CHECK:      sv.ifdef @ENABLE_INITIAL_REG_ {
   // CHECK-NEXT:   sv.ordered {
-  // CHECK-NEXT:     sv.ifdef  "FIRRTL_BEFORE_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_BEFORE_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_BEFORE_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:     sv.initial {
-  // CHECK-NEXT:       sv.ifdef.procedural "INIT_RANDOM_PROLOG_" {
+  // CHECK-NEXT:       sv.ifdef.procedural @INIT_RANDOM_PROLOG_ {
   // CHECK-NEXT:         sv.verbatim "`INIT_RANDOM_PROLOG_"
   // CHECK-NEXT:       }
-  // CHECK-NEXT:       sv.ifdef.procedural  "RANDOMIZE_REG_INIT" {
+  // CHECK-NEXT:       sv.ifdef.procedural @RANDOMIZE_REG_INIT {
   // CHECK-NEXT:         %_RANDOM = sv.logic : !hw.inout<uarray<8xi32>>
   // CHECK-NEXT:         sv.for %i = %c0_i4 to %c-8_i4 step %c1_i4 : i4 {
   // CHECK-NEXT:           %RANDOM = sv.macro.ref.se @RANDOM() : () -> i32
@@ -150,7 +151,7 @@ hw.module @lowering(in %clk : !seq.clock, in %rst : i1, in %in : i32, out a : i3
   // CHECK-NEXT:         sv.bpassign %rF, %c0_i32 : i32
   // CHECK-NEXT:       }
   // CHECK-NEXT:     }
-  // CHECK-NEXT:     sv.ifdef  "FIRRTL_AFTER_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_AFTER_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_AFTER_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:   }
@@ -183,16 +184,17 @@ hw.module private @UninitReg1(in %clock : !seq.clock, in %reset : i1, in %cond :
   %1 = comb.mux bin %cond, %value, %count : i2
   %2 = comb.mux bin %reset, %c0_i2, %1 : i2
 
-  // CHECK-NEXT: sv.ifdef "ENABLE_INITIAL_REG_"  {
+  // DISABLED-NOT: sv.ifdef.procedural @RANDOMIZE_REG
+  // CHECK-NEXT: sv.ifdef @ENABLE_INITIAL_REG_ {
   // CHECK-NEXT:   sv.ordered {
-  // CHECK-NEXT:     sv.ifdef "FIRRTL_BEFORE_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_BEFORE_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_BEFORE_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:     sv.initial {
-  // CHECK-NEXT:       sv.ifdef.procedural "INIT_RANDOM_PROLOG_" {
+  // CHECK-NEXT:       sv.ifdef.procedural @INIT_RANDOM_PROLOG_ {
   // CHECK-NEXT:         sv.verbatim "`INIT_RANDOM_PROLOG_"
   // CHECK-NEXT:       }
-  // CHECK-NEXT:       sv.ifdef.procedural "RANDOMIZE_REG_INIT"  {
+  // CHECK-NEXT:       sv.ifdef.procedural @RANDOMIZE_REG_INIT {
   // CHECK-NEXT:         %_RANDOM = sv.logic : !hw.inout<uarray<1xi32>>
   // CHECK:              sv.for %i = %{{false.*}} to %{{true.*}} step %{{true.*}} : i1 {
   // CHECK-NEXT:           %RANDOM = sv.macro.ref.se @RANDOM() : () -> i32
@@ -206,7 +208,7 @@ hw.module private @UninitReg1(in %clock : !seq.clock, in %reset : i1, in %cond :
   // CHECK-NEXT:         sv.bpassign %count, %5 : i2
   // CHECK-NEXT:       }
   // CHECK-NEXT:     }
-  // CHECK-NEXT:     sv.ifdef "FIRRTL_AFTER_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_AFTER_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_AFTER_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:   }
@@ -262,6 +264,7 @@ hw.module private @InitReg1(in %clock: !seq.clock, in %reset: i1, in %io_d: i32,
   %3 = comb.extract %2 from 1 : (i33) -> i32
   %4 = comb.mux bin %io_en, %io_d, %3 : i32
 
+  // DISABLED-NOT: sv.ifdef.procedural @RANDOMIZE_REG
   // COMMON:       %reg = sv.reg sym @[[reg_sym:.+]] : !hw.inout<i32>
   // COMMON-NEXT:  %0 = sv.read_inout %reg : !hw.inout<i32>
   // COMMON-NEXT:  %reg2 = sv.reg sym @[[reg2_sym:.+]] : !hw.inout<i32>
@@ -292,16 +295,16 @@ hw.module private @InitReg1(in %clock: !seq.clock, in %reset: i1, in %io_d: i32,
   // COMMON-NEXT:    } else  {
   // COMMON-NEXT:    }
   // COMMON-NEXT:  }
-  // COMMON-NEXT:  sv.ifdef "ENABLE_INITIAL_REG_"  {
+  // COMMON-NEXT:  sv.ifdef @ENABLE_INITIAL_REG_ {
   // COMMON-NEXT:    sv.ordered {
-  // COMMON-NEXT:      sv.ifdef  "FIRRTL_BEFORE_INITIAL" {
+  // COMMON-NEXT:      sv.ifdef @FIRRTL_BEFORE_INITIAL {
   // COMMON-NEXT:        sv.verbatim "`FIRRTL_BEFORE_INITIAL"
   // COMMON-NEXT:      }
   // COMMON-NEXT:      sv.initial {
-  // CHECK:            sv.ifdef.procedural "INIT_RANDOM_PROLOG_" {
+  // CHECK:            sv.ifdef.procedural @INIT_RANDOM_PROLOG_ {
   // CHECK-NEXT:         sv.verbatim "`INIT_RANDOM_PROLOG_"
   // CHECK-NEXT:       }
-  // CHECK-NEXT:       sv.ifdef.procedural "RANDOMIZE_REG_INIT"  {
+  // CHECK-NEXT:       sv.ifdef.procedural @RANDOMIZE_REG_INIT {
   // CHECK-NEXT:          %_RANDOM = sv.logic : !hw.inout<uarray<3xi32>>
   // CHECK-NEXT:          sv.for %i = %c0_i2 to %c-1_i2 step %c1_i2 : i2 {
   // CHECK-NEXT:            %RANDOM = sv.macro.ref.se @RANDOM() : () -> i32
@@ -323,7 +326,7 @@ hw.module private @InitReg1(in %clock: !seq.clock, in %reset: i1, in %io_d: i32,
   // COMMON-NEXT:        sv.bpassign %reg3, %c1_i32 : i32
   // COMMON-NEXT:      }
   // COMMON-NEXT:    }
-  // COMMON-NEXT:    sv.ifdef  "FIRRTL_AFTER_INITIAL" {
+  // COMMON-NEXT:    sv.ifdef @FIRRTL_AFTER_INITIAL {
   // COMMON-NEXT:      sv.verbatim "`FIRRTL_AFTER_INITIAL"
   // COMMON-NEXT:    }
   // COMMON-NEXT:  }
@@ -339,17 +342,18 @@ hw.module private @UninitReg42(in %clock: !seq.clock, in %reset: i1, in %cond: i
   %0 = comb.mux %cond, %value, %count : i42
   %1 = comb.mux %reset, %c0_i42, %0 : i42
 
+  // DISABLED-NOT: sv.ifdef.procedural @RANDOMIZE_REG
   // CHECK:      %count = sv.reg sym @count : !hw.inout<i42>
-  // CHECK:      sv.ifdef "ENABLE_INITIAL_REG_"  {
+  // CHECK:      sv.ifdef @ENABLE_INITIAL_REG_ {
   // CHECK-NEXT:   sv.ordered {
-  // CHECK-NEXT:     sv.ifdef  "FIRRTL_BEFORE_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_BEFORE_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_BEFORE_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:     sv.initial {
-  // CHECK-NEXT:       sv.ifdef.procedural "INIT_RANDOM_PROLOG_" {
+  // CHECK-NEXT:       sv.ifdef.procedural @INIT_RANDOM_PROLOG_ {
   // CHECK-NEXT:         sv.verbatim "`INIT_RANDOM_PROLOG_"
   // CHECK-NEXT:       }
-  // CHECK-NEXT:       sv.ifdef.procedural  "RANDOMIZE_REG_INIT" {
+  // CHECK-NEXT:       sv.ifdef.procedural @RANDOMIZE_REG_INIT {
   // CHECK-NEXT:         %_RANDOM = sv.logic : !hw.inout<uarray<2xi32>>
   // CHECK-NEXT:         sv.for %i = %c0_i2 to %c-2_i2 step %c1_i2 : i2 {
   // CHECK-NEXT:           %RANDOM = sv.macro.ref.se @RANDOM() : () -> i32
@@ -366,7 +370,7 @@ hw.module private @UninitReg42(in %clock: !seq.clock, in %reset: i1, in %cond: i
   // CHECK-NEXT:         sv.bpassign %count, %8 : i42
   // CHECK-NEXT:       }
   // CHECK-NEXT:     }
-  // CHECK-NEXT:     sv.ifdef  "FIRRTL_AFTER_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_AFTER_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_AFTER_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:   }
@@ -385,16 +389,17 @@ hw.module private @init1DVector(in %clock: !seq.clock, in %a: !hw.array<2xi1>, o
   // CHECK-NEXT:   sv.passign %r, %a : !hw.array<2xi1>
   // CHECK-NEXT: }
 
-  // CHECK:      sv.ifdef "ENABLE_INITIAL_REG_" {
+  // DISABLED-NOT: sv.ifdef.procedural @RANDOMIZE_REG
+  // CHECK:      sv.ifdef @ENABLE_INITIAL_REG_ {
   // CHECK-NEXT:   sv.ordered {
-  // CHECK-NEXT:     sv.ifdef  "FIRRTL_BEFORE_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_BEFORE_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_BEFORE_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:     sv.initial {
-  // CHECK-NEXT:       sv.ifdef.procedural "INIT_RANDOM_PROLOG_" {
+  // CHECK-NEXT:       sv.ifdef.procedural @INIT_RANDOM_PROLOG_ {
   // CHECK-NEXT:         sv.verbatim "`INIT_RANDOM_PROLOG_"
   // CHECK-NEXT:       }
-  // CHECK-NEXT:       sv.ifdef.procedural "RANDOMIZE_REG_INIT"  {
+  // CHECK-NEXT:       sv.ifdef.procedural @RANDOMIZE_REG_INIT {
   // CHECK-NEXT:       %_RANDOM = sv.logic : !hw.inout<uarray<1xi32>>
   // CHECK-NEXT:       sv.for %i = %false to %true step %true : i1 {
   // CHECK-NEXT:         %RANDOM = sv.macro.ref.se @RANDOM() : () -> i32
@@ -414,7 +419,7 @@ hw.module private @init1DVector(in %clock: !seq.clock, in %a: !hw.array<2xi1>, o
 
   // CHECK:            }
   // CHECK-NEXT:     }
-  // CHECK-NEXT:     sv.ifdef "FIRRTL_AFTER_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_AFTER_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_AFTER_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:   }
@@ -428,19 +433,20 @@ hw.module private @init1DVector(in %clock: !seq.clock, in %a: !hw.array<2xi1>, o
 hw.module private @init2DVector(in %clock: !seq.clock, in %a: !hw.array<1xarray<1xi1>>, out b: !hw.array<1xarray<1xi1>>) {
   %r = seq.firreg %a clock %clock sym @__r__ : !hw.array<1xarray<1xi1>>
 
+  // DISABLED-NOT: sv.ifdef.procedural @RANDOMIZE_REG
   // CHECK:      sv.always posedge %clock  {
   // CHECK-NEXT:   sv.passign %r, %a : !hw.array<1xarray<1xi1>>
   // CHECK-NEXT: }
-  // CHECK-NEXT: sv.ifdef  "ENABLE_INITIAL_REG_" {
+  // CHECK-NEXT: sv.ifdef @ENABLE_INITIAL_REG_ {
   // CHECK-NEXT:   sv.ordered {
-  // CHECK-NEXT:     sv.ifdef  "FIRRTL_BEFORE_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_BEFORE_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_BEFORE_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:     sv.initial {
-  // CHECK-NEXT:       sv.ifdef.procedural "INIT_RANDOM_PROLOG_" {
+  // CHECK-NEXT:       sv.ifdef.procedural @INIT_RANDOM_PROLOG_ {
   // CHECK-NEXT:         sv.verbatim "`INIT_RANDOM_PROLOG_"
   // CHECK-NEXT:       }
-  // CHECK-NEXT:       sv.ifdef.procedural  "RANDOMIZE_REG_INIT" {
+  // CHECK-NEXT:       sv.ifdef.procedural @RANDOMIZE_REG_INIT {
   // CHECK-NEXT:         %_RANDOM = sv.logic : !hw.inout<uarray<1xi32>>
   // CHECK-NEXT:         sv.for %i = %false to %true step %true : i1 {
   // CHECK-NEXT:           %RANDOM = sv.macro.ref.se @RANDOM() : () -> i32
@@ -456,7 +462,7 @@ hw.module private @init2DVector(in %clock: !seq.clock, in %a: !hw.array<1xarray<
   // CHECK-NEXT:         sv.bpassign %5, %3 : i1
   // CHECK:            }
   // CHECK-NEXT:     }
-  // CHECK-NEXT:     sv.ifdef "FIRRTL_AFTER_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_AFTER_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_AFTER_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:   }
@@ -471,22 +477,23 @@ hw.module private @initStruct(in %clock: !seq.clock) {
   %r = seq.firreg %r clock %clock sym @__r__ : !hw.struct<a: i1>
 
   // CHECK:      %r = sv.reg sym @[[r_sym:[_A-Za-z0-9]+]]
-  // CHECK:      sv.ifdef "ENABLE_INITIAL_REG_" {
+  // DISABLED-NOT: sv.ifdef.procedural @RANDOMIZE_REG
+  // CHECK:      sv.ifdef @ENABLE_INITIAL_REG_ {
   // CHECK-NEXT:   sv.ordered {
-  // CHECK-NEXT:     sv.ifdef  "FIRRTL_BEFORE_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_BEFORE_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_BEFORE_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:     sv.initial {
-  // CHECK-NEXT:       sv.ifdef.procedural "INIT_RANDOM_PROLOG_" {
+  // CHECK-NEXT:       sv.ifdef.procedural @INIT_RANDOM_PROLOG_ {
   // CHECK-NEXT:         sv.verbatim "`INIT_RANDOM_PROLOG_"
   // CHECK-NEXT:       }
-  // CHECK-NEXT:       sv.ifdef.procedural "RANDOMIZE_REG_INIT"  {
+  // CHECK-NEXT:       sv.ifdef.procedural @RANDOMIZE_REG_INIT {
   // CHECK:              %[[EXTRACT:.*]] = comb.extract %{{.*}} from 0 : (i32) -> i1
   // CHECK-NEXT:         %[[INOUT:.*]] = sv.struct_field_inout %r["a"] : !hw.inout<struct<a: i1>>
   // CHECK-NEXT:         sv.bpassign %[[INOUT]], %[[EXTRACT]] : i1
   // CHECK:            }
   // CHECK-NEXT:     }
-  // CHECK-NEXT:     sv.ifdef "FIRRTL_AFTER_INITIAL" {
+  // CHECK-NEXT:     sv.ifdef @FIRRTL_AFTER_INITIAL {
   // CHECK-NEXT:       sv.verbatim "`FIRRTL_AFTER_INITIAL"
   // CHECK-NEXT:     }
   // CHECK-NEXT:   }
@@ -729,18 +736,37 @@ hw.module @NestedSubaccess(in %clock: !seq.clock, in %en_0: i1, in %en_1: i1, in
 }
 
 // CHECK-LABEL: @with_preset
-hw.module @with_preset(in %clock: !seq.clock, in %reset: i1, in %next32: i32, in %next16: i16) {
+hw.module @with_preset(
+    in %clock: !seq.clock,
+    in %reset: i1,
+    in %next : i2,
+    in %next32: i32,
+    in %next16: i16,
+    in %next512: i512,
+    in %next_struct : !hw.struct<a: i16, b: i8>,
+    in %next_arr : !hw.array<5xi4>
+) {
+  %reg3 = seq.firreg %next clock %clock preset 3 : i2
+  %reg2 = seq.firreg %next clock %clock preset 2 : i2
   %preset_0 = seq.firreg %next32 clock %clock preset 0 : i32
   %preset_42 = seq.firreg %next16 clock %clock preset 42 : i16
+  %preset_512 = seq.firreg %next512 clock %clock preset 429496729642949672964294967296 : i512
+  %preset_struct = seq.firreg %next_struct clock %clock preset 123 : !hw.struct<a: i16, b: i8>
+  %preset_arr = seq.firreg %next_arr clock %clock preset 222 : !hw.array<5xi4>
 
-  // CHECK: %c42_i16 = hw.constant 42 : i16
-  // CHECK: %c0_i32 = hw.constant 0 : i32
-  // CHECK: sv.ordered {
-  // CHECK:   sv.initial {
-  // CHECK:     sv.bpassign %preset_0, %c0_i32 : i32
-  // CHECK:     sv.bpassign %preset_42, %c42_i16 : i16
-  // CHECK:   }
-  // CHECK: }
+  // CHECK:      sv.ordered {
+  // CHECK:        sv.initial {
+  // CHECK-NEXT:     sv.bpassign %reg3, %c-1_i2 : i2
+  // CHECK-NEXT:     sv.bpassign %reg2, %c-2_i2 : i2
+  // CHECK-NEXT:     sv.bpassign %preset_0, %c0_i32 : i32
+  // CHECK-NEXT:     sv.bpassign %preset_42, %c42_i16 : i16
+  // CHECK-NEXT:     sv.bpassign %preset_512, %c429496729642949672964294967296_i512 : i512
+  // CHECK-NEXT:     [[STRUCT_CAST:%.+]] = hw.bitcast %c123_i24 : (i24) -> !hw.struct<a: i16, b: i8>
+  // CHECK-NEXT:     sv.bpassign %preset_struct, [[STRUCT_CAST]] : !hw.struct<a: i16, b: i8>
+  // CHECK-NEXT:     [[ARR_CAST:%.+]] = hw.bitcast %c222_i20 : (i20) -> !hw.array<5xi4>
+  // CHECK-NEXT:     sv.bpassign %preset_arr, [[ARR_CAST]] : !hw.array<5xi4>
+  // CHECK-NEXT:   }
+  // CHECK:      }
 }
 
 // CHECK-LABEL: @reg_of_clock_type

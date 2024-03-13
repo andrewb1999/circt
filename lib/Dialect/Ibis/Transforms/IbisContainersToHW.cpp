@@ -39,7 +39,7 @@ struct ContainerPortInfo {
   llvm::DenseMap<StringAttr, OutputPortOp> opOutputs;
 
   ContainerPortInfo() = default;
-  ContainerPortInfo(ContainerOp container) {
+  ContainerPortInfo(ContainerOpInterface container) {
     SmallVector<hw::PortInfo, 4> inputs, outputs;
 
     // Copies all attributes from a port, except for the port symbol and type.
@@ -85,13 +85,14 @@ struct ContainerPortInfo {
 
 using ContainerPortInfoMap = llvm::DenseMap<StringAttr, ContainerPortInfo>;
 
+template <typename ContainerOp>
 struct ContainerOpConversionPattern : public OpConversionPattern<ContainerOp> {
   ContainerOpConversionPattern(MLIRContext *ctx,
                                ContainerPortInfoMap &portOrder)
       : OpConversionPattern<ContainerOp>(ctx), portOrder(portOrder) {}
 
   LogicalResult
-  matchAndRewrite(ContainerOp op, OpAdaptor adaptor,
+  matchAndRewrite(ContainerOp op, typename ContainerOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.setInsertionPoint(op);
 
@@ -272,7 +273,12 @@ struct ContainerInstanceOpConversionPattern
       auto outputReadIt = outputReadsToReplace.find(output.name);
       if (outputReadIt == outputReadsToReplace.end())
         continue;
-      rewriter.replaceAllUsesWith(outputReadIt->second.getResult(), value);
+      // TODO: RewriterBase::replaceAllUsesWith is not currently supported by
+      // DialectConversion. Using it may lead to assertions about mutating
+      // replaced/erased ops. For now, do this RAUW directly, until
+      // ConversionPatternRewriter properly supports RAUW.
+      // See https://github.com/llvm/circt/issues/6795.
+      outputReadIt->second.getResult().replaceAllUsesWith(value);
       rewriter.eraseOp(outputReadIt->second);
     }
 
@@ -298,12 +304,13 @@ void ContainersToHWPass::runOnOperation() {
 
   // Generate module signatures.
   ContainerPortInfoMap portOrder;
-  for (auto container : getOperation().getOps<ContainerOp>())
+  for (auto container : getOperation().getOps<ContainerOpInterface>())
     portOrder.try_emplace(container.getSymNameAttr(),
                           ContainerPortInfo(container));
 
   ConversionTarget target(*ctx);
-  target.addIllegalOp<ContainerOp, ContainerInstanceOp, ThisOp>();
+  target.addIllegalOp<OuterContainerOp, InnerContainerOp, ContainerInstanceOp,
+                      ThisOp>();
   target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
 
   // Parts of the conversion patterns will update operations in place, which in
@@ -313,9 +320,9 @@ void ContainersToHWPass::runOnOperation() {
   target.addLegalDialect<IbisDialect>();
 
   RewritePatternSet patterns(ctx);
-  patterns
-      .add<ContainerOpConversionPattern, ContainerInstanceOpConversionPattern>(
-          ctx, portOrder);
+  patterns.add<ContainerOpConversionPattern<OuterContainerOp>,
+               ContainerOpConversionPattern<InnerContainerOp>,
+               ContainerInstanceOpConversionPattern>(ctx, portOrder);
   patterns.add<ThisOpConversionPattern>(ctx);
 
   if (failed(

@@ -29,9 +29,17 @@ else ()
 endif ()
 
 add_circt_translation_library(CIRCTImportVerilog
+  Expressions.cpp
   ImportVerilog.cpp
+  Statements.cpp
+  Structure.cpp
+  Types.cpp
+
+  DEPENDS
+  slang_slang
 
   LINK_LIBS PUBLIC
+  CIRCTMoore
   MLIRTranslateLib
   PRIVATE
   slang_slang

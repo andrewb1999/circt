@@ -3,6 +3,7 @@ set(LLVM_OPTIONAL_SOURCES
   CHIRRTL.cpp
   Comb.cpp
   Debug.cpp
+  Emit.cpp
   ESI.cpp
   FIRRTL.cpp
   FSM.cpp
@@ -50,6 +51,7 @@ add_mlir_public_c_api_library(CIRCTCAPIFIRRTL
   LINK_LIBS PUBLIC
   MLIRCAPIIR
   CIRCTFIRRTL
+  CIRCTImportFIRFile
 )
 
 add_mlir_public_c_api_library(CIRCTCAPICHIRRTL
@@ -128,7 +130,7 @@ add_mlir_public_c_api_library(CIRCTCAPIFSM
   FSM.cpp
 
   DEPENDS
-  CIRCTConversionPassIncGen
+  CIRCTTransformsPassIncGen
 
   LINK_LIBS PUBLIC
   MLIRCAPIIR
@@ -172,4 +174,12 @@ add_mlir_public_c_api_library(CIRCTCAPILTL
   LINK_LIBS PUBLIC
   MLIRCAPIIR
   CIRCTLTL
+)
+
+add_mlir_public_c_api_library(CIRCTCAPIEmit
+  Emit.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRCAPIIR
+  CIRCTEmit
 )

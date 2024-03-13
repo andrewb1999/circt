@@ -23,9 +23,10 @@ import subprocess
 import sys
 import textwrap
 import time
-from typing import List
+from typing import Dict, List
 
-CosimCollateralDir = Path(os.path.dirname(os.path.realpath(__file__)))
+_thisdir = Path(__file__).parent
+CosimCollateralDir = _thisdir.parent / "cosim"
 
 
 def is_port_open(port) -> bool:
@@ -63,7 +64,7 @@ class SourceFiles:
     """Return a list of all the DPI shared object files."""
 
     def find_so(name: str) -> Path:
-      for path in os.environ["LD_LIBRARY_PATH"].split(":"):
+      for path in Simulator.get_env().get("LD_LIBRARY_PATH", "").split(":"):
         if os.name == "nt":
           so = Path(path) / f"{name}.dll"
         else:
@@ -92,12 +93,26 @@ class Simulator:
     self.run_dir = run_dir
     self.debug = debug
 
+  @staticmethod
+  def get_env() -> Dict[str, str]:
+    """Get the environment variables to locate shared objects."""
+
+    env = os.environ.copy()
+    env["LIBRARY_PATH"] = env.get("LIBRARY_PATH", "") + ":" + str(
+        _thisdir.parent / "lib")
+    env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH", "") + ":" + str(
+        _thisdir.parent / "lib")
+    return env
+
   def compile_command(self) -> List[str]:
     """Compile the sources. Returns the exit code of the simulation compiler."""
     assert False, "Must be implemented by subclass"
 
   def compile(self) -> int:
-    cp = subprocess.run(self.compile_command(), capture_output=True, text=True)
+    cp = subprocess.run(self.compile_command(),
+                        env=Simulator.get_env(),
+                        capture_output=True,
+                        text=True)
     self.run_dir.mkdir(parents=True, exist_ok=True)
     open(self.run_dir / "compile_stdout.log", "w").write(cp.stdout)
     open(self.run_dir / "compile_stderr.log", "w").write(cp.stderr)
@@ -133,7 +148,7 @@ class Simulator:
         os.remove(portFileName)
 
       # Run the simulation.
-      simEnv = os.environ.copy()
+      simEnv = Simulator.get_env()
       if self.debug:
         simEnv["COSIM_DEBUG_FILE"] = "cosim_debug.log"
       simProc = subprocess.Popen(self.run_command(),
@@ -173,7 +188,7 @@ class Simulator:
         time.sleep(0.05)
 
       # Run the inner command, passing the connection info via environment vars.
-      testEnv = os.environ.copy()
+      testEnv = Simulator.get_env()
       testEnv["ESI_COSIM_PORT"] = str(port)
       testEnv["ESI_COSIM_HOST"] = "localhost"
       return subprocess.run(inner_command, cwd=os.getcwd(),
@@ -215,7 +230,9 @@ class Verilator(Simulator):
         "--assert",
         str(Verilator.DefaultDriver),
     ]
-    cflags = []
+    cflags = [
+        "-DTOP_MODULE=" + self.sources.top,
+    ]
     if self.debug:
       cmd += ["--trace", "--trace-params", "--trace-structs"]
       cflags.append("-DTRACE")
