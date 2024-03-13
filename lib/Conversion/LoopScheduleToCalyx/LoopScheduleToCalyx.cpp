@@ -564,7 +564,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   auto memoryInterface =
       getState<ComponentLoweringState>().getMemoryInterface(memref);
 
-  getState<ComponentLoweringState>().interfaceReadOrContentEnSet(memoryInterface);
+  getState<ComponentLoweringState>().interfaceReadOrContentEnSet(
+      memoryInterface);
 
   // TODO: Check only one access to this memory per cycle
   // Single load from memory; we do not need to write the
@@ -583,8 +584,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     rewriter.create<calyx::AssignOp>(loadOp.getLoc(), memoryInterface.readEn(),
                                      one);
   } else if (memoryInterface.contentEnOpt().has_value()) {
-    rewriter.create<calyx::AssignOp>(loadOp.getLoc(), memoryInterface.contentEn(),
-                                     one);
+    rewriter.create<calyx::AssignOp>(loadOp.getLoc(),
+                                     memoryInterface.contentEn(), one);
   }
 
   // We refrain from replacing the loadOp result with
@@ -628,8 +629,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   if (memoryInterface.contentEnOpt().has_value()) {
     // If memory has content enable, it must be asserted when writing
     rewriter.create<calyx::AssignOp>(
-        storeOp.getLoc(), memoryInterface.contentEn(),
-        constant.getResult());
+        storeOp.getLoc(), memoryInterface.contentEn(), constant.getResult());
   }
 
   // getState<ComponentLoweringState>().registerSinkOperations(storeOp,
@@ -646,7 +646,8 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
   auto memoryInterface =
       getState<ComponentLoweringState>().getMemoryInterface(memref);
 
-  getState<ComponentLoweringState>().interfaceReadOrContentEnSet(memoryInterface);
+  getState<ComponentLoweringState>().interfaceReadOrContentEnSet(
+      memoryInterface);
 
   auto group = createStaticGroupForOp(rewriter, loadOp, 1);
   rewriter.setInsertionPointToEnd(group.getBodyBlock());
