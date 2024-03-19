@@ -923,6 +923,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                         ? llvm::Log2_64_Ceil(*tripCount * pipeline.getII() +
                                              pipeline.getBodyLatency() - 1)
                         : 32;
+    if (bitwidth < 1)
+      bitwidth = 1;
     auto incrReg =
         createRegister(op.getLoc(), rewriter, getComponent(), bitwidth,
                        getState<ComponentLoweringState>().getUniqueName("idx"));
