@@ -16,7 +16,7 @@
 include "mlir/Pass/PassBase.td"
 
 //===----------------------------------------------------------------------===//
-// AffineToPipeline
+// AffineToLoopSchedule and FuncToLoopSchedule
 //===----------------------------------------------------------------------===//
 
 def AffineToLoopSchedule : Pass<"convert-affine-to-loopschedule", "mlir::func::FuncOp"> {
@@ -38,7 +38,29 @@ def AffineToLoopSchedule : Pass<"convert-affine-to-loopschedule", "mlir::func::F
   let options = [
     Option<"disableBitwidthMinimization", "disable-bitwidth-minimization", "bool",
             "false", "Bool to determine if bitwidth minimization should be disabled">
-   ];
+  ];
+}
+
+def FuncToLoopSchedule : Pass<"convert-func-to-loopschedule", "mlir::func::FuncOp"> {
+  let summary = "Convert entire functions to LoopSchedule scheduled programs";
+  let description = [{
+    This pass analyzes control flow, creates a Scheduling
+    problem using the Calyx operator library, solves the problem, and lowers
+    the function to a LoopSchedule.
+  }];
+  let constructor = "circt::createFuncToLoopSchedule()";
+  let dependentDialects = [
+    "circt::loopschedule::LoopScheduleDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::cf::ControlFlowDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::func::FuncDialect"
+  ];
+  let options = [
+    Option<"disableBitwidthMinimization", "disable-bitwidth-minimization", "bool",
+            "false", "Bool to determine if bitwidth minimization should be disabled">
+  ];
 }
 
 //===----------------------------------------------------------------------===//

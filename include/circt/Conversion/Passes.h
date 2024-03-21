@@ -26,6 +26,7 @@
 #include "circt/Conversion/ExportVerilog.h"
 #include "circt/Conversion/FIRRTLToHW.h"
 #include "circt/Conversion/FSMToSV.h"
+#include "circt/Conversion/FuncToLoopSchedule.h"
 #include "circt/Conversion/HWArithToHW.h"
 #include "circt/Conversion/HWToBTOR2.h"
 #include "circt/Conversion/HWToLLHD.h"

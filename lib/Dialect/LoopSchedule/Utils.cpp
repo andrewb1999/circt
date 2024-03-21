@@ -10,6 +10,7 @@
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
+#include "circt/Scheduling/Algorithms.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -33,8 +34,11 @@
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/MathExtras.h"
+
+#define DEBUG_TYPE "to-loopschedule"
 
 using namespace mlir;
 using namespace mlir::affine;
@@ -790,6 +794,285 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
   return problem;
 }
 
+/// Populate the schedling problem operator types for the dialect we are
+/// targetting. Right now, we assume Calyx, which has a standard library with
+/// well-defined operator latencies. Ultimately, we should move this to a
+/// dialect interface in the Scheduling dialect.
+LogicalResult
+populateOperatorTypes(Operation *op, Region &loopBody,
+                      SharedOperatorsProblem &problem) {
+  // Scheduling analyis only considers the innermost loop nest for now.
+
+  // Load the Calyx operator library into the problem. This is a very minimal
+  // set of arithmetic and memory operators for now. This should ultimately be
+  // pulled out into some sort of dialect interface.
+  Problem::OperatorType combOpr = problem.getOrInsertOperatorType("comb");
+  problem.setLatency(combOpr, 0);
+  Problem::OperatorType seqOpr = problem.getOrInsertOperatorType("seq");
+  problem.setLatency(seqOpr, 1);
+  Problem::OperatorType loopOpr = problem.getOrInsertOperatorType("loop");
+  problem.setLatency(loopOpr, 1);
+  Problem::OperatorType mcOpr = problem.getOrInsertOperatorType("multicycle");
+  problem.setLatency(mcOpr, 4);
+
+  Operation *unsupported;
+  WalkResult result = loopBody.walk([&](Operation *op) {
+    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr) {
+      return WalkResult::advance();
+    }
+
+    return TypeSwitch<Operation *, WalkResult>(op)
+        .Case<scf::IfOp, AffineYieldOp, arith::ConstantOp, arith::ExtSIOp,
+              arith::ExtUIOp, arith::TruncIOp, CmpIOp, IndexCastOp,
+              memref::AllocaOp, memref::AllocOp, loopschedule::AllocInterface,
+              scf::YieldOp, func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, CmpIOp,
+              ShLIOp, AndIOp, ShRSIOp, ShRUIOp>([&](Operation *combOp) {
+          // Some known combinational ops.
+          problem.setLinkedOperatorType(combOp, combOpr);
+          return WalkResult::advance();
+        })
+        .Case<LoopInterface>([&](Operation *loopOp) {
+          // llvm::errs() << "loopOp\n";
+          // loopOp->dump();
+          // llvm::errs() << "loopOp after\n";
+          problem.setLinkedOperatorType(loopOp, loopOpr);
+          auto loop = cast<LoopInterface>(loopOp);
+          loop.getBodyBlock()->walk([&](Operation *op) {
+            if (isa<AffineLoadOp, AffineStoreOp, LoopScheduleLoadOp,
+                    LoopScheduleStoreOp>(op)) {
+              Value memRef = getMemref(op);
+              Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
+                  "mem_" + std::to_string(hash_value(memRef)));
+              problem.setLatency(memOpr, 1);
+              // External memories are 1 RW port
+              problem.setLimit(memOpr, 1);
+              problem.addExtraLimitingType(loopOp, memOpr);
+            } else if (isa<LoadInterface>(op)) {
+              auto loadOp = cast<loopschedule::LoadInterface>(*op);
+              auto latency = loadOp.getLatency();
+              auto limitOpt = loadOp.getLimit();
+              Problem::OperatorType portOpr =
+                  problem.getOrInsertOperatorType(loadOp.getUniqueId());
+              problem.setLatency(portOpr, latency);
+              if (limitOpt.has_value())
+                problem.setLimit(portOpr, limitOpt.value());
+              problem.addExtraLimitingType(loopOp, portOpr);
+            } else if (isa<StoreInterface>(op)) {
+              auto storeOp = cast<loopschedule::StoreInterface>(*op);
+              auto latency = storeOp.getLatency();
+              auto limitOpt = storeOp.getLimit();
+              Problem::OperatorType portOpr =
+                  problem.getOrInsertOperatorType(storeOp.getUniqueId());
+              problem.setLatency(portOpr, latency);
+              if (limitOpt.has_value())
+                problem.setLimit(portOpr, limitOpt.value());
+              problem.addExtraLimitingType(loopOp, portOpr);
+            }
+          });
+          return WalkResult::advance();
+        })
+        .Case<LoopScheduleStoreOp, AffineStoreOp>([&](Operation *memOp) {
+          // Some known sequential ops. In certain cases, reads may be
+          // combinational in Calyx, but taking advantage of that is left as
+          // a future enhancement.
+          Value memRef = isa<AffineStoreOp>(*memOp)
+                             ? cast<AffineStoreOp>(*memOp).getMemRef()
+                             : cast<LoopScheduleStoreOp>(*memOp).getMemRef();
+          Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
+              "mem_" + std::to_string(hash_value(memRef)));
+          problem.setLatency(memOpr, 1);
+          problem.setLimit(memOpr, 1);
+          problem.setLinkedOperatorType(memOp, memOpr);
+          return WalkResult::advance();
+        })
+        .Case<LoopScheduleLoadOp, AffineLoadOp>([&](Operation *memOp) {
+          // Some known sequential ops. In certain cases, reads may be
+          // combinational in Calyx, but taking advantage of that is left as
+          // a future enhancement.
+          Value memRef = isa<AffineLoadOp>(*memOp)
+                             ? cast<AffineLoadOp>(*memOp).getMemRef()
+                             : cast<LoopScheduleLoadOp>(*memOp).getMemRef();
+          Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
+              "mem_" + std::to_string(hash_value(memRef)));
+          problem.setLatency(memOpr, 1);
+          problem.setLimit(memOpr, 1);
+          problem.setLinkedOperatorType(memOp, memOpr);
+          return WalkResult::advance();
+        })
+        .Case<loopschedule::LoadInterface>([&](Operation *op) {
+          auto loadOp = cast<loopschedule::LoadInterface>(*op);
+          auto latency = loadOp.getLatency();
+          auto limitOpt = loadOp.getLimit();
+          Problem::OperatorType portOpr =
+              problem.getOrInsertOperatorType(loadOp.getUniqueId());
+          problem.setLatency(portOpr, latency);
+          if (limitOpt.has_value())
+            problem.setLimit(portOpr, limitOpt.value());
+          problem.setLinkedOperatorType(op, portOpr);
+
+          return WalkResult::advance();
+        })
+        .Case<loopschedule::StoreInterface>([&](Operation *op) {
+          auto storeOp = cast<loopschedule::StoreInterface>(*op);
+          auto latency = storeOp.getLatency();
+          auto limitOpt = storeOp.getLimit();
+          Problem::OperatorType portOpr =
+              problem.getOrInsertOperatorType(storeOp.getUniqueId());
+          problem.setLatency(portOpr, latency);
+          if (limitOpt.has_value())
+            problem.setLimit(portOpr, limitOpt.value());
+          problem.setLinkedOperatorType(op, portOpr);
+
+          return WalkResult::advance();
+        })
+        .Case<loopschedule::SchedulableInterface>([&](Operation *op) {
+          auto schedOp = cast<SchedulableInterface>(op);
+          auto latency = schedOp.getOpLatency();
+          auto limitOpt = schedOp.getOpLimit();
+          Problem::OperatorType opr =
+              problem.getOrInsertOperatorType(schedOp.getUniqueId());
+          problem.setLatency(opr, latency);
+          if (limitOpt.has_value())
+            problem.setLimit(opr, limitOpt.value());
+          problem.setLinkedOperatorType(op, opr);
+
+          return WalkResult::advance();
+        })
+        .Case<MulIOp, RemUIOp, RemSIOp, DivSIOp>([&](Operation *mcOp) {
+          // Some known multi-cycle ops.
+          problem.setLinkedOperatorType(mcOp, mcOpr);
+          return WalkResult::advance();
+        })
+        .Default([&](Operation *badOp) {
+          unsupported = op;
+          return WalkResult::interrupt();
+        });
+  });
+
+  if (result.wasInterrupted())
+    return op->emitError("unsupported operation ") << *unsupported;
+
+  return success();
+}
+
+/// Solve the pre-computed scheduling problem.
+LogicalResult solveModuloProblem(AffineForOp &loop,
+                                 ModuloProblem &problem) {
+  // Scheduling analyis only considers the innermost loop nest for now.
+  auto forOp = loop;
+
+  LLVM_DEBUG(forOp.dump());
+
+  // Optionally debug problem inputs.
+  LLVM_DEBUG(for (auto *op
+                  : problem.getOperations()) {
+    if (auto parent = op->getParentOfType<LoopInterface>(); parent)
+      continue;
+    llvm::dbgs() << "Modulo scheduling inputs for " << *op;
+    auto opr = problem.getLinkedOperatorType(op);
+    llvm::dbgs() << "\n  opr = " << opr;
+    llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
+    llvm::dbgs() << "\n  limit = " << problem.getLimit(*opr);
+    for (auto dep : problem.getDependences(op))
+      if (dep.isAuxiliary())
+        llvm::dbgs() << "\n  dep = { distance = " << problem.getDistance(dep)
+                     << ", source = " << *dep.getSource() << " }";
+    llvm::dbgs() << "\n\n";
+  });
+
+  // Verify and solve the problem.
+  if (failed(problem.check()))
+    return failure();
+
+  auto *anchor = forOp.getBody()->getTerminator();
+  if (failed(scheduleSimplex(problem, anchor)))
+    return failure();
+
+  // Verify the solution.
+  if (failed(problem.verify()))
+    return failure();
+
+  // Optionally debug problem outputs.
+  LLVM_DEBUG({
+    llvm::dbgs() << "Scheduled initiation interval = "
+                 << problem.getInitiationInterval() << "\n\n";
+    forOp.getBody()->walk<WalkOrder::PreOrder>([&](Operation *op) {
+      if (auto parent = op->getParentOfType<LoopInterface>(); parent)
+        return;
+      llvm::dbgs() << "Scheduling outputs for " << *op;
+      llvm::dbgs() << "\n  start = " << problem.getStartTime(op);
+      llvm::dbgs() << "\n\n";
+    });
+  });
+
+  return success();
+}
+
+/// Solve the pre-computed scheduling problem.
+LogicalResult solveSharedOperatorsProblem(
+    Region &region, SharedOperatorsProblem &problem) {
+
+  LLVM_DEBUG(region.getParentOp()->dump());
+
+  // Optionally debug problem inputs.
+  LLVM_DEBUG(region.walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (auto parent = op->getParentOfType<LoopInterface>(); parent)
+      return;
+    llvm::dbgs() << "Shared Operator scheduling inputs for " << *op;
+    auto opr = problem.getLinkedOperatorType(op);
+    llvm::dbgs() << "\n  opr = " << opr;
+    llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
+    llvm::dbgs() << "\n  limit = " << problem.getLimit(*opr);
+    for (auto dep : problem.getDependences(op))
+      if (dep.isAuxiliary())
+        llvm::dbgs() << "\n  dep = { "
+                     << "source = " << *dep.getSource() << " }";
+    llvm::dbgs() << "\n\n";
+  }));
+
+  // Verify and solve the problem.
+  if (failed(problem.check()))
+    return failure();
+
+  auto *anchor = region.back().getTerminator();
+  if (failed(scheduleSimplex(problem, anchor)))
+    return failure();
+
+  // Verify the solution.
+  if (failed(problem.verify()))
+    return failure();
+
+  // Optionally debug problem outputs.
+  LLVM_DEBUG({
+    region.walk<WalkOrder::PreOrder>([&](Operation *op) {
+      if (auto parent = op->getParentOfType<LoopInterface>(); parent)
+        return;
+      llvm::dbgs() << "Scheduling outputs for " << *op;
+      llvm::dbgs() << "\n  start = " << problem.getStartTime(op);
+      llvm::dbgs() << "\n\n";
+    });
+  });
+
+  return success();
+}
+
+DenseMap<int64_t, SmallVector<Operation *>>
+getOperationCycleMap(Problem &problem) {
+  DenseMap<int64_t, SmallVector<Operation *>> map;
+
+  for (auto *op : problem.getOperations()) {
+    auto cycleOpt = problem.getStartTime(op);
+    assert(cycleOpt.has_value());
+    auto cycle = cycleOpt.value();
+    auto vec = map.lookup(cycle);
+    vec.push_back(op);
+    map.insert(std::pair(cycle, vec));
+  }
+
+  return map;
+}
+
 LogicalResult unrollSubLoops(AffineForOp &forOp) {
   auto result = forOp.getBody()->walk<WalkOrder::PostOrder>([](AffineForOp op) {
     if (loopUnrollFull(op).failed())
@@ -889,12 +1172,17 @@ struct AffineForIterationReduction : OpRewritePattern<AffineForOp> {
   }
 };
 
+bool insideScheduledLoop(Operation *op) {
+  return op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
+         op->getParentOfType<LoopScheduleSequentialOp>() != nullptr;
+}
+
 struct TruncCleanupPattern : OpRewritePattern<TruncIOp> {
   using OpRewritePattern<TruncIOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(TruncIOp op,
                                 PatternRewriter &rewriter) const override {
-    if (isa<BlockArgument>(op.getIn()))
+    if (insideScheduledLoop(op) || isa<BlockArgument>(op.getIn()))
       return failure();
     auto *definingOp = op.getIn().getDefiningOp();
     auto outputType = op.getOut().getType();
@@ -918,6 +1206,8 @@ struct LoadCleanupPattern : OpRewritePattern<LoopScheduleLoadOp> {
 
   LogicalResult matchAndRewrite(LoopScheduleLoadOp op,
                                 PatternRewriter &rewriter) const override {
+    if (insideScheduledLoop(op))
+      return failure();
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto &idx : llvm::make_early_inc_range(indices)) {
@@ -951,6 +1241,8 @@ struct StoreCleanupPattern : OpRewritePattern<LoopScheduleStoreOp> {
 
   LogicalResult matchAndRewrite(LoopScheduleStoreOp op,
                                 PatternRewriter &rewriter) const override {
+    if (insideScheduledLoop(op))
+      return failure();
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto &idx : llvm::make_early_inc_range(indices)) {
@@ -984,6 +1276,8 @@ struct LoadAddressNarrowingPattern : OpRewritePattern<LoopScheduleLoadOp> {
 
   LogicalResult matchAndRewrite(LoopScheduleLoadOp op,
                                 PatternRewriter &rewriter) const override {
+    if (insideScheduledLoop(op))
+      return failure();
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto v : llvm::enumerate(indices)) {
@@ -1015,6 +1309,8 @@ struct LoadInterfaceCleanupPattern : OpInterfaceRewritePattern<LoadInterface> {
 
   LogicalResult matchAndRewrite(LoadInterface op,
                                 PatternRewriter &rewriter) const override {
+    if (insideScheduledLoop(op))
+      return failure();
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto &idx : llvm::make_early_inc_range(indices)) {
@@ -1049,6 +1345,8 @@ struct StoreInterfaceCleanupPattern
 
   LogicalResult matchAndRewrite(StoreInterface op,
                                 PatternRewriter &rewriter) const override {
+    if (insideScheduledLoop(op))
+      return failure();
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto &idx : llvm::make_early_inc_range(indices)) {
@@ -1083,6 +1381,8 @@ struct LoadInterfaceAddressNarrowingPattern
 
   LogicalResult matchAndRewrite(LoadInterface op,
                                 PatternRewriter &rewriter) const override {
+    if (insideScheduledLoop(op))
+      return failure();
     auto indices = op.getIndicesMutable();
     bool updated = false;
     for (auto v : llvm::enumerate(indices)) {
@@ -1136,6 +1436,8 @@ public:
   LogicalResult
   matchAndRewrite(Operation *op, ArrayRef<Value> operands,
                   ConversionPatternRewriter &rewriter) const override {
+    if (insideScheduledLoop(op))
+      return failure();
     Location loc = op->getLoc();
     const TypeConverter *converter = getTypeConverter();
     if (converter->isLegal(op))
@@ -1169,6 +1471,8 @@ public:
   LogicalResult
   matchAndRewrite(ConstantOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (insideScheduledLoop(op))
+      return failure();
     auto val = op.getValue();
     if (!isa<IndexType>(val.getType()))
       return failure();
@@ -1194,6 +1498,8 @@ public:
   LogicalResult
   matchAndRewrite(IndexCastOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (insideScheduledLoop(op))
+      return failure();
     rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(
         op, op.getOut().getType(), op.getIn());
 
@@ -1209,8 +1515,19 @@ bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
   RewritePatternSet patterns(&context);
   patterns.add<AffineForIterationReduction>(&context);
 
+  op->getParentOfType<ModuleOp>().dump();
+
+  SmallVector<Operation *> opsToSimplify;
+  if (isa<AffineForOp>(op))
+    opsToSimplify.push_back(op);
+  op->walk([&](Operation *op) {
+    if (isa<AffineForOp>(op)) {
+      opsToSimplify.push_back(op);
+    }
+  });
+
   GreedyRewriteConfig config;
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
+  if (failed(applyOpPatternsAndFold(opsToSimplify, std::move(patterns), config))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");
     return failure();
   }
@@ -1220,14 +1537,16 @@ bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
   populateIndexRemovalTypeConverter(typeConverter);
   ConversionTarget target(context);
   target.addDynamicallyLegalDialect<ArithDialect>(
-      [&typeConverter](Operation *op) { return typeConverter.isLegal(op); });
+      [&typeConverter](Operation *op) { return insideScheduledLoop(op) || 
+                                               typeConverter.isLegal(op); });
   target.addDynamicallyLegalDialect<LoopScheduleDialect>(
-      [&typeConverter](Operation *op) { return typeConverter.isLegal(op); });
+      [&typeConverter](Operation *op) { return insideScheduledLoop(op) ||
+                                               typeConverter.isLegal(op); });
   target.markUnknownOpDynamicallyLegal(
       [&typeConverter](Operation *op) -> std::optional<bool> {
         if (!isa<LoadInterface>(op) && !isa<StoreInterface>(op))
           return std::nullopt;
-        return typeConverter.isLegal(op);
+        return insideScheduledLoop(op) || typeConverter.isLegal(op);
       });
   target.addIllegalOp<arith::IndexCastOp>();
   patterns.clear();
@@ -1239,13 +1558,22 @@ bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
   if (failed(applyPartialConversion(op, target, std::move(patterns))))
     return failure();
 
+  op->getParentOfType<ModuleOp>().dump();
+
   // Cleanup extraneous casts after int narrowing
   patterns.clear();
   patterns.add<TruncCleanupPattern>(&context);
   patterns.add<LoadCleanupPattern>(&context);
   patterns.add<StoreCleanupPattern>(&context);
 
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
+  opsToSimplify.clear();
+  op->walk([&](Operation *op) {
+    if (isa<TruncIOp, LoopScheduleLoadOp, LoopScheduleStoreOp>(op)) {
+      opsToSimplify.push_back(op);
+    }
+  });
+
+  if (failed(applyOpPatternsAndFold(opsToSimplify, std::move(patterns), config))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");
     return failure();
   }
@@ -1258,7 +1586,15 @@ bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
   }
   populateArithIntNarrowingPatterns(
       patterns, ArithIntNarrowingOptions{bitwidthsSupported});
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
+
+  opsToSimplify.clear();
+  op->walk([&](Operation *op) {
+    if (isa<ArithDialect>(op->getDialect())) {
+      opsToSimplify.push_back(op);
+    }
+  });
+
+  if (failed(applyOpPatternsAndFold(opsToSimplify, std::move(patterns), config))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");
     return failure();
   }
@@ -1273,7 +1609,15 @@ bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
   patterns.add<StoreInterfaceCleanupPattern>(&context);
   patterns.add<LoadInterfaceAddressNarrowingPattern>(&context);
 
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
+  opsToSimplify.clear();
+  op->walk([&](Operation *op) {
+    if (isa<TruncIOp, LoopScheduleLoadOp, LoopScheduleStoreOp, 
+            LoadInterface, StoreInterface>(op)) {
+      opsToSimplify.push_back(op);
+    }
+  });
+
+  if (failed(applyOpPatternsAndFold(opsToSimplify, std::move(patterns), config))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");
     return failure();
   }

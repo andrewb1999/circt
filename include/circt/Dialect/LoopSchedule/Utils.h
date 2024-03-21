@@ -27,7 +27,7 @@ namespace loopschedule {
 // analysis.
 mlir::LogicalResult
 lowerAffineStructures(mlir::MLIRContext &context, mlir::Operation *op,
-                      analysis::MemoryDependenceAnalysis &memoryDependence);
+                      analysis::MemoryDependenceAnalysis &dependenceAnalysis);
 
 mlir::LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
                                               mlir::Operation *op);
@@ -45,6 +45,16 @@ scheduling::SharedOperatorsProblem getSharedOperatorsProblem(
 scheduling::SharedOperatorsProblem getSharedOperatorsProblem(
     mlir::func::FuncOp funcOp,
     analysis::MemoryDependenceAnalysis &dependenceAnalysis);
+
+LogicalResult populateOperatorTypes(Operation *op, Region &loopBody,
+                                    scheduling::SharedOperatorsProblem &problem);
+
+LogicalResult solveModuloProblem(mlir::affine::AffineForOp &loop, scheduling::ModuloProblem &problem);
+
+LogicalResult solveSharedOperatorsProblem(Region &region,
+                                          scheduling::SharedOperatorsProblem &problem);
+
+DenseMap<int64_t, SmallVector<Operation *>> getOperationCycleMap(scheduling::Problem &problem);
 
 LogicalResult unrollSubLoops(mlir::affine::AffineForOp &forOp);
 
