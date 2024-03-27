@@ -262,6 +262,14 @@ void SCFToLoopSchedule::runOnOperation() {
     depOp->erase();
     funcOp->removeAttr("loopschedule.dependencies");
   }
+
+  // Remove access names for now
+  // TODO: Probably should make this an independent pass for debugging reasons
+  funcOp->walk([](Operation *op) {
+    if (op->hasAttrOfType<StringAttr>("loopschedule.access_name")) {
+      op->removeAttr("loopschedule.access_name");
+    }
+  });
 }
 
 /// Populate the schedling problem operator types for the dialect we are
@@ -1176,7 +1184,7 @@ LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
 
     if (i.index() == startTimes.size() - 1) {
       // Add index increment to first step
-      stepTypes.push_back(builder.getIndexType());
+      stepTypes.push_back(lowerBound.getType());
     }
 
     // Create the step itself.

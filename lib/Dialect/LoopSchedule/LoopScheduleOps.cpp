@@ -563,6 +563,17 @@ LogicalResult LoopScheduleStepOp::verify() {
     }
   }
 
+  // Verify that result types match register types
+  auto regOp = step.getRegisterOp();
+  auto regOpTypes = regOp.getOperandTypes();
+  auto stepResTypes = step.getResultTypes();
+
+  for (auto p : llvm::zip(regOpTypes, stepResTypes)) {
+    if (std::get<0>(p) != std::get<1>(p)) {
+      return emitOpError("step op results do not match register op types");
+    }
+  }
+
   return success();
 }
 
