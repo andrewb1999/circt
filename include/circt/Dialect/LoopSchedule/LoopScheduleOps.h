@@ -20,6 +20,7 @@
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/Operation.h"
 
+#include "circt/Dialect/LoopSchedule/LoopScheduleAttributes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
 
 namespace circt {

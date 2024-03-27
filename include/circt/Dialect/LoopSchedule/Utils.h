@@ -13,8 +13,9 @@
 #ifndef MLIR_DIALECT_LOOPSCHEDULE_UTILS_H
 #define MLIR_DIALECT_LOOPSCHEDULE_UTILS_H
 
-#include "circt/Analysis/DependenceAnalysis.h"
+#include "circt/Analysis/LoopScheduleDependenceAnalysis.h"
 #include "circt/Scheduling/Problems.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include <optional>
@@ -25,9 +26,8 @@ namespace loopschedule {
 
 // Lowers affine structures for LoopSchedule while retaining memory dependence
 // analysis.
-mlir::LogicalResult
-lowerAffineStructures(mlir::MLIRContext &context, mlir::Operation *op,
-                      analysis::MemoryDependenceAnalysis &memoryDependence);
+mlir::LogicalResult ifOpHoisting(mlir::MLIRContext &context,
+                                 mlir::Operation *op);
 
 mlir::LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
                                               mlir::Operation *op);
@@ -35,26 +35,26 @@ mlir::LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
 Value getMemref(Operation *op);
 
 scheduling::ModuloProblem
-getModuloProblem(mlir::affine::AffineForOp forOp,
-                 analysis::MemoryDependenceAnalysis &dependenceAnalysis);
+getModuloProblem(mlir::scf::ForOp forOp,
+                 analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
 scheduling::SharedOperatorsProblem getSharedOperatorsProblem(
-    mlir::affine::AffineForOp forOp,
-    analysis::MemoryDependenceAnalysis &dependenceAnalysis);
+    mlir::scf::ForOp forOp,
+    analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
 scheduling::SharedOperatorsProblem getSharedOperatorsProblem(
     mlir::func::FuncOp funcOp,
-    analysis::MemoryDependenceAnalysis &dependenceAnalysis);
+    analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
 LogicalResult unrollSubLoops(mlir::affine::AffineForOp &forOp);
 
-LogicalResult
-replaceMemoryAccesses(mlir::MLIRContext &context, mlir::Operation *op,
-                      analysis::MemoryDependenceAnalysis &dependenceAnalysis);
+LogicalResult replaceMemoryAccesses(
+    mlir::MLIRContext &context, mlir::Operation *op,
+    analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
-LogicalResult
-bitwidthMinimization(mlir::MLIRContext &context, mlir::Operation *op,
-                     analysis::MemoryDependenceAnalysis &dependenceAnalysis);
+LogicalResult bitwidthMinimization(
+    mlir::MLIRContext &context, mlir::Operation *op,
+    analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
 } // namespace loopschedule
 } // namespace circt

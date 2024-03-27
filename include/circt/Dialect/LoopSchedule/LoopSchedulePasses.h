@@ -1,4 +1,4 @@
-//===- Passes.h - HW pass entry points --------------------------*- C++ -*-===//
+//===- LoopSchedulePasses.h - LoopSchedule pass entry points ----*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -21,11 +21,13 @@
 namespace circt {
 namespace loopschedule {
 
-std::unique_ptr<mlir::Pass> createBitwidthMinimization();
+// std::unique_ptr<mlir::Pass> createBitwidthMinimization();
+std::unique_ptr<mlir::Pass> createMarkMemoryAccessesPass();
+std::unique_ptr<mlir::Pass> createConstructMemoryDependenciesPass();
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION
-#include "circt/Dialect/LoopSchedule/Passes.h.inc"
+#include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h.inc"
 
 } // namespace loopschedule
 } // namespace circt

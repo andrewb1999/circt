@@ -16,17 +16,18 @@
 include "mlir/Pass/PassBase.td"
 
 //===----------------------------------------------------------------------===//
-// AffineToPipeline
+// SCFToLoopSchedule
 //===----------------------------------------------------------------------===//
 
-def AffineToLoopSchedule : Pass<"convert-affine-to-loopschedule", "mlir::func::FuncOp"> {
-  let summary = "Convert Affine dialect to LoopSchedule scheduled loops";
+def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::func::FuncOp"> {
+  let summary = "Convert SCF dialect to LoopSchedule scheduled loops";
   let description = [{
-    This pass analyzes Affine loops and control flow, creates a Scheduling
+    This pass analyzes SCF loops and control flow, creates a Scheduling
     problem using the Calyx operator library, solves the problem, and lowers
-    the loops to a LoopSchedule.
+    the loops to a LoopSchedule. Memory dependencies must be maked prior to
+    calling this pass using ConstructMemoryDependencies.
   }];
-  let constructor = "circt::createAffineToLoopSchedule()";
+  let constructor = "circt::createSCFToLoopSchedule()";
   let dependentDialects = [
     "circt::loopschedule::LoopScheduleDialect",
     "mlir::arith::ArithDialect",
@@ -39,6 +40,24 @@ def AffineToLoopSchedule : Pass<"convert-affine-to-loopschedule", "mlir::func::F
     Option<"disableBitwidthMinimization", "disable-bitwidth-minimization", "bool",
             "false", "Bool to determine if bitwidth minimization should be disabled">
    ];
+}
+
+//===----------------------------------------------------------------------===//
+// AffineToSCF
+//===----------------------------------------------------------------------===//
+
+def AffineToSCF : Pass<"convert-affine-to-scf", "mlir::func::FuncOp"> {
+  let summary = "Convert Affine dialect to SCF structured control flow";
+  let description = [{
+  }];
+  let constructor = "circt::createAffineToSCF()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::cf::ControlFlowDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::func::FuncDialect"
+  ];
 }
 
 //===----------------------------------------------------------------------===//

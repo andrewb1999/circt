@@ -24,7 +24,7 @@ namespace circt {
 namespace loopschedule {
 
 #define GEN_PASS_CLASSES
-#include "circt/Dialect/LoopSchedule/Passes.h.inc"
+#include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h.inc"
 
 } // namespace loopschedule
 } // namespace circt

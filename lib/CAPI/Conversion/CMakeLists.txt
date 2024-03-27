@@ -2,7 +2,8 @@ add_mlir_public_c_api_library(CIRCTCAPIConversion
   Passes.cpp
 
   LINK_LIBS PUBLIC
-  CIRCTAffineToLoopSchedule
+  CIRCTAffineToSCF
+  CIRCTSCFToLoopSchedule
   CIRCTArcToLLVM
   CIRCTCalyxToFSM
   CIRCTCalyxToHW

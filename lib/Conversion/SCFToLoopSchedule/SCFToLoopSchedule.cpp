@@ -1,4 +1,4 @@
-//===- AffineToLoopSchedule.cpp -------------------------------------------===//
+//===- SCFToLoopSchedule.cpp ----------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,9 +6,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "circt/Conversion/AffineToLoopSchedule.h"
+#include "circt/Conversion/SCFToLoopSchedule.h"
 #include "../PassDetail.h"
+#include "circt/Analysis/AccessNameAnalysis.h"
 #include "circt/Analysis/DependenceAnalysis.h"
+#include "circt/Analysis/LoopScheduleDependenceAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/LoopSchedule/Utils.h"
@@ -28,6 +30,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/Dominance.h"
@@ -55,7 +58,7 @@
 #include <string>
 #include <utility>
 
-#define DEBUG_TYPE "affine-to-loopschedule"
+#define DEBUG_TYPE "scf-to-loopschedule"
 
 using namespace mlir;
 using namespace mlir::arith;
@@ -70,9 +73,8 @@ using namespace circt::loopschedule;
 
 namespace {
 
-struct AffineToLoopSchedule
-    : public AffineToLoopScheduleBase<AffineToLoopSchedule> {
-  AffineToLoopSchedule(bool disableBitwidthMinimization) {
+struct SCFToLoopSchedule : public SCFToLoopScheduleBase<SCFToLoopSchedule> {
+  SCFToLoopSchedule(bool disableBitwidthMinimization) {
     this->disableBitwidthMinimization = disableBitwidthMinimization;
   }
   void runOnOperation() override;
@@ -80,25 +82,25 @@ struct AffineToLoopSchedule
 private:
   LogicalResult populateOperatorTypes(Operation *op, Region &loopBody,
                                       SharedOperatorsProblem &problem);
-  LogicalResult solveModuloProblem(AffineForOp &loop, ModuloProblem &problem);
+  LogicalResult solveModuloProblem(scf::ForOp &loop, ModuloProblem &problem);
   LogicalResult solveSharedOperatorsProblem(Region &region,
                                             SharedOperatorsProblem &problem);
-  LogicalResult createLoopSchedulePipeline(AffineForOp &loop,
+  LogicalResult createLoopSchedulePipeline(scf::ForOp &loop,
                                            ModuloProblem &problem);
-  LogicalResult createLoopScheduleSequential(AffineForOp &loop,
+  LogicalResult createLoopScheduleSequential(scf::ForOp &loop,
                                              SharedOperatorsProblem &problem);
   LogicalResult createFuncLoopSchedule(FuncOp &funcOp,
                                        SharedOperatorsProblem &problem);
 
-  std::optional<MemoryDependenceAnalysis> dependenceAnalysis;
+  std::optional<LoopScheduleDependenceAnalysis> dependenceAnalysis;
 };
 
 } // namespace
 
-void AffineToLoopSchedule::runOnOperation() {
+void SCFToLoopSchedule::runOnOperation() {
 
   // Collect loops to pipeline and work on them.
-  SmallVector<AffineForOp> loops;
+  SmallVector<scf::ForOp> loops;
 
   auto hasPipelinedParent = [](Operation *op) {
     Operation *currentOp = op;
@@ -113,23 +115,23 @@ void AffineToLoopSchedule::runOnOperation() {
   };
 
   getOperation()->walk<WalkOrder::PreOrder>([&](Operation *op) {
-    if (!isa<AffineForOp>(op) || !op->hasAttr("hls.pipeline"))
+    if (!isa<scf::ForOp>(op) || !op->hasAttr("hls.pipeline"))
       return;
 
     if (hasPipelinedParent(op))
       return;
 
-    loops.push_back(cast<AffineForOp>(op));
+    loops.push_back(cast<scf::ForOp>(op));
   });
 
   // Unroll loops within this loop to make pipelining possible
-  for (auto loop : llvm::make_early_inc_range(loops)) {
-    if (failed(unrollSubLoops(loop)))
-      return signalPassFailure();
-  }
+  // for (auto loop : llvm::make_early_inc_range(loops)) {
+  //   if (failed(unrollSubLoops(loop)))
+  //     return signalPassFailure();
+  // }
 
   // Get dependence analysis for the whole function.
-  dependenceAnalysis = getAnalysis<MemoryDependenceAnalysis>();
+  dependenceAnalysis = getAnalysis<LoopScheduleDependenceAnalysis>();
 
   // for (auto op : getOperation().getOps<LoopInterface>()){
   //   ArrayRef<MemoryDependence> dependences =
@@ -164,8 +166,7 @@ void AffineToLoopSchedule::runOnOperation() {
   // });
 
   // After dependence analysis, materialize affine structures.
-  if (failed(lowerAffineStructures(getContext(), getOperation(),
-                                   *dependenceAnalysis)))
+  if (failed(ifOpHoisting(getContext(), getOperation())))
     return signalPassFailure();
 
   if (failed(postLoweringOptimizations(getContext(), getOperation())))
@@ -201,9 +202,9 @@ void AffineToLoopSchedule::runOnOperation() {
   }
 
   // Schedule all remaining loops
-  SmallVector<AffineForOp> seqLoops;
+  SmallVector<scf::ForOp> seqLoops;
 
-  getOperation().walk([&](AffineForOp loop) {
+  getOperation().walk([&](scf::ForOp loop) {
     seqLoops.push_back(loop);
     return WalkResult::advance();
   });
@@ -250,6 +251,17 @@ void AffineToLoopSchedule::runOnOperation() {
     return signalPassFailure();
 
   // getOperation().dump();
+
+  // Remove dependencies
+  if (funcOp->hasAttrOfType<SymbolRefAttr>("loopschedule.dependencies")) {
+    auto depSymbol =
+        funcOp->getAttrOfType<SymbolRefAttr>("loopschedule.dependencies");
+    auto *depOp = SymbolTable::lookupNearestSymbolFrom(funcOp, depSymbol);
+    depOp->walk([](LoopScheduleAccessOp op) { op.erase(); });
+    depOp->walk([](LoopScheduleDependsOnOp op) { op.erase(); });
+    depOp->erase();
+    funcOp->removeAttr("loopschedule.dependencies");
+  }
 }
 
 /// Populate the schedling problem operator types for the dialect we are
@@ -257,8 +269,8 @@ void AffineToLoopSchedule::runOnOperation() {
 /// well-defined operator latencies. Ultimately, we should move this to a
 /// dialect interface in the Scheduling dialect.
 LogicalResult
-AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
-                                            SharedOperatorsProblem &problem) {
+SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
+                                         SharedOperatorsProblem &problem) {
   // Scheduling analyis only considers the innermost loop nest for now.
 
   // Load the Calyx operator library into the problem. This is a very minimal
@@ -281,7 +293,7 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
     }
 
     return TypeSwitch<Operation *, WalkResult>(op)
-        .Case<IfOp, AffineYieldOp, arith::ConstantOp, arith::ExtSIOp,
+        .Case<IfOp, scf::YieldOp, arith::ConstantOp, arith::ExtSIOp,
               arith::ExtUIOp, arith::TruncIOp, CmpIOp, IndexCastOp,
               memref::AllocaOp, memref::AllocOp, loopschedule::AllocInterface,
               YieldOp, func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, CmpIOp,
@@ -297,8 +309,7 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
           problem.setLinkedOperatorType(loopOp, loopOpr);
           auto loop = cast<LoopInterface>(loopOp);
           loop.getBodyBlock()->walk([&](Operation *op) {
-            if (isa<AffineLoadOp, AffineStoreOp, LoopScheduleLoadOp,
-                    LoopScheduleStoreOp>(op)) {
+            if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp>(op)) {
               Value memRef = getMemref(op);
               Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
                   "mem_" + std::to_string(hash_value(memRef)));
@@ -415,8 +426,8 @@ AffineToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
 }
 
 /// Solve the pre-computed scheduling problem.
-LogicalResult AffineToLoopSchedule::solveModuloProblem(AffineForOp &loop,
-                                                       ModuloProblem &problem) {
+LogicalResult SCFToLoopSchedule::solveModuloProblem(scf::ForOp &loop,
+                                                    ModuloProblem &problem) {
   // Scheduling analyis only considers the innermost loop nest for now.
   auto forOp = loop;
 
@@ -468,7 +479,7 @@ LogicalResult AffineToLoopSchedule::solveModuloProblem(AffineForOp &loop,
 }
 
 /// Solve the pre-computed scheduling problem.
-LogicalResult AffineToLoopSchedule::solveSharedOperatorsProblem(
+LogicalResult SCFToLoopSchedule::solveSharedOperatorsProblem(
     Region &region, SharedOperatorsProblem &problem) {
 
   LLVM_DEBUG(region.getParentOp()->dump());
@@ -543,8 +554,8 @@ Operation *cloneOrReplace(OpBuilder builder, Operation *op,
 
 /// Create the pipeline op for a loop nest.
 LogicalResult
-AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
-                                                 ModuloProblem &problem) {
+SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
+                                              ModuloProblem &problem) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
 
   // loop.dump();
@@ -553,32 +564,9 @@ AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
       &loop->getParentOfType<FuncOp>().getBody().front());
 
   // Create Values for the loop's lower and upper bounds.
-  Value lowerBound;
-  Value upperBound;
-  Type boundType = builder.getIndexType();
-  if (loop.hasConstantBounds()) {
-    auto lower = loop.getConstantLowerBound();
-    auto upper = loop.getConstantUpperBound();
-    // int64_t largestValue;
-    // // bool isSigned;
-    // if (lower >= 0 && upper >= 0) {
-    //   // isSigned = false;
-    //   largestValue = std::max(lower, upper);
-    // } else {
-    //   assert(false && "not handling negative affine bounds yet");
-    // }
-    boundType = loop.getInductionVar().getType();
-    lowerBound =
-        builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, lower));
-    upperBound =
-        builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, upper));
-  } else {
-    lowerBound = lowerAffineLowerBound(loop, builder);
-    upperBound = lowerAffineUpperBound(loop, builder);
-  }
-  int64_t stepValue = loop.getStep().getSExtValue();
-  auto step =
-      builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, stepValue));
+  Value lowerBound = loop.getLowerBound();
+  Value upperBound = loop.getUpperBound();
+  Value step = loop.getStep();
 
   builder.setInsertionPoint(loop);
 
@@ -595,8 +583,9 @@ AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
   // If possible, attach a constant trip count attribute. This could be
   // generalized to support non-constant trip counts by supporting an AffineMap.
   std::optional<IntegerAttr> tripCountAttr;
-  if (auto tripCount = getConstantTripCount(loop))
-    tripCountAttr = builder.getI64IntegerAttr(*tripCount);
+  if (auto tripCount =
+          loop->getAttrOfType<IntegerAttr>("loopschedule.trip_count"))
+    tripCountAttr = tripCount;
 
   auto pipeline = builder.create<LoopSchedulePipelineOp>(
       resultTypes, ii, tripCountAttr, iterArgs);
@@ -613,7 +602,7 @@ AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
   // Add the non-yield operations to their start time groups.
   DenseMap<unsigned, SmallVector<Operation *>> startGroups;
   for (auto *op : problem.getOperations()) {
-    if (isa<AffineYieldOp, YieldOp>(op))
+    if (isa<YieldOp>(op))
       continue;
     auto startTime = problem.getStartTime(op);
     startGroups[*startTime].push_back(op);
@@ -657,7 +646,7 @@ AffineToLoopSchedule::createLoopSchedulePipeline(AffineForOp &loop,
     // Collect the return types for this stage. Operations whose results are not
     // used within this stage are returned.
     auto isLoopTerminator = [loop](Operation *op) {
-      return isa<AffineYieldOp>(op) && op->getParentOp() == loop;
+      return isa<YieldOp>(op) && op->getParentOp() == loop;
     };
 
     // Initialize set of registers up until this point in time
@@ -973,8 +962,8 @@ bool isUsedOutsideOfRegion(Value val, Block *block) {
 }
 
 /// Create the stg ops for a loop nest.
-LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
-    AffineForOp &loop, SharedOperatorsProblem &problem) {
+LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
+    scf::ForOp &loop, SharedOperatorsProblem &problem) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
 
   // loop.dump();
@@ -983,32 +972,9 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
       &loop->getParentOfType<FuncOp>().getBody().front());
 
   // Create Values for the loop's lower and upper bounds.
-  Value lowerBound;
-  Value upperBound;
-  Type boundType = builder.getIndexType();
-  if (loop.hasConstantBounds()) {
-    auto lower = loop.getConstantLowerBound();
-    auto upper = loop.getConstantUpperBound();
-    // int64_t largestValue;
-    // // bool isSigned;
-    // if (lower >= 0 && upper >= 0) {
-    //   // isSigned = false;
-    //   largestValue = std::max(lower, upper);
-    // } else {
-    //   assert(false && "not handling negative affine bounds yet");
-    // }
-    boundType = loop.getInductionVar().getType();
-    lowerBound =
-        builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, lower));
-    upperBound =
-        builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, upper));
-  } else {
-    lowerBound = lowerAffineLowerBound(loop, builder);
-    upperBound = lowerAffineUpperBound(loop, builder);
-  }
-  int64_t stepValue = loop.getStep().getSExtValue();
-  auto incr =
-      builder.create<arith::ConstantOp>(IntegerAttr::get(boundType, stepValue));
+  Value lowerBound = loop.getLowerBound();
+  Value upperBound = loop.getUpperBound();
+  Value incr = loop.getStep();
 
   builder.setInsertionPoint(loop);
 
@@ -1025,8 +991,9 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
   // If possible, attach a constant trip count attribute. This could be
   // generalized to support non-constant trip counts by supporting an AffineMap.
   std::optional<IntegerAttr> tripCountAttr;
-  if (auto tripCount = getConstantTripCount(loop))
-    tripCountAttr = builder.getI64IntegerAttr(*tripCount);
+  if (auto tripCount =
+          loop->getAttrOfType<IntegerAttr>("loopschedule.trip_count"))
+    tripCountAttr = tripCount;
 
   auto opMap = getOperationCycleMap(problem);
 
@@ -1093,7 +1060,7 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
   DenseMap<unsigned, SmallVector<Operation *>> startGroups;
   unsigned endTime = 0;
   for (auto *op : problem.getOperations()) {
-    if (isa<AffineYieldOp, YieldOp>(op))
+    if (isa<YieldOp>(op))
       continue;
     auto startTime = problem.getStartTime(op);
     startGroups[*startTime].push_back(op);
@@ -1118,7 +1085,7 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
 
   // Must re-register return values of memories if they are used later
   for (auto *op : problem.getOperations()) {
-    if (isa<LoadOp, AffineLoadOp>(op)) {
+    if (isa<LoopScheduleLoadOp>(op)) {
       auto startTime = problem.getStartTime(op);
       auto resTime = *startTime + 1;
       if (hasLaterUse(op, resTime) && !startGroups.contains(resTime)) {
@@ -1182,7 +1149,7 @@ LogicalResult AffineToLoopSchedule::createLoopScheduleSequential(
     // Collect the return types for this stage. Operations whose results are not
     // used within this stage are returned.
     auto isLoopTerminator = [loop](Operation *op) {
-      return isa<AffineYieldOp>(op) && op->getParentOp() == loop;
+      return isa<YieldOp>(op) && op->getParentOp() == loop;
     };
 
     SmallVector<Type> stepTypes;
@@ -1354,8 +1321,8 @@ int64_t opOrParentStartTime(Problem &problem, Operation *op) {
 
 /// Create the loopschedule ops for an entire function.
 LogicalResult
-AffineToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
-                                             SharedOperatorsProblem &problem) {
+SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
+                                          SharedOperatorsProblem &problem) {
   auto *anchor = funcOp.getBody().back().getTerminator();
 
   auto opMap = getOperationCycleMap(problem);
@@ -1403,8 +1370,8 @@ AffineToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
   // Add the non-yield operations to their start time groups.
   DenseMap<unsigned, SmallVector<Operation *>> startGroups;
   for (auto *op : problem.getOperations()) {
-    if (isa<AffineYieldOp, YieldOp, func::ReturnOp, memref::AllocaOp,
-            arith::ConstantOp, memref::AllocOp, AllocInterface>(op))
+    if (isa<YieldOp, func::ReturnOp, memref::AllocaOp, arith::ConstantOp,
+            memref::AllocOp, AllocInterface>(op))
       continue;
     if (auto schedOp = dyn_cast<SchedulableInterface>(op)) {
       if (schedOp.isInitOp())
@@ -1546,6 +1513,6 @@ AffineToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
 }
 
 std::unique_ptr<mlir::Pass>
-circt::createAffineToLoopSchedule(bool disableBitwidthMinimization) {
-  return std::make_unique<AffineToLoopSchedule>(disableBitwidthMinimization);
+circt::createSCFToLoopSchedule(bool disableBitwidthMinimization) {
+  return std::make_unique<SCFToLoopSchedule>(disableBitwidthMinimization);
 }

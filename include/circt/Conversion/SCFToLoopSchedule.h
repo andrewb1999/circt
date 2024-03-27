@@ -1,5 +1,5 @@
-//===- AffineToLoopSchedule.h
-//-------------------------------------------------===//
+//===- SCFToLoopSchedule.h ------------------------------------------------===//
+//-------------------------------------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -7,8 +7,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef CIRCT_CONVERSION_AFFINETOLOOPSCHEDULE_H_
-#define CIRCT_CONVERSION_AFFINETOLOOPSCHEDULE_H_
+#ifndef CIRCT_CONVERSION_SCFTOLOOPSCHEDULE_H_
+#define CIRCT_CONVERSION_SCFTOLOOPSCHEDULE_H_
 
 #include <memory>
 
@@ -18,7 +18,7 @@ class Pass;
 
 namespace circt {
 std::unique_ptr<mlir::Pass>
-createAffineToLoopSchedule(bool disableBitwidthMinimization = false);
+createSCFToLoopSchedule(bool disableBitwidthMinimization = false);
 } // namespace circt
 
-#endif // CIRCT_CONVERSION_AFFINETOLOOPSCHEDULE_H_
+#endif // CIRCT_CONVERSION_SCFTOLOOPSCHEDULE_H_

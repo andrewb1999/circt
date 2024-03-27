@@ -11,7 +11,8 @@ add_circt_tool(circt-opt
 llvm_update_compile_flags(circt-opt)
 target_link_libraries(circt-opt
   PRIVATE
-  CIRCTAffineToLoopSchedule
+  CIRCTSCFToLoopSchedule
+  CIRCTAffineToSCF
   CIRCTAnalysisTestPasses
   CIRCTArc
   CIRCTArcToLLVM
@@ -66,6 +67,7 @@ target_link_libraries(circt-opt
   CIRCTHWToSV
   CIRCTHWTransforms
   CIRCTLoopSchedule
+  CIRCTLoopScheduleTransforms
   CIRCTLoopScheduleToCalyx
   CIRCTLTL
   CIRCTSCFToCalyx

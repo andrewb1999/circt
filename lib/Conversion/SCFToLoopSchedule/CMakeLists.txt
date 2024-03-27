@@ -1,12 +1,11 @@
-add_circt_library(CIRCTAffineToLoopSchedule
-  AffineToLoopSchedule.cpp
+add_circt_library(CIRCTSCFToLoopSchedule
+  SCFToLoopSchedule.cpp
 
   DEPENDS
   CIRCTConversionPassIncGen
   MLIRArithDialect
 
   LINK_LIBS PUBLIC
-  MLIRAffineToStandard
   MLIRPass
   CIRCTScheduling
   CIRCTSchedulingAnalysis

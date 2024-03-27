@@ -14,6 +14,7 @@
 #define CIRCIT_LOOP_SCHEDULE_OPS_TD
 
 include "mlir/IR/OpBase.td"
+include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/IR/RegionKindInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
@@ -472,5 +473,83 @@ def LoopScheduleStoreOp : LoopScheduleOp<"store",
     $value `,` $memref `[` $indices `:` type($indices) `]` attr-dict `:` type($memref)
   }];
 }
+
+def LoopScheduleDependenciesOp : LoopScheduleOp<"dependencies",
+     [NoRegionArguments, SingleBlock, NoTerminator, Symbol]> {
+  let summary = "Memory Dependencies operation";
+  let description = [{
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let assemblyFormat = "$sym_name $body attr-dict";
+  let regions = (region SizedRegion<1>:$body);
+
+  let extraClassDeclaration = [{
+    // OpAsmOpInterface
+    /* static ::llvm::StringRef getDefaultDialect() { return "loopschedule"; } */
+
+    // SymbolOpInterface
+    static bool isOptionalSymbol() { return false; }
+
+    // Convenience
+    ::mlir::Block *getBodyBlock() {
+      return &getBody().getBlocks().front();
+    }
+  }];
+
+  let skipDefaultBuilders = true;
+  let builders = [
+    OpBuilder<(ins "mlir::StringAttr":$sym_name), [{
+      ::mlir::Region* region = $_state.addRegion();
+      region->push_back(new ::mlir::Block());
+      $_state.getOrAddProperties<Properties>().sym_name = sym_name;
+    }]>
+  ];
+  /* let hasVerifier = 1; */
+}
+
+def LoopScheduleDependsOnOp : LoopScheduleOp<"depends_on",
+    [
+    HasParent<"LoopScheduleDependenciesOp">,
+    NoTerminator
+    ]> {
+  let summary = "Defines the accesses that an op depends on";
+  let description = [{
+  }];
+
+  let arguments = (ins StrAttr:$accessName);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = "$accessName $body attr-dict";
+
+  let extraClassDeclaration = [{
+    // Convenience
+    ::mlir::Block *getBodyBlock() {
+      return &getBody().getBlocks().front();
+    }
+  }];
+  let skipDefaultBuilders = true;
+  let builders = [
+    OpBuilder<(ins "mlir::StringAttr":$accessName), [{
+      ::mlir::Region* region = $_state.addRegion();
+      region->push_back(new ::mlir::Block());
+      $_state.getOrAddProperties<Properties>().accessName = accessName;
+    }]>
+  ];
+  /* let hasVerifier = 1; */
+}
+
+def LoopScheduleAccessOp : LoopScheduleOp<"access",
+    [
+      HasParent<"LoopScheduleDependsOnOp">
+    ]> {
+  let summary = "Defines an access that another op depends on";
+  let description = [{
+  }];
+
+  let arguments = (ins StrAttr:$accessName,
+                       OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<1>]>>:$dist);
+  let hasCustomAssemblyFormat = 1;
+}
+
 
 #endif // CIRCIT_LOOP_SCHEDULE_OPS_TD

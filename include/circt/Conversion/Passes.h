@@ -13,7 +13,7 @@
 #ifndef CIRCT_CONVERSION_PASSES_H
 #define CIRCT_CONVERSION_PASSES_H
 
-#include "circt/Conversion/AffineToLoopSchedule.h"
+#include "circt/Conversion/AffineToSCF.h"
 #include "circt/Conversion/ArcToLLVM.h"
 #include "circt/Conversion/CFToHandshake.h"
 #include "circt/Conversion/CalyxNative.h"
@@ -39,6 +39,7 @@
 #include "circt/Conversion/MooreToCore.h"
 #include "circt/Conversion/PipelineToHW.h"
 #include "circt/Conversion/SCFToCalyx.h"
+#include "circt/Conversion/SCFToLoopSchedule.h"
 #include "circt/Conversion/SeqToSV.h"
 #include "circt/Conversion/SimToSV.h"
 #include "circt/Conversion/VerifToSV.h"

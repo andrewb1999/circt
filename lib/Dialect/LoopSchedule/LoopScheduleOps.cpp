@@ -12,10 +12,12 @@
 
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/ESI/ESITypes.h"
+#include "circt/Dialect/LoopSchedule/LoopScheduleAttributes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
@@ -688,16 +690,93 @@ LogicalResult LoopScheduleStoreOp::verify() {
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// DependenciesOp
+//===----------------------------------------------------------------------===//
+
+// LogicalResult LoopScheduleDependenciesOp::verify() {
+//   // auto res = getBody().walk([](Operation *op) {
+//   //   if (!isa<LoopScheduleDependsOnOp>(op)) {
+//   //     return WalkResult::interrupt();
+//   //   }
+//   //   return WalkResult::advance();
+//   // });
+
+//   // if (res.wasInterrupted()) {
+//   //   return emitOpError("dependencies op can only contain dependence ops");
+//   // }
+
+//   return success();
+// }
+
+//===----------------------------------------------------------------------===//
+// DependsOnOp
+//===----------------------------------------------------------------------===//
+
+// LogicalResult LoopScheduleDependsOnOp::verify() {
+//   // auto res = getBody().walk([](Operation *op) {
+//   //   if (!isa<LoopScheduleAccessOp>(op)) {
+//   //     return WalkResult::interrupt();
+//   //   }
+//   //   return WalkResult::advance();
+//   // });
+
+//   // if (res.wasInterrupted()) {
+//   //   return emitOpError("depends_on op can only contain access ops");
+//   // }
+
+//   return success();
+// }
+
+//===----------------------------------------------------------------------===//
+// AccessOp
+//===----------------------------------------------------------------------===//
+
+ParseResult LoopScheduleAccessOp::parse(OpAsmParser &p,
+                                        OperationState &result) {
+  StringAttr name;
+  IntegerAttr dist;
+  if (p.parseAttribute(name))
+    return failure();
+
+  result.addAttribute("accessName", name);
+
+  if (succeeded(p.parseOptionalKeyword("dist"))) {
+    if (p.parseLess() || p.parseAttribute(dist) || p.parseGreater())
+      return failure();
+    result.addAttribute("dist", dist);
+  }
+
+  if (p.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  return success();
+}
+
+void LoopScheduleAccessOp::print(::mlir::OpAsmPrinter &p) {
+  p << " ";
+  p.printString(this->getAccessName());
+  if (this->getDist() > 0) {
+    p << " dist<" << this->getDist() << ">";
+  }
+  SmallVector<StringRef> elidedAttrs = {
+      this->getAccessNameAttrName().getValue(),
+      this->getDistAttrName().getValue()};
+  p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
+}
+
 #include "circt/Dialect/LoopSchedule/LoopScheduleInterfaces.cpp.inc"
 
 #define GET_OP_CLASSES
 #include "circt/Dialect/LoopSchedule/LoopSchedule.cpp.inc"
 
+#include "circt/Dialect/LoopSchedule/LoopScheduleDialect.cpp.inc"
+
 void LoopScheduleDialect::initialize() {
+  registerAttributes();
+
   addOperations<
 #define GET_OP_LIST
 #include "circt/Dialect/LoopSchedule/LoopSchedule.cpp.inc"
       >();
 }
-
-#include "circt/Dialect/LoopSchedule/LoopScheduleDialect.cpp.inc"

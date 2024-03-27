@@ -1,11 +1,6 @@
-set(LLVM_OPTIONAL_SOURCES
-  DialectRegistration.cpp
-  mlir_std_runner.cpp
-  Ops.cpp
-  )
-
 add_circt_dialect_library(CIRCTLoopSchedule
   LoopScheduleOps.cpp
+  LoopScheduleAttributes.cpp
   Utils.cpp
 
   ADDITIONAL_HEADER_DIRS
@@ -20,6 +15,7 @@ add_circt_dialect_library(CIRCTLoopSchedule
   DEPENDS
   MLIRArithDialect
   MLIRLoopScheduleIncGen
+  CIRCTLoopScheduleAttributesIncGen
 )
 
 add_subdirectory(Transforms)

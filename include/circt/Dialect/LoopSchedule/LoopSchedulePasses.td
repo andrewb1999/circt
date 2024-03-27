@@ -20,4 +20,16 @@ include "mlir/Pass/PassBase.td"
 /*   let constructor =  "circt::loopschedule::createBitwidthMinimization()"; */
 /* } */
 
+def MarkMemoryAccesses : Pass<"mark-memory-accesses", "mlir::func::FuncOp"> {
+  let summary = "Mark memory accesses with a unique name.";
+  let constructor =  "circt::loopschedule::createMarkMemoryAccessesPass()";
+  let dependentDialects = ["circt::loopschedule::LoopScheduleDialect"];
+}
+
+def ConstructMemoryDependencies : Pass<"construct-memory-dependencies", "mlir::func::FuncOp"> {
+  let summary = "Construct memory dependencies operation.";
+  let constructor =  "circt::loopschedule::createConstructMemoryDependenciesPass()";
+  let dependentDialects = ["circt::loopschedule::LoopScheduleDialect"];
+}
+
 #endif // CIRCT_DIALECT_LOOPSCHEDULE_PASSES_TD

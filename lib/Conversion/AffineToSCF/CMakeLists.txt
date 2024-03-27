@@ -1,13 +1,15 @@
-add_circt_library(CIRCTAffineToSTG
-  AffineToSTG.cpp
+add_circt_library(CIRCTAffineToSCF
+  AffineToSCF.cpp
 
   DEPENDS
   CIRCTConversionPassIncGen
+  MLIRArithDialect
 
   LINK_LIBS PUBLIC
   MLIRAffineToStandard
   MLIRPass
   CIRCTScheduling
   CIRCTSchedulingAnalysis
-  CIRCTSTGOps
+  CIRCTLoopSchedule
+  MLIRArithTransforms
   )
