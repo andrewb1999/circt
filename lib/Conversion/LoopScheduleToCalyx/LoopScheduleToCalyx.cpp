@@ -649,7 +649,8 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
   getState<ComponentLoweringState>().interfaceReadOrContentEnSet(
       memoryInterface);
 
-  auto group = createStaticGroupForOp(rewriter, loadOp, 1);
+  auto group =
+      createStaticGroupForOp(rewriter, loadOp, loadOp.getLatency().value_or(1));
   rewriter.setInsertionPointToEnd(group.getBodyBlock());
   auto &state = getState<ComponentLoweringState>();
   std::optional<Block *> blockOpt;
@@ -669,7 +670,8 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
 
   getState<ComponentLoweringState>().interfaceWriteEnSet(memoryInterface);
 
-  auto group = createStaticGroupForOp(rewriter, storeOp, 1);
+  auto group = createStaticGroupForOp(rewriter, storeOp,
+                                      storeOp.getLatency().value_or(1));
 
   rewriter.setInsertionPointToEnd(group.getBodyBlock());
   auto &state = getState<ComponentLoweringState>();
