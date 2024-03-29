@@ -28,12 +28,21 @@ add_circt_library(CIRCTDependenceAnalysis
   MLIRTransformUtils
 )
 
+add_circt_library(CIRCTAccessNameAnalysis
+  AccessNameAnalysis.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRAffineDialect
+  MLIRIR
+)
+
 add_circt_library(CIRCTLoopScheduleDependenceAnalysis
   LoopScheduleDependenceAnalysis.cpp
 
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRAffineUtils
+  CIRCTAccessNameAnalysis
   MLIRTransformUtils
 )
 
@@ -44,15 +53,8 @@ add_circt_library(CIRCTSchedulingAnalysis
   MLIRAffineDialect
   MLIRIR
   CIRCTDependenceAnalysis
+  CIRCTLoopScheduleDependenceAnalysis
   CIRCTScheduling
-)
-
-add_circt_library(CIRCTAccessNameAnalysis
-  AccessNameAnalysis.cpp
-
-  LINK_LIBS PUBLIC
-  MLIRAffineDialect
-  MLIRIR
 )
 
 add_circt_library(CIRCTAnalysisTestPasses
