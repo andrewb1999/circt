@@ -708,7 +708,21 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
     auto constantStep = op.getStep().getDefiningOp<ConstantOp>();
     if (constantLB == nullptr || constantUB == nullptr ||
         constantStep == nullptr) {
-      return failure();
+      auto inductionType = op.getInductionVar().getType();
+      auto bitwidth = isa<IndexType>(inductionType)
+                          ? 64
+                          : inductionType.getIntOrFloatBitWidth();
+      auto newType = rewriter.getIntegerType(bitwidth);
+      if (op.getInductionVar().getType() == newType)
+        return failure();
+
+      op.getInductionVar().setType(newType);
+      rewriter.setInsertionPointToStart(&op.getRegion().front());
+      auto newExt = rewriter.create<arith::ExtSIOp>(
+          op.getLoc(), rewriter.getI64Type(), op.getInductionVar());
+      rewriter.replaceAllUsesExcept(op.getInductionVar(), newExt.getOut(),
+                                    newExt);
+      return success();
     }
 
     auto upperBoundAttr = dyn_cast<IntegerAttr>(constantUB.getValue());

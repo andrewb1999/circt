@@ -409,3 +409,24 @@ def WireLibOp : UnaryLibraryOp<"wire", [SameTypeConstraint<"in", "out">]> {
 }
 
 def ExtSILibOp  : UnaryLibraryOp<"signext"> {}
+
+def ConstMultLibOp : CalyxLibraryOp<"const_mult", [
+    Combinational,
+    SameTypeConstraint<"in", "out">
+  ]> {
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       I64Attr:$value);
+  let results = (outs AnyInteger:$in, AnyInteger:$out);
+
+  let builders = [
+    OpBuilder<(ins "StringRef":$sym_name, "int":$value, "::mlir::TypeRange":$resultTypes), [{
+      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
+      $_state.addAttribute(getValueAttrName($_state.name), $_builder.getI64IntegerAttr(value));
+      $_state.addTypes(resultTypes);
+    }]>
+  ];
+
+  let assemblyFormat = [{
+    $sym_name ` ` $value attr-dict `:` qualified(type(results))
+  }];
+}

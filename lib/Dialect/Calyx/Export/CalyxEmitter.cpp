@@ -93,7 +93,7 @@ public:
   /// Returns the list of library names used for in this program.
   /// E.g. if `primitives/core.futil` is used, returns { "core" }.
   FailureOr<llvm::SmallSet<StringRef, 4>> getLibraryNames(ModuleOp module) {
-    auto walkRes = module.walk([&](ComponentOp component) {
+    auto walkRes = module.walk([&](ComponentInterface component) {
       for (auto &op : *component.getBodyBlock()) {
         if (!isa<CellInterface>(op) || isa<InstanceOp, PrimitiveOp>(op))
           // It is not a primitive.
@@ -128,11 +128,12 @@ private:
             })
         .Case<SgtLibOp, SltLibOp, SeqLibOp, SneqLibOp, SgeLibOp, SleLibOp,
               SrshLibOp, SeqMultLibOp, SeqRemULibOp, SeqRemSLibOp, SeqDivULibOp,
-              SeqDivSLibOp, ExtSILibOp>([&](auto op) -> FailureOr<StringRef> {
-          static constexpr std::string_view sBinaryOperators =
-              "binary_operators";
-          return {sBinaryOperators};
-        })
+              SeqDivSLibOp, ExtSILibOp, ConstMultLibOp>(
+            [&](auto op) -> FailureOr<StringRef> {
+              static constexpr std::string_view sBinaryOperators =
+                  "binary_operators";
+              return {sBinaryOperators};
+            })
         .Case<MemoryOp>([&](auto op) -> FailureOr<StringRef> {
           static constexpr std::string_view sMemories = "memories/comb";
           return {sMemories};
@@ -257,6 +258,9 @@ struct Emitter {
 
   // Seq Memory emission
   void emitSeqMemory(SeqMemoryOp memory);
+
+  // Const Mult emission
+  void emitConstMult(ConstMultLibOp op);
 
   // Invoke emission
   void emitInvoke(InvokeOp invoke);
@@ -645,6 +649,7 @@ void Emitter::emitComponent(ComponentInterface op) {
           .Case<RegisterOp>([&](auto op) { emitRegister(op); })
           .Case<MemoryOp>([&](auto op) { emitMemory(op); })
           .Case<SeqMemoryOp>([&](auto op) { emitSeqMemory(op); })
+          .Case<ConstMultLibOp>([&](auto op) { emitConstMult(op); })
           .Case<hw::ConstantOp>([&](auto op) { /*Do nothing*/ })
           .Case<SliceLibOp, PadLibOp, ExtSILibOp>(
               [&](auto op) { emitLibraryPrimTypedByAllPorts(op); })
@@ -944,6 +949,16 @@ void Emitter::emitLibraryPrimTypedByFirstOutputPort(
            << space() << equals() << space()
            << (calyxLibName ? *calyxLibName : removeCalyxPrefix(opName))
            << LParen() << bitWidth << RParen() << semicolonEndL();
+}
+
+void Emitter::emitConstMult(ConstMultLibOp op) {
+  unsigned bitWidth = op.getInputPorts()[0].getType().getIntOrFloatBitWidth();
+  int value = op.getValue();
+  StringRef opName = op->getName().getStringRef();
+  indent() << getAttributes(op, /*atFormat=*/true) << op.instanceName()
+           << space() << equals() << space() << removeCalyxPrefix(opName)
+           << LParen() << bitWidth << comma() << space() << value << RParen()
+           << semicolonEndL();
 }
 
 void Emitter::emitAssignment(AssignOp op) {
