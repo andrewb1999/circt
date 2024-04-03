@@ -7,7 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
+#include "PassDetails.h"
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
 #include "circt/Transforms/Passes.h"
@@ -28,10 +28,11 @@
 using namespace mlir;
 using namespace mlir::affine;
 using namespace circt::analysis;
+using namespace circt::loopschedule;
 
 namespace {
 struct PipelineForLoopSchedule
-    : public circt::PipelineForLoopScheduleBase<PipelineForLoopSchedule> {
+    : public PipelineForLoopScheduleBase<PipelineForLoopSchedule> {
   using PipelineForLoopScheduleBase<
       PipelineForLoopSchedule>::PipelineForLoopScheduleBase;
   void runOnOperation() override;
@@ -205,7 +206,9 @@ void PipelineForLoopSchedule::runOnOperation() {
 }
 
 namespace circt {
+namespace loopschedule {
 std::unique_ptr<mlir::Pass> createPipelineForLoopSchedulePass() {
   return std::make_unique<PipelineForLoopSchedule>();
 }
+} // namespace loopschedule
 } // namespace circt

@@ -91,11 +91,17 @@ struct MemoryDependence {
       : source(source), distance(distance) {}
   Operation *source;
   unsigned int distance;
+
+  friend bool operator<(const MemoryDependence &lhs,
+                        const MemoryDependence &rhs) {
+    return std::tie(lhs.source, lhs.distance) <
+           std::tie(rhs.source, rhs.distance);
+  }
 };
 } // namespace
 
 using MemoryDependenceResult =
-    std::map<Operation *, SmallVector<MemoryDependence>>;
+    std::map<Operation *, std::set<MemoryDependence>>;
 
 static void checkAffineAccessPair(Operation *source, Operation *destination,
                                   MemoryDependenceResult &results,
@@ -136,28 +142,11 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
   if (hasDependence(result)) {
     if (!isIntraIteration) {
       assert(!depComps.empty());
-      results[destination].emplace_back(source, depComps.back().lb.value());
+      results[destination].emplace(source, depComps.back().lb.value());
     } else {
-      results[destination].emplace_back(source, 0);
+      results[destination].emplace(source, 0);
     }
   }
-
-  // if (hasDependence(result)) {
-  //   llvm::errs() << "dependence! =========================\n";
-  //   llvm::errs() << "source: ";
-  //   source->dump();
-  //   llvm::errs() << "dest: ";
-  //   destination->dump();
-
-  //   if (!depComps.empty()) {
-  //     llvm::errs() << "depComps:\n";
-  //     auto comp = depComps.back();
-  //     // for (auto comp : depComps) {
-  //       // comp.op->dump();
-  //       llvm::errs() << "depComp: [" << comp.lb << ", " << comp.ub << "]\n";
-  //     // }
-  //   }
-  // }
 }
 
 static Value getMemoryValue(Operation *op) {
@@ -237,10 +226,10 @@ static void checkNonAffineAccessPair(Operation *source, Operation *destination,
     // Check if the dst or its ancestor is before the src or its ancestor.
     // We want to dst to be before the src to insert iter-iteration deps.
     if (!isIntraIteration && dstOrAncestor->isBeforeInBlock(srcOrAncestor)) {
-      results[destination].emplace_back(source, 1);
+      results[destination].emplace(source, 1);
     } else if (isIntraIteration &&
                srcOrAncestor->isBeforeInBlock(dstOrAncestor)) {
-      results[destination].emplace_back(source, 0);
+      results[destination].emplace(source, 0);
     }
   }
 }
@@ -270,7 +259,7 @@ void ConstructMemoryDependenciesPass::runOnOperation() {
   auto funcOp = getOperation();
   auto nameAnalysis = getAnalysis<AccessNameAnalysis>();
 
-  std::map<Operation *, SmallVector<MemoryDependence>> results;
+  MemoryDependenceResult results;
 
   // Collect affine loops grouped by nesting depth.
   std::vector<SmallVector<AffineForOp, 2>> depthToLoops;

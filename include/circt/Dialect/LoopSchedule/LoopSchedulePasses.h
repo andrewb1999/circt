@@ -21,9 +21,11 @@
 namespace circt {
 namespace loopschedule {
 
-// std::unique_ptr<mlir::Pass> createBitwidthMinimization();
 std::unique_ptr<mlir::Pass> createMarkMemoryAccessesPass();
 std::unique_ptr<mlir::Pass> createConstructMemoryDependenciesPass();
+std::unique_ptr<mlir::Pass> createBitwidthReductionForLoopSchedulePass();
+std::unique_ptr<mlir::Pass> createUnrollForLoopSchedulePass();
+std::unique_ptr<mlir::Pass> createPipelineForLoopSchedulePass();
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION

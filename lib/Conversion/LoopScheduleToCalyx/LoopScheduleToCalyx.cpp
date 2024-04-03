@@ -300,20 +300,20 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
     funcOp.walk([&](Operation *op) {
       opBuiltSuccessfully &=
           TypeSwitch<mlir::Operation *, bool>(op)
-              .template Case<arith::ConstantOp, ReturnOp, BranchOpInterface,
-                             /// memory ops
-                             memref::AllocOp, memref::AllocaOp,
-                             LoopScheduleLoadOp, LoopScheduleStoreOp,
-                             /// memory interface
-                             calyx::StoreLoweringInterface,
-                             calyx::LoadLoweringInterface,
-                             calyx::AllocLoweringInterface,
-                             /// standard arithmetic
-                             AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp,
-                             AndIOp, XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp,
-                             MulIOp, DivUIOp, RemUIOp, RemSIOp, IndexCastOp,
-                             /// loop schedule
-                             LoopInterface, LoopScheduleTerminatorOp>(
+              .template Case<
+                  arith::ConstantOp, ReturnOp, BranchOpInterface,
+                  /// memory ops
+                  memref::AllocOp, memref::AllocaOp, LoopScheduleLoadOp,
+                  LoopScheduleStoreOp,
+                  /// memory interface
+                  calyx::StoreLoweringInterface, calyx::LoadLoweringInterface,
+                  calyx::AllocLoweringInterface,
+                  /// standard arithmetic
+                  AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp, AndIOp,
+                  XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp, MulIOp, DivUIOp,
+                  DivSIOp, RemUIOp, RemSIOp, IndexCastOp, SelectOp,
+                  /// loop schedule
+                  LoopInterface, LoopScheduleTerminatorOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<FuncOp, LoopScheduleRegisterOp, PhaseInterface>(
                   [&](auto) {
@@ -359,6 +359,7 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, ExtSIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ReturnOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, IndexCastOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, SelectOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::AllocOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::AllocaOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, LoopScheduleLoadOp op) const;
@@ -774,8 +775,12 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   Location loc = op.getLoc();
   Type width = op.getResult().getType(), one = rewriter.getI1Type();
   if (isa<LoopSchedulePipelineStageOp>(op->getParentOp())) {
-    op.emitError() << "DivSI is not pipelineable";
-    return failure();
+    auto divSPipe = getState<ComponentLoweringState>()
+                        .getNewLibraryOpInstance<calyx::PipelinedDivSLibOp>(
+                            rewriter, loc, {one, one, width, width, width});
+    return buildLibraryBinaryPipeOp<calyx::PipelinedDivSLibOp>(
+        rewriter, op, divSPipe,
+        /*out=*/divSPipe.getOut());
   }
 
   auto divSSeq =
@@ -1179,6 +1184,11 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   return res;
 }
 
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     SelectOp op) const {
+  return buildLibraryOp<calyx::CombGroupOp, calyx::MuxLibOp>(rewriter, op);
+}
+
 /// Builds condition checks for each loop.
 class BuildConditionChecks : public calyx::FuncOpPartialLoweringPattern {
   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
@@ -1496,6 +1506,9 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
           Value v;
           if (auto mul = dyn_cast<calyx::PipelinedMultLibOp>(op); mul) {
             v = mul.getOut();
+          } else if (auto divs = dyn_cast<calyx::PipelinedDivSLibOp>(op);
+                     divs) {
+            v = divs.getOut();
           } else if (auto divu = dyn_cast<calyx::SeqDivULibOp>(op); divu) {
             v = divu.getOut();
           } else if (auto seqMem = dyn_cast<calyx::SeqMemoryOp>(op); seqMem) {
@@ -2433,8 +2446,8 @@ public:
     target.addLegalOp<AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp, AndIOp,
                       XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp, CondBranchOp,
                       BranchOp, MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp,
-                      DivSIOp, ReturnOp, arith::ConstantOp, IndexCastOp, FuncOp,
-                      ExtSIOp>();
+                      ReturnOp, arith::ConstantOp, IndexCastOp, FuncOp, ExtSIOp,
+                      SelectOp>();
 
     RewritePatternSet legalizePatterns(&getContext());
     legalizePatterns.add<DummyPattern>(&getContext());

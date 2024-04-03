@@ -27,7 +27,7 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::func::FuncOp"
     the loops to a LoopSchedule. Memory dependencies must be maked prior to
     calling this pass using ConstructMemoryDependencies.
   }];
-  let constructor = "circt::createSCFToLoopSchedule()";
+  let constructor = "circt::createSCFToLoopSchedulePass()";
   let dependentDialects = [
     "circt::loopschedule::LoopScheduleDialect",
     "mlir::arith::ArithDialect",
@@ -36,10 +36,21 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::func::FuncOp"
     "mlir::scf::SCFDialect",
     "mlir::func::FuncDialect"
   ];
-  let options = [
-    Option<"disableBitwidthMinimization", "disable-bitwidth-minimization", "bool",
-            "false", "Bool to determine if bitwidth minimization should be disabled">
-   ];
+}
+
+//===----------------------------------------------------------------------===//
+// MemrefToLoopSchedule
+//===----------------------------------------------------------------------===//
+
+def MemrefToLoopSchedule : Pass<"convert-memref-to-loopschedule", "mlir::func::FuncOp"> {
+  let summary = "Convert Memref dialect to LoopSchedule memory accesses";
+  let description = [{
+  }];
+  let constructor = "circt::createMemrefToLoopSchedulePass()";
+  let dependentDialects = [
+    "circt::loopschedule::LoopScheduleDialect",
+    "mlir::memref::MemRefDialect"
+  ];
 }
 
 //===----------------------------------------------------------------------===//
@@ -50,7 +61,7 @@ def AffineToSCF : Pass<"convert-affine-to-scf", "mlir::func::FuncOp"> {
   let summary = "Convert Affine dialect to SCF structured control flow";
   let description = [{
   }];
-  let constructor = "circt::createAffineToSCF()";
+  let constructor = "circt::createAffineToSCFPass()";
   let dependentDialects = [
     "mlir::arith::ArithDialect",
     "mlir::cf::ControlFlowDialect",

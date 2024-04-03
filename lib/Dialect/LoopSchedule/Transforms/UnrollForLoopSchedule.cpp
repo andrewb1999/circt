@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
+#include "PassDetails.h"
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
 #include "circt/Transforms/Passes.h"
@@ -28,10 +28,11 @@
 using namespace mlir;
 using namespace mlir::affine;
 using namespace circt::analysis;
+using namespace circt::loopschedule;
 
 namespace {
 struct UnrollForLoopSchedule
-    : public circt::UnrollForLoopScheduleBase<UnrollForLoopSchedule> {
+    : public UnrollForLoopScheduleBase<UnrollForLoopSchedule> {
   using UnrollForLoopScheduleBase<
       UnrollForLoopSchedule>::UnrollForLoopScheduleBase;
   void runOnOperation() override;
@@ -330,7 +331,9 @@ void UnrollForLoopSchedule::runOnOperation() {
 }
 
 namespace circt {
+namespace loopschedule {
 std::unique_ptr<mlir::Pass> createUnrollForLoopSchedulePass() {
   return std::make_unique<UnrollForLoopSchedule>();
 }
+} // namespace loopschedule
 } // namespace circt

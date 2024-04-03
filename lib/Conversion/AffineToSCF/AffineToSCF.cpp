@@ -220,6 +220,6 @@ void AffineToSCFPass::runOnOperation() {
     signalPassFailure();
 }
 
-std::unique_ptr<mlir::Pass> circt::createAffineToSCF() {
+std::unique_ptr<mlir::Pass> circt::createAffineToSCFPass() {
   return std::make_unique<AffineToSCFPass>();
 }

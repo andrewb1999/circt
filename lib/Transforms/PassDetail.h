@@ -12,6 +12,7 @@
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/Pass/Pass.h"
@@ -49,6 +50,10 @@ class HWDialect;
 namespace comb {
 class CombDialect;
 } // namespace comb
+
+namespace loopschedule {
+class LoopScheduleDialect;
+} // namespace loopschedule
 
 #define GEN_PASS_CLASSES
 #include "circt/Transforms/Passes.h.inc"

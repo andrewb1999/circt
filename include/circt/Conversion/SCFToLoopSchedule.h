@@ -17,8 +17,7 @@ class Pass;
 } // namespace mlir
 
 namespace circt {
-std::unique_ptr<mlir::Pass>
-createSCFToLoopSchedule(bool disableBitwidthMinimization = false);
+std::unique_ptr<mlir::Pass> createSCFToLoopSchedulePass();
 } // namespace circt
 
 #endif // CIRCT_CONVERSION_SCFTOLOOPSCHEDULE_H_

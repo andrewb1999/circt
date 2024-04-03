@@ -74,9 +74,7 @@ using namespace circt::loopschedule;
 namespace {
 
 struct SCFToLoopSchedule : public SCFToLoopScheduleBase<SCFToLoopSchedule> {
-  SCFToLoopSchedule(bool disableBitwidthMinimization) {
-    this->disableBitwidthMinimization = disableBitwidthMinimization;
-  }
+  using SCFToLoopScheduleBase<SCFToLoopSchedule>::SCFToLoopScheduleBase;
   void runOnOperation() override;
 
 private:
@@ -132,55 +130,6 @@ void SCFToLoopSchedule::runOnOperation() {
 
   // Get dependence analysis for the whole function.
   dependenceAnalysis = getAnalysis<LoopScheduleDependenceAnalysis>();
-
-  // for (auto op : getOperation().getOps<LoopInterface>()){
-  //   ArrayRef<MemoryDependence> dependences =
-  //       dependenceAnalysis->getDependences(op);
-  //   if (dependences.empty())
-  //     continue;
-  //   op->dump();
-  //   llvm::errs() << "===============================\n";
-  //   for (auto &memoryDep : dependences) {
-  //     if (!hasDependence(memoryDep.dependenceType))
-  //       continue;
-  //     llvm::errs() << "deps: ";
-  //     memoryDep.source->dump();
-  //   }
-  // }
-
-  // getOperation()->getParentOfType<ModuleOp>().dump();
-
-  // getOperation().walk([&](Operation *op) {
-  //   ArrayRef<MemoryDependence> dependences =
-  //       dependenceAnalysis->getDependences(op);
-  //   if (dependences.empty())
-  //     return;
-  //   op->dump();
-  //   for (auto &memoryDep : dependences) {
-  //     if (!hasDependence(memoryDep.dependenceType))
-  //       continue;
-  //     llvm::errs() << "deps: ";
-  //     memoryDep.source->dump();
-  //   }
-  //   llvm::errs() << "===============================\n\n";
-  // });
-
-  // After dependence analysis, materialize affine structures.
-  if (failed(ifOpHoisting(getContext(), getOperation())))
-    return signalPassFailure();
-
-  if (failed(postLoweringOptimizations(getContext(), getOperation())))
-    return signalPassFailure();
-
-  if (failed(replaceMemoryAccesses(getContext(), getOperation(),
-                                   *dependenceAnalysis)))
-    return signalPassFailure();
-
-  if (!disableBitwidthMinimization) {
-    if (failed(bitwidthMinimization(getContext(), getOperation(),
-                                    *dependenceAnalysis)))
-      return signalPassFailure();
-  }
 
   // Schedule all pipelined loops first
   for (auto loop : llvm::make_early_inc_range(loops)) {
@@ -292,6 +241,8 @@ SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
   problem.setLatency(loopOpr, 1);
   Problem::OperatorType mcOpr = problem.getOrInsertOperatorType("multicycle");
   problem.setLatency(mcOpr, 4);
+  Problem::OperatorType divOpr = problem.getOrInsertOperatorType("divider");
+  problem.setLatency(divOpr, 36);
 
   Operation *unsupported;
   WalkResult result = loopBody.walk([&](Operation *op) {
@@ -304,8 +255,8 @@ SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
         .Case<IfOp, scf::YieldOp, arith::ConstantOp, arith::ExtSIOp,
               arith::ExtUIOp, arith::TruncIOp, CmpIOp, IndexCastOp,
               memref::AllocaOp, memref::AllocOp, loopschedule::AllocInterface,
-              YieldOp, func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, CmpIOp,
-              ShLIOp, AndIOp, ShRSIOp, ShRUIOp>([&](Operation *combOp) {
+              YieldOp, func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, ShLIOp,
+              AndIOp, ShRSIOp, ShRUIOp>([&](Operation *combOp) {
           // Some known combinational ops.
           problem.setLinkedOperatorType(combOp, combOpr);
           return WalkResult::advance();
@@ -416,9 +367,17 @@ SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
 
           return WalkResult::advance();
         })
-        .Case<MulIOp, RemUIOp, RemSIOp, DivSIOp>([&](Operation *mcOp) {
+        .Case<MulIOp>([&](Operation *mcOp) {
           // Some known multi-cycle ops.
           problem.setLinkedOperatorType(mcOp, mcOpr);
+          return WalkResult::advance();
+        })
+        .Case<RemUIOp, RemSIOp, DivSIOp>([&](Operation *op) {
+          if (op->getResult(0).getType().getIntOrFloatBitWidth() != 32) {
+            unsupported = op;
+            return WalkResult::interrupt();
+          }
+          problem.setLinkedOperatorType(op, divOpr);
           return WalkResult::advance();
         })
         .Default([&](Operation *badOp) {
@@ -603,7 +562,7 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
   Block &condBlock = pipeline.getCondBlock();
   builder.setInsertionPointToStart(&condBlock);
   auto cmpResult = builder.create<arith::CmpIOp>(
-      builder.getI1Type(), arith::CmpIPredicate::ult, condBlock.getArgument(0),
+      builder.getI1Type(), arith::CmpIPredicate::slt, condBlock.getArgument(0),
       upperBound);
   condBlock.getTerminator()->insertOperands(0, {cmpResult});
 
@@ -1023,7 +982,7 @@ LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
   Block &condBlock = sequential.getCondBlock();
   builder.setInsertionPointToStart(&condBlock);
   auto cmpResult = builder.create<arith::CmpIOp>(
-      builder.getI1Type(), arith::CmpIPredicate::ult, condBlock.getArgument(0),
+      builder.getI1Type(), arith::CmpIPredicate::slt, condBlock.getArgument(0),
       upperBound);
   condBlock.getTerminator()->insertOperands(0, {cmpResult});
 
@@ -1520,7 +1479,6 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
   return success();
 }
 
-std::unique_ptr<mlir::Pass>
-circt::createSCFToLoopSchedule(bool disableBitwidthMinimization) {
-  return std::make_unique<SCFToLoopSchedule>(disableBitwidthMinimization);
+std::unique_ptr<mlir::Pass> circt::createSCFToLoopSchedulePass() {
+  return std::make_unique<SCFToLoopSchedule>();
 }

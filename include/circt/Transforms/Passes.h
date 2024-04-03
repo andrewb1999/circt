@@ -14,6 +14,8 @@
 #define CIRCT_TRANSFORMS_PASSES_H
 
 #include "circt/Dialect/HW/HWOpInterfaces.h"
+#include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include <limits>
@@ -29,8 +31,8 @@ std::unique_ptr<mlir::Pass> createFlattenMemRefPass();
 std::unique_ptr<mlir::Pass> createFlattenMemRefCallsPass();
 std::unique_ptr<mlir::Pass> createStripDebugInfoWithPredPass(
     const std::function<bool(mlir::Location)> &pred);
-std::unique_ptr<mlir::Pass> createUnrollForLoopSchedulePass();
-std::unique_ptr<mlir::Pass> createPipelineForLoopSchedulePass();
+std::unique_ptr<mlir::Pass> createArithStrengthReductionPass();
+std::unique_ptr<mlir::Pass> createIfOpHoistingPass();
 std::unique_ptr<mlir::Pass> createMaximizeSSAPass();
 std::unique_ptr<mlir::Pass> createInsertMergeBlocksPass();
 

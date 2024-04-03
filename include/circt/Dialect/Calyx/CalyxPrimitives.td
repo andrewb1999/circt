@@ -367,6 +367,7 @@ def SeqRemULibOp : SequentialArithBinaryLibraryOp<"remu"> {}
 def SeqRemSLibOp : SequentialArithBinaryLibraryOp<"rems"> {}
 
 def PipelinedMultLibOp : ArithBinaryPipeLibraryOp<"mult"> {}
+def PipelinedDivSLibOp : ArithBinaryPipeLibraryOp<"divs"> {}
 
 class ArithBinaryStallableLibraryOp<string mnemonic> : CalyxPrimitive<"stallable_" # mnemonic, [
     SameTypeConstraint<"left", "out">

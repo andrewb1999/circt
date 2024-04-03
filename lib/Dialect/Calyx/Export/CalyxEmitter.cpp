@@ -142,10 +142,11 @@ private:
           static constexpr std::string_view sMemories = "memories/seq";
           return {sMemories};
         })
-        .Case<PipelinedMultLibOp>([&](auto op) -> FailureOr<StringRef> {
-          static constexpr std::string_view sMemories = "pipelined";
-          return {sMemories};
-        })
+        .Case<PipelinedMultLibOp, PipelinedDivSLibOp>(
+            [&](auto op) -> FailureOr<StringRef> {
+              static constexpr std::string_view sMemories = "pipelined";
+              return {sMemories};
+            })
         .Case<StallableMultLibOp>([&](auto op) -> FailureOr<StringRef> {
           static constexpr std::string_view sMemories = "stallable";
           return {sMemories};
@@ -658,7 +659,8 @@ void Emitter::emitComponent(ComponentInterface op) {
                 SubLibOp, ShruLibOp, RshLibOp, SrshLibOp, LshLibOp, AndLibOp,
                 NotLibOp, OrLibOp, XorLibOp, WireLibOp>(
               [&](auto op) { emitLibraryPrimTypedByFirstInputPort(op); })
-          .Case<SeqMultLibOp, PipelinedMultLibOp, StallableMultLibOp>(
+          .Case<SeqMultLibOp, PipelinedMultLibOp, StallableMultLibOp,
+                PipelinedDivSLibOp>(
               [&](auto op) { emitLibraryPrimTypedByFirstOutputPort(op); })
           .Case<MuxLibOp>(
               [&](auto op) { emitLibraryPrimTypedByFirstOutputPort(op); })

@@ -1,4 +1,4 @@
-//===- AffineToSCF.h ------------------------------------------------------===//
+//===- MemrefToLoopSchedule.h ---------------------------------------------===//
 //-------------------------------------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -7,8 +7,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef CIRCT_CONVERSION_AFFINETOSCF_H_
-#define CIRCT_CONVERSION_AFFINETOSCF_H_
+#ifndef CIRCT_CONVERSION_MEMREFTOLOOPSCHEDULE_H_
+#define CIRCT_CONVERSION_MEMREFTOLOOPSCHEDULE_H_
 
 #include <memory>
 
@@ -17,7 +17,7 @@ class Pass;
 } // namespace mlir
 
 namespace circt {
-std::unique_ptr<mlir::Pass> createAffineToSCFPass();
+std::unique_ptr<mlir::Pass> createMemrefToLoopSchedulePass();
 } // namespace circt
 
-#endif // CIRCT_CONVERSION_AFFINETOSCF_H_
+#endif // CIRCT_CONVERSION_MEMREFTOLOOPSCHEDULE_H_

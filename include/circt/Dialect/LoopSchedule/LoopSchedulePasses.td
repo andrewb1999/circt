@@ -15,11 +15,6 @@
 
 include "mlir/Pass/PassBase.td"
 
-/* def BitwidthMinimization : Pass<"bitwidth-minimization", "mlir::func::FuncOp"> { */
-/*   let summary = "Minimize the bitwidth of loopschedule registers."; */
-/*   let constructor =  "circt::loopschedule::createBitwidthMinimization()"; */
-/* } */
-
 def MarkMemoryAccesses : Pass<"mark-memory-accesses", "mlir::func::FuncOp"> {
   let summary = "Mark memory accesses with a unique name.";
   let constructor =  "circt::loopschedule::createMarkMemoryAccessesPass()";
@@ -30,6 +25,28 @@ def ConstructMemoryDependencies : Pass<"construct-memory-dependencies", "mlir::f
   let summary = "Construct memory dependencies operation.";
   let constructor =  "circt::loopschedule::createConstructMemoryDependenciesPass()";
   let dependentDialects = ["circt::loopschedule::LoopScheduleDialect"];
+}
+
+def BitwidthReductionForLoopSchedule : Pass<"bitwidth-reduction-for-loopschedule", "::mlir::func::FuncOp"> {
+  let summary = "Reduce bitwidth of ops before lowering to loopschedule";
+  let description = [{Reduce bitwidth of ops before lowering to loopschedule}];
+  let constructor = "circt::loopschedule::createBitwidthReductionForLoopSchedulePass()";
+  let dependentDialects = ["mlir::scf::SCFDialect", "circt::loopschedule::LoopScheduleDialect",
+                           "mlir::func::FuncDialect", "mlir::arith::ArithDialect"];
+}
+
+def UnrollForLoopSchedule : Pass<"unroll-for-loopschedule", "::mlir::func::FuncOp"> {
+  let summary = "Unroll loops to exploit data-level parallelism";
+  let description = [{Unroll loops to exploit data-level parallelism}];
+  let constructor = "circt::loopschedule::createUnrollForLoopSchedulePass()";
+  let dependentDialects = ["mlir::affine::AffineDialect", "mlir::func::FuncDialect"];
+}
+
+def PipelineForLoopSchedule : Pass<"pipeline-for-loopschedule", "::mlir::func::FuncOp"> {
+  let summary = "Unroll and pipeline loops inner loops";
+  let description = [{Unroll and pipeline loops inner loops}];
+  let constructor = "circt::loopschedule::createPipelineForLoopSchedulePass()";
+  let dependentDialects = ["mlir::affine::AffineDialect", "mlir::func::FuncDialect"];
 }
 
 #endif // CIRCT_DIALECT_LOOPSCHEDULE_PASSES_TD

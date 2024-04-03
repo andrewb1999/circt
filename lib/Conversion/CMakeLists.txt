@@ -1,4 +1,5 @@
 add_subdirectory(SCFToLoopSchedule)
+add_subdirectory(MemrefToLoopSchedule)
 add_subdirectory(AffineToSCF)
 add_subdirectory(ArcToLLVM)
 add_subdirectory(CalyxToFSM)

@@ -2979,6 +2979,8 @@ ImplBinSeqOpCellInterface(SeqRemULibOp, "out_remainder")
 ImplBinSeqOpCellInterface(SeqRemSLibOp, "out_remainder")
 
 ImplBinPipeOpCellInterface(PipelinedMultLibOp, "out")
+ImplBinPipeOpCellInterface(PipelinedDivSLibOp, "out")
+
 ImplBinStallOpCellInterface(StallableMultLibOp, "out")
 
 ImplUnaryOpCellInterface(PadLibOp)
