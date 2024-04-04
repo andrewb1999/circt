@@ -1310,8 +1310,7 @@ class BuildStallableConditionChecks
 
       auto pipeline = dyn_cast<LoopSchedulePipelineOp>(loop.getOperation());
       assert(pipeline != nullptr);
-      auto bound = pipeline.getBound();
-      assert(bound.has_value());
+      auto bound = pipeline.getBound().value() * pipeline.getII();
       auto incrGroup =
           getState<ComponentLoweringState>().getIncrGroup(pipeline);
       auto incrVal =
@@ -1323,7 +1322,7 @@ class BuildStallableConditionChecks
       auto zero =
           calyx::createConstant(loop.getLoc(), rewriter, getComponent(), 1, 0);
       rewriter.create<calyx::AssignOp>(loop.getLoc(), condReg.getIn(),
-                                       bound.value() == 0 ? zero : one);
+                                       bound == 0 ? zero : one);
       rewriter.create<calyx::AssignOp>(loop.getLoc(), condReg.getWriteEn(),
                                        one);
 
@@ -1338,7 +1337,7 @@ class BuildStallableConditionChecks
       rewriter.create<calyx::AssignOp>(loop.getLoc(), ltOp.getLeft(), incrVal);
       auto constant = calyx::createConstant(
           loop.getLoc(), rewriter, getComponent(), bitwidth,
-          *bound + pipeline.getBodyLatency() - 1);
+          bound + pipeline.getBodyLatency() - 1);
       rewriter.create<calyx::AssignOp>(loop.getLoc(), ltOp.getRight(),
                                        constant);
       rewriter.create<calyx::AssignOp>(loop.getLoc(), condReg.getIn(),
