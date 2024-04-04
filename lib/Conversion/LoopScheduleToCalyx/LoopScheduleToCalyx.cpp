@@ -928,7 +928,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     auto tripCount = pipeline.getTripCount();
     auto bitwidth = tripCount.has_value()
                         ? llvm::Log2_64_Ceil(*tripCount * pipeline.getII() +
-                                             pipeline.getBodyLatency() - 1)
+                                             pipeline.getBodyLatency())
                         : 32;
     if (bitwidth < 1)
       bitwidth = 1;
