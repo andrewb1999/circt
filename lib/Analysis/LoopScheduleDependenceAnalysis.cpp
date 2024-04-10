@@ -122,25 +122,11 @@ circt::analysis::LoopScheduleDependenceAnalysis::getDependencies(
 /// Replaces the dependences, if any, from the oldOp to the newOp.
 void circt::analysis::LoopScheduleDependenceAnalysis::replaceOp(
     Operation *oldOp, Operation *newOp) {
-  // llvm::errs() << "\noldOp: ";
-  // oldOp->dump();
-  // llvm::errs() << "newOp: ";
-  // newOp->dump();
-  // llvm::errs() << "replace\n";
-  // newOp->dump();
-  // dumpMap(results);
   // If oldOp had any dependences.
   auto deps = results[oldOp];
-  // llvm::errs() << "move dep\n";
   // Move the dependences to newOp.
   results[newOp] = deps;
   results.erase(oldOp);
-
-  // auto test = results.find(newOp);
-  // if (test != results.end()) {
-  //   test->first->dump();
-  // }
-  // dumpMap(results);
 
   // Find any dependences originating from oldOp and make newOp the source.
   // TODO(mikeurbach): consider adding an inverted index to avoid this scan.
@@ -163,24 +149,12 @@ void circt::analysis::LoopScheduleDependenceAnalysis::replaceOp(
 bool circt::analysis::LoopScheduleDependenceAnalysis::containsOp(
     Operation *op) {
   if (results.count(op) > 0 && !results[op].empty()) {
-    llvm::errs() << "contains\n";
-    op->dump();
-    for (auto dep : results[op]) {
-      llvm::errs() << "dep: ";
-      dep.source->dump();
-    }
     return true;
   }
 
   for (auto &it : results)
     for (auto &dep : it.second)
-      // if (OperationEquivalence::isEquivalentTo(dep.source, op,
-      // OperationEquivalence::IgnoreLocations)) {
       if (dep.source == op) {
-        // llvm::errs() << "dep.dest\n";
-        // it.first->dump();
-        llvm::errs() << "dep.source\n";
-        op->dump();
         return true;
       }
 

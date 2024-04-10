@@ -31,13 +31,16 @@ bool takeReservation(
     SharedOperatorsProblem &prob, Operation *op, unsigned int cycle) {
   auto operatorType = prob.getLinkedOperatorType(op);
   assert(operatorType.has_value());
-  if (!prob.getLimit(operatorType.value()).has_value()) {
+  if (prob.getLinkedResourceTypes(op).empty()) {
     return true;
   }
 
-  auto typeLimit = prob.getLimit(operatorType.value()).value();
+  assert(prob.getLinkedResourceTypes(op).size() == 1);
+
+  auto rsrc = *prob.getLinkedResourceTypes(op).begin();
+  auto typeLimit = prob.getResourceLimit(rsrc).value();
   assert(typeLimit > 0);
-  auto key = std::pair(operatorType.value().str(), cycle);
+  auto key = std::pair(rsrc.getName().str(), cycle);
   if (reservationTable.count(key) == 0) {
     reservationTable.insert(std::pair(key, (int)typeLimit - 1));
     return true;
@@ -51,13 +54,16 @@ bool testReservation(
     SharedOperatorsProblem &prob, Operation *op, unsigned int cycle) {
   auto operatorType = prob.getLinkedOperatorType(op);
   assert(operatorType.has_value());
-  if (!prob.getLimit(operatorType.value()).has_value()) {
+  if (!prob.getLinkedResourceTypes(op).empty()) {
     return true;
   }
 
-  auto typeLimit = prob.getLimit(operatorType.value()).value();
+  assert(prob.getLinkedResourceTypes(op).size() == 1);
+
+  auto rsrc = *prob.getLinkedResourceTypes(op).begin();
+  auto typeLimit = prob.getResourceLimit(rsrc).value();
   assert(typeLimit > 0);
-  auto key = std::pair(operatorType.value().str(), cycle);
+  auto key = std::pair(rsrc.getName().str(), cycle);
   if (reservationTable.count(key) == 0) {
     reservationTable.insert(std::pair(key, (int)typeLimit));
     return true;

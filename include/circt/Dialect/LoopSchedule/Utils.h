@@ -46,7 +46,7 @@ scheduling::SharedOperatorsProblem getSharedOperatorsProblem(
     mlir::func::FuncOp funcOp,
     analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
-LogicalResult unrollSubLoops(mlir::affine::AffineForOp &forOp);
+LogicalResult unrollSubLoops(mlir::scf::ForOp &forOp);
 
 LogicalResult replaceMemoryAccesses(
     mlir::MLIRContext &context, mlir::Operation *op,

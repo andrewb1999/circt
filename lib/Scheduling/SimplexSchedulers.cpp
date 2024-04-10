@@ -145,15 +145,14 @@ protected:
 
   /// Allow subclasses to collect additional constraints that are not part of
   /// the input problem, but should be modeled in the linear problem.
-  SmallVector<Problem::Dependence> additionalConstraints;
+  SmallVector<Dependence> additionalConstraints;
 
   virtual Problem &getProblem() = 0;
   virtual LogicalResult checkLastOp();
   virtual bool fillObjectiveRow(SmallVector<int> &row, unsigned obj);
-  virtual void fillConstraintRow(SmallVector<int> &row,
-                                 Problem::Dependence dep);
+  virtual void fillConstraintRow(SmallVector<int> &row, Dependence dep);
   virtual void fillAdditionalConstraintRow(SmallVector<int> &row,
-                                           Problem::Dependence dep);
+                                           Dependence dep);
   void buildTableau();
 
   int getParametricConstant(unsigned row);
@@ -209,8 +208,7 @@ private:
 
 protected:
   Problem &getProblem() override { return prob; }
-  void fillConstraintRow(SmallVector<int> &row,
-                         Problem::Dependence dep) override;
+  void fillConstraintRow(SmallVector<int> &row, Dependence dep) override;
 
 public:
   CyclicSimplexScheduler(CyclicProblem &prob, Operation *lastOp)
@@ -243,8 +241,8 @@ private:
 
     using TableType = SmallDenseMap<unsigned, DenseSet<Operation *>>;
     using ReverseTableType = SmallDenseMap<Operation *, unsigned>;
-    SmallDenseMap<Problem::OperatorType, TableType> tables;
-    SmallDenseMap<Problem::OperatorType, ReverseTableType> reverseTables;
+    SmallDenseMap<ResourceType, TableType> tables;
+    SmallDenseMap<ResourceType, ReverseTableType> reverseTables;
 
     explicit MRT(ModuloSimplexScheduler &sched) : sched(sched) {}
     LogicalResult enter(Operation *op, unsigned timeStep);
@@ -281,7 +279,7 @@ private:
 protected:
   Problem &getProblem() override { return prob; }
   void fillAdditionalConstraintRow(SmallVector<int> &row,
-                                   Problem::Dependence dep) override;
+                                   Dependence dep) override;
 
 public:
   ChainingSimplexScheduler(ChainingProblem &prob, Operation *lastOp,
@@ -302,10 +300,9 @@ private:
 
 protected:
   Problem &getProblem() override { return prob; }
-  void fillConstraintRow(SmallVector<int> &row,
-                         Problem::Dependence dep) override;
+  void fillConstraintRow(SmallVector<int> &row, Dependence dep) override;
   void fillAdditionalConstraintRow(SmallVector<int> &row,
-                                   Problem::Dependence dep) override;
+                                   Dependence dep) override;
 
 public:
   ChainingCyclicSimplexScheduler(ChainingCyclicProblem &prob, Operation *lastOp,
@@ -337,7 +334,7 @@ bool SimplexSchedulerBase::fillObjectiveRow(SmallVector<int> &row,
 }
 
 void SimplexSchedulerBase::fillConstraintRow(SmallVector<int> &row,
-                                             Problem::Dependence dep) {
+                                             Dependence dep) {
   auto &prob = getProblem();
   Operation *src = dep.getSource();
   Operation *dst = dep.getDestination();
@@ -349,8 +346,8 @@ void SimplexSchedulerBase::fillConstraintRow(SmallVector<int> &row,
   }
 }
 
-void SimplexSchedulerBase::fillAdditionalConstraintRow(
-    SmallVector<int> &row, Problem::Dependence dep) {
+void SimplexSchedulerBase::fillAdditionalConstraintRow(SmallVector<int> &row,
+                                                       Dependence dep) {
   // Handling is subclass-specific, so do nothing by default.
   (void)row;
   (void)dep;
@@ -838,7 +835,7 @@ LogicalResult SimplexScheduler::schedule() {
 //===----------------------------------------------------------------------===//
 
 void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
-                                               Problem::Dependence dep) {
+                                               Dependence dep) {
   Operation *src = dep.getSource();
   Operation *dst = dep.getDestination();
   unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
@@ -886,11 +883,11 @@ LogicalResult CyclicSimplexScheduler::schedule() {
 //===----------------------------------------------------------------------===//
 
 static bool isLimited(Operation *op, SharedOperatorsProblem &prob) {
-  for (auto extra : prob.getExtraLimitingTypes(op)) {
-    if (prob.getLimit(extra).value_or(0) > 0)
+  for (auto rsrc : prob.getLinkedResourceTypes(op)) {
+    if (prob.getResourceLimit(rsrc).value_or(0) > 0)
       return true;
   }
-  return prob.getLimit(*prob.getLinkedOperatorType(op)).value_or(0) > 0;
+  return false;
 }
 
 LogicalResult SharedOperatorsSimplexScheduler::schedule() {
@@ -941,25 +938,21 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
 
   // Store the number of operations using an operator type in a particular time
   // step.
-  SmallDenseMap<Problem::OperatorType, SmallDenseMap<unsigned, unsigned>>
+  SmallDenseMap<ResourceType, SmallDenseMap<unsigned, unsigned>>
       reservationTable;
 
   for (auto *op : limitedOps) {
-    auto opr = *prob.getLinkedOperatorType(op);
-    auto extraOprs = prob.getExtraLimitingTypes(op);
-    auto limit = prob.getLimit(opr);
+    auto resourceTypes = prob.getLinkedResourceTypes(op);
 
     // Find the first time step (beginning at the current start time in the
     // partial schedule) in which an operator instance is available.
     unsigned startTimeVar = startTimeVariables[op];
     unsigned candTime = getStartTime(startTimeVar);
     auto canSchedule = [&](unsigned candTime) {
-      if (limit.has_value() && reservationTable[opr].lookup(candTime) == *limit)
-        return false;
-      for (auto extraOpr : extraOprs) {
-        auto extraLimit = prob.getLimit(extraOpr);
-        if (extraLimit.has_value() && 
-            reservationTable[extraOpr].lookup(candTime) == *extraLimit)
+      for (auto rsrc : resourceTypes) {
+        auto extraLimit = prob.getResourceLimit(rsrc);
+        if (extraLimit.has_value() &&
+            reservationTable[rsrc].lookup(candTime) == *extraLimit)
           return false;
       }
       return true;
@@ -973,11 +966,9 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
     assert(succeeded(fixed));
     (void)fixed;
 
-    // Record the operator use.
-    ++reservationTable[opr][candTime];
-
-    for (auto extraOpr : extraOprs)
-      ++reservationTable[extraOpr][candTime];
+    // Record the resource uses.
+    for (auto rsrc : resourceTypes)
+      ++reservationTable[rsrc][candTime];
 
     LLVM_DEBUG(dbgs() << "After scheduling " << startTimeVar
                       << " to t=" << candTime << ":\n";
@@ -1023,30 +1014,34 @@ LogicalResult ModuloSimplexScheduler::checkLastOp() {
 
 LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
                                                  unsigned timeStep) {
-  auto opr = *sched.prob.getLinkedOperatorType(op);
-  auto lim = *sched.prob.getLimit(opr);
-  assert(lim > 0);
 
-  auto &revTab = reverseTables[opr];
-  assert(!revTab.count(op));
+  for (auto rsrc : sched.prob.getLinkedResourceTypes(op)) {
+    auto lim = sched.prob.getResourceLimit(rsrc);
+    assert(lim.has_value() && "resource type does not have limit");
+    assert(lim.value() > 0);
 
-  unsigned slot = timeStep % sched.parameterT;
-  auto &cell = tables[opr][slot];
-  if (cell.size() < lim) {
+    auto &revTab = reverseTables[rsrc];
+    assert(!revTab.count(op));
+
+    unsigned slot = timeStep % sched.parameterT;
+    auto &cell = tables[rsrc][slot];
+    if (cell.size() >= lim)
+      return failure();
     cell.insert(op);
     revTab[op] = slot;
-    return success();
   }
-  return failure();
+
+  return success();
 }
 
 void ModuloSimplexScheduler::MRT::release(Operation *op) {
-  auto opr = *sched.prob.getLinkedOperatorType(op);
-  auto &revTab = reverseTables[opr];
-  auto it = revTab.find(op);
-  assert(it != revTab.end());
-  tables[opr][it->second].erase(op);
-  revTab.erase(it);
+  for (auto rsrc : sched.prob.getLinkedResourceTypes(op)) {
+    auto &revTab = reverseTables[rsrc];
+    auto it = revTab.find(op);
+    assert(it != revTab.end());
+    tables[rsrc][it->second].erase(op);
+    revTab.erase(it);
+  }
 }
 
 bool ModuloSimplexScheduler::fillObjectiveRow(SmallVector<int> &row,
@@ -1197,14 +1192,20 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
 
 unsigned ModuloSimplexScheduler::computeResMinII() {
   unsigned resMinII = 1;
-  SmallDenseMap<Problem::OperatorType, unsigned> uses;
-  for (auto *op : prob.getOperations())
-    if (isLimited(op, prob))
-      ++uses[*prob.getLinkedOperatorType(op)];
+  SmallDenseMap<ResourceType, unsigned> uses;
+  for (auto *op : prob.getOperations()) {
+    if (isLimited(op, prob)) {
+      for (auto rsrc : prob.getLinkedResourceTypes(op)) {
+        ++uses[rsrc];
+      }
+    }
+  }
 
-  for (auto pair : uses)
-    resMinII = std::max(
-        resMinII, (unsigned)ceil(pair.second / *prob.getLimit(pair.first)));
+  for (auto pair : uses) {
+    resMinII =
+        std::max(resMinII, (unsigned)ceil(pair.second /
+                                          *prob.getResourceLimit(pair.first)));
+  }
 
   return resMinII;
 }
@@ -1271,7 +1272,7 @@ LogicalResult ModuloSimplexScheduler::schedule() {
 //===----------------------------------------------------------------------===//
 
 void ChainingSimplexScheduler::fillAdditionalConstraintRow(
-    SmallVector<int> &row, Problem::Dependence dep) {
+    SmallVector<int> &row, Dependence dep) {
   fillConstraintRow(row, dep);
   // One _extra_ time step breaks the chain (note that the latency is negative
   // in the tableau).
@@ -1312,15 +1313,15 @@ LogicalResult ChainingSimplexScheduler::schedule() {
 // ChainingCyclicSimplexScheduler
 //===----------------------------------------------------------------------===//
 
-void ChainingCyclicSimplexScheduler::fillConstraintRow(
-    SmallVector<int> &row, Problem::Dependence dep) {
+void ChainingCyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
+                                                       Dependence dep) {
   SimplexSchedulerBase::fillConstraintRow(row, dep);
   if (auto dist = prob.getDistance(dep))
     row[parameterTColumn] = *dist;
 }
 
 void ChainingCyclicSimplexScheduler::fillAdditionalConstraintRow(
-    SmallVector<int> &row, Problem::Dependence dep) {
+    SmallVector<int> &row, Dependence dep) {
   fillConstraintRow(row, dep);
   // One _extra_ time step breaks the chain (note that the latency is negative
   // in the tableau).

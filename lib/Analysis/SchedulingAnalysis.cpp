@@ -72,7 +72,7 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
 
       // memoryDep.source->dump();
       // Insert a dependence into the problem.
-      Problem::Dependence dep(memoryDep.source, op);
+      Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -107,13 +107,13 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
       return WalkResult::skip();
 
     // Model the implicit value flow from the `yield` to the `if`'s result(s).
-    Problem::Dependence depThen(thenBlock->getTerminator(), op);
+    Dependence depThen(thenBlock->getTerminator(), op);
     auto depInserted = problem.insertDependence(depThen);
     assert(succeeded(depInserted));
     (void)depInserted;
 
     if (elseBlock) {
-      Problem::Dependence depElse(elseBlock->getTerminator(), op);
+      Dependence depElse(elseBlock->getTerminator(), op);
       depInserted = problem.insertDependence(depElse);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -128,7 +128,7 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
   forOp.getBody()->walk([&](Operation *op) {
     if (op == anchor || !problem.hasOperation(op))
       return;
-    Problem::Dependence dep(op, anchor);
+    Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -146,7 +146,7 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
         continue;
 
       for (Operation *iterArgUser : iterArgs[i].getUsers()) {
-        Problem::Dependence dep(iterArgDefiner, iterArgUser);
+        Dependence dep(iterArgDefiner, iterArgUser);
         auto depInserted = problem.insertDependence(dep);
         assert(succeeded(depInserted));
         (void)depInserted;
@@ -203,7 +203,7 @@ void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeForOp(
         return;
 
       // Insert a dependence into the problem.
-      Problem::Dependence dep(memoryDep.source, op);
+      Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -237,7 +237,7 @@ void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeForOp(
   //         if (loop == otherLoop || !loop->isAncestor(otherLoop))
   //           continue;
 
-  //         Problem::Dependence dep(loop, otherLoop);
+  //         Dependence dep(loop, otherLoop);
   //         auto depInserted = problem.insertDependence(dep);
   //         assert(succeeded(depInserted));
   //       }
@@ -268,13 +268,13 @@ void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeForOp(
   //     return WalkResult::skip();
 
   //   // Model the implicit value flow from the `yield` to the `if`'s
-  //   result(s). Problem::Dependence depThen(thenBlock->getTerminator(), op);
+  //   result(s). Dependence depThen(thenBlock->getTerminator(), op);
   //   auto depInserted = problem.insertDependence(depThen);
   //   assert(succeeded(depInserted));
   //   (void)depInserted;
 
   //   if (elseBlock) {
-  //     Problem::Dependence depElse(elseBlock->getTerminator(), op);
+  //     Dependence depElse(elseBlock->getTerminator(), op);
   //     depInserted = problem.insertDependence(depElse);
   //     assert(succeeded(depInserted));
   //     (void)depInserted;
@@ -293,7 +293,7 @@ void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeForOp(
       return;
     if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface>(op))
       return;
-    Problem::Dependence dep(op, anchor);
+    Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -330,7 +330,7 @@ void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeFuncOp(
     //   dependence. if (!hasDependence(memoryDep.dependenceType))
     //     continue;
     //   // Insert a dependence into the problem.
-    //   Problem::Dependence dep(memoryDep.source, op);
+    //   Dependence dep(memoryDep.source, op);
     //   auto depInserted = problem.insertDependence(dep);
     //   assert(succeeded(depInserted));
     //   (void)depInserted;
@@ -357,7 +357,7 @@ void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeFuncOp(
   //       for (auto otherLoop : memOps[memoryDep.source]) {
   //         if (loop == otherLoop || !loop->isAncestor(otherLoop))
   //           continue;
-  //         Problem::Dependence dep(loop, otherLoop);
+  //         Dependence dep(loop, otherLoop);
   //         auto depInserted = problem.insertDependence(dep);
   //         assert(succeeded(depInserted));
   //       }
@@ -389,13 +389,13 @@ void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeFuncOp(
   //     return WalkResult::skip();
 
   //   // Model the implicit value flow from the `yield` to the `if`'s
-  //   result(s). Problem::Dependence depThen(thenBlock->getTerminator(), op);
+  //   result(s). Dependence depThen(thenBlock->getTerminator(), op);
   //   auto depInserted = problem.insertDependence(depThen);
   //   assert(succeeded(depInserted));
   //   (void)depInserted;
 
   //   if (elseBlock) {
-  //     Problem::Dependence depElse(elseBlock->getTerminator(), op);
+  //     Dependence depElse(elseBlock->getTerminator(), op);
   //     depInserted = problem.insertDependence(depElse);
   //     assert(succeeded(depInserted));
   //     (void)depInserted;
@@ -413,7 +413,7 @@ void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeFuncOp(
       return;
     if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface>(op))
       return;
-    Problem::Dependence dep(op, anchor);
+    Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;

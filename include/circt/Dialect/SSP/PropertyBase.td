@@ -70,11 +70,11 @@ class OperatorTypeProperty<Dialect dialect, string name, string type, string pro
     : PropertyBase<dialect, name, type, problem, traits> {
   let extraClassDeclaration = [{
     void setInProblem(}] # problemClassName # [{ &prob,
-                      ::circt::scheduling::Problem::OperatorType opr) {
+                      ::circt::scheduling::OperatorType opr) {
       prob.set}] # propertyName # [{(opr, }] # unwrapValue # [{);
     }
     static ::mlir::Attribute getFromProblem(}] # problemClassName # [{ &prob,
-                                            ::circt::scheduling::Problem::OperatorType opr,
+                                            ::circt::scheduling::OperatorType opr,
                                             ::mlir::MLIRContext *ctx) {
       if (auto optValue = prob.get}] # propertyName # [{(opr)) {
         auto value = *optValue;
@@ -90,11 +90,11 @@ class DependenceProperty<Dialect dialect, string name, string type, string probl
     : PropertyBase<dialect, name, type, problem, traits> {
   let extraClassDeclaration = [{
     void setInProblem(}] # problemClassName # [{ &prob,
-                      ::circt::scheduling::Problem::Dependence dep) {
+                      ::circt::scheduling::Dependence dep) {
       prob.set}] # propertyName # [{(dep, }] # unwrapValue # [{);
     }
     static ::mlir::Attribute getFromProblem(}] # problemClassName # [{ &prob,
-                                            ::circt::scheduling::Problem::Dependence dep,
+                                            ::circt::scheduling::Dependence dep,
                                             ::mlir::MLIRContext *ctx) {
       if (auto optValue = prob.get}] # propertyName # [{(dep)) {
         auto value = *optValue;

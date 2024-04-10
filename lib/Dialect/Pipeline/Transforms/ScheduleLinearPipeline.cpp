@@ -60,8 +60,8 @@ ScheduleLinearPipelinePass::schedulePipeline(UnscheduledPipelineOp pipeline) {
   // Load operator info from attribute.
   auto problem = Problem::get(pipeline);
 
-  DenseMap<SymbolRefAttr, Problem::OperatorType> operatorTypes;
-  SmallDenseMap<StringAttr, unsigned> oprIds;
+  DenseMap<SymbolRefAttr, OperatorType> operatorTypes;
+  SmallDenseMap<OperatorType, unsigned> oprIds;
 
   // Set operation operator types.
   auto returnOp =
@@ -71,7 +71,7 @@ ScheduleLinearPipelinePass::schedulePipeline(UnscheduledPipelineOp pipeline) {
     if (ignoreOp(&op))
       continue;
 
-    Problem::OperatorType operatorType;
+    OperatorType operatorType;
     bool isReturnOp = &op == returnOp.getOperation();
     if (isReturnOp) {
       // Construct an operator type for the return op (not an externally defined

@@ -20,6 +20,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -48,199 +49,6 @@ using namespace circt::scheduling;
 namespace circt {
 
 namespace loopschedule {
-
-struct MulStrengthReduction : OpConversionPattern<MulIOp> {
-  using OpConversionPattern<MulIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(MulIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (isa<BlockArgument>(op.getRhs()))
-      return failure();
-    auto *rhsDef = op.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto val = cast<IntegerAttr>(constOp.getValue());
-      if (llvm::isPowerOf2_32(val.getInt())) {
-        auto log = val.getValue().exactLogBase2();
-        auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), log);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
-        rewriter.replaceOpWithNewOp<arith::ShLIOp>(op, op.getLhs(),
-                                                   shift.getResult());
-        return success();
-      }
-    }
-
-    return failure();
-  }
-};
-
-struct RemUIStrengthReduction : OpConversionPattern<RemUIOp> {
-  using OpConversionPattern<RemUIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(RemUIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (isa<BlockArgument>(op.getRhs()))
-      return failure();
-    auto *rhsDef = op.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto val = cast<IntegerAttr>(constOp.getValue());
-      if (llvm::isPowerOf2_32(val.getInt())) {
-        auto shifted = val.getValue() - 1;
-        auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), shifted);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
-        rewriter.replaceOpWithNewOp<arith::AndIOp>(op, op.getLhs(),
-                                                   shift.getResult());
-        return success();
-      }
-    }
-
-    return failure();
-  }
-};
-
-struct RemSIStrengthReduction : OpConversionPattern<RemSIOp> {
-  using OpConversionPattern<RemSIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(RemSIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<arith::RemUIOp>(op, op.getLhs(), op.getRhs());
-
-    return success();
-  }
-};
-
-struct DivSIStrengthReduction : OpConversionPattern<DivSIOp> {
-  using OpConversionPattern<DivSIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(DivSIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (isa<BlockArgument>(op.getRhs()))
-      return failure();
-    auto *rhsDef = op.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto val = cast<IntegerAttr>(constOp.getValue());
-      if (llvm::isPowerOf2_32(val.getInt())) {
-        auto log = val.getValue().exactLogBase2();
-        auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), log);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
-        rewriter.replaceOpWithNewOp<arith::ShRUIOp>(op, op.getLhs(),
-                                                    shift.getResult());
-        return success();
-      }
-    }
-
-    return failure();
-  }
-};
-
-static bool mulLegalityCallback(Operation *op) {
-  if (auto mulOp = dyn_cast<arith::MulIOp>(op)) {
-    if (isa<BlockArgument>(mulOp.getRhs()))
-      return true;
-    auto *rhsDef = mulOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
-          -1) {
-        return false;
-      }
-    }
-    // return FoldSign<arith::MulIOp>::opIsLegal(mulOp);
-  }
-  return true;
-}
-
-static bool divSIOpLegalityCallback(Operation *op) {
-  if (auto divOp = dyn_cast<arith::DivSIOp>(op)) {
-    if (isa<BlockArgument>(divOp.getRhs()))
-      return true;
-    auto *rhsDef = divOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
-          -1) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-static bool remUILegalityCallback(Operation *op) {
-  if (auto remOp = dyn_cast<arith::RemUIOp>(op)) {
-    if (isa<BlockArgument>(remOp.getRhs()))
-      return true;
-    auto *rhsDef = remOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
-          -1) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-static bool remSILegalityCallback(Operation *op) {
-  if (auto remOp = dyn_cast<arith::RemSIOp>(op)) {
-    if (isa<BlockArgument>(remOp.getRhs()))
-      return true;
-    auto *rhsDef = remOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto rhsValue = cast<IntegerAttr>(constOp.getValue());
-      if (rhsValue.getValue().exactLogBase2() != -1) {
-        if (rhsValue.getInt() >= 0)
-          return false;
-      }
-    }
-  }
-  return true;
-}
-
-LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
-                                        mlir::Operation *op) {
-  // llvm::errs() << "post lowering opt\n";
-  // op->getParentOfType<ModuleOp>().dump();
-  ConversionTarget target(context);
-  target.addLegalDialect<AffineDialect, ArithDialect, memref::MemRefDialect,
-                         scf::SCFDialect>();
-
-  auto *ctx = &context;
-  RewritePatternSet patterns(ctx);
-
-  patterns.add<MulStrengthReduction>(ctx);
-  patterns.add<DivSIStrengthReduction>(ctx);
-  patterns.add<RemUIStrengthReduction>(ctx);
-  patterns.add<RemSIStrengthReduction>(ctx);
-
-  target.addDynamicallyLegalOp<MulIOp>(mulLegalityCallback);
-  target.addDynamicallyLegalOp<DivSIOp>(divSIOpLegalityCallback);
-  target.addDynamicallyLegalOp<RemUIOp>(remUILegalityCallback);
-  target.addDynamicallyLegalOp<RemSIOp>(remSILegalityCallback);
-  target.addLegalOp<LoopScheduleLoadOp>();
-  target.addLegalOp<LoopScheduleStoreOp>();
-  target.markUnknownOpDynamicallyLegal([](Operation *op) { return true; });
-
-  if (failed(applyPartialConversion(op, target, std::move(patterns))))
-    return failure();
-
-  // Loop invariant code motion to hoist produced constants out of loop
-  op->walk(
-      [&](LoopLikeOpInterface loopLike) { moveLoopInvariantCode(loopLike); });
-
-  mlir::IRRewriter rewriter(&context);
-  (void)mlir::runRegionDCE(rewriter, op->getRegions());
-
-  return success();
-}
 
 Value getMemref(Operation *op) {
   Value memref =
@@ -306,7 +114,7 @@ getModuloProblem(scf::ForOp forOp,
         continue;
 
       // Insert a dependence into the problem.
-      Problem::Dependence dep(memoryDep.source, op);
+      Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -324,10 +132,11 @@ getModuloProblem(scf::ForOp forOp,
   // Set the anchor for scheduling. Insert dependences from all stores to the
   // terminator to ensure the problem schedules them before the terminator.
   auto *anchor = forOp.getBody()->getTerminator();
+  problem.insertOperation(anchor);
   forOp.getBody()->walk([&](Operation *op) {
     if (op == anchor || !problem.hasOperation(op))
       return;
-    Problem::Dependence dep(op, anchor);
+    Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -345,7 +154,7 @@ getModuloProblem(scf::ForOp forOp,
         continue;
 
       for (Operation *iterArgUser : iterArgs[i].getUsers()) {
-        Problem::Dependence dep(iterArgDefiner, iterArgUser);
+        Dependence dep(iterArgDefiner, iterArgUser);
         auto depInserted = problem.insertDependence(dep);
         assert(succeeded(depInserted));
         (void)depInserted;
@@ -378,7 +187,7 @@ getSharedOperatorsProblem(scf::ForOp forOp,
         for (auto &operand : innerOp->getOpOperands()) {
           auto *definingOp = operand.get().getDefiningOp();
           if (definingOp && definingOp->getParentOp() == forOp) {
-            Problem::Dependence dep(definingOp, op);
+            Dependence dep(definingOp, op);
             auto depInserted = problem.insertDependence(dep);
             assert(succeeded(depInserted));
             (void)depInserted;
@@ -403,7 +212,7 @@ getSharedOperatorsProblem(scf::ForOp forOp,
         continue;
 
       // Insert a dependence into the problem.
-      Problem::Dependence dep(memoryDep.source, op);
+      Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -414,13 +223,15 @@ getSharedOperatorsProblem(scf::ForOp forOp,
   // terminator to ensure the problem schedules them before the terminator.
   assert(forOp.getLoopRegions().size() == 1);
   auto *anchor = forOp.getLoopRegions().front()->back().getTerminator();
+  problem.insertOperation(anchor);
   forOp.getLoopRegions().front()->walk([&](Operation *op) {
     if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
-        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr)
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
+        !problem.hasOperation(op))
       return;
     if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface>(op))
       return;
-    Problem::Dependence dep(op, anchor);
+    Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -455,7 +266,7 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
       if (memoryDep.distance > 0)
         continue;
       // Insert a dependence into the problem.
-      Problem::Dependence dep(memoryDep.source, op);
+      Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -465,11 +276,13 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
   // Set the anchor for scheduling. Insert dependences from all stores to the
   // terminator to ensure the problem schedules them before the terminator.
   auto *anchor = funcOp.getBody().back().getTerminator();
+  problem.insertOperation(anchor);
   funcOp.getBody().walk([&](Operation *op) {
     if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
-        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr)
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
+        !problem.hasOperation(op))
       return;
-    Problem::Dependence dep(op, anchor);
+    Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -478,9 +291,21 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
   return problem;
 }
 
-LogicalResult unrollSubLoops(AffineForOp &forOp) {
-  auto result = forOp.getBody()->walk<WalkOrder::PostOrder>([](AffineForOp op) {
-    if (loopUnrollFull(op).failed())
+LogicalResult unrollSubLoops(scf::ForOp &forOp) {
+  auto result = forOp.getBody()->walk<WalkOrder::PostOrder>([](scf::ForOp op) {
+    std::optional<int64_t> lbCstOp = getConstantIntValue(op.getLowerBound());
+    std::optional<int64_t> ubCstOp = getConstantIntValue(op.getUpperBound());
+    std::optional<int64_t> stepCstOp = getConstantIntValue(op.getStep());
+    if (!lbCstOp || !ubCstOp || !stepCstOp) {
+      return WalkResult::interrupt();
+    }
+    int64_t lbCst = lbCstOp.value();
+    int64_t ubCst = ubCstOp.value();
+    int64_t stepCst = stepCstOp.value();
+    assert(lbCst >= 0 && ubCst >= 0 && stepCst >= 0 &&
+           "expected positive loop bounds and step");
+    int64_t tripCount = mlir::ceilDiv(ubCst - lbCst, stepCst);
+    if (loopUnrollByFactor(op, tripCount).failed())
       return WalkResult::interrupt();
     return WalkResult::advance();
   });
