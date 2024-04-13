@@ -22,6 +22,7 @@
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OperationSupport.h"
@@ -101,10 +102,16 @@ circt::analysis::LoopScheduleDependenceAnalysis::LoopScheduleDependenceAnalysis(
             commonBlock->findAncestorOpInBlock(*destination);
         if (srcOrAncestor == nullptr || dstOrAncestor == nullptr)
           return;
+        
         // Check if the dst or its ancestor is before the src or its ancestor.
         // We want to dst to be before the src to insert iter-iteration deps.
         if ((dist != 0 && dstOrAncestor->isBeforeInBlock(srcOrAncestor)) ||
             (dist == 0 && srcOrAncestor->isBeforeInBlock(dstOrAncestor))) {
+          // Do not create dependencies on IfOps
+          if (isa<scf::IfOp>(srcOrAncestor))
+            srcOrAncestor = source;
+          if (isa<scf::IfOp>(dstOrAncestor))
+            dstOrAncestor = destination;
           results[dstOrAncestor].emplace_back(srcOrAncestor, dist);
         }
       }

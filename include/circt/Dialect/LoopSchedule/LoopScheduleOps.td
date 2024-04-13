@@ -18,6 +18,7 @@ include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/IR/RegionKindInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "circt/Dialect/LoopSchedule/LoopSchedule.td"
 include "circt/Dialect/LoopSchedule/LoopScheduleInterfaces.td"
 
@@ -551,5 +552,39 @@ def LoopScheduleAccessOp : LoopScheduleOp<"access",
   let hasCustomAssemblyFormat = 1;
 }
 
+def LoopScheduleYieldOp : LoopScheduleOp<"yield", [Pure, ReturnLike, Terminator,
+    HasParent<"LoopScheduleIfOp">]> {
+  let summary = "loop schedule if op yield";
+
+  let arguments = (ins Variadic<AnyType>:$results);
+  let builders = [OpBuilder<(ins), [{ /* nothing to do */ }]>];
+
+  let assemblyFormat =
+      [{  attr-dict ($results^ `:` type($results))? }];
+}
+
+def LoopScheduleIfOp : LoopScheduleOp<"if",
+       [SingleBlockImplicitTerminator<"LoopScheduleYieldOp">,
+        NoRegionArguments]> {
+  let summary = "Conditional if operator";
+
+  let arguments = (ins
+    I1:$cond
+  );
+
+  let results = (outs
+    Variadic<AnyType>:$output
+  );
+
+  let regions = (region
+    SizedRegion<1>:$body
+  );
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins "TypeRange":$resultTypes, "Value":$cond)>
+  ];
+
+  let hasCustomAssemblyFormat = 1;
+}
 
 #endif // CIRCIT_LOOP_SCHEDULE_OPS_TD
