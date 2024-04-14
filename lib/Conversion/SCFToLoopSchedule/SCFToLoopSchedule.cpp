@@ -183,8 +183,6 @@ void SCFToLoopSchedule::runOnOperation() {
       return signalPassFailure();
   }
 
-  getOperation().dump();
-
   // Schedule all remaining loops
   SmallVector<scf::ForOp> seqLoops;
 
@@ -277,9 +275,8 @@ std::string getUnqiueName(Operation *op) {
   return name;
 }
 
-LogicalResult
-SCFToLoopSchedule::recordMemoryResources(Operation *op, Region &body) {
-  op->dump();
+LogicalResult SCFToLoopSchedule::recordMemoryResources(Operation *op,
+                                                       Region &body) {
   SmallVector<std::unique_ptr<IfOpTypes>> ifOps;
   DenseMap<Value, SmallVector<std::string>> finalTypes;
 
@@ -399,11 +396,8 @@ LogicalResult
 SCFToLoopSchedule::addPredicateDependencies(Operation *op, Region &body, 
                                             SharedOperatorsProblem &problem) {
   for (auto it : predicateMap) {
-    llvm::errs() << "predicate: ";
     auto *op = it.first;
     auto pred = it.second;
-    pred.dump();
-    llvm::errs() << "\n";
     predicateUse[pred].push_back(op);
     auto *definingOp = pred.getDefiningOp();
     Dependence dep(definingOp, op);
@@ -1069,7 +1063,6 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
       OpBuilder::InsertionGuard g(builder);
       LoopScheduleIfOp ifOp;
       if (predicateMap.contains(op)) {
-        predicateMap.lookup(op).dump();
         Value cond = predicateMap.lookup(op);
         if (stageValueMaps[startTime].contains(cond))
           cond = stageValueMaps[startTime].lookup(cond); 
@@ -1700,7 +1693,6 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
     SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
     for (auto *op : group) {
       unsigned resultIndex = stageTerminator->getNumOperands();
-      op->dump();
       auto *newOp = builder.clone(*op, valueMap);
       dependenceAnalysis->replaceOp(op, newOp);
       if (opsWithReturns.contains(op)) {

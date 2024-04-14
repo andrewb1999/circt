@@ -332,7 +332,6 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                                  : WalkResult::interrupt();
     });
 
-    llvm::errs() << "built successfully\n";
     return success(opBuiltSuccessfully);
   }
 
@@ -1659,25 +1658,21 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
 
     buildPhaseGuards(op, phase, rewriter);
     buildPhaseStallValues(op, phase, rewriter);
-    // phase.dump();
 
     getState<ComponentLoweringState>().addBlockSchedulable(phase->getBlock(),
                                                            phase);
 
-    // Collect group names for the prologue or epilogue.
-    SmallVector<StringAttr> bodyGroups;
-
-    auto addBodyGroup = [&](Value v, calyx::StaticGroupOp group) {
+    auto addBodyGroup = [&](std::optional<Value> v,
+                            calyx::StaticGroupOp group) {
       Block *block = &phase.getBodyBlock();
-      auto *definingOp = v.getDefiningOp();
-      if (isa<LoopScheduleLoadOp, LoadInterface>(definingOp)) {
-        block = definingOp->getBlock();
+      if (v.has_value()) {
+        auto *definingOp = v->getDefiningOp();
+        if (isa<LoopScheduleLoadOp, LoadInterface>(definingOp)) {
+          block = definingOp->getBlock();
+        }
       }
       // Mark the group for scheduling in the pipeline's block.
-      getState<ComponentLoweringState>().addBlockSchedulable(
-          block, group);
-
-      bodyGroups.push_back(group.getSymNameAttr());
+      getState<ComponentLoweringState>().addBlockSchedulable(block, group);
     };
 
     MutableArrayRef<OpOperand> operands =
@@ -1686,7 +1681,6 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
     for (auto &operand : operands) {
       unsigned i = operand.getOperandNumber();
       Value value = operand.get();
-      // value.dump();
 
       // Get the pipeline register for that result.
       auto reg = pipelineRegisters[i];
@@ -1737,11 +1731,7 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       // Replace the stage result uses with the register out.
       phase->getResult(i).replaceAllUsesWith(pipelineRegister.getOut());
 
-      addBodyGroup(value, group);
-    }
-
-    // If cond group was given, add to phase
-    if (condGroup.has_value()) {
+      addBodyGroup(std::nullopt, group);
     }
 
     return success();
@@ -1762,18 +1752,6 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
     calyx::buildAssignmentsForRegisterWrite(
         rewriter, group, getState<ComponentLoweringState>().getComponentOp(),
         pipelineRegister, value);
-
-    // Mark the new group as the evaluating group.
-    // for (auto assign : group.getOps<calyx::AssignOp>()) {
-    //   auto *src = assign.getSrc().getDefiningOp();
-    //   if (!isa<calyx::CellInterface>(*src)
-    //       // ||
-    //       // dyn_cast<calyx::CellInterface>(*src).isCombinational()
-    //       ) {
-    //     getState<ComponentLoweringState>().registerEvaluatingGroup(
-    //         assign.getSrc(), group);
-    //   }
-    // }
 
     return group;
   }
@@ -2069,7 +2047,6 @@ class BuildControl : public calyx::FuncOpPartialLoweringPattern {
         getComponent().getControlOp().getBodyBlock());
     auto topLevelSeqOp = rewriter.create<calyx::SeqOp>(funcOp.getLoc());
     DenseSet<Block *> path;
-    funcOp.dump();
     return buildCFGControl(path, rewriter, topLevelSeqOp.getBodyBlock(),
                            nullptr, entryBlock);
   }
