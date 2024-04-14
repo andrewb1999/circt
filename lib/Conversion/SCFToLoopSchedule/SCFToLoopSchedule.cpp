@@ -259,8 +259,8 @@ struct IfOpTypes {
 
   scf::IfOp ifOp;
   bool inThen;
-  DenseMap<Value, SmallVector<std::string>> thenTypes;
-  DenseMap<Value, SmallVector<std::string>> elseTypes;
+  llvm::StringMap<SmallVector<std::string>> thenTypes;
+  llvm::StringMap<SmallVector<std::string>> elseTypes;
 };
 
 std::map<Operation *, std::string> uniqueName;
@@ -278,7 +278,7 @@ std::string getUnqiueName(Operation *op) {
 LogicalResult SCFToLoopSchedule::recordMemoryResources(Operation *op,
                                                        Region &body) {
   SmallVector<std::unique_ptr<IfOpTypes>> ifOps;
-  DenseMap<Value, SmallVector<std::string>> finalTypes;
+  llvm::StringMap<SmallVector<std::string>> finalTypes;
 
   // Insert ResourceTypes
   // This method is needed to ensure that resource uses in ifOp then and else
@@ -297,65 +297,49 @@ LogicalResult SCFToLoopSchedule::recordMemoryResources(Operation *op,
           ifOpTypes = ifOps.pop_back_val();
           for (auto &it : ifOpTypes->thenTypes) {
             for (const auto& rsrc : it.second)
-              finalTypes[it.first].push_back(rsrc);
+              finalTypes[it.first()].push_back(rsrc);
           }
           for (auto &it : ifOpTypes->elseTypes) {
             for (const auto& rsrc : it.second)
-              finalTypes[it.first].push_back(rsrc);
+              finalTypes[it.first()].push_back(rsrc);
           }
         }
       }
-    } else if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp>(op)) {
-      Value memRef = getMemref(op);
+    } else if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp, LoadInterface,
+                   StoreInterface>(op)) {
+      std::string name;
+      if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp>(op)) {
+        Value memRef = getMemref(op);
+        name = "mem_" + std::to_string(hash_value(memRef));
+      } else if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*op)) {
+        name = loadOp.getUniqueId();
+      } else {
+        auto storeOp = cast<loopschedule::StoreInterface>(*op);
+        name = storeOp.getUniqueId();
+      }
       if (!ifOps.empty()) {
         auto &ifOpTypes = ifOps.back();
         auto ifOp = ifOpTypes->ifOp;
-        std::string memRsrc = "mem_" + std::to_string(hash_value(memRef))
-                              + "_" + getUnqiueName(ifOp) 
-                              + (ifOpTypes->inThen ? "then" : "else");
+        std::string memRsrc = name + "_" + getUnqiueName(ifOp) +
+                              (ifOpTypes->inThen ? "then" : "else");
         resourceMap[op].push_back(memRsrc);
         resourceSet.insert(memRsrc);
         auto &thenOrElseMap =
             ifOpTypes->inThen ? ifOpTypes->thenTypes : ifOpTypes->elseTypes;
-        for (const auto& opr : thenOrElseMap[memRef]) {
+        for (const auto &opr : thenOrElseMap[name]) {
           resourceMap[op].push_back(opr);
         }
-        thenOrElseMap[memRef].push_back(memRsrc);
+        thenOrElseMap[name].push_back(memRsrc);
+      } else {
+        finalTypes[name].push_back(name);
+        resourceSet.insert(name);
       }
 
-      for (const auto& opr : finalTypes[memRef]) {
+      for (const auto &opr : finalTypes[name]) {
         resourceMap[op].push_back(opr);
       }
     }
   });
-
-  // Insert ifOp result dependencies
-  // auto insertIfDeps = [&](scf::IfOp op, Operation *term) {
-  //   for (auto it : llvm::enumerate(term->getOperands())) {
-  //     auto i = it.index();
-  //     auto operand = it.value();
-  //     auto *definingOp = operand.getDefiningOp();
-  //     if (problem.hasOperation(definingOp)) {
-  //       for (auto *user : op.getResult(i).getUsers()) {
-  //         if (problem.hasOperation(user)) {
-  //           Dependence dep(definingOp, user);
-  //           auto depInserted = problem.insertDependence(dep);
-  //           assert(succeeded(depInserted));
-  //           (void)depInserted;
-  //         }
-  //       }
-  //     }
-  //   }
-  // };
-
-  // body.walk([&](scf::IfOp op) {
-  //   auto *thenTerm = op.thenBlock()->getTerminator();
-  //   insertIfDeps(op, thenTerm);
-  //   if (op.elseBlock()) {
-  //     auto *elseTerm = op.elseBlock()->getTerminator();
-  //     insertIfDeps(op, elseTerm);
-  //   }
-  // });
 
   return success();
 }
@@ -363,17 +347,6 @@ LogicalResult SCFToLoopSchedule::recordMemoryResources(Operation *op,
 LogicalResult
 SCFToLoopSchedule::addMemoryResources(Operation *op, Region &body, 
                                       SharedOperatorsProblem &problem) {
-
-  // for (const auto& it : resourceMap) {
-  //   auto *op = it.first;
-  //   auto rsrcs = it.second;
-  //   llvm::errs() << "Resources for:\n";
-  //   op->dump();
-  //   for (const auto& rsrc : rsrcs) {
-  //     llvm::errs() << "resource: ";
-  //     llvm::errs() << rsrc << "\n";
-  //   }
-  // }
 
   for (const auto& name : resourceSet) {
     auto memRsrc = problem.getOrInsertResourceType(name);
@@ -559,43 +532,30 @@ SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
           OperatorType memOpr = problem.getOrInsertOperatorType(
               "mem_" + std::to_string(hash_value(memRef)));
           problem.setLatency(memOpr, 1);
-          // problem.setLimit(memOpr, 1);
           problem.setLinkedOperatorType(memOp, memOpr);
           return WalkResult::advance();
         })
         .Case<LoopScheduleLoadOp, AffineLoadOp>([&](Operation *memOp) {
-          Value memRef = isa<AffineLoadOp>(*memOp)
-                             ? cast<AffineLoadOp>(*memOp).getMemRef()
-                             : cast<LoopScheduleLoadOp>(*memOp).getMemRef();
+          Value memRef = getMemref(memOp);
           OperatorType memOpr = problem.getOrInsertOperatorType(
               "mem_" + std::to_string(hash_value(memRef)));
           problem.setLatency(memOpr, 1);
-          // problem.setLimit(memOpr, 1);
           problem.setLinkedOperatorType(memOp, memOpr);
           return WalkResult::advance();
         })
-        .Case<loopschedule::LoadInterface>([&](Operation *op) {
-          auto loadOp = cast<loopschedule::LoadInterface>(*op);
-          auto latency = loadOp.getLatency();
-          // auto limitOpt = loadOp.getLimit();
-          OperatorType portOpr =
-              problem.getOrInsertOperatorType(loadOp.getUniqueId());
+        .Case<LoadInterface, StoreInterface>([&](Operation *op) {
+          unsigned latency;
+          std::string uniqueId;
+          if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*op)) {
+            latency = loadOp.getLatency();
+            uniqueId = loadOp.getUniqueId();
+          } else {
+            auto storeOp = cast<loopschedule::StoreInterface>(*op);
+            latency = storeOp.getLatency();
+            uniqueId = storeOp.getUniqueId();
+          }
+          OperatorType portOpr = problem.getOrInsertOperatorType(uniqueId);
           problem.setLatency(portOpr, latency);
-          // if (limitOpt.has_value())
-          //   problem.setLimit(portOpr, limitOpt.value());
-          problem.setLinkedOperatorType(op, portOpr);
-
-          return WalkResult::advance();
-        })
-        .Case<loopschedule::StoreInterface>([&](Operation *op) {
-          auto storeOp = cast<loopschedule::StoreInterface>(*op);
-          auto latency = storeOp.getLatency();
-          // auto limitOpt = storeOp.getLimit();
-          OperatorType portOpr =
-              problem.getOrInsertOperatorType(storeOp.getUniqueId());
-          problem.setLatency(portOpr, latency);
-          // if (limitOpt.has_value())
-          //   problem.setLimit(portOpr, limitOpt.value());
           problem.setLinkedOperatorType(op, portOpr);
 
           return WalkResult::advance();
