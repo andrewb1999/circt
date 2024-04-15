@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Scheduling/Algorithms.h"
+#include "circt/Scheduling/Problems.h"
 #include "circt/Scheduling/Utilities.h"
 
 #include "mlir/IR/Operation.h"
@@ -1015,6 +1016,10 @@ LogicalResult ModuloSimplexScheduler::checkLastOp() {
 LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
                                                  unsigned timeStep) {
 
+  DenseSet<ResourceType> usedRsrcs;
+  SmallDenseMap<ResourceType, TableType> tempTables(tables);
+
+  unsigned slot = timeStep % sched.parameterT;
   for (auto rsrc : sched.prob.getLinkedResourceTypes(op)) {
     auto lim = sched.prob.getResourceLimit(rsrc);
     assert(lim.has_value() && "resource type does not have limit");
@@ -1023,10 +1028,19 @@ LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
     auto &revTab = reverseTables[rsrc];
     assert(!revTab.count(op));
 
-    unsigned slot = timeStep % sched.parameterT;
-    auto &cell = tables[rsrc][slot];
+    auto &cell = tempTables[rsrc][slot];
     if (cell.size() >= lim)
       return failure();
+    cell.insert(op);
+    usedRsrcs.insert(rsrc);
+  }
+
+  for (auto rsrc : usedRsrcs) {
+    auto &revTab = reverseTables[rsrc];
+    assert(!revTab.count(op));
+    auto &cell = tables[rsrc][slot];
+    auto lim = sched.prob.getResourceLimit(rsrc);
+    assert(cell.size() < lim);
     cell.insert(op);
     revTab[op] = slot;
   }

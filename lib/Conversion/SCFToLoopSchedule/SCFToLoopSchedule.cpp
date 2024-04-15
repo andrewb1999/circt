@@ -302,7 +302,7 @@ LogicalResult SCFToLoopSchedule::recordMemoryResources(Operation *op,
                                                        Region &body) {
   resourceMap.clear();
   resourceLimits.clear();
-  SmallVector<std::unique_ptr<IfOpTypes>> ifOps;
+  std::vector<std::unique_ptr<IfOpTypes>> ifOps;
   llvm::StringMap<SmallVector<std::string>> finalTypes;
 
   // Insert ResourceTypes
@@ -322,14 +322,16 @@ LogicalResult SCFToLoopSchedule::recordMemoryResources(Operation *op,
         if (ifOpTypes->inThen) {
           ifOpTypes->inThen = false;
         } else {
-          ifOpTypes = ifOps.pop_back_val();
+          std::unique_ptr<IfOpTypes> ifOpTypes = std::move(ifOps.back());
+          ifOps.pop_back();
+          assert(ifOpTypes.get() != nullptr);
           for (auto &it : ifOpTypes->thenTypes) {
-            for (const auto& rsrc : it.second)
-              finalTypes[it.first()].push_back(rsrc);
+            for (auto &rsrc : it.second)
+              finalTypes[it.first()].push_back(std::move(rsrc));
           }
           for (auto &it : ifOpTypes->elseTypes) {
-            for (const auto& rsrc : it.second)
-              finalTypes[it.first()].push_back(rsrc);
+            for (auto &rsrc : it.second)
+              finalTypes[it.first()].push_back(std::move(rsrc));
           }
         }
       }
@@ -430,6 +432,8 @@ SCFToLoopSchedule::addPredicateDependencies(Operation *op, Region &body,
     auto pred = it.second;
     predicateUse[pred].push_back(op);
     auto *definingOp = pred.getDefiningOp();
+    assert(problem.hasOperation(definingOp));
+    assert(problem.hasOperation(op));
     Dependence dep(definingOp, op);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
@@ -438,21 +442,35 @@ SCFToLoopSchedule::addPredicateDependencies(Operation *op, Region &body,
   return success();
 }
 
-struct IfOpHoistingPattern : OpConversionPattern<scf::IfOp> {
+struct IfOpConversionPattern : OpConversionPattern<scf::IfOp> {
 public:
-  IfOpHoistingPattern(MLIRContext *context,
-                      PredicateMap &predicateMap)
-    : OpConversionPattern(context), predicateMap(predicateMap) {}
+  IfOpConversionPattern(MLIRContext *context, PredicateMap &predicateMap)
+      : OpConversionPattern<scf::IfOp>(context), predicateMap(predicateMap) {}
 
   LogicalResult
   matchAndRewrite(scf::IfOp ifOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    auto getNewPredicate = [&](Operation *op, Value cond,
+                               DenseMap<Value, Value> &condMap) {
+      if (condMap.contains(cond))
+        return condMap.lookup(cond);
+      Value newCond = cond;
+      if (predicateMap.contains(op)) {
+        auto currCond = predicateMap.lookup(op);
+        newCond = rewriter.create<arith::AndIOp>(ifOp.getLoc(), currCond, cond);
+      }
+      condMap.insert(std::pair(cond, newCond));
+      return newCond;
+    };
     rewriter.modifyOpInPlace(ifOp, [&]() {
       if (!ifOp.thenBlock()->without_terminator().empty()) {
         rewriter.splitBlock(ifOp.thenBlock(), --ifOp.thenBlock()->end());
+        DenseMap<Value, Value> condMap;
         ifOp.getThenRegion().front().walk([&](Operation *op) {
-          assert(!predicateMap.contains(op));
-          predicateMap.insert(std::pair(op, ifOp.getCondition()));
+          if (isa<scf::IfOp, scf::YieldOp>(op))
+            return;
+          Value newCond = getNewPredicate(op, ifOp.getCondition(), condMap);
+          predicateMap[op] = newCond;
         });
         rewriter.inlineBlockBefore(&ifOp.getThenRegion().front(), ifOp);
       }
@@ -464,9 +482,12 @@ public:
                                                       ifOp.getCondition(), 
                                                       constOne);
         rewriter.splitBlock(ifOp.elseBlock(), --ifOp.elseBlock()->end());
+        DenseMap<Value, Value> condMap;
         ifOp.getElseRegion().front().walk([&](Operation *op) {
-          assert(!predicateMap.contains(op));
-          predicateMap.insert(std::pair(op, condNot.getResult()));
+          if (isa<scf::IfOp, scf::YieldOp>(op))
+            return;
+          Value newCond = getNewPredicate(op, condNot, condMap);
+          predicateMap[op] = newCond;
         });
         rewriter.inlineBlockBefore(&ifOp.getElseRegion().front(), ifOp);
       }
@@ -525,7 +546,7 @@ SCFToLoopSchedule::ifOpConversion(Operation *op, Region &body) {
 
   auto *ctx = &getContext();
   RewritePatternSet patterns(ctx);
-  patterns.add<IfOpHoistingPattern>(ctx, predicateMap);
+  patterns.add<IfOpConversionPattern>(ctx, predicateMap);
   patterns.add<IfToSelectPattern>(ctx);
 
   return applyPartialConversion(op, target, std::move(patterns));
@@ -663,8 +684,8 @@ LogicalResult SCFToLoopSchedule::solveModuloProblem(scf::ForOp &loop,
   // Optionally debug problem inputs.
   LLVM_DEBUG(for (auto *op
                   : problem.getOperations()) {
-    if (auto parent = op->getParentOfType<LoopInterface>(); parent)
-      continue;
+    // if (auto parent = op->getParentOfType<LoopInterface>(); parent)
+    //   continue;
     llvm::dbgs() << "Modulo scheduling inputs for " << *op;
     auto opr = problem.getLinkedOperatorType(op);
     llvm::dbgs() << "\n  opr = " << opr->getName();
@@ -860,13 +881,21 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
     // Check each operation to see if its results need plumbing
     for (auto *op : group) {
       if (op->getUsers().empty()) {
-        if (llvm::none_of(op->getResults(), 
-              [&](Value v) { return predicateUse.contains(v); }))
-        continue;
+        if (llvm::none_of(op->getResults(),
+                          [&](Value v) { return predicateUse.contains(v); })) {
+          continue;
+        }
       }
 
       unsigned pipeEndTime = 0;
-      for (auto *user : op->getUsers()) {
+      SmallVector<Operation *> users;
+      users.append(op->getUsers().begin(), op->getUsers().end());
+
+      // Also check predicate users
+      for (auto res : op->getResults()) {
+        users.append(predicateUse.lookup(res));
+      }
+      for (auto *user : users) {
         unsigned userStartTime = *problem.getStartTime(user);
         if (*problem.getStartTime(user) > startTime)
           pipeEndTime = std::max(pipeEndTime, userStartTime);
