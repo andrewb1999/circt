@@ -1,4 +1,4 @@
-//===- AccessNameAnalysis.cpp ---------------------------------------------===//
+//===- NameAnalysis.cpp ---------------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "circt/Analysis/AccessNameAnalysis.h"
+#include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Debug/DebugOps.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -22,14 +22,17 @@ using namespace circt::loopschedule;
 using namespace mlir;
 using namespace affine;
 
-AccessNameAnalysis::AccessNameAnalysis(Operation *op) {
+NameAnalysis::NameAnalysis(Operation *op) {
   op->walk([&](Operation *op) {
     if (isa<AffineLoadOp, AffineStoreOp, memref::LoadOp, memref::StoreOp,
             LoopScheduleLoadOp, LoopScheduleStoreOp, LoadInterface,
             StoreInterface>(op)) {
-      auto nameAttr = op->getAttrOfType<StringAttr>("loopschedule.access_name");
+      auto nameAttr =
+          op->getAttrOfType<StringAttr>(NameAnalysis::getAttributeName());
       assert(nameAttr != nullptr &&
-             "memory access must have `loopschedule.access_name` attribute");
+             ("memory access must have `" + NameAnalysis::getAttributeName() +
+              "` attribute")
+                 .c_str());
       auto name = nameAttr.getValue();
       nameToOperationMap.insert(std::pair(name, op));
       operationToNameMap.insert(std::pair(op, name));
@@ -37,15 +40,15 @@ AccessNameAnalysis::AccessNameAnalysis(Operation *op) {
   });
 }
 
-Operation *AccessNameAnalysis::getOperationFromName(StringRef name) {
+Operation *NameAnalysis::getOperationFromName(StringRef name) {
   return nameToOperationMap.lookup(name);
 }
 
-StringRef AccessNameAnalysis::getOperationName(Operation *op) {
+StringRef NameAnalysis::getOperationName(Operation *op) {
   return operationToNameMap.lookup(op);
 }
 
-void AccessNameAnalysis::replaceOp(Operation *oldOp, Operation *newOp) {
+void NameAnalysis::replaceOp(Operation *oldOp, Operation *newOp) {
   assert(operationToNameMap.contains(oldOp));
   auto name = getOperationName(oldOp);
   operationToNameMap.erase(oldOp);

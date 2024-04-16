@@ -12,7 +12,7 @@
 
 #include "PassDetails.h"
 
-#include "circt/Analysis/AccessNameAnalysis.h"
+#include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleAttributes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h"
@@ -240,14 +240,14 @@ static void insertDependencies(const MemoryDependenceResult &results,
   for (const auto &val : results) {
     auto *destination = val.first;
     auto dependencies = val.second;
-    auto destName =
-        destination->getAttrOfType<StringAttr>("loopschedule.access_name");
+    auto destName = destination->getAttrOfType<StringAttr>(
+        NameAnalysis::getAttributeName());
     auto dependsOn = builder.create<LoopScheduleDependsOnOp>(destName);
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(dependsOn.getBodyBlock());
     for (auto dep : dependencies) {
-      auto sourceName =
-          dep.source->getAttrOfType<StringAttr>("loopschedule.access_name");
+      auto sourceName = dep.source->getAttrOfType<StringAttr>(
+          NameAnalysis::getAttributeName());
       auto dist =
           dep.distance > 0 ? builder.getI64IntegerAttr(dep.distance) : nullptr;
       builder.create<LoopScheduleAccessOp>(sourceName, dist);
@@ -257,7 +257,7 @@ static void insertDependencies(const MemoryDependenceResult &results,
 
 void ConstructMemoryDependenciesPass::runOnOperation() {
   auto funcOp = getOperation();
-  auto nameAnalysis = getAnalysis<AccessNameAnalysis>();
+  auto nameAnalysis = getAnalysis<NameAnalysis>();
 
   MemoryDependenceResult results;
 

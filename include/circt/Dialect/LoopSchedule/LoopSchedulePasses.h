@@ -23,6 +23,7 @@ namespace loopschedule {
 
 std::unique_ptr<mlir::Pass> createMarkMemoryAccessesPass();
 std::unique_ptr<mlir::Pass> createConstructMemoryDependenciesPass();
+std::unique_ptr<mlir::Pass> createUnrollSubLoopsPass();
 std::unique_ptr<mlir::Pass> createBitwidthReductionForLoopSchedulePass();
 std::unique_ptr<mlir::Pass> createUnrollForLoopSchedulePass();
 std::unique_ptr<mlir::Pass> createPipelineForLoopSchedulePass();

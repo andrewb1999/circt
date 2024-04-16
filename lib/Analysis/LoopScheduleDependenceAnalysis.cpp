@@ -12,7 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Analysis/LoopScheduleDependenceAnalysis.h"
-#include "circt/Analysis/AccessNameAnalysis.h"
+#include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
@@ -30,7 +30,6 @@
 
 using namespace mlir;
 using namespace mlir::affine;
-// using namespace circt;
 using namespace circt::analysis;
 using namespace circt::loopschedule;
 
@@ -76,7 +75,7 @@ static Block *getCommonBlockInAffineScope(Operation *opA, Operation *opB) {
 circt::analysis::LoopScheduleDependenceAnalysis::LoopScheduleDependenceAnalysis(
     Operation *op, AnalysisManager &analysisManager) {
   auto funcOp = cast<func::FuncOp>(op);
-  auto accessNameAnalysis = analysisManager.getAnalysis<AccessNameAnalysis>();
+  auto accessNameAnalysis = analysisManager.getAnalysis<NameAnalysis>();
 
   if (!funcOp->hasAttrOfType<SymbolRefAttr>("loopschedule.dependencies"))
     return;
@@ -141,11 +140,6 @@ void circt::analysis::LoopScheduleDependenceAnalysis::replaceOp(
     for (auto &dep : it.second) {
       if (OperationEquivalence::isEquivalentTo(
               dep.source, oldOp, OperationEquivalence::IgnoreLocations)) {
-        // if (dep.source == oldOp) {
-        // llvm::errs() << "replace dest\n";
-        // it.first->dump();
-        // llvm::errs() << "replace src\n";
-        // dep.source->dump();
         dep.source = newOp;
       }
     }

@@ -1,5 +1,5 @@
-//===- AccessNameAnalysis.h
-//----------------------------------------------------===//
+//===- NameAnalysis.h -----------------------------------------------------===//
+//-------------------------------------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -7,8 +7,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef CIRCT_ANALYSIS_ACCESSNAMEANALYSIS_H
-#define CIRCT_ANALYSIS_ACCESSNAMEANALYSIS_H
+#ifndef CIRCT_ANALYSIS_NAMEANALYSIS_H
+#define CIRCT_ANALYSIS_NAMEANALYSIS_H
 
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/Value.h"
@@ -26,8 +26,8 @@ class FuncOp;
 
 namespace circt {
 
-struct AccessNameAnalysis {
-  AccessNameAnalysis(Operation *op);
+struct NameAnalysis {
+  NameAnalysis(Operation *op);
 
   // Returns the operation that has a given name.
   Operation *getOperationFromName(StringRef name);
@@ -38,10 +38,13 @@ struct AccessNameAnalysis {
   // Updates name mapping from the oldOp to the newOp.
   void replaceOp(Operation *oldOp, Operation *newOp);
 
+  // Return attribute name
+  static std::string getAttributeName() { return "loopschedule.name"; }
+
   llvm::StringMap<Operation *> nameToOperationMap;
   llvm::MapVector<Operation *, StringRef> operationToNameMap;
 };
 
 } // namespace circt
 
-#endif // CIRCT_ANALYSIS_ACCESSNAMEANALYSIS_H
+#endif // CIRCT_ANALYSIS_NAMEANALYSIS_H

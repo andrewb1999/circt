@@ -291,31 +291,280 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
   return problem;
 }
 
-LogicalResult unrollSubLoops(scf::ForOp &forOp) {
-  auto result = forOp.getBody()->walk<WalkOrder::PostOrder>([](scf::ForOp op) {
-    std::optional<int64_t> lbCstOp = getConstantIntValue(op.getLowerBound());
-    std::optional<int64_t> ubCstOp = getConstantIntValue(op.getUpperBound());
-    std::optional<int64_t> stepCstOp = getConstantIntValue(op.getStep());
-    if (!lbCstOp || !ubCstOp || !stepCstOp) {
-      return WalkResult::interrupt();
+namespace {
+struct IfOpTypes {
+  IfOpTypes(scf::IfOp ifOp, bool inThen) : ifOp(ifOp), inThen(inThen) {}
+
+  scf::IfOp ifOp;
+  bool inThen;
+  llvm::StringMap<SmallVector<std::string>> thenTypes;
+  llvm::StringMap<SmallVector<std::string>> elseTypes;
+};
+} // namespace
+
+static std::map<Operation *, std::string> uniqueName;
+static int ifCounter = 0;
+
+static std::string getUnqiueName(Operation *op) {
+  if (uniqueName.count(op) > 0)
+    return uniqueName[op];
+  auto name = "if" + std::to_string(ifCounter);
+  uniqueName.insert(std::pair(op, name));
+  ifCounter++;
+  return name;
+}
+
+LogicalResult recordMemoryResources(Operation *op, Region &body,
+                                    ResourceMap &resourceMap,
+                                    ResourceLimits &resourceLimits) {
+  std::vector<std::unique_ptr<IfOpTypes>> ifOps;
+  llvm::StringMap<SmallVector<std::string>> finalTypes;
+
+  // Insert ResourceTypes
+  // This method is needed to ensure that resource uses in ifOp then and else
+  // blocks can be run in parallel.
+  body.walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (op->getParentOfType<LoopInterface>() != nullptr)
+      return;
+
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      ifOps.push_back(std::make_unique<IfOpTypes>(ifOp, true));
     }
-    int64_t lbCst = lbCstOp.value();
-    int64_t ubCst = ubCstOp.value();
-    int64_t stepCst = stepCstOp.value();
-    assert(lbCst >= 0 && ubCst >= 0 && stepCst >= 0 &&
-           "expected positive loop bounds and step");
-    int64_t tripCount = mlir::ceilDiv(ubCst - lbCst, stepCst);
-    if (loopUnrollByFactor(op, tripCount).failed())
-      return WalkResult::interrupt();
-    return WalkResult::advance();
+
+    if (auto yield = dyn_cast<scf::YieldOp>(op)) {
+      if (!ifOps.empty()) {
+        auto &ifOpTypes = ifOps.back();
+        if (ifOpTypes->inThen) {
+          ifOpTypes->inThen = false;
+        } else {
+          std::unique_ptr<IfOpTypes> ifOpTypes = std::move(ifOps.back());
+          ifOps.pop_back();
+          assert(ifOpTypes.get() != nullptr);
+          for (auto &it : ifOpTypes->thenTypes) {
+            for (auto &rsrc : it.second)
+              finalTypes[it.first()].push_back(std::move(rsrc));
+          }
+          for (auto &it : ifOpTypes->elseTypes) {
+            for (auto &rsrc : it.second)
+              finalTypes[it.first()].push_back(std::move(rsrc));
+          }
+        }
+      }
+    } else if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp, LoadInterface,
+                   StoreInterface>(op)) {
+      std::string name;
+      if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp>(op)) {
+        Value memRef = getMemref(op);
+        name = "mem_" + std::to_string(hash_value(memRef));
+      } else if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*op)) {
+        name = loadOp.getUniqueId();
+      } else {
+        auto storeOp = cast<loopschedule::StoreInterface>(*op);
+        name = storeOp.getUniqueId();
+      }
+      if (!ifOps.empty()) {
+        auto &ifOpTypes = ifOps.back();
+        auto ifOp = ifOpTypes->ifOp;
+        std::string memRsrc = name + "_" + getUnqiueName(ifOp) +
+                              (ifOpTypes->inThen ? "then" : "else");
+        resourceMap[op].push_back(memRsrc);
+        resourceLimits.insert(std::pair(memRsrc, 1));
+        auto &thenOrElseMap =
+            ifOpTypes->inThen ? ifOpTypes->thenTypes : ifOpTypes->elseTypes;
+        for (const auto &opr : thenOrElseMap[name]) {
+          resourceMap[op].push_back(opr);
+        }
+        thenOrElseMap[name].push_back(memRsrc);
+      } else {
+        finalTypes[name].push_back(name);
+        resourceLimits.insert(std::pair(name, 1));
+      }
+
+      for (const auto &opr : finalTypes[name]) {
+        resourceMap[op].push_back(opr);
+      }
+    } else if (auto loop = dyn_cast<LoopInterface>(op)) {
+      assert(ifOps.empty() &&
+             "Loops inside if statements is unsupported currently");
+      loop.getBodyBlock()->walk([&](Operation *op) {
+        std::string name;
+        if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp>(op)) {
+          Value memRef = getMemref(op);
+          name = "mem_" + std::to_string(hash_value(memRef));
+          resourceLimits.insert(std::pair(name, 1));
+          finalTypes[name].push_back(name);
+        } else if (isa<LoadInterface, StoreInterface>(op)) {
+          std::optional<unsigned> limitOpt;
+          if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*op)) {
+            limitOpt = loadOp.getLimit();
+            name = loadOp.getUniqueId();
+          } else if (auto storeOp =
+                         dyn_cast<loopschedule::StoreInterface>(*op)) {
+            limitOpt = storeOp.getLimit();
+            name = storeOp.getUniqueId();
+          }
+          if (limitOpt.has_value()) {
+            finalTypes[name].push_back(name);
+            resourceLimits.insert(std::pair(name, limitOpt.value()));
+          }
+        }
+        for (const auto &opr : finalTypes[name]) {
+          resourceMap[op].push_back(opr);
+        }
+      });
+    }
   });
 
-  if (result.wasInterrupted()) {
-    forOp.emitOpError("Could not unroll sub loops");
-    return failure();
+  return success();
+}
+
+LogicalResult addMemoryResources(Operation *op, Region &body,
+                                 scheduling::SharedOperatorsProblem &problem,
+                                 ResourceMap &resourceMap,
+                                 ResourceLimits &resourceLimits) {
+
+  for (const auto &it : resourceLimits) {
+    auto memRsrc = problem.getOrInsertResourceType(it.getKey());
+    problem.setResourceLimit(memRsrc, it.getValue());
+  }
+
+  for (const auto &it : resourceMap) {
+    auto *op = it.first;
+    auto rsrcs = it.second;
+    for (const auto &name : rsrcs) {
+      auto memRsrc = problem.getOrInsertResourceType(name);
+      problem.addResourceType(op, memRsrc);
+    }
   }
 
   return success();
+}
+
+struct IfOpConversionPattern : OpConversionPattern<scf::IfOp> {
+public:
+  IfOpConversionPattern(MLIRContext *context, PredicateMap &predicateMap)
+      : OpConversionPattern<scf::IfOp>(context), predicateMap(predicateMap) {}
+
+  LogicalResult
+  matchAndRewrite(scf::IfOp ifOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto getNewPredicate = [&](Operation *op, Value cond,
+                               DenseMap<Value, Value> &condMap) {
+      if (condMap.contains(cond))
+        return condMap.lookup(cond);
+      Value newCond = cond;
+      if (predicateMap.contains(op)) {
+        auto currCond = predicateMap.lookup(op);
+        newCond = rewriter.create<arith::AndIOp>(ifOp.getLoc(), currCond, cond);
+      }
+      condMap.insert(std::pair(cond, newCond));
+      return newCond;
+    };
+    rewriter.modifyOpInPlace(ifOp, [&]() {
+      if (!ifOp.thenBlock()->without_terminator().empty()) {
+        rewriter.splitBlock(ifOp.thenBlock(), --ifOp.thenBlock()->end());
+        DenseMap<Value, Value> condMap;
+        ifOp.getThenRegion().front().walk([&](Operation *op) {
+          if (isa<scf::IfOp, scf::YieldOp>(op))
+            return;
+          Value newCond = getNewPredicate(op, ifOp.getCondition(), condMap);
+          predicateMap[op] = newCond;
+        });
+        rewriter.inlineBlockBefore(&ifOp.getThenRegion().front(), ifOp);
+      }
+      if (ifOp.elseBlock() && !ifOp.elseBlock()->without_terminator().empty()) {
+        rewriter.setInsertionPoint(ifOp);
+        auto constOne = rewriter.create<arith::ConstantOp>(
+            ifOp.getLoc(), rewriter.getIntegerAttr(rewriter.getI1Type(), 1));
+        auto condNot = rewriter.create<arith::XOrIOp>(
+            ifOp.getLoc(), ifOp.getCondition(), constOne);
+        rewriter.splitBlock(ifOp.elseBlock(), --ifOp.elseBlock()->end());
+        DenseMap<Value, Value> condMap;
+        ifOp.getElseRegion().front().walk([&](Operation *op) {
+          if (isa<scf::IfOp, scf::YieldOp>(op))
+            return;
+          Value newCond = getNewPredicate(op, condNot, condMap);
+          predicateMap[op] = newCond;
+        });
+        rewriter.inlineBlockBefore(&ifOp.getElseRegion().front(), ifOp);
+      }
+    });
+
+    return success();
+  }
+
+private:
+  PredicateMap &predicateMap;
+};
+
+struct IfToSelectPattern : OpConversionPattern<scf::IfOp> {
+  using OpConversionPattern<scf::IfOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!op.thenBlock()->without_terminator().empty() || !op.elseBlock()) {
+      return failure();
+    }
+
+    if (op.elseBlock() && !op.elseBlock()->without_terminator().empty()) {
+      return failure();
+    }
+
+    auto thenOperands = op.thenYield().getOperands();
+    auto elseOperands = op.elseYield().getOperands();
+
+    for (auto iv : llvm::enumerate(llvm::zip(thenOperands, elseOperands))) {
+      auto i = iv.index();
+      auto v = iv.value();
+      SmallVector<Value> operands;
+      operands.push_back(op.getCondition());
+      operands.push_back(std::get<0>(v));
+      operands.push_back(std::get<1>(v));
+      auto selectOp = rewriter.create<arith::SelectOp>(op.getLoc(), operands);
+      auto ifRes = op.getResult(i);
+      rewriter.replaceAllUsesWith(ifRes, selectOp.getResult());
+    }
+
+    rewriter.eraseOp(op);
+
+    return success();
+  }
+};
+
+LogicalResult ifOpConversion(Operation *op, Region &body,
+                             PredicateMap &predicateMap) {
+  predicateMap.clear();
+  auto *ctx = op->getContext();
+  ConversionTarget target(*ctx);
+  target
+      .addLegalDialect<arith::ArithDialect, scf::SCFDialect, func::FuncDialect,
+                       loopschedule::LoopScheduleDialect>();
+  target.addIllegalOp<scf::IfOp>();
+
+  RewritePatternSet patterns(ctx);
+  patterns.add<IfOpConversionPattern>(ctx, predicateMap);
+  patterns.add<IfToSelectPattern>(ctx);
+
+  return applyPartialConversion(op, target, std::move(patterns));
+}
+
+void addPredicateDependencies(Operation *op, Region &body,
+                              scheduling::SharedOperatorsProblem &problem,
+                              const PredicateMap &predicateMap,
+                              PredicateUse &predicateUse) {
+  predicateUse.clear();
+  for (auto it : predicateMap) {
+    auto *op = it.first;
+    auto pred = it.second;
+    predicateUse[pred].push_back(op);
+    auto *definingOp = pred.getDefiningOp();
+    assert(problem.hasOperation(definingOp));
+    assert(problem.hasOperation(op));
+    Dependence dep(definingOp, op);
+    auto depInserted = problem.insertDependence(dep);
+    assert(succeeded(depInserted));
+  }
 }
 
 } // namespace loopschedule

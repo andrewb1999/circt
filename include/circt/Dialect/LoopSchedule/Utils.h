@@ -24,13 +24,10 @@ namespace circt {
 
 namespace loopschedule {
 
-// Lowers affine structures for LoopSchedule while retaining memory dependence
-// analysis.
-mlir::LogicalResult ifOpHoisting(mlir::MLIRContext &context,
-                                 mlir::Operation *op);
-
-mlir::LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
-                                              mlir::Operation *op);
+using PredicateMap = llvm::DenseMap<Operation *, Value>;
+using PredicateUse = llvm::DenseMap<Value, SmallVector<Operation *>>;
+using ResourceMap = llvm::DenseMap<Operation *, SmallVector<std::string>>;
+using ResourceLimits = llvm::StringMap<unsigned>;
 
 Value getMemref(Operation *op);
 
@@ -46,15 +43,22 @@ scheduling::SharedOperatorsProblem getSharedOperatorsProblem(
     mlir::func::FuncOp funcOp,
     analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
-LogicalResult unrollSubLoops(mlir::scf::ForOp &forOp);
+LogicalResult recordMemoryResources(Operation *op, Region &body,
+                                    ResourceMap &resourceMap,
+                                    ResourceLimits &resourceLimits);
 
-LogicalResult replaceMemoryAccesses(
-    mlir::MLIRContext &context, mlir::Operation *op,
-    analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
+LogicalResult addMemoryResources(Operation *op, Region &body,
+                                 scheduling::SharedOperatorsProblem &problem,
+                                 ResourceMap &resourceMap,
+                                 ResourceLimits &resourceLimits);
 
-LogicalResult bitwidthMinimization(
-    mlir::MLIRContext &context, mlir::Operation *op,
-    analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
+LogicalResult ifOpConversion(Operation *op, Region &body,
+                             PredicateMap &predicateMap);
+
+void addPredicateDependencies(Operation *op, Region &body,
+                              scheduling::SharedOperatorsProblem &problem,
+                              const PredicateMap &predicateMap,
+                              PredicateUse &predicateUse);
 
 } // namespace loopschedule
 } // namespace circt

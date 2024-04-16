@@ -8,6 +8,7 @@
 
 #include "circt/Conversion/MemrefToLoopSchedule.h"
 #include "../PassDetail.h"
+#include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -39,8 +40,9 @@ public:
     auto newOp = rewriter.replaceOpWithNewOp<LoopScheduleLoadOp>(
         op.getOperation(), op.getResult().getType(), op.getMemRef(),
         op.getIndices());
-    auto accessName = op->getAttrOfType<StringAttr>("loopschedule.access_name");
-    newOp->setAttr("loopschedule.access_name", accessName);
+    auto accessName =
+        op->getAttrOfType<StringAttr>(NameAnalysis::getAttributeName());
+    newOp->setAttr(NameAnalysis::getAttributeName(), accessName);
     return success();
   }
 };
@@ -55,8 +57,9 @@ public:
     auto newOp = rewriter.replaceOpWithNewOp<LoopScheduleStoreOp>(
         op.getOperation(), op.getValueToStore(), op.getMemRef(),
         op.getIndices());
-    auto accessName = op->getAttrOfType<StringAttr>("loopschedule.access_name");
-    newOp->setAttr("loopschedule.access_name", accessName);
+    auto accessName =
+        op->getAttrOfType<StringAttr>(NameAnalysis::getAttributeName());
+    newOp->setAttr(NameAnalysis::getAttributeName(), accessName);
     return success();
   }
 };

@@ -27,6 +27,13 @@ def ConstructMemoryDependencies : Pass<"construct-memory-dependencies", "mlir::f
   let dependentDialects = ["circt::loopschedule::LoopScheduleDialect"];
 }
 
+def UnrollSubLoops : Pass<"unroll-sub-loops", "::mlir::func::FuncOp"> {
+  let summary = "Unroll loops within other pipelined loops to enable scheduling";
+  let description = [{Unroll loops within other pipelined loops to enable scheduling}];
+  let constructor = "circt::loopschedule::createUnrollSubLoopsPass()";
+  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::func::FuncDialect"];
+}
+
 def BitwidthReductionForLoopSchedule : Pass<"bitwidth-reduction-for-loopschedule", "::mlir::func::FuncOp"> {
   let summary = "Reduce bitwidth of ops before lowering to loopschedule";
   let description = [{Reduce bitwidth of ops before lowering to loopschedule}];

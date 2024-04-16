@@ -4,6 +4,7 @@ add_circt_dialect_library(CIRCTLoopScheduleTransforms
   UnrollForLoopSchedule.cpp
   PipelineForLoopSchedule.cpp
   BitwidthReductionForLoopSchedule.cpp
+  UnrollSubLoops.cpp
 
   DEPENDS
   CIRCTLoopScheduleTransformsIncGen

@@ -8,7 +8,7 @@
 
 #include "circt/Conversion/AffineToSCF.h"
 #include "../PassDetail.h"
-#include "circt/Analysis/AccessNameAnalysis.h"
+#include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
@@ -42,8 +42,6 @@ using namespace circt::loopschedule;
 
 namespace {
 
-const std::string accessNameAttrName = "loopschedule.access_name";
-
 /// Apply the affine map from an 'affine.load' operation to its operands, and
 /// feed the results to a newly created 'memref.load' operation (which replaces
 /// the original 'affine.load').
@@ -62,14 +60,15 @@ public:
     if (!resultOperands)
       return failure();
 
-    auto accessName =
-        affineLoadOp->getAttrOfType<StringAttr>(accessNameAttrName);
+    auto accessName = affineLoadOp->getAttrOfType<StringAttr>(
+        NameAnalysis::getAttributeName());
     // Replace with simple load operation and keep correspondance between the
     // two operations
     memref::LoadOp loadOp = rewriter.replaceOpWithNewOp<memref::LoadOp>(
         affineLoadOp, affineLoadOp.getMemRef(), *resultOperands);
-    if (affineLoadOp->hasAttrOfType<StringAttr>(accessNameAttrName))
-      loadOp->setAttr(accessNameAttrName, accessName);
+    if (affineLoadOp->hasAttrOfType<StringAttr>(
+            NameAnalysis::getAttributeName()))
+      loadOp->setAttr(NameAnalysis::getAttributeName(), accessName);
 
     return success();
   }
@@ -94,15 +93,16 @@ public:
     if (!maybeExpandedMap)
       return failure();
 
-    auto accessName =
-        affineStoreOp->getAttrOfType<StringAttr>(accessNameAttrName);
+    auto accessName = affineStoreOp->getAttrOfType<StringAttr>(
+        NameAnalysis::getAttributeName());
     // Replace with simple store operation and keep correspondance between the
     // two operations
     memref::StoreOp storeOp = rewriter.replaceOpWithNewOp<memref::StoreOp>(
         affineStoreOp, affineStoreOp.getValueToStore(),
         affineStoreOp.getMemRef(), *maybeExpandedMap);
-    if (affineStoreOp->hasAttrOfType<StringAttr>(accessNameAttrName))
-      storeOp->setAttr(accessNameAttrName, accessName);
+    if (affineStoreOp->hasAttrOfType<StringAttr>(
+            NameAnalysis::getAttributeName()))
+      storeOp->setAttr(NameAnalysis::getAttributeName(), accessName);
 
     return success();
   }
@@ -174,12 +174,14 @@ public:
     if (!maybeExpandedMap.has_value())
       return failure();
 
-    auto accessName = op->getAttrOfType<StringAttr>(accessNameAttrName);
+    auto accessName =
+        op->getAttrOfType<StringAttr>(NameAnalysis::getAttributeName());
     // Build non-affine op from expandedMap.
     rewriter.setInsertionPoint(op);
     auto *newOp = schedInterface.createNonAffineOp(rewriter, *maybeExpandedMap);
-    if (schedInterface->hasAttrOfType<StringAttr>(accessNameAttrName))
-      newOp->setAttr(accessNameAttrName, accessName);
+    if (schedInterface->hasAttrOfType<StringAttr>(
+            NameAnalysis::getAttributeName()))
+      newOp->setAttr(NameAnalysis::getAttributeName(), accessName);
     rewriter.replaceOp(op, newOp);
 
     return success();
