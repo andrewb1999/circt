@@ -807,15 +807,17 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
       if (predicateMap.contains(op)) {
         Value cond = predicateMap.lookup(op);
         if (stageValueMaps[startTime].contains(cond))
-          cond = stageValueMaps[startTime].lookup(cond); 
-        ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(), op->getResultTypes(), cond);
+          cond = stageValueMaps[startTime].lookup(cond);
+        ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(),
+                                                op->getResultTypes(), cond);
         builder.setInsertionPointToStart(&ifOp.getBody().front());
       }
       auto *newOp = builder.clone(*op, stageValueMaps[startTime]);
       dependenceAnalysis->replaceOp(op, newOp);
       if (predicateMap.contains(op)) {
         if (!newOp->getResults().empty())
-          builder.create<LoopScheduleYieldOp>(op->getLoc(), newOp->getResults());
+          builder.create<LoopScheduleYieldOp>(op->getLoc(),
+                                              newOp->getResults());
         newOp = ifOp;
       }
 

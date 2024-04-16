@@ -101,7 +101,7 @@ circt::analysis::LoopScheduleDependenceAnalysis::LoopScheduleDependenceAnalysis(
             commonBlock->findAncestorOpInBlock(*destination);
         if (srcOrAncestor == nullptr || dstOrAncestor == nullptr)
           return;
-        
+
         // Check if the dst or its ancestor is before the src or its ancestor.
         // We want to dst to be before the src to insert iter-iteration deps.
         if ((dist != 0 && dstOrAncestor->isBeforeInBlock(srcOrAncestor)) ||

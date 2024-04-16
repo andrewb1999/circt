@@ -94,8 +94,8 @@ public:
 //===----------------------------------------------------------------------===//
 
 /// A variant of types representing schedulable operations.
-using Schedulable =
-    std::variant<calyx::StaticGroupOp, LoopWrapper, PhaseInterface, LoopScheduleIfOp>;
+using Schedulable = std::variant<calyx::StaticGroupOp, LoopWrapper,
+                                 PhaseInterface, LoopScheduleIfOp>;
 
 using PhaseRegister = std::variant<calyx::RegisterOp, Value>;
 
@@ -313,8 +313,8 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                   XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp, MulIOp, DivUIOp,
                   DivSIOp, RemUIOp, RemSIOp, IndexCastOp, SelectOp,
                   /// loop schedule
-                  LoopInterface, LoopScheduleTerminatorOp,
-                  LoopScheduleYieldOp, LoopScheduleIfOp>(
+                  LoopInterface, LoopScheduleTerminatorOp, LoopScheduleYieldOp,
+                  LoopScheduleIfOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<FuncOp, LoopScheduleRegisterOp, PhaseInterface>(
                   [&](auto) {
@@ -377,8 +377,7 @@ private:
                         LoopScheduleTerminatorOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter,
                         LoopScheduleYieldOp op) const;
-  LogicalResult buildOp(PatternRewriter &rewriter,
-                        LoopScheduleIfOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, LoopScheduleIfOp op) const;
 
   /// buildLibraryOp will build a TCalyxLibOp inside a TGroupOp based on the
   /// source operation TSrcOp.
@@ -1690,7 +1689,7 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
             getState<ComponentLoweringState>().getEvaluatingGroup(value);
         assert(isa<calyx::StaticGroupOp>(evaluatingGroup.value()));
         addBodyGroup(value, dyn_cast<calyx::StaticGroupOp>(
-            evaluatingGroup.value().getOperation()));
+                                evaluatingGroup.value().getOperation()));
         phase->getResult(i).replaceAllUsesWith(*valuePtr);
         auto name =
             getState<ComponentLoweringState>().getUniqueName("phase_reg");
@@ -2206,12 +2205,14 @@ private:
         auto condValue = ifOp.getCond();
         Block *bodyBlock;
         if (phaseOp.isStatic()) {
-          auto ifCtrlOp = rewriter.create<calyx::StaticIfOp>(ifOp.getLoc(), condValue);
+          auto ifCtrlOp =
+              rewriter.create<calyx::StaticIfOp>(ifOp.getLoc(), condValue);
           rewriter.setInsertionPointToEnd(ifCtrlOp.getBodyBlock());
           auto parOp = rewriter.create<calyx::StaticParOp>(ifOp.getLoc());
           bodyBlock = parOp.getBodyBlock();
         } else {
-          auto ifCtrlOp = rewriter.create<calyx::IfOp>(ifOp.getLoc(), condValue);
+          auto ifCtrlOp =
+              rewriter.create<calyx::IfOp>(ifOp.getLoc(), condValue);
           rewriter.setInsertionPointToEnd(ifCtrlOp.getBodyBlock());
           auto parOp = rewriter.create<calyx::ParOp>(ifOp.getLoc());
           bodyBlock = parOp.getBodyBlock();

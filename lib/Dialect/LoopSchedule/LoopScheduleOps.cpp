@@ -780,7 +780,8 @@ void LoopScheduleAccessOp::print(::mlir::OpAsmPrinter &p) {
 // IfOp
 //===----------------------------------------------------------------------===//
 
-ParseResult LoopScheduleIfOp::parse(OpAsmParser &parser, OperationState &result) {
+ParseResult LoopScheduleIfOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
   // Create the regions for 'then'.
   result.regions.reserve(1);
   Region *bodyRegion = result.addRegion();
@@ -797,7 +798,8 @@ ParseResult LoopScheduleIfOp::parse(OpAsmParser &parser, OperationState &result)
   // Parse the 'then' region.
   if (parser.parseRegion(*bodyRegion))
     return failure();
-  LoopScheduleIfOp::ensureTerminator(*bodyRegion, parser.getBuilder(), result.location);
+  LoopScheduleIfOp::ensureTerminator(*bodyRegion, parser.getBuilder(),
+                                     result.location);
 
   // Parse the optional attribute list.
   if (parser.parseOptionalAttrDict(result.attributes))
@@ -832,7 +834,8 @@ void LoopScheduleIfOp::build(OpBuilder &odsBuilder, OperationState &odsState,
   Region *thenRegion = odsState.addRegion();
   odsBuilder.createBlock(thenRegion);
   if (resultTypes.empty())
-    LoopScheduleIfOp::ensureTerminator(*thenRegion, odsBuilder, odsState.location);
+    LoopScheduleIfOp::ensureTerminator(*thenRegion, odsBuilder,
+                                       odsState.location);
 }
 
 #include "circt/Dialect/LoopSchedule/LoopScheduleInterfaces.cpp.inc"
