@@ -94,8 +94,8 @@ public:
 //===----------------------------------------------------------------------===//
 
 /// A variant of types representing schedulable operations.
-using Schedulable =
-    std::variant<calyx::StaticGroupOp, LoopWrapper, PhaseInterface>;
+using Schedulable = std::variant<calyx::StaticGroupOp, LoopWrapper,
+                                 PhaseInterface, LoopScheduleIfOp>;
 
 using PhaseRegister = std::variant<calyx::RegisterOp, Value>;
 
@@ -313,7 +313,8 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                   XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp, MulIOp, DivUIOp,
                   DivSIOp, RemUIOp, RemSIOp, IndexCastOp, SelectOp,
                   /// loop schedule
-                  LoopInterface, LoopScheduleTerminatorOp>(
+                  LoopInterface, LoopScheduleTerminatorOp, LoopScheduleYieldOp,
+                  LoopScheduleIfOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<FuncOp, LoopScheduleRegisterOp, PhaseInterface>(
                   [&](auto) {
@@ -323,7 +324,7 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
               .Default([&](auto op) {
                 op->dump();
                 op->emitError()
-                    << "Unhandled operation during BuildOpGroups() test " << op;
+                    << "Unhandled operation during BuildOpGroups() " << op;
                 return false;
               });
 
@@ -374,6 +375,9 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, LoopInterface op) const;
   LogicalResult buildOp(PatternRewriter &rewriter,
                         LoopScheduleTerminatorOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        LoopScheduleYieldOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, LoopScheduleIfOp op) const;
 
   /// buildLibraryOp will build a TCalyxLibOp inside a TGroupOp based on the
   /// source operation TSrcOp.
@@ -998,6 +1002,29 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 }
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     LoopScheduleYieldOp op) const {
+  if (op.getOperands().empty())
+    return success();
+
+  // Replace the if's result(s) with the yield's operands.
+  auto *ifOp = op->getParentOp();
+  for (size_t i = 0, e = ifOp->getNumResults(); i < e; ++i)
+    ifOp->getResult(i).replaceAllUsesWith(op.getOperand(i));
+
+  for (auto res : ifOp->getResults()) {
+    assert(res.getUses().empty());
+  }
+  op->erase();
+  return success();
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     LoopScheduleIfOp op) const {
+  getState<ComponentLoweringState>().addBlockSchedulable(op->getBlock(), op);
+  return success();
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      BranchOpInterface brOp) const {
   /// Branch argument passing group creation
   /// Branch operands are passed through registers. In BuildBasicBlockRegs we
@@ -1581,7 +1608,6 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
     // Build all phases contained in loops
-    // getComponent()->getParentOfType<ModuleOp>().dump();
     auto res = funcOp.walk([&](LoopInterface loop) {
       auto *bodyBlock = loop.getBodyBlock();
       auto condValue = loop.getConditionValue();
@@ -1631,20 +1657,21 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
 
     buildPhaseGuards(op, phase, rewriter);
     buildPhaseStallValues(op, phase, rewriter);
-    // phase.dump();
 
     getState<ComponentLoweringState>().addBlockSchedulable(phase->getBlock(),
                                                            phase);
 
-    // Collect group names for the prologue or epilogue.
-    SmallVector<StringAttr> bodyGroups;
-
-    auto addBodyGroup = [&](calyx::StaticGroupOp group) {
+    auto addBodyGroup = [&](std::optional<Value> v,
+                            calyx::StaticGroupOp group) {
+      Block *block = &phase.getBodyBlock();
+      if (v.has_value()) {
+        auto *definingOp = v->getDefiningOp();
+        if (isa<LoopScheduleLoadOp, LoadInterface>(definingOp)) {
+          block = definingOp->getBlock();
+        }
+      }
       // Mark the group for scheduling in the pipeline's block.
-      getState<ComponentLoweringState>().addBlockSchedulable(
-          &phase.getBodyBlock(), group);
-
-      bodyGroups.push_back(group.getSymNameAttr());
+      getState<ComponentLoweringState>().addBlockSchedulable(block, group);
     };
 
     MutableArrayRef<OpOperand> operands =
@@ -1653,7 +1680,6 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
     for (auto &operand : operands) {
       unsigned i = operand.getOperandNumber();
       Value value = operand.get();
-      // value.dump();
 
       // Get the pipeline register for that result.
       auto reg = pipelineRegisters[i];
@@ -1662,8 +1688,8 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
         auto evaluatingGroup =
             getState<ComponentLoweringState>().getEvaluatingGroup(value);
         assert(isa<calyx::StaticGroupOp>(evaluatingGroup.value()));
-        addBodyGroup(dyn_cast<calyx::StaticGroupOp>(
-            evaluatingGroup.value().getOperation()));
+        addBodyGroup(value, dyn_cast<calyx::StaticGroupOp>(
+                                evaluatingGroup.value().getOperation()));
         phase->getResult(i).replaceAllUsesWith(*valuePtr);
         auto name =
             getState<ComponentLoweringState>().getUniqueName("phase_reg");
@@ -1704,11 +1730,7 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       // Replace the stage result uses with the register out.
       phase->getResult(i).replaceAllUsesWith(pipelineRegister.getOut());
 
-      addBodyGroup(group);
-    }
-
-    // If cond group was given, add to phase
-    if (condGroup.has_value()) {
+      addBodyGroup(std::nullopt, group);
     }
 
     return success();
@@ -1729,18 +1751,6 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
     calyx::buildAssignmentsForRegisterWrite(
         rewriter, group, getState<ComponentLoweringState>().getComponentOp(),
         pipelineRegister, value);
-
-    // Mark the new group as the evaluating group.
-    // for (auto assign : group.getOps<calyx::AssignOp>()) {
-    //   auto *src = assign.getSrc().getDefiningOp();
-    //   if (!isa<calyx::CellInterface>(*src)
-    //       // ||
-    //       // dyn_cast<calyx::CellInterface>(*src).isCombinational()
-    //       ) {
-    //     getState<ComponentLoweringState>().registerEvaluatingGroup(
-    //         assign.getSrc(), group);
-    //   }
-    // }
 
     return group;
   }
@@ -2189,6 +2199,31 @@ private:
         rewriter.setInsertionPointAfter(loopParentCtrlOp);
         if (res.failed())
           return loopOp.getOperation()->emitError("Cannot schedule loop body");
+      } else if (auto *ifSchedPtr = std::get_if<LoopScheduleIfOp>(&sched)) {
+        auto &ifOp = *ifSchedPtr;
+        auto phaseOp = ifOp->getParentOfType<PhaseInterface>();
+        auto condValue = ifOp.getCond();
+        Block *bodyBlock;
+        if (phaseOp.isStatic()) {
+          auto ifCtrlOp =
+              rewriter.create<calyx::StaticIfOp>(ifOp.getLoc(), condValue);
+          rewriter.setInsertionPointToEnd(ifCtrlOp.getBodyBlock());
+          auto parOp = rewriter.create<calyx::StaticParOp>(ifOp.getLoc());
+          bodyBlock = parOp.getBodyBlock();
+        } else {
+          auto ifCtrlOp =
+              rewriter.create<calyx::IfOp>(ifOp.getLoc(), condValue);
+          rewriter.setInsertionPointToEnd(ifCtrlOp.getBodyBlock());
+          auto parOp = rewriter.create<calyx::ParOp>(ifOp.getLoc());
+          bodyBlock = parOp.getBodyBlock();
+        }
+        rewriter.setInsertionPointToEnd(bodyBlock);
+
+        path.insert(&ifOp.getBody().front());
+        auto res = scheduleBasicBlock(rewriter, path, bodyBlock,
+                                      &ifOp.getBody().front());
+        if (res.failed())
+          ifOp->emitOpError("Failed to schedule if op block");
       } else
         llvm_unreachable("Unknown schedulable");
     }
@@ -2618,11 +2653,10 @@ void LoopScheduleToCalyxPass::runOnOperation() {
     LogicalResult partialPatternRes = runPartialPattern(
         pat.pattern,
         /*runOnce=*/pat.strategy == LoweringPattern::Strategy::Once);
-    if (succeeded(partialPatternRes)) {
-      continue;
+    if (failed(partialPatternRes)) {
+      signalPassFailure();
+      return;
     }
-    signalPassFailure();
-    return;
   }
 
   //===----------------------------------------------------------------------===//

@@ -1,6 +1,6 @@
 set(LLVM_OPTIONAL_SOURCES
   DebugAnalysis.cpp
-  AccessNameAnalysis.cpp
+  NameAnalysis.cpp
   DebugInfo.cpp
   DependenceAnalysis.cpp
   SchedulingAnalysis.cpp
@@ -28,8 +28,8 @@ add_circt_library(CIRCTDependenceAnalysis
   MLIRTransformUtils
 )
 
-add_circt_library(CIRCTAccessNameAnalysis
-  AccessNameAnalysis.cpp
+add_circt_library(CIRCTNameAnalysis
+  NameAnalysis.cpp
 
   LINK_LIBS PUBLIC
   MLIRAffineDialect
@@ -42,7 +42,7 @@ add_circt_library(CIRCTLoopScheduleDependenceAnalysis
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRAffineUtils
-  CIRCTAccessNameAnalysis
+  CIRCTNameAnalysis
   MLIRTransformUtils
 )
 
@@ -64,7 +64,7 @@ add_circt_library(CIRCTAnalysisTestPasses
   CIRCTDebugAnalysis
   CIRCTDependenceAnalysis
   CIRCTSchedulingAnalysis
-  CIRCTAccessNameAnalysis
+  CIRCTNameAnalysis
   CIRCTLoopScheduleDependenceAnalysis
   CIRCTHW
   MLIRPass

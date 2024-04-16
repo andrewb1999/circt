@@ -8,9 +8,9 @@
 
 #include "circt/Conversion/SCFToLoopSchedule.h"
 #include "../PassDetail.h"
-#include "circt/Analysis/AccessNameAnalysis.h"
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Analysis/LoopScheduleDependenceAnalysis.h"
+#include "circt/Analysis/NameAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/LoopSchedule/Utils.h"
@@ -36,6 +36,7 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Value.h"
@@ -53,8 +54,10 @@
 #include <cassert>
 #include <limits>
 #include <math.h>
+#include <memory>
 #include <optional>
 #include <queue>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -91,6 +94,8 @@ private:
                                        SharedOperatorsProblem &problem);
 
   std::optional<LoopScheduleDependenceAnalysis> dependenceAnalysis;
+  PredicateUse predicateUse;
+  PredicateMap predicateMap;
 };
 
 } // namespace
@@ -112,30 +117,47 @@ void SCFToLoopSchedule::runOnOperation() {
     return false;
   };
 
-  getOperation()->walk<WalkOrder::PreOrder>([&](Operation *op) {
+  auto res = getOperation()->walk<WalkOrder::PreOrder>([&](Operation *op) {
     if (!isa<scf::ForOp>(op) || !op->hasAttr("hls.pipeline"))
-      return;
+      return WalkResult::advance();
 
     if (hasPipelinedParent(op))
-      return;
+      return WalkResult::interrupt();
 
     loops.push_back(cast<scf::ForOp>(op));
+    return WalkResult::advance();
   });
 
-  // Unroll loops within this loop to make pipelining possible
-  // for (auto loop : llvm::make_early_inc_range(loops)) {
-  //   if (failed(unrollSubLoops(loop)))
-  //     return signalPassFailure();
-  // }
+  if (res.wasInterrupted()) {
+    getOperation().emitOpError(
+        "Loops marked for pipelining cannot contain other loops");
+    signalPassFailure();
+  }
 
   // Get dependence analysis for the whole function.
   dependenceAnalysis = getAnalysis<LoopScheduleDependenceAnalysis>();
 
   // Schedule all pipelined loops first
   for (auto loop : llvm::make_early_inc_range(loops)) {
+    ResourceMap resourceMap;
+    ResourceLimits resourceLimits;
+    if (failed(recordMemoryResources(loop.getOperation(), loop.getRegion(),
+                                     resourceMap, resourceLimits)))
+      return signalPassFailure();
+
+    if (failed(ifOpConversion(loop.getOperation(), loop.getRegion(),
+                              predicateMap)))
+      return signalPassFailure();
 
     // Populate the target operator types.
     ModuloProblem moduloProblem = getModuloProblem(loop, *dependenceAnalysis);
+
+    if (failed(addMemoryResources(loop.getOperation(), loop.getRegion(),
+                                  moduloProblem, resourceMap, resourceLimits)))
+      return signalPassFailure();
+
+    addPredicateDependencies(loop.getOperation(), loop.getRegion(),
+                             moduloProblem, predicateMap, predicateUse);
 
     if (failed(populateOperatorTypes(loop.getOperation(), loop.getRegion(),
                                      moduloProblem)))
@@ -160,10 +182,25 @@ void SCFToLoopSchedule::runOnOperation() {
 
   // Schedule loops
   for (auto loop : seqLoops) {
-    // getOperation().dump();
-    // loop.dump();
+    ResourceMap resourceMap;
+    ResourceLimits resourceLimits;
+    if (failed(recordMemoryResources(loop.getOperation(), loop.getRegion(),
+                                     resourceMap, resourceLimits)))
+      return signalPassFailure();
+
+    if (failed(ifOpConversion(loop.getOperation(), loop.getRegion(),
+                              predicateMap)))
+      return signalPassFailure();
+
     assert(loop.getLoopRegions().size() == 1);
     auto problem = getSharedOperatorsProblem(loop, *dependenceAnalysis);
+
+    if (failed(addMemoryResources(loop.getOperation(), loop.getRegion(),
+                                  problem, resourceMap, resourceLimits)))
+      return signalPassFailure();
+
+    addPredicateDependencies(loop.getOperation(), loop.getRegion(), problem,
+                             predicateMap, predicateUse);
 
     // Populate the target operator types.
     if (failed(populateOperatorTypes(loop.getOperation(),
@@ -180,11 +217,27 @@ void SCFToLoopSchedule::runOnOperation() {
       return signalPassFailure();
   }
 
-  // llvm::errs() << "schedule func\n";
-
   // Schedule whole function
   auto funcOp = cast<FuncOp>(getOperation());
+
+  ResourceMap resourceMap;
+  ResourceLimits resourceLimits;
+  if (failed(recordMemoryResources(funcOp.getOperation(), funcOp.getRegion(),
+                                   resourceMap, resourceLimits)))
+    return signalPassFailure();
+
+  if (failed(ifOpConversion(funcOp.getOperation(), funcOp.getRegion(),
+                            predicateMap)))
+    return signalPassFailure();
+
   auto problem = getSharedOperatorsProblem(funcOp, *dependenceAnalysis);
+
+  if (failed(addMemoryResources(funcOp.getOperation(), funcOp.getRegion(),
+                                problem, resourceMap, resourceLimits)))
+    return signalPassFailure();
+
+  addPredicateDependencies(funcOp.getOperation(), funcOp.getRegion(), problem,
+                           predicateMap, predicateUse);
 
   // Populate the target operator types.
   if (failed(populateOperatorTypes(funcOp.getOperation(), funcOp.getBody(),
@@ -198,8 +251,6 @@ void SCFToLoopSchedule::runOnOperation() {
   // Convert the IR.
   if (failed(createFuncLoopSchedule(funcOp, problem)))
     return signalPassFailure();
-
-  // getOperation().dump();
 
   // Remove dependencies
   if (funcOp->hasAttrOfType<SymbolRefAttr>("loopschedule.dependencies")) {
@@ -215,8 +266,8 @@ void SCFToLoopSchedule::runOnOperation() {
   // Remove access names for now
   // TODO: Probably should make this an independent pass for debugging reasons
   funcOp->walk([](Operation *op) {
-    if (op->hasAttrOfType<StringAttr>("loopschedule.access_name")) {
-      op->removeAttr("loopschedule.access_name");
+    if (op->hasAttrOfType<StringAttr>(NameAnalysis::getAttributeName())) {
+      op->removeAttr(NameAnalysis::getAttributeName());
     }
   });
 }
@@ -233,15 +284,15 @@ SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
   // Load the Calyx operator library into the problem. This is a very minimal
   // set of arithmetic and memory operators for now. This should ultimately be
   // pulled out into some sort of dialect interface.
-  Problem::OperatorType combOpr = problem.getOrInsertOperatorType("comb");
+  OperatorType combOpr = problem.getOrInsertOperatorType("comb");
   problem.setLatency(combOpr, 0);
-  Problem::OperatorType seqOpr = problem.getOrInsertOperatorType("seq");
+  OperatorType seqOpr = problem.getOrInsertOperatorType("seq");
   problem.setLatency(seqOpr, 1);
-  Problem::OperatorType loopOpr = problem.getOrInsertOperatorType("loop");
+  OperatorType loopOpr = problem.getOrInsertOperatorType("loop");
   problem.setLatency(loopOpr, 1);
-  Problem::OperatorType mcOpr = problem.getOrInsertOperatorType("multicycle");
+  OperatorType mcOpr = problem.getOrInsertOperatorType("multicycle");
   problem.setLatency(mcOpr, 4);
-  Problem::OperatorType divOpr = problem.getOrInsertOperatorType("divider");
+  OperatorType divOpr = problem.getOrInsertOperatorType("divider");
   problem.setLatency(divOpr, 36);
 
   Operation *unsupported;
@@ -252,104 +303,60 @@ SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
     }
 
     return TypeSwitch<Operation *, WalkResult>(op)
-        .Case<IfOp, scf::YieldOp, arith::ConstantOp, arith::ExtSIOp,
-              arith::ExtUIOp, arith::TruncIOp, CmpIOp, IndexCastOp,
-              memref::AllocaOp, memref::AllocOp, loopschedule::AllocInterface,
-              YieldOp, func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, ShLIOp,
-              AndIOp, ShRSIOp, ShRUIOp>([&](Operation *combOp) {
+        .Case<YieldOp, arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
+              arith::TruncIOp, CmpIOp, IndexCastOp, memref::AllocaOp,
+              memref::AllocOp, loopschedule::AllocInterface, YieldOp,
+              func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, ShLIOp, AndIOp,
+              ShRSIOp, ShRUIOp, XOrIOp>([&](Operation *combOp) {
           // Some known combinational ops.
           problem.setLinkedOperatorType(combOp, combOpr);
           return WalkResult::advance();
         })
-        .Case<LoopInterface>([&](Operation *loopOp) {
-          // llvm::errs() << "loopOp\n";
-          // loopOp->dump();
-          // llvm::errs() << "loopOp after\n";
-          problem.setLinkedOperatorType(loopOp, loopOpr);
-          auto loop = cast<LoopInterface>(loopOp);
-          loop.getBodyBlock()->walk([&](Operation *op) {
-            if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp>(op)) {
-              Value memRef = getMemref(op);
-              Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
-                  "mem_" + std::to_string(hash_value(memRef)));
-              problem.setLatency(memOpr, 1);
-              // External memories are 1 RW port
-              problem.setLimit(memOpr, 1);
-              problem.addExtraLimitingType(loopOp, memOpr);
-            } else if (isa<LoadInterface>(op)) {
-              auto loadOp = cast<loopschedule::LoadInterface>(*op);
-              auto latency = loadOp.getLatency();
-              auto limitOpt = loadOp.getLimit();
-              Problem::OperatorType portOpr =
-                  problem.getOrInsertOperatorType(loadOp.getUniqueId());
-              problem.setLatency(portOpr, latency);
-              if (limitOpt.has_value())
-                problem.setLimit(portOpr, limitOpt.value());
-              problem.addExtraLimitingType(loopOp, portOpr);
-            } else if (isa<StoreInterface>(op)) {
-              auto storeOp = cast<loopschedule::StoreInterface>(*op);
-              auto latency = storeOp.getLatency();
-              auto limitOpt = storeOp.getLimit();
-              Problem::OperatorType portOpr =
-                  problem.getOrInsertOperatorType(storeOp.getUniqueId());
-              problem.setLatency(portOpr, latency);
-              if (limitOpt.has_value())
-                problem.setLimit(portOpr, limitOpt.value());
-              problem.addExtraLimitingType(loopOp, portOpr);
-            }
-          });
+        .Case<MulIOp>([&](Operation *mcOp) {
+          // Multiplier
+          problem.setLinkedOperatorType(mcOp, mcOpr);
+          return WalkResult::advance();
+        })
+        .Case<RemUIOp, RemSIOp, DivSIOp>([&](Operation *op) {
+          // Divider ops
+          if (op->getResult(0).getType().getIntOrFloatBitWidth() != 32) {
+            unsupported = op;
+            return WalkResult::interrupt();
+          }
+          problem.setLinkedOperatorType(op, divOpr);
           return WalkResult::advance();
         })
         .Case<LoopScheduleStoreOp, AffineStoreOp>([&](Operation *memOp) {
-          // Some known sequential ops. In certain cases, reads may be
-          // combinational in Calyx, but taking advantage of that is left as
-          // a future enhancement.
           Value memRef = isa<AffineStoreOp>(*memOp)
                              ? cast<AffineStoreOp>(*memOp).getMemRef()
                              : cast<LoopScheduleStoreOp>(*memOp).getMemRef();
-          Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
+          OperatorType memOpr = problem.getOrInsertOperatorType(
               "mem_" + std::to_string(hash_value(memRef)));
           problem.setLatency(memOpr, 1);
-          problem.setLimit(memOpr, 1);
           problem.setLinkedOperatorType(memOp, memOpr);
           return WalkResult::advance();
         })
         .Case<LoopScheduleLoadOp, AffineLoadOp>([&](Operation *memOp) {
-          // Some known sequential ops. In certain cases, reads may be
-          // combinational in Calyx, but taking advantage of that is left as
-          // a future enhancement.
-          Value memRef = isa<AffineLoadOp>(*memOp)
-                             ? cast<AffineLoadOp>(*memOp).getMemRef()
-                             : cast<LoopScheduleLoadOp>(*memOp).getMemRef();
-          Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
+          Value memRef = getMemref(memOp);
+          OperatorType memOpr = problem.getOrInsertOperatorType(
               "mem_" + std::to_string(hash_value(memRef)));
           problem.setLatency(memOpr, 1);
-          problem.setLimit(memOpr, 1);
           problem.setLinkedOperatorType(memOp, memOpr);
           return WalkResult::advance();
         })
-        .Case<loopschedule::LoadInterface>([&](Operation *op) {
-          auto loadOp = cast<loopschedule::LoadInterface>(*op);
-          auto latency = loadOp.getLatency();
-          auto limitOpt = loadOp.getLimit();
-          Problem::OperatorType portOpr =
-              problem.getOrInsertOperatorType(loadOp.getUniqueId());
+        .Case<LoadInterface, StoreInterface>([&](Operation *op) {
+          unsigned latency;
+          std::string uniqueId;
+          if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*op)) {
+            latency = loadOp.getLatency();
+            uniqueId = loadOp.getUniqueId();
+          } else {
+            auto storeOp = cast<loopschedule::StoreInterface>(*op);
+            latency = storeOp.getLatency();
+            uniqueId = storeOp.getUniqueId();
+          }
+          OperatorType portOpr = problem.getOrInsertOperatorType(uniqueId);
           problem.setLatency(portOpr, latency);
-          if (limitOpt.has_value())
-            problem.setLimit(portOpr, limitOpt.value());
-          problem.setLinkedOperatorType(op, portOpr);
-
-          return WalkResult::advance();
-        })
-        .Case<loopschedule::StoreInterface>([&](Operation *op) {
-          auto storeOp = cast<loopschedule::StoreInterface>(*op);
-          auto latency = storeOp.getLatency();
-          auto limitOpt = storeOp.getLimit();
-          Problem::OperatorType portOpr =
-              problem.getOrInsertOperatorType(storeOp.getUniqueId());
-          problem.setLatency(portOpr, latency);
-          if (limitOpt.has_value())
-            problem.setLimit(portOpr, limitOpt.value());
           problem.setLinkedOperatorType(op, portOpr);
 
           return WalkResult::advance();
@@ -358,26 +365,20 @@ SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
           auto schedOp = cast<SchedulableInterface>(op);
           auto latency = schedOp.getOpLatency();
           auto limitOpt = schedOp.getOpLimit();
-          Problem::OperatorType opr =
+          OperatorType opr =
               problem.getOrInsertOperatorType(schedOp.getUniqueId());
           problem.setLatency(opr, latency);
-          if (limitOpt.has_value())
-            problem.setLimit(opr, limitOpt.value());
+          if (limitOpt.has_value()) {
+            auto rsrc = problem.getOrInsertResourceType(schedOp.getUniqueId());
+            problem.setResourceLimit(rsrc, limitOpt.value());
+            problem.addResourceType(op, rsrc);
+          }
           problem.setLinkedOperatorType(op, opr);
 
           return WalkResult::advance();
         })
-        .Case<MulIOp>([&](Operation *mcOp) {
-          // Some known multi-cycle ops.
-          problem.setLinkedOperatorType(mcOp, mcOpr);
-          return WalkResult::advance();
-        })
-        .Case<RemUIOp, RemSIOp, DivSIOp>([&](Operation *op) {
-          if (op->getResult(0).getType().getIntOrFloatBitWidth() != 32) {
-            unsupported = op;
-            return WalkResult::interrupt();
-          }
-          problem.setLinkedOperatorType(op, divOpr);
+        .Case<LoopInterface>([&](Operation *loopOp) {
+          problem.setLinkedOperatorType(loopOp, loopOpr);
           return WalkResult::advance();
         })
         .Default([&](Operation *badOp) {
@@ -403,13 +404,15 @@ LogicalResult SCFToLoopSchedule::solveModuloProblem(scf::ForOp &loop,
   // Optionally debug problem inputs.
   LLVM_DEBUG(for (auto *op
                   : problem.getOperations()) {
-    if (auto parent = op->getParentOfType<LoopInterface>(); parent)
-      continue;
+    // if (auto parent = op->getParentOfType<LoopInterface>(); parent)
+    //   continue;
     llvm::dbgs() << "Modulo scheduling inputs for " << *op;
     auto opr = problem.getLinkedOperatorType(op);
-    llvm::dbgs() << "\n  opr = " << opr;
+    llvm::dbgs() << "\n  opr = " << opr->getName();
     llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
-    llvm::dbgs() << "\n  limit = " << problem.getLimit(*opr);
+    for (auto rsrc : problem.getLinkedResourceTypes(op))
+      llvm::dbgs() << "\n  resource = " << rsrc.getName()
+                   << " limit = " << problem.getResourceLimit(rsrc);
     for (auto dep : problem.getDependences(op))
       if (dep.isAuxiliary())
         llvm::dbgs() << "\n  dep = { distance = " << problem.getDistance(dep)
@@ -433,13 +436,13 @@ LogicalResult SCFToLoopSchedule::solveModuloProblem(scf::ForOp &loop,
   LLVM_DEBUG({
     llvm::dbgs() << "Scheduled initiation interval = "
                  << problem.getInitiationInterval() << "\n\n";
-    forOp.getBody()->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    for (auto *op : problem.getOperations()) {
       if (auto parent = op->getParentOfType<LoopInterface>(); parent)
-        return;
+        continue;
       llvm::dbgs() << "Scheduling outputs for " << *op;
       llvm::dbgs() << "\n  start = " << problem.getStartTime(op);
       llvm::dbgs() << "\n\n";
-    });
+    }
   });
 
   return success();
@@ -452,20 +455,21 @@ LogicalResult SCFToLoopSchedule::solveSharedOperatorsProblem(
   LLVM_DEBUG(region.getParentOp()->dump());
 
   // Optionally debug problem inputs.
-  LLVM_DEBUG(region.walk<WalkOrder::PreOrder>([&](Operation *op) {
-    if (auto parent = op->getParentOfType<LoopInterface>(); parent)
-      return;
+  LLVM_DEBUG(for (auto op
+                  : problem.getOperations()) {
     llvm::dbgs() << "Shared Operator scheduling inputs for " << *op;
     auto opr = problem.getLinkedOperatorType(op);
-    llvm::dbgs() << "\n  opr = " << opr;
+    llvm::dbgs() << "\n  opr = " << opr->getName();
     llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
-    llvm::dbgs() << "\n  limit = " << problem.getLimit(*opr);
+    for (auto rsrc : problem.getLinkedResourceTypes(op))
+      llvm::dbgs() << "\n  resource = " << rsrc.getName()
+                   << " limit = " << problem.getResourceLimit(rsrc);
     for (auto dep : problem.getDependences(op))
       if (dep.isAuxiliary())
         llvm::dbgs() << "\n  dep = { "
                      << "source = " << *dep.getSource() << " }";
     llvm::dbgs() << "\n\n";
-  }));
+  });
 
   // Verify and solve the problem.
   if (failed(problem.check()))
@@ -491,32 +495,6 @@ LogicalResult SCFToLoopSchedule::solveSharedOperatorsProblem(
   });
 
   return success();
-}
-
-// Replaces memref loads/stores with loopschedule loads/stores
-Operation *cloneOrReplace(OpBuilder builder, Operation *op,
-                          IRMapping valueMap) {
-  // if (auto load = dyn_cast<memref::LoadOp>(op)) {
-  //   SmallVector<Value> indices;
-  //   auto memref = valueMap.lookupOrDefault(load.getMemRef());
-  //   auto returnType = cast<MemRefType>(memref.getType()).getElementType();
-  //   for (auto opValue : load.getIndices())
-  //    indices.push_back(valueMap.lookupOrDefault(opValue));
-  //   return builder.create<LoopScheduleLoadOp>(op->getLoc(), returnType,
-  //             memref, indices);
-  // }
-
-  // if (auto store = dyn_cast<memref::StoreOp>(op)) {
-  //   SmallVector<Value> indices;
-  //   auto memref = valueMap.lookupOrDefault(store.getMemRef());
-  //   auto valToStore = valueMap.lookupOrDefault(store.getValueToStore());
-  //   for (auto opValue : store.getIndices())
-  //    indices.push_back(valueMap.lookupOrDefault(opValue));
-  //   return builder.create<LoopScheduleStoreOp>(op->getLoc(), valToStore,
-  //             memref, indices);
-  // }
-
-  return builder.clone(*op, valueMap);
 }
 
 /// Create the pipeline op for a loop nest.
@@ -566,10 +544,10 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
       upperBound);
   condBlock.getTerminator()->insertOperands(0, {cmpResult});
 
-  // Add the non-yield operations to their start time groups.
+  // Add the non-yield and non-if operations to their start time groups.
   DenseMap<unsigned, SmallVector<Operation *>> startGroups;
   for (auto *op : problem.getOperations()) {
-    if (isa<YieldOp>(op))
+    if (isa<YieldOp, IfOp>(op))
       continue;
     auto startTime = problem.getStartTime(op);
     startGroups[*startTime].push_back(op);
@@ -622,11 +600,22 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
 
     // Check each operation to see if its results need plumbing
     for (auto *op : group) {
-      if (op->getUsers().empty())
-        continue;
+      if (op->getUsers().empty()) {
+        if (llvm::none_of(op->getResults(),
+                          [&](Value v) { return predicateUse.contains(v); })) {
+          continue;
+        }
+      }
 
       unsigned pipeEndTime = 0;
-      for (auto *user : op->getUsers()) {
+      SmallVector<Operation *> users;
+      users.append(op->getUsers().begin(), op->getUsers().end());
+
+      // Also check predicate users
+      for (auto res : op->getResults()) {
+        users.append(predicateUse.lookup(res));
+      }
+      for (auto *user : users) {
         unsigned userStartTime = *problem.getStartTime(user);
         if (*problem.getStartTime(user) > startTime)
           pipeEndTime = std::max(pipeEndTime, userStartTime);
@@ -645,16 +634,36 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
 
       // Keep a collection of this stages results as keys to our valueMaps
       for (auto result : op->getResults()) {
+        bool registered = false;
         for (auto *user : result.getUsers()) {
           auto inThisGroup = false;
           for (auto *op : group) {
             if (user == op) {
               inThisGroup = true;
+              break;
             }
           }
           if (!inThisGroup) {
             registerValues[startTime].push_back(result);
+            registered = true;
             break;
+          }
+        }
+
+        // Also keep around results that are used as predicates
+        if (!registered) {
+          for (auto *user : predicateUse.lookup(result)) {
+            auto inThisGroup = false;
+            for (auto *op : group) {
+              if (user == op) {
+                inThisGroup = true;
+                break;
+              }
+            }
+            if (!inThisGroup) {
+              registerValues[startTime].push_back(result);
+              break;
+            }
           }
         }
       }
@@ -793,13 +802,24 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
     builder.setInsertionPointToStart(&stageBlock);
 
     for (auto *op : group) {
-      auto *newOp = cloneOrReplace(builder, op, stageValueMaps[startTime]);
-      // llvm::errs() << memAnalysis.getDependences(op).size() << "\n";
-      // llvm::errs() << "before\n";
-      // op->dump();
-      // newOp->dump();
+      OpBuilder::InsertionGuard g(builder);
+      LoopScheduleIfOp ifOp;
+      if (predicateMap.contains(op)) {
+        Value cond = predicateMap.lookup(op);
+        if (stageValueMaps[startTime].contains(cond))
+          cond = stageValueMaps[startTime].lookup(cond);
+        ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(),
+                                                op->getResultTypes(), cond);
+        builder.setInsertionPointToStart(&ifOp.getBody().front());
+      }
+      auto *newOp = builder.clone(*op, stageValueMaps[startTime]);
       dependenceAnalysis->replaceOp(op, newOp);
-      // llvm::errs() << "after\n";
+      if (predicateMap.contains(op)) {
+        if (!newOp->getResults().empty())
+          builder.create<LoopScheduleYieldOp>(op->getLoc(),
+                                              newOp->getResults());
+        newOp = ifOp;
+      }
 
       // All further uses in this stage should used the cloned-version of values
       // So we update the mapping in this stage
@@ -868,8 +888,11 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
 
   dependenceAnalysis->replaceOp(loop, pipeline);
 
-  loop.walk(
-      [&](Operation *op) { assert(!dependenceAnalysis->containsOp(op)); });
+  loop.walk([&](Operation *op) {
+    if (!isa<scf::IfOp>(op)) {
+      assert(!dependenceAnalysis->containsOp(op));
+    }
+  });
 
   // Remove the loop nest from the IR.
   loop.walk([&](Operation *op) {
@@ -882,7 +905,7 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
   return success();
 }
 
-DenseMap<int64_t, SmallVector<Operation *>>
+static DenseMap<int64_t, SmallVector<Operation *>>
 getOperationCycleMap(Problem &problem) {
   DenseMap<int64_t, SmallVector<Operation *>> map;
 
@@ -898,42 +921,10 @@ getOperationCycleMap(Problem &problem) {
   return map;
 }
 
-int64_t longestOperationStartingAtTime(
-    Problem &problem, const DenseMap<int64_t, SmallVector<Operation *>> &opMap,
-    int64_t cycle) {
-  int64_t longestOp = 0;
-  for (auto *op : opMap.lookup(cycle)) {
-    auto oprType = problem.getLinkedOperatorType(op);
-    assert(oprType.has_value());
-    auto latency = problem.getLatency(oprType.value());
-    assert(latency.has_value());
-    if (latency.value() > longestOp)
-      longestOp = latency.value();
-  }
-
-  return longestOp;
-}
-
-/// Returns true if the value is used outside of the given loop.
-bool isUsedOutsideOfRegion(Value val, Block *block) {
-  return llvm::any_of(val.getUsers(), [&](Operation *user) {
-    Operation *u = user;
-    while (!isa<ModuleOp>(u->getParentRegion()->getParentOp())) {
-      if (u->getBlock() == block) {
-        return false;
-      }
-      u = u->getParentRegion()->getParentOp();
-    }
-    return true;
-  });
-}
-
-/// Create the stg ops for a loop nest.
+/// Create loopschedule seq op for a sequential loop
 LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
     scf::ForOp &loop, SharedOperatorsProblem &problem) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
-
-  // loop.dump();
 
   builder.setInsertionPointToStart(
       &loop->getParentOfType<FuncOp>().getBody().front());
@@ -955,24 +946,13 @@ LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
   iterArgs.push_back(lowerBound);
   iterArgs.append(loop.getInits().begin(), loop.getInits().end());
 
-  // If possible, attach a constant trip count attribute. This could be
-  // generalized to support non-constant trip counts by supporting an AffineMap.
+  // If possible, attach a constant trip count attribute.
   std::optional<IntegerAttr> tripCountAttr;
   if (auto tripCount =
           loop->getAttrOfType<IntegerAttr>("loopschedule.trip_count"))
     tripCountAttr = tripCount;
 
   auto opMap = getOperationCycleMap(problem);
-
-  // If possible, attach a constant trip count attribute. This could be
-  // generalized to support non-constant trip counts by supporting an AffineMap.
-  // Optional<IntegerAttr> tripCountAttr;
-  // if (loop->hasAttr("stg.tripCount")) {
-  //   tripCountAttr = loop->getAttr("stg.tripCount").cast<IntegerAttr>();
-  // }
-
-  // auto condValue = builder.getIntegerAttr(builder.getIndexType(), 1);
-  // auto cond = builder.create<arith::ConstantOp>(loop.getLoc(), condValue);
 
   auto sequential = builder.create<LoopScheduleSequentialOp>(
       loop.getLoc(), resultTypes, tripCountAttr, iterArgs);
@@ -986,48 +966,16 @@ LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
       upperBound);
   condBlock.getTerminator()->insertOperands(0, {cmpResult});
 
-  // Maintain mappings of values in the loop body and results of stages,
-  // initially populated with the iter args.
+  // Maintain mappings of values in the loop body and results of stages
   IRMapping valueMap;
-  // for (size_t i = 0; i < iterArgs.size(); ++i)
-  //   valueMap.map(loop.getBefore().getArgument(i),
-  //                stgWhile.getCondBlock().getArgument(i));
-
-  // builder.setInsertionPointToStart(&sequential.getCondBlock());
-
-  // // auto condConst = builder.create<arith::ConstantOp>(loop.getLoc(),
-  // // builder.getIntegerAttr(builder.getI1Type(), 1));
-  // auto *conditionReg = stgWhile.getCondBlock().getTerminator();
-  // // conditionReg->insertOperands(0, condConst.getResult());
-  // for (auto &op : loop.getBefore().front().getOperations()) {
-  //   if (isa<scf::ConditionOp>(op)) {
-  //     auto condOp = cast<scf::ConditionOp>(op);
-  //     auto cond = condOp.getCondition();
-  //     auto condNew = valueMap.lookupOrNull(cond);
-  //     assert(condNew);
-  //     conditionReg->insertOperands(0, condNew);
-  //   } else {
-  //     auto *newOp = builder.clone(op, valueMap);
-  //     for (size_t i = 0; i < newOp->getNumResults(); ++i) {
-  //       auto newValue = newOp->getResult(i);
-  //       auto oldValue = op.getResult(i);
-  //       valueMap.map(oldValue, newValue);
-  //     }
-  //   }
-  // }
 
   builder.setInsertionPointToStart(&sequential.getScheduleBlock());
-
-  // auto termConst = builder.create<arith::ConstantOp>(loop.getLoc(),
-  // builder.getIndexAttr(1));
-  // auto term = stgWhile.getTerminator();
-  // term.getIterArgsMutable().append(termConst.getResult());
 
   // Add the non-yield operations to their start time groups.
   DenseMap<unsigned, SmallVector<Operation *>> startGroups;
   unsigned endTime = 0;
   for (auto *op : problem.getOperations()) {
-    if (isa<YieldOp>(op))
+    if (isa<YieldOp, IfOp>(op))
       continue;
     auto startTime = problem.getStartTime(op);
     startGroups[*startTime].push_back(op);
@@ -1042,6 +990,10 @@ LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
         for (auto *operation : startGroup) {
           for (auto &operand : operation->getOpOperands()) {
             if (operand.get().getDefiningOp() == op)
+              return true;
+
+            // Forward values used for predicates as well
+            if (predicateUse.contains(operand.get()))
               return true;
           }
         }
@@ -1122,7 +1074,13 @@ LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
     SmallVector<Type> stepTypes;
     DenseSet<Operation *> opsWithReturns;
     for (auto *op : group) {
-      for (auto *user : op->getUsers()) {
+      SmallVector<Operation *, 10> users;
+      users.append(op->getUsers().begin(), op->getUsers().end());
+      for (auto res : op->getResults()) {
+        auto predUsers = predicateUse.lookup(res);
+        users.append(predUsers.begin(), predUsers.end());
+      }
+      for (auto *user : users) {
         auto *userOrAncestor =
             loop.getLoopRegions().front()->findAncestorOpInRegion(*user);
         auto startTimeOpt = problem.getStartTime(userOrAncestor);
@@ -1160,15 +1118,33 @@ LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
     SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
     for (auto *op : group) {
       unsigned resultIndex = stepTerminator->getNumOperands();
+      OpBuilder::InsertionGuard g(builder);
+      LoopScheduleIfOp ifOp;
+      if (predicateMap.contains(op)) {
+        Value cond = predicateMap.lookup(op);
+        cond = valueMap.lookupOrDefault(cond);
+        ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(),
+                                                op->getResultTypes(), cond);
+        builder.setInsertionPointToStart(&ifOp.getBody().front());
+      }
       auto *newOp = builder.clone(*op, valueMap);
       dependenceAnalysis->replaceOp(op, newOp);
+      if (predicateMap.contains(op)) {
+        if (!newOp->getResults().empty())
+          builder.create<LoopScheduleYieldOp>(op->getLoc(),
+                                              newOp->getResults());
+        newOp = ifOp;
+      }
+
       std::queue<Operation *> oldOps;
       op->walk([&](Operation *op) { oldOps.push(op); });
-      newOp->walk([&](Operation *op) {
-        Operation *oldOp = oldOps.front();
-        dependenceAnalysis->replaceOp(oldOp, op);
-        oldOps.pop();
-      });
+      if (isa<LoopInterface>(newOp)) {
+        newOp->walk([&](Operation *op) {
+          Operation *oldOp = oldOps.front();
+          dependenceAnalysis->replaceOp(oldOp, op);
+          oldOps.pop();
+        });
+      }
       if (opsWithReturns.contains(op)) {
         stepTerminator->insertOperands(resultIndex, newOp->getResults());
         movedOps.emplace_back(op, newOp, resultIndex);
@@ -1298,47 +1274,16 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
   // auto innerLoop = loopNest.back();
   ImplicitLocOpBuilder builder(funcOp.getLoc(), funcOp);
 
-  // Maintain mappings of values in the loop body and results of stages,
-  // initially populated with the iter args.
+  // Maintain mappings of values in the loop body and results of stages
   IRMapping valueMap;
-  // for (size_t i = 0; i < iterArgs.size(); ++i)
-  //   valueMap.map(whileOp.getBefore().getArgument(i),
-  //                stgWhile.getCondBlock().getArgument(i));
 
   builder.setInsertionPointToStart(&funcOp.getBody().front());
-
-  // auto condConst = builder.create<arith::ConstantOp>(whileOp.getLoc(),
-  // builder.getIntegerAttr(builder.getI1Type(), 1)); auto *conditionReg =
-  // stgWhile.getCondBlock().getTerminator(); conditionReg->insertOperands(0,
-  // condConst.getResult()); for (auto &op :
-  // whileOp.getBefore().front().getOperations()) {
-  //   if (isa<scf::ConditionOp>(op)) {
-  //     auto condOp = cast<scf::ConditionOp>(op);
-  //     auto cond = condOp.getCondition();
-  //     auto condNew = valueMap.lookupOrNull(cond);
-  //     assert(condNew);
-  //     conditionReg->insertOperands(0, condNew);
-  //   } else {
-  //     auto *newOp = builder.clone(op, valueMap);
-  //     for (size_t i = 0; i < newOp->getNumResults(); ++i) {
-  //       auto newValue = newOp->getResult(i);
-  //       auto oldValue = op.getResult(i);
-  //       valueMap.map(oldValue, newValue);
-  //     }
-  //   }
-  // }
-
-  // builder.setInsertionPointToStart(&stgWhile.getScheduleBlock());
-
-  // auto termConst = builder.create<arith::ConstantOp>(whileOp.getLoc(),
-  // builder.getIndexAttr(1)); auto term = stgWhile.getTerminator();
-  // term.getIterArgsMutable().append(termConst.getResult());
 
   // Add the non-yield operations to their start time groups.
   DenseMap<unsigned, SmallVector<Operation *>> startGroups;
   for (auto *op : problem.getOperations()) {
     if (isa<YieldOp, func::ReturnOp, memref::AllocaOp, arith::ConstantOp,
-            memref::AllocOp, AllocInterface>(op))
+            memref::AllocOp, AllocInterface, IfOp>(op))
       continue;
     if (auto schedOp = dyn_cast<SchedulableInterface>(op)) {
       if (schedOp.isInitOp())
@@ -1348,21 +1293,8 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
     startGroups[*startTime].push_back(op);
   }
 
-  // for (auto *op : problem.getOperations()) {
-  //   if (isa<memref::AllocaOp>(op)) {
-  //     op.
-  //   }
-  // }
-
   SmallVector<SmallVector<Operation *>> scheduleGroups;
   auto totalLatency = problem.getStartTime(anchor).value();
-
-  // Maintain mappings of values in the loop body and results of stages,
-  // initially populated with the iter args.
-  // valueMap.clear();
-  // for (size_t i = 0; i < iterArgs.size(); ++i)
-  //   valueMap.map(whileOp.getAfter().getArgument(i),
-  //                stgWhile.getScheduleBlock().getArgument(i));
 
   // Create the stages.
   Block &funcBlock = funcOp.getBody().front();
@@ -1388,7 +1320,13 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
     SmallVector<Type> stepTypes;
     DenseSet<Operation *> opsWithReturns;
     for (auto *op : group) {
-      for (auto *user : op->getUsers()) {
+      SmallVector<Operation *, 10> users;
+      users.append(op->getUsers().begin(), op->getUsers().end());
+      for (auto res : op->getResults()) {
+        auto predUsers = predicateUse.lookup(res);
+        users.append(predUsers.begin(), predUsers.end());
+      }
+      for (auto *user : users) {
         if (opOrParentStartTime(problem, user) > startTime ||
             isFuncTerminator(user)) {
           if (!opsWithReturns.contains(op)) {
@@ -1414,8 +1352,23 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
     SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
     for (auto *op : group) {
       unsigned resultIndex = stageTerminator->getNumOperands();
-      auto *newOp = cloneOrReplace(builder, op, valueMap);
+      OpBuilder::InsertionGuard g(builder);
+      LoopScheduleIfOp ifOp;
+      if (predicateMap.contains(op)) {
+        Value cond = predicateMap.lookup(op);
+        cond = valueMap.lookupOrDefault(cond);
+        ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(),
+                                                op->getResultTypes(), cond);
+        builder.setInsertionPointToStart(&ifOp.getBody().front());
+      }
+      auto *newOp = builder.clone(*op, valueMap);
       dependenceAnalysis->replaceOp(op, newOp);
+      if (predicateMap.contains(op)) {
+        if (!newOp->getResults().empty())
+          builder.create<LoopScheduleYieldOp>(op->getLoc(),
+                                              newOp->getResults());
+        newOp = ifOp;
+      }
       if (opsWithReturns.contains(op)) {
         stageTerminator->insertOperands(resultIndex, newOp->getResults());
         movedOps.emplace_back(op, newOp, resultIndex);

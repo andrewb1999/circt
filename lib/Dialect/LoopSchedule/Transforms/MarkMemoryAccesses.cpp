@@ -12,6 +12,7 @@
 
 #include "PassDetails.h"
 
+#include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleAttributes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h"
@@ -71,13 +72,12 @@ void MarkMemoryAccessesPass::runOnOperation() {
     if (isa<AffineWriteOpInterface, AffineReadOpInterface, memref::LoadOp,
             memref::StoreOp, LoopScheduleLoadOp, LoopScheduleStoreOp,
             LoadInterface, StoreInterface>(op)) {
-      if (op->hasAttrOfType<StringAttr>("loopschedule.access_name")) {
+      if (op->hasAttrOfType<StringAttr>(NameAnalysis::getAttributeName())) {
         auto nameAttr =
-            op->getAttrOfType<StringAttr>("loopschedule.access_name");
+            op->getAttrOfType<StringAttr>(NameAnalysis::getAttributeName());
         auto name = nameAttr.getValue();
         if (usedNames.contains(name)) {
-          emitError(op->getLoc())
-              << "access name '" + name.str() + "' is not unique";
+          emitError(op->getLoc()) << "name '" + name.str() + "' is not unique";
           signalPassFailure();
         }
         usedNames.insert(std::pair(name, op));
@@ -91,10 +91,10 @@ void MarkMemoryAccessesPass::runOnOperation() {
     if (isa<AffineWriteOpInterface, AffineReadOpInterface, memref::LoadOp,
             memref::StoreOp, LoopScheduleLoadOp, LoopScheduleStoreOp,
             LoadInterface, StoreInterface>(op)) {
-      if (!op->hasAttrOfType<StringAttr>("loopschedule.access_name")) {
+      if (!op->hasAttrOfType<StringAttr>(NameAnalysis::getAttributeName())) {
         auto name = getUniqueName(getBaseName(op), usedNames, counters);
         StringAttr nameAttr = StringAttr::get(funcOp.getContext(), name);
-        op->setAttr("loopschedule.access_name", nameAttr);
+        op->setAttr(NameAnalysis::getAttributeName(), nameAttr);
         usedNames.insert(std::pair(StringRef(name), op));
       }
     }

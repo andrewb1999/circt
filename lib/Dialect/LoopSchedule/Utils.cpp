@@ -20,6 +20,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -48,199 +49,6 @@ using namespace circt::scheduling;
 namespace circt {
 
 namespace loopschedule {
-
-struct MulStrengthReduction : OpConversionPattern<MulIOp> {
-  using OpConversionPattern<MulIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(MulIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (isa<BlockArgument>(op.getRhs()))
-      return failure();
-    auto *rhsDef = op.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto val = cast<IntegerAttr>(constOp.getValue());
-      if (llvm::isPowerOf2_32(val.getInt())) {
-        auto log = val.getValue().exactLogBase2();
-        auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), log);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
-        rewriter.replaceOpWithNewOp<arith::ShLIOp>(op, op.getLhs(),
-                                                   shift.getResult());
-        return success();
-      }
-    }
-
-    return failure();
-  }
-};
-
-struct RemUIStrengthReduction : OpConversionPattern<RemUIOp> {
-  using OpConversionPattern<RemUIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(RemUIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (isa<BlockArgument>(op.getRhs()))
-      return failure();
-    auto *rhsDef = op.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto val = cast<IntegerAttr>(constOp.getValue());
-      if (llvm::isPowerOf2_32(val.getInt())) {
-        auto shifted = val.getValue() - 1;
-        auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), shifted);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
-        rewriter.replaceOpWithNewOp<arith::AndIOp>(op, op.getLhs(),
-                                                   shift.getResult());
-        return success();
-      }
-    }
-
-    return failure();
-  }
-};
-
-struct RemSIStrengthReduction : OpConversionPattern<RemSIOp> {
-  using OpConversionPattern<RemSIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(RemSIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<arith::RemUIOp>(op, op.getLhs(), op.getRhs());
-
-    return success();
-  }
-};
-
-struct DivSIStrengthReduction : OpConversionPattern<DivSIOp> {
-  using OpConversionPattern<DivSIOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(DivSIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (isa<BlockArgument>(op.getRhs()))
-      return failure();
-    auto *rhsDef = op.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto val = cast<IntegerAttr>(constOp.getValue());
-      if (llvm::isPowerOf2_32(val.getInt())) {
-        auto log = val.getValue().exactLogBase2();
-        auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), log);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
-        rewriter.replaceOpWithNewOp<arith::ShRUIOp>(op, op.getLhs(),
-                                                    shift.getResult());
-        return success();
-      }
-    }
-
-    return failure();
-  }
-};
-
-static bool mulLegalityCallback(Operation *op) {
-  if (auto mulOp = dyn_cast<arith::MulIOp>(op)) {
-    if (isa<BlockArgument>(mulOp.getRhs()))
-      return true;
-    auto *rhsDef = mulOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
-          -1) {
-        return false;
-      }
-    }
-    // return FoldSign<arith::MulIOp>::opIsLegal(mulOp);
-  }
-  return true;
-}
-
-static bool divSIOpLegalityCallback(Operation *op) {
-  if (auto divOp = dyn_cast<arith::DivSIOp>(op)) {
-    if (isa<BlockArgument>(divOp.getRhs()))
-      return true;
-    auto *rhsDef = divOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
-          -1) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-static bool remUILegalityCallback(Operation *op) {
-  if (auto remOp = dyn_cast<arith::RemUIOp>(op)) {
-    if (isa<BlockArgument>(remOp.getRhs()))
-      return true;
-    auto *rhsDef = remOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
-          -1) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-static bool remSILegalityCallback(Operation *op) {
-  if (auto remOp = dyn_cast<arith::RemSIOp>(op)) {
-    if (isa<BlockArgument>(remOp.getRhs()))
-      return true;
-    auto *rhsDef = remOp.getRhs().getDefiningOp();
-
-    if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
-      auto rhsValue = cast<IntegerAttr>(constOp.getValue());
-      if (rhsValue.getValue().exactLogBase2() != -1) {
-        if (rhsValue.getInt() >= 0)
-          return false;
-      }
-    }
-  }
-  return true;
-}
-
-LogicalResult postLoweringOptimizations(mlir::MLIRContext &context,
-                                        mlir::Operation *op) {
-  // llvm::errs() << "post lowering opt\n";
-  // op->getParentOfType<ModuleOp>().dump();
-  ConversionTarget target(context);
-  target.addLegalDialect<AffineDialect, ArithDialect, memref::MemRefDialect,
-                         scf::SCFDialect>();
-
-  auto *ctx = &context;
-  RewritePatternSet patterns(ctx);
-
-  patterns.add<MulStrengthReduction>(ctx);
-  patterns.add<DivSIStrengthReduction>(ctx);
-  patterns.add<RemUIStrengthReduction>(ctx);
-  patterns.add<RemSIStrengthReduction>(ctx);
-
-  target.addDynamicallyLegalOp<MulIOp>(mulLegalityCallback);
-  target.addDynamicallyLegalOp<DivSIOp>(divSIOpLegalityCallback);
-  target.addDynamicallyLegalOp<RemUIOp>(remUILegalityCallback);
-  target.addDynamicallyLegalOp<RemSIOp>(remSILegalityCallback);
-  target.addLegalOp<LoopScheduleLoadOp>();
-  target.addLegalOp<LoopScheduleStoreOp>();
-  target.markUnknownOpDynamicallyLegal([](Operation *op) { return true; });
-
-  if (failed(applyPartialConversion(op, target, std::move(patterns))))
-    return failure();
-
-  // Loop invariant code motion to hoist produced constants out of loop
-  op->walk(
-      [&](LoopLikeOpInterface loopLike) { moveLoopInvariantCode(loopLike); });
-
-  mlir::IRRewriter rewriter(&context);
-  (void)mlir::runRegionDCE(rewriter, op->getRegions());
-
-  return success();
-}
 
 Value getMemref(Operation *op) {
   Value memref =
@@ -306,7 +114,7 @@ getModuloProblem(scf::ForOp forOp,
         continue;
 
       // Insert a dependence into the problem.
-      Problem::Dependence dep(memoryDep.source, op);
+      Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -324,10 +132,11 @@ getModuloProblem(scf::ForOp forOp,
   // Set the anchor for scheduling. Insert dependences from all stores to the
   // terminator to ensure the problem schedules them before the terminator.
   auto *anchor = forOp.getBody()->getTerminator();
+  problem.insertOperation(anchor);
   forOp.getBody()->walk([&](Operation *op) {
     if (op == anchor || !problem.hasOperation(op))
       return;
-    Problem::Dependence dep(op, anchor);
+    Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -345,7 +154,7 @@ getModuloProblem(scf::ForOp forOp,
         continue;
 
       for (Operation *iterArgUser : iterArgs[i].getUsers()) {
-        Problem::Dependence dep(iterArgDefiner, iterArgUser);
+        Dependence dep(iterArgDefiner, iterArgUser);
         auto depInserted = problem.insertDependence(dep);
         assert(succeeded(depInserted));
         (void)depInserted;
@@ -378,7 +187,7 @@ getSharedOperatorsProblem(scf::ForOp forOp,
         for (auto &operand : innerOp->getOpOperands()) {
           auto *definingOp = operand.get().getDefiningOp();
           if (definingOp && definingOp->getParentOp() == forOp) {
-            Problem::Dependence dep(definingOp, op);
+            Dependence dep(definingOp, op);
             auto depInserted = problem.insertDependence(dep);
             assert(succeeded(depInserted));
             (void)depInserted;
@@ -403,7 +212,7 @@ getSharedOperatorsProblem(scf::ForOp forOp,
         continue;
 
       // Insert a dependence into the problem.
-      Problem::Dependence dep(memoryDep.source, op);
+      Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -414,13 +223,15 @@ getSharedOperatorsProblem(scf::ForOp forOp,
   // terminator to ensure the problem schedules them before the terminator.
   assert(forOp.getLoopRegions().size() == 1);
   auto *anchor = forOp.getLoopRegions().front()->back().getTerminator();
+  problem.insertOperation(anchor);
   forOp.getLoopRegions().front()->walk([&](Operation *op) {
     if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
-        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr)
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
+        !problem.hasOperation(op))
       return;
     if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface>(op))
       return;
-    Problem::Dependence dep(op, anchor);
+    Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -455,7 +266,7 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
       if (memoryDep.distance > 0)
         continue;
       // Insert a dependence into the problem.
-      Problem::Dependence dep(memoryDep.source, op);
+      Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -465,11 +276,13 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
   // Set the anchor for scheduling. Insert dependences from all stores to the
   // terminator to ensure the problem schedules them before the terminator.
   auto *anchor = funcOp.getBody().back().getTerminator();
+  problem.insertOperation(anchor);
   funcOp.getBody().walk([&](Operation *op) {
     if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
-        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr)
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
+        !problem.hasOperation(op))
       return;
-    Problem::Dependence dep(op, anchor);
+    Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -478,524 +291,280 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
   return problem;
 }
 
-LogicalResult unrollSubLoops(AffineForOp &forOp) {
-  auto result = forOp.getBody()->walk<WalkOrder::PostOrder>([](AffineForOp op) {
-    if (loopUnrollFull(op).failed())
-      return WalkResult::interrupt();
-    return WalkResult::advance();
+namespace {
+struct IfOpTypes {
+  IfOpTypes(scf::IfOp ifOp, bool inThen) : ifOp(ifOp), inThen(inThen) {}
+
+  scf::IfOp ifOp;
+  bool inThen;
+  llvm::StringMap<SmallVector<std::string>> thenTypes;
+  llvm::StringMap<SmallVector<std::string>> elseTypes;
+};
+} // namespace
+
+static std::map<Operation *, std::string> uniqueName;
+static int ifCounter = 0;
+
+static std::string getUnqiueName(Operation *op) {
+  if (uniqueName.count(op) > 0)
+    return uniqueName[op];
+  auto name = "if" + std::to_string(ifCounter);
+  uniqueName.insert(std::pair(op, name));
+  ifCounter++;
+  return name;
+}
+
+LogicalResult recordMemoryResources(Operation *op, Region &body,
+                                    ResourceMap &resourceMap,
+                                    ResourceLimits &resourceLimits) {
+  std::vector<std::unique_ptr<IfOpTypes>> ifOps;
+  llvm::StringMap<SmallVector<std::string>> finalTypes;
+
+  // Insert ResourceTypes
+  // This method is needed to ensure that resource uses in ifOp then and else
+  // blocks can be run in parallel.
+  body.walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (op->getParentOfType<LoopInterface>() != nullptr)
+      return;
+
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      ifOps.push_back(std::make_unique<IfOpTypes>(ifOp, true));
+    }
+
+    if (auto yield = dyn_cast<scf::YieldOp>(op)) {
+      if (!ifOps.empty()) {
+        auto &ifOpTypes = ifOps.back();
+        if (ifOpTypes->inThen) {
+          ifOpTypes->inThen = false;
+        } else {
+          std::unique_ptr<IfOpTypes> ifOpTypes = std::move(ifOps.back());
+          ifOps.pop_back();
+          assert(ifOpTypes.get() != nullptr);
+          for (auto &it : ifOpTypes->thenTypes) {
+            for (auto &rsrc : it.second)
+              finalTypes[it.first()].push_back(std::move(rsrc));
+          }
+          for (auto &it : ifOpTypes->elseTypes) {
+            for (auto &rsrc : it.second)
+              finalTypes[it.first()].push_back(std::move(rsrc));
+          }
+        }
+      }
+    } else if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp, LoadInterface,
+                   StoreInterface>(op)) {
+      std::string name;
+      if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp>(op)) {
+        Value memRef = getMemref(op);
+        name = "mem_" + std::to_string(hash_value(memRef));
+      } else if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*op)) {
+        name = loadOp.getUniqueId();
+      } else {
+        auto storeOp = cast<loopschedule::StoreInterface>(*op);
+        name = storeOp.getUniqueId();
+      }
+      if (!ifOps.empty()) {
+        auto &ifOpTypes = ifOps.back();
+        auto ifOp = ifOpTypes->ifOp;
+        std::string memRsrc = name + "_" + getUnqiueName(ifOp) +
+                              (ifOpTypes->inThen ? "then" : "else");
+        resourceMap[op].push_back(memRsrc);
+        resourceLimits.insert(std::pair(memRsrc, 1));
+        auto &thenOrElseMap =
+            ifOpTypes->inThen ? ifOpTypes->thenTypes : ifOpTypes->elseTypes;
+        for (const auto &opr : thenOrElseMap[name]) {
+          resourceMap[op].push_back(opr);
+        }
+        thenOrElseMap[name].push_back(memRsrc);
+      } else {
+        finalTypes[name].push_back(name);
+        resourceLimits.insert(std::pair(name, 1));
+      }
+
+      for (const auto &opr : finalTypes[name]) {
+        resourceMap[op].push_back(opr);
+      }
+    } else if (auto loop = dyn_cast<LoopInterface>(op)) {
+      assert(ifOps.empty() &&
+             "Loops inside if statements is unsupported currently");
+      loop.getBodyBlock()->walk([&](Operation *op) {
+        std::string name;
+        if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp>(op)) {
+          Value memRef = getMemref(op);
+          name = "mem_" + std::to_string(hash_value(memRef));
+          resourceLimits.insert(std::pair(name, 1));
+          finalTypes[name].push_back(name);
+        } else if (isa<LoadInterface, StoreInterface>(op)) {
+          std::optional<unsigned> limitOpt;
+          if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*op)) {
+            limitOpt = loadOp.getLimit();
+            name = loadOp.getUniqueId();
+          } else if (auto storeOp =
+                         dyn_cast<loopschedule::StoreInterface>(*op)) {
+            limitOpt = storeOp.getLimit();
+            name = storeOp.getUniqueId();
+          }
+          if (limitOpt.has_value()) {
+            finalTypes[name].push_back(name);
+            resourceLimits.insert(std::pair(name, limitOpt.value()));
+          }
+        }
+        for (const auto &opr : finalTypes[name]) {
+          resourceMap[op].push_back(opr);
+        }
+      });
+    }
   });
 
-  if (result.wasInterrupted()) {
-    forOp.emitOpError("Could not unroll sub loops");
-    return failure();
+  return success();
+}
+
+LogicalResult addMemoryResources(Operation *op, Region &body,
+                                 scheduling::SharedOperatorsProblem &problem,
+                                 ResourceMap &resourceMap,
+                                 ResourceLimits &resourceLimits) {
+
+  for (const auto &it : resourceLimits) {
+    auto memRsrc = problem.getOrInsertResourceType(it.getKey());
+    problem.setResourceLimit(memRsrc, it.getValue());
+  }
+
+  for (const auto &it : resourceMap) {
+    auto *op = it.first;
+    auto rsrcs = it.second;
+    for (const auto &name : rsrcs) {
+      auto memRsrc = problem.getOrInsertResourceType(name);
+      problem.addResourceType(op, memRsrc);
+    }
   }
 
   return success();
 }
 
-struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
-  using OpRewritePattern<scf::ForOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(scf::ForOp op,
-                                PatternRewriter &rewriter) const override {
-    auto constantLB = op.getLowerBound().getDefiningOp<ConstantOp>();
-    auto constantUB = op.getUpperBound().getDefiningOp<ConstantOp>();
-    auto constantStep = op.getStep().getDefiningOp<ConstantOp>();
-    if (constantLB == nullptr || constantUB == nullptr ||
-        constantStep == nullptr) {
-      auto inductionType = op.getInductionVar().getType();
-      auto bitwidth = isa<IndexType>(inductionType)
-                          ? 64
-                          : inductionType.getIntOrFloatBitWidth();
-      auto newType = rewriter.getIntegerType(bitwidth);
-      if (op.getInductionVar().getType() == newType)
-        return failure();
-
-      op.getInductionVar().setType(newType);
-      rewriter.setInsertionPointToStart(&op.getRegion().front());
-      auto newExt = rewriter.create<arith::ExtSIOp>(
-          op.getLoc(), rewriter.getI64Type(), op.getInductionVar());
-      rewriter.replaceAllUsesExcept(op.getInductionVar(), newExt.getOut(),
-                                    newExt);
-      return success();
-    }
-
-    auto upperBoundAttr = dyn_cast<IntegerAttr>(constantUB.getValue());
-    auto upperBound = upperBoundAttr.getValue();
-    upperBound = upperBound + 1;
-    auto bitwidth = upperBound.ceilLogBase2();
-
-    auto induction = op.getInductionVar();
-    auto newType = rewriter.getIntegerType(bitwidth);
-    if (induction.getType() == newType)
-      return failure();
-
-    // Replace lowerBound, upperBound and step
-    auto lbValue = cast<IntegerAttr>(constantLB.getValue()).getInt();
-    auto newLBAttr = rewriter.getIntegerAttr(newType, lbValue);
-    auto newLB = rewriter.create<ConstantOp>(op.getLoc(), newLBAttr);
-    op.setLowerBound(newLB);
-
-    auto ubValue = cast<IntegerAttr>(constantUB.getValue()).getInt();
-    auto newUBAttr = rewriter.getIntegerAttr(newType, ubValue);
-    auto newUB = rewriter.create<ConstantOp>(op.getLoc(), newUBAttr);
-    op.setUpperBound(newUB);
-
-    auto stepValue = cast<IntegerAttr>(constantStep.getValue()).getInt();
-    auto newStepAttr = rewriter.getIntegerAttr(newType, stepValue);
-    auto newStep = rewriter.create<ConstantOp>(op.getLoc(), newStepAttr);
-    op.setStep(newStep);
-
-    induction.setType(newType);
-    rewriter.setInsertionPointToStart(&op.getRegion().front());
-    auto newExt = rewriter.create<arith::ExtSIOp>(
-        op.getLoc(), rewriter.getI64Type(), induction);
-    // auto newCast = rewriter.create<arith::IndexCastOp>(op.getLoc(),
-    // rewriter.getIndexType(), newExt.getOut());
-    rewriter.replaceAllUsesExcept(induction, newExt.getOut(), newExt);
-    return success();
-  }
-};
-
-struct SCFForCleanupPattern : OpRewritePattern<scf::ForOp> {
-  using OpRewritePattern<scf::ForOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(scf::ForOp op,
-                                PatternRewriter &rewriter) const override {
-    bool changed = false;
-    auto cast = op.getLowerBound().getDefiningOp<UnrealizedConversionCastOp>();
-    if (cast != nullptr && cast.getInputs().size() == 1) {
-      auto newVal = cast.getInputs().front();
-      op.setLowerBound(newVal);
-      changed = true;
-    }
-
-    cast = op.getUpperBound().getDefiningOp<UnrealizedConversionCastOp>();
-    if (cast != nullptr && cast.getInputs().size() == 1) {
-      auto newVal = cast.getInputs().front();
-      op.setUpperBound(newVal);
-      changed = true;
-    }
-
-    cast = op.getStep().getDefiningOp<UnrealizedConversionCastOp>();
-    if (cast != nullptr && cast.getInputs().size() == 1) {
-      auto newVal = cast.getInputs().front();
-      op.setStep(newVal);
-      changed = true;
-    }
-
-    if (!changed)
-      return failure();
-    return success();
-  }
-};
-
-struct TruncCleanupPattern : OpRewritePattern<TruncIOp> {
-  using OpRewritePattern<TruncIOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(TruncIOp op,
-                                PatternRewriter &rewriter) const override {
-    if (isa<BlockArgument>(op.getIn()))
-      return failure();
-    auto *definingOp = op.getIn().getDefiningOp();
-    auto outputType = op.getOut().getType();
-    Operation *newOp = nullptr;
-    if (auto extUI = dyn_cast<ExtUIOp>(definingOp)) {
-      newOp = rewriter.create<ExtUIOp>(op.getLoc(), outputType, extUI.getIn());
-    } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
-      newOp = rewriter.create<ExtSIOp>(op.getLoc(), outputType, extSI.getIn());
-    }
-
-    if (!newOp)
-      return failure();
-
-    rewriter.replaceOp(op, newOp);
-    return success();
-  }
-};
-
-struct LoadCleanupPattern : OpRewritePattern<LoopScheduleLoadOp> {
-  using OpRewritePattern<LoopScheduleLoadOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(LoopScheduleLoadOp op,
-                                PatternRewriter &rewriter) const override {
-    auto indices = op.getIndicesMutable();
-    bool updated = false;
-    for (auto &idx : llvm::make_early_inc_range(indices)) {
-      if (isa<BlockArgument>(idx.get()))
-        continue;
-      auto *definingOp = idx.get().getDefiningOp();
-      if (auto extUI = dyn_cast<ExtUIOp>(definingOp)) {
-        idx.set(extUI.getIn());
-        updated = true;
-      } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
-        idx.set(extSI.getIn());
-        updated = true;
-      } else if (auto unreal =
-                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
-        if (unreal.getInputs().size() != 1)
-          continue;
-        idx.set(unreal.getInputs().front());
-        updated = true;
-      }
-    }
-
-    if (!updated)
-      return failure();
-
-    return success();
-  }
-};
-
-struct StoreCleanupPattern : OpRewritePattern<LoopScheduleStoreOp> {
-  using OpRewritePattern<LoopScheduleStoreOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(LoopScheduleStoreOp op,
-                                PatternRewriter &rewriter) const override {
-    auto indices = op.getIndicesMutable();
-    bool updated = false;
-    for (auto &idx : llvm::make_early_inc_range(indices)) {
-      if (isa<BlockArgument>(idx.get()))
-        continue;
-      auto *definingOp = idx.get().getDefiningOp();
-      if (auto extUI = dyn_cast<ExtUIOp>(definingOp)) {
-        idx.set(extUI.getIn());
-        updated = true;
-      } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
-        idx.set(extSI.getIn());
-        updated = true;
-      } else if (auto unreal =
-                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
-        if (unreal.getInputs().size() != 1)
-          continue;
-        idx.set(unreal.getInputs().front());
-        updated = true;
-      }
-    }
-
-    if (!updated)
-      return failure();
-
-    return success();
-  }
-};
-
-struct LoadAddressNarrowingPattern : OpRewritePattern<LoopScheduleLoadOp> {
-  using OpRewritePattern<LoopScheduleLoadOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(LoopScheduleLoadOp op,
-                                PatternRewriter &rewriter) const override {
-    auto indices = op.getIndicesMutable();
-    bool updated = false;
-    for (auto v : llvm::enumerate(indices)) {
-      auto &idx = v.value();
-      auto i = v.index();
-      auto dimSize = op.getMemRefType().getDimSize(i);
-      auto bitwidth = llvm::Log2_64_Ceil(dimSize);
-      auto newType = rewriter.getIntegerType(bitwidth);
-      auto oldType = dyn_cast_or_null<IntegerType>(idx.get().getType());
-      if (oldType) {
-        if (newType.getIntOrFloatBitWidth() < oldType.getIntOrFloatBitWidth()) {
-          auto newIdx =
-              rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
-          idx.set(newIdx);
-          updated = true;
-        }
-      }
-    }
-
-    if (!updated)
-      return failure();
-
-    return success();
-  }
-};
-
-struct LoadInterfaceCleanupPattern : OpInterfaceRewritePattern<LoadInterface> {
-  using OpInterfaceRewritePattern<LoadInterface>::OpInterfaceRewritePattern;
-
-  LogicalResult matchAndRewrite(LoadInterface op,
-                                PatternRewriter &rewriter) const override {
-    auto indices = op.getIndicesMutable();
-    bool updated = false;
-    for (auto &idx : llvm::make_early_inc_range(indices)) {
-      if (isa<BlockArgument>(idx.get()))
-        continue;
-      auto *definingOp = idx.get().getDefiningOp();
-      if (auto extUI = dyn_cast<ExtUIOp>(definingOp)) {
-        idx.set(extUI.getIn());
-        updated = true;
-      } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
-        idx.set(extSI.getIn());
-        updated = true;
-      } else if (auto unreal =
-                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
-        if (unreal.getInputs().size() != 1)
-          continue;
-        idx.set(unreal.getInputs().front());
-        updated = true;
-      }
-    }
-
-    if (!updated)
-      return failure();
-
-    return success();
-  }
-};
-
-struct StoreInterfaceCleanupPattern
-    : OpInterfaceRewritePattern<StoreInterface> {
-  using OpInterfaceRewritePattern<StoreInterface>::OpInterfaceRewritePattern;
-
-  LogicalResult matchAndRewrite(StoreInterface op,
-                                PatternRewriter &rewriter) const override {
-    auto indices = op.getIndicesMutable();
-    bool updated = false;
-    for (auto &idx : llvm::make_early_inc_range(indices)) {
-      if (isa<BlockArgument>(idx.get()))
-        continue;
-      auto *definingOp = idx.get().getDefiningOp();
-      if (auto extUI = dyn_cast<ExtUIOp>(definingOp)) {
-        idx.set(extUI.getIn());
-        updated = true;
-      } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
-        idx.set(extSI.getIn());
-        updated = true;
-      } else if (auto unreal =
-                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
-        if (unreal.getInputs().size() != 1)
-          continue;
-        idx.set(unreal.getInputs().front());
-        updated = true;
-      }
-    }
-
-    if (!updated)
-      return failure();
-
-    return success();
-  }
-};
-
-struct LoadInterfaceAddressNarrowingPattern
-    : OpInterfaceRewritePattern<LoadInterface> {
-  using OpInterfaceRewritePattern<LoadInterface>::OpInterfaceRewritePattern;
-
-  LogicalResult matchAndRewrite(LoadInterface op,
-                                PatternRewriter &rewriter) const override {
-    auto indices = op.getIndicesMutable();
-    bool updated = false;
-    for (auto v : llvm::enumerate(indices)) {
-      auto &idx = v.value();
-      auto i = v.index();
-      auto bitwidth = op.getDimBitwidth(i);
-      auto newType = rewriter.getIntegerType(bitwidth);
-      auto oldType = dyn_cast_or_null<IntegerType>(idx.get().getType());
-      if (oldType) {
-        if (newType.getIntOrFloatBitWidth() < oldType.getIntOrFloatBitWidth()) {
-          auto newIdx =
-              rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
-          idx.set(newIdx);
-          updated = true;
-        }
-      }
-    }
-
-    if (!updated)
-      return failure();
-
-    return success();
-  }
-};
-
-void populateIndexRemovalTypeConverter(TypeConverter &typeConverter) {
-  typeConverter.addConversion(
-      [](Type type) -> std::optional<Type> { return type; });
-  typeConverter.addConversion([](IndexType type) -> std::optional<Type> {
-    return IntegerType::get(type.getContext(), 64);
-  });
-  typeConverter.addTargetMaterialization(
-      [](OpBuilder &b, Type target, ValueRange input, Location loc) {
-        return b.create<UnrealizedConversionCastOp>(loc, target, input)
-            .getResult(0);
-      });
-  typeConverter.addSourceMaterialization(
-      [](OpBuilder &b, Type source, ValueRange input, Location loc) {
-        return b.create<UnrealizedConversionCastOp>(loc, source, input)
-            .getResult(0);
-      });
-}
-
-struct IndexRemovalRewritePattern final : ConversionPattern {
+struct IfOpConversionPattern : OpConversionPattern<scf::IfOp> {
 public:
-  IndexRemovalRewritePattern(TypeConverter &converter, MLIRContext *context,
-                             LoopScheduleDependenceAnalysis &dependenceAnalysis)
-      : ConversionPattern(converter, MatchAnyOpTypeTag{}, 1, context),
-        dependenceAnalysis(dependenceAnalysis) {}
+  IfOpConversionPattern(MLIRContext *context, PredicateMap &predicateMap)
+      : OpConversionPattern<scf::IfOp>(context), predicateMap(predicateMap) {}
 
   LogicalResult
-  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+  matchAndRewrite(scf::IfOp ifOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Location loc = op->getLoc();
-    const TypeConverter *converter = getTypeConverter();
-    if (converter->isLegal(op))
-      return rewriter.notifyMatchFailure(loc, "op already legal");
-
-    OperationState newOp(loc, op->getName());
-    newOp.addOperands(operands);
-
-    SmallVector<Type> newResultTypes;
-    if (failed(converter->convertTypes(op->getResultTypes(), newResultTypes)))
-      return rewriter.notifyMatchFailure(loc, "couldn't convert return types");
-    newOp.addTypes(newResultTypes);
-    newOp.addAttributes(op->getAttrs());
-    Operation *legalized = rewriter.create(newOp);
-    SmallVector<Value> results = legalized->getResults();
-    dependenceAnalysis.replaceOp(op, legalized);
-    rewriter.replaceOp(op, results);
+    auto getNewPredicate = [&](Operation *op, Value cond,
+                               DenseMap<Value, Value> &condMap) {
+      if (condMap.contains(cond))
+        return condMap.lookup(cond);
+      Value newCond = cond;
+      if (predicateMap.contains(op)) {
+        auto currCond = predicateMap.lookup(op);
+        newCond = rewriter.create<arith::AndIOp>(ifOp.getLoc(), currCond, cond);
+      }
+      condMap.insert(std::pair(cond, newCond));
+      return newCond;
+    };
+    rewriter.modifyOpInPlace(ifOp, [&]() {
+      if (!ifOp.thenBlock()->without_terminator().empty()) {
+        rewriter.splitBlock(ifOp.thenBlock(), --ifOp.thenBlock()->end());
+        DenseMap<Value, Value> condMap;
+        ifOp.getThenRegion().front().walk([&](Operation *op) {
+          if (isa<scf::IfOp, scf::YieldOp>(op))
+            return;
+          Value newCond = getNewPredicate(op, ifOp.getCondition(), condMap);
+          predicateMap[op] = newCond;
+        });
+        rewriter.inlineBlockBefore(&ifOp.getThenRegion().front(), ifOp);
+      }
+      if (ifOp.elseBlock() && !ifOp.elseBlock()->without_terminator().empty()) {
+        rewriter.setInsertionPoint(ifOp);
+        auto constOne = rewriter.create<arith::ConstantOp>(
+            ifOp.getLoc(), rewriter.getIntegerAttr(rewriter.getI1Type(), 1));
+        auto condNot = rewriter.create<arith::XOrIOp>(
+            ifOp.getLoc(), ifOp.getCondition(), constOne);
+        rewriter.splitBlock(ifOp.elseBlock(), --ifOp.elseBlock()->end());
+        DenseMap<Value, Value> condMap;
+        ifOp.getElseRegion().front().walk([&](Operation *op) {
+          if (isa<scf::IfOp, scf::YieldOp>(op))
+            return;
+          Value newCond = getNewPredicate(op, condNot, condMap);
+          predicateMap[op] = newCond;
+        });
+        rewriter.inlineBlockBefore(&ifOp.getElseRegion().front(), ifOp);
+      }
+    });
 
     return success();
   }
 
 private:
-  LoopScheduleDependenceAnalysis &dependenceAnalysis;
+  PredicateMap &predicateMap;
 };
 
-struct ConstIndexRemovalRewritePattern final
-    : public OpConversionPattern<ConstantOp> {
-public:
-  using OpConversionPattern<ConstantOp>::OpConversionPattern;
+struct IfToSelectPattern : OpConversionPattern<scf::IfOp> {
+  using OpConversionPattern<scf::IfOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(ConstantOp op, OpAdaptor adaptor,
+  matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto val = op.getValue();
-    if (!isa<IndexType>(val.getType()))
+    if (!op.thenBlock()->without_terminator().empty() || !op.elseBlock()) {
       return failure();
+    }
 
-    auto integerAttr = dyn_cast_or_null<IntegerAttr>(val);
-    if (!integerAttr)
+    if (op.elseBlock() && !op.elseBlock()->without_terminator().empty()) {
       return failure();
+    }
 
-    auto intVal = integerAttr.getInt();
+    auto thenOperands = op.thenYield().getOperands();
+    auto elseOperands = op.elseYield().getOperands();
 
-    rewriter.replaceOpWithNewOp<ConstantOp>(op,
-                                            rewriter.getI64IntegerAttr(intVal));
+    for (auto iv : llvm::enumerate(llvm::zip(thenOperands, elseOperands))) {
+      auto i = iv.index();
+      auto v = iv.value();
+      SmallVector<Value> operands;
+      operands.push_back(op.getCondition());
+      operands.push_back(std::get<0>(v));
+      operands.push_back(std::get<1>(v));
+      auto selectOp = rewriter.create<arith::SelectOp>(op.getLoc(), operands);
+      auto ifRes = op.getResult(i);
+      rewriter.replaceAllUsesWith(ifRes, selectOp.getResult());
+    }
+
+    rewriter.eraseOp(op);
 
     return success();
   }
 };
 
-struct IndexCastRemovalRewritePattern final
-    : public OpConversionPattern<IndexCastOp> {
-public:
-  using OpConversionPattern<IndexCastOp>::OpConversionPattern;
+LogicalResult ifOpConversion(Operation *op, Region &body,
+                             PredicateMap &predicateMap) {
+  predicateMap.clear();
+  auto *ctx = op->getContext();
+  ConversionTarget target(*ctx);
+  target
+      .addLegalDialect<arith::ArithDialect, scf::SCFDialect, func::FuncDialect,
+                       loopschedule::LoopScheduleDialect>();
+  target.addIllegalOp<scf::IfOp>();
 
-  LogicalResult
-  matchAndRewrite(IndexCastOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(
-        op, op.getOut().getType(), op.getIn());
+  RewritePatternSet patterns(ctx);
+  patterns.add<IfOpConversionPattern>(ctx, predicateMap);
+  patterns.add<IfToSelectPattern>(ctx);
 
-    return success();
+  return applyPartialConversion(op, target, std::move(patterns));
+}
+
+void addPredicateDependencies(Operation *op, Region &body,
+                              scheduling::SharedOperatorsProblem &problem,
+                              const PredicateMap &predicateMap,
+                              PredicateUse &predicateUse) {
+  predicateUse.clear();
+  for (auto it : predicateMap) {
+    auto *op = it.first;
+    auto pred = it.second;
+    predicateUse[pred].push_back(op);
+    auto *definingOp = pred.getDefiningOp();
+    assert(problem.hasOperation(definingOp));
+    assert(problem.hasOperation(op));
+    Dependence dep(definingOp, op);
+    auto depInserted = problem.insertDependence(dep);
+    assert(succeeded(depInserted));
   }
-};
-
-LogicalResult bitwidthMinimization(
-    mlir::MLIRContext &context, mlir::Operation *op,
-    analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis) {
-  // Minimize SCFFor iteration argument bitwidth to enable further bitwidth
-  // reduction
-  RewritePatternSet patterns(&context);
-  patterns.add<SCFForIterationReduction>(&context);
-
-  GreedyRewriteConfig config;
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
-    op->emitOpError("Failed to perform bitwidth minimization conversions");
-    return failure();
-  }
-
-  // Remove index types to enable bitwidth reduction of indices
-  TypeConverter typeConverter;
-  populateIndexRemovalTypeConverter(typeConverter);
-  ConversionTarget target(context);
-  target.addDynamicallyLegalDialect<ArithDialect>(
-      [&typeConverter](Operation *op) { return typeConverter.isLegal(op); });
-  target.addDynamicallyLegalDialect<LoopScheduleDialect>(
-      [&typeConverter](Operation *op) { return typeConverter.isLegal(op); });
-  // target.addDynamicallyLegalDialect<scf::SCFDialect>(
-  //     [&typeConverter](Operation *op) { return typeConverter.isLegal(op); });
-  target.markUnknownOpDynamicallyLegal(
-      [&typeConverter](Operation *op) -> std::optional<bool> {
-        if (!isa<LoadInterface>(op) && !isa<StoreInterface>(op))
-          return std::nullopt;
-        return typeConverter.isLegal(op);
-      });
-  target.addIllegalOp<arith::IndexCastOp>();
-  patterns.clear();
-  patterns.add<IndexRemovalRewritePattern>(typeConverter, &context,
-                                           dependenceAnalysis);
-  patterns.add<ConstIndexRemovalRewritePattern>(typeConverter, &context);
-  patterns.add<IndexCastRemovalRewritePattern>(typeConverter, &context);
-  populateReconcileUnrealizedCastsPatterns(patterns);
-  if (failed(applyPartialConversion(op, target, std::move(patterns))))
-    return failure();
-
-  // Cleanup extraneous casts after int narrowing
-  patterns.clear();
-  patterns.add<TruncCleanupPattern>(&context);
-  patterns.add<LoadCleanupPattern>(&context);
-  patterns.add<StoreCleanupPattern>(&context);
-
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
-    op->emitOpError("Failed to perform bitwidth minimization conversions");
-    return failure();
-  }
-
-  // Apply the core integer narrowing pass
-  patterns.clear();
-  SmallVector<unsigned> bitwidthsSupported;
-  for (unsigned i = 1; i <= 128; ++i) {
-    bitwidthsSupported.push_back(i);
-  }
-  populateArithIntNarrowingPatterns(
-      patterns, ArithIntNarrowingOptions{bitwidthsSupported});
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
-    op->emitOpError("Failed to perform bitwidth minimization conversions");
-    return failure();
-  }
-
-  // Cleanup extraneous casts after int narrowing
-  patterns.clear();
-  patterns.add<TruncCleanupPattern>(&context);
-  patterns.add<SCFForCleanupPattern>(&context);
-  patterns.add<LoadCleanupPattern>(&context);
-  patterns.add<StoreCleanupPattern>(&context);
-  patterns.add<LoadAddressNarrowingPattern>(&context);
-  patterns.add<LoadInterfaceCleanupPattern>(&context);
-  patterns.add<StoreInterfaceCleanupPattern>(&context);
-  patterns.add<LoadInterfaceAddressNarrowingPattern>(&context);
-
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
-    op->emitOpError("Failed to perform bitwidth minimization conversions");
-    return failure();
-  }
-
-  auto res = op->walk([](Operation *op) {
-    if (isa<UnrealizedConversionCastOp>(op))
-      return WalkResult::interrupt();
-    return WalkResult::advance();
-  });
-
-  if (res.wasInterrupted())
-    return op->emitOpError(
-        "Bitwidth minimization failed to remove UnrealizedConversionCastOps");
-  // Perform dead code elimination again before scheduling
-  mlir::IRRewriter rewriter(&context);
-  (void)mlir::runRegionDCE(rewriter, op->getRegions());
-
-  return success();
 }
 
 } // namespace loopschedule

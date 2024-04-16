@@ -12,7 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Analysis/LoopScheduleDependenceAnalysis.h"
-#include "circt/Analysis/AccessNameAnalysis.h"
+#include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
@@ -22,6 +22,7 @@
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OperationSupport.h"
@@ -29,7 +30,6 @@
 
 using namespace mlir;
 using namespace mlir::affine;
-// using namespace circt;
 using namespace circt::analysis;
 using namespace circt::loopschedule;
 
@@ -75,7 +75,7 @@ static Block *getCommonBlockInAffineScope(Operation *opA, Operation *opB) {
 circt::analysis::LoopScheduleDependenceAnalysis::LoopScheduleDependenceAnalysis(
     Operation *op, AnalysisManager &analysisManager) {
   auto funcOp = cast<func::FuncOp>(op);
-  auto accessNameAnalysis = analysisManager.getAnalysis<AccessNameAnalysis>();
+  auto accessNameAnalysis = analysisManager.getAnalysis<NameAnalysis>();
 
   if (!funcOp->hasAttrOfType<SymbolRefAttr>("loopschedule.dependencies"))
     return;
@@ -101,10 +101,16 @@ circt::analysis::LoopScheduleDependenceAnalysis::LoopScheduleDependenceAnalysis(
             commonBlock->findAncestorOpInBlock(*destination);
         if (srcOrAncestor == nullptr || dstOrAncestor == nullptr)
           return;
+
         // Check if the dst or its ancestor is before the src or its ancestor.
         // We want to dst to be before the src to insert iter-iteration deps.
         if ((dist != 0 && dstOrAncestor->isBeforeInBlock(srcOrAncestor)) ||
             (dist == 0 && srcOrAncestor->isBeforeInBlock(dstOrAncestor))) {
+          // Do not create dependencies on IfOps
+          if (isa<scf::IfOp>(srcOrAncestor))
+            srcOrAncestor = source;
+          if (isa<scf::IfOp>(dstOrAncestor))
+            dstOrAncestor = destination;
           results[dstOrAncestor].emplace_back(srcOrAncestor, dist);
         }
       }
@@ -122,25 +128,11 @@ circt::analysis::LoopScheduleDependenceAnalysis::getDependencies(
 /// Replaces the dependences, if any, from the oldOp to the newOp.
 void circt::analysis::LoopScheduleDependenceAnalysis::replaceOp(
     Operation *oldOp, Operation *newOp) {
-  // llvm::errs() << "\noldOp: ";
-  // oldOp->dump();
-  // llvm::errs() << "newOp: ";
-  // newOp->dump();
-  // llvm::errs() << "replace\n";
-  // newOp->dump();
-  // dumpMap(results);
   // If oldOp had any dependences.
   auto deps = results[oldOp];
-  // llvm::errs() << "move dep\n";
   // Move the dependences to newOp.
   results[newOp] = deps;
   results.erase(oldOp);
-
-  // auto test = results.find(newOp);
-  // if (test != results.end()) {
-  //   test->first->dump();
-  // }
-  // dumpMap(results);
 
   // Find any dependences originating from oldOp and make newOp the source.
   // TODO(mikeurbach): consider adding an inverted index to avoid this scan.
@@ -148,11 +140,6 @@ void circt::analysis::LoopScheduleDependenceAnalysis::replaceOp(
     for (auto &dep : it.second) {
       if (OperationEquivalence::isEquivalentTo(
               dep.source, oldOp, OperationEquivalence::IgnoreLocations)) {
-        // if (dep.source == oldOp) {
-        // llvm::errs() << "replace dest\n";
-        // it.first->dump();
-        // llvm::errs() << "replace src\n";
-        // dep.source->dump();
         dep.source = newOp;
       }
     }
@@ -163,24 +150,12 @@ void circt::analysis::LoopScheduleDependenceAnalysis::replaceOp(
 bool circt::analysis::LoopScheduleDependenceAnalysis::containsOp(
     Operation *op) {
   if (results.count(op) > 0 && !results[op].empty()) {
-    llvm::errs() << "contains\n";
-    op->dump();
-    for (auto dep : results[op]) {
-      llvm::errs() << "dep: ";
-      dep.source->dump();
-    }
     return true;
   }
 
   for (auto &it : results)
     for (auto &dep : it.second)
-      // if (OperationEquivalence::isEquivalentTo(dep.source, op,
-      // OperationEquivalence::IgnoreLocations)) {
       if (dep.source == op) {
-        // llvm::errs() << "dep.dest\n";
-        // it.first->dump();
-        llvm::errs() << "dep.source\n";
-        op->dump();
         return true;
       }
 

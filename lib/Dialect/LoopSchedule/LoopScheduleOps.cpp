@@ -776,6 +776,68 @@ void LoopScheduleAccessOp::print(::mlir::OpAsmPrinter &p) {
   p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
 }
 
+//===----------------------------------------------------------------------===//
+// IfOp
+//===----------------------------------------------------------------------===//
+
+ParseResult LoopScheduleIfOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
+  // Create the regions for 'then'.
+  result.regions.reserve(1);
+  Region *bodyRegion = result.addRegion();
+
+  auto &builder = parser.getBuilder();
+  OpAsmParser::UnresolvedOperand cond;
+  Type i1Type = builder.getIntegerType(1);
+  if (parser.parseOperand(cond) ||
+      parser.resolveOperand(cond, i1Type, result.operands))
+    return failure();
+  // Parse optional results type list.
+  if (parser.parseOptionalArrowTypeList(result.types))
+    return failure();
+  // Parse the 'then' region.
+  if (parser.parseRegion(*bodyRegion))
+    return failure();
+  LoopScheduleIfOp::ensureTerminator(*bodyRegion, parser.getBuilder(),
+                                     result.location);
+
+  // Parse the optional attribute list.
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+  return success();
+}
+
+void LoopScheduleIfOp::print(OpAsmPrinter &p) {
+  bool printBlockTerminators = false;
+
+  p << " " << getCond();
+  if (!getResults().empty()) {
+    p << " -> (" << getResultTypes() << ")";
+    // Print yield explicitly if the op defines values.
+    printBlockTerminators = true;
+  }
+  p << ' ';
+  p.printRegion(getBodyRegion(),
+                /*printEntryBlockArgs=*/false,
+                /*printBlockTerminators=*/printBlockTerminators);
+
+  p.printOptionalAttrDict((*this)->getAttrs());
+}
+
+void LoopScheduleIfOp::build(OpBuilder &odsBuilder, OperationState &odsState,
+                             TypeRange resultTypes, Value cond) {
+  odsState.addTypes(resultTypes);
+  odsState.addOperands(cond);
+
+  // Build then region.
+  OpBuilder::InsertionGuard guard(odsBuilder);
+  Region *thenRegion = odsState.addRegion();
+  odsBuilder.createBlock(thenRegion);
+  if (resultTypes.empty())
+    LoopScheduleIfOp::ensureTerminator(*thenRegion, odsBuilder,
+                                       odsState.location);
+}
+
 #include "circt/Dialect/LoopSchedule/LoopScheduleInterfaces.cpp.inc"
 
 #define GET_OP_CLASSES

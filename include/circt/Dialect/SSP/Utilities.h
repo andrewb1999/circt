@@ -27,11 +27,10 @@
 
 #include <functional>
 
+using namespace circt::scheduling;
+
 namespace circt {
 namespace ssp {
-
-using OperatorType = scheduling::Problem::OperatorType;
-using Dependence = scheduling::Problem::Dependence;
 
 //===----------------------------------------------------------------------===//
 // ssp.InstanceOp -> circt::scheduling::Problem (or subclasses)
@@ -99,12 +98,12 @@ void loadInstanceProperties(ProblemT &prob, ArrayAttr props) {
 /// instantiation fails if properties are incompatible with \p ProblemT.
 template <typename ProblemT, typename... OperatorTypePropertyTs>
 OperatorType loadOperatorType(ProblemT &prob, OperatorTypeOp oprOp,
-                              SmallDenseMap<StringAttr, unsigned> &oprIds) {
+                              SmallDenseMap<OperatorType, unsigned> &oprIds) {
   OperatorType opr = oprOp.getNameAttr();
   unsigned &id = oprIds[opr];
   if (id > 0)
-    opr = StringAttr::get(opr.getContext(),
-                          opr.getValue() + Twine('_') + Twine(id));
+    opr = StringAttr::get(opr.getName().getContext(),
+                          opr.getName().getValue() + Twine('_') + Twine(id));
   ++id;
   assert(!prob.hasOperatorType(opr));
   prob.insertOperatorType(opr);
@@ -200,7 +199,7 @@ ProblemT loadProblem(InstanceOp instOp,
 
     // Load the operator type from `oprOp` if needed.
     auto &opr = operatorTypes[oprOp];
-    if (!opr)
+    if (!opr.getName())
       opr = loadOperatorType<ProblemT, OperatorTypePropertyTs...>(
           prob, cast<OperatorTypeOp>(oprOp), operatorTypeIds);
 
@@ -339,8 +338,9 @@ saveProblem(ProblemT &prob, std::tuple<OperationPropertyTs...> opProps,
 
   for (auto opr : prob.getOperatorTypes())
     b.create<OperatorTypeOp>(
-        opr, saveOperatorTypeProperties<ProblemT, OperatorTypePropertyTs...>(
-                 prob, opr, b));
+        opr.getName(),
+        saveOperatorTypeProperties<ProblemT, OperatorTypePropertyTs...>(
+            prob, opr, b));
 
   // Determine which operations act as source ops for auxiliary dependences, and
   // therefore need a name. Also, honor names provided by the client.
@@ -500,8 +500,7 @@ struct Default<scheduling::SharedOperatorsProblem> {
   static constexpr auto operationProperties =
       Default<scheduling::Problem>::operationProperties;
   static constexpr auto operatorTypeProperties =
-      std::tuple_cat(Default<scheduling::Problem>::operatorTypeProperties,
-                     std::make_tuple(LimitAttr()));
+      Default<scheduling::Problem>::operatorTypeProperties;
   static constexpr auto dependenceProperties =
       Default<scheduling::Problem>::dependenceProperties;
   static constexpr auto instanceProperties =

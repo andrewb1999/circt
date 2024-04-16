@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "PassDetails.h"
+#include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
@@ -26,6 +27,7 @@
 using namespace mlir;
 using namespace mlir::affine;
 using namespace mlir::arith;
+using namespace circt;
 using namespace circt::loopschedule;
 
 namespace {
@@ -457,10 +459,10 @@ public:
     newOp.addAttributes(op->getAttrs());
     Operation *legalized = rewriter.create(newOp);
     SmallVector<Value> results = legalized->getResults();
-    if (op->hasAttrOfType<StringAttr>("loopschedule.access_name")) {
+    if (op->hasAttrOfType<StringAttr>(NameAnalysis::getAttributeName())) {
       auto accessName =
-          op->getAttrOfType<StringAttr>("loopschedule.access_name");
-      legalized->setAttr("loopschedule.access_name", accessName);
+          op->getAttrOfType<StringAttr>(NameAnalysis::getAttributeName());
+      legalized->setAttr(NameAnalysis::getAttributeName(), accessName);
     }
     rewriter.replaceOp(op, results);
 

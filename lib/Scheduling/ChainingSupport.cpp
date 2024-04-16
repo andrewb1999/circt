@@ -19,8 +19,6 @@
 using namespace circt;
 using namespace circt::scheduling;
 
-using Dependence = Problem::Dependence;
-
 LogicalResult scheduling::computeChainBreakingDependences(
     ChainingProblem &prob, float cycleTime,
     SmallVectorImpl<Dependence> &result) {
@@ -30,7 +28,7 @@ LogicalResult scheduling::computeChainBreakingDependences(
     if (*prob.getIncomingDelay(opr) > cycleTime ||
         *prob.getOutgoingDelay(opr) > cycleTime)
       return prob.getContainingOp()->emitError()
-             << "Delays of operator type '" << opr.getValue()
+             << "Delays of operator type '" << opr.getName().getValue()
              << "' exceed maximum cycle time: " << cycleTime;
 
   // chains[v][u] denotes the accumulated delay incoming at `v`, of the longest

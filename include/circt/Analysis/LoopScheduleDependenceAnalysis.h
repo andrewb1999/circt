@@ -14,7 +14,7 @@
 #ifndef CIRCT_ANALYSIS_LOOPSCHEDULE_DEPENDENCE_ANALYSIS_H
 #define CIRCT_ANALYSIS_LOOPSCHEDULE_DEPENDENCE_ANALYSIS_H
 
-#include "circt/Analysis/AccessNameAnalysis.h"
+#include "circt/Analysis/NameAnalysis.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Pass/AnalysisManager.h"

@@ -51,8 +51,8 @@ LogicalResult Problem::insertDependence(Dependence dep) {
   return success();
 }
 
-Problem::OperatorType Problem::getOrInsertOperatorType(StringRef name) {
-  auto opr = OperatorType::get(containingOp->getContext(), name);
+OperatorType Problem::getOrInsertOperatorType(StringRef name) {
+  auto opr = OperatorType(StringAttr::get(containingOp->getContext(), name));
   operatorTypes.insert(opr);
   return opr;
 }
@@ -65,7 +65,7 @@ Problem::DependenceRange Problem::getDependences(Operation *op) {
 Problem::PropertyStringVector Problem::getProperties(Operation *op) {
   PropertyStringVector psv;
   if (auto linkedOpr = getLinkedOperatorType(op))
-    psv.emplace_back("linkedOpr", (*linkedOpr).str());
+    psv.emplace_back("linkedOpr", (*linkedOpr).getName().str());
   if (auto startTime = getStartTime(op))
     psv.emplace_back("startTime", std::to_string(*startTime));
   return psv;
@@ -93,22 +93,23 @@ LogicalResult Problem::checkLinkedOperatorType(Operation *op) {
   return success();
 }
 
-LogicalResult Problem::checkLatency(OperatorType opr) {
+LogicalResult Problem::checkLatency(Operation *op) {
+  auto opr = getLinkedOperatorType(op).value();
   if (!getLatency(opr))
     return getContainingOp()->emitError()
-           << "Operator type '" << opr.getValue() << "' has no latency";
+           << "Operator type '" << opr.getName().getValue()
+           << "' has no latency";
 
   return success();
 }
 
 LogicalResult Problem::check() {
-  for (auto *op : getOperations())
+  for (auto *op : getOperations()) {
     if (failed(checkLinkedOperatorType(op)))
       return failure();
-
-  for (auto opr : getOperatorTypes())
-    if (failed(checkLatency(opr)))
+    if (failed(checkLatency(op)))
       return failure();
+  }
 
   return success();
 }
@@ -235,20 +236,20 @@ LogicalResult ChainingProblem::checkDelays(OperatorType opr) {
 
   if (!incomingDelay || !outgoingDelay)
     return getContainingOp()->emitError()
-           << "Missing delays for operator type '" << opr << "'";
+           << "Missing delays for operator type '" << opr.getName() << "'";
 
   float iDel = *incomingDelay;
   float oDel = *outgoingDelay;
 
   if (iDel < 0.0f || oDel < 0.0f)
     return getContainingOp()->emitError()
-           << "Negative delays for operator type '" << opr << "'";
+           << "Negative delays for operator type '" << opr.getName() << "'";
 
   if (*getLatency(opr) == 0 && iDel != oDel)
     return getContainingOp()->emitError()
            << "Incoming & outgoing delay must be equal for zero-latency "
               "operator type '"
-           << opr << "'";
+           << opr.getName() << "'";
 
   return success();
 }
@@ -329,37 +330,40 @@ LogicalResult ChainingProblem::verify() {
 Problem::PropertyStringVector
 SharedOperatorsProblem::getProperties(OperatorType opr) {
   auto psv = Problem::getProperties(opr);
-  if (auto limit = getLimit(opr))
-    psv.emplace_back("limit", std::to_string(*limit));
   return psv;
 }
 
-LogicalResult SharedOperatorsProblem::checkLatency(OperatorType opr) {
-  if (failed(Problem::checkLatency(opr)))
+LogicalResult SharedOperatorsProblem::checkLatency(Operation *op) {
+  if (failed(Problem::checkLatency(op)))
     return failure();
 
-  auto limit = getLimit(opr);
-  if (limit && *limit > 0 && *getLatency(opr) == 0)
-    return getContainingOp()->emitError()
-           << "Limited operator type '" << opr.getValue()
-           << "' has zero latency.";
+  auto opr = *getLinkedOperatorType(op);
+
+  for (auto rsrc : getLinkedResourceTypes(op)) {
+    auto limit = getResourceLimit(rsrc);
+    if (limit && *limit > 0 && *getLatency(opr) == 0)
+      return getContainingOp()->emitError()
+             << "Limited operator type '" << opr.getName().getValue()
+             << "' has zero latency.";
+  }
   return success();
 }
 
-LogicalResult SharedOperatorsProblem::verifyUtilization(OperatorType opr) {
-  auto limit = getLimit(opr);
+LogicalResult SharedOperatorsProblem::verifyUtilization(ResourceType rsrc) {
+  auto limit = getResourceLimit(rsrc);
   if (!limit)
     return success();
 
   llvm::SmallDenseMap<unsigned, unsigned> nOpsPerTimeStep;
   for (auto *op : getOperations())
-    if (opr == *getLinkedOperatorType(op))
+    if (getLinkedResourceTypes(op).contains(rsrc))
       ++nOpsPerTimeStep[*getStartTime(op)];
 
   for (auto &kv : nOpsPerTimeStep)
     if (kv.second > *limit)
       return getContainingOp()->emitError()
-             << "Operator type '" << opr.getValue() << "' is oversubscribed."
+             << "Operator type '" << rsrc.getName().getValue()
+             << "' is oversubscribed."
              << "\n  time step: " << kv.first
              << "\n  #operations: " << kv.second << "\n  limit: " << *limit;
 
@@ -370,8 +374,8 @@ LogicalResult SharedOperatorsProblem::verify() {
   if (failed(Problem::verify()))
     return failure();
 
-  for (auto opr : getOperatorTypes())
-    if (failed(verifyUtilization(opr)))
+  for (auto rsrc : getResourceTypes())
+    if (failed(verifyUtilization(rsrc)))
       return failure();
 
   return success();
@@ -381,21 +385,22 @@ LogicalResult SharedOperatorsProblem::verify() {
 // ModuloProblem
 //===----------------------------------------------------------------------===//
 
-LogicalResult ModuloProblem::verifyUtilization(OperatorType opr) {
-  auto limit = getLimit(opr);
+LogicalResult ModuloProblem::verifyUtilization(ResourceType rsrc) {
+  auto limit = getResourceLimit(rsrc);
   if (!limit)
     return success();
 
   unsigned ii = *getInitiationInterval();
   llvm::SmallDenseMap<unsigned, unsigned> nOpsPerCongruenceClass;
   for (auto *op : getOperations())
-    if (opr == *getLinkedOperatorType(op))
+    if (getLinkedResourceTypes(op).contains(rsrc))
       ++nOpsPerCongruenceClass[*getStartTime(op) % ii];
 
   for (auto &kv : nOpsPerCongruenceClass)
     if (kv.second > *limit)
       return getContainingOp()->emitError()
-             << "Operator type '" << opr.getValue() << "' is oversubscribed."
+             << "Operator type '" << rsrc.getName().getValue()
+             << "' is oversubscribed."
              << "\n  congruence class: " << kv.first
              << "\n  #operations: " << kv.second << "\n  limit: " << *limit;
 
@@ -408,8 +413,8 @@ LogicalResult ModuloProblem::verify() {
 
   // Don't call SharedOperatorsProblem::verify() here to prevent redundant
   // verification of the base problem.
-  for (auto opr : getOperatorTypes())
-    if (failed(verifyUtilization(opr)))
+  for (auto rsrc : getResourceTypes())
+    if (failed(verifyUtilization(rsrc)))
       return failure();
 
   return success();
