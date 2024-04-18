@@ -51,9 +51,7 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
     if (constantLB == nullptr || constantUB == nullptr ||
         constantStep == nullptr) {
       auto inductionType = op.getInductionVar().getType();
-      auto bitwidth = isa<IndexType>(inductionType)
-                          ? 64
-                          : inductionType.getIntOrFloatBitWidth();
+      auto bitwidth = inductionType.getIntOrFloatBitWidth();
       auto newType = rewriter.getIntegerType(bitwidth);
       if (op.getInductionVar().getType() == newType)
         return failure();
@@ -97,8 +95,6 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
     rewriter.setInsertionPointToStart(&op.getRegion().front());
     auto newExt = rewriter.create<arith::ExtSIOp>(
         op.getLoc(), rewriter.getI64Type(), induction);
-    // auto newCast = rewriter.create<arith::IndexCastOp>(op.getLoc(),
-    // rewriter.getIndexType(), newExt.getOut());
     rewriter.replaceAllUsesExcept(induction, newExt.getOut(), newExt);
     return success();
   }
@@ -178,12 +174,12 @@ struct LoadCleanupPattern : OpRewritePattern<LoopScheduleLoadOp> {
       } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
         idx.set(extSI.getIn());
         updated = true;
-      } else if (auto unreal =
-                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
-        if (unreal.getInputs().size() != 1)
-          continue;
-        idx.set(unreal.getInputs().front());
-        updated = true;
+        // } else if (auto unreal =
+        //                dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
+        //   if (unreal.getInputs().size() != 1)
+        //     continue;
+        //   idx.set(unreal.getInputs().front());
+        //   updated = true;
       }
     }
 
@@ -211,12 +207,12 @@ struct StoreCleanupPattern : OpRewritePattern<LoopScheduleStoreOp> {
       } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
         idx.set(extSI.getIn());
         updated = true;
-      } else if (auto unreal =
-                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
-        if (unreal.getInputs().size() != 1)
-          continue;
-        idx.set(unreal.getInputs().front());
-        updated = true;
+        // } else if (auto unreal =
+        //                dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
+        //   if (unreal.getInputs().size() != 1)
+        //     continue;
+        //   idx.set(unreal.getInputs().front());
+        //   updated = true;
       }
     }
 
@@ -306,12 +302,12 @@ struct LoadInterfaceCleanupPattern : OpInterfaceRewritePattern<LoadInterface> {
       } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
         idx.set(extSI.getIn());
         updated = true;
-      } else if (auto unreal =
-                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
-        if (unreal.getInputs().size() != 1)
-          continue;
-        idx.set(unreal.getInputs().front());
-        updated = true;
+        // } else if (auto unreal =
+        //                dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
+        //   if (unreal.getInputs().size() != 1)
+        //     continue;
+        //   idx.set(unreal.getInputs().front());
+        //   updated = true;
       }
     }
 
@@ -340,12 +336,12 @@ struct StoreInterfaceCleanupPattern
       } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
         idx.set(extSI.getIn());
         updated = true;
-      } else if (auto unreal =
-                     dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
-        if (unreal.getInputs().size() != 1)
-          continue;
-        idx.set(unreal.getInputs().front());
-        updated = true;
+        // } else if (auto unreal =
+        //                dyn_cast<UnrealizedConversionCastOp>(definingOp)) {
+        //   if (unreal.getInputs().size() != 1)
+        //     continue;
+        //   idx.set(unreal.getInputs().front());
+        //   updated = true;
       }
     }
 
@@ -418,98 +414,6 @@ struct StoreInterfaceAddressNarrowingPattern
   }
 };
 
-void populateIndexRemovalTypeConverter(TypeConverter &typeConverter) {
-  typeConverter.addConversion(
-      [](Type type) -> std::optional<Type> { return type; });
-  typeConverter.addConversion([](IndexType type) -> std::optional<Type> {
-    return IntegerType::get(type.getContext(), 64);
-  });
-  typeConverter.addTargetMaterialization(
-      [](OpBuilder &b, Type target, ValueRange input, Location loc) {
-        return b.create<UnrealizedConversionCastOp>(loc, target, input)
-            .getResult(0);
-      });
-  typeConverter.addSourceMaterialization(
-      [](OpBuilder &b, Type source, ValueRange input, Location loc) {
-        return b.create<UnrealizedConversionCastOp>(loc, source, input)
-            .getResult(0);
-      });
-}
-
-struct IndexRemovalRewritePattern final : ConversionPattern {
-public:
-  IndexRemovalRewritePattern(TypeConverter &converter, MLIRContext *context)
-      : ConversionPattern(converter, MatchAnyOpTypeTag{}, 1, context) {}
-
-  LogicalResult
-  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
-                  ConversionPatternRewriter &rewriter) const override {
-    Location loc = op->getLoc();
-    const TypeConverter *converter = getTypeConverter();
-    if (converter->isLegal(op))
-      return rewriter.notifyMatchFailure(loc, "op already legal");
-
-    OperationState newOp(loc, op->getName());
-    newOp.addOperands(operands);
-
-    SmallVector<Type> newResultTypes;
-    if (failed(converter->convertTypes(op->getResultTypes(), newResultTypes)))
-      return rewriter.notifyMatchFailure(loc, "couldn't convert return types");
-    newOp.addTypes(newResultTypes);
-    newOp.addAttributes(op->getAttrs());
-    Operation *legalized = rewriter.create(newOp);
-    SmallVector<Value> results = legalized->getResults();
-    if (op->hasAttrOfType<StringAttr>(NameAnalysis::getAttributeName())) {
-      auto accessName =
-          op->getAttrOfType<StringAttr>(NameAnalysis::getAttributeName());
-      legalized->setAttr(NameAnalysis::getAttributeName(), accessName);
-    }
-    rewriter.replaceOp(op, results);
-
-    return success();
-  }
-};
-
-struct ConstIndexRemovalRewritePattern final
-    : public OpConversionPattern<ConstantOp> {
-public:
-  using OpConversionPattern<ConstantOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(ConstantOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto val = op.getValue();
-    if (!isa<IndexType>(val.getType()))
-      return failure();
-
-    auto integerAttr = dyn_cast_or_null<IntegerAttr>(val);
-    if (!integerAttr)
-      return failure();
-
-    auto intVal = integerAttr.getInt();
-
-    rewriter.replaceOpWithNewOp<ConstantOp>(op,
-                                            rewriter.getI64IntegerAttr(intVal));
-
-    return success();
-  }
-};
-
-struct IndexCastRemovalRewritePattern final
-    : public OpConversionPattern<IndexCastOp> {
-public:
-  using OpConversionPattern<IndexCastOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(IndexCastOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(
-        op, op.getOut().getType(), op.getIn());
-
-    return success();
-  }
-};
-
 void BitwidthReductionForLoopSchedule::runOnOperation() {
   auto op = getOperation();
   auto &context = getContext();
@@ -520,42 +424,6 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   patterns.add<SCFForIterationReduction>(&context);
 
   GreedyRewriteConfig config;
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
-    op->emitOpError("Failed to perform bitwidth minimization conversions");
-    signalPassFailure();
-  }
-
-  // Remove index types to enable bitwidth reduction of indices
-  TypeConverter typeConverter;
-  populateIndexRemovalTypeConverter(typeConverter);
-  ConversionTarget target(context);
-  target.addDynamicallyLegalDialect<ArithDialect>(
-      [&typeConverter](Operation *op) { return typeConverter.isLegal(op); });
-  target.addDynamicallyLegalDialect<LoopScheduleDialect>(
-      [&typeConverter](Operation *op) { return typeConverter.isLegal(op); });
-  // target.addDynamicallyLegalDialect<scf::SCFDialect>(
-  //     [&typeConverter](Operation *op) { return typeConverter.isLegal(op); });
-  target.markUnknownOpDynamicallyLegal(
-      [&typeConverter](Operation *op) -> std::optional<bool> {
-        if (!isa<LoadInterface>(op) && !isa<StoreInterface>(op))
-          return std::nullopt;
-        return typeConverter.isLegal(op);
-      });
-  target.addIllegalOp<arith::IndexCastOp>();
-  patterns.clear();
-  patterns.add<IndexRemovalRewritePattern>(typeConverter, &context);
-  patterns.add<ConstIndexRemovalRewritePattern>(typeConverter, &context);
-  patterns.add<IndexCastRemovalRewritePattern>(typeConverter, &context);
-  populateReconcileUnrealizedCastsPatterns(patterns);
-  if (failed(applyPartialConversion(op, target, std::move(patterns))))
-    signalPassFailure();
-
-  // Cleanup extraneous casts after int narrowing
-  patterns.clear();
-  patterns.add<TruncCleanupPattern>(&context);
-  patterns.add<LoadCleanupPattern>(&context);
-  patterns.add<StoreCleanupPattern>(&context);
-
   if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");
     signalPassFailure();
@@ -577,7 +445,6 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   // Cleanup extraneous casts after int narrowing
   patterns.clear();
   patterns.add<TruncCleanupPattern>(&context);
-  patterns.add<SCFForCleanupPattern>(&context);
   patterns.add<LoadCleanupPattern>(&context);
   patterns.add<StoreCleanupPattern>(&context);
   patterns.add<LoadAddressNarrowingPattern>(&context);
@@ -592,19 +459,7 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
     signalPassFailure();
   }
 
-  auto res = op->walk([](Operation *op) {
-    if (isa<UnrealizedConversionCastOp>(op))
-      return WalkResult::interrupt();
-    return WalkResult::advance();
-  });
-
-  if (res.wasInterrupted()) {
-    op->emitOpError(
-        "Bitwidth minimization failed to remove UnrealizedConversionCastOps");
-    signalPassFailure();
-  }
-
-  // Perform dead code elimination again before scheduling
+  // Perform dead code elimination
   mlir::IRRewriter rewriter(&context);
   (void)mlir::runRegionDCE(rewriter, op->getRegions());
 }

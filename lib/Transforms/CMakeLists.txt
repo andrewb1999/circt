@@ -6,6 +6,7 @@ add_circt_library(CIRCTTransforms
   InsertMergeBlocks.cpp
   IfOpHoisting.cpp
   ArithStrengthReduction.cpp
+  IndexRemoval.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Transforms

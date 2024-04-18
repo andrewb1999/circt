@@ -68,6 +68,14 @@ def ArithStrengthReduction : Pass<"arith-strength-reduction", "::mlir::func::Fun
   let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect"];
 }
 
+def IndexRemoval : Pass<"index-removal", "::mlir::func::FuncOp"> {
+  let summary = "Replace index types with integers";
+  let description = [{Replace index types with integers}];
+  let constructor = "circt::createIndexRemovalPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect", 
+                           "mlir::scf::SCFDialect"];
+}
+
 def MapArithToCombPass : Pass<"map-arith-to-comb"> {
   let summary = "Map arith ops to combinational logic";
   let description = [{
