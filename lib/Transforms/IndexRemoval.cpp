@@ -163,6 +163,13 @@ void IndexRemoval::runOnOperation() {
     for (OpResult result : op->getResults())
       if (isa<IndexType>(result.getType()))
         result.setType(indexWidthInt);
+    for (auto &region : op->getRegions()) {
+      for (auto arg : region.getArguments()) {
+        if (isa<IndexType>(arg.getType()))
+          arg.setType(indexWidthInt);
+      }
+    }
+
 
     return WalkResult::advance();
   });
