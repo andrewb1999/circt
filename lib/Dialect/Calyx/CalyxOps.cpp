@@ -1982,6 +1982,43 @@ SmallVector<DictionaryAttr> RegisterOp::portAttributes() {
 bool RegisterOp::isCombinational() { return false; }
 
 //===----------------------------------------------------------------------===//
+// BypassRegisterOp
+//===----------------------------------------------------------------------===//
+
+/// Provide meaningful names to the result values of a BypassRegisterOp.
+void BypassRegisterOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  getCellAsmResultNames(setNameFn, *this, this->portNames());
+}
+
+SmallVector<StringRef> BypassRegisterOp::portNames() {
+  return {"in", "write_en", clkPort, resetPort, "out", donePort};
+}
+
+SmallVector<Direction> BypassRegisterOp::portDirections() {
+  return {Input, Input, Input, Input, Output, Output};
+}
+
+SmallVector<DictionaryAttr> BypassRegisterOp::portAttributes() {
+  MLIRContext *context = getContext();
+  IntegerAttr isSet = IntegerAttr::get(IntegerType::get(context, 1), 1);
+  NamedAttrList writeEn, clk, reset, done;
+  writeEn.append(goPort, isSet);
+  clk.append(clkPort, isSet);
+  reset.append(resetPort, isSet);
+  done.append(donePort, isSet);
+  return {
+      DictionaryAttr::get(context),   // In
+      writeEn.getDictionary(context), // Write enable
+      clk.getDictionary(context),     // Clk
+      reset.getDictionary(context),   // Reset
+      DictionaryAttr::get(context),   // Out
+      done.getDictionary(context)     // Done
+  };
+}
+
+bool BypassRegisterOp::isCombinational() { return false; }
+
+//===----------------------------------------------------------------------===//
 // MemoryOp
 //===----------------------------------------------------------------------===//
 

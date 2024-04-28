@@ -114,7 +114,7 @@ private:
   /// Returns the library name for a given Operation Type.
   FailureOr<StringRef> getLibraryFor(Operation *op) {
     return TypeSwitch<Operation *, FailureOr<StringRef>>(op)
-        .Case<AddLibOp, RegisterOp, UndefLibOp, WireLibOp>(
+        .Case<AddLibOp, RegisterOp, BypassRegisterOp, UndefLibOp, WireLibOp>(
             [&](auto op) -> FailureOr<StringRef> {
               static constexpr std::string_view sCompile = "compile";
               return {sCompile};
@@ -250,6 +250,9 @@ struct Emitter {
 
   // Register emission
   void emitRegister(RegisterOp reg);
+
+  // BypassRegister emission
+  void emitBypassRegister(BypassRegisterOp reg);
 
   // Emit undefined op
   void emitUndef(UndefLibOp op);
@@ -648,6 +651,7 @@ void Emitter::emitComponent(ComponentInterface op) {
           .Case<InstanceOp>([&](auto op) { emitInstance(op); })
           .Case<PrimitiveOp>([&](auto op) { emitPrimitive(op); })
           .Case<RegisterOp>([&](auto op) { emitRegister(op); })
+          .Case<BypassRegisterOp>([&](auto op) { emitBypassRegister(op); })
           .Case<MemoryOp>([&](auto op) { emitMemory(op); })
           .Case<SeqMemoryOp>([&](auto op) { emitSeqMemory(op); })
           .Case<ConstMultLibOp>([&](auto op) { emitConstMult(op); })
@@ -798,6 +802,13 @@ void Emitter::emitRegister(RegisterOp reg) {
   size_t bitWidth = reg.getIn().getType().getIntOrFloatBitWidth();
   indent() << getAttributes(reg, /*atFormat=*/true) << reg.instanceName()
            << space() << equals() << space() << "std_reg" << LParen()
+           << std::to_string(bitWidth) << RParen() << semicolonEndL();
+}
+
+void Emitter::emitBypassRegister(BypassRegisterOp reg) {
+  size_t bitWidth = reg.getIn().getType().getIntOrFloatBitWidth();
+  indent() << getAttributes(reg, /*atFormat=*/true) << reg.instanceName()
+           << space() << equals() << space() << "std_bypass_reg" << LParen()
            << std::to_string(bitWidth) << RParen() << semicolonEndL();
 }
 
