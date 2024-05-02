@@ -852,4 +852,6 @@ class BuildCallInstance : public calyx::FuncOpPartialLoweringPattern {
 
 #include "circt/Dialect/Calyx/CalyxLoweringInterfaces.h.inc"
 
+#include "circt/Dialect/Calyx/CalyxLoweringTypeInterfaces.h.inc"
+
 #endif // CIRCT_DIALECT_CALYX_CALYXLOWERINGUTILS_H

@@ -20,6 +20,12 @@ mlir_tablegen(CalyxLoweringInterfaces.cpp.inc -gen-op-interface-defs)
 add_public_tablegen_target(MLIRCalyxLoweringInterfacesIncGen)
 add_dependencies(circt-headers MLIRCalyxLoweringInterfacesIncGen)
 
+set(LLVM_TARGET_DEFINITIONS CalyxLoweringInterfaces.td)
+mlir_tablegen(CalyxLoweringTypeInterfaces.h.inc -gen-type-interface-decls)
+mlir_tablegen(CalyxLoweringTypeInterfaces.cpp.inc -gen-type-interface-defs)
+add_public_tablegen_target(MLIRCalyxLoweringTypeInterfacesIncGen)
+add_dependencies(circt-headers MLIRCalyxLoweringTypeInterfacesIncGen)
+
 set(LLVM_TARGET_DEFINITIONS CalyxPasses.td)
 mlir_tablegen(CalyxPasses.h.inc -gen-pass-decls)
 add_public_tablegen_target(CIRCTCalyxTransformsIncGen)

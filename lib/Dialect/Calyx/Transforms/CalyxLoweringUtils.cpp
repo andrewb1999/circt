@@ -951,3 +951,5 @@ BuildCallInstance::getCallComponent(mlir::func::CallOp callOp) const {
 } // namespace circt
 
 #include "circt/Dialect/Calyx/CalyxLoweringInterfaces.cpp.inc"
+
+#include "circt/Dialect/Calyx/CalyxLoweringTypeInterfaces.cpp.inc"

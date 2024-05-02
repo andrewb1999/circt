@@ -1405,7 +1405,8 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
     SmallVector<calyx::PortInfo> inPorts, outPorts;
     FunctionType funcType = funcOp.getFunctionType();
     for (auto arg : enumerate(funcOp.getArguments())) {
-      if (!arg.value().getType().isa<MemRefType>()) {
+      if (!arg.value().getType().isa<MemRefType>() &&
+          !isa<calyx::MemoryLikeTypeInterface>(arg.value().getType())) {
         /// Single-port arguments
         auto inName = "in" + std::to_string(arg.index());
         funcOpArgRewrites[arg.value()] = inPorts.size();
@@ -1447,7 +1448,6 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
       mapping.getFirst().replaceAllUsesWith(
           compOp.getArgument(mapping.getSecond()));
 
-    unsigned extMemCounter = 0;
     rewriter.setInsertionPointToStart(compOp.getBodyBlock());
     for (auto arg : enumerate(funcOp.getArguments())) {
       if (auto memtype = arg.value().getType().dyn_cast<MemRefType>()) {
@@ -1457,7 +1457,7 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
           sizes.push_back(dim);
           addrSizes.push_back(calyx::handleZeroWidth(dim));
         }
-        auto memName = "ext_mem_" + std::to_string(extMemCounter);
+        auto memName = "ext_mem_" + std::to_string(arg.index());
         auto bitwidth = memtype.getElementType().getIntOrFloatBitWidth();
         auto memoryOp = rewriter.create<calyx::SeqMemoryOp>(
             funcOp.getLoc(), memName, bitwidth, sizes, addrSizes);
@@ -1466,7 +1466,6 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
                                                        llvm::APInt(1, 1)));
         compState->registerMemoryInterface(arg.value(),
                                            calyx::MemoryInterface(memoryOp));
-        extMemCounter++;
       }
     }
 

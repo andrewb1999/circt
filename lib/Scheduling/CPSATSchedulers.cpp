@@ -13,6 +13,7 @@
 
 #include "circt/Scheduling/Algorithms.h"
 
+#include "circt/Scheduling/Problems.h"
 #include "mlir/IR/Operation.h"
 
 #include "ortools/sat/cp_model.h"
@@ -28,7 +29,6 @@ using namespace operations_research;
 using namespace operations_research::sat;
 
 using llvm::dbgs;
-using llvm::format;
 
 /// Solve the shared operators problem by modeling it as a Resource
 /// Constrained Project Scheduling Problem (RCPSP), which in turn is formulated
@@ -49,7 +49,7 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
 
   DenseMap<Operation *, IntVar> taskStarts;
   DenseMap<Operation *, IntVar> taskEnds;
-  DenseMap<Problem::OperatorType, SmallVector<IntervalVar, 4>>
+  DenseMap<ResourceType, SmallVector<IntervalVar, 4>>
       resourcesToTaskIntervals;
 
   // First get horizon, i.e., the time taken if all operations were executed
@@ -75,14 +75,17 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
                         .WithName((Twine("end_of_task_") + Twine(i)).str());
     taskStarts[task] = startVar;
     taskEnds[task] = endVar;
-    auto resource = prob.getLinkedOperatorType(task);
-    unsigned duration = *prob.getLatency(*resource);
+    auto opr = prob.getLinkedOperatorType(task);
+    unsigned duration = *prob.getLatency(*opr);
     IntervalVar taskInterval =
         cpModel.NewIntervalVar(startVar, duration, endVar)
             .WithName((Twine("task_interval_") + Twine(i)).str());
 
-    if (prob.getLimit(*resource))
-      resourcesToTaskIntervals[resource.value()].emplace_back(taskInterval);
+    for (auto resource : prob.getLinkedResourceTypes(task)) {
+      auto limit = prob.getResourceLimit(resource);
+      if (limit.has_value())
+        resourcesToTaskIntervals[resource].emplace_back(taskInterval);
+    }
   }
 
   // Check for cycles and otherwise establish operation ordering
@@ -100,8 +103,8 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
   // Establish "cumulative" constraints in order to constrain maximum
   // concurrent usage of operators.
   for (auto resourceToTaskIntervals : resourcesToTaskIntervals) {
-    Problem::OperatorType &resource = resourceToTaskIntervals.getFirst();
-    auto capacity = prob.getLimit(resource);
+    ResourceType &resource = resourceToTaskIntervals.getFirst();
+    auto capacity = prob.getResourceLimit(resource);
     SmallVector<IntervalVar, 4> &taskIntervals =
         resourceToTaskIntervals.getSecond();
     // The semantics of cumulative constraints in or-tools are such that
@@ -115,7 +118,7 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
       auto i = item.index();
       auto taskInterval = item.value();
       IntVar demandVar = cpModel.NewIntVar(Domain(1)).WithName(
-          (Twine("demand_") + Twine(i) + Twine("_") + Twine(resource.strref()))
+          (Twine("demand_") + Twine(i) + Twine("_") + Twine(resource.getName().strref()))
               .str());
       // Conventional formulation for SharedOperatorsProblem;
       // interval during which the resource is occupied has size 1.

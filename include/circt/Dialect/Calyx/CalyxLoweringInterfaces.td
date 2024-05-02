@@ -10,6 +10,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#ifndef CALYX_LOWERING_INTERFACES
+#define CALYX_LOWERING_INTERFACES
+
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/OpBase.td"
 
@@ -23,7 +26,7 @@ def AllocOpLoweringInterface : OpInterface<"AllocLoweringInterface"> {
 
   let methods = [
     InterfaceMethod<
-      "This returns the latency of the store.",
+      "Insert memory into Calyx component.",
       "void",
       "insertMemory",
       (ins "OpBuilder&":$rewriter, "calyx::ComponentLoweringStateInterface&":$state)>
@@ -107,3 +110,23 @@ def StoreOpLoweringInterface : OpInterface<"StoreLoweringInterface"> {
   ];
   /* let verify = [{ return verifyGroupInterface(op); }]; */
 }
+
+// Op interface for allocations.
+def MemoryLikeTypeInterface : TypeInterface<"MemoryLikeTypeInterface"> {
+  let cppNamespace = "::circt::calyx";
+
+  let description = [{
+    This is a type interrface for memory types that can be lowered to Calyx.
+  }];
+
+  let methods = [
+    InterfaceMethod<
+      "Insert memory for this type into the component.",
+      "void",
+      "insertMemory",
+      (ins "OpBuilder&":$rewriter, "calyx::ComponentLoweringStateInterface&":$state)>
+  ];
+  /* let verify = [{ return verifyGroupInterface(op); }]; */
+}
+
+#endif // CALYX_LOWERING_INTERFACES
