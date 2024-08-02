@@ -26,6 +26,8 @@
 namespace circt {
 namespace calyx {
 
+class WiresOp;
+
 // the goPort, donePort, resetPort and clkPort identify the attributes of the
 // go, done, reset and clk port of the circuit.
 static constexpr std::string_view goPort = "go";
