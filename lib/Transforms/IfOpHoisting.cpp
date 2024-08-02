@@ -130,8 +130,11 @@ void IfOpHoisting::runOnOperation() {
   patterns.add<IfToSelectPattern>(ctx);
 
   auto op = getOperation();
+  // op->dump();
   if (failed(applyPartialConversion(op, target, std::move(patterns))))
     signalPassFailure();
+  // op->dump();
+  // llvm::errs() << "=============================\n";
 }
 
 namespace circt {

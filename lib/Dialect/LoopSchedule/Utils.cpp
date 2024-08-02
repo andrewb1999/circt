@@ -386,20 +386,20 @@ LogicalResult recordMemoryResources(Operation *op, Region &body,
     } else if (auto loop = dyn_cast<LoopInterface>(op)) {
       assert(ifOps.empty() &&
              "Loops inside if statements is unsupported currently");
-      loop.getBodyBlock()->walk([&](Operation *op) {
+      loop.getBodyBlock()->walk([&](Operation *innerOp) {
         std::string name;
-        if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp>(op)) {
-          Value memRef = getMemref(op);
+        if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp>(innerOp)) {
+          Value memRef = getMemref(innerOp);
           name = "mem_" + std::to_string(hash_value(memRef));
           resourceLimits.insert(std::pair(name, 1));
           finalTypes[name].push_back(name);
-        } else if (isa<LoadInterface, StoreInterface>(op)) {
+        } else if (isa<LoadInterface, StoreInterface>(innerOp)) {
           std::optional<unsigned> limitOpt;
-          if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*op)) {
+          if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*innerOp)) {
             limitOpt = loadOp.getLimit();
             name = loadOp.getUniqueId();
           } else if (auto storeOp =
-                         dyn_cast<loopschedule::StoreInterface>(*op)) {
+                         dyn_cast<loopschedule::StoreInterface>(*innerOp)) {
             limitOpt = storeOp.getLimit();
             name = storeOp.getUniqueId();
           }
@@ -431,9 +431,15 @@ LogicalResult addMemoryResources(Operation *op, Region &body,
   for (const auto &it : resourceMap) {
     auto *op = it.first;
     auto rsrcs = it.second;
-    for (const auto &name : rsrcs) {
-      auto memRsrc = problem.getOrInsertResourceType(name);
-      problem.addResourceType(op, memRsrc);
+    auto opr = problem.getLinkedOperatorType(op);
+    if (opr.has_value()) {
+      auto latency = problem.getLatency(opr.value());
+      if (latency != 0) {
+        for (const auto &name : rsrcs) {
+          auto memRsrc = problem.getOrInsertResourceType(name);
+          problem.addResourceType(op, memRsrc);
+        }
+      }
     }
   }
 
@@ -514,19 +520,16 @@ struct IfToSelectPattern : OpConversionPattern<scf::IfOp> {
     auto thenOperands = op.thenYield().getOperands();
     auto elseOperands = op.elseYield().getOperands();
 
-    for (auto iv : llvm::enumerate(llvm::zip(thenOperands, elseOperands))) {
-      auto i = iv.index();
-      auto v = iv.value();
+    SmallVector<Value> newValues;
+    for (auto v : llvm::zip(thenOperands, elseOperands)) {
       SmallVector<Value> operands;
       operands.push_back(op.getCondition());
       operands.push_back(std::get<0>(v));
       operands.push_back(std::get<1>(v));
       auto selectOp = rewriter.create<arith::SelectOp>(op.getLoc(), operands);
-      auto ifRes = op.getResult(i);
-      rewriter.replaceAllUsesWith(ifRes, selectOp.getResult());
+      newValues.push_back(selectOp.getResult());
     }
-
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, newValues);
 
     return success();
   }
@@ -542,11 +545,15 @@ LogicalResult ifOpConversion(Operation *op, Region &body,
                        loopschedule::LoopScheduleDialect>();
   target.addIllegalOp<scf::IfOp>();
 
+
   RewritePatternSet patterns(ctx);
   patterns.add<IfOpConversionPattern>(ctx, predicateMap);
   patterns.add<IfToSelectPattern>(ctx);
 
-  return applyPartialConversion(op, target, std::move(patterns));
+  if (failed(applyPartialConversion(op, target, std::move(patterns))))
+    return failure();
+
+  return success();
 }
 
 void addPredicateDependencies(Operation *op, Region &body,

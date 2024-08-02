@@ -11,10 +11,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Scheduling/Algorithms.h"
 #include "circt/Scheduling/Problems.h"
 #include "circt/Scheduling/Utilities.h"
 
+#include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
 #include "mlir/IR/Operation.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -706,6 +708,7 @@ LogicalResult SimplexSchedulerBase::scheduleAt(unsigned startTimeVariable,
   parameterS = 0;
 
   if (failed(solved)) {
+    llvm::errs() << "here failed\n";
     // The LP is infeasible with the new constraint. We could try other values
     // for S, but for now, we just roll back and signal failure to the driver.
     translate(frozenCol, /* factor1= */ 0, /* factorS= */ -1, /* factorT= */ 0);
@@ -835,6 +838,30 @@ LogicalResult SimplexScheduler::schedule() {
 // CyclicSimplexScheduler
 //===----------------------------------------------------------------------===//
 
+bool chainBroken(CyclicProblem &prob, Operation *src, Operation *dst) {
+  auto opr = *prob.getLinkedOperatorType(src);
+  if (src == dst && prob.getLatency(opr) == 0)
+    return false;
+  
+  if (src == dst)
+    return true;
+
+  if (prob.getLatency(opr) == 0) {
+    for (auto dep : prob.getDependences(src)) {
+      if (dep.isAuxiliary())
+        continue;
+      if (chainBroken(prob, dep.getSource(), dst))
+        return true;
+    }
+  }
+
+  return false;
+}
+
+// bool isStore(Operation *op) {
+//   return isa<loopschedule::LoopScheduleStoreOp, mlir::affine::AffineWriteOpInterface, loopschedule::StoreInterface>(op);
+// }
+
 void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
                                                Dependence dep) {
   Operation *src = dep.getSource();
@@ -842,8 +869,15 @@ void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
   unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
   if (auto dist = prob.getDistance(dep)) {
     // the latency of the last op in a recurrence must be at least 1
-    if (latency == 0)
-      latency = 1;
+    if (latency == 0) {
+      // // src->dump();
+      // // dst->dump();
+      // if (!chainBroken(prob, src, dst)) {
+        // llvm::errs() << "not chain broken\n";
+        latency = 1;
+      // }
+      // llvm::errs() << "=======================\n";
+    }
   }
   row[parameter1Column] = -latency; // note the negation
   if (src != dst) { // note that these coefficients just zero out in self-arcs.
@@ -1200,7 +1234,9 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   // implicit shift caused by incrementing the II.
   auto fixedN = scheduleAt(stvN, stN + phiN + deltaN);
   auto enteredN = mrt.enter(n, tauN + deltaN);
-  assert(succeeded(fixedN) && succeeded(enteredN));
+  n->dump();
+  assert(succeeded(enteredN));
+  assert(succeeded(fixedN));
   (void)fixedN, (void)enteredN;
 }
 
@@ -1221,6 +1257,7 @@ unsigned ModuloSimplexScheduler::computeResMinII() {
                                           *prob.getResourceLimit(pair.first)));
   }
 
+  llvm::errs() << "resMinII = " << resMinII << "\n";
   return resMinII;
 }
 

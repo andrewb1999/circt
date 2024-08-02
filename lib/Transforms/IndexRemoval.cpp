@@ -115,11 +115,20 @@ struct ReplaceFuncSignature : public OpRewritePattern<func::FuncOp> {
   LogicalResult matchAndRewrite(func::FuncOp funcOp,
                                 PatternRewriter &rewriter) const override {
 
-    auto isNotIndexType = [](Type type) { return !isa<IndexType>(type); };
+    auto isNotIndexType = [](Type type) { 
+      if (auto shaped = dyn_cast<ShapedType>(type)) {
+        return !isa<IndexType>(shaped.getElementType());
+      }
+      return !isa<IndexType>(type); 
+    };
 
     auto sameOrIndexToInt = [&](Type type) -> Type {
       if (isNotIndexType(type))
         return type;
+      if (auto shaped = dyn_cast<ShapedType>(type)) {
+        auto newIntType = IntegerType::get(type.getContext(), width);
+        return shaped.cloneWith(std::nullopt, newIntType);
+      }
       return IntegerType::get(type.getContext(), width);
     };
 
@@ -142,7 +151,13 @@ struct ReplaceFuncSignature : public OpRewritePattern<func::FuncOp> {
     rewriter.modifyOpInPlace(funcOp, [&] {
       auto funcType = rewriter.getFunctionType(argTypes, resTypes);
       funcOp.setFunctionType(funcType);
+      for (unsigned i = 0; i < funcOp.getBody().getNumArguments(); ++i) {
+        auto arg = funcOp.getBody().getArgument(i);
+        auto argType = arg.getType();
+        arg.setType(sameOrIndexToInt(argType));
+      }
     });
+
     return success();
   }
 
@@ -155,21 +170,37 @@ void IndexRemoval::runOnOperation() {
   auto &context = getContext();
   auto indexWidthInt = IntegerType::get(&context, 64);
 
+  auto isIndexType = [](Type type) { 
+    if (auto shaped = dyn_cast<ShapedType>(type)) {
+      return isa<IndexType>(shaped.getElementType());
+    }
+    return isa<IndexType>(type); 
+  };
+
+  auto indexToInt = [&](Type type) -> Type {
+    if (auto shaped = dyn_cast<MemRefType>(type))
+      return shaped.cloneWith(std::nullopt, indexWidthInt);
+
+    if (isa<IndexType>(type))
+      return indexWidthInt;
+
+    return type;
+  };
+
   // Change the type of all SSA values with an IndexType
   WalkResult walkRes = getOperation().walk([&](Operation *op) {
     for (Value operand : op->getOperands())
-      if (isa<IndexType>(operand.getType()))
-        operand.setType(indexWidthInt);
+      if (isIndexType(operand.getType()))
+        operand.setType(indexToInt(operand.getType()));
     for (OpResult result : op->getResults())
-      if (isa<IndexType>(result.getType()))
-        result.setType(indexWidthInt);
+      if (isIndexType(result.getType()))
+        result.setType(indexToInt(result.getType()));
     for (auto &region : op->getRegions()) {
       for (auto arg : region.getArguments()) {
-        if (isa<IndexType>(arg.getType()))
-          arg.setType(indexWidthInt);
+        if (isIndexType(arg.getType()))
+          arg.setType(indexToInt(arg.getType()));
       }
     }
-
 
     return WalkResult::advance();
   });
@@ -187,6 +218,11 @@ void IndexRemoval::runOnOperation() {
                ReplaceIndexCast<arith::IndexCastUIOp, arith::ExtUIOp>>(ctx);
   if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns),
                                           config)))
+    return signalPassFailure();
+
+  patterns.clear();
+  patterns.add<ReplaceFuncSignature>(ctx, 64);
+  if (failed(applyOpPatternsAndFold(SmallVector<Operation*> {getOperation()}, std::move(patterns))))
     return signalPassFailure();
 }
 
