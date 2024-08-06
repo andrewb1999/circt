@@ -96,7 +96,7 @@ ModuloProblem
 getModuloProblem(scf::ForOp forOp,
                  LoopScheduleDependenceAnalysis &dependenceAnalysis) {
   // Create a modulo scheduling problem.
-  ModuloProblem problem = ModuloProblem::get(forOp);
+  ModuloProblem problem(forOp);
 
   // Insert memory dependences into the problem.
   forOp.getBody()->walk([&](Operation *op) {
@@ -171,7 +171,7 @@ getModuloProblem(scf::ForOp forOp,
 SharedOperatorsProblem
 getSharedOperatorsProblem(scf::ForOp forOp,
                           LoopScheduleDependenceAnalysis &dependenceAnalysis) {
-  SharedOperatorsProblem problem = SharedOperatorsProblem::get(forOp);
+  SharedOperatorsProblem problem(forOp);
 
   // Insert memory dependences into the problem.
   assert(forOp.getLoopRegions().size() == 1);
@@ -243,7 +243,7 @@ getSharedOperatorsProblem(scf::ForOp forOp,
 SharedOperatorsProblem
 getSharedOperatorsProblem(func::FuncOp funcOp,
                           LoopScheduleDependenceAnalysis &dependenceAnalysis) {
-  SharedOperatorsProblem problem = SharedOperatorsProblem::get(funcOp);
+  SharedOperatorsProblem problem(funcOp);
 
   // Insert memory dependences into the problem.
   funcOp.getBody().walk([&](Operation *op) {

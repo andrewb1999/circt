@@ -327,7 +327,8 @@ void UnrollForLoopSchedule::runOnOperation() {
 
   // After we unroll and merge, get rid of redundant loads
   affineScalarReplace(getOperation(), getAnalysis<DominanceInfo>(),
-                      getAnalysis<PostDominanceInfo>());
+                      getAnalysis<PostDominanceInfo>(),
+                      getAnalysis<AliasAnalysis>());
 }
 
 namespace circt {

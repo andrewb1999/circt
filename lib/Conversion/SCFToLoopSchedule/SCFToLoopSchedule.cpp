@@ -7,7 +7,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/SCFToLoopSchedule.h"
-#include "../PassDetail.h"
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Analysis/LoopScheduleDependenceAnalysis.h"
 #include "circt/Analysis/NameAnalysis.h"
@@ -63,6 +62,11 @@
 
 #define DEBUG_TYPE "scf-to-loopschedule"
 
+namespace circt {
+#define GEN_PASS_DEF_SCFTOLOOPSCHEDULE
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
+
 using namespace mlir;
 using namespace mlir::arith;
 using namespace mlir::affine;
@@ -76,7 +80,7 @@ using namespace circt::loopschedule;
 
 namespace {
 
-struct SCFToLoopSchedule : public SCFToLoopScheduleBase<SCFToLoopSchedule> {
+struct SCFToLoopSchedule : public circt::impl::SCFToLoopScheduleBase<SCFToLoopSchedule> {
   using SCFToLoopScheduleBase<SCFToLoopSchedule>::SCFToLoopScheduleBase;
   void runOnOperation() override;
 

@@ -7,7 +7,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/AffineToSCF.h"
-#include "../PassDetail.h"
 #include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
@@ -30,6 +29,11 @@
 #include <optional>
 
 #define DEBUG_TYPE "affine-to-scf"
+
+namespace circt {
+#define GEN_PASS_DEF_AFFINETOSCF
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace mlir::arith;
@@ -191,7 +195,7 @@ public:
 } // namespace
 
 namespace {
-class AffineToSCFPass : public AffineToSCFBase<AffineToSCFPass> {
+class AffineToSCFPass : public circt::impl::AffineToSCFBase<AffineToSCFPass> {
   void runOnOperation() override;
 };
 } // namespace

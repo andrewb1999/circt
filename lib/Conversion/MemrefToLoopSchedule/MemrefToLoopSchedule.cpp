@@ -7,13 +7,18 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/MemrefToLoopSchedule.h"
-#include "../PassDetail.h"
 #include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 #define DEBUG_TYPE "memref-to-loopschedule"
+
+namespace circt {
+#define GEN_PASS_DEF_MEMREFTOLOOPSCHEDULE
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace mlir::memref;
@@ -23,7 +28,7 @@ using namespace circt::loopschedule;
 namespace {
 
 struct MemrefToLoopSchedule
-    : public MemrefToLoopScheduleBase<MemrefToLoopSchedule> {
+    : public circt::impl::MemrefToLoopScheduleBase<MemrefToLoopSchedule> {
   using MemrefToLoopScheduleBase::MemrefToLoopScheduleBase;
   void runOnOperation() override;
 };

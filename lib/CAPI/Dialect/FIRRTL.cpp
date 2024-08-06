@@ -346,24 +346,3 @@ bool firrtlImportAnnotationsFromJSONRaw(
   *importedAnnotationsArray = wrap(ArrayAttr::get(ctxUnwrapped, annos));
   return true;
 }
-
-bool firrtlImportAnnotationsFromJSONRaw(
-    MlirContext ctx, MlirStringRef annotationsStr,
-    MlirAttribute *importedAnnotationsArray) {
-  auto annotations = json::parse(unwrap(annotationsStr));
-  if (!annotations) {
-    return false;
-  }
-
-  auto *ctxUnwrapped = unwrap(ctx);
-
-  json::Path::Root root;
-  SmallVector<Attribute> annos;
-  if (!importAnnotationsFromJSONRaw(annotations.get(), annos, root,
-                                    ctxUnwrapped)) {
-    return false;
-  }
-
-  *importedAnnotationsArray = wrap(ArrayAttr::get(ctxUnwrapped, annos));
-  return true;
-}

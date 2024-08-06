@@ -180,7 +180,7 @@ void IndexRemoval::runOnOperation() {
   auto *ctx = &context;
   mlir::GreedyRewriteConfig config;
   config.useTopDownTraversal = true;
-  config.enableRegionSimplification = false;
+  config.enableRegionSimplification = mlir::GreedySimplifyRegionLevel::Disabled;
   RewritePatternSet patterns{ctx};
   patterns.add<ReplaceConstantOpAttr>(ctx, 64);
   patterns.add<ReplaceIndexCast<arith::IndexCastOp, arith::ExtSIOp>,

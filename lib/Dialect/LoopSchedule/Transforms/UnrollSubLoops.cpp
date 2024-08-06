@@ -14,7 +14,7 @@
 
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Support/LogicalResult.h"
-#include "mlir/Support/MathExtras.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace circt;
 using namespace loopschedule;
@@ -44,7 +44,7 @@ LogicalResult unrollSubLoops(scf::ForOp &forOp) {
     int64_t stepCst = stepCstOp.value();
     assert(lbCst >= 0 && ubCst >= 0 && stepCst >= 0 &&
            "expected positive loop bounds and step");
-    int64_t tripCount = mlir::ceilDiv(ubCst - lbCst, stepCst);
+    int64_t tripCount = llvm::divideCeilSigned(ubCst - lbCst, stepCst);
     if (loopUnrollByFactor(op, tripCount).failed())
       return WalkResult::interrupt();
     return WalkResult::advance();

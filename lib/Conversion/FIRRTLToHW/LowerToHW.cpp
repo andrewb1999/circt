@@ -4751,7 +4751,6 @@ LogicalResult FIRRTLLowering::visitStmt(AttachOp op) {
       // In the non-synthesis case, we emit a SystemVerilog alias
       // statement.
       [&]() {
-        circuitState.used_VERILATOR = true;
         builder.create<sv::IfDefOp>(
             "VERILATOR",
             [&]() {

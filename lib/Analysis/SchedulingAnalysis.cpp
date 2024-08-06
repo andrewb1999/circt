@@ -29,6 +29,7 @@
 using namespace mlir;
 using namespace mlir::affine;
 using namespace circt::scheduling;
+using namespace circt::loopschedule;
 
 /// CyclicSchedulingAnalysis constructs a CyclicProblem for each AffineForOp by
 /// performing a memory dependence analysis and inserting dependences into the
@@ -178,7 +179,7 @@ circt::analysis::SharedOperatorsSchedulingAnalysis::
 void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeForOp(
     AffineForOp forOp, MemoryDependenceAnalysis memoryAnalysis) {
   // Create a cyclic scheduling problem.
-  SharedOperatorsProblem problem = SharedOperatorsProblem::get(forOp);
+  SharedOperatorsProblem problem = SharedOperatorsProblem(forOp);
 
   // Insert memory dependences into the problem.
   assert(forOp.getLoopRegions().size() == 1);
@@ -306,7 +307,7 @@ void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeForOp(
 void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeFuncOp(
     func::FuncOp funcOp, MemoryDependenceAnalysis memoryAnalysis) {
   // Create a cyclic scheduling problem.
-  SharedOperatorsProblem problem = SharedOperatorsProblem::get(funcOp);
+  SharedOperatorsProblem problem = SharedOperatorsProblem(funcOp);
   llvm::errs() << "func sched\n";
 
   // Insert memory dependences into the problem.
