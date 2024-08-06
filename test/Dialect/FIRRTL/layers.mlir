@@ -164,7 +164,7 @@ firrtl.circuit "Test" {
     firrtl.layerblock @A {
       %w = firrtl.wire : !firrtl.uint<1>
       firrtl.when %test : !firrtl.uint<1> {
-        firrtl.strictconnect %w, %c0_ui1 : !firrtl.uint<1>
+        firrtl.matchingconnect %w, %c0_ui1 : !firrtl.uint<1>
       }
     }
   }
@@ -201,4 +201,16 @@ firrtl.circuit "Test" {
       firrtl.propassign %foo_in, %str : !firrtl.string
     }
   }
+
+  //===--------------------------------------------------------------------===//
+  // RWProbe under Layer
+  //===--------------------------------------------------------------------===//
+
+  firrtl.module @RWProbeInLayer() {
+    firrtl.layerblock @A {
+      %w = firrtl.wire sym @sym : !firrtl.uint<1>
+      %rwp = firrtl.ref.rwprobe <@RWProbeInLayer::@sym> : !firrtl.rwprobe<uint<1>>
+    }
+  }
+
 }

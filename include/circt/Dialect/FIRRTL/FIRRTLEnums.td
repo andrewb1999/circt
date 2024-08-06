@@ -51,12 +51,29 @@ def ConventionAttr : EnumAttr<FIRRTLDialect, Convention, "convention">;
 //===----------------------------------------------------------------------===//
 
 def LayerConvention : I32EnumAttr<"LayerConvention", "layer convention", [
-  I32EnumAttrCase<"Bind", 0, "bind">]> {
+  I32EnumAttrCase<"Bind", 0, "bind">,
+  I32EnumAttrCase<"Inline", 1, "inline">
+]> {
 
   let genSpecializedAttr = 0;
 }
 
 def LayerConventionAttr : EnumAttr<FIRRTLDialect, LayerConvention, "layerconvention">;
+
+//===----------------------------------------------------------------------===//
+// Layer Specialization
+//===----------------------------------------------------------------------===//
+
+def LayerSpecialization :
+    I32EnumAttr<"LayerSpecialization", "layer specialization", [
+  I32EnumAttrCase<"Enable", 0, "enable">,
+  I32EnumAttrCase<"Disable", 1, "disable">
+]> {
+  let genSpecializedAttr = 0;
+}
+
+def LayerSpecializationAttr :
+    EnumAttr<FIRRTLDialect, LayerSpecialization, "layerspecialization">;
 
 //===----------------------------------------------------------------------===//
 // Read Under Write Behaviour

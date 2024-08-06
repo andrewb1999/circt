@@ -6,21 +6,28 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWPasses.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+namespace circt {
+namespace hw {
+#define GEN_PASS_DEF_FLATTENIO
+#include "circt/Dialect/HW/Passes.h.inc"
+} // namespace hw
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
 
 static bool isStructType(Type type) {
-  return hw::getCanonicalType(type).isa<hw::StructType>();
+  return isa<hw::StructType>(hw::getCanonicalType(type));
 }
 
 static hw::StructType getStructType(Type type) {
-  return hw::getCanonicalType(type).dyn_cast<hw::StructType>();
+  return dyn_cast<hw::StructType>(hw::getCanonicalType(type));
 }
 
 // Legal if no in- or output type is a struct.
@@ -63,8 +70,8 @@ struct OutputOpConversion : public OpConversionPattern<hw::OutputOp> {
     }
 
     // And replace.
-    rewriter.replaceOpWithNewOp<hw::OutputOp>(op, convOperands);
     opVisited->insert(op->getParentOp());
+    rewriter.replaceOpWithNewOp<hw::OutputOp>(op, convOperands);
     return success();
   }
   DenseSet<Operation *> *opVisited;
@@ -483,7 +490,7 @@ static bool flattenIO(ModuleOp module, bool recursive,
 
 namespace {
 
-class FlattenIOPass : public circt::hw::FlattenIOBase<FlattenIOPass> {
+class FlattenIOPass : public circt::hw::impl::FlattenIOBase<FlattenIOPass> {
 public:
   FlattenIOPass(bool recursiveFlag, bool flattenExternFlag, char join) {
     recursive = recursiveFlag;

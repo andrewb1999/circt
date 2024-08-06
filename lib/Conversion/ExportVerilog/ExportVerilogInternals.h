@@ -10,6 +10,7 @@
 #define CONVERSION_EXPORTVERILOG_EXPORTVERILOGINTERNAL_H
 
 #include "circt/Dialect/Comb/CombVisitors.h"
+#include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWSymCache.h"
 #include "circt/Dialect/HW/HWVisitors.h"
@@ -26,6 +27,7 @@ struct LoweringOptions;
 
 namespace ExportVerilog {
 class GlobalNameResolver;
+struct NameCollisionResolver;
 
 /// Check if the value is from read of a wire or reg or is a port.
 bool isSimpleReadOrPort(Value v);
@@ -56,6 +58,9 @@ struct GlobalNameTable {
     return it != enumPrefixes.end() ? it->second : StringAttr();
   }
 
+  // Add the set of reserved names to a resolver.
+  void addReservedNames(NameCollisionResolver &nameResolver) const;
+
 private:
   friend class GlobalNameResolver;
   GlobalNameTable() {}
@@ -75,6 +80,9 @@ private:
   // This contains prefixes for any typedecl'd enum types. Keys are type-aliases
   // of enum types.
   DenseMap<Type, StringAttr> enumPrefixes;
+
+  /// List of names which are marked as reserved for any name.
+  DenseSet<StringAttr> reservedNames;
 };
 
 //===----------------------------------------------------------------------===//
@@ -328,6 +336,9 @@ private:
 /// Mapping from symbols to file operations.
 using FileMapping = DenseMap<StringAttr, Operation *>;
 
+/// Mapping from symbols to file operations.
+using FragmentMapping = DenseMap<StringAttr, emit::FragmentOp>;
+
 /// This class tracks the top-level state for the emitters, which is built and
 /// then shared across all per-file emissions that happen in parallel.
 struct SharedEmitterState {
@@ -368,6 +379,9 @@ struct SharedEmitterState {
 
   /// Tracks the referenceable files through their symbol.
   FileMapping fileMapping;
+
+  /// Tracks referenceable files through their symbol.
+  FragmentMapping fragmentMapping;
 
   explicit SharedEmitterState(ModuleOp designOp, const LoweringOptions &options,
                               GlobalNameTable globalNames)
@@ -438,10 +452,10 @@ LogicalResult lowerHWInstanceChoices(mlir::ModuleOp module);
 /// For each module we emit, do a prepass over the structure, pre-lowering and
 /// otherwise rewriting operations we don't want to emit.
 LogicalResult prepareHWModule(Block &block, const LoweringOptions &options);
-LogicalResult prepareHWModule(hw::HWModuleOp module,
+LogicalResult prepareHWModule(hw::HWEmittableModuleLike module,
                               const LoweringOptions &options);
 
-void pruneZeroValuedLogic(hw::HWModuleOp module);
+void pruneZeroValuedLogic(hw::HWEmittableModuleLike module);
 
 /// Rewrite module names and interfaces to not conflict with each other or with
 /// Verilog keywords.

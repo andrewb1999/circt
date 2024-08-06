@@ -30,11 +30,11 @@ createAddTapsPass(const AddTapsOptions &options = {});
 std::unique_ptr<mlir::Pass> createAllocateStatePass();
 std::unique_ptr<mlir::Pass> createArcCanonicalizerPass();
 std::unique_ptr<mlir::Pass> createDedupPass();
+std::unique_ptr<mlir::Pass> createFindInitialVectorsPass();
 std::unique_ptr<mlir::Pass> createGroupResetsAndEnablesPass();
 std::unique_ptr<mlir::Pass>
 createInferMemoriesPass(const InferMemoriesOptions &options = {});
 std::unique_ptr<mlir::Pass> createInlineArcsPass();
-std::unique_ptr<mlir::Pass> createInlineModulesPass();
 std::unique_ptr<mlir::Pass> createIsolateClocksPass();
 std::unique_ptr<mlir::Pass> createLatencyRetimingPass();
 std::unique_ptr<mlir::Pass> createLegalizeStateUpdatePass();

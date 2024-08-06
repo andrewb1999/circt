@@ -13,6 +13,7 @@
 #ifndef CIRCT_FIRTOOL_FIRTOOL_H
 #define CIRCT_FIRTOOL_FIRTOOL_H
 
+#include "circt/Conversion/Passes.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/Seq/SeqPasses.h"
 #include "circt/Support/LLVM.h"
@@ -91,6 +92,10 @@ public:
   bool shouldLowerNoRefTypePortAnnotations() const {
     return lowerAnnotationsNoRefTypePorts;
   }
+  bool shouldAllowAddingPortsOnPublic() const {
+    return allowAddingPortsOnPublic;
+  }
+  bool shouldConvertProbesToSignals() const { return probesToSignals; }
   bool shouldReplicateSequentialMemories() const { return replSeqMem; }
   bool shouldDisableOptimization() const { return disableOptimization; }
   bool shouldLowerMemories() const { return lowerMemories; }
@@ -99,9 +104,6 @@ public:
   bool shouldIgnoreReadEnableMemories() const { return ignoreReadEnableMem; }
   bool shouldEmitOMIR() const { return emitOMIR; }
   bool shouldExportChiselInterface() const { return exportChiselInterface; }
-  bool shouldDisableHoistingHWPassthrough() const {
-    return disableHoistingHWPassthrough;
-  }
   bool shouldConvertVecOfBundle() const { return vbToBV; }
   bool shouldEtcDisableInstanceExtraction() const {
     return etcDisableInstanceExtraction;
@@ -119,7 +121,7 @@ public:
     return disableAggressiveMergeConnections;
   }
   bool shouldEnableAnnotationWarning() const { return enableAnnotationWarning; }
-  bool shouldEmitChiselAssertsAsSVA() const { return emitChiselAssertsAsSVA; }
+  auto getVerificationFlavor() const { return verificationFlavor; }
   bool shouldEmitSeparateAlwaysBlocks() const {
     return emitSeparateAlwaysBlocks;
   }
@@ -129,6 +131,7 @@ public:
   }
   bool shouldExtractTestCode() const { return extractTestCode; }
   bool shouldFixupEICGWrapper() const { return fixupEICGWrapper; }
+  bool shouldAddCompanionAssume() const { return addCompanionAssume; }
 
   // Setters, used by the CAPI
   FirtoolOptions &setOutputFilename(StringRef name) {
@@ -148,6 +151,16 @@ public:
 
   FirtoolOptions &setLowerAnnotationsNoRefTypePorts(bool value) {
     lowerAnnotationsNoRefTypePorts = value;
+    return *this;
+  }
+
+  FirtoolOptions &setAllowAddingPortsOnPublic(bool value) {
+    allowAddingPortsOnPublic = value;
+    return *this;
+  }
+
+  FirtoolOptions &setConvertProbesToSignals(bool value) {
+    probesToSignals = value;
     return *this;
   }
 
@@ -205,11 +218,6 @@ public:
 
   FirtoolOptions &setDisableAggressiveMergeConnections(bool value) {
     disableAggressiveMergeConnections = value;
-    return *this;
-  }
-
-  FirtoolOptions &setDisableHoistingHWPassthrough(bool value) {
-    disableHoistingHWPassthrough = value;
     return *this;
   }
 
@@ -273,8 +281,8 @@ public:
     return *this;
   }
 
-  FirtoolOptions &setEmitChiselAssertsAsSVA(bool value) {
-    emitChiselAssertsAsSVA = value;
+  FirtoolOptions &setVerificationFlavor(firrtl::VerificationFlavor value) {
+    verificationFlavor = value;
     return *this;
   }
 
@@ -349,11 +357,18 @@ public:
     return *this;
   }
 
+  FirtoolOptions &setAddCompanionAssume(bool value) {
+    addCompanionAssume = value;
+    return *this;
+  }
+
 private:
   std::string outputFilename;
   bool disableAnnotationsUnknown;
   bool disableAnnotationsClassless;
   bool lowerAnnotationsNoRefTypePorts;
+  bool allowAddingPortsOnPublic;
+  bool probesToSignals;
   firrtl::PreserveAggregate::PreserveMode preserveAggregate;
   firrtl::PreserveValues::PreserveMode preserveMode;
   bool enableDebugInfo;
@@ -365,7 +380,6 @@ private:
   bool noDedup;
   firrtl::CompanionMode companionMode;
   bool disableAggressiveMergeConnections;
-  bool disableHoistingHWPassthrough;
   bool emitOMIR;
   std::string omirOutFile;
   bool lowerMemories;
@@ -378,7 +392,7 @@ private:
   std::string outputAnnotationFilename;
   bool enableAnnotationWarning;
   bool addMuxPragmas;
-  bool emitChiselAssertsAsSVA;
+  firrtl::VerificationFlavor verificationFlavor;
   bool emitSeparateAlwaysBlocks;
   bool etcDisableInstanceExtraction;
   bool etcDisableRegisterExtraction;
@@ -394,6 +408,7 @@ private:
   bool stripFirDebugInfo;
   bool stripDebugInfo;
   bool fixupEICGWrapper;
+  bool addCompanionAssume;
 };
 
 void registerFirtoolCLOptions();
@@ -424,6 +439,10 @@ LogicalResult populateExportSplitVerilog(mlir::PassManager &pm,
 
 LogicalResult populateFinalizeIR(mlir::PassManager &pm,
                                  const FirtoolOptions &opt);
+
+LogicalResult populateHWToBTOR2(mlir::PassManager &pm,
+                                const FirtoolOptions &opt,
+                                llvm::raw_ostream &os);
 
 } // namespace firtool
 } // namespace circt

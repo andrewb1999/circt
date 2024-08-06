@@ -34,7 +34,7 @@ void appendPortsForExternalMemref(PatternRewriter &rewriter, StringRef memName,
                                   Value memref, unsigned memoryID,
                                   SmallVectorImpl<calyx::PortInfo> &inPorts,
                                   SmallVectorImpl<calyx::PortInfo> &outPorts) {
-  MemRefType memrefType = memref.getType().cast<MemRefType>();
+  MemRefType memrefType = cast<MemRefType>(memref.getType());
 
   // Ports constituting a memory interface are added a set of attributes under
   // a "mem : {...}" dictionary. These attributes allows for deducing which
@@ -848,7 +848,7 @@ BuildBasicBlockRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
 
     for (auto arg : enumerate(block->getArguments())) {
       Type argType = arg.value().getType();
-      assert(argType.isa<IntegerType>() && "unsupported block argument type");
+      assert(isa<IntegerType>(argType) && "unsupported block argument type");
       unsigned width = argType.getIntOrFloatBitWidth();
       std::string index = std::to_string(arg.index());
       std::string name = loweringState().blockName(block) + "_arg" + index;
@@ -871,7 +871,7 @@ BuildReturnRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
 
   for (auto argType : enumerate(funcOp.getResultTypes())) {
     auto convArgType = calyx::convIndexType(rewriter, argType.value());
-    assert(convArgType.isa<IntegerType>() && "unsupported return type");
+    assert(isa<IntegerType>(convArgType) && "unsupported return type");
     unsigned width = convArgType.getIntOrFloatBitWidth();
     std::string name = "ret_arg" + std::to_string(argType.index());
     auto reg =

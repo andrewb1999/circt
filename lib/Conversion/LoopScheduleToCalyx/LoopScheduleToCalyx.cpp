@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/LoopScheduleToCalyx.h"
-#include "../PassDetail.h"
 #include "circt/Dialect/Calyx/CalyxHelpers.h"
 #include "circt/Dialect/Calyx/CalyxLoweringUtils.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
@@ -43,6 +42,11 @@
 #include <string>
 #include <unordered_set>
 #include <variant>
+
+namespace circt {
+#define GEN_PASS_DEF_LOOPSCHEDULETOCALYX
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace llvm;
 using namespace mlir;
@@ -1572,7 +1576,7 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
 
         // Create a register for passing this result to later phases.
         Type resultType = value.getType();
-        assert(resultType.isa<IntegerType>() &&
+        assert(isa<IntegerType>(resultType) &&
                "unsupported pipeline result type");
 
         auto name =
@@ -2410,7 +2414,7 @@ class CleanupFuncOps : public calyx::FuncOpPartialLoweringPattern {
 // Pass driver
 //===----------------------------------------------------------------------===//
 class LoopScheduleToCalyxPass
-    : public LoopScheduleToCalyxBase<LoopScheduleToCalyxPass> {
+    : public circt::impl::LoopScheduleToCalyxBase<LoopScheduleToCalyxPass> {
 public:
   LoopScheduleToCalyxPass()
       : LoopScheduleToCalyxBase<LoopScheduleToCalyxPass>(),
@@ -2524,7 +2528,8 @@ public:
     // will only be established later in the conversion process, so ensure
     // that rewriter optimizations (especially DCE) are disabled.
     GreedyRewriteConfig config;
-    config.enableRegionSimplification = false;
+    config.enableRegionSimplification =
+        mlir::GreedySimplifyRegionLevel::Disabled;
     if (runOnce)
       config.maxIterations = 1;
 
@@ -2658,9 +2663,9 @@ void LoopScheduleToCalyxPass::runOnOperation() {
     }
   }
 
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
   // Cleanup patterns
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
   RewritePatternSet cleanupPatterns(&getContext());
   cleanupPatterns.add<calyx::MultipleGroupDonePattern,
                       calyx::NonTerminatingGroupDonePattern>(&getContext());

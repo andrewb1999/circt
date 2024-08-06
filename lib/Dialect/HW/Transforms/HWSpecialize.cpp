@@ -10,7 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -21,8 +20,16 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+namespace circt {
+namespace hw {
+#define GEN_PASS_DEF_HWSPECIALIZE
+#include "circt/Dialect/HW/Passes.h.inc"
+} // namespace hw
+} // namespace circt
 
 using namespace llvm;
 using namespace mlir;
@@ -38,8 +45,8 @@ static std::string generateModuleName(Namespace &ns, hw::HWModuleOp moduleOp,
   assert(parameters.size() != 0);
   std::string name = moduleOp.getName().str();
   for (auto param : parameters) {
-    auto paramAttr = param.cast<ParamDeclAttr>();
-    int64_t paramValue = paramAttr.getValue().cast<IntegerAttr>().getInt();
+    auto paramAttr = cast<ParamDeclAttr>(param);
+    int64_t paramValue = cast<IntegerAttr>(paramAttr.getValue()).getInt();
     name += "_" + paramAttr.getName().str() + "_" + std::to_string(paramValue);
   }
 
@@ -59,7 +66,7 @@ static FailureOr<Value> narrowValueToArrayWidth(OpBuilder &builder, Value array,
                                                 Value value) {
   OpBuilder::InsertionGuard g(builder);
   builder.setInsertionPointAfterValue(value);
-  auto arrayType = array.getType().cast<hw::ArrayType>();
+  auto arrayType = cast<hw::ArrayType>(array.getType());
   unsigned hiBit = llvm::Log2_64_Ceil(arrayType.getNumElements());
 
   return hiBit == 0
@@ -115,7 +122,7 @@ struct EliminateParamValueOpPattern : public OpRewritePattern<ParamValueOp> {
       return failure();
     rewriter.replaceOpWithNewOp<hw::ConstantOp>(
         op, op.getType(),
-        evaluated->cast<IntegerAttr>().getValue().getSExtValue());
+        cast<IntegerAttr>(*evaluated).getValue().getSExtValue());
     return success();
   }
 
@@ -189,7 +196,8 @@ struct ParametricTypeConversionPattern : public ConversionPattern {
   ArrayAttr parameters;
 };
 
-struct HWSpecializePass : public hw::HWSpecializeBase<HWSpecializePass> {
+struct HWSpecializePass
+    : public circt::hw::impl::HWSpecializeBase<HWSpecializePass> {
   void runOnOperation() override;
 };
 
@@ -227,7 +235,7 @@ static LogicalResult registerNestedParametricInstanceOps(
     llvm::SmallVector<Attribute> evaluatedInstanceParameters;
     evaluatedInstanceParameters.reserve(instanceParameters.size());
     for (auto instanceParameter : instanceParameters) {
-      auto instanceParameterDecl = instanceParameter.cast<hw::ParamDeclAttr>();
+      auto instanceParameterDecl = cast<hw::ParamDeclAttr>(instanceParameter);
       auto instanceParameterValue = instanceParameterDecl.getValue();
       auto evaluated = evaluateParametricAttr(target.getLoc(), parameters,
                                               instanceParameterValue);

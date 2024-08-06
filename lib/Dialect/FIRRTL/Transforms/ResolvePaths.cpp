@@ -10,10 +10,19 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotationHelper.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/OwningModuleCache.h"
+#include "circt/Dialect/FIRRTL/Passes.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/Pass/Pass.h"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_RESOLVEPATHS
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -22,7 +31,7 @@ namespace {
 struct PathResolver {
   PathResolver(CircuitOp circuit, InstanceGraph &instanceGraph)
       : circuit(circuit), symbolTable(circuit), instanceGraph(instanceGraph),
-        hierPathCache(circuit, symbolTable),
+        instancePathCache(instanceGraph), hierPathCache(circuit, symbolTable),
         builder(OpBuilder::atBlockBegin(circuit->getBlock())) {}
 
   /// This function will find the operation targeted and create a hierarchical
@@ -30,7 +39,7 @@ struct PathResolver {
   /// be a reference to the HierPathOp, or null if no HierPathOp was needed.
   LogicalResult resolveHierPath(Location loc, FModuleOp owningModule,
                                 const AnnoPathValue &target,
-                                FlatSymbolRefAttr &op) {
+                                FlatSymbolRefAttr &result) {
 
     // We want to root this path at the top level module, or in the case of an
     // unreachable module, we settle for as high as we can get.
@@ -49,38 +58,30 @@ struct PathResolver {
                << "unable to resolve path relative to owning module "
                << owningModule.getModuleNameAttr();
       // If there is more than one instance of this module, then the path
-      // operation is ambiguous, which is an error.
+      // operation is ambiguous, which is a warning. This should become an error
+      // once user code is properly enforcing single instantiation, but in
+      // practice this generates the same outputs as the original flow for now.
+      // See https://github.com/llvm/circt/issues/7128.
       if (!node->hasOneUse()) {
-        auto diag = emitError(loc) << "unable to uniquely resolve target due "
-                                      "to multiple instantiation";
+        auto diag = emitWarning(loc) << "unable to uniquely resolve target due "
+                                        "to multiple instantiation";
         for (auto *use : node->uses())
           diag.attachNote(use->getInstance().getLoc()) << "instance here";
-        return diag;
       }
       node = (*node->usesBegin())->getParent();
     }
 
-    // Find the minimal uniquely-identifying path to the operation.  We scan
-    // through the list of instances looking for the first module which is
-    // multiply instantiated.  We will start our HierPathOp at this instance.
-    auto *it = llvm::find_if(target.instances, [&](InstanceOp instance) {
-      auto *node = instanceGraph.lookup(instance.getReferencedModuleNameAttr());
-      return !node->hasOneUse();
-    });
-
-    // If the path is empty, then this is a local reference and we should not
+    // If the path is empty then this is a local reference and we should not
     // construct a HierPathOp.
-    auto pathLength = std::distance(it, target.instances.end());
-    if (pathLength == 0) {
-      op = nullptr;
+    if (target.instances.empty()) {
       return success();
     }
 
     // Transform the instances into a list of FlatSymbolRefs.
     SmallVector<Attribute> insts;
-    insts.reserve(pathLength);
-    std::transform(it, target.instances.end(), std::back_inserter(insts),
-                   [&](InstanceOp instance) {
+    insts.reserve(target.instances.size());
+    std::transform(target.instances.begin(), target.instances.end(),
+                   std::back_inserter(insts), [&](InstanceOp instance) {
                      return OpAnnoTarget(instance).getNLAReference(
                          namespaces[instance->getParentOfType<FModuleLike>()]);
                    });
@@ -88,10 +89,12 @@ struct PathResolver {
     // Push a reference to the current module.
     insts.push_back(
         FlatSymbolRefAttr::get(target.ref.getModule().getModuleNameAttr()));
-    auto instAttr = ArrayAttr::get(circuit.getContext(), insts);
 
     // Return the hierchical path.
-    op = hierPathCache.getRefFor(instAttr);
+    auto instAttr = ArrayAttr::get(circuit.getContext(), insts);
+
+    result = hierPathCache.getRefFor(instAttr);
+
     return success();
   }
 
@@ -107,7 +110,7 @@ struct PathResolver {
     // OMDeleted nodes do not have a target, so it is impossible to resolve
     // them to a real path.  We create a special constant for these path
     // values.
-    if (target.consume_front("OMDeleted")) {
+    if (target.consume_front("OMDeleted:")) {
       if (!target.empty())
         return emitError(loc, "OMDeleted references can not have targets");
       // Deleted targets are turned into OMReference targets with a dangling
@@ -159,17 +162,14 @@ struct PathResolver {
     // we are targeting a module, the type will be null.
     if (Type targetType = path->ref.getType()) {
       auto fieldId = path->fieldIdx;
-      auto baseType = dyn_cast<FIRRTLBaseType>(targetType);
+      auto baseType = type_dyn_cast<FIRRTLBaseType>(targetType);
       if (!baseType)
         return emitError(loc, "unable to target non-hardware type ")
                << targetType;
       targetType = hw::FieldIdImpl::getFinalTypeByFieldID(baseType, fieldId);
-      if (isa<BundleType, FVectorType>(targetType))
+      if (type_isa<BundleType, FVectorType>(targetType))
         return emitError(loc, "unable to target aggregate type ") << targetType;
     }
-
-    // Create a unique ID.
-    auto id = DistinctAttr::create(UnitAttr::get(context));
 
     auto owningModule = cache.lookup(unresolved);
     StringRef moduleName = "nullptr";
@@ -178,33 +178,47 @@ struct PathResolver {
     if (!owningModule)
       return unresolved->emitError("path does not have a single owning module");
 
-    // Resolve a unique path to the operation in question.
+    // Resolve a path to the operation in question.
     FlatSymbolRefAttr hierPathName;
     if (failed(resolveHierPath(loc, owningModule, *path, hierPathName)))
       return failure();
 
-    // Create the annotation.
-    NamedAttrList fields;
-    fields.append("id", id);
-    fields.append("class", StringAttr::get(context, "circt.tracker"));
-    if (hierPathName)
-      fields.append("circt.nonlocal", hierPathName);
-    if (path->fieldIdx != 0)
-      fields.append("circt.fieldID", b.getI64IntegerAttr(path->fieldIdx));
-    auto annotation = DictionaryAttr::get(context, fields);
+    auto createAnnotation = [&](FlatSymbolRefAttr hierPathName) {
+      // Create a unique ID.
+      auto id = DistinctAttr::create(UnitAttr::get(context));
 
-    // Attach the annotation to the target.
+      // Create the annotation.
+      NamedAttrList fields;
+      fields.append("id", id);
+      fields.append("class", StringAttr::get(context, "circt.tracker"));
+      if (hierPathName)
+        fields.append("circt.nonlocal", hierPathName);
+      if (path->fieldIdx != 0)
+        fields.append("circt.fieldID", b.getI64IntegerAttr(path->fieldIdx));
+
+      return DictionaryAttr::get(context, fields);
+    };
+
+    // Create the annotation(s).
+    Attribute annotation = createAnnotation(hierPathName);
+
+    // Attach the annotation(s) to the target.
     auto annoTarget = path->ref;
-    auto annotations = annoTarget.getAnnotations();
-    annotations.addAnnotations(annotation);
+    auto targetAnnotations = annoTarget.getAnnotations();
+    targetAnnotations.addAnnotations({annotation});
     if (targetKindAttr.getValue() == TargetKind::DontTouch)
-      annotations.addDontTouch();
-    annoTarget.setAnnotations(annotations);
+      targetAnnotations.addDontTouch();
+    annoTarget.setAnnotations(targetAnnotations);
 
-    // Create the path operation.
+    // Create a PathOp using the id in the annotation we added to the target.
+    auto dictAttr = cast<DictionaryAttr>(annotation);
+    auto id = cast<DistinctAttr>(dictAttr.get("id"));
     auto resolved = b.create<PathOp>(targetKindAttr, id);
+
+    // Replace the unresolved path with the PathOp.
     unresolved->replaceAllUsesWith(resolved);
     unresolved.erase();
+
     return success();
   }
 
@@ -212,6 +226,7 @@ struct PathResolver {
   SymbolTable symbolTable;
   CircuitTargetCache targetCache;
   InstanceGraph &instanceGraph;
+  InstancePathCache instancePathCache;
   hw::InnerSymbolNamespaceCollection namespaces;
   HierPathCache hierPathCache;
   OpBuilder builder;
@@ -223,7 +238,8 @@ struct PathResolver {
 //===----------------------------------------------------------------------===//
 
 namespace {
-struct ResolvePathsPass : public ResolvePathsBase<ResolvePathsPass> {
+struct ResolvePathsPass
+    : public circt::firrtl::impl::ResolvePathsBase<ResolvePathsPass> {
   void runOnOperation() override;
 };
 } // end anonymous namespace

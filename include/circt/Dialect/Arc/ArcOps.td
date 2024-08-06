@@ -93,7 +93,7 @@ def DefineOp : ArcOp<"define", [
     /// an error if the attribute is invalid.
     mlir::LogicalResult verifyType() {
       auto type = getFunctionTypeAttr().getValue();
-      if (!type.isa<mlir::FunctionType>())
+      if (!llvm::isa<mlir::FunctionType>(type))
         return emitOpError("requires '") << getFunctionTypeAttrName() <<
                            "' attribute of function type";
       return mlir::success();
@@ -277,10 +277,10 @@ def MemoryOp : ArcOp<"memory", [MemoryEffects<[MemAlloc]>]> {
 
 class MemoryAndDataTypesMatch<string mem, string data> : TypesMatchWith<
   "memory and data types must match", mem, data,
-  "$_self.cast<MemoryType>().getWordType()">;
+  "llvm::cast<MemoryType>($_self).getWordType()">;
 class MemoryAndAddressTypesMatch<string mem, string address> : TypesMatchWith<
   "memory and address types must match", mem, address,
-  "$_self.cast<MemoryType>().getAddressType()">;
+  "llvm::cast<MemoryType>($_self).getAddressType()">;
 
 def MemoryReadPortOp : ArcOp<"memory_read_port", [
   Pure,
@@ -528,7 +528,7 @@ def StorageGetOp : ArcOp<"storage.get", [Pure]> {
 
 class StateAndValueTypesMatch<string state, string value> : TypesMatchWith<
   "state and value types must match", state, value,
-  "$_self.cast<StateType>().getType()">;
+  "llvm::cast<StateType>($_self).getType()">;
 
 def StateReadOp : ArcOp<"state_read", [
   MemoryEffects<[MemRead]>,
@@ -757,7 +757,6 @@ def VectorizeOp : ArcOp<"vectorize", [
     vectorized each list will only contain a single SSA value of either vector
     type or an integer representing the concatenation of all original operands
     of that vector.
-    Only integer types can be vectorized, no arrays or structs are allowed.
 
     Example:
 
@@ -845,9 +844,9 @@ def VectorizeOp : ArcOp<"vectorize", [
   }];
 
   let arguments = (ins
-    VariadicOfVariadic<IntOr1DVectorOfInt, "inputOperandSegments">:$inputs,
+    VariadicOfVariadic<AnyType, "inputOperandSegments">:$inputs,
     DenseI32ArrayAttr:$inputOperandSegments);
-  let results = (outs Variadic<IntOr1DVectorOfInt>:$results);
+  let results = (outs Variadic<AnyType>:$results);
   let regions = (region SizedRegion<1>:$body);
 
   let assemblyFormat = [{
@@ -876,7 +875,7 @@ def VectorizeReturnOp : ArcOp<"vectorize.return", [
   HasParent<"VectorizeOp">, Pure, ReturnLike, Terminator
 ]> {
   let summary = "arc.vectorized terminator";
-  let arguments = (ins IntOr1DVectorOfInt:$value);
+  let arguments = (ins AnyType:$value);
   let assemblyFormat = "operands attr-dict `:` qualified(type(operands))";
 }
 

@@ -10,10 +10,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/CFToHandshake.h"
-#include "../PassDetail.h"
 #include "circt/Dialect/Handshake/HandshakeOps.h"
 #include "circt/Dialect/Handshake/HandshakePasses.h"
+#include "circt/Dialect/Handshake/HandshakeUtils.h"
 #include "circt/Support/BackedgeBuilder.h"
+#include "circt/Transforms/Passes.h"
 #include "mlir/Analysis/CFGLoopInfo.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
@@ -44,6 +45,12 @@
 
 #include <list>
 #include <map>
+
+namespace circt {
+#define GEN_PASS_DEF_CFTOHANDSHAKE
+#define GEN_PASS_DEF_HANDSHAKEREMOVEBLOCK
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace mlir::func;
@@ -247,6 +254,12 @@ void handshake::removeBasicBlocks(Region &r) {
   }
 }
 
+LogicalResult
+HandshakeLowering::runSSAMaximization(ConversionPatternRewriter &rewriter,
+                                      Value entryCtrl) {
+  return maximizeSSA(entryCtrl, rewriter);
+}
+
 void removeBasicBlocks(handshake::FuncOp funcOp) {
   if (funcOp.isExternal())
     return; // nothing to do, external funcOp.
@@ -354,7 +367,7 @@ HandshakeLowering::insertMergeOps(HandshakeLowering::ValueMap &mergePairs,
     // thanks to prior SSA maximization
     for (auto &arg : block.getArguments()) {
       // No merges on memref block arguments; these are handled separately
-      if (arg.getType().isa<mlir::MemRefType>())
+      if (isa<mlir::MemRefType>(arg.getType()))
         continue;
 
       auto mergeInfo = insertMerge(&block, arg, edgeBuilder, rewriter);
@@ -376,7 +389,7 @@ static Value getMergeOperand(HandshakeLowering::MergeOpInfo mergeInfo,
   // The block terminator is either a cf-level branch or cf-level conditional
   // branch. In either case, identify the value passed to the block using its
   // index in the list of block arguments
-  unsigned index = srcVal.cast<BlockArgument>().getArgNumber();
+  unsigned index = cast<BlockArgument>(srcVal).getArgNumber();
   Operation *termOp = predBlock->getTerminator();
   if (mlir::cf::CondBranchOp br = dyn_cast<mlir::cf::CondBranchOp>(termOp)) {
     // Block should be one of the two destinations of the conditional branch
@@ -692,7 +705,7 @@ BufferOp FeedForwardNetworkRewriter::buildSplitNetwork(
              std::back_inserter(branches));
 
   auto *findRes = llvm::find_if(branches, [](auto br) {
-    return br.getDataOperand().getType().template isa<NoneType>();
+    return llvm::isa<NoneType>(br.getDataOperand().getType());
   });
 
   assert(findRes && "expected one branch for the ctrl signal");
@@ -1205,7 +1218,7 @@ struct BlockControlTerm {
   BlockControlTerm(Operation *op, Value ctrlOperand)
       : op(op), ctrlOperand(ctrlOperand) {
     assert(op && ctrlOperand);
-    assert(ctrlOperand.getType().isa<NoneType>() &&
+    assert(isa<NoneType>(ctrlOperand.getType()) &&
            "Control operand must be a NoneType");
   }
 
@@ -1508,10 +1521,10 @@ HandshakeLowering::connectToMemory(ConversionPatternRewriter &rewriter,
 
     // A memory is external if the memref that defines it is provided as a
     // function (block) argument.
-    bool isExternalMemory = memrefOperand.isa<BlockArgument>();
+    bool isExternalMemory = isa<BlockArgument>(memrefOperand);
 
     mlir::MemRefType memrefType =
-        memrefOperand.getType().cast<mlir::MemRefType>();
+        cast<mlir::MemRefType>(memrefOperand.getType());
     if (failed(isValidMemrefType(memrefOperand.getLoc(), memrefType)))
       return failure();
 
@@ -1643,7 +1656,7 @@ namespace {
 class HandshakeLoweringSSAStrategy : public SSAMaximizationStrategy {
   /// Filters out block arguments of type MemRefType
   bool maximizeArgument(BlockArgument arg) override {
-    return !arg.getType().isa<mlir::MemRefType>();
+    return !isa<mlir::MemRefType>(arg.getType());
   }
 
   /// Filters out allocation operations
@@ -1727,11 +1740,12 @@ static LogicalResult lowerFuncOp(func::FuncOp funcOp, MLIRContext *ctx,
 namespace {
 
 struct HandshakeRemoveBlockPass
-    : HandshakeRemoveBlockBase<HandshakeRemoveBlockPass> {
+    : circt::impl::HandshakeRemoveBlockBase<HandshakeRemoveBlockPass> {
   void runOnOperation() override { removeBasicBlocks(getOperation()); }
 };
 
-struct CFToHandshakePass : public CFToHandshakeBase<CFToHandshakePass> {
+struct CFToHandshakePass
+    : public circt::impl::CFToHandshakeBase<CFToHandshakePass> {
   CFToHandshakePass(bool sourceConstants, bool disableTaskPipelining) {
     this->sourceConstants = sourceConstants;
     this->disableTaskPipelining = disableTaskPipelining;

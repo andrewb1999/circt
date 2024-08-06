@@ -14,22 +14,29 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
 #include "circt/Support/LoweringOptions.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Pass/Pass.h"
+
+namespace circt {
+namespace sv {
+#define GEN_PASS_DEF_HWLEGALIZEMODULES
+#include "circt/Dialect/SV/SVPasses.h.inc"
+} // namespace sv
+} // namespace circt
 
 using namespace circt;
-
 //===----------------------------------------------------------------------===//
 // HWLegalizeModulesPass
 //===----------------------------------------------------------------------===//
 
 namespace {
 struct HWLegalizeModulesPass
-    : public sv::HWLegalizeModulesBase<HWLegalizeModulesPass> {
+    : public circt::sv::impl::HWLegalizeModulesBase<HWLegalizeModulesPass> {
   void runOnOperation() override;
 
 private:
@@ -70,7 +77,7 @@ bool HWLegalizeModulesPass::tryLoweringPackedArrayOp(Operation &op) {
                 builder.create<hw::ConstantOp>(constOp.getLoc(), intAttr));
           else
             inputs.push_back(builder.create<hw::AggregateConstantOp>(
-                constOp.getLoc(), constOp.getType(), field.cast<ArrayAttr>()));
+                constOp.getLoc(), constOp.getType(), cast<ArrayAttr>(field)));
         }
         if (!processUsers(op, constOp.getResult(), inputs))
           return false;
@@ -256,7 +263,7 @@ Value HWLegalizeModulesPass::lowerLookupToCasez(Operation &op, Value input,
                                            builder.getStringAttr("casez_tmp"));
   builder.setInsertionPoint(&op);
 
-  auto loc = input.getDefiningOp()->getLoc();
+  auto loc = input.getLoc();
   // A casez is a procedural operation, so if we're in a
   // non-procedural region we need to inject an always_comb
   // block.
@@ -378,7 +385,7 @@ void HWLegalizeModulesPass::processPostOrder(Block &body) {
       // Otherwise, if the IR produces a packed array and we aren't allowing
       // multi-dimensional arrays, reject the IR as invalid.
       for (auto value : op.getResults()) {
-        if (value.getType().isa<hw::ArrayType>()) {
+        if (isa<hw::ArrayType>(value.getType())) {
           op.emitError("unsupported packed array expression");
           signalPassFailure();
         }

@@ -49,6 +49,23 @@ void FileOp::build(OpBuilder &builder, OperationState &result,
 }
 
 //===----------------------------------------------------------------------===//
+// FragmentOp
+//===----------------------------------------------------------------------===//
+
+void FragmentOp::build(OpBuilder &builder, OperationState &result,
+                       StringAttr symName,
+                       llvm::function_ref<void()> bodyCtor) {
+  OpBuilder::InsertionGuard guard(builder);
+
+  auto &props = result.getOrAddProperties<Properties>();
+  props.sym_name = symName;
+
+  builder.createBlock(result.addRegion());
+  if (bodyCtor)
+    bodyCtor();
+}
+
+//===----------------------------------------------------------------------===//
 // RefOp
 //===----------------------------------------------------------------------===//
 
@@ -57,7 +74,7 @@ LogicalResult RefOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   auto *op = symbolTable.lookupNearestSymbolFrom(getOperation(), target);
   if (!op)
     return emitError("invalid symbol reference: ") << target;
-  if (!op->hasTrait<emit::Emittable>())
+  if (!isa<emit::Emittable>(op))
     return emitError("does not target an emittable op: ") << target;
   return success();
 }
@@ -69,7 +86,7 @@ LogicalResult RefOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
 LogicalResult FileListOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   for (auto sym : getFiles()) {
     Operation *op = symbolTable.lookupNearestSymbolFrom(
-        getOperation(), sym.cast<FlatSymbolRefAttr>());
+        getOperation(), cast<FlatSymbolRefAttr>(sym));
     if (!op)
       return emitError("invalid symbol reference: ") << sym;
 

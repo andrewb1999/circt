@@ -481,17 +481,20 @@ Example:
 | class      | string | `sifive.enterprise.firrtl.FullAsyncResetAnnotation` |
 | target     | string | Reference target                                    |
 
-Indicates that all reset-less registers which are children of the target will
-have an asynchronous reset attached, with a reset value of 0.
 
-A module targeted by this annotation is not allowed to reside in multiple
+The target must be a signal that is or is inferred to be an asynchronous reset.
+
+Indicates that all reset-less registers which are children of the module containing
+the target will have the asynchronous reset targeted attached, with a reset value of 0.
+
+The module containing the target of this annotation is not allowed to reside in multiple
 hierarchies.
 
 Example:
 ```json
 {
   "class": "sifive.enterprise.firrtl.FullAsyncResetAnnotation",
-  "target": "~Foo|Bar/d:Baz"
+  "target": "~Foo|Bar/d:Baz>reset"
 }
 ```
 
@@ -838,39 +841,6 @@ Example:
 }
 ```
 
-### ScalaClassAnnotation
-
-| Property   | Type   | Description                                     |
-| ---------- | ------ | -------------                                   |
-| class      | string | `sifive.enterprise.firrtl.ScalaClassAnnotation` |
-| target     | string | Reference target                                |
-| className  | string | The corresponding class name                    |
-
-This annotation records the name of the Java or Scala class which corresponds
-to the module.
-
-Example:
-```json
-{
-  "class":"sifive.enterprise.firrtl.ScalaClassAnnotation",
-  "target":"Top.ClockGroupAggregator",
-  "className":"freechips.rocketchip.prci.ClockGroupAggregator"
-}
-```
-
-### circt.Intrinsic
-
-| Property   | Type   | Description       |
-| ---------- | ------ | -------------     |
-| class      | string | `circt.Intrinsic` |
-| target     | string | Reference target  |
-| intrinsic  | string | Name of Intrinsic |
-
-Used to indicate an external module is really an intrinsic module.  This exists
-to allow a frontend to generate intrinsics without FIRRTL language support for
-intrinsics.  It is expected this will be deprecated as soon as the FIRRTL language
-supports intrinsics.  This annotation can only be local and applied to a module.
-
 ### SitestBlackBoxAnnotation
 
 | Property   | Type   | Description                                         |
@@ -908,32 +878,6 @@ Example:
 {
   "class":"sifive.enterprise.firrtl.SitestTestHarnessBlackBoxAnnotation",
   "filename":"./testharness_blackboxes.json"
-}
-```
-
-### SubCircuitsTargetDirectory
-
-| Property   | Type   | Description                                                        |
-| ---------- | ------ | -------------                                                      |
-| class      | string | `sifive.enterprise.grandcentral.phases.SubCircuitsTargetDirectory` |
-| dir        | string | The sub-circuit output directory                                   |
-
-This annotation is used to indicate the directory to serialize sub-circuits to
-by GrandCentral. Sub-circuits will be put in subdirectories of `dir`, named by
-their `circuitPackage` field.
-
-In the Scala FIRRTL compiler this is attached to the circuit with the
-commandline option `sub-circuits-target-dir`.
-```
--sub-circuit-targets-dir <dir>
--sctd <dir>
-```
-
-Example:
-```json
-{
-  "class":"sifive.enterprise.grandcentral.phases.SubCircuitsTargetDirectory",
-  "dir":"verilog/verif.subcircuits"
 }
 ```
 
@@ -1511,6 +1455,26 @@ Example:
     "GCTMemTap.MemTap.mem[1]"
   ],
   "source":"~GCTMemTap|GCTMemTap>mem"
+}
+```
+
+### OutputDirAnnotation
+
+| Property   | Type   | Description                             |
+| ---------- | ------ | --------------------------------------- |
+| class      | string | `circt.OutputDirAnnotation`             |
+| dirname    | string | The output directory                    |
+| target     | string | Reference target                        |
+
+Specify the output directory for a module. The target must be a public module,
+and must be local.
+
+Example:
+```json
+{
+  "class": "circt.OutputDirAnnotation",
+  "dirname": "verification",
+  "target": "~Foo|Bar"
 }
 ```
 

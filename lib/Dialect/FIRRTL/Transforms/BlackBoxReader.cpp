@@ -13,11 +13,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/HW/HWAttributes.h"
@@ -25,6 +25,7 @@
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Support/Path.h"
 #include "mlir/IR/Attributes.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Support/FileUtilities.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
@@ -34,6 +35,13 @@
 #include "llvm/Support/Path.h"
 
 #define DEBUG_TYPE "firrtl-blackbox-reader"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_BLACKBOXREADER
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -89,7 +97,8 @@ struct OutputFileInfo {
   bool excludeFromFileList;
 };
 
-struct BlackBoxReaderPass : public BlackBoxReaderBase<BlackBoxReaderPass> {
+struct BlackBoxReaderPass
+    : public circt::firrtl::impl::BlackBoxReaderBase<BlackBoxReaderPass> {
   void runOnOperation() override;
   bool runOnAnnotation(Operation *op, Annotation anno, OpBuilder &builder,
                        bool isCover, AnnotationInfo &annotationInfo);
@@ -398,8 +407,6 @@ StringAttr BlackBoxReaderPass::loadFile(Operation *op, StringRef inputPath,
 OutputFileInfo BlackBoxReaderPass::getOutputFile(Operation *origOp,
                                                  StringAttr fileNameAttr,
                                                  bool isCover) {
-  // If the original operation has a specified output file that is not a
-  // directory, then just use that.
   auto outputFile = origOp->getAttrOfType<hw::OutputFileAttr>("output_file");
   if (outputFile && !outputFile.isDirectory()) {
     return {outputFile.getFilename(), Priority::TargetDir,
@@ -413,16 +420,18 @@ OutputFileInfo BlackBoxReaderPass::getOutputFile(Operation *origOp,
   auto ext = llvm::sys::path::extension(fileName);
   bool exclude = (ext == ".h" || ext == ".vh" || ext == ".svh");
   auto outDir = std::make_pair(targetDir, Priority::TargetDir);
+  // If the original operation has a specified output file that is not a
+  // directory, then just use that.
+  if (outputFile)
+    outDir = {outputFile.getFilename(), Priority::Explicit};
   // In order to output into the testbench directory, we need to have a
   // testbench dir annotation, not have a blackbox target directory annotation
   // (or one set to the current directory), have a DUT annotation, and the
   // module needs to be in or under the DUT.
-  if (!testBenchDir.empty() && targetDir.equals(".") && dut && !isDut(origOp))
+  else if (!testBenchDir.empty() && targetDir == "." && dut && !isDut(origOp))
     outDir = {testBenchDir, Priority::TestBench};
   else if (isCover)
     outDir = {coverDir, Priority::Verification};
-  else if (outputFile)
-    outDir = {outputFile.getFilename(), Priority::Explicit};
 
   // If targetDir is not set explicitly and this is a testbench module, then
   // update the targetDir to be the "../testbench".
@@ -438,9 +447,8 @@ bool BlackBoxReaderPass::isDut(Operation *module) {
   auto iter = dutModuleMap.find(module);
   if (iter != dutModuleMap.end())
     return iter->getSecond();
-  AnnotationSet annos(module);
   // Any module with the dutAnno, is the DUT.
-  if (annos.hasAnnotation(dutAnnoClass)) {
+  if (AnnotationSet::hasAnnotation(module, dutAnnoClass)) {
     dutModuleMap[module] = true;
     return true;
   }
@@ -448,6 +456,8 @@ bool BlackBoxReaderPass::isDut(Operation *module) {
   bool anyParentIsDut = false;
   if (node)
     for (auto *u : node->uses()) {
+      if (cast<InstanceOp>(u->getInstance().getOperation()).getLowerToBind())
+        return false;
       // Recursively check the parents.
       auto dut = isDut(u->getInstance()->getParentOfType<FModuleOp>());
       // Cache the result.

@@ -7,18 +7,24 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/FSMToSV.h"
-#include "../PassDetail.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/FSM/FSMOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 #include <memory>
 #include <variant>
+
+namespace circt {
+#define GEN_PASS_DEF_CONVERTFSMTOSV
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
@@ -212,8 +218,9 @@ void StateEncoding::setEncoding(StateOp state, Value v, bool wire) {
 class MachineOpConverter {
 public:
   MachineOpConverter(OpBuilder &builder, hw::TypeScopeOp typeScope,
-                     MachineOp machineOp)
-      : machineOp(machineOp), typeScope(typeScope), b(builder) {}
+                     MachineOp machineOp, FlatSymbolRefAttr headerName)
+      : machineOp(machineOp), typeScope(typeScope), b(builder),
+        headerName(headerName) {}
 
   // Converts the machine op to a hardware module.
   // 1. Creates a HWModuleOp for the machine op, with the same I/O as the FSM +
@@ -310,7 +317,6 @@ private:
 
   // A handle to the MachineOp being converted.
   MachineOp machineOp;
-
   // A handle to the HW ModuleOp being created.
   hw::HWModuleOp hwModuleOp;
 
@@ -321,6 +327,9 @@ private:
   hw::TypeScopeOp typeScope;
 
   OpBuilder &b;
+
+  // The name of the header which contains the type scope for the machine.
+  FlatSymbolRefAttr headerName;
 };
 
 FailureOr<Operation *>
@@ -412,6 +421,8 @@ LogicalResult MachineOpConverter::dispatch() {
   SmallVector<hw::PortInfo, 16> ports;
   auto clkRstIdxs = getMachinePortInfo(ports, machineOp, b);
   hwModuleOp = b.create<hw::HWModuleOp>(loc, machineOp.getSymNameAttr(), ports);
+  hwModuleOp->setAttr(emit::getFragmentsAttrName(),
+                      b.getArrayAttr({headerName}));
   b.setInsertionPointToStart(hwModuleOp.getBodyBlock());
 
   // Replace all uses of the machine arguments with the arguments of the
@@ -441,7 +452,7 @@ LogicalResult MachineOpConverter::dispatch() {
 
   llvm::DenseMap<VariableOp, sv::RegOp> variableNextStateWires;
   for (auto variableOp : machineOp.front().getOps<fsm::VariableOp>()) {
-    auto initValueAttr = variableOp.getInitValueAttr().dyn_cast<IntegerAttr>();
+    auto initValueAttr = dyn_cast<IntegerAttr>(variableOp.getInitValueAttr());
     if (!initValueAttr)
       return variableOp.emitOpError() << "expected an integer attribute "
                                          "for the initial value.";
@@ -665,32 +676,43 @@ MachineOpConverter::convertState(StateOp state) {
   return res;
 }
 
-struct FSMToSVPass : public ConvertFSMToSVBase<FSMToSVPass> {
+struct FSMToSVPass : public circt::impl::ConvertFSMToSVBase<FSMToSVPass> {
   void runOnOperation() override;
 };
 
 void FSMToSVPass::runOnOperation() {
   auto module = getOperation();
+  auto loc = module.getLoc();
   auto b = OpBuilder(module);
-  SmallVector<Operation *, 16> opToErase;
+
+  // Identify the machines to lower, bail out if none exist.
+  auto machineOps = llvm::to_vector(module.getOps<MachineOp>());
+  if (machineOps.empty()) {
+    markAllAnalysesPreserved();
+    return;
+  }
 
   // Create a typescope shared by all of the FSMs. This typescope will be
   // emitted in a single separate file to avoid polluting each output file with
   // typedefs.
-  StringAttr typeScopeFilename = b.getStringAttr("fsm_enum_typedefs.sv");
   b.setInsertionPointToStart(module.getBody());
-  auto typeScope = b.create<hw::TypeScopeOp>(
-      module.getLoc(), b.getStringAttr("fsm_enum_typedecls"));
+  hw::TypeScopeOp typeScope =
+      b.create<hw::TypeScopeOp>(loc, b.getStringAttr("fsm_enum_typedecls"));
   typeScope.getBodyRegion().push_back(new Block());
-  typeScope->setAttr(
-      "output_file",
-      hw::OutputFileAttr::get(typeScopeFilename,
-                              /*excludeFromFileList*/ b.getBoolAttr(false),
-                              /*includeReplicatedOps*/ b.getBoolAttr(false)));
+
+  auto file = b.create<emit::FileOp>(loc, "fsm_enum_typedefs.sv", [&] {
+    b.create<emit::RefOp>(loc,
+                          FlatSymbolRefAttr::get(typeScope.getSymNameAttr()));
+  });
+  auto fragment = b.create<emit::FragmentOp>(loc, "FSM_ENUM_TYPEDEFS", [&] {
+    b.create<sv::VerbatimOp>(loc, "`include \"" + file.getFileName() + "\"");
+  });
+
+  auto headerName = FlatSymbolRefAttr::get(fragment.getSymNameAttr());
 
   // Traverse all machines and convert.
-  for (auto machine : llvm::make_early_inc_range(module.getOps<MachineOp>())) {
-    MachineOpConverter converter(b, typeScope, machine);
+  for (auto machineOp : machineOps) {
+    MachineOpConverter converter(b, typeScope, machineOp, headerName);
 
     if (failed(converter.dispatch())) {
       signalPassFailure();
@@ -718,16 +740,7 @@ void FSMToSVPass::runOnOperation() {
     instance.erase();
   }
 
-  if (typeScope.getBodyBlock()->empty()) {
-    // If the typescope is empty (no FSMs were converted), erase it.
-    typeScope.erase();
-  } else {
-    // Else, add an include file to the top-level (will include typescope
-    // in all files).
-    b.setInsertionPointToStart(module.getBody());
-    b.create<sv::VerbatimOp>(
-        module.getLoc(), "`include \"" + typeScopeFilename.getValue() + "\"");
-  }
+  assert(!typeScope.getBodyBlock()->empty() && "missing type decls");
 }
 
 } // end anonymous namespace

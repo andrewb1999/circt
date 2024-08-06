@@ -6,7 +6,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "../PassDetail.h"
 #include "circt/Conversion/ArcToLLVM.h"
 #include "circt/Conversion/CombToLLVM.h"
 #include "circt/Conversion/HWToLLVM.h"
@@ -29,10 +28,16 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinDialect.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "lower-arc-to-llvm"
+
+namespace circt {
+#define GEN_PASS_DEF_LOWERARCTOLLVM
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
@@ -182,7 +187,7 @@ static MemoryAccess prepareMemoryAccess(Location loc, Value memory,
                                         Value address, MemoryType type,
                                         ConversionPatternRewriter &rewriter) {
   auto zextAddrType = rewriter.getIntegerType(
-      address.getType().cast<IntegerType>().getWidth() + 1);
+      cast<IntegerType>(address.getType()).getWidth() + 1);
   Value addr = rewriter.create<LLVM::ZExtOp>(loc, zextAddrType, address);
   Value addrLimit = rewriter.create<LLVM::ConstantOp>(
       loc, zextAddrType, rewriter.getI32IntegerAttr(type.getNumWords()));
@@ -200,7 +205,7 @@ struct MemoryReadOpLowering : public OpConversionPattern<arc::MemoryReadOp> {
   matchAndRewrite(arc::MemoryReadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
     auto type = typeConverter->convertType(op.getType());
-    auto memoryType = op.getMemory().getType().cast<MemoryType>();
+    auto memoryType = cast<MemoryType>(op.getMemory().getType());
     auto access =
         prepareMemoryAccess(op.getLoc(), adaptor.getMemory(),
                             adaptor.getAddress(), memoryType, rewriter);
@@ -230,7 +235,7 @@ struct MemoryWriteOpLowering : public OpConversionPattern<arc::MemoryWriteOp> {
                   ConversionPatternRewriter &rewriter) const final {
     auto access = prepareMemoryAccess(
         op.getLoc(), adaptor.getMemory(), adaptor.getAddress(),
-        op.getMemory().getType().cast<MemoryType>(), rewriter);
+        cast<MemoryType>(op.getMemory().getType()), rewriter);
     auto enable = access.withinBounds;
     if (adaptor.getEnable())
       enable = rewriter.create<LLVM::AndOp>(op.getLoc(), adaptor.getEnable(),
@@ -355,6 +360,8 @@ struct SimInstantiateOpLowering
 
     ConversionPatternRewriter::InsertionGuard guard(rewriter);
 
+    // FIXME: like the rest of MLIR, this assumes sizeof(intptr_t) ==
+    // sizeof(size_t) on the target architecture.
     Type convertedIndex = typeConverter->convertType(rewriter.getIndexType());
 
     LLVM::LLVMFuncOp mallocFunc =
@@ -460,8 +467,9 @@ struct SimStepOpLowering : public ModelAwarePattern<arc::SimStepOp> {
   }
 };
 
-/// Lowers SimEmitValueOp to a printf call. This pattern will mutate the global
-/// module.
+/// Lowers SimEmitValueOp to a printf call. The integer will be printed in its
+/// entirety if it is of size up to size_t, and explicitly truncated otherwise.
+/// This pattern will mutate the global module.
 struct SimEmitValueOpLowering
     : public OpConversionPattern<arc::SimEmitValueOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -475,19 +483,38 @@ struct SimEmitValueOpLowering
 
     Location loc = op.getLoc();
 
-    Value toPrint = rewriter.create<LLVM::IntToPtrOp>(
-        loc, LLVM::LLVMPointerType::get(getContext()), adaptor.getValue());
-
     ModuleOp moduleOp = op->getParentOfType<ModuleOp>();
     if (!moduleOp)
       return failure();
 
+    // Cast the value to a size_t.
+    // FIXME: like the rest of MLIR, this assumes sizeof(intptr_t) ==
+    // sizeof(size_t) on the target architecture.
+    Value toPrint = adaptor.getValue();
+    DataLayout layout = DataLayout::closest(op);
+    llvm::TypeSize sizeOfSizeT =
+        layout.getTypeSizeInBits(rewriter.getIndexType());
+    assert(!sizeOfSizeT.isScalable() &&
+           sizeOfSizeT.getFixedValue() <= std::numeric_limits<unsigned>::max());
+    bool truncated = false;
+    if (valueType.getWidth() > sizeOfSizeT) {
+      toPrint = rewriter.create<LLVM::TruncOp>(
+          loc, IntegerType::get(getContext(), sizeOfSizeT.getFixedValue()),
+          toPrint);
+      truncated = true;
+    } else if (valueType.getWidth() < sizeOfSizeT)
+      toPrint = rewriter.create<LLVM::ZExtOp>(
+          loc, IntegerType::get(getContext(), sizeOfSizeT.getFixedValue()),
+          toPrint);
+
+    // Lookup of create printf function symbol.
     auto printfFunc = LLVM::lookupOrCreateFn(
         moduleOp, "printf", LLVM::LLVMPointerType::get(getContext()),
         LLVM::LLVMVoidType::get(getContext()), true);
 
     // Insert the format string if not already available.
     SmallString<16> formatStrName{"_arc_sim_emit_"};
+    formatStrName.append(truncated ? "trunc_" : "full_");
     formatStrName.append(adaptor.getValueName());
     LLVM::GlobalOp formatStrGlobal;
     if (!(formatStrGlobal =
@@ -495,7 +522,10 @@ struct SimEmitValueOpLowering
       ConversionPatternRewriter::InsertionGuard insertGuard(rewriter);
 
       SmallString<16> formatStr = adaptor.getValueName();
-      formatStr.append(" = %0.8p\n");
+      formatStr.append(" = ");
+      if (truncated)
+        formatStr.append("(truncated) ");
+      formatStr.append("%zx\n");
       SmallVector<char> formatStrVec{formatStr.begin(), formatStr.end()};
       formatStrVec.push_back(0);
 
@@ -524,7 +554,8 @@ struct SimEmitValueOpLowering
 //===----------------------------------------------------------------------===//
 
 namespace {
-struct LowerArcToLLVMPass : public LowerArcToLLVMBase<LowerArcToLLVMPass> {
+struct LowerArcToLLVMPass
+    : public circt::impl::LowerArcToLLVMBase<LowerArcToLLVMPass> {
   void runOnOperation() override;
 };
 } // namespace

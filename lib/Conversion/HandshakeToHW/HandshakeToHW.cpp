@@ -11,13 +11,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/HandshakeToHW.h"
-#include "../PassDetail.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/ESI/ESIOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/Handshake/HandshakeOps.h"
 #include "circt/Dialect/Handshake/HandshakePasses.h"
+#include "circt/Dialect/Handshake/HandshakeUtils.h"
 #include "circt/Dialect/Handshake/Visitor.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
@@ -25,11 +25,17 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
 #include <optional>
+
+namespace circt {
+#define GEN_PASS_DEF_HANDSHAKETOHW
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
@@ -102,7 +108,7 @@ static std::string getCallName(Operation *op) {
 /// assume that opType itself is the data-carrying type.
 static Type getOperandDataType(Value op) {
   auto opType = op.getType();
-  if (auto channelType = opType.dyn_cast<esi::ChannelType>())
+  if (auto channelType = dyn_cast<esi::ChannelType>(opType))
     return channelType.getInner();
   return opType;
 }
@@ -111,7 +117,7 @@ static Type getOperandDataType(Value op) {
 static SmallVector<Type> filterNoneTypes(ArrayRef<Type> input) {
   SmallVector<Type> filterRes;
   llvm::copy_if(input, std::back_inserter(filterRes),
-                [](Type type) { return !type.isa<NoneType>(); });
+                [](Type type) { return !isa<NoneType>(type); });
   return filterRes;
 }
 
@@ -145,17 +151,17 @@ static std::string getTypeName(Location loc, Type type) {
   std::string typeName;
   // Builtin types
   if (type.isIntOrIndex()) {
-    if (auto indexType = type.dyn_cast<IndexType>())
+    if (auto indexType = dyn_cast<IndexType>(type))
       typeName += "_ui" + std::to_string(indexType.kInternalStorageBitWidth);
     else if (type.isSignedInteger())
       typeName += "_si" + std::to_string(type.getIntOrFloatBitWidth());
     else
       typeName += "_ui" + std::to_string(type.getIntOrFloatBitWidth());
-  } else if (auto tupleType = type.dyn_cast<TupleType>()) {
+  } else if (auto tupleType = dyn_cast<TupleType>(type)) {
     typeName += "_tuple";
     for (auto elementType : tupleType.getTypes())
       typeName += getTypeName(loc, elementType);
-  } else if (auto structType = type.dyn_cast<hw::StructType>()) {
+  } else if (auto structType = dyn_cast<hw::StructType>(type)) {
     typeName += "_struct";
     for (auto element : structType.getElements())
       typeName += "_" + element.name.str() + getTypeName(loc, element.type);
@@ -174,7 +180,7 @@ static std::string getSubModuleName(Operation *oldOp) {
 
   // Add value of the constant operation.
   if (auto constOp = dyn_cast<handshake::ConstantOp>(oldOp)) {
-    if (auto intAttr = constOp.getValue().dyn_cast<IntegerAttr>()) {
+    if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
       auto intType = intAttr.getType();
 
       if (intType.isSignedInteger())
@@ -218,9 +224,9 @@ static std::string getSubModuleName(Operation *oldOp) {
     if (auto initValues = bufferOp.getInitValues()) {
       subModuleName += "_init";
       for (const Attribute e : *initValues) {
-        assert(e.isa<IntegerAttr>());
+        assert(isa<IntegerAttr>(e));
         subModuleName +=
-            "_" + std::to_string(e.dyn_cast<IntegerAttr>().getInt());
+            "_" + std::to_string(dyn_cast<IntegerAttr>(e).getInt());
       }
     }
   }
@@ -290,14 +296,13 @@ portToFieldInfo(llvm::ArrayRef<hw::PortInfo> portInfo) {
 // Convert any handshake.extmemory operations and the top-level I/O
 // associated with these.
 static LogicalResult convertExtMemoryOps(HWModuleOp mod) {
-  auto ports = mod.getPortList();
   auto *ctx = mod.getContext();
 
   // Gather memref ports to be converted.
   llvm::DenseMap<unsigned, Value> memrefPorts;
   for (auto [i, arg] : llvm::enumerate(mod.getBodyBlock()->getArguments())) {
-    auto channel = arg.getType().dyn_cast<esi::ChannelType>();
-    if (channel && channel.getInner().isa<MemRefType>())
+    auto channel = dyn_cast<esi::ChannelType>(arg.getType());
+    if (channel && isa<MemRefType>(channel.getInner()))
       memrefPorts[i] = arg;
   }
 
@@ -574,7 +579,7 @@ struct RTLBuilder {
 
   // Unpacks a hw.struct into a list of values.
   ValueRange unpack(Value value) {
-    auto structType = value.getType().cast<hw::StructType>();
+    auto structType = cast<hw::StructType>(value.getType());
     llvm::SmallVector<Type> innerTypes;
     structType.getInnerTypes(innerTypes);
     return b.create<hw::StructExplodeOp>(loc, innerTypes, value).getResults();
@@ -661,7 +666,7 @@ struct RTLBuilder {
     // Todo: clean up when handshake supports i0.
     auto dataType = inputs[0].getType();
     unsigned width =
-        dataType.isa<NoneType>() ? 0 : dataType.getIntOrFloatBitWidth();
+        isa<NoneType>(dataType) ? 0 : dataType.getIntOrFloatBitWidth();
     Value muxValue = constant(width, 0);
 
     // Iteratively chain together muxes from the high bit to the low bit.
@@ -1912,7 +1917,8 @@ static LogicalResult convertFuncOp(ESITypeConverter &typeConverter,
 }
 
 namespace {
-class HandshakeToHWPass : public HandshakeToHWBase<HandshakeToHWPass> {
+class HandshakeToHWPass
+    : public circt::impl::HandshakeToHWBase<HandshakeToHWPass> {
 public:
   void runOnOperation() override {
     mlir::ModuleOp mod = getOperation();

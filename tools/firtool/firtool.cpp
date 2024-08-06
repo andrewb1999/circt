@@ -34,6 +34,7 @@
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Sim/SimDialect.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
+#include "circt/Dialect/Verif/VerifPasses.h"
 #include "circt/Support/LoweringOptions.h"
 #include "circt/Support/LoweringOptionsParser.h"
 #include "circt/Support/Passes.h"
@@ -128,6 +129,11 @@ static cl::opt<bool>
                            cl::init(true), cl::cat(mainCategory));
 
 static cl::opt<bool>
+    scalarizeIntModules("scalarize-internal-modules",
+                        cl::desc("Scalarize the ports of any internal modules"),
+                        cl::init(false), cl::cat(mainCategory));
+
+static cl::opt<bool>
     scalarizeExtModules("scalarize-ext-modules",
                         cl::desc("Scalarize the ports of any external modules"),
                         cl::init(true), cl::cat(mainCategory));
@@ -167,6 +173,7 @@ enum OutputFormatKind {
   OutputIRSV,
   OutputIRVerilog,
   OutputVerilog,
+  OutputBTOR2,
   OutputSplitVerilog,
   OutputDisabled
 };
@@ -183,6 +190,7 @@ static cl::opt<OutputFormatKind> outputFormat(
         clEnumValN(OutputIRVerilog, "ir-verilog",
                    "Emit IR after Verilog lowering"),
         clEnumValN(OutputVerilog, "verilog", "Emit Verilog"),
+        clEnumValN(OutputBTOR2, "btor2", "Emit BTOR2"),
         clEnumValN(OutputSplitVerilog, "split-verilog",
                    "Emit Verilog (one file per module; specify "
                    "directory with -o=<dir>)"),
@@ -247,6 +255,29 @@ static cl::opt<bool>
                           cl::init(false), cl::cat(mainCategory));
 
 static LoweringOptionsOption loweringOptions(mainCategory);
+
+static cl::list<std::string>
+    enableLayers("enable-layers", cl::desc("enable these layers permanently"),
+                 cl::value_desc("layer-list"), cl::MiscFlags::CommaSeparated,
+                 cl::cat(mainCategory));
+
+static cl::list<std::string>
+    disableLayers("disable-layers",
+                  cl::desc("disable these layers permanently"),
+                  cl::value_desc("layer-list"), cl::MiscFlags::CommaSeparated,
+                  cl::cat(mainCategory));
+
+enum class LayerSpecializationOpt { None, Enable, Disable };
+static llvm::cl::opt<LayerSpecializationOpt> defaultLayerSpecialization{
+    "default-layer-specialization",
+    llvm::cl::desc("The default specialization for layers"),
+    llvm::cl::values(
+        clEnumValN(LayerSpecializationOpt::None, "none", "Layers are disabled"),
+        clEnumValN(LayerSpecializationOpt::Disable, "disable",
+                   "Layers are disabled"),
+        clEnumValN(LayerSpecializationOpt::Enable, "enable",
+                   "Layers are enabled")),
+    cl::init(LayerSpecializationOpt::None), cl::cat(mainCategory)};
 
 /// Check output stream before writing bytecode to it.
 /// Warn and return true if output is known to be displayed.
@@ -348,7 +379,23 @@ static LogicalResult processBuffer(
     options.infoLocatorHandling = infoLocHandling;
     options.numAnnotationFiles = numAnnotationFiles;
     options.scalarizePublicModules = scalarizePublicModules;
+    options.scalarizeInternalModules = scalarizeIntModules;
     options.scalarizeExtModules = scalarizeExtModules;
+    options.enableLayers = enableLayers;
+    options.disableLayers = disableLayers;
+
+    switch (defaultLayerSpecialization) {
+    case LayerSpecializationOpt::None:
+      options.defaultLayerSpecialization = std::nullopt;
+      break;
+    case LayerSpecializationOpt::Enable:
+      options.defaultLayerSpecialization = firrtl::LayerSpecialization::Enable;
+      break;
+    case LayerSpecializationOpt::Disable:
+      options.defaultLayerSpecialization = firrtl::LayerSpecialization::Disable;
+      break;
+    }
+
     module = importFIRFile(sourceMgr, &context, parserTimer, options);
   } else {
     auto parserTimer = ts.nest("MLIR Parser");
@@ -401,12 +448,18 @@ static LogicalResult processBuffer(
     if (failed(parsePassPipeline(StringRef(lowFIRRTLPassPlugin), pm)))
       return failure();
 
-  // Lower if we are going to verilog or if lowering was specifically requested.
+  // Lower if we are going to verilog or if lowering was specifically
+  // requested.
   if (outputFormat != OutputIRFir) {
     if (failed(firtool::populateLowFIRRTLToHW(pm, firtoolOptions)))
       return failure();
     if (!hwPassPlugin.empty())
       if (failed(parsePassPipeline(StringRef(hwPassPlugin), pm)))
+        return failure();
+    // Add passes specific to btor2 emission
+    if (outputFormat == OutputBTOR2)
+      if (failed(firtool::populateHWToBTOR2(pm, firtoolOptions,
+                                            (*outputFile)->os())))
         return failure();
     if (outputFormat != OutputIRHW)
       if (failed(firtool::populateHWToSV(pm, firtoolOptions)))
@@ -696,6 +749,8 @@ int main(int argc, char **argv) {
     firrtl::registerPasses();
     om::registerPasses();
     sv::registerPasses();
+    hw::registerFlattenModulesPass();
+    verif::registerVerifyClockedAssertLikePass();
 
     // Export passes:
     registerExportChiselInterfacePass();
@@ -711,6 +766,8 @@ int main(int argc, char **argv) {
     registerLowerSeqToSVPass();
     registerLowerSimToSVPass();
     registerLowerVerifToSVPass();
+    registerLowerLTLToCorePass();
+    registerConvertHWToBTOR2Pass();
   }
 
   // Register any pass manager command line options.

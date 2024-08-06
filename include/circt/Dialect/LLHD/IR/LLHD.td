@@ -13,6 +13,7 @@
 #ifndef CIRCT_DIALECT_LLHD_IR_LLHD
 #define CIRCT_DIALECT_LLHD_IR_LLHD
 
+include "circt/Dialect/HW/HWTypes.td"
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/OpBase.td"
 include "mlir/IR/PatternBase.td"
@@ -30,6 +31,7 @@ include "mlir/IR/SymbolInterfaces.td"
 def LLHD_Dialect : Dialect {
   let name = "llhd";
   let cppNamespace = "::circt::llhd";
+  let dependentDialects = ["circt::hw::HWDialect"];
 
   let description = [{
     A low-level hardware description dialect in MLIR.
@@ -64,32 +66,21 @@ include "LLHDTypesImpl.td"
 
 // LLHD Time Type
 def LLHD_TimeType : DialectType<LLHD_Dialect,
-    CPred<"$_self.isa<TimeType>()">, "LLHD time type", "TimeType">,
+    CPred<"llvm::isa<TimeType>($_self)">, "LLHD time type", "TimeType">,
     BuildableType<"TimeType::get($_builder.getContext())">;
 
 // Legal underlying types for signals and pointers.
-def LLHD_AnyUnderlyingType :
+def LLHD_AnyElementType :
   AnyTypeOf<[HWIntegerType, ArrayType, StructType]>;
-
-// LLHD sig type
-class LLHD_SigType<list<Type> allowedTypes>
-  : ContainerType<AnyTypeOf<allowedTypes>, CPred<"$_self.isa<SigType>()">,
-    "$_self.cast<SigType>().getUnderlyingType()", "LLHD sig type">;
-
-def LLHD_AnySigType : LLHD_SigType<[LLHD_AnyUnderlyingType]>;
 
 // LLHD ptr type
 class LLHD_PtrType<list<Type> allowedTypes>
-  : ContainerType<AnyTypeOf<allowedTypes>, CPred<"$_self.isa<PtrType>()">,
-    "$_self.cast<PtrType>().getUnderlyingType()", "LLHD pointer type">;
+  : ContainerType<AnyTypeOf<allowedTypes>, CPred<"llvm::isa<PtrType>($_self)">,
+    "llvm::cast<PtrType>($_self).getElementType()", "LLHD pointer type">;
 
-def LLHD_AnyPtrType : LLHD_PtrType<[LLHD_AnyUnderlyingType]>;
+def LLHD_AnyPtrType : LLHD_PtrType<[LLHD_AnyElementType]>;
 
-// LLHD sig or ptr type
-class LLHD_SigOrPtrType<list<Type> allowedTypes>
-  : AnyTypeOf<[LLHD_SigType<allowedTypes>, LLHD_PtrType<allowedTypes>]>;
-
-def LLHD_AnySigOrPtrType : LLHD_SigOrPtrType<[LLHD_AnyUnderlyingType]>;
+def LLHD_AnySigOrPtrType : AnyTypeOf<[LLHD_AnyPtrType, InOutType]>;
 
 //===----------------------------------------------------------------------===//
 // LLHD op definition

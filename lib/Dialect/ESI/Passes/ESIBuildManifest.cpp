@@ -8,7 +8,6 @@
 
 #include "../PassDetails.h"
 
-#include "circt/Dialect/ESI/APIUtilities.h"
 #include "circt/Dialect/ESI/AppID.h"
 #include "circt/Dialect/ESI/ESIOps.h"
 #include "circt/Dialect/ESI/ESIPasses.h"
@@ -20,12 +19,19 @@
 #include "llvm/Support/Compression.h"
 #include "llvm/Support/JSON.h"
 
+namespace circt {
+namespace esi {
+#define GEN_PASS_DEF_ESIBUILDMANIFEST
+#include "circt/Dialect/ESI/ESIPasses.h.inc"
+} // namespace esi
+} // namespace circt
+
 using namespace circt;
 using namespace esi;
 
 namespace {
 struct ESIBuildManifestPass
-    : public ESIBuildManifestBase<ESIBuildManifestPass> {
+    : public circt::esi::impl::ESIBuildManifestBase<ESIBuildManifestPass> {
   void runOnOperation() override;
 
 private:
@@ -321,7 +327,7 @@ llvm::json::Value ESIBuildManifestPass::json(Operation *errorOp, Type type) {
   o["circt_name"] = circtName;
 
   int64_t width = hw::getBitWidth(type);
-  if (auto chanType = type.dyn_cast<ChannelType>())
+  if (auto chanType = dyn_cast<ChannelType>(type))
     width = hw::getBitWidth(chanType.getInner());
   if (width >= 0)
     o["hw_bitwidth"] = width;

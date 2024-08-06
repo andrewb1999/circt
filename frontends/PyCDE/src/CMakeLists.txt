@@ -13,41 +13,40 @@ add_compile_definitions("MLIR_PYTHON_PACKAGE_PREFIX=pycde.circt.")
 declare_mlir_python_sources(PyCDESources
   ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
   SOURCES
-  __init__.py
-  types.py
-  dialects/__init__.py
-  dialects/msft.py
-  dialects/seq.py
-  dialects/hw.py
-  dialects/comb.py
-  dialects/sv.py
-  dialects/fsm.py
-  dialects/esi.py
-  dialects/hwarith.py
-  support.py
-  module.py
-  behavioral.py
-  constructs.py
-  common.py
-  system.py
-  devicedb.py
-  instance.py
-  signals.py
-  ndarray.py
-  esi.py
-  fsm.py
-  ibis.py
-  testing.py
+  pycde/__init__.py
+  pycde/types.py
+  pycde/dialects/__init__.py
+  pycde/dialects/msft.py
+  pycde/dialects/seq.py
+  pycde/dialects/hw.py
+  pycde/dialects/comb.py
+  pycde/dialects/sv.py
+  pycde/dialects/fsm.py
+  pycde/dialects/esi.py
+  pycde/dialects/hwarith.py
+  pycde/support.py
+  pycde/module.py
+  pycde/behavioral.py
+  pycde/constructs.py
+  pycde/common.py
+  pycde/system.py
+  pycde/devicedb.py
+  pycde/instance.py
+  pycde/signals.py
+  pycde/ndarray.py
+  pycde/esi.py
+  pycde/fsm.py
+  pycde/testing.py
 
-  bsp/__init__.py
-  bsp/common.py
-  bsp/cosim.py
-  bsp/xrt.py
-  bsp/Makefile.xrt.mk
-  bsp/xrt_package.tcl
-  bsp/xrt_api.py
-  bsp/xrt.ini
-  bsp/xsim.tcl
+  pycde/bsp/__init__.py
+  pycde/bsp/common.py
+  pycde/bsp/cosim.py
+  pycde/bsp/xrt.py
+  pycde/bsp/Makefile.xrt.mk
+  pycde/bsp/xrt_package.tcl
+  pycde/bsp/xrt_api.py
+  pycde/bsp/xrt.ini
+  pycde/bsp/xsim.tcl
 )
 
 ################################################################################
@@ -78,8 +77,8 @@ add_mlir_python_modules(PyCDE_CIRCTPythonModules
 )
 
 add_mlir_python_modules(PyCDE
-  ROOT_PREFIX "${PYCDE_PYTHON_PACKAGE_DIR}/pycde"
-  INSTALL_PREFIX "python_packages/pycde"
+  ROOT_PREFIX "${PYCDE_PYTHON_PACKAGE_DIR}/"
+  INSTALL_PREFIX "python_packages/"
   DECLARED_SOURCES
     PyCDESources
   COMMON_CAPI_LINK_LIBS
@@ -89,6 +88,20 @@ add_mlir_python_modules(PyCDE
 add_dependencies(PyCDE PyCDE_CIRCTPythonModules)
 add_dependencies(install-PyCDE install-PyCDE_CIRCTPythonModules)
 
+# Copy ESIPrimitives.sv to both the build and install directories.
+# TODO: this won't work if ESIPrimitives has multiple source files. Figure out
+# how to handle this.
+set(esiprims "$<TARGET_PROPERTY:ESIPrimitives,SOURCE_DIR>/$<TARGET_PROPERTY:ESIPrimitives,SOURCES>")
+add_custom_command(TARGET PyCDE POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          ${esiprims}
+          ${PYCDE_PYTHON_PACKAGE_DIR}/pycde
+)
+install(FILES ${esiprims}
+  DESTINATION python_packages/pycde
+  COMPONENT PyCDE
+)
+
 install(IMPORTED_RUNTIME_ARTIFACTS PyCDE_CIRCTPythonCAPI
   RUNTIME_DEPENDENCY_SET PyCDE_RUNTIME_DEPS
   DESTINATION python_packages/pycde/circt/_mlir_libs
@@ -97,6 +110,6 @@ install(IMPORTED_RUNTIME_ARTIFACTS PyCDE_CIRCTPythonCAPI
 install(RUNTIME_DEPENDENCY_SET PyCDE_RUNTIME_DEPS
   DESTINATION python_packages/pycde/circt/_mlir_libs
   PRE_EXCLUDE_REGEXES .*
-  PRE_INCLUDE_REGEXES capnp kj
+  PRE_INCLUDE_REGEXES zlib1
   COMPONENT PyCDE
 )

@@ -6,7 +6,9 @@ add_circt_library(CIRCTFirtool
   CIRCTExportVerilog
   CIRCTFIRRTLToHW
   CIRCTFIRRTLTransforms
+  CIRCTHWToBTOR2
   CIRCTHWTransforms
+  CIRCTLTLToCore
   CIRCTOMTransforms
   CIRCTSeqToSV
   CIRCTSimToSV
@@ -14,6 +16,7 @@ add_circt_library(CIRCTFirtool
   CIRCTSVTransforms
   CIRCTTransforms
   CIRCTVerifToSV
+  CIRCTVerifTransforms
 
   MLIRIR
   MLIRSupport

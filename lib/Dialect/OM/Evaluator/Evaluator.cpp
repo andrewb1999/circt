@@ -167,9 +167,12 @@ FailureOr<evaluator::EvaluatorValuePtr> circt::om::Evaluator::getOrCreateValue(
                           evaluator::PathValue::getEmptyPath(loc));
                   return success(result);
                 })
-                .Case<ListCreateOp, TupleCreateOp, MapCreateOp, ObjectFieldOp,
-                      ObjectOp>([&](auto op) {
-                  return getPartiallyEvaluatedValue(op.getType(), loc);
+                .Case<ListCreateOp, TupleCreateOp, MapCreateOp, ObjectFieldOp>(
+                    [&](auto op) {
+                      return getPartiallyEvaluatedValue(op.getType(), loc);
+                    })
+                .Case<ObjectOp>([&](auto op) {
+                  return getPartiallyEvaluatedValue(op.getType(), op.getLoc());
                 })
                 .Default([&](Operation *op) {
                   auto error = op->emitError("unable to evaluate value");
@@ -816,7 +819,7 @@ evaluator::PathValue evaluator::PathValue::getEmptyPath(Location loc) {
 StringAttr evaluator::PathValue::getAsString() const {
   // If the module is null, then this is a path to a deleted object.
   if (!targetKind)
-    return StringAttr::get(getContext(), "OMDeleted");
+    return StringAttr::get(getContext(), "OMDeleted:");
   SmallString<64> result;
   switch (targetKind.getValue()) {
   case TargetKind::DontTouch:

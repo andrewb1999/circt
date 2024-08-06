@@ -10,12 +10,19 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/Interop/InteropOps.h"
 #include "circt/Dialect/SystemC/SystemCOps.h"
 #include "circt/Dialect/SystemC/SystemCPasses.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+
+namespace circt {
+namespace systemc {
+#define GEN_PASS_DEF_SYSTEMCLOWERINSTANCEINTEROP
+#include "circt/Dialect/SystemC/Passes.h.inc"
+} // namespace systemc
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
@@ -104,8 +111,8 @@ private:
     Value state = updateOp.getBody()->getArguments().front();
     for (size_t i = 0; i < inputValues.size(); ++i) {
       Value member = updateBuilder.create<MemberAccessOp>(
-          loc, inputValues[i].getType(), state,
-          inputNames[i].cast<StringAttr>(), MemberAccessKind::Arrow);
+          loc, inputValues[i].getType(), state, cast<StringAttr>(inputNames[i]),
+          MemberAccessKind::Arrow);
       updateBuilder.create<AssignOp>(loc, member,
                                      updateOp.getBody()->getArgument(i + 1));
     }
@@ -125,7 +132,7 @@ private:
     for (size_t i = 0; i < resultValues.size(); ++i) {
       results.push_back(updateBuilder.create<MemberAccessOp>(
           loc, resultValues[i].getType(), state,
-          resultNames[i].cast<StringAttr>().getValue(),
+          cast<StringAttr>(resultNames[i]).getValue(),
           MemberAccessKind::Arrow));
     }
 
@@ -152,7 +159,8 @@ private:
 
 namespace {
 struct SystemCLowerInstanceInteropPass
-    : SystemCLowerInstanceInteropBase<SystemCLowerInstanceInteropPass> {
+    : circt::systemc::impl::SystemCLowerInstanceInteropBase<
+          SystemCLowerInstanceInteropPass> {
   void runOnOperation() override;
 };
 } // namespace

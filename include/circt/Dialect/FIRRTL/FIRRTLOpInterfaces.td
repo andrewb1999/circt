@@ -54,14 +54,14 @@ def FModuleLike : OpInterface<"FModuleLike", [Symbol, PortList, InstanceGraphMod
     //===------------------------------------------------------------------===//
 
     InterfaceMethod<"Get the port directions attribute",
-    "IntegerAttr", "getPortDirectionsAttr", (ins), [{}],
+    "mlir::DenseBoolArrayAttr", "getPortDirectionsAttr", (ins), [{}],
     /*defaultImplementation=*/[{
       return $_op->template
-        getAttrOfType<IntegerAttr>(FModuleLike::getPortDirectionsAttrName());
+        getAttrOfType<mlir::DenseBoolArrayAttr>(FModuleLike::getPortDirectionsAttrName());
     }]>,
 
     InterfaceMethod<"Get the port directions",
-    "APInt", "getPortDirections", (ins), [{}],
+    "ArrayRef<bool>", "getPortDirections", (ins), [{}],
     /*defaultImplementation=*/[{
       return $_op.getPortDirectionsAttr().getValue();
     }]>,
@@ -92,7 +92,7 @@ def FModuleLike : OpInterface<"FModuleLike", [Symbol, PortList, InstanceGraphMod
     InterfaceMethod<"Get a port name",
     "StringAttr", "getPortNameAttr", (ins "size_t":$portIndex), [{}],
     /*defaultImplementation=*/[{
-      return $_op.getPortNames()[portIndex].template cast<StringAttr>();
+      return llvm::cast<StringAttr>($_op.getPortNames()[portIndex]);
     }]>,
 
     InterfaceMethod<"Get a port name",
@@ -121,7 +121,7 @@ def FModuleLike : OpInterface<"FModuleLike", [Symbol, PortList, InstanceGraphMod
     InterfaceMethod<"Get a port type",
     "TypeAttr", "getPortTypeAttr", (ins "size_t":$portIndex), [{}],
     /*defaultImplementation=*/[{
-      return $_op.getPortTypes()[portIndex].template cast<TypeAttr>();
+      return llvm::cast<TypeAttr>($_op.getPortTypes()[portIndex]);
     }]>,
 
     InterfaceMethod<"Get a port type",
@@ -142,6 +142,12 @@ def FModuleLike : OpInterface<"FModuleLike", [Symbol, PortList, InstanceGraphMod
         getAttrOfType<ArrayAttr>(FModuleLike::getPortAnnotationsAttrName());
     }]>,
 
+    InterfaceMethod<"Set the port annotations attribute",
+    "void", "setPortAnnotationsAttr", (ins "ArrayAttr":$annotations), [{}],
+    /*defaultImplementation=*/[{
+      return $_op->setAttr(FModuleLike::getPortAnnotationsAttrName(), annotations);
+    }]>,
+
     InterfaceMethod<"Get the port annotations attribute",
     "ArrayRef<Attribute>", "getPortAnnotations", (ins), [{}],
     /*defaultImplementation=*/[{
@@ -154,7 +160,7 @@ def FModuleLike : OpInterface<"FModuleLike", [Symbol, PortList, InstanceGraphMod
       auto annos = $_op.getPortAnnotationsAttr();
       if (annos.empty())
         return annos; // annos already is an empty array
-      return annos[portIndex].template cast<ArrayAttr>();
+      return llvm::cast<ArrayAttr>(annos[portIndex]);
     }]>,
 
     InterfaceMethod<"Get a port's annotations",
@@ -192,16 +198,16 @@ def FModuleLike : OpInterface<"FModuleLike", [Symbol, PortList, InstanceGraphMod
     "bool", "hasPortSymbolAttr", (ins "size_t":$portIndex), [{}], [{
       auto syms = $_op.getPortSymbols();
         return  (!syms.empty() &&
-        !syms[portIndex].template cast<hw::InnerSymAttr>().empty());
+        !llvm::cast<hw::InnerSymAttr>(syms[portIndex]).empty());
     }]>,
 
     InterfaceMethod<"Get the port symbol attribute",
     "circt::hw::InnerSymAttr", "getPortSymbolAttr", (ins "size_t":$portIndex), [{}], [{
       auto syms = $_op.getPortSymbols();
       if (syms.empty() ||
-          syms[portIndex].template cast<hw::InnerSymAttr>().empty())
+          llvm::cast<hw::InnerSymAttr>(syms[portIndex]).empty())
         return hw::InnerSymAttr();
-      return syms[portIndex].template cast<hw::InnerSymAttr>();
+      return llvm::cast<hw::InnerSymAttr>(syms[portIndex]);
     }]>,
 
     // Setters
@@ -279,8 +285,7 @@ def FModuleLike : OpInterface<"FModuleLike", [Symbol, PortList, InstanceGraphMod
     InterfaceMethod<"Get a port's location attribute",
     "LocationAttr", "getPortLocationAttr", (ins "size_t":$portIndex), [{}],
     /*defaultImplementation=*/[{
-      return $_op.getPortLocationsAttr()[portIndex].
-        template cast<LocationAttr>();
+      return llvm::cast<LocationAttr>($_op.getPortLocationsAttr()[portIndex]);
     }]>,
 
     InterfaceMethod<"Get a port's location",
@@ -454,10 +459,12 @@ def FNamableOp : OpInterface<"FNamableOp"> {
     }]>,
     InterfaceMethod<"Completely drop a name.",
     "void", "dropName", (ins), [{}], /*defaultImplementation=*/[{
-      this->getOperation()->setAttr("nameKind",
-        NameKindEnumAttr::get(this->getOperation()->getContext(),
+      auto* op = this->getOperation();
+      auto* ctx = op->getContext();
+      op->setAttr("nameKind",
+        NameKindEnumAttr::get(ctx,
                               NameKindEnum::DroppableName));
-      this->getOperation()->setAttr("name", StringAttr::get(this->getOperation()->getContext(), ""));
+      op->setAttr("name", StringAttr::get(ctx, ""));
     }]>,
     InterfaceMethod<"Set a namekind.",
     "void", "setNameKindAttr", (ins "firrtl::NameKindEnumAttr":$nameKind),
@@ -515,5 +522,4 @@ def Forceable : OpInterface<"Forceable"> {
     return detail::verifyForceableOp(cast<::circt::firrtl::Forceable>($_op));
   }];
 }
-
 #endif // CIRCT_DIALECT_FIRRTL_FIRRTLOPINTERFACES_TD

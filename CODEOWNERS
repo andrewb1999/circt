@@ -12,6 +12,9 @@ tools/arcilator @fabianschuiki @maerhart
 **/Conversion/CalyxNative @rachitnigam
 **/Conversion/LoopScheduleToCalyx @andrewb1999 @mikeurbach
 
+# Comb
+**/Dialect/Comb @darthscsi
+
 # DC
 **/Dialect/DC @mortbopet
 
@@ -19,9 +22,7 @@ tools/arcilator @fabianschuiki @maerhart
 **/Dialect/ESI @teqdruid
 
 # FIRRTL
-**/FIRRTL* @darthscsi @dtzSiFive @seldridge
-*/firtool @dtzSiFive
-libs/Firtool @dtzSiFive
+**/FIRRTL* @darthscsi @seldridge
 
 # FSM
 **/Dialect/FSM @mortbopet
@@ -31,32 +32,32 @@ libs/Firtool @dtzSiFive
 
 # LLHD
 **/LLHD* @fabianschuiki @maerhart
-tools/llhd-sim @fabianschuiki @maerhart
 
 # Pipeline
 **/Dialect/Pipeline @mortbopet
 
 # Handshake
-**/Handshake* @Dinistro @mortbopet @RamirezLucas
+**/Handshake* @Dinistro @mortbopet
 
 # HW
-# **/Dialect/HW
+**/Dialect/HW @darthscsi
+
+# SMT
+**/Dialect/SMT @maerhart
+lib/Conversion/SMTToZ3LLVM @maerhart
+lib/Target/ExportSMTLIB @maerhart
 
 # SV
-# **/Dialect/SV
+**/Dialect/SV @darthscsi
 
 # Ibis
 **/Dialect/Ibis @teqdruid @mortbopet @blakep-msft
-
-## Conversions
-
-lib/Conversion/ExportVerilog @dtzSiFive
 
 
 ## Infra
 
 # CI
-.github @teqdruid @dtzSiFive
+.github @teqdruid
 
 # PrettyPrinter
 **/Support/Pretty* @dtzSiFive

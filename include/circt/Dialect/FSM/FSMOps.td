@@ -73,7 +73,7 @@ def MachineOp : FSMOp<"machine", [
     /// an error if the attribute is invalid.
     LogicalResult verifyType() {
       auto type = getFunctionTypeAttr().getValue();
-      if (!type.isa<FunctionType>())
+      if (!llvm::isa<FunctionType>(type))
         return emitOpError("requires '" + getFunctionTypeAttrName().getValue() +
                            "' attribute of function type");
       return success();
@@ -222,7 +222,8 @@ def StateOp : FSMOp<"state", [HasParent<"MachineOp">, Symbol, NoTerminator]> {
   }];
 
   let builders = [
-    OpBuilder<(ins "StringRef":$stateName)>
+    OpBuilder<(ins "StringRef":$stateName)>,
+    OpBuilder<(ins "StringRef":$stateName, "ValueRange":$outputs)>
   ];
 
   let skipDefaultBuilders = 1;
@@ -301,8 +302,11 @@ def TransitionOp : FSMOp<"transition", [HasParent<"StateOp">, NoTerminator]> {
   }];
 
   let builders = [
-    OpBuilder<(ins "StringRef":$nextState)>,
-    OpBuilder<(ins "fsm::StateOp":$nextState)>
+    // OpBuilder<(ins "StringRef":$nextState)>,
+    OpBuilder<(ins "fsm::StateOp":$nextState)>,
+    OpBuilder<(ins "StringRef":$nextState,
+                   CArg<"llvm::function_ref<void()>", "{}">:$guardCtor,
+                   CArg<"llvm::function_ref<void()>", "{}">:$actionCtor)>
   ];
 
   let skipDefaultBuilders = 1;

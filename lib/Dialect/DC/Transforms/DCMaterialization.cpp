@@ -10,16 +10,24 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/DC/DCOps.h"
 #include "circt/Dialect/DC/DCPasses.h"
+#include "mlir/Pass/Pass.h"
+
+namespace circt {
+namespace dc {
+#define GEN_PASS_DEF_DCMATERIALIZEFORKSSINKS
+#define GEN_PASS_DEF_DCDEMATERIALIZEFORKSSINKS
+#include "circt/Dialect/DC/DCPasses.h.inc"
+} // namespace dc
+} // namespace circt
 
 using namespace circt;
 using namespace dc;
 using namespace mlir;
 
 static bool isDCTyped(Value v) {
-  return v.getType().isa<dc::TokenType, dc::ValueType>();
+  return isa<dc::TokenType, dc::ValueType>(v.getType());
 }
 
 static void replaceFirstUse(Operation *op, Value oldVal, Value newVal) {
@@ -33,7 +41,7 @@ static void replaceFirstUse(Operation *op, Value oldVal, Value newVal) {
 // Adds a sink to the provided token or value-typed Value `v`.
 static void insertSink(Value v, OpBuilder &rewriter) {
   rewriter.setInsertionPointAfterValue(v);
-  if (v.getType().isa<ValueType>()) {
+  if (isa<ValueType>(v.getType())) {
     // Unpack before sinking
     v = rewriter.create<UnpackOp>(v.getLoc(), v).getToken();
   }
@@ -49,7 +57,7 @@ static void insertFork(Value result, OpBuilder &rewriter) {
   for (auto &u : result.getUses())
     opsToProcess.push_back(u.getOwner());
 
-  bool isValue = result.getType().isa<ValueType>();
+  bool isValue = isa<ValueType>(result.getType());
   Value token = result;
   Value value;
   if (isValue) {
@@ -132,14 +140,13 @@ static LogicalResult addSinkOps(Block &block, OpBuilder &rewriter) {
 
 namespace {
 struct DCMaterializeForksSinksPass
-    : public DCMaterializeForksSinksBase<DCMaterializeForksSinksPass> {
+    : public circt::dc::impl::DCMaterializeForksSinksBase<
+          DCMaterializeForksSinksPass> {
   void runOnOperation() override {
-    auto funcOp = getOperation();
-    if (funcOp.isExternal())
-      return;
-    OpBuilder builder(funcOp);
+    auto *op = getOperation();
+    OpBuilder builder(op);
 
-    auto walkRes = funcOp.walk([&](mlir::Block *block) {
+    auto walkRes = op->walk([&](mlir::Block *block) {
       if (addForkOps(*block, builder).failed() ||
           addSinkOps(*block, builder).failed())
         return WalkResult::interrupt();
@@ -153,14 +160,12 @@ struct DCMaterializeForksSinksPass
 };
 
 struct DCDematerializeForksSinksPass
-    : public DCDematerializeForksSinksBase<DCDematerializeForksSinksPass> {
+    : public circt::dc::impl::DCDematerializeForksSinksBase<
+          DCDematerializeForksSinksPass> {
   void runOnOperation() override {
-    auto funcOp = getOperation();
-
-    if (funcOp.isExternal())
-      return;
-    funcOp.walk([&](dc::SinkOp sinkOp) { sinkOp.erase(); });
-    funcOp.walk([&](dc::ForkOp forkOp) {
+    auto *op = getOperation();
+    op->walk([&](dc::SinkOp sinkOp) { sinkOp.erase(); });
+    op->walk([&](dc::ForkOp forkOp) {
       for (auto res : forkOp->getResults())
         res.replaceAllUsesWith(forkOp.getOperand());
       forkOp.erase();

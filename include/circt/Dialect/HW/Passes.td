@@ -44,6 +44,19 @@ def FlattenIO : Pass<"hw-flatten-io", "mlir::ModuleOp"> {
   ];
 }
 
+def FlattenModules : Pass<"hw-flatten-modules", "mlir::ModuleOp"> {
+  let summary = "Eagerly inline private modules";
+  let description = [{
+    This pass eagerly inlines private HW modules into their instantiation sites.
+    This is necessary for verification purposes, as model checking backends do not 
+    require or support the use of module hierarchy. For simulation, module hierarchies 
+    degenerate into a purely cosmetic construct, at which point it is beneficial
+    to fully flatten the module hierarchy to simplify further analysis and 
+    optimization of state transfer arcs.
+  }];
+  let constructor = "circt::hw::createFlattenModulesPass()";
+}
+
 def HWSpecialize : Pass<"hw-specialize", "mlir::ModuleOp"> {
   let summary = "Specializes instances of parametric hw.modules";
   let constructor = "circt::hw::createHWSpecializePass()";
@@ -60,6 +73,18 @@ def HWSpecialize : Pass<"hw-specialize", "mlir::ModuleOp"> {
 def VerifyInnerRefNamespace : Pass<"hw-verify-irn"> {
   let summary = "Verify InnerRefNamespaceLike operations, if not self-verifying.";
   let constructor =  "circt::hw::createVerifyInnerRefNamespacePass()";
+}
+
+/**
+ * Tutorial Pass, doesn't do anything interesting
+ */
+def FooWires : Pass<"hw-foo-wires", "hw::HWModuleOp"> {
+  let summary = "Change all wires' name to foo_<n>.";
+  let description = [{
+    Very basic pass that numbers all of the wires in a given module.
+    The wires' names are then all converte to foo_<that number>.
+  }];
+  let constructor = "circt::hw::createFooWiresPass()";
 }
 
 #endif // CIRCT_DIALECT_HW_PASSES_TD

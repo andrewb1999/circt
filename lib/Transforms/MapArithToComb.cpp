@@ -10,13 +10,18 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOpInterfaces.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+
+namespace circt {
+#define GEN_PASS_DEF_MAPARITHTOCOMBPASS
+#include "circt/Transforms/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
@@ -29,7 +34,7 @@ class MapArithTypeConverter : public mlir::TypeConverter {
 public:
   MapArithTypeConverter() {
     addConversion([](Type type) {
-      if (type.isa<mlir::IntegerType>())
+      if (isa<mlir::IntegerType>(type))
         return type;
 
       return Type();
@@ -147,7 +152,8 @@ public:
   }
 };
 
-struct MapArithToCombPass : public MapArithToCombPassBase<MapArithToCombPass> {
+struct MapArithToCombPass
+    : public circt::impl::MapArithToCombPassBase<MapArithToCombPass> {
 public:
   void runOnOperation() override {
     auto *ctx = &getContext();

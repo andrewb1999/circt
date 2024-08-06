@@ -12,7 +12,7 @@ firrtl.module @BadTargetKind() {
 firrtl.circuit "BadPathString" {
 firrtl.module @BadPathString() {
     // expected-error @below {{OMDeleted references can not have targets}}
-    %0 = firrtl.unresolved_path "OMDeleted:"
+    %0 = firrtl.unresolved_path "OMDeleted:~Foo|Bar>baz"
 }
 }
 
@@ -54,6 +54,15 @@ firrtl.module @BundleTarget(in %a : !firrtl.bundle<>) {
 
 // -----
 
+firrtl.circuit "AliasBundleTarget" {
+firrtl.module @AliasBundleTarget(in %a : !firrtl.alias<t, bundle<>>) {
+    // expected-error @below {{unable to target aggregate type '!firrtl.alias<t, bundle<>>'}}
+    %0 = firrtl.unresolved_path "OMReferenceTarget:~AliasBundleTarget|AliasBundleTarget>a"
+}
+}
+
+// -----
+
 firrtl.circuit "VectorTarget" {
 firrtl.module @VectorTarget(in %a : !firrtl.vector<uint<1>, 1>) {
     // expected-error @below {{unable to target aggregate type '!firrtl.vector<uint<1>, 1>'}}
@@ -65,7 +74,7 @@ firrtl.module @VectorTarget(in %a : !firrtl.vector<uint<1>, 1>) {
 
 firrtl.circuit "AmbiguousPath" {
 firrtl.module @AmbiguousPath() {
-    // expected-error @below {{unable to uniquely resolve target due to multiple instantiation}}
+    // expected-warning @below {{unable to uniquely resolve target due to multiple instantiation}}
     %0 = firrtl.unresolved_path "OMReferenceTarget:~AmbiguousPath|Child"
     // expected-note @below {{instance here}}
     firrtl.instance child0 @Child()

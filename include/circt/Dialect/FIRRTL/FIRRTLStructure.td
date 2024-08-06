@@ -31,8 +31,13 @@ def CircuitOp : FIRRTLOp<"circuit",
     The "firrtl.circuit" operation represents an overall Verilog circuit,
     containing a list of modules.
   }];
-  let arguments = (ins StrAttr:$name,
-                   DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations);
+  let arguments = (ins
+    StrAttr:$name,
+    DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations,
+    OptionalAttr<SymbolRefArrayAttr>:$enable_layers,
+    OptionalAttr<SymbolRefArrayAttr>:$disable_layers,
+    OptionalAttr<LayerSpecializationAttr>:$default_layer_specialization
+  );
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);
 
@@ -129,10 +134,16 @@ def FModuleOp : FIRRTLModuleLike<"module", [SingleBlock, NoTerminator]> {
     the module.
   }];
   let arguments =
-            (ins ConventionAttr:$convention,
-                 ArrayRefAttr:$portLocations,
-                 DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations,
-                 DefaultValuedAttr<LayerArrayAttr, "{}">:$layers);
+      (ins ConventionAttr:$convention,
+           DenseBoolArrayAttr:$portDirections,
+           ArrayRefAttr:$portLocations,
+           ArrayRefAttr:$portAnnotations,
+           ArrayRefAttr:$portSyms,
+           ArrayRefAttr:$portNames,
+           ArrayRefAttr:$portTypes,
+           DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations,
+           DefaultValuedAttr<LayerArrayAttr, "{}">:$layers
+      );
 
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);
@@ -185,16 +196,20 @@ def FExtModuleOp : FIRRTLModuleLike<"extmodule"> {
     into the external module, to be used for generating XMRs. Each RefType
     port must be removed by LowerXMR pass.
   }];
-  let arguments = (ins
-                   OptionalAttr<StrAttr>:$defname,
-                   ConventionAttr:$convention,
-                   ArrayRefAttr:$portLocations,
-                   ParamDeclArrayAttr:$parameters,
-                   DefaultValuedAttr<
-                    AnnotationArrayAttr, "{}">:$annotations,
-                   DefaultValuedAttr<LayerArrayAttr, "{}">:$layers,
-                   OptionalAttr<InternalPathArrayAttr>:$internalPaths
-                  );
+  let arguments = 
+      (ins OptionalAttr<StrAttr>:$defname,
+           ParamDeclArrayAttr:$parameters,
+           ConventionAttr:$convention,
+           DenseBoolArrayAttr:$portDirections,
+           ArrayRefAttr:$portLocations,
+           ArrayRefAttr:$portAnnotations,
+           ArrayRefAttr:$portSyms,
+           ArrayRefAttr:$portNames,
+           ArrayRefAttr:$portTypes,
+           DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations,
+           DefaultValuedAttr<LayerArrayAttr, "{}">:$layers,
+           OptionalAttr<InternalPathArrayAttr>:$internalPaths
+      );
   let results = (outs);
   let regions = (region AnyRegion:$body);
 
@@ -224,15 +239,19 @@ def FIntModuleOp : FIRRTLModuleLike<"intmodule"> {
   let description = [{
     The "firrtl.intmodule" operation represents a compiler intrinsic.
   }];
-  let arguments = (ins
-                   OptionalAttr<StrAttr>:$intrinsic,
-                   ArrayRefAttr:$portLocations,
-                   ParamDeclArrayAttr:$parameters,
-                   DefaultValuedAttr<AnnotationArrayAttr,
-                   "ArrayAttr()">:$annotations,
-                   OptionalAttr<InternalPathArrayAttr>:$internalPaths,
-                   DefaultValuedAttr<LayerArrayAttr, "{}">:$layers
-                  );
+  let arguments = 
+      (ins StrAttr:$intrinsic,
+           ParamDeclArrayAttr:$parameters,
+           DenseBoolArrayAttr:$portDirections,
+           ArrayRefAttr:$portLocations,
+           ArrayRefAttr:$portAnnotations,
+           ArrayRefAttr:$portSyms,
+           ArrayRefAttr:$portNames,
+           ArrayRefAttr:$portTypes,
+           DefaultValuedAttr<AnnotationArrayAttr, "ArrayAttr()">:$annotations,
+           DefaultValuedAttr<LayerArrayAttr, "{}">:$layers,
+           OptionalAttr<InternalPathArrayAttr>:$internalPaths
+      );
   let results = (outs);
   let regions = (region AnyRegion:$body);
 
@@ -240,7 +259,7 @@ def FIntModuleOp : FIRRTLModuleLike<"intmodule"> {
   let builders = [
     OpBuilder<(ins "StringAttr":$name,
                       "ArrayRef<PortInfo>":$ports,
-                      CArg<"StringRef", "StringRef()">:$intrinsicNameAttr,
+                      "StringRef":$intrinsicNameStr,
                       CArg<"ArrayAttr", "ArrayAttr()">:$annotations,
                       CArg<"ArrayAttr", "ArrayAttr()">:$parameters,
                       CArg<"ArrayAttr", "ArrayAttr()">:$internalPaths,
@@ -267,13 +286,20 @@ def FMemModuleOp : FIRRTLModuleLike<"memmodule"> {
     are not directly lowered to registers by the compiler.
   }];
   let arguments =
-    (ins UI32Attr:$numReadPorts, UI32Attr:$numWritePorts,
-         UI32Attr:$numReadWritePorts, UI32Attr:$dataWidth, UI32Attr:$maskBits,
-         UI32Attr:$readLatency, UI32Attr:$writeLatency, UI64Attr:$depth,
-         ArrayAttr:$extraPorts,
-         ArrayRefAttr:$portLocations,
-         AnnotationArrayAttr:$annotations,
-         DefaultValuedAttr<LayerArrayAttr, "{}">:$layers);
+      (ins UI32Attr:$numReadPorts, UI32Attr:$numWritePorts,
+           UI32Attr:$numReadWritePorts, UI32Attr:$dataWidth, UI32Attr:$maskBits,
+           UI32Attr:$readLatency, UI32Attr:$writeLatency, UI64Attr:$depth,
+           ArrayAttr:$extraPorts,
+           DenseBoolArrayAttr:$portDirections,
+           ArrayRefAttr:$portLocations,
+           ArrayRefAttr:$portAnnotations,
+           ArrayRefAttr:$portSyms,
+           ArrayRefAttr:$portNames,
+           ArrayRefAttr:$portTypes,
+           AnnotationArrayAttr:$annotations,
+           DefaultValuedAttr<LayerArrayAttr, "{}">:$layers
+      );
+      
   let results = (outs);
   let regions = (region AnyRegion:$body);
 
@@ -317,7 +343,8 @@ def ClassOp : FIRRTLModuleLike<"class", [
     A class may only have property ports, and its body may only be ops that act
     on properties, such as propassign ops.
   }];
-  let arguments = (ins SymbolNameAttr:$sym_name, APIntAttr:$portDirections,
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       DenseBoolArrayAttr:$portDirections,
                        ArrayRefAttr:$portNames, ArrayRefAttr:$portTypes,
                        ArrayRefAttr:$portSyms, ArrayRefAttr:$portLocations);
   let results = (outs);
@@ -377,7 +404,8 @@ def ExtClassOp : FIRRTLModuleLike<"extclass", [
     firrtl.extclass @MyImportedClass(in in_str: !firrtl.string, out out_str: !firrtl.string)
     ```
   }];
-  let arguments = (ins SymbolNameAttr:$sym_name, APIntAttr:$portDirections,
+  let arguments = (ins SymbolNameAttr:$sym_name, 
+                       DenseBoolArrayAttr:$portDirections,
                        ArrayRefAttr:$portNames, ArrayRefAttr:$portTypes,
                        ArrayRefAttr:$portSyms, ArrayRefAttr:$portLocations);
   let results = (outs);
@@ -417,7 +445,7 @@ def LayerOp : FIRRTLOp<
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
-    $sym_name $convention attr-dict-with-keyword $body
+    $sym_name `` $convention attr-dict-with-keyword $body
   }];
 }
 

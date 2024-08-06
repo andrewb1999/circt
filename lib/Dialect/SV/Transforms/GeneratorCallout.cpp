@@ -11,13 +11,21 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
+
+namespace circt {
+namespace sv {
+#define GEN_PASS_DEF_HWGENERATORCALLOUTPASS
+#include "circt/Dialect/SV/SVPasses.h.inc"
+} // namespace sv
+} // namespace circt
 
 using namespace circt;
 using namespace sv;
@@ -30,7 +38,8 @@ using namespace hw;
 namespace {
 
 struct HWGeneratorCalloutPass
-    : public sv::HWGeneratorCalloutPassBase<HWGeneratorCalloutPass> {
+    : public circt::sv::impl::HWGeneratorCalloutPassBase<
+          HWGeneratorCalloutPass> {
   void runOnOperation() override;
 
   void processGenerator(HWModuleGeneratedOp generatedModuleOp,
@@ -94,15 +103,15 @@ void HWGeneratorCalloutPass::processGenerator(
   // Assumption: All the options required by the generator program must be
   // present in the schema.
   for (auto attr : genSchema.getRequiredAttrs()) {
-    auto sAttr = attr.cast<StringAttr>();
+    auto sAttr = cast<StringAttr>(attr);
     // Get the port name from schema.
     StringRef portName = sAttr.getValue();
     generatorArgs.push_back("--" + portName.str());
     // Get the value for the corresponding port name.
     auto v = generatedModuleOp->getAttr(portName);
-    if (auto intV = v.dyn_cast<IntegerAttr>())
+    if (auto intV = dyn_cast<IntegerAttr>(v))
       generatorArgs.push_back(std::to_string(intV.getValue().getZExtValue()));
-    else if (auto strV = v.dyn_cast<StringAttr>())
+    else if (auto strV = dyn_cast<StringAttr>(v))
       generatorArgs.push_back(strV.getValue().str());
     else {
       generatedModuleOp.emitError(

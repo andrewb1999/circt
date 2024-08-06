@@ -266,6 +266,7 @@ def InvalidValueOp : FIRRTLOp<"invalidvalue",
   let arguments = (ins);
   let results = (outs FIRRTLBaseType:$result);
   let hasCanonicalizeMethod = 1;
+  let hasFolder = 1;
 
   let assemblyFormat = "attr-dict `:` qualified(type($result))";
 }
@@ -756,7 +757,7 @@ def HeadPrimOp : PrimOp<"head"> {
 }
 
 def MuxPrimOp : PrimOp<"mux"> {
-  let arguments = (ins UInt1OrUnsizedType:$sel, PassiveType:$high,
+  let arguments = (ins UIntLTE1OrUnsizedType:$sel, PassiveType:$high,
                        PassiveType:$low);
   let results = (outs PassiveType:$result);
 
@@ -842,9 +843,11 @@ def Mux2CellIntrinsicOp : PrimOp<"int.mux2cell"> {
     the inference process in the same way as a normal mux operation.
   }];
 
-  let arguments = (ins UInt1OrUnsizedType:$sel, PassiveType:$high,
+  let arguments = (ins UIntLTE1OrUnsizedType:$sel, PassiveType:$high,
                        PassiveType:$low);
   let results = (outs PassiveType:$result);
+
+  let hasCanonicalizer = true;
 
   let assemblyFormat =
     "`(` operands `)` attr-dict `:` functional-type(operands, $result)";
@@ -861,10 +864,12 @@ def Mux4CellIntrinsicOp : PrimOp<"int.mux4cell"> {
     the inference process as a sugar of mux operation chains.
   }];
 
-  let arguments = (ins UInt2OrUnsizedType:$sel, PassiveType:$v3,
+  let arguments = (ins UIntLTE2OrUnsizedType:$sel, PassiveType:$v3,
                        PassiveType:$v2, PassiveType:$v1,
                        PassiveType:$v0);
   let results = (outs PassiveType:$result);
+
+  let hasCanonicalizer = true;
 
   let assemblyFormat =
     "`(` operands `)` attr-dict `:` functional-type(operands, $result)";
@@ -953,7 +958,7 @@ class SameGroundTypeOperandConstness<string a, string b>
 
 def UninferredResetCastOp : FIRRTLOp<"resetCast", [HasCustomSSAName, Pure, SameGroundTypeOperandConstness<"input", "result">]> {
   let description = [{
-    Cast between reset types.  This is used to enable strictconnects early in
+    Cast between reset types.  This is used to enable matchingconnects early in
     the pipeline by isolating all uninferred reset connections to a single op.
   }];
   let arguments = (ins AnyResetType:$input);
@@ -1367,8 +1372,22 @@ def RWProbeOp : FIRRTLOp<"ref.rwprobe",
   }];
 
   let arguments = (ins InnerRefAttr:$target);
-  let results = (outs RWProbeConcreteReset:$result);
+  let results = (outs RWProbe:$result);
   let assemblyFormat = "$target attr-dict `:` type($result)";
+}
+
+def XMRRefOp : FIRRTLOp<"xmr.ref"> {
+  let summary = "FIRRTL XMR operation, targetable by ref ops.";
+  let arguments = (ins FlatSymbolRefAttr:$ref, DefaultValuedAttr<StrAttr, "{}">:$verbatimSuffix);
+  let results = (outs RefType:$dest);
+  let assemblyFormat = "$ref (`,` $verbatimSuffix^)? attr-dict `:` qualified(type($dest))";
+}
+
+def XMRDerefOp : FIRRTLOp<"xmr.deref"> {
+  let summary = "FIRRTL XMR operation, reading an XMR target.";
+  let arguments = (ins FlatSymbolRefAttr:$ref, DefaultValuedAttr<StrAttr, "{}">:$verbatimSuffix);
+  let results = (outs PassiveType:$dest);
+  let assemblyFormat = "$ref (`,` $verbatimSuffix^)? attr-dict `:` qualified(type($dest))";
 }
 
 //===----------------------------------------------------------------------===//
@@ -1399,6 +1418,7 @@ class BinaryLTLIntrinsicOp<string mnemonic, list<Trait> traits = []> :
 // Generic
 def LTLAndIntrinsicOp : BinaryLTLIntrinsicOp<"and", [Commutative]>;
 def LTLOrIntrinsicOp : BinaryLTLIntrinsicOp<"or", [Commutative]>;
+def LTLIntersectIntrinsicOp : BinaryLTLIntrinsicOp<"intersect", [Commutative]>;
 
 // Sequences
 def LTLDelayIntrinsicOp : LTLIntrinsicOp<"delay"> {
@@ -1411,10 +1431,40 @@ def LTLDelayIntrinsicOp : LTLIntrinsicOp<"delay"> {
   }];
 }
 def LTLConcatIntrinsicOp : BinaryLTLIntrinsicOp<"concat">;
+def LTLRepeatIntrinsicOp : LTLIntrinsicOp<"repeat"> {
+  let arguments = (ins UInt1Type:$input,
+                       I64Attr:$base,
+                       OptionalAttr<I64Attr>:$more);
+  let assemblyFormat = [{
+    $input `,` $base (`,` $more^)? attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+def LTLGoToRepeatIntrinsicOp : LTLIntrinsicOp<"goto_repeat"> {
+  let arguments = (ins UInt1Type:$input,
+                       I64Attr:$base,
+                       I64Attr:$more);
+  let assemblyFormat = [{
+    $input `,` $base `,` $more attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+def LTLNonConsecutiveRepeatIntrinsicOp : LTLIntrinsicOp<"non_consecutive_repeat"> {
+  let arguments = (ins UInt1Type:$input,
+                       I64Attr:$base,
+                       I64Attr:$more);
+  let assemblyFormat = [{
+    $input `,` $base `,` $more attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
 
 // Properties
 def LTLNotIntrinsicOp : UnaryLTLIntrinsicOp<"not">;
 def LTLImplicationIntrinsicOp : BinaryLTLIntrinsicOp<"implication">;
+def LTLUntilIntrinsicOp : BinaryLTLIntrinsicOp<"until">;
 def LTLEventuallyIntrinsicOp : UnaryLTLIntrinsicOp<"eventually">;
 
 // Clocking
@@ -1424,6 +1474,5 @@ def LTLClockIntrinsicOp : LTLIntrinsicOp<"clock"> {
     $input `,` $clock attr-dict `:` functional-type(operands, results)
   }];
 }
-def LTLDisableIntrinsicOp : BinaryLTLIntrinsicOp<"disable">;
 
 #endif // CIRCT_DIALECT_FIRRTL_FIRRTLEXPRESSIONS_TD

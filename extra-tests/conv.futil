@@ -1,0 +1,214 @@
+module attributes {calyx.entrypoint = "kernel_conv"} {
+  calyx.component @kernel_conv(%clk: i1 {clk}, %reset: i1 {reset}, %go: i1 {go}) -> (%done: i1 {done}) {
+    %true = hw.constant true
+    %c2_i3 = hw.constant 2 : i3
+    %c0_i2 = hw.constant 0 : i2
+    %c-2_i2 = hw.constant -2 : i2
+    %c1_i2 = hw.constant 1 : i2
+    %c0_i64 = hw.constant 0 : i64
+    %c0_i4 = hw.constant 0 : i4
+    %c1_i3 = hw.constant 1 : i3
+    %c0_i3 = hw.constant 0 : i3
+    %false = hw.constant false
+    %std_pad_1.in, %std_pad_1.out = calyx.std_pad @std_pad_1 : i2, i4
+    %std_pad_0.in, %std_pad_0.out = calyx.std_pad @std_pad_0 : i2, i4
+    %std_slice_3.in, %std_slice_3.out = calyx.std_slice @std_slice_3 : i64, i4
+    %std_slice_2.in, %std_slice_2.out = calyx.std_slice @std_slice_2 : i64, i4
+    %guard_reg_5_reg.in, %guard_reg_5_reg.write_en, %guard_reg_5_reg.clk, %guard_reg_5_reg.reset, %guard_reg_5_reg.out, %guard_reg_5_reg.done = calyx.register @guard_reg_5_reg : i1, i1, i1, i1, i1, i1
+    %guard_reg_4_reg.in, %guard_reg_4_reg.write_en, %guard_reg_4_reg.clk, %guard_reg_4_reg.reset, %guard_reg_4_reg.out, %guard_reg_4_reg.done = calyx.register @guard_reg_4_reg : i1, i1, i1, i1, i1, i1
+    %guard_reg_3_reg.in, %guard_reg_3_reg.write_en, %guard_reg_3_reg.clk, %guard_reg_3_reg.reset, %guard_reg_3_reg.out, %guard_reg_3_reg.done = calyx.register @guard_reg_3_reg : i1, i1, i1, i1, i1, i1
+    %guard_reg_2_reg.in, %guard_reg_2_reg.write_en, %guard_reg_2_reg.clk, %guard_reg_2_reg.reset, %guard_reg_2_reg.out, %guard_reg_2_reg.done = calyx.register @guard_reg_2_reg : i1, i1, i1, i1, i1, i1
+    %guard_reg_1_reg.in, %guard_reg_1_reg.write_en, %guard_reg_1_reg.clk, %guard_reg_1_reg.reset, %guard_reg_1_reg.out, %guard_reg_1_reg.done = calyx.register @guard_reg_1_reg : i1, i1, i1, i1, i1, i1
+    %guard_reg_0_reg.in, %guard_reg_0_reg.write_en, %guard_reg_0_reg.clk, %guard_reg_0_reg.reset, %guard_reg_0_reg.out, %guard_reg_0_reg.done = calyx.register @guard_reg_0_reg : i1, i1, i1, i1, i1, i1
+    %std_lt_3.left, %std_lt_3.right, %std_lt_3.out = calyx.std_lt @std_lt_3 : i3, i3, i1
+    %loop_1_arg1_reg.in, %loop_1_arg1_reg.write_en, %loop_1_arg1_reg.clk, %loop_1_arg1_reg.reset, %loop_1_arg1_reg.out, %loop_1_arg1_reg.done = calyx.register @loop_1_arg1_reg : i32, i1, i1, i1, i32, i1
+    %loop_1_arg0_reg.in, %loop_1_arg0_reg.write_en, %loop_1_arg0_reg.clk, %loop_1_arg0_reg.reset, %loop_1_arg0_reg.out, %loop_1_arg0_reg.done = calyx.register @loop_1_arg0_reg : i2, i1, i1, i1, i2, i1
+    %std_lt_2.left, %std_lt_2.right, %std_lt_2.out = calyx.std_lt @std_lt_2 : i2, i2, i1
+    %std_add_3.left, %std_add_3.right, %std_add_3.out = calyx.std_add @std_add_3 : i2, i2, i2
+    %std_add_2.left, %std_add_2.right, %std_add_2.out = calyx.std_add @std_add_2 : i3, i3, i3
+    %idx_0_reg.in, %idx_0_reg.write_en, %idx_0_reg.clk, %idx_0_reg.reset, %idx_0_reg.out, %idx_0_reg.done = calyx.register @idx_0_reg : i3, i1, i1, i1, i3, i1
+    %loop_0_arg1_reg.in, %loop_0_arg1_reg.write_en, %loop_0_arg1_reg.clk, %loop_0_arg1_reg.reset, %loop_0_arg1_reg.out, %loop_0_arg1_reg.done = calyx.register @loop_0_arg1_reg : i32, i1, i1, i1, i32, i1
+    %loop_0_arg0_reg.in, %loop_0_arg0_reg.write_en, %loop_0_arg0_reg.clk, %loop_0_arg0_reg.reset, %loop_0_arg0_reg.out, %loop_0_arg0_reg.done = calyx.register @loop_0_arg0_reg : i2, i1, i1, i1, i2, i1
+    %std_add_1.left, %std_add_1.right, %std_add_1.out = calyx.std_add @std_add_1 : i32, i32, i32
+    %pipelined_mult_0.clk, %pipelined_mult_0.reset, %pipelined_mult_0.left, %pipelined_mult_0.right, %pipelined_mult_0.out = calyx.pipelined_mult @pipelined_mult_0 : i1, i1, i32, i32, i32
+    %std_add_0.left, %std_add_0.right, %std_add_0.out = calyx.std_add @std_add_0 : i2, i2, i2
+    %std_slice_1.in, %std_slice_1.out = calyx.std_slice @std_slice_1 : i2, i1
+    %std_slice_0.in, %std_slice_0.out = calyx.std_slice @std_slice_0 : i2, i1
+    %std_lt_1.left, %std_lt_1.right, %std_lt_1.out = calyx.std_lt @std_lt_1 : i2, i2, i1
+    %std_lt_0.left, %std_lt_0.right, %std_lt_0.out = calyx.std_lt @std_lt_0 : i2, i2, i1
+    %loop_1_cond_reg.in, %loop_1_cond_reg.write_en, %loop_1_cond_reg.clk, %loop_1_cond_reg.reset, %loop_1_cond_reg.out, %loop_1_cond_reg.done = calyx.register @loop_1_cond_reg : i1, i1, i1, i1, i1, i1
+    %ext_mem_0.addr0, %ext_mem_0.addr1, %ext_mem_0.write_data, %ext_mem_0.write_en, %ext_mem_0.write_done, %ext_mem_0.clk, %ext_mem_0.read_data, %ext_mem_0.read_en, %ext_mem_0.read_done = calyx.seq_mem @ext_mem_0 <[16, 16] x 32> [4, 4] {external = true} : i4, i4, i32, i1, i1, i1, i32, i1, i1
+    %ext_mem_1.addr0, %ext_mem_1.addr1, %ext_mem_1.write_data, %ext_mem_1.write_en, %ext_mem_1.write_done, %ext_mem_1.clk, %ext_mem_1.read_data, %ext_mem_1.read_en, %ext_mem_1.read_done = calyx.seq_mem @ext_mem_1 <[2, 2] x 32> [1, 1] {external = true} : i1, i1, i32, i1, i1, i1, i32, i1, i1
+    %ext_mem_2.addr0, %ext_mem_2.addr1, %ext_mem_2.write_data, %ext_mem_2.write_en, %ext_mem_2.write_done, %ext_mem_2.clk, %ext_mem_2.read_data, %ext_mem_2.read_en, %ext_mem_2.read_done = calyx.seq_mem @ext_mem_2 <[16, 16] x 32> [4, 4] {external = true} : i4, i4, i32, i1, i1, i1, i32, i1, i1
+    calyx.wires {
+      calyx.assign %ext_mem_0.write_en = %false : i1
+      calyx.assign %ext_mem_1.write_en = %false : i1
+      calyx.static_group latency<1> @cond_init_0 {
+        calyx.assign %loop_1_cond_reg.in = %std_lt_0.out : i1
+        calyx.assign %loop_1_cond_reg.write_en = %true : i1
+        calyx.assign %std_lt_0.left = %c0_i2 : i2
+        calyx.assign %std_lt_0.right = %c-2_i2 : i2
+      }
+      calyx.static_group latency<1> @cond_0 {
+        calyx.assign %loop_1_cond_reg.in = %std_lt_2.out : i1
+        calyx.assign %loop_1_cond_reg.write_en = %true : i1
+        calyx.assign %std_lt_2.left = %std_add_3.out : i2
+        calyx.assign %std_add_3.left = %loop_1_arg0_reg.out : i2
+        calyx.assign %std_add_3.right = %c1_i2 : i2
+        calyx.assign %std_lt_2.right = %c-2_i2 : i2
+      }
+      calyx.static_group latency<1> @load_0 {
+        calyx.assign %ext_mem_2.addr0 = %c0_i4 : i4
+        calyx.assign %ext_mem_2.addr1 = %c0_i4 : i4
+        calyx.assign %ext_mem_2.read_en = %true : i1
+      }
+      calyx.static_group latency<1> @load_1 {
+        calyx.assign %std_pad_1.in = %loop_1_arg0_reg.out : i2
+        calyx.assign %std_pad_0.in = %loop_0_arg0_reg.out : i2
+        calyx.assign %ext_mem_0.addr0 = %std_pad_1.out : i4
+        calyx.assign %ext_mem_0.addr1 = %std_pad_0.out : i4
+        calyx.assign %ext_mem_0.read_en = %true : i1
+      }
+      calyx.static_group latency<1> @load_2 {
+        calyx.assign %ext_mem_1.addr0 = %std_slice_0.out : i1
+        calyx.assign %ext_mem_1.addr1 = %std_slice_1.out : i1
+        calyx.assign %ext_mem_1.read_en = %true : i1
+        calyx.assign %std_slice_0.in = %loop_1_arg0_reg.out : i2
+        calyx.assign %std_slice_1.in = %loop_0_arg0_reg.out : i2
+      }
+      calyx.static_group latency<1> @muli_0 {
+        calyx.assign %pipelined_mult_0.left = %ext_mem_0.read_data : i32
+        calyx.assign %pipelined_mult_0.right = %ext_mem_1.read_data : i32
+      }
+      calyx.static_group latency<1> @assign_loop_0_init_0 {
+        calyx.assign %loop_0_arg0_reg.in = %c0_i2 : i2
+        calyx.assign %loop_0_arg0_reg.write_en = %true : i1
+      }
+      calyx.static_group latency<1> @assign_loop_0_init_1 {
+        calyx.assign %loop_0_arg1_reg.in = %loop_1_arg1_reg.out : i32
+        calyx.assign %loop_0_arg1_reg.write_en = %true : i1
+      }
+      calyx.static_group latency<1> @incr_0 {
+        calyx.assign %std_add_2.left = %idx_0_reg.out : i3
+        calyx.assign %std_add_2.right = %c1_i3 : i3
+        calyx.assign %idx_0_reg.in = %std_add_2.out : i3
+        calyx.assign %idx_0_reg.write_en = %true : i1
+        calyx.assign %std_lt_3.left = %std_add_2.out : i3
+        calyx.assign %std_lt_3.right = %c2_i3 : i3
+        calyx.assign %guard_reg_0_reg.in = %std_lt_3.out : i1
+        calyx.assign %guard_reg_0_reg.write_en = %true : i1
+        calyx.assign %guard_reg_1_reg.in = %guard_reg_0_reg.out : i1
+        calyx.assign %guard_reg_1_reg.write_en = %true : i1
+        calyx.assign %guard_reg_2_reg.in = %guard_reg_1_reg.out : i1
+        calyx.assign %guard_reg_2_reg.write_en = %true : i1
+        calyx.assign %guard_reg_3_reg.in = %guard_reg_2_reg.out : i1
+        calyx.assign %guard_reg_3_reg.write_en = %true : i1
+        calyx.assign %guard_reg_4_reg.in = %guard_reg_3_reg.out : i1
+        calyx.assign %guard_reg_4_reg.write_en = %true : i1
+        calyx.assign %guard_reg_5_reg.in = %guard_reg_4_reg.out : i1
+        calyx.assign %guard_reg_5_reg.write_en = %true : i1
+      }
+      calyx.static_group latency<1> @incr_init_0 {
+        calyx.assign %idx_0_reg.in = %c0_i3 : i3
+        calyx.assign %idx_0_reg.write_en = %true : i1
+      }
+      calyx.static_group latency<1> @assign_loop_1_init_0 {
+        calyx.assign %loop_1_arg0_reg.in = %c0_i2 : i2
+        calyx.assign %loop_1_arg0_reg.write_en = %true : i1
+      }
+      calyx.static_group latency<1> @assign_loop_1_init_1 {
+        calyx.assign %loop_1_arg1_reg.in = %ext_mem_2.read_data : i32
+        calyx.assign %loop_1_arg1_reg.write_en = %true : i1
+      }
+      calyx.static_group latency<1> @iter_arg_0 {
+        calyx.assign %loop_1_arg1_reg.in = %loop_0_arg1_reg.out : i32
+        calyx.assign %loop_1_arg1_reg.write_en = %true : i1
+      }
+      calyx.static_group latency<1> @store_0 {
+        calyx.assign %std_slice_3.in = %c0_i64 : i64
+        calyx.assign %std_slice_2.in = %c0_i64 : i64
+        calyx.assign %ext_mem_2.addr0 = %std_slice_3.out : i4
+        calyx.assign %ext_mem_2.addr1 = %std_slice_2.out : i4
+        calyx.assign %ext_mem_2.write_data = %loop_1_arg1_reg.out : i32
+        calyx.assign %ext_mem_2.write_en = %true : i1
+      }
+      calyx.static_group latency<1> @guard_init_0 {
+        calyx.assign %guard_reg_0_reg.in = %true : i1
+        calyx.assign %guard_reg_0_reg.write_en = %true : i1
+      }
+      calyx.static_group latency<1> @phase_reg_2 {
+        calyx.assign %loop_0_arg0_reg.in = %std_add_0.out : i2
+        calyx.assign %loop_0_arg0_reg.write_en = %true : i1
+        calyx.assign %std_add_0.left = %loop_0_arg0_reg.out : i2
+        calyx.assign %std_add_0.right = %c1_i2 : i2
+      }
+      calyx.static_group latency<1> @guard_init_1 {
+        calyx.assign %guard_reg_1_reg.in = %false : i1
+        calyx.assign %guard_reg_1_reg.write_en = %true : i1
+      }
+      calyx.static_group latency<1> @guard_init_2 {
+        calyx.assign %guard_reg_5_reg.in = %false : i1
+        calyx.assign %guard_reg_5_reg.write_en = %true : i1
+      }
+      calyx.static_group latency<1> @phase_reg_4 {
+        calyx.assign %loop_0_arg1_reg.in = %std_add_1.out : i32
+        calyx.assign %loop_0_arg1_reg.write_en = %true : i1
+        calyx.assign %std_add_1.left = %loop_0_arg1_reg.out : i32
+        calyx.assign %std_add_1.right = %pipelined_mult_0.out : i32
+      }
+      calyx.static_group latency<1> @phase_reg_5 {
+        calyx.assign %loop_1_arg0_reg.in = %std_add_3.out : i2
+        calyx.assign %loop_1_arg0_reg.write_en = %true : i1
+        calyx.assign %std_add_3.left = %loop_1_arg0_reg.out : i2
+        calyx.assign %std_add_3.right = %c1_i2 : i2
+      }
+    }
+    calyx.control {
+      calyx.seq {
+        calyx.enable @load_0
+        calyx.static_par {
+          calyx.enable @cond_init_0
+          calyx.enable @assign_loop_1_init_0
+          calyx.enable @assign_loop_1_init_1
+        }
+        calyx.while %loop_1_cond_reg.out {
+          calyx.seq {
+            calyx.static_par {
+              calyx.enable @assign_loop_0_init_0
+              calyx.enable @assign_loop_0_init_1
+              calyx.enable @incr_init_0
+              calyx.enable @guard_init_0
+              calyx.enable @guard_init_1
+              calyx.enable @guard_init_2
+            }
+            calyx.static_repeat 7 {
+              calyx.static_par {
+                calyx.enable @incr_0
+                calyx.static_if %guard_reg_0_reg.out {
+                  calyx.static_par {
+                    calyx.enable @load_1
+                    calyx.enable @load_2
+                    calyx.enable @phase_reg_2
+                  }
+                }
+                calyx.static_if %guard_reg_1_reg.out {
+                  calyx.enable @muli_0
+                }
+                calyx.static_if %guard_reg_5_reg.out {
+                  calyx.enable @phase_reg_4
+                }
+              }
+            }
+            calyx.par {
+              calyx.enable @cond_0
+              calyx.enable @iter_arg_0
+              calyx.enable @phase_reg_5
+            }
+          }
+        }
+        calyx.enable @store_0
+      }
+    }
+  } {toplevel}
+}
+

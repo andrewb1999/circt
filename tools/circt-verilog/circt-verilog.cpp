@@ -13,10 +13,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/ImportVerilog.h"
+#include "circt/Conversion/MooreToCore.h"
+#include "circt/Dialect/Moore/MoorePasses.h"
+#include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
+#include "mlir/Transforms/Passes.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/SourceMgr.h"
@@ -31,7 +35,14 @@ using namespace circt;
 //===----------------------------------------------------------------------===//
 
 namespace {
-enum class LoweringMode { OnlyPreprocess, OnlyLint, OnlyParse, Full };
+enum class LoweringMode {
+  OnlyPreprocess,
+  OnlyLint,
+  OnlyParse,
+  OutputIRMoore,
+  OutputIRHW,
+  Full
+};
 
 struct CLOptions {
   cl::OptionCategory cat{"Verilog Frontend Options"};
@@ -60,7 +71,13 @@ struct CLOptions {
                      "CIRCT IR"),
           clEnumValN(LoweringMode::OnlyParse, "parse-only",
                      "Only parse and elaborate the input, without mapping to "
-                     "CIRCT IR")),
+                     "CIRCT IR"),
+          clEnumValN(LoweringMode::OutputIRMoore, "ir-moore",
+                     "Run the entire pass manager to just before MooreToCore "
+                     "conversion, and emit the resulting Moore dialect IR"),
+          clEnumValN(LoweringMode::OutputIRHW, "ir-hw",
+                     "Run the MooreToCore conversion and emit the resulting "
+                     "core dialect IR")),
       cl::init(LoweringMode::Full), cl::cat(cat)};
 
   //===--------------------------------------------------------------------===//
@@ -201,6 +218,60 @@ struct CLOptions {
 static CLOptions opts;
 
 //===----------------------------------------------------------------------===//
+// Pass Pipeline
+//===----------------------------------------------------------------------===//
+
+/// Optimize and simplify the Moore dialect IR.
+static void populateMooreTransforms(PassManager &pm) {
+  {
+    // Perform an initial cleanup and preprocessing across all
+    // modules/functions.
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createCSEPass());
+    anyPM.addPass(createSimpleCanonicalizerPass());
+  }
+
+  {
+    // Perform module-specific transformations.
+    auto &modulePM = pm.nest<moore::SVModuleOp>();
+    modulePM.addPass(moore::createLowerConcatRefPass());
+    modulePM.addPass(moore::createSimplifyProceduresPass());
+  }
+
+  {
+    // Perform a final cleanup across all modules/functions.
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createSROA());
+    anyPM.addPass(mlir::createMem2Reg());
+    anyPM.addPass(mlir::createCSEPass());
+    anyPM.addPass(createSimpleCanonicalizerPass());
+  }
+}
+
+/// Convert Moore dialect IR into core dialect IR
+static void populateMooreToCoreLowering(PassManager &pm) {
+  // Perform the conversion.
+  pm.addPass(createConvertMooreToCorePass());
+
+  {
+    // Conversion to the core dialects likely uncovers new canonicalization
+    // opportunities.
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createCSEPass());
+    anyPM.addPass(createSimpleCanonicalizerPass());
+  }
+}
+
+/// Populate the given pass manager with transformations as configured by the
+/// command line options.
+static void populatePasses(PassManager &pm) {
+  populateMooreTransforms(pm);
+  if (opts.loweringMode == LoweringMode::OutputIRMoore)
+    return;
+  populateMooreToCoreLowering(pm);
+}
+
+//===----------------------------------------------------------------------===//
 // Implementation
 //===----------------------------------------------------------------------===//
 
@@ -268,6 +339,23 @@ static LogicalResult executeWithSources(MLIRContext *context,
   OwningOpRef<ModuleOp> module(ModuleOp::create(UnknownLoc::get(context)));
   if (failed(importVerilog(sourceMgr, context, ts, module.get(), &options)))
     return failure();
+
+  // If the user requested for the files to be only linted, the module remains
+  // empty and there is nothing left to do.
+  if (opts.loweringMode == LoweringMode::OnlyLint)
+    return success();
+
+  // If the user requested anything besides simply parsing the input, run the
+  // appropriate transformation passes according to the command line options.
+  if (opts.loweringMode != LoweringMode::OnlyParse) {
+    PassManager pm(context);
+    pm.enableVerifier(true);
+    if (failed(applyPassManagerCLOptions(pm)))
+      return failure();
+    populatePasses(pm);
+    if (failed(pm.run(module.get())))
+      return failure();
+  }
 
   // Print the final MLIR.
   module->print(outputFile->os());

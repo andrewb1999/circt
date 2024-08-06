@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/HWToLLVM.h"
-#include "../PassDetail.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Support/LLVM.h"
 #include "circt/Support/Namespace.h"
@@ -21,6 +20,11 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+namespace circt {
+#define GEN_PASS_DEF_CONVERTHWTOLLVM
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
@@ -93,11 +97,10 @@ struct StructExplodeOpConversion
 
     SmallVector<Value> replacements;
 
-    for (size_t i = 0, e = adaptor.getInput()
-                               .getType()
-                               .cast<LLVM::LLVMStructType>()
-                               .getBody()
-                               .size();
+    for (size_t i = 0,
+                e = cast<LLVM::LLVMStructType>(adaptor.getInput().getType())
+                        .getBody()
+                        .size();
          i < e; ++i)
 
       replacements.push_back(rewriter.create<LLVM::ExtractValueOp>(
@@ -257,7 +260,7 @@ struct ArrayConcatOpConversion
   matchAndRewrite(hw::ArrayConcatOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
 
-    hw::ArrayType arrTy = op.getResult().getType().cast<hw::ArrayType>();
+    hw::ArrayType arrTy = cast<hw::ArrayType>(op.getResult().getType());
     Type resultTy = typeConverter->convertType(arrTy);
 
     Value arr = rewriter.create<LLVM::UndefOp>(op->getLoc(), resultTy);
@@ -272,7 +275,7 @@ struct ArrayConcatOpConversion
 
       ++k;
       if (k >=
-          op.getInputs()[j].getType().cast<hw::ArrayType>().getNumElements()) {
+          cast<hw::ArrayType>(op.getInputs()[j].getType()).getNumElements()) {
         k = 0;
         --j;
       }
@@ -428,7 +431,7 @@ struct HWStructCreateOpConversion
     auto resTy = typeConverter->convertType(op.getResult().getType());
 
     Value tup = rewriter.create<LLVM::UndefOp>(op->getLoc(), resTy);
-    for (size_t i = 0, e = resTy.cast<LLVM::LLVMStructType>().getBody().size();
+    for (size_t i = 0, e = cast<LLVM::LLVMStructType>(resTy).getBody().size();
          i < e; ++i) {
       Value input =
           adaptor.getInput()[HWToLLVMEndianessConverter::convertToLLVMEndianess(
@@ -448,13 +451,13 @@ struct HWStructCreateOpConversion
 
 bool AggregateConstantOpConversion::containsArrayAndStructAggregatesOnly(
     Type type) const {
-  if (auto intType = type.dyn_cast<IntegerType>())
+  if (auto intType = dyn_cast<IntegerType>(type))
     return true;
 
-  if (auto arrTy = type.dyn_cast<hw::ArrayType>())
+  if (auto arrTy = dyn_cast<hw::ArrayType>(type))
     return containsArrayAndStructAggregatesOnly(arrTy.getElementType());
 
-  if (auto structTy = type.dyn_cast<hw::StructType>()) {
+  if (auto structTy = dyn_cast<hw::StructType>(type)) {
     SmallVector<Type> innerTypes;
     structTy.getInnerTypes(innerTypes);
     return llvm::all_of(innerTypes, [&](auto ty) {
@@ -467,10 +470,10 @@ bool AggregateConstantOpConversion::containsArrayAndStructAggregatesOnly(
 
 bool AggregateConstantOpConversion::isMultiDimArrayOfIntegers(
     Type type, SmallVectorImpl<int64_t> &dims) const {
-  if (auto intType = type.dyn_cast<IntegerType>())
+  if (auto intType = dyn_cast<IntegerType>(type))
     return true;
 
-  if (auto arrTy = type.dyn_cast<hw::ArrayType>()) {
+  if (auto arrTy = dyn_cast<hw::ArrayType>(type)) {
     dims.push_back(arrTy.getNumElements());
     return isMultiDimArrayOfIntegers(arrTy.getElementType(), dims);
   }
@@ -480,18 +483,18 @@ bool AggregateConstantOpConversion::isMultiDimArrayOfIntegers(
 
 void AggregateConstantOpConversion::flatten(
     Type type, Attribute attr, SmallVectorImpl<Attribute> &output) const {
-  if (type.isa<IntegerType>()) {
-    assert(attr.isa<IntegerAttr>());
+  if (isa<IntegerType>(type)) {
+    assert(isa<IntegerAttr>(attr));
     output.push_back(attr);
     return;
   }
 
-  auto arrAttr = attr.cast<ArrayAttr>();
+  auto arrAttr = cast<ArrayAttr>(attr);
   for (size_t i = 0, e = arrAttr.size(); i < e; ++i) {
     auto element =
         arrAttr[HWToLLVMEndianessConverter::convertToLLVMEndianess(type, i)];
 
-    flatten(type.cast<hw::ArrayType>().getElementType(), element, output);
+    flatten(cast<hw::ArrayType>(type).getElementType(), element, output);
   }
 }
 
@@ -501,12 +504,12 @@ Value AggregateConstantOpConversion::constructAggregate(
   Type llvmType = typeConverter.convertType(type);
 
   auto getElementType = [](Type type, size_t index) {
-    if (auto arrTy = type.dyn_cast<hw::ArrayType>()) {
+    if (auto arrTy = dyn_cast<hw::ArrayType>(type)) {
       return arrTy.getElementType();
     }
 
-    assert(type.isa<hw::StructType>());
-    auto structTy = type.cast<hw::StructType>();
+    assert(isa<hw::StructType>(type));
+    auto structTy = cast<hw::StructType>(type);
     SmallVector<Type> innerTypes;
     structTy.getInnerTypes(innerTypes);
     return innerTypes[index];
@@ -514,11 +517,11 @@ Value AggregateConstantOpConversion::constructAggregate(
 
   return TypeSwitch<Type, Value>(type)
       .Case<IntegerType>([&](auto ty) {
-        return builder.create<LLVM::ConstantOp>(loc, data.cast<TypedAttr>());
+        return builder.create<LLVM::ConstantOp>(loc, cast<TypedAttr>(data));
       })
       .Case<hw::ArrayType, hw::StructType>([&](auto ty) {
         Value aggVal = builder.create<LLVM::UndefOp>(loc, llvmType);
-        auto arrayAttr = data.cast<ArrayAttr>();
+        auto arrayAttr = cast<ArrayAttr>(data);
         for (size_t i = 0, e = arrayAttr.size(); i < e; ++i) {
           size_t currIdx =
               HWToLLVMEndianessConverter::convertToLLVMEndianess(type, i);
@@ -566,7 +569,7 @@ LogicalResult AggregateConstantOpConversion::matchAndRewrite(
       flatten(aggregateType, adaptor.getFields(), ints);
       assert(!ints.empty());
       auto shapedType = RankedTensorType::get(
-          dims, ints.front().cast<IntegerAttr>().getType());
+          dims, cast<IntegerAttr>(ints.front()).getType());
       auto denseAttr = DenseElementsAttr::get(shapedType, ints);
 
       constAggregateGlobalsMap[typeAttrPair] = rewriter.create<LLVM::GlobalOp>(
@@ -624,7 +627,8 @@ static Type convertStructType(hw::StructType type,
 //===----------------------------------------------------------------------===//
 
 namespace {
-struct HWToLLVMLoweringPass : public ConvertHWToLLVMBase<HWToLLVMLoweringPass> {
+struct HWToLLVMLoweringPass
+    : public circt::impl::ConvertHWToLLVMBase<HWToLLVMLoweringPass> {
   void runOnOperation() override;
 };
 } // namespace
@@ -671,9 +675,6 @@ void HWToLLVMLoweringPass::runOnOperation() {
   populateHWToLLVMTypeConversions(converter);
 
   LLVMConversionTarget target(getContext());
-  target.addLegalOp<UnrealizedConversionCastOp>();
-  target.addLegalOp<ModuleOp>();
-  target.addLegalDialect<LLVM::LLVMDialect>();
   target.addIllegalDialect<hw::HWDialect>();
 
   // Setup the conversion.

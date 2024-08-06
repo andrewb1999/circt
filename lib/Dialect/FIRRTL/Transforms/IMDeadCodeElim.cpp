@@ -6,9 +6,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/InnerSymbolTable.h"
@@ -16,6 +16,7 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Threading.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMapInfoVariant.h"
 #include "llvm/ADT/PostOrderIterator.h"
@@ -23,6 +24,13 @@
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "firrtl-imdeadcodeelim"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_IMDEADCODEELIM
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -48,7 +56,8 @@ static bool isDeletableDeclaration(Operation *op) {
 }
 
 namespace {
-struct IMDeadCodeElimPass : public IMDeadCodeElimBase<IMDeadCodeElimPass> {
+struct IMDeadCodeElimPass
+    : public circt::firrtl::impl::IMDeadCodeElimBase<IMDeadCodeElimPass> {
   void runOnOperation() override;
 
   void rewriteModuleSignature(FModuleOp module);
@@ -159,7 +168,7 @@ void IMDeadCodeElimPass::visitModuleOp(FModuleOp module) {
 void IMDeadCodeElimPass::visitHierPathOp(hw::HierPathOp hierPathOp) {
   // If the hierpath is alive, mark all instances on the path alive.
   for (auto path : hierPathOp.getNamepathAttr())
-    if (auto innerRef = path.dyn_cast<hw::InnerRefAttr>()) {
+    if (auto innerRef = dyn_cast<hw::InnerRefAttr>(path)) {
       auto *op = innerRefNamespace->lookupOp(innerRef);
       if (auto instance = dyn_cast_or_null<InstanceOp>(op))
         markAlive(instance);
@@ -331,12 +340,12 @@ void IMDeadCodeElimPass::runOnOperation() {
       // If the hierpath is public or ill-formed, the verifier should have
       // caught the error. Conservatively mark the symbol as alive.
       if (hierPath.isPublic() || namePath.size() <= 1 ||
-          namePath.back().isa<hw::InnerRefAttr>())
+          isa<hw::InnerRefAttr>(namePath.back()))
         return markAlive(hierPath);
 
       if (auto instance =
               dyn_cast_or_null<firrtl::InstanceOp>(innerRefNamespace->lookupOp(
-                  namePath.drop_back().back().cast<hw::InnerRefAttr>())))
+                  cast<hw::InnerRefAttr>(namePath.drop_back().back()))))
         instanceToHierPaths[instance].push_back(hierPath);
       return;
     }
@@ -482,7 +491,7 @@ void IMDeadCodeElimPass::visitValue(Value value) {
   // Marking an instance port as alive propagates to the corresponding port of
   // the module.
   if (auto instance = value.getDefiningOp<InstanceOp>()) {
-    auto instanceResult = value.cast<mlir::OpResult>();
+    auto instanceResult = cast<mlir::OpResult>(value);
     // Update the src, when it's an instance op.
     auto module = instance.getReferencedModule<FModuleOp>(*instanceGraph);
 

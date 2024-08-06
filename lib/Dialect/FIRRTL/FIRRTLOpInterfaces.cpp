@@ -42,12 +42,9 @@ static LogicalResult verifyNoInputProbes(FModuleLike module) {
         });
   };
 
-  if (module.isPublic()) {
-    for (auto &pi : module.getPorts()) {
-      if (hasInputRef(pi.type, pi.isOutput()))
-        return emitError(pi.loc, "input probe not allowed on public module");
-    }
-  }
+  for (auto &pi : module.getPorts())
+    if (hasInputRef(pi.type, pi.isOutput()))
+      return emitError(pi.loc, "input probe not allowed");
   return success();
 }
 
@@ -68,8 +65,8 @@ LogicalResult circt::firrtl::verifyModuleLikeOpInterface(FModuleLike module) {
     return module.emitOpError("requires valid port direction");
   // TODO: bitwidth is 1 when there are no ports, since APInt previously did not
   // support 0 bit widths.
-  auto bitWidth = portDirections.getValue().getBitWidth();
-  if (bitWidth != numPorts)
+  auto bitWidth = portDirections.size();
+  if (static_cast<size_t>(bitWidth) != numPorts)
     return module.emitOpError("requires ") << numPorts << " port directions";
 
   // Verify the port names.

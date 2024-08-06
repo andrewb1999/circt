@@ -27,16 +27,11 @@ MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(LLHD, llhd, circt::llhd::LLHDDialect)
 //===----------------------------------------------------------------------===//
 
 /// Check if a type is a time type.
-bool llhdTypeIsATimeType(MlirType type) { return unwrap(type).isa<TimeType>(); }
-
-/// Check if a type is a signal type.
-bool llhdTypeIsASignalType(MlirType type) {
-  return unwrap(type).isa<SigType>();
-}
+bool llhdTypeIsATimeType(MlirType type) { return isa<TimeType>(unwrap(type)); }
 
 /// Check if a type is a pointer type.
 bool llhdTypeIsAPointerType(MlirType type) {
-  return unwrap(type).isa<PtrType>();
+  return isa<PtrType>(unwrap(type));
 }
 
 /// Create a time type.
@@ -44,24 +39,14 @@ MlirType llhdTimeTypeGet(MlirContext ctx) {
   return wrap(TimeType::get(unwrap(ctx)));
 }
 
-/// Create a signal type.
-MlirType llhdSignalTypeGet(MlirType element) {
-  return wrap(SigType::get(unwrap(element)));
-}
-
 /// Create a pointer type.
 MlirType llhdPointerTypeGet(MlirType element) {
   return wrap(PtrType::get(unwrap(element)));
 }
 
-/// Get the inner type of a signal.
-MlirType llhdSignalTypeGetElementType(MlirType type) {
-  return wrap(unwrap(type).cast<SigType>().getUnderlyingType());
-}
-
 /// Get the inner type of a pointer.
 MlirType llhdPointerTypeGetElementType(MlirType type) {
-  return wrap(unwrap(type).cast<PtrType>().getUnderlyingType());
+  return wrap(cast<PtrType>(unwrap(type)).getElementType());
 }
 
 //===----------------------------------------------------------------------===//
@@ -70,7 +55,7 @@ MlirType llhdPointerTypeGetElementType(MlirType type) {
 
 /// Check if an attribute is a time attribute.
 bool llhdAttrIsATimeAttr(MlirAttribute attr) {
-  return unwrap(attr).isa<TimeAttr>();
+  return isa<TimeAttr>(unwrap(attr));
 }
 
 /// Create a time attribute.
@@ -83,20 +68,20 @@ MlirAttribute llhdTimeAttrGet(MlirContext ctx, MlirStringRef timeUnit,
 
 /// Get the time unit of a time attribute.
 MlirStringRef llhdTimeAttrGetTimeUnit(MlirAttribute attr) {
-  return wrap(unwrap(attr).cast<TimeAttr>().getTimeUnit());
+  return wrap(cast<TimeAttr>(unwrap(attr)).getTimeUnit());
 }
 
 /// Get the seconds component of a time attribute.
 uint64_t llhdTimeAttrGetSeconds(MlirAttribute attr) {
-  return unwrap(attr).cast<TimeAttr>().getTime();
+  return cast<TimeAttr>(unwrap(attr)).getTime();
 }
 
 /// Get the delta component of a time attribute.
 uint64_t llhdTimeAttrGetDelta(MlirAttribute attr) {
-  return unwrap(attr).cast<TimeAttr>().getDelta();
+  return cast<TimeAttr>(unwrap(attr)).getDelta();
 }
 
 /// Get the epsilon component of a time attribute.
 uint64_t llhdTimeAttrGetEpsilon(MlirAttribute attr) {
-  return unwrap(attr).cast<TimeAttr>().getEpsilon();
+  return cast<TimeAttr>(unwrap(attr)).getEpsilon();
 }

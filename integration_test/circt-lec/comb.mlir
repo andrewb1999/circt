@@ -1,5 +1,5 @@
-// These tests will be only enabled if circt-lec is built.
-// REQUIRES: circt-lec
+// REQUIRES: libz3
+// REQUIRES: circt-lec-jit
 
 hw.module @basic(in %in: i1, out out: i1) {
   hw.output %in : i1
@@ -12,7 +12,7 @@ hw.module @not(in %in: i1, out out: i1) {
 }
 
 // comb.add
-//  RUN: circt-lec %s -c1=adder -c2=completeAdder -v=false | FileCheck %s --check-prefix=COMB_ADD
+//  RUN: circt-lec %s -c1=adder -c2=completeAdder --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_ADD
 //  COMB_ADD: c1 == c2
 
 hw.module @adder(in %in1: i2, in %in2: i2, out out: i2) {
@@ -39,7 +39,7 @@ hw.module @completeAdder(in %in1: i2, in %in2 : i2, out out: i2) {
 }
 
 // comb.and
-//  RUN: circt-lec %s -c1=and -c2=decomposedAnd -v=false | FileCheck %s --check-prefix=COMB_AND
+//  RUN: circt-lec %s -c1=and -c2=decomposedAnd --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_AND
 //  COMB_AND: c1 == c2
 
 hw.module @and(in %in1: i1, in %in2: i1, out out: i1) {
@@ -59,25 +59,103 @@ hw.module @decomposedAnd(in %in1: i1, in %in2: i1, out out: i1) {
 // TODO
 
 // comb.divs
-// TODO
+// RUN: circt-lec %s -c1=divs_unsafe -c2=divs_unsafe --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_DIVS_UNSAFE
+// RUN: circt-lec %s -c1=divs -c2=divs --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_DIVS
+// COMB_DIVS_UNSAFE: c1 != c2
+// COMB_DIVS: c1 == c2
+
+hw.module @divs_unsafe(in %in1: i32, in %in2: i32, out out: i32) {
+  %0 = comb.divs %in1, %in2 : i32
+  hw.output %0 : i32
+}
+
+hw.module @divs(in %in1: i32, in %in2: i32, out out: i32) {
+  %0 = hw.constant 0 : i32
+  %1 = comb.icmp eq %in2, %0 : i32
+  %2 = comb.divs %in1, %in2 : i32
+  %3 = comb.mux %1, %0, %2 : i32
+  hw.output %3 : i32
+}
 
 // comb.divu
-// TODO
+// RUN: circt-lec %s -c1=divu_unsafe -c2=divu_unsafe --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_DIVU_UNSAFE
+// RUN: circt-lec %s -c1=divu -c2=divu --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_DIVU
+// COMB_DIVU_UNSAFE: c1 != c2
+// COMB_DIVU: c1 == c2
+
+hw.module @divu_unsafe(in %in1: i32, in %in2: i32, out out: i32) {
+  %0 = comb.divu %in1, %in2 : i32
+  hw.output %0 : i32
+}
+
+hw.module @divu(in %in1: i32, in %in2: i32, out out: i32) {
+  %0 = hw.constant 0 : i32
+  %1 = comb.icmp eq %in2, %0 : i32
+  %2 = comb.divu %in1, %in2 : i32
+  %3 = comb.mux %1, %0, %2 : i32
+  hw.output %3 : i32
+}
 
 // comb.extract
 // TODO
 
 // comb.icmp
-// TODO
+//  RUN: circt-lec %s -c1=eqInv -c2=constFalse --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_ICMPEQ
+//  COMB_ICMPEQ: c1 == c2
+hw.module @eqInv(in %a: i8, out eq: i1) {
+  %ones = hw.constant -1 : i8
+  %inv_a = comb.xor bin %a, %ones : i8
+  %eq = comb.icmp bin eq %a, %inv_a : i8
+  hw.output %eq : i1
+}
+
+hw.module @constFalse(in %a: i8, out eq: i1) {
+  %eq = hw.constant false
+  hw.output %eq : i1
+}
+
+// TODO: Other icmp predicates
 
 // comb.mods
-// TODO
+// RUN: circt-lec %s -c1=mods_unsafe -c2=mods_unsafe --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_MODS_UNSAFE
+// RUN: circt-lec %s -c1=mods -c2=mods --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_MODS
+// COMB_MODS_UNSAFE: c1 != c2
+// COMB_MODS: c1 == c2
+
+hw.module @mods_unsafe(in %in1: i32, in %in2: i32, out out: i32) {
+  %0 = comb.mods %in1, %in2 : i32
+  hw.output %0 : i32
+}
+
+hw.module @mods(in %in1: i32, in %in2: i32, out out: i32) {
+  %0 = hw.constant 0 : i32
+  %1 = comb.icmp eq %in2, %0 : i32
+  %2 = comb.mods %in1, %in2 : i32
+  %3 = comb.mux %1, %0, %2 : i32
+  hw.output %3 : i32
+}
 
 // comb.modu
-// TODO
+// RUN: circt-lec %s -c1=modu_unsafe -c2=modu_unsafe --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_MODU_UNSAFE
+// RUN: circt-lec %s -c1=modu -c2=modu --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_MODU
+// COMB_MODU_UNSAFE: c1 != c2
+// COMB_MODU: c1 == c2
+
+hw.module @modu_unsafe(in %in1: i32, in %in2: i32, out out: i32) {
+  %0 = comb.modu %in1, %in2 : i32
+  hw.output %0 : i32
+}
+
+hw.module @modu(in %in1: i32, in %in2: i32, out out: i32) {
+  %0 = hw.constant 0 : i32
+  %1 = comb.icmp eq %in2, %0 : i32
+  %2 = comb.modu %in1, %in2 : i32
+  %3 = comb.mux %1, %0, %2 : i32
+  hw.output %3 : i32
+}
 
 // comb.mul
-//  RUN: circt-lec %s -c1=mulBy2 -c2=addTwice -v=false | FileCheck %s --check-prefix=COMB_MUL
+//  RUN: circt-lec %s -c1=mulBy2 -c2=addTwice --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_MUL
 //  COMB_MUL: c1 == c2
 
 hw.module @mulBy2(in %in: i2, out out: i2) {
@@ -92,7 +170,7 @@ hw.module @addTwice(in %in: i2, out out: i2) {
 }
 
 // comb.mux
-//  RUN: circt-lec %s -c1=mux -c2=decomposedMux -v=false | FileCheck %s --check-prefix=COMB_MUX
+//  RUN: circt-lec %s -c1=mux -c2=decomposedMux --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_MUX
 //  COMB_MUX: c1 == c2
 
 hw.module @mux(in %cond: i1, in %tvalue: i8, in %fvalue: i8, out out: i8) {
@@ -112,7 +190,7 @@ hw.module @decomposedMux(in %cond: i1, in %tvalue: i8, in %fvalue: i8, out out: 
 }
 
 // comb.or
-//  RUN: circt-lec %s -c1=or -c2=decomposedOr -v=false | FileCheck %s --check-prefix=COMB_OR
+//  RUN: circt-lec %s -c1=or -c2=decomposedOr --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_OR
 //  COMB_OR: c1 == c2
 
 hw.module @or(in %in1: i1, in %in2: i1, out out: i1) {
@@ -129,7 +207,7 @@ hw.module @decomposedOr(in %in1: i1, in %in2: i1, out out: i1) {
 }
 
 // comb.parity
-//  RUN: circt-lec %s -c1=parity -c2=decomposedParity -v=false | FileCheck %s --check-prefix=COMB_PARITY
+//  RUN: circt-lec %s -c1=parity -c2=decomposedParity --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_PARITY
 //  COMB_PARITY: c1 == c2
 
 hw.module @parity(in %in: i8, out out: i1) {
@@ -151,7 +229,7 @@ hw.module @decomposedParity(in %in: i8, out out: i1) {
 }
 
 // comb.replicate
-//  RUN: circt-lec %s -c1=replicate -c2=decomposedReplicate -v=false | FileCheck %s --check-prefix=COMB_REPLICATE
+//  RUN: circt-lec %s -c1=replicate -c2=decomposedReplicate --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_REPLICATE
 //  COMB_REPLICATE: c1 == c2
 
 hw.module @replicate(in %in: i2, out out: i8) {
@@ -165,7 +243,7 @@ hw.module @decomposedReplicate(in %in: i2, out out: i8) {
 }
 
 // comb.shl
-//  RUN: circt-lec %s -c1=shl -c2=decomposedShl -v=false | FileCheck %s --check-prefix=COMB_SHL
+//  RUN: circt-lec %s -c1=shl -c2=decomposedShl --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_SHL
 //  COMB_SHL: c1 == c2
 
 hw.module @shl(in %in1: i2, in %in2: i2, out out: i2) {
@@ -199,7 +277,7 @@ hw.module @decomposedShl(in %in1: i2, in %in2: i2, out out: i2) {
 // TODO
 
 // comb.sub
-//  RUN: circt-lec %s -c1=subtractor -c2=completeSubtractor -v=false | FileCheck %s --check-prefix=COMB_SUB
+//  RUN: circt-lec %s -c1=subtractor -c2=completeSubtractor --shared-libs=%libz3 | FileCheck %s --check-prefix=COMB_SUB
 //  COMB_SUB: c1 == c2
 
 hw.module @subtractor(in %in1: i8, in %in2: i8, out out: i8) {

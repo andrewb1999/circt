@@ -41,15 +41,15 @@ static Attribute constFoldUnaryOp(ArrayRef<Attribute> operands,
   if (!operands[0])
     return {};
 
-  if (auto val = operands[0].dyn_cast<AttrElementT>()) {
+  if (auto val = dyn_cast<AttrElementT>(operands[0])) {
     return AttrElementT::get(val.getType(), calculate(val.getValue()));
-  } else if (auto val = operands[0].dyn_cast<SplatElementsAttr>()) {
+  } else if (auto val = dyn_cast<SplatElementsAttr>(operands[0])) {
     // Operand is a splat so we can avoid expanding the value out and
     // just fold based on the splat value.
     auto elementResult = calculate(val.getSplatValue<ElementValueT>());
     return DenseElementsAttr::get(val.getType(), elementResult);
   }
-  if (auto val = operands[0].dyn_cast<ElementsAttr>()) {
+  if (auto val = dyn_cast<ElementsAttr>(operands[0])) {
     // Operand is ElementsAttr-derived; perform an element-wise fold by
     // expanding the values.
     auto valIt = val.getValues<ElementValueT>().begin();
@@ -72,37 +72,37 @@ static Attribute constFoldTernaryOp(ArrayRef<Attribute> operands,
   if (!operands[0] || !operands[1] || !operands[2])
     return {};
 
-  if (operands[0].isa<AttrElementT>() && operands[1].isa<AttrElementT>() &&
-      operands[2].isa<AttrElementT>()) {
-    auto fst = operands[0].cast<AttrElementT>();
-    auto snd = operands[1].cast<AttrElementT>();
-    auto trd = operands[2].cast<AttrElementT>();
+  if (isa<AttrElementT>(operands[0]) && isa<AttrElementT>(operands[1]) &&
+      isa<AttrElementT>(operands[2])) {
+    auto fst = cast<AttrElementT>(operands[0]);
+    auto snd = cast<AttrElementT>(operands[1]);
+    auto trd = cast<AttrElementT>(operands[2]);
 
     return AttrElementT::get(
         fst.getType(),
         calculate(fst.getValue(), snd.getValue(), trd.getValue()));
   }
-  if (operands[0].isa<SplatElementsAttr>() &&
-      operands[1].isa<SplatElementsAttr>() &&
-      operands[2].isa<SplatElementsAttr>()) {
+  if (isa<SplatElementsAttr>(operands[0]) &&
+      isa<SplatElementsAttr>(operands[1]) &&
+      isa<SplatElementsAttr>(operands[2])) {
     // Operands are splats so we can avoid expanding the values out and
     // just fold based on the splat value.
-    auto fst = operands[0].cast<SplatElementsAttr>();
-    auto snd = operands[1].cast<SplatElementsAttr>();
-    auto trd = operands[2].cast<SplatElementsAttr>();
+    auto fst = cast<SplatElementsAttr>(operands[0]);
+    auto snd = cast<SplatElementsAttr>(operands[1]);
+    auto trd = cast<SplatElementsAttr>(operands[2]);
 
     auto elementResult = calculate(fst.getSplatValue<ElementValueT>(),
                                    snd.getSplatValue<ElementValueT>(),
                                    trd.getSplatValue<ElementValueT>());
     return DenseElementsAttr::get(fst.getType(), elementResult);
   }
-  if (operands[0].isa<ElementsAttr>() && operands[1].isa<ElementsAttr>() &&
-      operands[2].isa<ElementsAttr>()) {
+  if (isa<ElementsAttr>(operands[0]) && isa<ElementsAttr>(operands[1]) &&
+      isa<ElementsAttr>(operands[2])) {
     // Operands are ElementsAttr-derived; perform an element-wise fold by
     // expanding the values.
-    auto fst = operands[0].cast<ElementsAttr>();
-    auto snd = operands[1].cast<ElementsAttr>();
-    auto trd = operands[2].cast<ElementsAttr>();
+    auto fst = cast<ElementsAttr>(operands[0]);
+    auto snd = cast<ElementsAttr>(operands[1]);
+    auto trd = cast<ElementsAttr>(operands[2]);
 
     auto fstIt = fst.getValues<ElementValueT>().begin();
     auto sndIt = snd.getValues<ElementValueT>().begin();
@@ -130,23 +130,23 @@ struct constant_int_all_ones_matcher {
 } // anonymous namespace
 
 unsigned circt::llhd::getLLHDTypeWidth(Type type) {
-  if (auto sig = type.dyn_cast<llhd::SigType>())
-    type = sig.getUnderlyingType();
-  else if (auto ptr = type.dyn_cast<llhd::PtrType>())
-    type = ptr.getUnderlyingType();
-  if (auto array = type.dyn_cast<hw::ArrayType>())
+  if (auto sig = dyn_cast<hw::InOutType>(type))
+    type = sig.getElementType();
+  else if (auto ptr = dyn_cast<llhd::PtrType>(type))
+    type = ptr.getElementType();
+  if (auto array = dyn_cast<hw::ArrayType>(type))
     return array.getNumElements();
-  if (auto tup = type.dyn_cast<hw::StructType>())
+  if (auto tup = dyn_cast<hw::StructType>(type))
     return tup.getElements().size();
   return type.getIntOrFloatBitWidth();
 }
 
 Type circt::llhd::getLLHDElementType(Type type) {
-  if (auto sig = type.dyn_cast<llhd::SigType>())
-    type = sig.getUnderlyingType();
-  else if (auto ptr = type.dyn_cast<llhd::PtrType>())
-    type = ptr.getUnderlyingType();
-  if (auto array = type.dyn_cast<hw::ArrayType>())
+  if (auto sig = dyn_cast<hw::InOutType>(type))
+    type = sig.getElementType();
+  else if (auto ptr = dyn_cast<llhd::PtrType>(type))
+    type = ptr.getElementType();
+  if (auto array = dyn_cast<hw::ArrayType>(type))
     return array.getElementType();
   return type;
 }
@@ -184,7 +184,7 @@ static OpFoldResult foldSigPtrExtractOp(Op op, ArrayRef<Attribute> operands) {
 
   // llhd.sig.extract(input, 0) with inputWidth == resultWidth => input
   if (op.getResultWidth() == op.getInputWidth() &&
-      operands[1].cast<IntegerAttr>().getValue().isZero())
+      cast<IntegerAttr>(operands[1]).getValue().isZero())
     return op.getInput();
 
   return nullptr;
@@ -210,7 +210,7 @@ static OpFoldResult foldSigPtrArraySliceOp(Op op,
 
   // llhd.sig.array_slice(input, 0) with inputWidth == resultWidth => input
   if (op.getResultWidth() == op.getInputWidth() &&
-      operands[1].cast<IntegerAttr>().getValue().isZero())
+      cast<IntegerAttr>(operands[1]).getValue().isZero())
     return op.getInput();
 
   return nullptr;
@@ -237,10 +237,12 @@ static LogicalResult canonicalizeSigPtrArraySliceOp(Op op,
   if (matchPattern(op.getInput(),
                    m_Op<Op>(matchers::m_Any(), m_Constant(&a)))) {
     auto sliceOp = op.getInput().template getDefiningOp<Op>();
-    op.getInputMutable().assign(sliceOp.getInput());
-    Value newIndex = rewriter.create<hw::ConstantOp>(
-        op->getLoc(), a.getValue() + indexAttr.getValue());
-    op.getLowIndexMutable().assign(newIndex);
+    rewriter.modifyOpInPlace(op, [&]() {
+      op.getInputMutable().assign(sliceOp.getInput());
+      Value newIndex = rewriter.create<hw::ConstantOp>(
+          op->getLoc(), a.getValue() + indexAttr.getValue());
+      op.getLowIndexMutable().assign(newIndex);
+    });
 
     return success();
   }
@@ -267,15 +269,11 @@ static LogicalResult inferReturnTypesOfStructExtractOp(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
     DictionaryAttr attrs, mlir::OpaqueProperties properties,
     mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
-  Type type = operands[0]
-                  .getType()
-                  .cast<SigPtrType>()
-                  .getUnderlyingType()
-                  .template cast<hw::StructType>()
-                  .getFieldType(attrs.getNamed("field")
-                                    ->getValue()
-                                    .cast<StringAttr>()
-                                    .getValue());
+  Type type =
+      cast<hw::StructType>(
+          cast<SigPtrType>(operands[0].getType()).getElementType())
+          .getFieldType(
+              cast<StringAttr>(attrs.getNamed("field")->getValue()).getValue());
   if (!type) {
     context->getDiagEngine().emit(loc.value_or(UnknownLoc()),
                                   DiagnosticSeverity::Error)
@@ -290,7 +288,7 @@ LogicalResult llhd::SigStructExtractOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
     DictionaryAttr attrs, mlir::OpaqueProperties properties,
     mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
-  return inferReturnTypesOfStructExtractOp<llhd::SigType>(
+  return inferReturnTypesOfStructExtractOp<hw::InOutType>(
       context, loc, operands, attrs, properties, regions, results);
 }
 
@@ -340,475 +338,6 @@ LogicalResult llhd::DrvOp::canonicalize(llhd::DrvOp op,
 SuccessorOperands llhd::WaitOp::getSuccessorOperands(unsigned index) {
   assert(index == 0 && "invalid successor index");
   return SuccessorOperands(getDestOpsMutable());
-}
-
-//===----------------------------------------------------------------------===//
-// EntityOp
-//===----------------------------------------------------------------------===//
-
-/// Parse an argument list of an entity operation.
-/// The argument list and argument types are returned in args and argTypes
-/// respectively.
-static ParseResult
-parseArgumentList(OpAsmParser &parser,
-                  SmallVectorImpl<OpAsmParser::Argument> &args,
-                  SmallVectorImpl<Type> &argTypes) {
-  auto parseElt = [&]() -> ParseResult {
-    OpAsmParser::Argument argument;
-    Type argType;
-    auto optArg = parser.parseOptionalArgument(argument);
-    if (optArg.has_value()) {
-      if (succeeded(optArg.value())) {
-        if (!argument.ssaName.name.empty() &&
-            succeeded(parser.parseColonType(argType))) {
-          args.push_back(argument);
-          argTypes.push_back(argType);
-          args.back().type = argType;
-        }
-      }
-    }
-    return success();
-  };
-
-  return parser.parseCommaSeparatedList(OpAsmParser::Delimiter::Paren,
-                                        parseElt);
-}
-
-/// parse an entity signature with syntax:
-/// (%arg0 : T0, %arg1 : T1, <...>) -> (%out0 : T0, %out1 : T1, <...>)
-static ParseResult
-parseEntitySignature(OpAsmParser &parser, OperationState &result,
-                     SmallVectorImpl<OpAsmParser::Argument> &args,
-                     SmallVectorImpl<Type> &argTypes) {
-  if (parseArgumentList(parser, args, argTypes))
-    return failure();
-  // create the integer attribute with the number of inputs.
-  IntegerAttr insAttr = parser.getBuilder().getI64IntegerAttr(args.size());
-  result.addAttribute("ins", insAttr);
-  if (succeeded(parser.parseOptionalArrow()))
-    if (parseArgumentList(parser, args, argTypes))
-      return failure();
-
-  return success();
-}
-
-ParseResult llhd::EntityOp::parse(OpAsmParser &parser, OperationState &result) {
-  StringAttr entityName;
-  SmallVector<OpAsmParser::Argument, 4> args;
-  SmallVector<Type, 4> argTypes;
-
-  if (parser.parseSymbolName(entityName, SymbolTable::getSymbolAttrName(),
-                             result.attributes))
-    return failure();
-
-  if (parseEntitySignature(parser, result, args, argTypes))
-    return failure();
-
-  if (parser.parseOptionalAttrDictWithKeyword(result.attributes))
-    return failure();
-
-  auto type = parser.getBuilder().getFunctionType(argTypes, std::nullopt);
-  result.addAttribute(
-      circt::llhd::EntityOp::getFunctionTypeAttrName(result.name),
-      TypeAttr::get(type));
-
-  auto &body = *result.addRegion();
-  if (parser.parseRegion(body, args))
-    return failure();
-  if (body.empty())
-    body.push_back(std::make_unique<Block>().release());
-
-  return success();
-}
-
-static void printArgumentList(OpAsmPrinter &printer,
-                              std::vector<BlockArgument> args) {
-  printer << "(";
-  llvm::interleaveComma(args, printer, [&](BlockArgument arg) {
-    printer << arg << " : " << arg.getType();
-  });
-  printer << ")";
-}
-
-void llhd::EntityOp::print(OpAsmPrinter &printer) {
-  std::vector<BlockArgument> ins, outs;
-  uint64_t nIns = getInsAttr().getInt();
-  for (uint64_t i = 0; i < getBody().front().getArguments().size(); ++i) {
-    // no furter verification for the attribute type is required, already
-    // handled by verify.
-    if (i < nIns) {
-      ins.push_back(getBody().front().getArguments()[i]);
-    } else {
-      outs.push_back(getBody().front().getArguments()[i]);
-    }
-  }
-  auto entityName =
-      (*this)
-          ->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName())
-          .getValue();
-  printer << " ";
-  printer.printSymbolName(entityName);
-  printer << " ";
-  printArgumentList(printer, ins);
-  printer << " -> ";
-  printArgumentList(printer, outs);
-  printer.printOptionalAttrDictWithKeyword(
-      (*this)->getAttrs(),
-      /*elidedAttrs =*/{SymbolTable::getSymbolAttrName(),
-                        getFunctionTypeAttrName(), "ins"});
-  printer << " ";
-  printer.printRegion(getBody(), false, false);
-}
-
-LogicalResult llhd::EntityOp::verify() {
-  uint64_t numArgs = getNumArguments();
-  uint64_t nIns = getInsAttr().getInt();
-  // check that there is at most one flag for each argument
-  if (numArgs < nIns) {
-    return emitError(
-               "Cannot have more inputs than arguments, expected at most ")
-           << numArgs << " but got: " << nIns;
-  }
-
-  // Check that all block arguments are of signal type
-  for (size_t i = 0; i < numArgs; ++i)
-    if (!getArgument(i).getType().isa<llhd::SigType>())
-      return emitError("usage of invalid argument type. Got ")
-             << getArgument(i).getType() << ", expected LLHD signal type";
-
-  return success();
-}
-
-LogicalResult circt::llhd::EntityOp::verifyType() {
-  FunctionType type = getFunctionType();
-
-  // Fail if function returns any values. An entity's outputs are specially
-  // marked arguments.
-  if (type.getNumResults() > 0)
-    return emitOpError("an entity cannot have return types.");
-
-  // Check that all operands are of signal type
-  for (Type inputType : type.getInputs())
-    if (!inputType.isa<llhd::SigType>())
-      return emitOpError("usage of invalid argument type. Got ")
-             << inputType << ", expected LLHD signal type";
-
-  return success();
-}
-
-LogicalResult circt::llhd::EntityOp::verifyBody() {
-  // check signal names are unique
-  llvm::StringSet<> sigSet;
-  llvm::StringSet<> instSet;
-  auto walkResult = walk([&sigSet, &instSet](Operation *op) -> WalkResult {
-    return TypeSwitch<Operation *, WalkResult>(op)
-        .Case<SigOp>([&](auto sigOp) -> WalkResult {
-          if (!sigSet.insert(sigOp.getName()).second)
-            return sigOp.emitError("redefinition of signal named '")
-                   << sigOp.getName() << "'!";
-
-          return success();
-        })
-        .Case<OutputOp>([&](auto outputOp) -> WalkResult {
-          if (outputOp.getName() && !sigSet.insert(*outputOp.getName()).second)
-            return outputOp.emitError("redefinition of signal named '")
-                   << *outputOp.getName() << "'!";
-
-          return success();
-        })
-        .Case<InstOp>([&](auto instOp) -> WalkResult {
-          if (!instSet.insert(instOp.getName()).second)
-            return instOp.emitError("redefinition of instance named '")
-                   << instOp.getName() << "'!";
-
-          return success();
-        })
-        .Default([](auto op) -> WalkResult { return WalkResult::advance(); });
-  });
-
-  return failure(walkResult.wasInterrupted());
-}
-
-/// Returns the argument types of this function.
-ArrayRef<Type> llhd::EntityOp::getArgumentTypes() {
-  return getFunctionType().getInputs();
-}
-
-/// Returns the result types of this function.
-ArrayRef<Type> llhd::EntityOp::getResultTypes() {
-  return getFunctionType().getResults();
-}
-
-Region *llhd::EntityOp::getCallableRegion() {
-  return isExternal() ? nullptr : &getBody();
-}
-
-//===----------------------------------------------------------------------===//
-// ProcOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult circt::llhd::ProcOp::verifyType() {
-  // Fail if function returns more than zero values. This is because the
-  // outputs of a process are specially marked arguments.
-  if (getNumResults() > 0) {
-    return emitOpError(
-        "process has more than zero return types, this is not allowed");
-  }
-
-  // Check that all operands are of signal type
-  for (int i = 0, e = getNumArguments(); i < e; ++i) {
-    if (!getArgument(i).getType().isa<llhd::SigType>()) {
-      return emitOpError("usage of invalid argument type, was ")
-             << getArgument(i).getType() << ", expected LLHD signal type";
-    }
-  }
-  return success();
-}
-
-/// Returns the argument types of this function.
-ArrayRef<Type> llhd::ProcOp::getArgumentTypes() {
-  return getFunctionType().getInputs();
-}
-
-/// Returns the result types of this function.
-ArrayRef<Type> llhd::ProcOp::getResultTypes() {
-  return getFunctionType().getResults();
-}
-
-LogicalResult circt::llhd::ProcOp::verifyBody() { return success(); }
-
-LogicalResult llhd::ProcOp::verify() {
-  // Check that the ins attribute is smaller or equal the number of
-  // arguments
-  uint64_t numArgs = getNumArguments();
-  uint64_t numIns = getInsAttr().getInt();
-  if (numArgs < numIns) {
-    return emitOpError(
-               "Cannot have more inputs than arguments, expected at most ")
-           << numArgs << ", got " << numIns;
-  }
-  return success();
-}
-
-static ParseResult
-parseProcArgumentList(OpAsmParser &parser, SmallVectorImpl<Type> &argTypes,
-                      SmallVectorImpl<OpAsmParser::Argument> &argNames) {
-  if (parser.parseLParen())
-    return failure();
-
-  // The argument list either has to consistently have ssa-id's followed by
-  // types, or just be a type list.  It isn't ok to sometimes have SSA ID's
-  // and sometimes not.
-  auto parseArgument = [&]() -> ParseResult {
-    llvm::SMLoc loc = parser.getCurrentLocation();
-
-    // Parse argument name if present.
-    OpAsmParser::Argument argument;
-    Type argumentType;
-    auto optArg = parser.parseOptionalArgument(argument);
-    if (optArg.has_value()) {
-      if (succeeded(optArg.value())) {
-        // Reject this if the preceding argument was missing a name.
-        if (argNames.empty() && !argTypes.empty())
-          return parser.emitError(loc,
-                                  "expected type instead of SSA identifier");
-        argNames.push_back(argument);
-
-        if (parser.parseColonType(argumentType))
-          return failure();
-      } else if (!argNames.empty()) {
-        // Reject this if the preceding argument had a name.
-        return parser.emitError(loc, "expected SSA identifier");
-      } else if (parser.parseType(argumentType)) {
-        return failure();
-      }
-    }
-
-    // Add the argument type.
-    argTypes.push_back(argumentType);
-    argNames.back().type = argumentType;
-
-    return success();
-  };
-
-  // Parse the function arguments.
-  if (failed(parser.parseOptionalRParen())) {
-    do {
-      unsigned numTypedArguments = argTypes.size();
-      if (parseArgument())
-        return failure();
-
-      llvm::SMLoc loc = parser.getCurrentLocation();
-      if (argTypes.size() == numTypedArguments &&
-          succeeded(parser.parseOptionalComma()))
-        return parser.emitError(loc, "variadic arguments are not allowed");
-    } while (succeeded(parser.parseOptionalComma()));
-    if (parser.parseRParen())
-      return failure();
-  }
-
-  return success();
-}
-
-ParseResult llhd::ProcOp::parse(OpAsmParser &parser, OperationState &result) {
-  StringAttr procName;
-  SmallVector<OpAsmParser::Argument, 8> argNames;
-  SmallVector<Type, 8> argTypes;
-  Builder &builder = parser.getBuilder();
-
-  if (parser.parseSymbolName(procName, SymbolTable::getSymbolAttrName(),
-                             result.attributes))
-    return failure();
-
-  if (parseProcArgumentList(parser, argTypes, argNames))
-    return failure();
-
-  result.addAttribute("ins", builder.getI64IntegerAttr(argTypes.size()));
-  if (parser.parseArrow())
-    return failure();
-
-  if (parseProcArgumentList(parser, argTypes, argNames))
-    return failure();
-
-  auto type = builder.getFunctionType(argTypes, std::nullopt);
-  result.addAttribute(circt::llhd::ProcOp::getFunctionTypeAttrName(result.name),
-                      TypeAttr::get(type));
-
-  auto *body = result.addRegion();
-  if (parser.parseRegion(*body, argNames))
-    return failure();
-
-  return success();
-}
-
-/// Print the signature of the `proc` unit. Assumes that it passed the
-/// verification.
-static void printProcArguments(OpAsmPrinter &p, Operation *op,
-                               ArrayRef<Type> types, uint64_t numIns) {
-  Region &body = op->getRegion(0);
-  auto printList = [&](unsigned i, unsigned max) -> void {
-    for (; i < max; ++i) {
-      p << body.front().getArgument(i) << " : " << types[i];
-      p.printOptionalAttrDict(::mlir::function_interface_impl::getArgAttrs(
-          cast<mlir::FunctionOpInterface>(op), i));
-
-      if (i < max - 1)
-        p << ", ";
-    }
-  };
-
-  p << '(';
-  printList(0, numIns);
-  p << ") -> (";
-  printList(numIns, types.size());
-  p << ')';
-}
-
-void llhd::ProcOp::print(OpAsmPrinter &printer) {
-  FunctionType type = getFunctionType();
-  printer << ' ';
-  printer.printSymbolName(getName());
-  printProcArguments(printer, getOperation(), type.getInputs(),
-                     getInsAttr().getInt());
-  printer << " ";
-  printer.printRegion(getBody(), false, true);
-}
-
-Region *llhd::ProcOp::getCallableRegion() {
-  return isExternal() ? nullptr : &getBody();
-}
-
-//===----------------------------------------------------------------------===//
-// InstOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult llhd::InstOp::verify() {
-  // Check that the callee attribute was specified.
-  auto calleeAttr = (*this)->getAttrOfType<FlatSymbolRefAttr>("callee");
-  if (!calleeAttr)
-    return emitOpError("requires a 'callee' symbol reference attribute");
-
-  auto proc = (*this)->getParentOfType<ModuleOp>().lookupSymbol<llhd::ProcOp>(
-      calleeAttr.getValue());
-  if (proc) {
-    auto type = proc.getFunctionType();
-
-    if (proc.getIns() != getInputs().size())
-      return emitOpError("incorrect number of inputs for proc instantiation");
-
-    if (type.getNumInputs() != getNumOperands())
-      return emitOpError("incorrect number of outputs for proc instantiation");
-
-    for (size_t i = 0, e = type.getNumInputs(); i != e; ++i) {
-      if (getOperand(i).getType() != type.getInput(i))
-        return emitOpError("operand type mismatch");
-    }
-
-    return success();
-  }
-
-  auto entity =
-      (*this)->getParentOfType<ModuleOp>().lookupSymbol<llhd::EntityOp>(
-          calleeAttr.getValue());
-  if (entity) {
-    auto type = entity.getFunctionType();
-
-    if (entity.getIns() != getInputs().size())
-      return emitOpError("incorrect number of inputs for entity instantiation");
-
-    if (type.getNumInputs() != getNumOperands())
-      return emitOpError(
-          "incorrect number of outputs for entity instantiation");
-
-    for (size_t i = 0, e = type.getNumInputs(); i != e; ++i) {
-      if (getOperand(i).getType() != type.getInput(i))
-        return emitOpError("operand type mismatch");
-    }
-
-    return success();
-  }
-
-  auto module =
-      (*this)->getParentOfType<ModuleOp>().lookupSymbol<hw::HWModuleOp>(
-          calleeAttr.getValue());
-  if (module) {
-
-    if (module.getNumInputPorts() != getInputs().size())
-      return emitOpError(
-          "incorrect number of inputs for hw.module instantiation");
-
-    if (module.getNumOutputPorts() + module.getNumInputPorts() !=
-        getNumOperands())
-      return emitOpError(
-          "incorrect number of outputs for hw.module instantiation");
-
-    // Check input types
-    for (size_t i = 0, e = module.getNumInputPorts(); i != e; ++i) {
-      if (getOperand(i).getType().cast<llhd::SigType>().getUnderlyingType() !=
-          module.getInputTypes()[i])
-        return emitOpError("input type mismatch");
-    }
-
-    // Check output types
-    for (size_t i = 0, e = module.getNumOutputPorts(); i != e; ++i) {
-      if (getOperand(module.getNumInputPorts() + i)
-              .getType()
-              .cast<llhd::SigType>()
-              .getUnderlyingType() != module.getOutputTypes()[i])
-        return emitOpError("output type mismatch");
-    }
-
-    return success();
-  }
-
-  return emitOpError()
-         << "'" << calleeAttr.getValue()
-         << "' does not reference a valid proc, entity, or hw.module";
-}
-
-FunctionType llhd::InstOp::getCalleeType() {
-  SmallVector<Type, 8> argTypes(getOperandTypes());
-  return FunctionType::get(getContext(), argTypes, ArrayRef<Type>());
 }
 
 //===----------------------------------------------------------------------===//
@@ -921,7 +450,7 @@ void llhd::RegOp::print(OpAsmPrinter &printer) {
   printer << " " << getSignal();
   for (size_t i = 0, e = getValues().size(); i < e; ++i) {
     std::optional<llhd::RegMode> mode = llhd::symbolizeRegMode(
-        getModes().getValue()[i].cast<IntegerAttr>().getInt());
+        cast<IntegerAttr>(getModes().getValue()[i]).getInt());
     if (!mode) {
       emitError("invalid RegMode");
       return;
@@ -979,7 +508,7 @@ LogicalResult llhd::RegOp::verify() {
   unsigned counter = 0;
   unsigned prevElement = 0;
   for (Attribute maskElem : getGateMask().getValue()) {
-    int64_t val = maskElem.cast<IntegerAttr>().getInt();
+    int64_t val = cast<IntegerAttr>(maskElem).getInt();
     if (val < 0)
       return emitError("Element in 'gateMask' must not be negative!");
     if (val == 0)
@@ -1000,7 +529,7 @@ LogicalResult llhd::RegOp::verify() {
   for (auto val : getValues()) {
     if (val.getType() != getSignal().getType() &&
         val.getType() !=
-            getSignal().getType().cast<llhd::SigType>().getUnderlyingType()) {
+            cast<hw::InOutType>(getSignal().getType()).getElementType()) {
       return emitOpError(
           "type of each 'value' has to be either the same as the "
           "type of 'signal' or the underlying type of 'signal'");

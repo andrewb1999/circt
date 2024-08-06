@@ -9,8 +9,9 @@
 ; CHECK:   }
 ; CHECK: }
 
+FIRRTL version 4.0.0
 circuit StopAndFinishTest:
-  module StopAndFinishTest :
+  public module StopAndFinishTest :
     input clock : Clock
     input cond : UInt<1>
 
@@ -26,5 +27,6 @@ circuit StopAndFinishTest:
     ; CHECK:   }
     ; CHECK: }
 
+    printf(clock, cond, "Stop message")
     stop(clock, cond, 0)
     stop(clock, cond, 1)

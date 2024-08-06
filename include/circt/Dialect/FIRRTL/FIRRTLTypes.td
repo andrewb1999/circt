@@ -39,7 +39,7 @@ def FIRRTLType : FIRRTLDialectTypeHelper<"FIRRTLType", "FIRRTLType", [{
   }]>;
 
 def FIRRTLBaseType : FIRRTLDialectType<
-  CPred<"$_self.isa<FIRRTLBaseType>()">,
+  CPred<"llvm::isa<FIRRTLBaseType>($_self)">,
   "a base type", "::circt::firrtl::FIRRTLBaseType", [{
     A base FIRRTL type, such as a clock, integer, or wire.
 
@@ -87,16 +87,17 @@ def PassiveType : FIRRTLDialectType<
 
 def SizedType : FIRRTLDialectType<CPred<"type_isa<FIRRTLBaseType>($_self) && "
     "!type_cast<FIRRTLBaseType>($_self).hasUninferredWidth()">,
-    "a sized type (contains no uninferred widths)", "::circt::firrtl::FIRRTLType">;
+    "a sized type (contains no uninferred widths)", 
+    "::circt::firrtl::FIRRTLBaseType">;
 def SizedOrForeignType : AnyTypeOf<[SizedType, ForeignType]>;
 def SizedPassiveType : FIRRTLDialectType<And<[SizedType.predicate,PassiveType.predicate]>,
-    "a sized passive base type (contains no uninferred widths, or flips)", "::circt::firrtl::FIRRTLType">;
+    "a sized passive base type (contains no uninferred widths, or flips)", 
+    "::circt::firrtl::FIRRTLBaseType">;
 def SizedPassiveOrForeignType : AnyTypeOf<[SizedPassiveType, ForeignType]>;
 
 def AsyncResetType : FIRRTLDialectAliasTypeHelper<"AsyncResetType", "async reset type">;
 
 def ResetType : FIRRTLDialectAliasTypeHelper<"ResetType", "reset type">;
-
 
 def RefType : FIRRTLDialectTypeHelper<"RefType", "reference type">;
 
@@ -104,14 +105,11 @@ def RWProbe : FIRRTLDialectType<
   CPred<"type_isa<RefType>($_self) && type_cast<RefType>($_self).getForceable()">,
    "rwprobe type", "::circt::firrtl::RefType">;
 
-def RWProbeConcreteReset : FIRRTLDialectType<
-  CPred<[{type_isa<RefType>($_self) &&
-         type_cast<RefType>($_self).getForceable() &&
-         !type_cast<RefType>($_self).hasUninferredReset()}]>,
-   "rwprobe type (with concrete resets only)", "::circt::firrtl::RefType">;
+def LHSType : FIRRTLDialectType<CPred<"isa<LHSType>($_self)">,
+                                      "writable type", "::circt::firrtl::LHSType">;
 
 def ConnectableType : AnyTypeOf<[FIRRTLBaseType, ForeignType]>;
-def StrictConnectableType : AnyTypeOf<[SizedPassiveType, ForeignType]>;
+def MatchingConnectableType : AnyTypeOf<[SizedPassiveType, ForeignType]>;
 
 //===----------------------------------------------------------------------===//
 // Sized and Unsized Integers
@@ -128,6 +126,12 @@ class SizedUIntType<int width> : FIRRTLDialectType<
           "type_cast<UIntType>($_self).getWidth() == " # width>,
     width # "-bit uint", "::circt::firrtl::UIntType">;
 
+class SizedUIntTypeLTE<int width> : FIRRTLDialectType<
+    CPred<"type_isa<UIntType>($_self) && "
+          "type_cast<UIntType>($_self).getWidth() <= " # width>,
+    "uint with width less than or equal to " # width # " bits",
+    "::circt::firrtl::UIntType">;
+
 class NonConstSizedUIntType<int width> :
   SizedUIntType<width>,
   BuildableType<
@@ -138,8 +142,8 @@ def UInt2Type : SizedUIntType<2>;
 def UInt32Type : SizedUIntType<32>;
 def NonConstUInt1Type : NonConstSizedUIntType<1>;
 
-def UInt1OrUnsizedType : AnyTypeOf<[UInt1Type, UnsizedUIntType]>;
-def UInt2OrUnsizedType : AnyTypeOf<[UInt2Type, UnsizedUIntType]>;
+def UIntLTE1OrUnsizedType : AnyTypeOf<[SizedUIntTypeLTE<1>, UnsizedUIntType]>;
+def UIntLTE2OrUnsizedType : AnyTypeOf<[SizedUIntTypeLTE<2>, UnsizedUIntType]>;
 
 //===----------------------------------------------------------------------===//
 // FIRRTL Types Predicates

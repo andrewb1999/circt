@@ -3,11 +3,11 @@ add_circt_dialect_library(CIRCTArcTransforms
   AllocateState.cpp
   ArcCanonicalizer.cpp
   Dedup.cpp
+  FindInitialVectors.cpp
   GroupResetsAndEnables.cpp
   InferMemories.cpp
   InferStateProperties.cpp
   InlineArcs.cpp
-  InlineModules.cpp
   IsolateClocks.cpp
   LatencyRetiming.cpp
   LegalizeStateUpdate.cpp
@@ -19,6 +19,7 @@ add_circt_dialect_library(CIRCTArcTransforms
   MakeTables.cpp
   MuxToControlFlow.cpp
   SimplifyVariadicOps.cpp
+  SplitFuncs.cpp
   SplitLoops.cpp
   StripSV.cpp
 

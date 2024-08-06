@@ -1,4 +1,4 @@
-// RUN: circt-opt %s -prepare-for-emission --split-input-file -verify-diagnostics | FileCheck %s
+// RUN: circt-opt %s --pass-pipeline='builtin.module(any(prepare-for-emission))' --split-input-file -verify-diagnostics | FileCheck %s
 // RUN: circt-opt %s -export-verilog -split-input-file
 
 // CHECK: @namehint_variadic
@@ -144,6 +144,25 @@ module attributes {circt.loweringOptions = "disallowExpressionInliningInPorts"} 
   %0 = comb.add %a_in, %a_in : i8
   hw.instance "xyz3" @MyExtModule(in: %0: i8) -> ()
  }
+}
+
+// -----
+
+module attributes {circt.loweringOptions = "disallowExpressionInliningInPorts"} {
+  // CHECK-LABEL: @ClockExpr(
+  hw.module @ClockExpr(in %clk: i1, in %a: i1, in %b: i1) {
+    %clk_xor_b = comb.xor %clk, %b : i1
+
+    // CHECK: %[[XOR:.+]] = comb.xor
+    // CHECK: %[[WIRE:.+]] = sv.wire
+    // CHECK: sv.assign %[[WIRE]], %[[XOR]]
+    // CHECK: %[[READ:.+]] = sv.read_inout %[[WIRE]]
+    // CHECK: ltl.clock %{{.+}} posedge %[[READ]]
+    %i0 = ltl.implication %a, %b : i1, i1
+    %k0 = ltl.clock %i0, posedge %clk_xor_b : !ltl.property
+
+    verif.assert %k0 : !ltl.property
+  }
 }
 
 // -----

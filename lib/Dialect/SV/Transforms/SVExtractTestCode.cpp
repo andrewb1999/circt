@@ -13,21 +13,31 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
+#include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWInstanceGraph.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWSymCache.h"
 #include "circt/Dialect/HW/InnerSymbolNamespace.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "circt/Dialect/Verif/VerifOps.h"
 #include "circt/Support/Namespace.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SetVector.h"
 
 #include <set>
+
+namespace circt {
+namespace sv {
+#define GEN_PASS_DEF_SVEXTRACTTESTCODE
+#include "circt/Dialect/SV/SVPasses.h.inc"
+} // namespace sv
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
@@ -66,7 +76,7 @@ getBackwardSliceSimple(Operation *rootOp, SetVector<Operation *> &backwardSlice,
       if (!backwardSlice.contains(definingOp))
         for (auto newOperand : llvm::reverse(definingOp->getOperands()))
           worklist.push_back(newOperand);
-    } else if (auto blockArg = operand.dyn_cast<BlockArgument>()) {
+    } else if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
       Block *block = blockArg.getOwner();
       Operation *parentOp = block->getParentOp();
       // TODO: determine whether we want to recurse backward into the other
@@ -140,8 +150,8 @@ getBackwardSlice(hw::HWModuleOp module,
 
 static StringAttr getNameForPort(Value val,
                                  SmallVector<mlir::Attribute> modulePorts) {
-  if (auto bv = val.dyn_cast<BlockArgument>())
-    return modulePorts[bv.getArgNumber()].cast<StringAttr>();
+  if (auto bv = dyn_cast<BlockArgument>(val))
+    return cast<StringAttr>(modulePorts[bv.getArgNumber()]);
 
   if (auto *op = val.getDefiningOp()) {
     if (auto readinout = dyn_cast<ReadInOutOp>(op)) {
@@ -152,7 +162,7 @@ static StringAttr getNameForPort(Value val,
           return reg.getNameAttr();
       }
     } else if (auto inst = dyn_cast<hw::InstanceOp>(op)) {
-      auto index = val.cast<mlir::OpResult>().getResultNumber();
+      auto index = cast<mlir::OpResult>(val).getResultNumber();
       SmallString<64> portName = inst.getInstanceName();
       portName += ".";
       auto resultName = inst.getResultName(index);
@@ -222,6 +232,8 @@ static hw::HWModuleOp createModuleForCut(hw::HWModuleOp op,
       b.getStringAttr(getVerilogModuleNameAttr(op).getValue() + suffix), ports);
   if (path)
     newMod->setAttr("output_file", path);
+  if (auto fragments = op->getAttr(emit::getFragmentsAttrName()))
+    newMod->setAttr(emit::getFragmentsAttrName(), fragments);
   newMod.setCommentAttr(b.getStringAttr("VCS coverage exclude_file"));
   newMod.setPrivate();
 
@@ -549,7 +561,8 @@ static bool isAssertOp(hw::HWSymbolCache &symCache, Operation *op) {
     return false;
   }
 
-  return isa<AssertOp, FinishOp, FWriteOp, AssertConcurrentOp, FatalOp>(op);
+  return isa<AssertOp, FinishOp, FWriteOp, AssertConcurrentOp, FatalOp,
+             verif::AssertOp, verif::ClockedAssertOp>(op);
 }
 
 static bool isCoverOp(hw::HWSymbolCache &symCache, Operation *op) {
@@ -559,7 +572,8 @@ static bool isCoverOp(hw::HWSymbolCache &symCache, Operation *op) {
     if (auto *mod = symCache.getDefinition(inst.getModuleNameAttr()))
       if (mod->getAttr("firrtl.extract.cover.extra"))
         return true;
-  return isa<CoverOp, CoverConcurrentOp>(op);
+  return isa<CoverOp, CoverConcurrentOp, verif::CoverOp, verif::ClockedCoverOp>(
+      op);
 }
 
 static bool isAssumeOp(hw::HWSymbolCache &symCache, Operation *op) {
@@ -570,7 +584,8 @@ static bool isAssumeOp(hw::HWSymbolCache &symCache, Operation *op) {
       if (mod->getAttr("firrtl.extract.assume.extra"))
         return true;
 
-  return isa<AssumeOp, AssumeConcurrentOp>(op);
+  return isa<AssumeOp, AssumeConcurrentOp, verif::AssumeOp,
+             verif::ClockedAssumeOp>(op);
 }
 
 /// Return true if the operation belongs to the design.
@@ -622,7 +637,7 @@ bool isInDesign(hw::HWSymbolCache &symCache, Operation *op,
 namespace {
 
 struct SVExtractTestCodeImplPass
-    : public SVExtractTestCodeBase<SVExtractTestCodeImplPass> {
+    : public circt::sv::impl::SVExtractTestCodeBase<SVExtractTestCodeImplPass> {
   SVExtractTestCodeImplPass(bool disableInstanceExtraction,
                             bool disableRegisterExtraction,
                             bool disableModuleInlining) {

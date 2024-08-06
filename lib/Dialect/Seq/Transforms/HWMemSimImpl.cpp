@@ -11,7 +11,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/HW/HWAttributes.h"
@@ -20,8 +19,10 @@
 #include "circt/Dialect/HW/InnerSymbolNamespace.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqAttributes.h"
+#include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Dialect/Seq/SeqPasses.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Path.h"
 
@@ -88,7 +89,7 @@ struct HWMemSimImplPass : public impl::HWMemSimImplBase<HWMemSimImplPass> {
 static bool valueDefinedBeforeOp(Value value, Operation *op) {
   Operation *valueOp = value.getDefiningOp();
   Block *valueBlock =
-      valueOp ? valueOp->getBlock() : value.cast<BlockArgument>().getOwner();
+      valueOp ? valueOp->getBlock() : cast<BlockArgument>(value).getOwner();
   while (op->getBlock() && op->getBlock() != valueBlock)
     op = op->getParentOp();
   return valueBlock == op->getBlock() &&
@@ -110,11 +111,10 @@ static Value getMemoryRead(ImplicitLocOpBuilder &b, Value memory, Value addr,
   auto slot =
       b.create<sv::ReadInOutOp>(b.create<sv::ArrayIndexInOutOp>(memory, addr));
   // If we don't want to add mux pragmas, just return the read value.
-  if (!addMuxPragmas || memory.getType()
-                                .cast<hw::InOutType>()
-                                .getElementType()
-                                .cast<hw::UnpackedArrayType>()
-                                .getNumElements() <= 1)
+  if (!addMuxPragmas ||
+      cast<hw::UnpackedArrayType>(
+          cast<hw::InOutType>(memory.getType()).getElementType())
+              .getNumElements() <= 1)
     return slot;
   circt::sv::setSVAttributes(
       slot, sv::SVAttributeAttr::get(b.getContext(), "cadence map_to_mux",
@@ -593,10 +593,9 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
         b.create<sv::IfDefProceduralOp>("RANDOMIZE_MEM_INIT", [&]() {
           auto outerLoopIndVarType =
               b.getIntegerType(llvm::Log2_64_Ceil(mem.depth + 1));
-          auto innerUpperBoundWidth = randomMemReg.getType()
-                                          .getElementType()
-                                          .cast<IntegerType>()
-                                          .getWidth();
+          auto innerUpperBoundWidth =
+              cast<IntegerType>(randomMemReg.getType().getElementType())
+                  .getWidth();
           auto innerLoopIndVarType =
               b.getIntegerType(llvm::Log2_64_Ceil(innerUpperBoundWidth + 1));
           // Construct the following nested for loops:

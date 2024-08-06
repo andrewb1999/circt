@@ -10,12 +10,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRParser.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotationHelper.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/NLATable.h"
 #include "circt/Dialect/FIRRTL/Namespace.h"
@@ -25,12 +25,20 @@
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/JSON.h"
 #include <functional>
 
 #define DEBUG_TYPE "omir"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_EMITOMIR
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -59,7 +67,7 @@ struct Tracker {
   bool hasFieldID() { return fieldID > 0; }
 };
 
-class EmitOMIRPass : public EmitOMIRBase<EmitOMIRPass> {
+class EmitOMIRPass : public circt::firrtl::impl::EmitOMIRBase<EmitOMIRPass> {
 public:
   using EmitOMIRBase::outputFilename;
 
@@ -179,7 +187,7 @@ static IntegerAttr isOMSRAM(Attribute &node) {
       if (auto valueArr = omTy.getAs<ArrayAttr>("value"))
         for (auto attr : valueArr)
           if (auto str = dyn_cast<StringAttr>(attr))
-            if (str.getValue().equals("OMString:OMSRAM"))
+            if (str.getValue() == "OMString:OMSRAM")
               return id;
   }
   return {};
@@ -653,8 +661,7 @@ void EmitOMIRPass::runOnOperation() {
     AnnotationSet::removeAnnotations(
         op, std::bind(setTracker, -1, std::placeholders::_1));
     if (auto modOp = dyn_cast<FModuleOp>(op)) {
-      AnnotationSet annos(modOp.getAnnotations());
-      if (!annos.hasAnnotation(dutAnnoClass))
+      if (!AnnotationSet::hasAnnotation(modOp, dutAnnoClass))
         return;
       dutModuleName = modOp.getNameAttr();
     }
@@ -760,7 +767,7 @@ void EmitOMIRPass::makeTrackerAbsolute(Tracker &tracker) {
   if (tracker.nla) {
     auto path = tracker.nla.getNamepath().getValue();
     for (auto attr : path.drop_back()) {
-      auto ref = attr.cast<hw::InnerRefAttr>();
+      auto ref = cast<hw::InnerRefAttr>(attr);
       // Find the instance referenced by the NLA.
       auto *node = instanceGraph->lookup(ref.getModule());
       auto it = llvm::find_if(*node, [&](igraph::InstanceRecord *record) {
@@ -900,7 +907,7 @@ void EmitOMIRPass::emitOMField(StringAttr fieldName, DictionaryAttr field,
     jsonStream.attribute("name", fieldName.strref());
     jsonStream.attributeBegin("value");
     emitValue(field.get("value"), jsonStream,
-              fieldName.strref().equals("dutInstance"));
+              fieldName.strref() == "dutInstance");
     jsonStream.attributeEnd();
   });
 }
@@ -1118,7 +1125,7 @@ void EmitOMIRPass::emitTrackedTarget(DictionaryAttr node,
     hw::InnerRefAttr instName;
     for (auto nameRef : tracker.nla.getNamepath()) {
       StringAttr modName;
-      if (auto innerRef = nameRef.dyn_cast<hw::InnerRefAttr>())
+      if (auto innerRef = dyn_cast<hw::InnerRefAttr>(nameRef))
         modName = innerRef.getModule();
       else if (auto ref = dyn_cast<FlatSymbolRefAttr>(nameRef))
         modName = ref.getAttr();
@@ -1146,7 +1153,7 @@ void EmitOMIRPass::emitTrackedTarget(DictionaryAttr node,
       }
       target.append(addSymbol(module));
 
-      if (auto innerRef = nameRef.dyn_cast<hw::InnerRefAttr>()) {
+      if (auto innerRef = dyn_cast<hw::InnerRefAttr>(nameRef)) {
         // Find an instance with the given name in this module. Ensure it has a
         // symbol that we can refer to.
         auto instOp = instancesByName.lookup(innerRef);

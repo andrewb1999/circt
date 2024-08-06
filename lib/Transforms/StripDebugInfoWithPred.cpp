@@ -6,7 +6,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
@@ -14,8 +13,12 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
 
-using namespace mlir;
+namespace circt {
+#define GEN_PASS_DEF_STRIPDEBUGINFOWITHPRED
+#include "circt/Transforms/Passes.h.inc"
+} // namespace circt
 
+using namespace mlir;
 template <typename OpOrBlockArgument>
 static void updateLocIfChanged(OpOrBlockArgument *op, Location newLoc) {
   if (op->getLoc() != newLoc)
@@ -24,7 +27,7 @@ static void updateLocIfChanged(OpOrBlockArgument *op, Location newLoc) {
 
 namespace {
 struct StripDebugInfoWithPred
-    : public circt::StripDebugInfoWithPredBase<StripDebugInfoWithPred> {
+    : public circt::impl::StripDebugInfoWithPredBase<StripDebugInfoWithPred> {
   StripDebugInfoWithPred(const std::function<bool(mlir::Location)> &pred)
       : pred(pred) {}
   void runOnOperation() override;
@@ -35,12 +38,15 @@ struct StripDebugInfoWithPred
     if (pred(loc))
       return UnknownLoc::get(loc.getContext());
 
-    if (auto fusedLoc = loc.dyn_cast<FusedLoc>()) {
+    if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
       SmallVector<mlir::Location> newLocations;
       newLocations.reserve(fusedLoc.getLocations().size());
       for (auto loc : fusedLoc.getLocations())
         newLocations.push_back(getStrippedLoc(loc));
-      return FusedLoc::get(&getContext(), newLocations, fusedLoc.getMetadata());
+      // NOTE: Don't use FusedLoc::get(&getContext(), newLocations,
+      //       fusedLoc.getMetadata()) to avoid a bytecode reader bug
+      //       llvm-project#99626.
+      return FusedLoc::get(newLocations, fusedLoc.getMetadata(), &getContext());
     }
 
     // TODO: Handle other loc type.
@@ -71,7 +77,7 @@ void StripDebugInfoWithPred::runOnOperation() {
   // strip file info with that suffix.
   if (!pred && !dropSuffix.empty()) {
     pred = [&](mlir::Location loc) {
-      if (auto fileLoc = loc.dyn_cast<FileLineColLoc>())
+      if (auto fileLoc = dyn_cast<FileLineColLoc>(loc))
         return fileLoc.getFilename().getValue().ends_with(dropSuffix);
       return false;
     };
@@ -83,20 +89,39 @@ void StripDebugInfoWithPred::runOnOperation() {
     return;
   }
 
-  parallelForEach(
-      &getContext(), getOperation().getOps(), [&](Operation &toplevelOp) {
-        toplevelOp.walk([&](Operation *op) {
-          updateLocIfChanged(op, getStrippedLoc(op->getLoc()));
-          updateLocArray(op, "arg_locs");
-          updateLocArray(op, "result_locs");
-          updateLocArray(op, "port_locs");
-          // Strip block arguments debug info.
-          for (Region &region : op->getRegions())
-            for (Block &block : region.getBlocks())
-              for (BlockArgument &arg : block.getArguments())
-                updateLocIfChanged(&arg, getStrippedLoc(arg.getLoc()));
-        });
-      });
+  auto stripLocsOnOp = [this](Operation *op) {
+    updateLocIfChanged(op, getStrippedLoc(op->getLoc()));
+    updateLocArray(op, "arg_locs");
+    updateLocArray(op, "result_locs");
+    updateLocArray(op, "port_locs");
+  };
+
+  // Handle operations sequentially if they have no regions,
+  // and parallelize walking over the remainder.
+  // If not for this special sequential-vs-parallel handling, would instead
+  // only do a simple walk and defer to pass scheduling for parallelism.
+  SmallVector<Operation *> topLevelOpsToWalk;
+  for (auto &op : getOperation().getOps()) {
+    // Gather operations with regions for parallel processing.
+    if (op.getNumRegions() != 0) {
+      topLevelOpsToWalk.push_back(&op);
+      continue;
+    }
+
+    // Otherwise, handle right now -- not worth the cost.
+    stripLocsOnOp(&op);
+  }
+
+  parallelForEach(&getContext(), topLevelOpsToWalk, [&](Operation *toplevelOp) {
+    toplevelOp->walk([&](Operation *op) {
+      stripLocsOnOp(op);
+      // Strip block arguments debug info.
+      for (Region &region : op->getRegions())
+        for (Block &block : region.getBlocks())
+          for (BlockArgument &arg : block.getArguments())
+            updateLocIfChanged(&arg, getStrippedLoc(arg.getLoc()));
+    });
+  });
 }
 
 namespace circt {

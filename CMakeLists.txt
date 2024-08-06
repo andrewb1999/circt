@@ -145,6 +145,12 @@ else()
   include_directories(SYSTEM ${MLIR_INCLUDE_DIR})
   include_directories(SYSTEM ${MLIR_TABLEGEN_OUTPUT_DIR})
 
+  # If building as part of a unified build, whether or not MLIR's execution engine
+  # is enabled must be fetched from its subdirectory scope.
+  get_directory_property(MLIR_ENABLE_EXECUTION_ENGINE
+      DIRECTORY ${MLIR_MAIN_SRC_DIR}
+      DEFINITION MLIR_ENABLE_EXECUTION_ENGINE)
+
   set(BACKEND_PACKAGE_STRING "${PACKAGE_STRING}")
 
   set(CIRCT_GTEST_AVAILABLE 1)
@@ -189,6 +195,9 @@ include(AddCIRCT)
 add_custom_target(circt-headers)
 set_target_properties(circt-headers PROPERTIES FOLDER "Misc")
 add_custom_target(circt-doc)
+
+# Umbrella target that builds all C API bindings.
+add_custom_target(circt-capi)
 
 # Add MLIR and LLVM headers to the include path
 include_directories(${LLVM_INCLUDE_DIRS})
@@ -440,31 +449,13 @@ else()
 endif()
 
 #-------------------------------------------------------------------------------
-# llhd-sim Configuration
+# Z3Lib Configuration (for circt-lec and SMT dialect integration tests)
 #-------------------------------------------------------------------------------
 
-if(NOT WIN32)
-  option(CIRCT_LLHD_SIM_ENABLED "Enables LLHD sim." ON)
-else()
-  option(CIRCT_LLHD_SIM_ENABLED "Enables LLHD sim." OFF)
-endif()
-
-if(CIRCT_LLHD_SIM_ENABLED)
-  message(STATUS "llhd-sim is enabled.")
-else()
-  message(STATUS "llhd-sim is disabled.")
-endif()
-
-llvm_canonicalize_cmake_booleans(CIRCT_LLHD_SIM_ENABLED)
-
-#-------------------------------------------------------------------------------
-# circt-lec Configuration
-#-------------------------------------------------------------------------------
-
-# If circt-lec hasn't been explicitly disabled, find it.
-option(CIRCT_LEC_DISABLE "Disable the Logical Equivalence Checker" OFF)
-if(CIRCT_LEC_DISABLE)
-  message(STATUS "Disabling circt-lec")
+# If z3 hasn't been explicitly disabled, find it.
+option(Z3_DISABLE "Disable the z3 tests.")
+if (Z3_DISABLE)
+  message(STATUS "Disabling tests requiring z3.")
 else()
   if(Z3_DIR)
     # Search and load the package configuration file in the specified directory.
@@ -479,16 +470,35 @@ else()
     # Attempt initialising Z3 according to LLVM's `FindZ3` CMake module.
     find_package(Z3)
   endif()
-  
+
   if(Z3_FOUND)
     SET(CIRCT_LEC_Z3_VER 4.8.11)
     if(Z3_VERSION_STRING VERSION_LESS ${CIRCT_LEC_Z3_VER})
       message(WARNING "Cannot build circt-lec with outdated Z3 version ${Z3_VERSION_STRING}, requires ${CIRCT_LEC_Z3_VER}.")
     else()
       message(STATUS "Z3 identified as a logical backend.")
-      # Signal to proceed building circt-lec.
-      set(CIRCT_LEC_ENABLED ON)
     endif()
+  endif()
+endif()
+
+#-------------------------------------------------------------------------------
+# Z3 Configuration (for integration tests to check SMT-LIB export)
+#-------------------------------------------------------------------------------
+
+# If z3 hasn't been explicitly disabled, find it.
+option(Z3_DISABLE "Disable the z3 tests.")
+if (Z3_DISABLE)
+  message(STATUS "Disabling tests requiring z3.")
+else()
+  # Search for the `z3` command.
+  find_program(Z3_PATH "z3")
+  if(EXISTS ${Z3_PATH})
+    # Then strip the filename.
+    get_filename_component(Z3_PATH ${Z3_PATH} DIRECTORY)
+    message(STATUS "Found z3 at ${Z3_PATH}.")
+  else()
+    set(Z3_PATH "")
+    message(STATUS "Did NOT find z3.")
   endif()
 endif()
 
@@ -581,10 +591,27 @@ if(CIRCT_SLANG_FRONTEND_ENABLED)
     # harder than it ought to be.
     set_property(
       GLOBAL APPEND PROPERTY CIRCT_EXPORTS slang_slang unordered_dense fmt)
+    
+    # Disable the installation of headers coming from third-party libraries. We
+    # won't use those APIs directly. Just make them static libraries for the sake
+    # of running slang normally.
+    set_target_properties(fmt PROPERTIES PUBLIC_HEADER "")
+    set_target_properties(unordered_dense PROPERTIES PUBLIC_HEADER "")
+
     install(TARGETS slang_slang unordered_dense fmt EXPORT CIRCTTargets)
   else()
     find_package(slang 3.0 REQUIRED)
   endif()
+endif()
+
+#-------------------------------------------------------------------------------
+# Arcilator JIT
+#-------------------------------------------------------------------------------
+
+if(MLIR_ENABLE_EXECUTION_ENGINE)
+  set(ARCILATOR_JIT_ENABLED 1)
+else()
+  set(ARCILATOR_JIT_ENABLED 0)
 endif()
 
 #-------------------------------------------------------------------------------

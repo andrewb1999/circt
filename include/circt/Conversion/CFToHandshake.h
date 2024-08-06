@@ -17,7 +17,6 @@
 #include "circt/Dialect/Handshake/HandshakeOps.h"
 #include "circt/Dialect/Handshake/HandshakePasses.h"
 #include "circt/Support/BackedgeBuilder.h"
-#include "circt/Transforms/Passes.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 #include <memory>
@@ -29,6 +28,11 @@ class OperationPass;
 } // namespace mlir
 
 namespace circt {
+
+#define GEN_PASS_DECL_CFTOHANDSHAKE
+#define GEN_PASS_DECL_HANDSHAKEREMOVEBLOCK
+#include "circt/Conversion/Passes.h.inc"
+
 namespace handshake {
 
 // ============================================================================
@@ -72,7 +76,7 @@ public:
   template <typename TSrcTerm, typename TDstTerm>
   LogicalResult setControlOnlyPath(ConversionPatternRewriter &rewriter,
                                    Value entryCtrl) {
-    assert(entryCtrl.getType().isa<NoneType>() &&
+    assert(isa<NoneType>(entryCtrl.getType()) &&
            "Expected NoneType for entry control value");
     // Creates start and end points of the control-only path
     Block *entryBlock = &r.front();
@@ -95,7 +99,7 @@ public:
     // Apply SSA maximization on the newly added entry block argument to
     // propagate it explicitly between the start-point of the control-only
     // network and the function's terminators
-    if (failed(maximizeSSA(entryCtrl, rewriter)))
+    if (failed(runSSAMaximization(rewriter, entryCtrl)))
       return failure();
 
     // Identify all block arguments belonging to the control-only network
@@ -145,6 +149,12 @@ public:
   MLIRContext *getContext() { return r.getContext(); }
 
 protected:
+  // SSA maximization dispatch, to avoid an inclusion of
+  // "circt/Transforms/Passes.h" in this header file (which itself is in the
+  // Converisons library). Instead, move this dependency to CFToHandshake.cpp.
+  LogicalResult runSSAMaximization(ConversionPatternRewriter &rewriter,
+                                   Value entryCtrl);
+
   Region &r;
 
   /// Start point of the control-only network
