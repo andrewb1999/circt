@@ -307,7 +307,7 @@ SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
     }
 
     return TypeSwitch<Operation *, WalkResult>(op)
-        .Case<YieldOp, arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
+        .Case<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
               arith::TruncIOp, CmpIOp, IndexCastOp, memref::AllocaOp,
               memref::AllocOp, loopschedule::AllocInterface, YieldOp,
               func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, ShLIOp, AndIOp,

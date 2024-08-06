@@ -594,6 +594,8 @@ LogicalResult SimplexSchedulerBase::solveTableau() {
       continue;
     }
 
+    llvm::errs() << "failed to find pivot column\n";
+    dumpTableau();
     // If we did not find a pivot column, then the entire row contained only
     // positive entries, and the problem is in principle infeasible. However, if
     // the entry in the `parameterTColumn` is positive, we can try to make the
@@ -698,6 +700,10 @@ LogicalResult SimplexSchedulerBase::scheduleAt(unsigned startTimeVariable,
   assert(startTimeVariable < startTimeLocations.size());
   assert(!frozenVariables.count(startTimeVariable));
 
+  // auto solvedTest = solveTableau();
+  // if (succeeded(solvedTest))
+  //   llvm::errs() << "solved correctly before fixing\n";
+
   // Freeze variable and translate its column by parameter S.
   unsigned frozenCol = freeze(startTimeVariable, timeStep);
   translate(frozenCol, /* factor1= */ 0, /* factorS= */ 1, /* factorT= */ 0);
@@ -740,6 +746,7 @@ LogicalResult SimplexSchedulerBase::scheduleAt(unsigned startTimeVariable,
   translate(parameterSColumn, /* factor1= */ -timeStep, /* factorS= */ 1,
             /* factorT= */ 0);
 
+  dumpTableau();
   return success();
 }
 
@@ -867,7 +874,12 @@ void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
   Operation *src = dep.getSource();
   Operation *dst = dep.getDestination();
   unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
+  llvm::errs() << "source: ";
+  dep.getSource()->dump();
+  llvm::errs() << "dest: ";
+  dep.getDestination()->dump();
   if (auto dist = prob.getDistance(dep)) {
+    llvm::errs() << "dist: " << dist.value() << "\n";
     // the latency of the last op in a recurrence must be at least 1
     if (latency == 0) {
       // // src->dump();
@@ -879,6 +891,7 @@ void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
       // llvm::errs() << "=======================\n";
     }
   }
+  llvm::errs() << "=======================\n";
   row[parameter1Column] = -latency; // note the negation
   if (src != dst) { // note that these coefficients just zero out in self-arcs.
     row[startTimeLocations[startTimeVariables[src]]] = 1;
@@ -1053,8 +1066,11 @@ LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
   DenseSet<ResourceType> usedRsrcs;
   SmallDenseMap<ResourceType, TableType> tempTables(tables);
 
+  // llvm::errs() << "here1\n";
   unsigned slot = timeStep % sched.parameterT;
+  // llvm::errs() << "slot = " << slot << "\n";
   for (auto rsrc : sched.prob.getLinkedResourceTypes(op)) {
+    // llvm::errs() << "resource type\n";
     auto lim = sched.prob.getResourceLimit(rsrc);
     assert(lim.has_value() && "resource type does not have limit");
     assert(lim.value() > 0);
@@ -1062,14 +1078,15 @@ LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
     auto &revTab = reverseTables[rsrc];
     assert(!revTab.count(op));
 
-    auto &cell = tempTables[rsrc][slot];
-    if (cell.size() >= lim)
+    auto &tempCell = tempTables[rsrc][slot];
+    if (tempCell.size() >= lim)
       return failure();
-    cell.insert(op);
+    tempCell.insert(op);
     usedRsrcs.insert(rsrc);
   }
 
   for (auto rsrc : usedRsrcs) {
+    // llvm::errs() << "usedRsrcs\n";
     auto &revTab = reverseTables[rsrc];
     assert(!revTab.count(op));
     auto &cell = tables[rsrc][slot];
@@ -1084,6 +1101,7 @@ LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
 
 void ModuloSimplexScheduler::MRT::release(Operation *op) {
   for (auto rsrc : sched.prob.getLinkedResourceTypes(op)) {
+    // llvm::errs() << "release resource\n";
     auto &revTab = reverseTables[rsrc];
     auto it = revTab.find(op);
     assert(it != revTab.end());
@@ -1146,6 +1164,7 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
 
   for (unsigned ct = stN; ct <= ubN; ++ct)
     if (succeeded(mrt.enter(n, ct))) {
+      // llvm::errs() << "entered, schedule at " << ct << "\n";
       auto fixedN = scheduleAt(stvN, ct);
       if (succeeded(fixedN)) {
         LLVM_DEBUG(dbgs() << "Success at t=" << ct << " " << *n << '\n');
@@ -1168,6 +1187,8 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   // Note that the approach below is much simpler than in the paper
   // because of the fully-pipelined operators. In our case, it's always
   // sufficient to increment the II by one.
+
+  llvm::errs() << "parameterT: " << parameterT << "\n";
 
   // Decompose start time.
   unsigned phiN = stN / parameterT;
@@ -1202,6 +1223,11 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
       }
     }
 
+    j->dump();
+    llvm::errs() << "phiJ: " << phiJ << "\n";
+    llvm::errs() << "deltaJ: " << deltaJ << "\n";
+    llvm::errs() << "========================\n";
+
     // Move operation.
     //
     // In order to keep the op in its current MRT slot `tauJ` after incrementing
@@ -1232,6 +1258,10 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
 
   // Finally, schedule the operation. Again, adding `phiN` accounts for the
   // implicit shift caused by incrementing the II.
+  llvm::errs() << "II shift schedule at " << stN + phiN + deltaN << "\n";
+  llvm::errs() << "stN: " << stN << "\n";
+  llvm::errs() << "phiN: " << phiN << "\n";
+  llvm::errs() << "deltaN: " << deltaN << "\n";
   auto fixedN = scheduleAt(stvN, stN + phiN + deltaN);
   auto enteredN = mrt.enter(n, tauN + deltaN);
   n->dump();

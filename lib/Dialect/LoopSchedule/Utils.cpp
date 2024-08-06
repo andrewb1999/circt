@@ -113,6 +113,9 @@ getModuloProblem(scf::ForOp forOp,
       if (!forOp->isAncestor(memoryDep.source))
         continue;
 
+      unsigned distance = memoryDep.distance;
+      // if (distance > 0)
+      //   continue;
       // Insert a dependence into the problem.
       Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
@@ -123,7 +126,7 @@ getModuloProblem(scf::ForOp forOp,
       // assumes outer loops execute sequentially, i.e. one iteration of the
       // inner loop completes before the next iteration is initiated. With
       // proper analysis and lowerings, this can be relaxed.
-      unsigned distance = memoryDep.distance;
+      // unsigned distance = memoryDep.distance;
       if (distance > 0)
         problem.setDistance(dep, distance);
     }

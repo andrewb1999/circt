@@ -362,7 +362,7 @@ LogicalResult SharedOperatorsProblem::verifyUtilization(ResourceType rsrc) {
   for (auto &kv : nOpsPerTimeStep)
     if (kv.second > *limit)
       return getContainingOp()->emitError()
-             << "Operator type '" << rsrc.getName().getValue()
+             << "Resource type '" << rsrc.getName().getValue()
              << "' is oversubscribed."
              << "\n  time step: " << kv.first
              << "\n  #operations: " << kv.second << "\n  limit: " << *limit;
