@@ -594,8 +594,8 @@ LogicalResult SimplexSchedulerBase::solveTableau() {
       continue;
     }
 
-    llvm::errs() << "failed to find pivot column\n";
-    dumpTableau();
+    // llvm::errs() << "failed to find pivot column\n";
+    // dumpTableau();
     // If we did not find a pivot column, then the entire row contained only
     // positive entries, and the problem is in principle infeasible. However, if
     // the entry in the `parameterTColumn` is positive, we can try to make the
@@ -714,7 +714,7 @@ LogicalResult SimplexSchedulerBase::scheduleAt(unsigned startTimeVariable,
   parameterS = 0;
 
   if (failed(solved)) {
-    llvm::errs() << "here failed\n";
+    // llvm::errs() << "here failed\n";
     // The LP is infeasible with the new constraint. We could try other values
     // for S, but for now, we just roll back and signal failure to the driver.
     translate(frozenCol, /* factor1= */ 0, /* factorS= */ -1, /* factorT= */ 0);
@@ -746,7 +746,7 @@ LogicalResult SimplexSchedulerBase::scheduleAt(unsigned startTimeVariable,
   translate(parameterSColumn, /* factor1= */ -timeStep, /* factorS= */ 1,
             /* factorT= */ 0);
 
-  dumpTableau();
+  // dumpTableau();
   return success();
 }
 
@@ -874,12 +874,12 @@ void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
   Operation *src = dep.getSource();
   Operation *dst = dep.getDestination();
   unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
-  llvm::errs() << "source: ";
-  dep.getSource()->dump();
-  llvm::errs() << "dest: ";
-  dep.getDestination()->dump();
+  // llvm::errs() << "source: ";
+  // dep.getSource()->dump();
+  // llvm::errs() << "dest: ";
+  // dep.getDestination()->dump();
   if (auto dist = prob.getDistance(dep)) {
-    llvm::errs() << "dist: " << dist.value() << "\n";
+    // llvm::errs() << "dist: " << dist.value() << "\n";
     // the latency of the last op in a recurrence must be at least 1
     if (latency == 0) {
       // // src->dump();
@@ -891,7 +891,7 @@ void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
       // llvm::errs() << "=======================\n";
     }
   }
-  llvm::errs() << "=======================\n";
+  // llvm::errs() << "=======================\n";
   row[parameter1Column] = -latency; // note the negation
   if (src != dst) { // note that these coefficients just zero out in self-arcs.
     row[startTimeLocations[startTimeVariables[src]]] = 1;
@@ -1188,7 +1188,7 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   // because of the fully-pipelined operators. In our case, it's always
   // sufficient to increment the II by one.
 
-  llvm::errs() << "parameterT: " << parameterT << "\n";
+  // llvm::errs() << "parameterT: " << parameterT << "\n";
 
   // Decompose start time.
   unsigned phiN = stN / parameterT;
@@ -1223,10 +1223,10 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
       }
     }
 
-    j->dump();
-    llvm::errs() << "phiJ: " << phiJ << "\n";
-    llvm::errs() << "deltaJ: " << deltaJ << "\n";
-    llvm::errs() << "========================\n";
+    // j->dump();
+    // llvm::errs() << "phiJ: " << phiJ << "\n";
+    // llvm::errs() << "deltaJ: " << deltaJ << "\n";
+    // llvm::errs() << "========================\n";
 
     // Move operation.
     //
@@ -1258,10 +1258,10 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
 
   // Finally, schedule the operation. Again, adding `phiN` accounts for the
   // implicit shift caused by incrementing the II.
-  llvm::errs() << "II shift schedule at " << stN + phiN + deltaN << "\n";
-  llvm::errs() << "stN: " << stN << "\n";
-  llvm::errs() << "phiN: " << phiN << "\n";
-  llvm::errs() << "deltaN: " << deltaN << "\n";
+  // llvm::errs() << "II shift schedule at " << stN + phiN + deltaN << "\n";
+  // llvm::errs() << "stN: " << stN << "\n";
+  // llvm::errs() << "phiN: " << phiN << "\n";
+  // llvm::errs() << "deltaN: " << deltaN << "\n";
   auto fixedN = scheduleAt(stvN, stN + phiN + deltaN);
   auto enteredN = mrt.enter(n, tauN + deltaN);
   n->dump();
@@ -1287,7 +1287,7 @@ unsigned ModuloSimplexScheduler::computeResMinII() {
                                           *prob.getResourceLimit(pair.first)));
   }
 
-  llvm::errs() << "resMinII = " << resMinII << "\n";
+  // llvm::errs() << "resMinII = " << resMinII << "\n";
   return resMinII;
 }
 
