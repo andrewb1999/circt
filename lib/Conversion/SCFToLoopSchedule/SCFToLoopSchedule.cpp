@@ -80,7 +80,8 @@ using namespace circt::loopschedule;
 
 namespace {
 
-struct SCFToLoopSchedule : public circt::impl::SCFToLoopScheduleBase<SCFToLoopSchedule> {
+struct SCFToLoopSchedule
+    : public circt::impl::SCFToLoopScheduleBase<SCFToLoopSchedule> {
   using SCFToLoopScheduleBase<SCFToLoopSchedule>::SCFToLoopScheduleBase;
   void runOnOperation() override;
 
@@ -878,8 +879,9 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
       stagesBlock.front().getResult(stagesBlock.front().getNumResults() - 1));
 
   for (auto value : loop.getBody()->getTerminator()->getOperands()) {
-    unsigned lookupTime = std::min((unsigned)(stageValueMaps.size() - 1),
-                                   (unsigned)(pipeTimes[value].first + ii.getInt()));
+    unsigned lookupTime =
+        std::min((unsigned)(stageValueMaps.size() - 1),
+                 (unsigned)(pipeTimes[value].first + ii.getInt()));
 
     termIterArgs.push_back(stageValueMaps[lookupTime].lookup(value));
     termResults.push_back(stageValueMaps[lookupTime].lookup(value));

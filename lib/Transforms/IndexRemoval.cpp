@@ -115,11 +115,11 @@ struct ReplaceFuncSignature : public OpRewritePattern<func::FuncOp> {
   LogicalResult matchAndRewrite(func::FuncOp funcOp,
                                 PatternRewriter &rewriter) const override {
 
-    auto isNotIndexType = [](Type type) { 
+    auto isNotIndexType = [](Type type) {
       if (auto shaped = dyn_cast<ShapedType>(type)) {
         return !isa<IndexType>(shaped.getElementType());
       }
-      return !isa<IndexType>(type); 
+      return !isa<IndexType>(type);
     };
 
     auto sameOrIndexToInt = [&](Type type) -> Type {
@@ -170,11 +170,11 @@ void IndexRemoval::runOnOperation() {
   auto &context = getContext();
   auto indexWidthInt = IntegerType::get(&context, 64);
 
-  auto isIndexType = [](Type type) { 
+  auto isIndexType = [](Type type) {
     if (auto shaped = dyn_cast<ShapedType>(type)) {
       return isa<IndexType>(shaped.getElementType());
     }
-    return isa<IndexType>(type); 
+    return isa<IndexType>(type);
   };
 
   auto indexToInt = [&](Type type) -> Type {
@@ -222,7 +222,8 @@ void IndexRemoval::runOnOperation() {
 
   patterns.clear();
   patterns.add<ReplaceFuncSignature>(ctx, 64);
-  if (failed(applyOpPatternsAndFold(SmallVector<Operation*> {getOperation()}, std::move(patterns))))
+  if (failed(applyOpPatternsAndFold(SmallVector<Operation *>{getOperation()},
+                                    std::move(patterns))))
     return signalPassFailure();
 }
 

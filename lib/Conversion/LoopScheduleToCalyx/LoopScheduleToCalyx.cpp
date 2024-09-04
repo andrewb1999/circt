@@ -186,13 +186,13 @@ public:
     return stallValues[loop];
   }
 
-  void addPhaseDynamicAccess(PhaseInterface phase, Value port, 
-                         const SmallVector<LoopScheduleIfOp>& conds) {
+  void addPhaseDynamicAccess(PhaseInterface phase, Value port,
+                             const SmallVector<LoopScheduleIfOp> &conds) {
     dynamicAccesses[phase].push_back(std::pair(port, conds));
   }
 
-  SmallVector<std::pair<Value, SmallVector<LoopScheduleIfOp>>> 
-    getPhaseDynamicAccesses(PhaseInterface phase) {
+  SmallVector<std::pair<Value, SmallVector<LoopScheduleIfOp>>>
+  getPhaseDynamicAccesses(PhaseInterface phase) {
     return dynamicAccesses[phase];
   }
 
@@ -268,7 +268,9 @@ private:
 
   DenseMap<LoopInterface, Value> stallValues;
 
-  DenseMap<PhaseInterface, SmallVector<std::pair<Value, SmallVector<LoopScheduleIfOp>>>> dynamicAccesses;
+  DenseMap<PhaseInterface,
+           SmallVector<std::pair<Value, SmallVector<LoopScheduleIfOp>>>>
+      dynamicAccesses;
 
   DenseMap<LoopInterface, SmallVector<Value>> stallPorts;
 
@@ -664,12 +666,12 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
 
   calyx::GroupInterface group;
   if (loadOp.getLatency().value_or(1) > 0) {
-    group =
-        createStaticGroupForOp(rewriter, loadOp, loadOp.getLatency().value_or(1));
+    group = createStaticGroupForOp(rewriter, loadOp,
+                                   loadOp.getLatency().value_or(1));
   } else {
     auto name = getState<ComponentLoweringState>().getUniqueName("load");
-    group = calyx::createGroup<calyx::CombGroupOp>(
-        rewriter, getComponent(), loadOp.getLoc(), name);
+    group = calyx::createGroup<calyx::CombGroupOp>(rewriter, getComponent(),
+                                                   loadOp.getLoc(), name);
   }
   rewriter.setInsertionPointToEnd(group.getBody());
   auto &state = getState<ComponentLoweringState>();
@@ -695,8 +697,7 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
   if (latency < 1)
     latency = 1;
 
-  auto group = createStaticGroupForOp(rewriter, storeOp,
-                                      latency);
+  auto group = createStaticGroupForOp(rewriter, storeOp, latency);
 
   rewriter.setInsertionPointToEnd(group.getBodyBlock());
   auto &state = getState<ComponentLoweringState>();
@@ -1324,7 +1325,8 @@ class BuildStallMap : public calyx::FuncOpPartialLoweringPattern {
             Value regVal = prevPhase.getBodyBlock().back().getOperand(resNum);
             if (auto prevIfOp = regVal.getDefiningOp<LoopScheduleIfOp>()) {
               auto ifResNum = cast<OpResult>(regVal).getResultNumber();
-              regVal = prevIfOp.getBody().getBlocks().back().back().getOperand(ifResNum);
+              regVal = prevIfOp.getBody().getBlocks().back().back().getOperand(
+                  ifResNum);
             }
             if (!isa<BlockArgument>(regVal)) {
               auto *definingOp = regVal.getDefiningOp();
@@ -1334,20 +1336,16 @@ class BuildStallMap : public calyx::FuncOpPartialLoweringPattern {
                   SmallVector<LoopScheduleIfOp> conds;
                   if (ifOp != nullptr)
                     conds.push_back(ifOp);
-                  getState<ComponentLoweringState>()
-                    .addPhaseDynamicAccess(phase,
-                                           loadOp.getMemoryValue(),
-                                           conds);
+                  getState<ComponentLoweringState>().addPhaseDynamicAccess(
+                      phase, loadOp.getMemoryValue(), conds);
                 }
               } else if (auto storeOp = dyn_cast<StoreInterface>(definingOp)) {
                 if (storeOp.isDynamic()) {
                   SmallVector<LoopScheduleIfOp> conds;
                   if (ifOp != nullptr)
                     conds.push_back(ifOp);
-                  getState<ComponentLoweringState>()
-                    .addPhaseDynamicAccess(phase,
-                                           storeOp.getMemoryValue(),
-                                           conds);
+                  getState<ComponentLoweringState>().addPhaseDynamicAccess(
+                      phase, storeOp.getMemoryValue(), conds);
                 }
               }
             }
@@ -1620,13 +1618,13 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
           continue;
         }
 
-        if (isa<LoopScheduleLoadOp>(
-                value.getDefiningOp())) {
+        if (isa<LoopScheduleLoadOp>(value.getDefiningOp())) {
           getState<ComponentLoweringState>().addPhaseReg(phase, value, i);
           continue;
         }
 
-        if (auto load = dyn_cast<calyx::LoadLoweringInterface>(value.getDefiningOp())) {
+        if (auto load =
+                dyn_cast<calyx::LoadLoweringInterface>(value.getDefiningOp())) {
           if (load.getLatency().value_or(1) > 0) {
             getState<ComponentLoweringState>().addPhaseReg(phase, value, i);
             continue;
@@ -1748,7 +1746,6 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       // Get the pipeline register for that result.
       auto reg = pipelineRegisters[i];
 
-      
       if (auto *valuePtr = std::get_if<Value>(&reg); valuePtr) {
         auto evaluatingGroup =
             getState<ComponentLoweringState>().getEvaluatingGroup(value);
@@ -2028,8 +2025,8 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
                                             .getBodyBlock());
       for (auto dynamicAccessPair : dynamicAccesses) {
         Value port = std::get<0>(dynamicAccessPair);
-        auto interface = getState<ComponentLoweringState>()
-                           .getMemoryInterface(port);
+        auto interface =
+            getState<ComponentLoweringState>().getMemoryInterface(port);
         Value doneVal = interface.done();
         auto notOp = getState<ComponentLoweringState>()
                          .getNewLibraryOpInstance<calyx::NotLibOp>(
@@ -2041,9 +2038,10 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
         if (!condVals.empty()) {
           assert(condVals.size() == 1 && "Only one nested if allowed for now");
           auto condVal = condVals.front().getCond();
-          auto andOp = getState<ComponentLoweringState>()
-                           .getNewLibraryOpInstance<calyx::AndLibOp>(
-                               rewriter, phase.getLoc(), {i1Type, i1Type, i1Type});
+          auto andOp =
+              getState<ComponentLoweringState>()
+                  .getNewLibraryOpInstance<calyx::AndLibOp>(
+                      rewriter, phase.getLoc(), {i1Type, i1Type, i1Type});
           rewriter.create<calyx::AssignOp>(phase.getLoc(), andOp.getLeft(),
                                            doneVal);
           rewriter.create<calyx::AssignOp>(phase.getLoc(), andOp.getRight(),
@@ -2094,7 +2092,6 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       return;
 
     // auto nextPhase = dyn_cast<PhaseInterface>(phase->getNextNode());
-
   }
 };
 
@@ -2666,7 +2663,7 @@ void LoopScheduleToCalyxPass::runOnOperation() {
 
   /// This pattern .
   addOncePattern<BuildStallMap>(loweringPatterns, patternState, funcMap,
-                                       *loweringState);
+                                *loweringState);
 
   /// This pattern converts operations within basic blocks to Calyx library
   /// operators. Combinational operations are assigned inside a

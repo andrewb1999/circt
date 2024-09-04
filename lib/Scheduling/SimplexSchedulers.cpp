@@ -849,7 +849,7 @@ bool chainBroken(CyclicProblem &prob, Operation *src, Operation *dst) {
   auto opr = *prob.getLinkedOperatorType(src);
   if (src == dst && prob.getLatency(opr) == 0)
     return false;
-  
+
   if (src == dst)
     return true;
 
@@ -866,7 +866,8 @@ bool chainBroken(CyclicProblem &prob, Operation *src, Operation *dst) {
 }
 
 // bool isStore(Operation *op) {
-//   return isa<loopschedule::LoopScheduleStoreOp, mlir::affine::AffineWriteOpInterface, loopschedule::StoreInterface>(op);
+//   return isa<loopschedule::LoopScheduleStoreOp,
+//   mlir::affine::AffineWriteOpInterface, loopschedule::StoreInterface>(op);
 // }
 
 void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
@@ -885,8 +886,8 @@ void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
       // // src->dump();
       // // dst->dump();
       // if (!chainBroken(prob, src, dst)) {
-        // llvm::errs() << "not chain broken\n";
-        latency = 1;
+      // llvm::errs() << "not chain broken\n";
+      latency = 1;
       // }
       // llvm::errs() << "=======================\n";
     }

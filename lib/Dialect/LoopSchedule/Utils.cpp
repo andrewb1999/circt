@@ -548,7 +548,6 @@ LogicalResult ifOpConversion(Operation *op, Region &body,
                        loopschedule::LoopScheduleDialect>();
   target.addIllegalOp<scf::IfOp>();
 
-
   RewritePatternSet patterns(ctx);
   patterns.add<IfOpConversionPattern>(ctx, predicateMap);
   patterns.add<IfToSelectPattern>(ctx);

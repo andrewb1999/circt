@@ -155,7 +155,6 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
   DependenceResult result = checkMemrefAccessDependence(
       src, dst, depth, &dependenceConstraints, &depComps, false);
 
-
   // llvm::errs() << "dependence check\n";
   // if (result.value == DependenceResult::Failure) {
   //   llvm::errs() << "dependence failure\n";
@@ -202,7 +201,6 @@ static void checkNonAffineAccessPair(Operation *source, Operation *destination,
   if (source == destination)
     return;
 
-
   auto sourceIsSchedInterface =
       isa<SchedulableAffineInterface, LoadInterface, StoreInterface>(source);
   auto destIsSchedInterface =
@@ -211,7 +209,6 @@ static void checkNonAffineAccessPair(Operation *source, Operation *destination,
 
   if (sourceIsSchedInterface != destIsSchedInterface)
     return;
-
 
   if (auto srcInterface = dyn_cast<SchedulableAffineInterface>(source)) {
     if (!srcInterface.hasDependence(destination))
@@ -250,7 +247,6 @@ static void checkNonAffineAccessPair(Operation *source, Operation *destination,
   // We don't care about RAR dependencies
   if (isLoad(source) && isLoad(destination))
     return;
-
 
   if (auto *commonBlock = getCommonBlockInAffineScope(source, destination)) {
 
