@@ -543,6 +543,8 @@ def StaticGroupOp : CalyxOp<"static_group", [
       region->push_back(new Block());
     }]>
   ];
+
+  let hasVerifier = 1;
 }
 
 def AssignOp : CalyxOp<"assign", [

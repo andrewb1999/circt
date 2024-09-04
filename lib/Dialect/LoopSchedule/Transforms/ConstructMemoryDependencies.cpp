@@ -121,9 +121,23 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
       return;
   }
 
+  // source->dump();
+  // destination->dump();
+  // llvm::errs() << "isIntraIteration: " << isIntraIteration << "\n";
+
   // Look for inter-iteration dependences on the same memory location.
   MemRefAccess src(source);
   MemRefAccess dst(destination);
+
+  if (!sourceIsSchedInterface && !destIsSchedInterface) {
+    if (dst.memref != src.memref) {
+      // llvm::errs() << "=======================================\n";
+      return;
+    }
+  }
+
+  // Hack to avoid having to copy the checkMemrefAccessDependence function
+  dst.memref = src.memref;
   FlatAffineValueConstraints dependenceConstraints;
   SmallVector<DependenceComponent, 2> depComps;
 
@@ -131,15 +145,25 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
   // to the same loop nest
   auto numCommonLoops = getNumCommonSurroundingLoops(*source, *destination);
 
-  if (!isIntraIteration && numCommonLoops < 1)
+  if (!isIntraIteration && numCommonLoops < 1) {
+    // llvm::errs() << "=======================================\n";
     return;
+  }
 
   auto depth = isIntraIteration ? numCommonLoops + 1 : numCommonLoops;
 
   DependenceResult result = checkMemrefAccessDependence(
       src, dst, depth, &dependenceConstraints, &depComps, false);
 
+  // llvm::errs() << "dependence check\n";
+  // if (result.value == DependenceResult::Failure) {
+  //   llvm::errs() << "dependence failure\n";
+  // }
+  // if (result.value == DependenceResult::NoDependence) {
+  //   llvm::errs() << "no dependence\n";
+  // }
   if (hasDependence(result)) {
+    // llvm::errs() << "hasDependence\n";
     if (!isIntraIteration) {
       assert(!depComps.empty());
       results[destination].emplace(source, depComps.back().lb.value());
@@ -147,6 +171,7 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
       results[destination].emplace(source, 0);
     }
   }
+  // llvm::errs() << "=======================================\n";
 }
 
 static Value getMemoryValue(Operation *op) {
@@ -167,7 +192,7 @@ static Value getMemoryValue(Operation *op) {
 }
 
 static bool isLoad(Operation *op) {
-  return isa<memref::LoadOp, AffineWriteOpInterface, LoadInterface>(op);
+  return isa<memref::LoadOp, AffineReadOpInterface, LoadInterface>(op);
 }
 
 static void checkNonAffineAccessPair(Operation *source, Operation *destination,
@@ -211,6 +236,13 @@ static void checkNonAffineAccessPair(Operation *source, Operation *destination,
 
   if (!isIntraIteration && numCommonLoops < 1)
     return;
+
+  // source->dump();
+  // destination->dump();
+  // llvm::errs() << "isIntraIteration: " << isIntraIteration << "\n";
+  // llvm::errs() << "source is load: " << isLoad(source) << "\n";
+  // llvm::errs() << "dest is load: " << isLoad(destination) << "\n";
+  // llvm::errs() << "=======================================\n";
 
   // We don't care about RAR dependencies
   if (isLoad(source) && isLoad(destination))
