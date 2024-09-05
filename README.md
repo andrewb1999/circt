@@ -5,9 +5,9 @@
 
 # ⚡️ "CIRCT" / Circuit IR Compilers and Tools
 
-This is fork of CIRCT for ECE5775. The code is located at [rcs-flow](https://github.com/andrewb1999/circt/tree/rcs-flow).
+This is fork of CIRCT for AMC. The code is located at [amc-integration](https://github.com/andrewb1999/circt/tree/amc-integration).
 
-"CIRCT" stands for "Circuit IR Compilers and Tools".  One might also interpret
+"CIRCT" stands for "Circuit Intermediate Representations (IR) Compilers and Tools".  One might also interpret
 it as the recursively as "CIRCT IR Compiler and Tools".  The T can be
 selectively expanded as Tool, Translator, Team, Technology, Target, Tree, Type,
 ... we're ok with the ambiguity.

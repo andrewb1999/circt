@@ -70,11 +70,11 @@ def ServiceRequestRecordOp : ESI_Op<"manifest.req", [
   let arguments = (ins AppIDAttr:$requestor,
                        InnerRefAttr:$servicePort,
                        OptionalAttr<StrAttr>:$stdService,
-                       TypeAttrOf<ChannelBundleType>:$bundleType);
+                       TypeAttrOf<ChannelBundleType>:$typeID);
 
   let assemblyFormat = [{
     qualified($requestor) `,` $servicePort (`std` $stdService^)?
-    `,` $bundleType attr-dict
+    `,` $typeID attr-dict
   }];
 
   let extraClassDeclaration = [{
@@ -128,10 +128,10 @@ def ServiceImplClientRecordOp : ESI_Op<"manifest.impl_conn", [
 
   let arguments = (ins AppIDArrayAttr:$relAppIDPath,
                        InnerRefAttr:$servicePort,
-                       TypeAttrOf<ChannelBundleType>:$bundleType,
+                       TypeAttrOf<ChannelBundleType>:$typeID,
                        DictionaryAttr:$implDetails);
   let assemblyFormat = [{
-    $relAppIDPath `req` $servicePort `(` $bundleType `)`
+    $relAppIDPath `req` $servicePort `(` $typeID `)`
       `with` $implDetails attr-dict
   }];
 
@@ -166,6 +166,23 @@ def AppIDHierNodeOp : ESI_Op<"manifest.hier_node", [
 
   let assemblyFormat = [{
     qualified($appID) `mod` $moduleRef attr-dict-with-keyword $children
+  }];
+}
+
+def SymbolConstantsOp : ESI_Op<"manifest.constants", [
+  DeclareOpInterfaceMethods<IsManifestData>]> {
+  let summary = "Constant values associated with a symbol";
+
+  let arguments = (ins FlatSymbolRefAttr:$symbolRef,
+                       DictionaryAttr:$constants);
+  let assemblyFormat = [{
+    $symbolRef $constants attr-dict
+  }];
+
+  let extraClassDeclaration = [{
+    // Get information which needs to appear in the manifest for the host to
+    // connect to this service.
+    void getDetails(SmallVectorImpl<NamedAttribute> &results);
   }];
 }
 

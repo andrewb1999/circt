@@ -1269,7 +1269,7 @@ static OpFoldResult foldMux(OpTy op, typename OpTy::FoldAdaptor adaptor) {
                       APInt(0, 0, op.getType().isSignedInteger()));
 
   // mux(cond, x, x) -> x
-  if (op.getHigh() == op.getLow())
+  if (op.getHigh() == op.getLow() && op.getHigh().getType() == op.getType())
     return op.getHigh();
 
   // The following folds require that the result has a known width. Otherwise
@@ -1653,6 +1653,17 @@ LogicalResult MultibitMuxOp::canonicalize(MultibitMuxOp op,
         return input == op.getInputs().front();
       })) {
     replaceOpAndCopyName(rewriter, op, op.getInputs().front());
+    return success();
+  }
+
+  // If the index width is narrower than the size of inputs, drop front
+  // elements.
+  auto indexWidth = op.getIndex().getType().getBitWidthOrSentinel();
+  uint64_t inputSize = op.getInputs().size();
+  if (indexWidth >= 0 && indexWidth < 64 && 1ull << indexWidth < inputSize) {
+    rewriter.modifyOpInPlace(op, [&]() {
+      op.getInputsMutable().erase(0, inputSize - (1ull << indexWidth));
+    });
     return success();
   }
 

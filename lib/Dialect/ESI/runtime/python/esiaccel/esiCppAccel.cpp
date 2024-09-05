@@ -42,7 +42,62 @@ struct polymorphic_type_hook<ChannelPort> {
     return port;
   }
 };
+template <>
+struct polymorphic_type_hook<Service> {
+  static const void *get(const Service *svc, const std::type_info *&type) {
+    if (auto p = dynamic_cast<const MMIO *>(svc)) {
+      type = &typeid(MMIO);
+      return p;
+    }
+    if (auto p = dynamic_cast<const SysInfo *>(svc)) {
+      type = &typeid(SysInfo);
+      return p;
+    }
+    if (auto p = dynamic_cast<const HostMem *>(svc)) {
+      type = &typeid(HostMem);
+      return p;
+    }
+    return svc;
+  }
+};
+
+namespace detail {
+/// Pybind11 doesn't have a built-in type caster for std::any
+/// (https://github.com/pybind/pybind11/issues/1590). We must provide one which
+/// knows about all of the potential types which the any might be.
+template <>
+struct type_caster<std::any> {
+public:
+  PYBIND11_TYPE_CASTER(std::any, const_name("object"));
+
+  static handle cast(std::any src, return_value_policy /* policy */,
+                     handle /* parent */) {
+    const std::type_info &t = src.type();
+    if (t == typeid(std::string))
+      return py::str(std::any_cast<std::string>(src));
+    else if (t == typeid(int64_t))
+      return py::int_(std::any_cast<int64_t>(src));
+    else if (t == typeid(uint64_t))
+      return py::int_(std::any_cast<uint64_t>(src));
+    else if (t == typeid(double))
+      return py::float_(std::any_cast<double>(src));
+    else if (t == typeid(bool))
+      return py::bool_(std::any_cast<bool>(src));
+    else if (t == typeid(std::nullptr_t))
+      return py::none();
+    return py::none();
+  }
+};
+} // namespace detail
 } // namespace pybind11
+
+/// Resolve a Type to the Python wrapper object.
+py::object getPyType(std::optional<const Type *> t) {
+  py::object typesModule = py::module_::import("esiaccel.types");
+  if (!t)
+    return py::none();
+  return typesModule.attr("_get_esi_type")(*t);
+}
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 PYBIND11_MODULE(esiCppAccel, m) {
@@ -75,6 +130,37 @@ PYBIND11_MODULE(esiCppAccel, m) {
                              py::return_value_policy::reference)
       .def_property_readonly("size", &ArrayType::getSize);
 
+  py::class_<Constant>(m, "Constant")
+      .def_property_readonly("value", [](Constant &c) { return c.value; })
+      .def_property_readonly(
+          "type", [](Constant &c) { return getPyType(*c.type); },
+          py::return_value_policy::reference);
+
+  py::class_<AppID>(m, "AppID")
+      .def(py::init<std::string, std::optional<uint32_t>>(), py::arg("name"),
+           py::arg("idx") = std::nullopt)
+      .def_property_readonly("name", [](AppID &id) { return id.name; })
+      .def_property_readonly("idx",
+                             [](AppID &id) -> py::object {
+                               if (id.idx)
+                                 return py::cast(id.idx);
+                               return py::none();
+                             })
+      .def("__repr__",
+           [](AppID &id) {
+             std::string ret = "<" + id.name;
+             if (id.idx)
+               ret = ret + "[" + std::to_string(*id.idx) + "]";
+             ret = ret + ">";
+             return ret;
+           })
+      .def("__eq__", [](AppID &a, AppID &b) { return a == b; })
+      .def("__hash__", [](AppID &id) {
+        return utils::hash_combine(std::hash<std::string>{}(id.name),
+                                   std::hash<uint32_t>{}(id.idx.value_or(-1)));
+      });
+  py::class_<AppIDPath>(m, "AppIDPath").def("__repr__", &AppIDPath::toStr);
+
   py::class_<ModuleInfo>(m, "ModuleInfo")
       .def_property_readonly("name", [](ModuleInfo &info) { return info.name; })
       .def_property_readonly("summary",
@@ -84,6 +170,8 @@ PYBIND11_MODULE(esiCppAccel, m) {
       .def_property_readonly("repo", [](ModuleInfo &info) { return info.repo; })
       .def_property_readonly("commit_hash",
                              [](ModuleInfo &info) { return info.commitHash; })
+      .def_property_readonly("constants",
+                             [](ModuleInfo &info) { return info.constants; })
       // TODO: "extra" field.
       .def("__repr__", [](ModuleInfo &info) {
         std::string ret;
@@ -92,13 +180,30 @@ PYBIND11_MODULE(esiCppAccel, m) {
         return os.str();
       });
 
-  py::class_<SysInfo>(m, "SysInfo")
+  py::enum_<Logger::Level>(m, "LogLevel")
+      .value("Debug", Logger::Level::Debug)
+      .value("Info", Logger::Level::Info)
+      .value("Warning", Logger::Level::Warning)
+      .value("Error", Logger::Level::Error)
+      .export_values();
+  py::class_<Logger>(m, "Logger");
+
+  py::class_<services::Service>(m, "Service");
+
+  py::class_<SysInfo, services::Service>(m, "SysInfo")
       .def("esi_version", &SysInfo::getEsiVersion)
       .def("json_manifest", &SysInfo::getJsonManifest);
 
-  py::class_<services::MMIO>(m, "MMIO")
+  py::class_<MMIO::RegionDescriptor>(m, "MMIORegionDescriptor")
+      .def_property_readonly("base",
+                             [](MMIO::RegionDescriptor &r) { return r.base; })
+      .def_property_readonly("size",
+                             [](MMIO::RegionDescriptor &r) { return r.size; });
+  py::class_<services::MMIO, services::Service>(m, "MMIO")
       .def("read", &services::MMIO::read)
-      .def("write", &services::MMIO::write);
+      .def("write", &services::MMIO::write)
+      .def_property_readonly("regions", &services::MMIO::getRegions,
+                             py::return_value_policy::reference);
 
   py::class_<services::HostMem::HostMemRegion>(m, "HostMemRegion")
       .def_property_readonly("ptr",
@@ -123,7 +228,7 @@ PYBIND11_MODULE(esiCppAccel, m) {
         return ret;
       });
 
-  py::class_<services::HostMem>(m, "HostMem")
+  py::class_<services::HostMem, services::Service>(m, "HostMem")
       .def("allocate", &services::HostMem::allocate, py::arg("size"),
            py::arg("options") = services::HostMem::Options(),
            py::return_value_policy::take_ownership)
@@ -141,33 +246,15 @@ PYBIND11_MODULE(esiCppAccel, m) {
           },
           py::arg("ptr"));
 
-  py::class_<AppID>(m, "AppID")
-      .def(py::init<std::string, std::optional<uint32_t>>(), py::arg("name"),
-           py::arg("idx") = std::nullopt)
-      .def_property_readonly("name", [](AppID &id) { return id.name; })
-      .def_property_readonly("idx",
-                             [](AppID &id) -> py::object {
-                               if (id.idx)
-                                 return py::cast(id.idx);
-                               return py::none();
-                             })
-      .def("__repr__",
-           [](AppID &id) {
-             std::string ret = "<" + id.name;
-             if (id.idx)
-               ret = ret + "[" + std::to_string(*id.idx) + "]";
-             ret = ret + ">";
-             return ret;
-           })
-      .def("__eq__", [](AppID &a, AppID &b) { return a == b; })
-      .def("__hash__", [](AppID &id) {
-        // TODO: This is a bad hash function. Replace it.
-        return std::hash<std::string>{}(id.name) ^
-               (std::hash<uint32_t>{}(id.idx.value_or(-1)) << 1);
-      });
-
+  // py::class_<std::__basic_future<MessageData>>(m, "MessageDataFuture");
   py::class_<std::future<MessageData>>(m, "MessageDataFuture")
-      .def("valid", &std::future<MessageData>::valid)
+      .def("valid",
+           [](std::future<MessageData> &f) {
+             // For some reason, if we just pass the function pointer, pybind11
+             // sees `std::__basic_future` as the type and pybind11_stubgen
+             // emits an error.
+             return f.valid();
+           })
       .def("wait", &std::future<MessageData>::wait)
       .def("get", [](std::future<MessageData> &f) {
         MessageData data = f.get();
@@ -181,11 +268,18 @@ PYBIND11_MODULE(esiCppAccel, m) {
                              py::return_value_policy::reference);
 
   py::class_<WriteChannelPort, ChannelPort>(m, "WriteChannelPort")
-      .def("write", [](WriteChannelPort &p, py::bytearray &data) {
+      .def("write",
+           [](WriteChannelPort &p, py::bytearray &data) {
+             py::buffer_info info(py::buffer(data).request());
+             std::vector<uint8_t> dataVec((uint8_t *)info.ptr,
+                                          (uint8_t *)info.ptr + info.size);
+             p.write(dataVec);
+           })
+      .def("tryWrite", [](WriteChannelPort &p, py::bytearray &data) {
         py::buffer_info info(py::buffer(data).request());
         std::vector<uint8_t> dataVec((uint8_t *)info.ptr,
                                      (uint8_t *)info.ptr + info.size);
-        p.write(dataVec);
+        return p.tryWrite(dataVec);
       });
   py::class_<ReadChannelPort, ChannelPort>(m, "ReadChannelPort")
       .def(
@@ -208,6 +302,12 @@ PYBIND11_MODULE(esiCppAccel, m) {
            py::return_value_policy::reference);
 
   py::class_<ServicePort, BundlePort>(m, "ServicePort");
+
+  py::class_<MMIO::MMIORegion, ServicePort>(m, "MMIORegion")
+      .def_property_readonly("descriptor", &MMIO::MMIORegion::getDescriptor)
+      .def("read", &MMIO::MMIORegion::read)
+      .def("write", &MMIO::MMIORegion::write);
+
   py::class_<FuncService::Function, ServicePort>(m, "Function")
       .def(
           "call",
@@ -228,6 +328,8 @@ PYBIND11_MODULE(esiCppAccel, m) {
       py::class_<HWModule>(m, "HWModule")
           .def_property_readonly("info", &HWModule::getInfo)
           .def_property_readonly("ports", &HWModule::getPorts,
+                                 py::return_value_policy::reference)
+          .def_property_readonly("services", &HWModule::getServices,
                                  py::return_value_policy::reference);
 
   // In order to inherit methods from "HWModule", it needs to be defined first.
@@ -245,7 +347,10 @@ PYBIND11_MODULE(esiCppAccel, m) {
 
   py::class_<Context>(m, "Context")
       .def(py::init<>())
-      .def("connect", &Context::connect);
+      .def("connect", &Context::connect)
+      .def("set_stdio_logger", [](Context &ctxt, Logger::Level level) {
+        ctxt.setLogger(std::make_unique<StreamLogger>(level));
+      });
 
   accConn.def(py::init(&registry::connect))
       .def(
@@ -270,8 +375,21 @@ PYBIND11_MODULE(esiCppAccel, m) {
   py::class_<Manifest>(m, "Manifest")
       .def(py::init<Context &, std::string>())
       .def_property_readonly("api_version", &Manifest::getApiVersion)
-      .def("build_accelerator", &Manifest::buildAccelerator,
-           py::return_value_policy::take_ownership)
-      .def_property_readonly("type_table", &Manifest::getTypeTable)
+      .def(
+          "build_accelerator",
+          [&](Manifest &m, AcceleratorConnection &conn) {
+            auto acc = m.buildAccelerator(conn);
+            conn.getServiceThread()->addPoll(*acc);
+            return acc;
+          },
+          py::return_value_policy::reference)
+      .def_property_readonly("type_table",
+                             [](Manifest &m) {
+                               std::vector<py::object> ret;
+                               std::ranges::transform(m.getTypeTable(),
+                                                      std::back_inserter(ret),
+                                                      getPyType);
+                               return ret;
+                             })
       .def_property_readonly("module_infos", &Manifest::getModuleInfos);
 }

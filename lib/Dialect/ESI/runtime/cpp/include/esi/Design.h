@@ -76,6 +76,15 @@ public:
   const std::map<AppID, const BundlePort &> &getPorts() const {
     return portIndex;
   }
+  /// Access the services provided by this module.
+  const std::vector<services::Service *> &getServices() const {
+    return services;
+  }
+
+  /// Master poll method. Calls the `poll` method on all locally owned ports and
+  /// the master `poll` method on all of the children. Returns true if any of
+  /// the `poll` calls returns true.
+  bool poll();
 
 protected:
   const std::optional<ModuleInfo> info;

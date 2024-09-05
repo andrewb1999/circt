@@ -92,11 +92,16 @@ void printInfo(std::ostream &os, AcceleratorConnection &acc) {
 
 void printPort(std::ostream &os, const BundlePort &port,
                std::string indent = "") {
-  os << indent << "  " << port.getID() << ":" << std::endl;
-  for (const auto &[name, chan] : port.getChannels()) {
+  os << indent << "  " << port.getID() << ":";
+  if (auto svcPort = dynamic_cast<const services::ServicePort *>(&port))
+    if (auto svcPortStr = svcPort->toString()) {
+      os << " " << *svcPortStr << std::endl;
+      return;
+    }
+  os << std::endl;
+  for (const auto &[name, chan] : port.getChannels())
     os << indent << "    " << name << ": " << chan.getType()->getID()
        << std::endl;
-  }
 }
 
 void printInstance(std::ostream &os, const HWModule *d,
@@ -121,10 +126,10 @@ void printInstance(std::ostream &os, const HWModule *d,
 void printHier(std::ostream &os, AcceleratorConnection &acc) {
   Manifest manifest(acc.getCtxt(),
                     acc.getService<services::SysInfo>()->getJsonManifest());
-  std::unique_ptr<Accelerator> design = manifest.buildAccelerator(acc);
+  Accelerator *design = manifest.buildAccelerator(acc);
   os << "********************************" << std::endl;
   os << "* Design hierarchy" << std::endl;
   os << "********************************" << std::endl;
   os << std::endl;
-  printInstance(os, design.get());
+  printInstance(os, design);
 }

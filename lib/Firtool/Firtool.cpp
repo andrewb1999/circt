@@ -26,6 +26,9 @@ using namespace circt;
 
 LogicalResult firtool::populatePreprocessTransforms(mlir::PassManager &pm,
                                                     const FirtoolOptions &opt) {
+  pm.nest<firrtl::CircuitOp>().addPass(
+      firrtl::createCheckRecursiveInstantiation());
+  pm.nest<firrtl::CircuitOp>().addPass(firrtl::createCheckLayers());
   // Legalize away "open" aggregates to hw-only versions.
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createLowerOpenAggsPass());
 
@@ -78,7 +81,7 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createInferWidthsPass());
 
   pm.nest<firrtl::CircuitOp>().addPass(
-      firrtl::createMemToRegOfVecPass(opt.shouldReplicateSequentialMemories(),
+      firrtl::createMemToRegOfVecPass(opt.shouldReplaceSequentialMemories(),
                                       opt.shouldIgnoreReadEnableMemories()));
 
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createInferResetsPass());
@@ -161,7 +164,7 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
     pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
         firrtl::createInferReadWritePass());
 
-  if (opt.shouldReplicateSequentialMemories())
+  if (opt.shouldReplaceSequentialMemories())
     pm.nest<firrtl::CircuitOp>().addPass(firrtl::createLowerMemoryPass());
 
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createPrefixModulesPass());
@@ -176,7 +179,7 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
   pm.addNestedPass<firrtl::CircuitOp>(firrtl::createAddSeqMemPortsPass());
 
   pm.addPass(firrtl::createCreateSiFiveMetadataPass(
-      opt.shouldReplicateSequentialMemories(),
+      opt.shouldReplaceSequentialMemories(),
       opt.getReplaceSequentialMemoriesFile()));
 
   pm.addNestedPass<firrtl::CircuitOp>(firrtl::createExtractInstancesPass());
@@ -187,13 +190,6 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
   // collateral is resolved entirely by LowerAnnotations.
   pm.addNestedPass<firrtl::CircuitOp>(
       firrtl::createGrandCentralPass(opt.getCompanionMode()));
-
-  // Read black box source files into the IR.
-  StringRef blackBoxRoot = opt.getBlackBoxRootPath().empty()
-                               ? llvm::sys::path::parent_path(inputFilename)
-                               : opt.getBlackBoxRootPath();
-  pm.nest<firrtl::CircuitOp>().addPass(
-      firrtl::createBlackBoxReaderPass(blackBoxRoot));
 
   // Run SymbolDCE as late as possible, but before InnerSymbolDCE. This is for
   // hierpathop's and just for general cleanup.
@@ -235,6 +231,13 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
 
   pm.nest<firrtl::CircuitOp>().addPass(
       firrtl::createAssignOutputDirsPass(outputFilename));
+
+  // Read black box source files into the IR.
+  StringRef blackBoxRoot = opt.getBlackBoxRootPath().empty()
+                               ? llvm::sys::path::parent_path(inputFilename)
+                               : opt.getBlackBoxRootPath();
+  pm.nest<firrtl::CircuitOp>().addPass(
+      firrtl::createBlackBoxReaderPass(blackBoxRoot));
   return success();
 }
 
@@ -303,7 +306,7 @@ LogicalResult firtool::populateHWToSV(mlir::PassManager &pm,
            FirtoolOptions::RandomKind::Mem),
        /*disableRegRandomization=*/
        !opt.isRandomEnabled(FirtoolOptions::RandomKind::Reg),
-       /*replSeqMem=*/opt.shouldReplicateSequentialMemories(),
+       /*replSeqMem=*/opt.shouldReplaceSequentialMemories(),
        /*readEnableMode=*/opt.shouldIgnoreReadEnableMemories()
            ? seq::ReadEnableMode::Ignore
            : seq::ReadEnableMode::Undefined,

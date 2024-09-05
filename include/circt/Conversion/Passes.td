@@ -551,7 +551,8 @@ def ConvertMooreToCore : Pass<"convert-moore-to-core", "mlir::ModuleOp"> {
   }];
   let constructor = "circt::createConvertMooreToCorePass()";
   let dependentDialects = ["comb::CombDialect", "hw::HWDialect",
-                           "llhd::LLHDDialect"];
+                           "llhd::LLHDDialect", "mlir::cf::ControlFlowDialect",
+                           "mlir::scf::SCFDialect"];
 }
 
 //===----------------------------------------------------------------------===//
@@ -688,7 +689,7 @@ def ConvertToArcs : Pass<"convert-to-arcs", "mlir::ModuleOp"> {
     latency.
   }];
   let constructor = "circt::createConvertToArcsPass()";
-  let dependentDialects = ["circt::arc::ArcDialect"];
+  let dependentDialects = ["circt::arc::ArcDialect", "circt::hw::HWDialect"];
   let options = [
     Option<"tapRegisters", "tap-registers", "bool", "true",
       "Make registers observable">,
