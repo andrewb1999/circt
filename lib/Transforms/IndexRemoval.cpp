@@ -58,7 +58,7 @@ struct ReplaceConstantOpAttr : public OpRewritePattern<arith::ConstantOp> {
 
     auto newAttr =
         IntegerAttr::get(IntegerType::get(getContext(), width),
-                         constantOp.getValue().cast<IntegerAttr>().getInt());
+                         cast<IntegerAttr>(constantOp.getValue()).getInt());
     constantOp.setValueAttr(newAttr);
 
     return success();
