@@ -80,7 +80,8 @@ using namespace circt::loopschedule;
 
 namespace {
 
-struct SCFToLoopSchedule : public circt::impl::SCFToLoopScheduleBase<SCFToLoopSchedule> {
+struct SCFToLoopSchedule
+    : public circt::impl::SCFToLoopScheduleBase<SCFToLoopSchedule> {
   using SCFToLoopScheduleBase<SCFToLoopSchedule>::SCFToLoopScheduleBase;
   void runOnOperation() override;
 
@@ -156,16 +157,16 @@ void SCFToLoopSchedule::runOnOperation() {
     // Populate the target operator types.
     ModuloProblem moduloProblem = getModuloProblem(loop, *dependenceAnalysis);
 
+    if (failed(populateOperatorTypes(loop.getOperation(), loop.getRegion(),
+                                     moduloProblem)))
+      return signalPassFailure();
+
     if (failed(addMemoryResources(loop.getOperation(), loop.getRegion(),
                                   moduloProblem, resourceMap, resourceLimits)))
       return signalPassFailure();
 
     addPredicateDependencies(loop.getOperation(), loop.getRegion(),
                              moduloProblem, predicateMap, predicateUse);
-
-    if (failed(populateOperatorTypes(loop.getOperation(), loop.getRegion(),
-                                     moduloProblem)))
-      return signalPassFailure();
 
     // Solve the scheduling problem computed by the analysis.
     if (failed(solveModuloProblem(loop, moduloProblem)))
@@ -199,17 +200,17 @@ void SCFToLoopSchedule::runOnOperation() {
     assert(loop.getLoopRegions().size() == 1);
     auto problem = getSharedOperatorsProblem(loop, *dependenceAnalysis);
 
+    // Populate the target operator types.
+    if (failed(populateOperatorTypes(loop.getOperation(),
+                                     *loop.getLoopRegions().front(), problem)))
+      return signalPassFailure();
+
     if (failed(addMemoryResources(loop.getOperation(), loop.getRegion(),
                                   problem, resourceMap, resourceLimits)))
       return signalPassFailure();
 
     addPredicateDependencies(loop.getOperation(), loop.getRegion(), problem,
                              predicateMap, predicateUse);
-
-    // Populate the target operator types.
-    if (failed(populateOperatorTypes(loop.getOperation(),
-                                     *loop.getLoopRegions().front(), problem)))
-      return signalPassFailure();
 
     // Solve the scheduling problem computed by the analysis.
     if (failed(solveSharedOperatorsProblem(*loop.getLoopRegions().front(),
@@ -236,17 +237,17 @@ void SCFToLoopSchedule::runOnOperation() {
 
   auto problem = getSharedOperatorsProblem(funcOp, *dependenceAnalysis);
 
+  // Populate the target operator types.
+  if (failed(populateOperatorTypes(funcOp.getOperation(), funcOp.getBody(),
+                                   problem)))
+    return signalPassFailure();
+
   if (failed(addMemoryResources(funcOp.getOperation(), funcOp.getRegion(),
                                 problem, resourceMap, resourceLimits)))
     return signalPassFailure();
 
   addPredicateDependencies(funcOp.getOperation(), funcOp.getRegion(), problem,
                            predicateMap, predicateUse);
-
-  // Populate the target operator types.
-  if (failed(populateOperatorTypes(funcOp.getOperation(), funcOp.getBody(),
-                                   problem)))
-    return signalPassFailure();
 
   // Solve the scheduling problem computed by the analysis.
   if (failed(solveSharedOperatorsProblem(funcOp.getBody(), problem)))
@@ -307,7 +308,7 @@ SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
     }
 
     return TypeSwitch<Operation *, WalkResult>(op)
-        .Case<YieldOp, arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
+        .Case<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
               arith::TruncIOp, CmpIOp, IndexCastOp, memref::AllocaOp,
               memref::AllocOp, loopschedule::AllocInterface, YieldOp,
               func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, ShLIOp, AndIOp,
@@ -323,7 +324,8 @@ SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
         })
         .Case<RemUIOp, RemSIOp, DivSIOp>([&](Operation *op) {
           // Divider ops
-          if (op->getResult(0).getType().getIntOrFloatBitWidth() != 32) {
+          auto bitwidth = op->getResult(0).getType().getIntOrFloatBitWidth();
+          if (bitwidth != 32 && bitwidth != 64) {
             unsupported = op;
             return WalkResult::interrupt();
           }
@@ -703,8 +705,9 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
     unsigned pipeEndTime = 0;
     for (auto *user : iterArg.getUsers()) {
       unsigned userStartTime = *problem.getStartTime(user);
-      if (userStartTime >= startPipeTime)
+      if (userStartTime >= startPipeTime) {
         pipeEndTime = std::max(pipeEndTime, userStartTime);
+      }
     }
 
     // Do not need to pipe result if there are no later uses
@@ -876,8 +879,9 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
       stagesBlock.front().getResult(stagesBlock.front().getNumResults() - 1));
 
   for (auto value : loop.getBody()->getTerminator()->getOperands()) {
-    unsigned lookupTime = std::min((unsigned)(stageValueMaps.size() - 1),
-                                   pipeTimes[value].second);
+    unsigned lookupTime =
+        std::min((unsigned)(stageValueMaps.size() - 1),
+                 (unsigned)(pipeTimes[value].first + ii.getInt()));
 
     termIterArgs.push_back(stageValueMaps[lookupTime].lookup(value));
     termResults.push_back(stageValueMaps[lookupTime].lookup(value));

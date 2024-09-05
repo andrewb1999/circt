@@ -26,6 +26,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
 #include "mlir/Support/LLVM.h"
+#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PriorityQueue.h"
 #include "llvm/ADT/STLExtras.h"
@@ -1404,6 +1405,14 @@ LogicalResult calyx::verifyGroupInterface(Operation *op) {
       continue;
     if (failed(verifyPrimitivePortDriving(assign, group)))
       return failure();
+  }
+
+  return success();
+}
+
+LogicalResult StaticGroupOp::verify() {
+  if (getLatency() < 1) {
+    return emitOpError() << "has latency less than 1";
   }
 
   return success();
