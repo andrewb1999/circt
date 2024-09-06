@@ -509,8 +509,6 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
                                               ModuloProblem &problem) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
 
-  // loop.dump();
-
   builder.setInsertionPointToStart(
       &loop->getParentOfType<FuncOp>().getBody().front());
 
@@ -685,7 +683,6 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
     }
   }
 
-  // loop.dump();
   assert(loop.getLoopRegions().size() == 1);
   for (auto it : enumerate(loop.getLoopRegions().front()->getArguments())) {
     auto iterArg = it.value();
@@ -711,8 +708,6 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
     }
 
     // Do not need to pipe result if there are no later uses
-    // iterArg.dump();
-    // llvm::errs() << startPipeTime << " : " << pipeEndTime << "\n";
     if (startPipeTime >= pipeEndTime)
       continue;
 
@@ -750,18 +745,6 @@ SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
     registerTypes.push_back(types);
     stageValueMaps.push_back(valueMap);
   }
-
-  // llvm::errs() << "startTime\n";
-  // for (auto startTime : startTimes) {
-  //   llvm::errs() << "time = " << startTime << "\n";
-  //   for (auto *op : startGroups[startTime]) {
-  //     op->dump();
-  //   }
-  // }
-  // llvm::errs() << "after startTime\n";
-
-  // One more map is needed for the pipeline stages terminator
-  stageValueMaps.push_back(valueMap);
 
   startTimes.clear();
   startTimes.append(newStartTimes.begin(), newStartTimes.end());
@@ -1033,7 +1016,6 @@ LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
 
   assert(loop.getLoopRegions().size() == 1);
   if (!loop.getLoopRegions().front()->getArgument(0).getUsers().empty()) {
-    // llvm::errs() << "Add extra start group\n";
     auto containsLoop = false;
     for (auto *op : startGroups[endTime]) {
       if (isa<LoopInterface>(op)) {
