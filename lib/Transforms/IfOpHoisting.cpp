@@ -41,27 +41,19 @@ struct IfOpHoistingPattern : OpConversionPattern<scf::IfOp> {
   LogicalResult
   matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.modifyOpInPlace(op, [&]() {
-      if (!op.thenBlock()->without_terminator().empty()) {
-        rewriter.splitBlock(op.thenBlock(), --op.thenBlock()->end());
-        rewriter.inlineBlockBefore(&op.getThenRegion().front(), op);
-      }
-      if (op.elseBlock() && !op.elseBlock()->without_terminator().empty()) {
-        rewriter.splitBlock(op.elseBlock(), --op.elseBlock()->end());
-        rewriter.inlineBlockBefore(&op.getElseRegion().front(), op);
-      }
-    });
+    if (!op.elseBlock()) {
+      return failure();
+    }
 
-    return success();
-  }
-};
+    if (!op.thenBlock()->without_terminator().empty()) {
+      rewriter.splitBlock(op.thenBlock(), --op.thenBlock()->end());
+      rewriter.inlineBlockBefore(&op.getThenRegion().front(), op);
+    }
+    if (op.elseBlock() && !op.elseBlock()->without_terminator().empty()) {
+      rewriter.splitBlock(op.elseBlock(), --op.elseBlock()->end());
+      rewriter.inlineBlockBefore(&op.getElseRegion().front(), op);
+    }
 
-struct IfToSelectPattern : OpConversionPattern<scf::IfOp> {
-  using OpConversionPattern<scf::IfOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
     if (!op.thenBlock()->without_terminator().empty() || !op.elseBlock()) {
       return failure();
     }
@@ -73,19 +65,17 @@ struct IfToSelectPattern : OpConversionPattern<scf::IfOp> {
     auto thenOperands = op.thenYield().getOperands();
     auto elseOperands = op.elseYield().getOperands();
 
-    for (auto iv : llvm::enumerate(llvm::zip(thenOperands, elseOperands))) {
-      auto i = iv.index();
-      auto v = iv.value();
+    SmallVector<Value> newVals;
+    for (auto val : llvm::zip(thenOperands, elseOperands)) {
       SmallVector<Value> operands;
       operands.push_back(op.getCondition());
-      operands.push_back(std::get<0>(v));
-      operands.push_back(std::get<1>(v));
+      operands.push_back(std::get<0>(val));
+      operands.push_back(std::get<1>(val));
       auto selectOp = rewriter.create<arith::SelectOp>(op.getLoc(), operands);
-      auto ifRes = op.getResult(i);
-      rewriter.replaceAllUsesWith(ifRes, selectOp.getResult());
+      newVals.push_back(selectOp.getResult());
     }
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, newVals);
 
     return success();
   }
@@ -121,20 +111,18 @@ static bool ifOpLegalityCallback(scf::IfOp op) {
 void IfOpHoisting::runOnOperation() {
   ConversionTarget target(getContext());
   target.addLegalDialect<arith::ArithDialect, scf::SCFDialect,
-                         affine::AffineDialect, memref::MemRefDialect>();
+                         affine::AffineDialect, memref::MemRefDialect,
+                         func::FuncDialect>();
+  target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
   target.addDynamicallyLegalOp<scf::IfOp>(ifOpLegalityCallback);
 
   auto *ctx = &getContext();
   RewritePatternSet patterns(ctx);
   patterns.add<IfOpHoistingPattern>(ctx);
-  patterns.add<IfToSelectPattern>(ctx);
 
   auto op = getOperation();
-  // op->dump();
   if (failed(applyPartialConversion(op, target, std::move(patterns))))
     signalPassFailure();
-  // op->dump();
-  // llvm::errs() << "=============================\n";
 }
 
 namespace circt {

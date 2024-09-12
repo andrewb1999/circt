@@ -53,6 +53,14 @@ def StripDebugInfoWithPred : Pass<"strip-debuginfo-with-pred", "::mlir::ModuleOp
            "intended to be used for testing."> ];
 }
 
+def IndexSwitchToIf : Pass<"index-switch-to-if", "::mlir::func::FuncOp"> {
+  let summary = "Lower scf index_switch ops to a series of scf if ops";
+  let description = [{Lower scf index_switch ops to a series of scf if ops}];
+  let constructor = "circt::createIndexSwitchToIfPass()";
+  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::arith::ArithDialect",
+                           "mlir::func::FuncDialect"];
+}
+
 def IfOpHoisting : Pass<"if-op-hoisting", "::mlir::func::FuncOp"> {
   let summary = "Hoist scf IfOps to arith.select when possible";
   let description = [{Hoist scf IfOps to arith.select when possible}];
