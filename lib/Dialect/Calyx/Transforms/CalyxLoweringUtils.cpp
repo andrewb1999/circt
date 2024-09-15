@@ -765,7 +765,7 @@ void InlineCombGroups::recurseInlineCombGroups(
     //   been rewritten to their register outputs, see comment in
     //   LateSSAReplacement)
     // Needed to add memory interfaces as well
-    if (src.isa<BlockArgument>() ||
+    if (isa<BlockArgument>(src) ||
         isa<calyx::RegisterOp, calyx::MemoryOp, calyx::SeqMemoryOp,
             hw::ConstantOp, mlir::arith::ConstantOp, calyx::SeqMultLibOp,
             calyx::SeqDivULibOp, calyx::SeqDivSLibOp, calyx::SeqRemSLibOp,

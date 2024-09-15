@@ -7,11 +7,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "PassDetail.h"
+#include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Operation.h"
@@ -27,6 +29,7 @@
 
 using namespace mlir;
 using namespace mlir::affine;
+using namespace circt::loopschedule;
 
 namespace {
 struct IfOpHoisting : public circt::IfOpHoistingBase<IfOpHoisting> {
@@ -45,21 +48,43 @@ struct IfOpHoistingPattern : OpConversionPattern<scf::IfOp> {
       return failure();
     }
 
-    if (!op.thenBlock()->without_terminator().empty()) {
-      rewriter.splitBlock(op.thenBlock(), --op.thenBlock()->end());
-      rewriter.inlineBlockBefore(&op.getThenRegion().front(), op);
-    }
-    if (op.elseBlock() && !op.elseBlock()->without_terminator().empty()) {
-      rewriter.splitBlock(op.elseBlock(), --op.elseBlock()->end());
-      rewriter.inlineBlockBefore(&op.getElseRegion().front(), op);
-    }
+    rewriter.modifyOpInPlace(op, [&]() {
+      if (!op.thenBlock()->without_terminator().empty()) {
+        // rewriter.splitBlock(op.thenBlock(), --op.thenBlock()->end());
+        // rewriter.inlineBlockBefore(&op.getThenRegion().front(), op);
+        for (auto &innerOp :
+             llvm::make_early_inc_range(op.thenBlock()->without_terminator())) {
+          auto res = innerOp.walk([](Operation *op) {
+            if (hasEffect<MemoryEffects::Write>(op))
+              return WalkResult::interrupt();
+            return WalkResult::advance();
+          });
+          if (!res.wasInterrupted())
+            rewriter.moveOpBefore(&innerOp, op);
+        }
+      }
+      if (op.elseBlock() && !op.elseBlock()->without_terminator().empty()) {
+        // rewriter.splitBlock(op.elseBlock(), --op.elseBlock()->end());
+        // rewriter.inlineBlockBefore(&op.getElseRegion().front(), op);
+        for (auto &innerOp :
+             llvm::make_early_inc_range(op.elseBlock()->without_terminator())) {
+          auto res = innerOp.walk([](Operation *op) {
+            if (hasEffect<MemoryEffects::Write>(op))
+              return WalkResult::interrupt();
+            return WalkResult::advance();
+          });
+          if (!res.wasInterrupted())
+            rewriter.moveOpBefore(&innerOp, op);
+        }
+      }
+    });
 
     if (!op.thenBlock()->without_terminator().empty() || !op.elseBlock()) {
-      return failure();
+      return success();
     }
 
     if (op.elseBlock() && !op.elseBlock()->without_terminator().empty()) {
-      return failure();
+      return success();
     }
 
     auto thenOperands = op.thenYield().getOperands();
@@ -82,30 +107,63 @@ struct IfOpHoistingPattern : OpConversionPattern<scf::IfOp> {
 };
 
 static bool ifOpLegalityCallback(scf::IfOp op) {
-  auto resThen = op.getThenRegion().walk([&](Operation *op) {
-    if (hasEffect<MemoryEffects::Write>(op))
+  auto res = op.getThenRegion().walk([&](Operation *op) {
+    if (isa<scf::YieldOp>(op))
+      return WalkResult::advance();
+    if (!hasEffect<MemoryEffects::Write>(op))
       return WalkResult::interrupt();
+    if (auto load = dyn_cast<LoadInterface>(op)) {
+      if (load.isDynamic())
+        return WalkResult::advance();
+    }
     return WalkResult::advance();
   });
+  bool notOnlyWriteAndYield = res.wasInterrupted();
 
-  if (resThen.wasInterrupted())
-    return true;
+  res = op.getThenRegion().walk([&](Operation *op) {
+    if (hasEffect<MemoryEffects::Write>(op))
+      return WalkResult::interrupt();
+    if (auto load = dyn_cast<LoadInterface>(op)) {
+      if (load.isDynamic())
+        return WalkResult::advance();
+    }
+    return WalkResult::advance();
+  });
+  bool hasWrite = res.wasInterrupted();
+
+  if (notOnlyWriteAndYield && !hasWrite)
+    return false;
 
   if (op.elseBlock()) {
-    auto resElse = op.getElseRegion().walk([&](Operation *op) {
-      if (hasEffect<MemoryEffects::Write>(op))
+    auto res = op.getElseRegion().walk([&](Operation *op) {
+      if (isa<scf::YieldOp>(op))
+        return WalkResult::advance();
+      if (!hasEffect<MemoryEffects::Write>(op))
         return WalkResult::interrupt();
+      if (auto load = dyn_cast<LoadInterface>(op)) {
+        if (load.isDynamic())
+          return WalkResult::advance();
+      }
       return WalkResult::advance();
     });
+    bool notOnlyWriteAndYield = res.wasInterrupted();
 
-    if (resElse.wasInterrupted())
-      return true;
-  } else {
-    if (op.thenBlock()->without_terminator().empty())
-      return true;
+    res = op.getElseRegion().walk([&](Operation *op) {
+      if (hasEffect<MemoryEffects::Write>(op))
+        return WalkResult::interrupt();
+      if (auto load = dyn_cast<LoadInterface>(op)) {
+        if (load.isDynamic())
+          return WalkResult::advance();
+      }
+      return WalkResult::advance();
+    });
+    bool hasWrite = res.wasInterrupted();
+
+    if (notOnlyWriteAndYield && !hasWrite)
+      return false;
   }
 
-  return false;
+  return true;
 }
 
 void IfOpHoisting::runOnOperation() {

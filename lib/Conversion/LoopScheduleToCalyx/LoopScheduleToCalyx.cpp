@@ -1043,6 +1043,18 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      LoopScheduleIfOp op) const {
   getState<ComponentLoweringState>().addBlockSchedulable(op->getBlock(), op);
+  auto type = op.getCond().getType();
+  auto wireOp = getState<ComponentLoweringState>()
+                .getNewLibraryOpInstance<calyx::WireLibOp>(rewriter, op.getLoc(), 
+                                                           type);
+  std::string groupName =
+      getState<ComponentLoweringState>().getUniqueName("static_if");
+  auto groupOp = calyx::createStaticGroup(rewriter, getComponent(),
+                                          op.getLoc(), groupName, 1);
+  getState<ComponentLoweringState>().addBlockSchedulable(op->getBlock(), groupOp);
+  rewriter.setInsertionPointToStart(groupOp.getBodyBlock());
+  rewriter.create<calyx::AssignOp>(op.getLoc(), wireOp.getIn(), op.getCond());
+  op.getCondMutable().assign(wireOp.getOut());
   return success();
 }
 
@@ -1459,7 +1471,7 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
     SmallVector<calyx::PortInfo> inPorts, outPorts;
     FunctionType funcType = funcOp.getFunctionType();
     for (auto arg : enumerate(funcOp.getArguments())) {
-      if (!arg.value().getType().isa<MemRefType>() &&
+      if (!isa<MemRefType>(arg.value().getType()) &&
           !isa<calyx::MemoryLikeTypeInterface>(arg.value().getType())) {
         /// Single-port arguments
         auto inName = "in" + std::to_string(arg.index());
@@ -2384,6 +2396,7 @@ private:
     return whileCtrlOp;
   }
 };
+
 
 /// LateSSAReplacement contains various functions for replacing SSA values that
 /// were not replaced during op construction.

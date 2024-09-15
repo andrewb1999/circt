@@ -89,11 +89,8 @@ void IndexSwitchToIf::runOnOperation() {
   patterns.add<IndexSwitchToIfPattern>(ctx);
 
   auto op = getOperation();
-  // op->dump();
   if (failed(applyPartialConversion(op, target, std::move(patterns))))
     signalPassFailure();
-  // op->dump();
-  // llvm::errs() << "=============================\n";
 }
 
 namespace circt {
