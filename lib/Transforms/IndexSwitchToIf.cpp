@@ -44,18 +44,24 @@ struct IndexSwitchToIfPattern : OpConversionPattern<scf::IndexSwitchOp> {
                   ConversionPatternRewriter &rewriter) const override {
     SmallVector<Value> comparisons;
     for (unsigned int i = 0; i < op.getNumCases(); ++i) {
-      auto constOp = rewriter.create<arith::ConstantOp>(op.getLoc(), rewriter.getIndexAttr(op.getCases()[i]));
-      auto cmpiOp = rewriter.create<arith::CmpIOp>(op.getLoc(), arith::CmpIPredicate::eq, op.getArg(), constOp.getResult());
+      auto constOp = rewriter.create<arith::ConstantOp>(
+          op.getLoc(), rewriter.getIndexAttr(op.getCases()[i]));
+      auto cmpiOp =
+          rewriter.create<arith::CmpIOp>(op.getLoc(), arith::CmpIPredicate::eq,
+                                         op.getArg(), constOp.getResult());
       comparisons.push_back(cmpiOp.getResult());
     }
 
     scf::IfOp outerIfOp;
     for (unsigned int i = 0; i < op.getNumCases(); ++i) {
       bool lastCase = i == op.getNumCases() - 1;
-      auto ifOp = rewriter.create<scf::IfOp>(op.getLoc(), op.getResultTypes(), comparisons[i], false, false);
-      rewriter.inlineRegionBefore(op.getCaseRegions()[i], ifOp.getThenRegion(), ifOp.getThenRegion().end());
+      auto ifOp = rewriter.create<scf::IfOp>(op.getLoc(), op.getResultTypes(),
+                                             comparisons[i], false, false);
+      rewriter.inlineRegionBefore(op.getCaseRegions()[i], ifOp.getThenRegion(),
+                                  ifOp.getThenRegion().end());
       if (lastCase) {
-        rewriter.inlineRegionBefore(op.getDefaultRegion(), ifOp.getElseRegion(), ifOp.getElseRegion().end());
+        rewriter.inlineRegionBefore(op.getDefaultRegion(), ifOp.getElseRegion(),
+                                    ifOp.getElseRegion().end());
       } else {
         rewriter.createBlock(&ifOp.getElseRegion());
       }

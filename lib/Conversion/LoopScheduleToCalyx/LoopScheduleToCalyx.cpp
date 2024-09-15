@@ -1045,13 +1045,14 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   getState<ComponentLoweringState>().addBlockSchedulable(op->getBlock(), op);
   auto type = op.getCond().getType();
   auto wireOp = getState<ComponentLoweringState>()
-                .getNewLibraryOpInstance<calyx::WireLibOp>(rewriter, op.getLoc(), 
-                                                           type);
+                    .getNewLibraryOpInstance<calyx::WireLibOp>(
+                        rewriter, op.getLoc(), type);
   std::string groupName =
       getState<ComponentLoweringState>().getUniqueName("static_if");
-  auto groupOp = calyx::createStaticGroup(rewriter, getComponent(),
-                                          op.getLoc(), groupName, 1);
-  getState<ComponentLoweringState>().addBlockSchedulable(op->getBlock(), groupOp);
+  auto groupOp = calyx::createStaticGroup(rewriter, getComponent(), op.getLoc(),
+                                          groupName, 1);
+  getState<ComponentLoweringState>().addBlockSchedulable(op->getBlock(),
+                                                         groupOp);
   rewriter.setInsertionPointToStart(groupOp.getBodyBlock());
   rewriter.create<calyx::AssignOp>(op.getLoc(), wireOp.getIn(), op.getCond());
   op.getCondMutable().assign(wireOp.getOut());
@@ -2396,7 +2397,6 @@ private:
     return whileCtrlOp;
   }
 };
-
 
 /// LateSSAReplacement contains various functions for replacing SSA values that
 /// were not replaced during op construction.
