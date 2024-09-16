@@ -29,6 +29,7 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Visitors.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Casting.h"
 #include <set>
@@ -87,9 +88,9 @@ static Block *getCommonBlockInAffineScope(Operation *opA, Operation *opB) {
 
 namespace {
 struct MemoryDependence {
-  MemoryDependence(Operation *source, unsigned int distance)
+  MemoryDependence(StringRef source, unsigned int distance)
       : source(source), distance(distance) {}
-  Operation *source;
+  StringRef source;
   unsigned int distance;
 
   friend bool operator<(const MemoryDependence &lhs,
@@ -100,11 +101,11 @@ struct MemoryDependence {
 };
 } // namespace
 
-using MemoryDependenceResult =
-    std::map<Operation *, std::set<MemoryDependence>>;
+using MemoryDependenceResult = std::map<StringRef, std::set<MemoryDependence>>;
 
 static void checkAffineAccessPair(Operation *source, Operation *destination,
                                   MemoryDependenceResult &results,
+                                  NameAnalysis nameAnalysis,
                                   bool isIntraIteration) {
   if (source == destination)
     return;
@@ -155,23 +156,16 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
   DependenceResult result = checkMemrefAccessDependence(
       src, dst, depth, &dependenceConstraints, &depComps, false);
 
-  // llvm::errs() << "dependence check\n";
-  // if (result.value == DependenceResult::Failure) {
-  //   llvm::errs() << "dependence failure\n";
-  // }
-  // if (result.value == DependenceResult::NoDependence) {
-  //   llvm::errs() << "no dependence\n";
-  // }
   if (hasDependence(result)) {
-    // llvm::errs() << "hasDependence\n";
     if (!isIntraIteration) {
       assert(!depComps.empty());
-      results[destination].emplace(source, depComps.back().lb.value());
+      results[nameAnalysis.getOperationName(destination)].emplace(
+          nameAnalysis.getOperationName(source), depComps.back().lb.value());
     } else {
-      results[destination].emplace(source, 0);
+      results[nameAnalysis.getOperationName(destination)].emplace(
+          nameAnalysis.getOperationName(source), 0);
     }
   }
-  // llvm::errs() << "=======================================\n";
 }
 
 static Value getMemoryValue(Operation *op) {
@@ -197,6 +191,7 @@ static bool isLoad(Operation *op) {
 
 static void checkNonAffineAccessPair(Operation *source, Operation *destination,
                                      MemoryDependenceResult &results,
+                                     NameAnalysis nameAnalysis,
                                      bool isIntraIteration) {
   if (source == destination)
     return;
@@ -258,10 +253,12 @@ static void checkNonAffineAccessPair(Operation *source, Operation *destination,
     // Check if the dst or its ancestor is before the src or its ancestor.
     // We want to dst to be before the src to insert iter-iteration deps.
     if (!isIntraIteration && dstOrAncestor->isBeforeInBlock(srcOrAncestor)) {
-      results[destination].emplace(source, 1);
+      results[nameAnalysis.getOperationName(destination)].emplace(
+          nameAnalysis.getOperationName(source), 1);
     } else if (isIntraIteration &&
                srcOrAncestor->isBeforeInBlock(dstOrAncestor)) {
-      results[destination].emplace(source, 0);
+      results[nameAnalysis.getOperationName(destination)].emplace(
+          nameAnalysis.getOperationName(source), 0);
     }
   }
 }
@@ -270,16 +267,15 @@ static void insertDependencies(const MemoryDependenceResult &results,
                                ImplicitLocOpBuilder builder) {
 
   for (const auto &val : results) {
-    auto *destination = val.first;
+    auto destNameRef = val.first;
+    auto destName = builder.getStringAttr(destNameRef);
     auto dependencies = val.second;
-    auto destName = destination->getAttrOfType<StringAttr>(
-        NameAnalysis::getAttributeName());
     auto dependsOn = builder.create<LoopScheduleDependsOnOp>(destName);
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(dependsOn.getBodyBlock());
     for (auto dep : dependencies) {
-      auto sourceName = dep.source->getAttrOfType<StringAttr>(
-          NameAnalysis::getAttributeName());
+      auto sourceNameRef = dep.source;
+      auto sourceName = builder.getStringAttr(sourceNameRef);
       auto dist =
           dep.distance > 0 ? builder.getI64IntegerAttr(dep.distance) : nullptr;
       builder.create<LoopScheduleAccessOp>(sourceName, dist);
@@ -307,8 +303,8 @@ void ConstructMemoryDependenciesPass::runOnOperation() {
   // For each depth, check memref accesses.
   for (auto *source : affineOps) {
     for (auto *destination : affineOps) {
-      checkAffineAccessPair(source, destination, results, false);
-      checkAffineAccessPair(source, destination, results, true);
+      checkAffineAccessPair(source, destination, results, nameAnalysis, false);
+      checkAffineAccessPair(source, destination, results, nameAnalysis, true);
     }
   }
 
@@ -323,8 +319,10 @@ void ConstructMemoryDependenciesPass::runOnOperation() {
   // For each depth, check memref accesses.
   for (auto *source : memrefOps) {
     for (auto *destination : memrefOps) {
-      checkNonAffineAccessPair(source, destination, results, false);
-      checkNonAffineAccessPair(source, destination, results, true);
+      checkNonAffineAccessPair(source, destination, results, nameAnalysis,
+                               false);
+      checkNonAffineAccessPair(source, destination, results, nameAnalysis,
+                               true);
     }
   }
 
@@ -336,11 +334,7 @@ void ConstructMemoryDependenciesPass::runOnOperation() {
   auto depOpNameAttr = builder.getStringAttr(funcOp.getName() + "_deps");
   auto dependencies = builder.create<LoopScheduleDependenciesOp>(depOpNameAttr);
   builder.setInsertionPointToEnd(dependencies.getBodyBlock());
-  // auto dependsOn =
-  // builder.create<LoopScheduleDependsOnOp>(builder.getStringAttr("store0"));
-  // builder.setInsertionPointToEnd(dependsOn.getBodyBlock());
-  // builder.create<LoopScheduleAccessOp>("load0",
-  // builder.getI64IntegerAttr(2));
+
   insertDependencies(results, builder);
   auto symbolName = builder.getAttr<FlatSymbolRefAttr>(depOpNameAttr);
   funcOp->setAttr("loopschedule.dependencies", symbolName);

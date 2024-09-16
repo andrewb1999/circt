@@ -106,7 +106,6 @@ private:
 } // namespace
 
 void SCFToLoopSchedule::runOnOperation() {
-
   // Collect loops to pipeline and work on them.
   SmallVector<scf::ForOp> loops;
 

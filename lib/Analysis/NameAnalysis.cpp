@@ -11,6 +11,7 @@
 #include "circt/Dialect/Debug/DebugOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
+#include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -24,9 +25,9 @@ using namespace affine;
 
 NameAnalysis::NameAnalysis(Operation *op) {
   op->walk([&](Operation *op) {
-    if (isa<AffineLoadOp, AffineStoreOp, memref::LoadOp, memref::StoreOp,
-            LoopScheduleLoadOp, LoopScheduleStoreOp, LoadInterface,
-            StoreInterface>(op)) {
+    if (isa<memref::LoadOp, memref::StoreOp, LoopScheduleLoadOp,
+            LoopScheduleStoreOp, LoadInterface, StoreInterface,
+            AffineReadOpInterface, AffineWriteOpInterface>(op)) {
       auto nameAttr =
           op->getAttrOfType<StringAttr>(NameAnalysis::getAttributeName());
       assert(nameAttr != nullptr &&
@@ -41,11 +42,16 @@ NameAnalysis::NameAnalysis(Operation *op) {
 }
 
 Operation *NameAnalysis::getOperationFromName(StringRef name) {
-  return nameToOperationMap.lookup(name);
+  auto *op = nameToOperationMap.lookup(name);
+  assert(op != nullptr);
+  return op;
 }
 
 StringRef NameAnalysis::getOperationName(Operation *op) {
-  return operationToNameMap.lookup(op);
+  assert(operationToNameMap.contains(op));
+  auto name = operationToNameMap.lookup(op);
+  assert(!name.empty());
+  return name;
 }
 
 void NameAnalysis::replaceOp(Operation *oldOp, Operation *newOp) {
