@@ -35,6 +35,7 @@ std::unique_ptr<mlir::Pass> createFlattenMemRefCallsPass();
 std::unique_ptr<mlir::Pass> createStripDebugInfoWithPredPass(
     const std::function<bool(mlir::Location)> &pred);
 std::unique_ptr<mlir::Pass> createArithStrengthReductionPass();
+std::unique_ptr<mlir::Pass> createIndexSwitchToIfPass();
 std::unique_ptr<mlir::Pass> createIfOpHoistingPass();
 std::unique_ptr<mlir::Pass> createIndexRemovalPass();
 std::unique_ptr<mlir::Pass> createMaximizeSSAPass();

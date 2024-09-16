@@ -5,6 +5,7 @@ add_circt_library(CIRCTTransforms
   MaximizeSSA.cpp
   InsertMergeBlocks.cpp
   IfOpHoisting.cpp
+  IndexSwitchToIf.cpp
   ArithStrengthReduction.cpp
   IndexRemoval.cpp
 
