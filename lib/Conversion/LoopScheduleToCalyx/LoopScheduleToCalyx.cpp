@@ -1051,7 +1051,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                     .getNewLibraryOpInstance<calyx::WireLibOp>(
                         rewriter, op.getLoc(), type);
   std::string groupName =
-      getState<ComponentLoweringState>().getUniqueName("static_if");
+      getState<ComponentLoweringState>().getUniqueName("if");
   auto groupOp = calyx::createGroup<calyx::CombGroupOp>(
       rewriter, getComponent(), op.getLoc(), groupName);
   // getState<ComponentLoweringState>().addBlockSchedulable(op->getBlock(),
@@ -2543,11 +2543,17 @@ class InlineCombGroupsIf : public calyx::FuncOpPartialLoweringPattern {
     auto componentOp = state.getComponentOp();
     llvm::SmallSetVector<Operation *, 32> inlinedGroups;
 
-    componentOp.walk([&](calyx::StaticIfOp ifOp) {
-      auto evalGroupOpt = state.getEvaluatingGroup(ifOp.getCond());
+    componentOp.walk([&](Operation *op) {
+      std::optional<Operation *> evalGroupOpt;
+      if (auto ifOp = dyn_cast<calyx::StaticIfOp>(op)) {
+        evalGroupOpt = state.getEvaluatingGroup(ifOp.getCond());
+      } else if (auto ifOp = dyn_cast<calyx::IfOp>(op)) {
+        evalGroupOpt = state.getEvaluatingGroup(ifOp.getCond());
+      } else {
+        return;
+      }
       if (evalGroupOpt.has_value()) {
-        auto srcCombGroup =
-            dyn_cast<calyx::CombGroupOp>(evalGroupOpt.value().getOperation());
+        auto srcCombGroup = dyn_cast<calyx::CombGroupOp>(evalGroupOpt.value());
         if (srcCombGroup) {
           // Starting from the matched originGroup, we traverse use-def chains
           // of combinational logic, and inline assignments from the defining
