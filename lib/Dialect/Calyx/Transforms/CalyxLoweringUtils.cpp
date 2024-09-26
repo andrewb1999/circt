@@ -19,6 +19,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
+#include "llvm/ADT/STLExtras.h"
 
 #include <cassert>
 #include <variant>
@@ -423,7 +424,6 @@ ComponentLoweringStateInterface::getBlockArgGroups(Block *from, Block *to) {
 
 std::string ComponentLoweringStateInterface::getUniqueName(StringRef prefix) {
   std::string prefixStr = prefix.str();
-  // llvm::errs() << prefixStr << "\n";
   unsigned idx = prefixIdMap[prefixStr];
   ++prefixIdMap[prefixStr];
   return (prefix + "_" + std::to_string(idx)).str();
@@ -442,14 +442,20 @@ void ComponentLoweringStateInterface::setUniqueName(Operation *op,
   opNames[op] = getUniqueName(prefix);
 }
 
-// void ComponentLoweringStateInterface::registerStartGroup(
-//     Value v, calyx::StaticGroupOp group) {
-//   valueStartGroups[v] = group;
-// }
-
 void ComponentLoweringStateInterface::registerEvaluatingGroup(
     Value v, calyx::GroupInterface group) {
   valueGroupAssigns[v] = group;
+}
+
+void ComponentLoweringStateInterface::removeEvaluatingGroup(
+    calyx::GroupInterface group) {
+  for (auto valGroup : llvm::make_early_inc_range(valueGroupAssigns)) {
+    auto val = valGroup.getFirst();
+    auto otherGroup = valGroup.getSecond();
+    if (otherGroup.getOperation() == group.getOperation()) {
+      valueGroupAssigns.erase(val);
+    }
+  }
 }
 
 void ComponentLoweringStateInterface::addReturnReg(calyx::RegisterOp reg,
@@ -778,6 +784,8 @@ void InlineCombGroups::recurseInlineCombGroups(
       continue;
     }
     auto evalGroup = evalGroupOpt.value();
+    if (evalGroup == nullptr)
+      continue;
     auto srcCombGroup = dyn_cast<calyx::CombGroupOp>(evalGroup.getOperation());
     if (!srcCombGroup)
       continue;
@@ -823,13 +831,9 @@ RewriteMemoryAccesses::partiallyLower(calyx::AssignOp assignOp,
 
   rewriter.setInsertionPoint(assignOp->getBlock(),
                              assignOp->getBlock()->begin());
-  // llvm::errs() << "Create new assign" << "\n";
-  // newOp->getResult(0).dump();
-  // newOp->getResult(1).dump();
   rewriter.create<calyx::AssignOp>(assignOp->getLoc(), newOp->getResult(0),
                                    src);
   assignOp.setOperand(1, newOp->getResult(1));
-  // assignOp.dump();
 
   return success();
 }

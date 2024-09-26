@@ -429,6 +429,9 @@ public:
   /// Register value v as being evaluated when scheduling group.
   void registerEvaluatingGroup(Value v, calyx::GroupInterface group);
 
+  /// Remove evaluating group for value v.
+  void removeEvaluatingGroup(calyx::GroupInterface group);
+
   /// Register reg as being the idx'th return value register.
   void addReturnReg(calyx::RegisterOp reg, unsigned idx);
 

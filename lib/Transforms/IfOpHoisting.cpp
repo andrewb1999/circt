@@ -50,13 +50,16 @@ struct IfOpHoistingPattern : OpConversionPattern<scf::IfOp> {
 
     rewriter.modifyOpInPlace(op, [&]() {
       if (!op.thenBlock()->without_terminator().empty()) {
-        // rewriter.splitBlock(op.thenBlock(), --op.thenBlock()->end());
-        // rewriter.inlineBlockBefore(&op.getThenRegion().front(), op);
         for (auto &innerOp :
              llvm::make_early_inc_range(op.thenBlock()->without_terminator())) {
           auto res = innerOp.walk([](Operation *op) {
             if (hasEffect<MemoryEffects::Write>(op))
               return WalkResult::interrupt();
+            if (auto load = dyn_cast<LoadInterface>(op)) {
+              if (load.isDynamic()) {
+                return WalkResult::interrupt();
+              }
+            }
             return WalkResult::advance();
           });
           if (!res.wasInterrupted())
@@ -64,13 +67,15 @@ struct IfOpHoistingPattern : OpConversionPattern<scf::IfOp> {
         }
       }
       if (op.elseBlock() && !op.elseBlock()->without_terminator().empty()) {
-        // rewriter.splitBlock(op.elseBlock(), --op.elseBlock()->end());
-        // rewriter.inlineBlockBefore(&op.getElseRegion().front(), op);
         for (auto &innerOp :
              llvm::make_early_inc_range(op.elseBlock()->without_terminator())) {
           auto res = innerOp.walk([](Operation *op) {
             if (hasEffect<MemoryEffects::Write>(op))
               return WalkResult::interrupt();
+            if (auto load = dyn_cast<LoadInterface>(op)) {
+              if (load.isDynamic())
+                return WalkResult::interrupt();
+            }
             return WalkResult::advance();
           });
           if (!res.wasInterrupted())
@@ -113,8 +118,8 @@ static bool ifOpLegalityCallback(scf::IfOp op) {
     if (!hasEffect<MemoryEffects::Write>(op))
       return WalkResult::interrupt();
     if (auto load = dyn_cast<LoadInterface>(op)) {
-      if (load.isDynamic())
-        return WalkResult::advance();
+      if (!load.isDynamic())
+        return WalkResult::interrupt();
     }
     return WalkResult::advance();
   });
@@ -125,13 +130,13 @@ static bool ifOpLegalityCallback(scf::IfOp op) {
       return WalkResult::interrupt();
     if (auto load = dyn_cast<LoadInterface>(op)) {
       if (load.isDynamic())
-        return WalkResult::advance();
+        return WalkResult::interrupt();
     }
     return WalkResult::advance();
   });
-  bool hasWrite = res.wasInterrupted();
+  bool hasWriteOrDynamic = res.wasInterrupted();
 
-  if (notOnlyWriteAndYield && !hasWrite)
+  if (notOnlyWriteAndYield && !hasWriteOrDynamic)
     return false;
 
   if (op.elseBlock()) {
@@ -141,8 +146,8 @@ static bool ifOpLegalityCallback(scf::IfOp op) {
       if (!hasEffect<MemoryEffects::Write>(op))
         return WalkResult::interrupt();
       if (auto load = dyn_cast<LoadInterface>(op)) {
-        if (load.isDynamic())
-          return WalkResult::advance();
+        if (!load.isDynamic())
+          return WalkResult::interrupt();
       }
       return WalkResult::advance();
     });
@@ -157,9 +162,9 @@ static bool ifOpLegalityCallback(scf::IfOp op) {
       }
       return WalkResult::advance();
     });
-    bool hasWrite = res.wasInterrupted();
+    bool hasWriteOrDynamic = res.wasInterrupted();
 
-    if (notOnlyWriteAndYield && !hasWrite)
+    if (notOnlyWriteAndYield && !hasWriteOrDynamic)
       return false;
   }
 
