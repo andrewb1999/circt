@@ -1265,7 +1265,7 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   // llvm::errs() << "deltaN: " << deltaN << "\n";
   auto fixedN = scheduleAt(stvN, stN + phiN + deltaN);
   auto enteredN = mrt.enter(n, tauN + deltaN);
-  n->dump();
+  // n->dump();
   assert(succeeded(enteredN));
   assert(succeeded(fixedN));
   (void)fixedN, (void)enteredN;
