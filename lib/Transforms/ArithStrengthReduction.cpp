@@ -9,6 +9,7 @@
 
 #include "PassDetail.h"
 #include "circt/Transforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
@@ -51,6 +52,16 @@ struct MulStrengthReduction : OpConversionPattern<MulIOp> {
         auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
         rewriter.replaceOpWithNewOp<arith::ShLIOp>(op, op.getLhs(),
                                                    shift.getResult());
+        return success();
+      }
+
+      if (val.getInt() == -1) {
+        auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), 1);
+        auto constOne = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
+        auto xorOp = rewriter.create<arith::XOrIOp>(op.getLoc(), op.getLhs(),
+                                                    op.getRhs());
+        rewriter.replaceOpWithNewOp<arith::AddIOp>(op, xorOp.getResult(),
+                                                   constOne);
         return success();
       }
     }
@@ -132,6 +143,9 @@ static bool mulLegalityCallback(Operation *op) {
     if (auto constOp = dyn_cast<arith::ConstantOp>(rhsDef)) {
       if (cast<IntegerAttr>(constOp.getValue()).getValue().exactLogBase2() !=
           -1) {
+        return false;
+      }
+      if (cast<IntegerAttr>(constOp.getValue()).getInt() == -1) {
         return false;
       }
     }
