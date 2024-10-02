@@ -316,7 +316,6 @@ void circt::analysis::SharedOperatorsSchedulingAnalysis::analyzeFuncOp(
         op->getParentOfType<LoopSchedulePipelineOp>() != nullptr)
       return;
 
-    op->dump();
     // Insert every operation into the problem.
     problem.insertOperation(op);
 

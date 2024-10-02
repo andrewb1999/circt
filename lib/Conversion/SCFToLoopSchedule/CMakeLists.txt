@@ -1,9 +1,12 @@
-add_circt_library(CIRCTSCFToLoopSchedule
+add_circt_conversion_library(CIRCTSCFToLoopSchedule
   SCFToLoopSchedule.cpp
 
   DEPENDS
   CIRCTConversionPassIncGen
   MLIRArithDialect
+
+  LINK_COMPONENTS
+  Core
 
   LINK_LIBS PUBLIC
   MLIRPass
@@ -11,4 +14,4 @@ add_circt_library(CIRCTSCFToLoopSchedule
   CIRCTSchedulingAnalysis
   CIRCTLoopSchedule
   MLIRArithTransforms
-  )
+)

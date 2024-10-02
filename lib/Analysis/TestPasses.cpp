@@ -12,7 +12,10 @@
 
 #include "circt/Analysis/DebugAnalysis.h"
 #include "circt/Analysis/DependenceAnalysis.h"
+#include "circt/Analysis/FIRRTLInstanceInfo.h"
+#include "circt/Analysis/OpCountAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
+#include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "circt/Dialect/HW/HWInstanceGraph.h"
 #include "circt/Scheduling/Problems.h"
 #include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
@@ -21,6 +24,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/Support/Debug.h"
 
 using namespace mlir;
@@ -177,6 +181,124 @@ void InferTopModulePass::runOnOperation() {
 }
 
 //===----------------------------------------------------------------------===//
+// FIRRTL Instance Info
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct FIRRTLInstanceInfoPass
+    : public PassWrapper<FIRRTLInstanceInfoPass,
+                         OperationPass<firrtl::CircuitOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FIRRTLInstanceInfoPass)
+
+  void runOnOperation() override;
+  StringRef getArgument() const override { return "test-firrtl-instance-info"; }
+  StringRef getDescription() const override {
+    return "Run firrtl::InstanceInfo analysis and show the results.  This pass "
+           "is intended to be used for testing purposes only.";
+  }
+};
+} // namespace
+
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const bool a) {
+  if (a)
+    return os << "true";
+  return os << "false";
+}
+
+static void printCircuitInfo(firrtl::CircuitOp op,
+                             firrtl::InstanceInfo &iInfo) {
+  OpPrintingFlags flags;
+  flags.skipRegions();
+  llvm::errs() << "  - operation: ";
+  op->print(llvm::errs(), flags);
+  llvm::errs() << "\n"
+               << "    hasDut: " << iInfo.hasDut() << "\n"
+               << "    dut: ";
+  if (auto dutNode = iInfo.getDut())
+    dutNode->print(llvm::errs(), flags);
+  else
+    llvm::errs() << "null";
+  llvm::errs() << "\n"
+               << "    effectiveDut: ";
+  iInfo.getEffectiveDut()->print(llvm::errs(), flags);
+  llvm::errs() << "\n";
+}
+
+static void printModuleInfo(igraph::ModuleOpInterface op,
+                            firrtl::InstanceInfo &iInfo) {
+  OpPrintingFlags flags;
+  flags.skipRegions();
+  llvm::errs() << "  - operation: ";
+  op->print(llvm::errs(), flags);
+  llvm::errs() << "\n"
+               << "    isDut: " << iInfo.isDut(op) << "\n"
+               << "    anyInstanceUnderDut: " << iInfo.anyInstanceUnderDut(op)
+               << "\n"
+               << "    allInstancesUnderDut: " << iInfo.allInstancesUnderDut(op)
+               << "\n"
+               << "    anyInstanceUnderEffectiveDut: "
+               << iInfo.anyInstanceUnderEffectiveDut(op) << "\n"
+               << "    allInstancesUnderEffectiveDut: "
+               << iInfo.allInstancesUnderEffectiveDut(op) << "\n"
+               << "    anyInstanceUnderLayer: "
+               << iInfo.anyInstanceUnderLayer(op) << "\n"
+               << "    allInstancesUnderLayer: "
+               << iInfo.allInstancesUnderLayer(op) << "\n";
+}
+
+void FIRRTLInstanceInfoPass::runOnOperation() {
+  auto &iInfo = getAnalysis<firrtl::InstanceInfo>();
+
+  printCircuitInfo(getOperation(), iInfo);
+  for (auto op :
+       getOperation().getBodyBlock()->getOps<igraph::ModuleOpInterface>())
+    printModuleInfo(op, iInfo);
+}
+
+//===----------------------------------------------------------------------===//
+// Op Count
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct TestOpCountAnalysisPass
+    : public PassWrapper<TestOpCountAnalysisPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestOpCountAnalysisPass)
+
+  void runOnOperation() override;
+  StringRef getArgument() const override { return "test-op-count-analysis"; }
+  StringRef getDescription() const override {
+    return "Run OpCountAnalysis and show the results.  This pass "
+           "is intended to be used for testing purposes only.";
+  }
+};
+} // namespace
+
+void printOpAndOperandCounts(OpCountAnalysis &opCount) {
+  auto opNames = opCount.getFoundOpNames();
+  // Sort to account for non-deterministic DenseMap ordering
+  llvm::sort(opNames, [](OperationName name1, OperationName name2) {
+    return name1.getStringRef() < name2.getStringRef();
+  });
+  for (auto opName : opNames) {
+    llvm::errs() << opName << ": " << opCount.getOpCount(opName) << "\n";
+    auto operandMap = opCount.getOperandCountMap(opName);
+    // Sort for determinism again
+    llvm::SmallVector<size_t> keys;
+    for (auto pair : operandMap)
+      keys.push_back(pair.first);
+    llvm::sort(keys);
+    for (auto num : keys)
+      llvm::errs() << " with " << num << " operands: " << operandMap[num]
+                   << "\n";
+  }
+}
+
+void TestOpCountAnalysisPass::runOnOperation() {
+  auto &opCount = getAnalysis<OpCountAnalysis>();
+  printOpAndOperandCounts(opCount);
+}
+
+//===----------------------------------------------------------------------===//
 // Pass registration
 //===----------------------------------------------------------------------===//
 
@@ -194,6 +316,12 @@ void registerAnalysisTestPasses() {
   });
   registerPass([]() -> std::unique_ptr<Pass> {
     return std::make_unique<InferTopModulePass>();
+  });
+  registerPass([]() -> std::unique_ptr<Pass> {
+    return std::make_unique<FIRRTLInstanceInfoPass>();
+  });
+  registerPass([]() -> std::unique_ptr<Pass> {
+    return std::make_unique<TestOpCountAnalysisPass>();
   });
 }
 } // namespace test

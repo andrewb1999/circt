@@ -1,4 +1,4 @@
-add_circt_library(CIRCTAffineToSCF
+add_circt_conversion_library(CIRCTAffineToSCF
   AffineToSCF.cpp
 
   DEPENDS

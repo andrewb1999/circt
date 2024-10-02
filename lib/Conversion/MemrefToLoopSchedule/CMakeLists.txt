@@ -1,4 +1,4 @@
-add_circt_library(CIRCTMemrefToLoopSchedule
+add_circt_conversion_library(CIRCTMemrefToLoopSchedule
   MemrefToLoopSchedule.cpp
 
   DEPENDS
