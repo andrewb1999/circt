@@ -118,7 +118,12 @@ getModuloProblem(scf::ForOp forOp,
       //   continue;
       // Insert a dependence into the problem.
       Dependence dep(memoryDep.source, op);
+      if (isa<loopschedule::LoopScheduleStoreOp, StoreInterface,
+              memref::StoreOp>(memoryDep.source)) {
+        problem.setSrcAsStore(dep, true);
+      }
       auto depInserted = problem.insertDependence(dep);
+
       assert(succeeded(depInserted));
       (void)depInserted;
 

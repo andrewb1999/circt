@@ -887,8 +887,12 @@ void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
       // // dst->dump();
       // if (!chainBroken(prob, src, dst)) {
       // llvm::errs() << "not chain broken\n";
-      latency = 1;
+      // if (!isStore(src))
+      // if (dep.isSrcStore()) {
       // }
+      if (!prob.isSrcStore(dep)) {
+        latency = 1;
+      }
       // llvm::errs() << "=======================\n";
     }
   }

@@ -376,6 +376,7 @@ protected:
 
 private:
   DependenceProperty<unsigned> distance;
+  DependenceProperty<bool> srcIsStore;
   InstanceProperty<unsigned> initiationInterval;
 
 public:
@@ -385,6 +386,13 @@ public:
     return distance.lookup(dep);
   }
   void setDistance(Dependence dep, unsigned val) { distance[dep] = val; }
+
+  bool isSrcStore(Dependence dep) {
+    if (!srcIsStore.contains(dep))
+      return false;
+    return srcIsStore.lookup(dep).value();
+  }
+  void setSrcAsStore(Dependence dep, bool val) { srcIsStore[dep] = val; }
 
   /// The initiation interval (II) is the number of time steps between
   /// subsequent iterations, i.e. a new iteration is started every II time

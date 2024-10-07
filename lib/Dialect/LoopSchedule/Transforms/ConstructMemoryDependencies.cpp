@@ -205,6 +205,10 @@ static void checkNonAffineAccessPair(Operation *source, Operation *destination,
   if (sourceIsSchedInterface != destIsSchedInterface)
     return;
 
+  if (!isIntraIteration && isa<SchedulableAffineInterface>(source) &&
+      isa<SchedulableAffineInterface>(destination))
+    return;
+
   if (auto srcInterface = dyn_cast<SchedulableAffineInterface>(source)) {
     if (!srcInterface.hasDependence(destination))
       return;
