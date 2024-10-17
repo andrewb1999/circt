@@ -205,7 +205,7 @@ static void checkNonAffineAccessPair(Operation *source, Operation *destination,
   if (sourceIsSchedInterface != destIsSchedInterface)
     return;
 
-  if (!isIntraIteration && isa<SchedulableAffineInterface>(source) &&
+  if (isa<SchedulableAffineInterface>(source) &&
       isa<SchedulableAffineInterface>(destination))
     return;
 

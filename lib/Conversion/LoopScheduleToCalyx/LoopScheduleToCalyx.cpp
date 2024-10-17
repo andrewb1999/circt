@@ -186,6 +186,16 @@ public:
     return stallValues[loop];
   }
 
+  void setNoStallLastCycleWire(LoopInterface loop, calyx::WireLibOp wire) {
+    noStallLastCycleWires[loop] = wire;
+  }
+
+  std::optional<calyx::WireLibOp> getNoStallLastCycleWire(LoopInterface loop) {
+    if (!noStallLastCycleWires.contains(loop))
+      return std::nullopt;
+    return noStallLastCycleWires[loop];
+  }
+
   void addPhaseDynamicAccess(PhaseInterface phase, Value port,
                              const SmallVector<LoopScheduleIfOp> &conds) {
     dynamicAccesses[phase].push_back(std::pair(port, conds));
@@ -202,6 +212,14 @@ public:
 
   SmallVector<Value> getStallPorts(LoopInterface loop) {
     return stallPorts[loop];
+  }
+
+  void setHoldCEInPhase(Value v, PhaseInterface phase) {
+    holdCEInPhase[phase].push_back(v);
+  }
+
+  SmallVector<Value> getHoldCEInPhase(PhaseInterface phase) {
+    return holdCEInPhase[phase];
   }
 
   void interfaceReadOrContentEnSet(const calyx::MemoryInterface &interface) {
@@ -268,6 +286,8 @@ private:
 
   DenseMap<LoopInterface, Value> stallValues;
 
+  DenseMap<LoopInterface, calyx::WireLibOp> noStallLastCycleWires;
+
   DenseMap<PhaseInterface,
            SmallVector<std::pair<Value, SmallVector<LoopScheduleIfOp>>>>
       dynamicAccesses;
@@ -277,6 +297,8 @@ private:
   SmallVector<calyx::MemoryInterface> readOrContentEnSet;
 
   SmallVector<calyx::MemoryInterface> writeEnSet;
+
+  DenseMap<PhaseInterface, SmallVector<Value>> holdCEInPhase;
 };
 
 /// Handles the current state of lowering of a Calyx component. It is mainly
@@ -668,10 +690,10 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
   getState<ComponentLoweringState>().interfaceReadOrContentEnSet(
       memoryInterface);
 
+  auto latency = loadOp.getLatency().value_or(1);
   calyx::GroupInterface group;
-  if (loadOp.getLatency().value_or(1) > 0) {
-    group = createStaticGroupForOp(rewriter, loadOp,
-                                   loadOp.getLatency().value_or(1));
+  if (latency > 0) {
+    group = createStaticGroupForOp(rewriter, loadOp, 1);
   } else {
     auto name = getState<ComponentLoweringState>().getUniqueName("load");
     group = calyx::createGroup<calyx::CombGroupOp>(rewriter, getComponent(),
@@ -682,6 +704,16 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
   std::optional<Block *> blockOpt;
   auto res = loadOp.connectToMemInterface(rewriter, group, getComponent(),
                                           state, blockOpt);
+
+  if (latency > 1) {
+    Value ce = memoryInterface.contentEn();
+    auto phase = loadOp->getParentOfType<PhaseInterface>();
+    for (unsigned i = 0; i < latency - 1; ++i) {
+      phase = cast<PhaseInterface>(phase->getNextNode());
+      getState<ComponentLoweringState>().setHoldCEInPhase(ce, phase);
+    }
+  }
+
   if (res.failed())
     return failure();
 
@@ -696,12 +728,12 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
 
   getState<ComponentLoweringState>().interfaceWriteEnSet(memoryInterface);
 
-  auto latency = storeOp.getLatency().value_or(1);
+  // auto latency = storeOp.getLatency().value_or(1);
 
-  if (latency < 1)
-    latency = 1;
+  // if (latency < 1)
+  //   latency = 1;
 
-  auto group = createStaticGroupForOp(rewriter, storeOp, latency);
+  auto group = createStaticGroupForOp(rewriter, storeOp, 1);
 
   rewriter.setInsertionPointToEnd(group.getBodyBlock());
   auto &state = getState<ComponentLoweringState>();
@@ -1715,6 +1747,34 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
           return WalkResult::interrupt();
         condGroup = std::nullopt;
       }
+
+      if (getState<ComponentLoweringState>()
+              .getNoStallLastCycleWire(loop)
+              .has_value()) {
+        auto stallLastCycleReg = createRegister(
+            loop.getLoc(), rewriter, getComponent(), 1,
+            getState<ComponentLoweringState>().getUniqueName("last_stall_reg"));
+        auto one = calyx::createConstant(loop.getLoc(), rewriter,
+                                         getComponent(), 1, 1);
+        rewriter.create<calyx::AssignOp>(
+            loop.getLoc(), stallLastCycleReg.getIn(),
+            *getState<ComponentLoweringState>().getStallValue(loop));
+        rewriter.create<calyx::AssignOp>(loop.getLoc(),
+                                         stallLastCycleReg.getWriteEn(), one);
+
+        auto i1Type = rewriter.getI1Type();
+        auto notOp = getState<ComponentLoweringState>()
+                         .getNewLibraryOpInstance<calyx::NotLibOp>(
+                             rewriter, loop.getLoc(), {i1Type, i1Type});
+        rewriter.create<calyx::AssignOp>(loop.getLoc(), notOp.getIn(),
+                                         stallLastCycleReg.getOut());
+
+        rewriter.create<calyx::AssignOp>(loop.getLoc(),
+                                         getState<ComponentLoweringState>()
+                                             .getNoStallLastCycleWire(loop)
+                                             ->getIn(),
+                                         notOp.getOut());
+      }
       return WalkResult::advance();
     });
 
@@ -1842,8 +1902,8 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       assert(isa<calyx::CombGroupOp>(evaluatingGroup.value().getOperation()));
       // Stitch the register in, depending on whether the group was
       // combinational or sequential.
-      calyx::StaticGroupOp group =
-          buildRegisterGroup(phase.getLoc(), pipelineRegister, value, rewriter);
+      calyx::StaticGroupOp group = buildRegisterGroup(
+          phase.getLoc(), phase, pipelineRegister, value, rewriter);
 
       // Replace the stage result uses with the register out.
       phase->getResult(i).replaceAllUsesWith(pipelineRegister.getOut());
@@ -1860,7 +1920,7 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
     return success();
   }
 
-  calyx::StaticGroupOp buildRegisterGroup(Location loc,
+  calyx::StaticGroupOp buildRegisterGroup(Location loc, PhaseInterface phase,
                                           calyx::RegisterOp pipelineRegister,
                                           Value value,
                                           PatternRewriter &rewriter) const {
@@ -1875,6 +1935,15 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
     calyx::buildAssignmentsForRegisterWrite(
         rewriter, group, getState<ComponentLoweringState>().getComponentOp(),
         pipelineRegister, value);
+
+    auto one = calyx::createConstant(loc, rewriter, getComponent(), 1, 1);
+
+    auto ces = getState<ComponentLoweringState>().getHoldCEInPhase(phase);
+
+    rewriter.setInsertionPointToEnd(group.getBodyBlock());
+    for (auto ce : ces) {
+      rewriter.create<calyx::AssignOp>(loc, ce, one);
+    }
 
     return group;
   }
@@ -2071,6 +2140,7 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       return;
     }
 
+    auto i1Type = rewriter.getI1Type();
     auto stallValue =
         getState<ComponentLoweringState>().getStallValue(pipeline);
     auto guardVal = getState<ComponentLoweringState>().getGuardValue(phase);
@@ -2079,8 +2149,17 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
         getState<ComponentLoweringState>().getPhaseDynamicAccesses(phase);
 
     if (!dynamicAccesses.empty()) {
+      auto noStallLastCycleWire =
+          getState<ComponentLoweringState>().getNoStallLastCycleWire(pipeline);
+      if (!noStallLastCycleWire.has_value()) {
+        noStallLastCycleWire = getState<ComponentLoweringState>()
+                                   .getNewLibraryOpInstance<calyx::WireLibOp>(
+                                       rewriter, phase.getLoc(), i1Type);
+        getState<ComponentLoweringState>().setNoStallLastCycleWire(
+            pipeline, *noStallLastCycleWire);
+      }
+
       std::optional<Value> notDoneValue;
-      auto i1Type = rewriter.getI1Type();
       rewriter.setInsertionPointToStart(getState<ComponentLoweringState>()
                                             .getComponentOp()
                                             .getWiresOp()
@@ -2090,6 +2169,35 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
         auto interface =
             getState<ComponentLoweringState>().getMemoryInterface(port);
         Value doneVal = interface.done();
+
+        noStallLastCycleWire->getOut();
+        auto noStallOrDone =
+            getState<ComponentLoweringState>()
+                .getNewLibraryOpInstance<calyx::OrLibOp>(
+                    rewriter, phase.getLoc(), {i1Type, i1Type, i1Type});
+        rewriter.create<calyx::AssignOp>(phase.getLoc(),
+                                         noStallOrDone.getLeft(),
+                                         noStallLastCycleWire->getOut());
+        rewriter.create<calyx::AssignOp>(phase.getLoc(),
+                                         noStallOrDone.getRight(), doneVal);
+
+        calyx::BypassRegisterOp bypassRegOp;
+        {
+          OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(getState<ComponentLoweringState>()
+                                                .getComponentOp()
+                                                .getBodyBlock());
+          auto name =
+              getState<ComponentLoweringState>().getUniqueName("bypass_reg");
+          bypassRegOp =
+              rewriter.create<calyx::BypassRegisterOp>(phase.getLoc(), name, 1);
+        }
+        rewriter.create<calyx::AssignOp>(phase.getLoc(), bypassRegOp.getIn(),
+                                         doneVal);
+        rewriter.create<calyx::AssignOp>(
+            phase.getLoc(), bypassRegOp.getWriteEn(), noStallOrDone.getOut());
+        doneVal = bypassRegOp.getOut();
+
         auto notOp = getState<ComponentLoweringState>()
                          .getNewLibraryOpInstance<calyx::NotLibOp>(
                              rewriter, phase.getLoc(), {i1Type, i1Type});
