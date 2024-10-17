@@ -706,7 +706,13 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                           state, blockOpt);
 
   if (latency > 1) {
-    Value ce = memoryInterface.contentEn();
+    Value ce;
+    auto ceOpt = memoryInterface.contentEnOpt();
+    if (ceOpt.has_value()) {
+      ce = ceOpt.value();
+    } else {
+      ce = memoryInterface.readEn();
+    }
     auto phase = loadOp->getParentOfType<PhaseInterface>();
     for (unsigned i = 0; i < latency - 1; ++i) {
       phase = cast<PhaseInterface>(phase->getNextNode());
