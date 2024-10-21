@@ -299,6 +299,57 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
   return problem;
 }
 
+ChainingSharedOperatorsProblem
+getChainingSharedOperatorsProblem(func::FuncOp funcOp,
+                          LoopScheduleDependenceAnalysis &dependenceAnalysis) {
+  ChainingSharedOperatorsProblem problem(funcOp);
+
+  // Insert memory dependences into the problem.
+  funcOp.getBody().walk([&](Operation *op) {
+    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr)
+      return;
+
+    // Insert every operation into the problem.
+    problem.insertOperation(op);
+
+    ArrayRef<LoopScheduleDependence> dependences =
+        dependenceAnalysis.getDependencies(op);
+    if (dependences.empty())
+      return;
+
+    for (const LoopScheduleDependence &memoryDep : dependences) {
+      // Don't insert a dependence into the problem if there is no dependence.
+      if (!funcOp->isAncestor(memoryDep.source))
+        continue;
+      if (memoryDep.distance > 0)
+        continue;
+      // Insert a dependence into the problem.
+      Dependence dep(memoryDep.source, op);
+      auto depInserted = problem.insertDependence(dep);
+      assert(succeeded(depInserted));
+      (void)depInserted;
+    }
+  });
+
+  // Set the anchor for scheduling. Insert dependences from all stores to the
+  // terminator to ensure the problem schedules them before the terminator.
+  auto *anchor = funcOp.getBody().back().getTerminator();
+  problem.insertOperation(anchor);
+  funcOp.getBody().walk([&](Operation *op) {
+    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
+        !problem.hasOperation(op))
+      return;
+    Dependence dep(op, anchor);
+    auto depInserted = problem.insertDependence(dep);
+    assert(succeeded(depInserted));
+    (void)depInserted;
+  });
+
+  return problem;
+}
+
 namespace {
 struct IfOpTypes {
   IfOpTypes(scf::IfOp ifOp, bool inThen) : ifOp(ifOp), inThen(inThen) {}

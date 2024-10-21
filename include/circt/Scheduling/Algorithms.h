@@ -74,6 +74,9 @@ LogicalResult scheduleSimplex(ChainingProblem &prob, Operation *lastOp,
 LogicalResult scheduleSimplex(ChainingCyclicProblem &prob, Operation *lastOp,
                               float cycleTime);
 
+LogicalResult scheduleSimplex(ChainingSharedOperatorsProblem &prob, Operation *lastOp,
+                              float cycleTime);
+
 /// Solve the basic problem using linear programming and an external LP solver.
 /// The objective is to minimize the start time of the given \p lastOp. Fails if
 /// the dependence graph contains cycles, or \p prob does not include \p lastOp.

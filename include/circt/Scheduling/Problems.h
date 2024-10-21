@@ -564,6 +564,21 @@ public:
   virtual LogicalResult verify() override;
 };
 
+class ChainingSharedOperatorsProblem : public virtual ChainingProblem,
+                      public virtual SharedOperatorsProblem {
+public:
+  static constexpr auto name = "ChainingSharedOperatorsProblem";
+  using ChainingProblem::ChainingProblem;
+
+protected:
+  ChainingSharedOperatorsProblem() = default;
+
+  virtual PropertyStringVector getProperties(OperatorType opr) override;
+
+public:
+  virtual LogicalResult verify() override;
+};
+
 /// This class models the modulo scheduling problem as the composition of the
 /// cyclic problem and the resource-constrained problem with fully-pipelined
 /// shared operators.
@@ -619,6 +634,26 @@ public:
   LogicalResult check() override;
   LogicalResult verify() override;
 };
+
+// class ChainingModuloProblem : public virtual ChainingCyclicProblem,
+//                       public virtual SharedOperatorsProblem {
+// public:
+//   static constexpr auto name = "ChainingModuloProblem";
+//   using ChainingCyclicProblem::ChainingCyclicProblem;
+
+//   virtual PropertyStringVector getProperties(OperatorType opr) override;
+
+// protected:
+//   ChainingModuloProblem() = default;
+
+//   /// \p opr is not oversubscribed in any congruence class modulo II.
+//   virtual LogicalResult verifyUtilization(ResourceType rsrc) override;
+
+// public:
+//   virtual LogicalResult verify() override;
+//   static ModuloProblem get(CyclicProblem &prob);
+// };
+
 
 } // namespace scheduling
 } // namespace circt

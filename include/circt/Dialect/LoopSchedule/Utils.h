@@ -43,6 +43,10 @@ scheduling::SharedOperatorsProblem getSharedOperatorsProblem(
     mlir::func::FuncOp funcOp,
     analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
+scheduling::ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
+    mlir::func::FuncOp funcOp,
+    analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
+
 LogicalResult recordMemoryResources(Operation *op, Region &body,
                                     ResourceMap &resourceMap,
                                     ResourceLimits &resourceLimits);

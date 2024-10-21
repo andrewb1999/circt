@@ -382,6 +382,31 @@ LogicalResult SharedOperatorsProblem::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// ChainingSharedOperatorsProblem
+//===----------------------------------------------------------------------===//
+
+Problem::PropertyStringVector
+ChainingSharedOperatorsProblem::getProperties(OperatorType opr) {
+  auto psv = Problem::getProperties(opr);
+  if (auto incDelay = getIncomingDelay(opr))
+    psv.emplace_back("incoming delay", std::to_string(*incDelay));
+  if (auto outDelay = getOutgoingDelay(opr))
+    psv.emplace_back("outgoing delay", std::to_string(*outDelay));
+  return psv;
+}
+
+LogicalResult ChainingSharedOperatorsProblem::verify() {
+  if (failed(Problem::verify()))
+    return failure();
+
+  if (ChainingProblem::check().failed() ||
+      SharedOperatorsProblem::check().failed())
+    return failure();
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // ModuloProblem
 //===----------------------------------------------------------------------===//
 
