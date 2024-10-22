@@ -1108,10 +1108,6 @@ getOperationCycleMap(Problem &problem) {
   return map;
 }
 
-LogicalResult createLoopScheduleSteps(Operation *op) {
-
-}
-
 /// Create loopschedule seq op for a sequential loop
 LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
     scf::ForOp &loop, Problem &problem) {
@@ -1286,7 +1282,6 @@ LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
     }
 
     for (auto val : reregisterValues[startTime]) {
-      val.dump();
       stepTypes.push_back(val.getType());
     }
 
@@ -1472,6 +1467,7 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
 
   // Add the non-yield operations to their start time groups.
   DenseMap<unsigned, SmallVector<Operation *>> startGroups;
+  unsigned endTime = 0;
   for (auto *op : problem.getOperations()) {
     if (isa<YieldOp, func::ReturnOp, memref::AllocaOp, arith::ConstantOp,
             memref::AllocOp, AllocInterface, IfOp>(op))
@@ -1482,6 +1478,46 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
     }
     auto startTime = problem.getStartTime(op);
     startGroups[*startTime].push_back(op);
+    if (startTime > endTime)
+      endTime = *startTime;
+  }
+
+  auto hasLaterUse = [&](Operation *op, uint32_t resTime) {
+    for (uint32_t i = resTime + 1; i < endTime; ++i) {
+      if (startGroups.contains(i)) {
+        auto startGroup = startGroups[i];
+        for (auto *operation : startGroup) {
+          for (auto &operand : operation->getOpOperands()) {
+            if (operand.get().getDefiningOp() == op)
+              return true;
+
+            // Forward values used for predicates as well
+            if (predicateUse.contains(operand.get()))
+              return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  // Must re-register return values of memories if they are used later
+  for (auto *op : problem.getOperations()) {
+    if (isa<LoopScheduleLoadOp>(op)) {
+      auto startTime = problem.getStartTime(op);
+      auto resTime = *startTime + 1;
+      if (hasLaterUse(op, resTime) && !startGroups.contains(resTime)) {
+        startGroups[resTime] = SmallVector<Operation *>();
+      }
+    }
+    if (auto load = dyn_cast<LoadInterface>(op)) {
+      auto startTime = problem.getStartTime(op);
+      auto latency = load.getLatency();
+      auto resTime = *startTime + latency;
+      if (hasLaterUse(op, resTime) && !startGroups.contains(resTime)) {
+        startGroups[resTime] = SmallVector<Operation *>();
+      }
+    }
   }
 
   SmallVector<SmallVector<Operation *>> scheduleGroups;
@@ -1497,6 +1533,8 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
   for (const auto &group : startGroups)
     startTimes.push_back(group.first);
   llvm::sort(startTimes);
+
+  DenseMap<uint32_t, SmallVector<Value>> reregisterValues;
 
   DominanceInfo dom(getOperation());
   for (auto startTime : startTimes) {
@@ -1529,11 +1567,15 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
       }
     }
 
+    for (auto val : reregisterValues[startTime]) {
+      stepTypes.push_back(val.getType());
+    }
+
     // Create the stage itself.
-    auto stage = builder.create<LoopScheduleStepOp>(stepTypes);
-    auto &stageBlock = stage.getBodyBlock();
-    auto *stageTerminator = stageBlock.getTerminator();
-    builder.setInsertionPointToStart(&stageBlock);
+    auto step = builder.create<LoopScheduleStepOp>(stepTypes);
+    auto &stepBlock = step.getBodyBlock();
+    auto *stepTerminator = stepBlock.getTerminator();
+    builder.setInsertionPointToStart(&stepBlock);
 
     // Sort the group according to original dominance.
     llvm::sort(group,
@@ -1542,7 +1584,7 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
     // Move over the operations and add their results to the terminator.
     SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
     for (auto *op : group) {
-      unsigned resultIndex = stageTerminator->getNumOperands();
+      unsigned resultIndex = stepTerminator->getNumOperands();
       OpBuilder::InsertionGuard g(builder);
       LoopScheduleIfOp ifOp;
       if (predicateMap.contains(op)) {
@@ -1561,7 +1603,7 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
         newOp = ifOp;
       }
       if (opsWithReturns.contains(op)) {
-        stageTerminator->insertOperands(resultIndex, newOp->getResults());
+        stepTerminator->insertOperands(resultIndex, newOp->getResults());
         movedOps.emplace_back(op, newOp, resultIndex);
       }
       // All further uses in this step should used the cloned-version of values
@@ -1570,15 +1612,38 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
         valueMap.map(result, newOp->getResult(result.getResultNumber()));
     }
 
+    // Reregister values
+    for (auto val : reregisterValues[startTime]) {
+      unsigned resultIndex = stepTerminator->getNumOperands();
+      stepTerminator->insertOperands(resultIndex, valueMap.lookup(val));
+      auto newValue = step->getResult(resultIndex);
+      valueMap.map(val, newValue);
+    }
+
     // Add the stage results to the value map for the original op.
     for (auto tuple : movedOps) {
       Operation *op = std::get<0>(tuple);
       Operation *newOp = std::get<1>(tuple);
       unsigned resultIndex = std::get<2>(tuple);
       for (size_t i = 0; i < newOp->getNumResults(); ++i) {
-        auto newValue = stage->getResult(resultIndex + i);
+        auto newValue = step->getResult(resultIndex + i);
         auto oldValue = op->getResult(i);
         valueMap.map(oldValue, newValue);
+      }
+    }
+
+    // Add values that need to be reregistered in the future
+    for (auto *op : group) {
+      if (auto load = dyn_cast<LoopScheduleLoadOp>(op)) {
+        if (hasLaterUse(op, startTime + 1)) {
+          reregisterValues[startTime + 1].push_back(load.getResult());
+        }
+      } else if (auto load = dyn_cast<LoadInterface>(op)) {
+        auto latency = load.getLatency();
+        if (hasLaterUse(op, startTime + latency)) {
+          auto resTime = startTime + latency;
+          reregisterValues[resTime].push_back(load.getResult());
+        }
       }
     }
   }
