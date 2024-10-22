@@ -98,7 +98,7 @@ private:
   LogicalResult createLoopSchedulePipeline(scf::ForOp &loop,
                                            ModuloProblem &problem);
   LogicalResult createLoopScheduleSequential(scf::ForOp &loop,
-                                             SharedOperatorsProblem &problem);
+                                             Problem &problem);
   LogicalResult createFuncLoopSchedule(FuncOp &funcOp,
                                        Problem &problem);
 
@@ -201,11 +201,11 @@ void SCFToLoopSchedule::runOnOperation() {
       return signalPassFailure();
 
     assert(loop.getLoopRegions().size() == 1);
-    auto problem = getSharedOperatorsProblem(loop, *dependenceAnalysis);
+    auto problem = getChainingSharedOperatorsProblem(loop, *dependenceAnalysis);
 
     // Populate the target operator types.
-    if (failed(populateOperatorTypes(loop.getOperation(),
-                                     *loop.getLoopRegions().front(), problem)))
+    if (failed(populateChainingOperatorTypes(loop.getOperation(),
+                                           *loop.getLoopRegions().front(), problem)))
       return signalPassFailure();
 
     if (failed(addMemoryResources(loop.getOperation(), loop.getRegion(),
@@ -216,7 +216,7 @@ void SCFToLoopSchedule::runOnOperation() {
                              predicateMap, predicateUse);
 
     // Solve the scheduling problem computed by the analysis.
-    if (failed(solveSharedOperatorsProblem(*loop.getLoopRegions().front(),
+    if (failed(solveChainingSharedOperatorsProblem(*loop.getLoopRegions().front(),
                                            problem)))
       return signalPassFailure();
 
@@ -288,6 +288,10 @@ SCFToLoopSchedule::populateChainingOperatorTypes(Operation *op, Region &loopBody
   // Load the Calyx operator library into the problem. This is a very minimal
   // set of arithmetic and memory operators for now. This should ultimately be
   // pulled out into some sort of dialect interface.
+  OperatorType freeOpr = problem.getOrInsertOperatorType("free");
+  problem.setLatency(freeOpr, 0);
+  problem.setIncomingDelay(freeOpr, 0);
+  problem.setOutgoingDelay(freeOpr, 0);
   OperatorType combOpr = problem.getOrInsertOperatorType("comb");
   problem.setLatency(combOpr, 0);
   problem.setIncomingDelay(combOpr, 0.3);
@@ -318,10 +322,15 @@ SCFToLoopSchedule::populateChainingOperatorTypes(Operation *op, Region &loopBody
 
     return TypeSwitch<Operation *, WalkResult>(op)
         .Case<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
-              arith::TruncIOp, CmpIOp, IndexCastOp, memref::AllocaOp,
+              arith::TruncIOp, IndexCastOp, memref::AllocaOp,
               memref::AllocOp, loopschedule::AllocInterface, YieldOp,
-              func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, ShLIOp, AndIOp,
-              ShRSIOp, ShRUIOp, XOrIOp>([&](Operation *combOp) {
+              func::ReturnOp>([&](Operation *freeOp) {
+          // Some known free ops.
+          problem.setLinkedOperatorType(freeOp, freeOpr);
+          return WalkResult::advance();
+        })
+        .Case<CmpIOp, arith::SelectOp, AddIOp, SubIOp, ShLIOp, 
+              AndIOp, ShRSIOp, ShRUIOp, XOrIOp>([&](Operation *combOp) {
           // Some known combinational ops.
           problem.setLinkedOperatorType(combOp, combOpr);
           return WalkResult::advance();
@@ -1099,9 +1108,13 @@ getOperationCycleMap(Problem &problem) {
   return map;
 }
 
+LogicalResult createLoopScheduleSteps(Operation *op) {
+
+}
+
 /// Create loopschedule seq op for a sequential loop
 LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
-    scf::ForOp &loop, SharedOperatorsProblem &problem) {
+    scf::ForOp &loop, Problem &problem) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
 
   builder.setInsertionPointToStart(
@@ -1273,6 +1286,7 @@ LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
     }
 
     for (auto val : reregisterValues[startTime]) {
+      val.dump();
       stepTypes.push_back(val.getType());
     }
 
@@ -1354,7 +1368,7 @@ LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
 
     // Add values that need to be reregistered in the future
     for (auto *op : group) {
-      if (auto load = dyn_cast<LoadOp>(op)) {
+      if (auto load = dyn_cast<LoopScheduleLoadOp>(op)) {
         if (hasLaterUse(op, startTime + 1)) {
           reregisterValues[startTime + 1].push_back(load.getResult());
         }

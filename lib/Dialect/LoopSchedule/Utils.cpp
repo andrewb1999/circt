@@ -248,6 +248,78 @@ getSharedOperatorsProblem(scf::ForOp forOp,
   return problem;
 }
 
+ChainingSharedOperatorsProblem
+getChainingSharedOperatorsProblem(scf::ForOp forOp,
+                          LoopScheduleDependenceAnalysis &dependenceAnalysis) {
+  ChainingSharedOperatorsProblem problem(forOp);
+
+  // Insert memory dependences into the problem.
+  assert(forOp.getLoopRegions().size() == 1);
+  forOp.getLoopRegions().front()->walk([&](Operation *op) {
+    if (op->getParentOfType<LoopInterface>() != nullptr)
+      return;
+
+    // Insert every operation into the problem.
+    problem.insertOperation(op);
+
+    if (auto loop = dyn_cast<LoopInterface>(op)) {
+      loop.getBodyBlock()->walk([&](Operation *innerOp) {
+        for (auto &operand : innerOp->getOpOperands()) {
+          auto *definingOp = operand.get().getDefiningOp();
+          if (definingOp && definingOp->getParentOp() == forOp) {
+            Dependence dep(definingOp, op);
+            auto depInserted = problem.insertDependence(dep);
+            assert(succeeded(depInserted));
+            (void)depInserted;
+          }
+        }
+      });
+    }
+
+    ArrayRef<LoopScheduleDependence> dependences =
+        dependenceAnalysis.getDependencies(op);
+    if (dependences.empty())
+      return;
+
+    for (const LoopScheduleDependence &memoryDep : dependences) {
+      assert(memoryDep.source != nullptr);
+      if (!forOp->isAncestor(memoryDep.source))
+        continue;
+
+      // Do not consider inter-iteration deps for seq loops
+      auto distance = memoryDep.distance;
+      if (distance > 0)
+        continue;
+
+      // Insert a dependence into the problem.
+      Dependence dep(memoryDep.source, op);
+      auto depInserted = problem.insertDependence(dep);
+      assert(succeeded(depInserted));
+      (void)depInserted;
+    }
+  });
+
+  // Set the anchor for scheduling. Insert dependences from all stores to the
+  // terminator to ensure the problem schedules them before the terminator.
+  assert(forOp.getLoopRegions().size() == 1);
+  auto *anchor = forOp.getLoopRegions().front()->back().getTerminator();
+  problem.insertOperation(anchor);
+  forOp.getLoopRegions().front()->walk([&](Operation *op) {
+    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
+        !problem.hasOperation(op))
+      return;
+    if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface>(op))
+      return;
+    Dependence dep(op, anchor);
+    auto depInserted = problem.insertDependence(dep);
+    assert(succeeded(depInserted));
+    (void)depInserted;
+  });
+
+  return problem;
+}
+
 SharedOperatorsProblem
 getSharedOperatorsProblem(func::FuncOp funcOp,
                           LoopScheduleDependenceAnalysis &dependenceAnalysis) {
