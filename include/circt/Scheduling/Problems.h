@@ -402,18 +402,18 @@ public:
   std::optional<unsigned> getInitiationInterval() { return initiationInterval; }
   void setInitiationInterval(unsigned val) { initiationInterval = val; }
 
-  virtual PropertyStringVector getProperties(Dependence dep) override;
-  virtual PropertyStringVector getProperties() override;
+  PropertyStringVector getProperties(Dependence dep) override;
+  PropertyStringVector getProperties() override;
 
 protected:
   /// \p dep's source operation is available before \p dep's destination
   /// operation starts (\p dep's distance iterations later).
-  virtual LogicalResult verifyPrecedence(Dependence dep) override;
+  LogicalResult verifyPrecedence(Dependence dep) override;
   /// This problem has a non-zero II.
-  virtual LogicalResult verifyInitiationInterval();
+  LogicalResult verifyInitiationInterval();
 
 public:
-  virtual LogicalResult verify() override;
+  LogicalResult verify() override;
 };
 
 /// This class models the accumulation of physical propagation delays on
@@ -470,8 +470,8 @@ public:
   }
   void clearStartTimeInCycle() { startTimeInCycle.clear(); }
 
-  virtual PropertyStringVector getProperties(Operation *op) override;
-  virtual PropertyStringVector getProperties(OperatorType opr) override;
+  PropertyStringVector getProperties(Operation *op) override;
+  PropertyStringVector getProperties(OperatorType opr) override;
 
 protected:
   /// Incoming/outgoing delays are set for \p opr and non-negative. The delays
@@ -486,8 +486,8 @@ protected:
   virtual LogicalResult verifyPrecedenceInCycle(Dependence dep);
 
 public:
-  virtual LogicalResult check() override;
-  virtual LogicalResult verify() override;
+  LogicalResult check() override;
+  LogicalResult verify() override;
 };
 
 /// This class models a resource-constrained scheduling problem. An optional,
@@ -552,16 +552,16 @@ public:
   /// Return the set of resource types.
   const ResourceTypeSet &getResourceTypes() { return resourceTypes; }
 
-  virtual PropertyStringVector getProperties(OperatorType opr) override;
+  PropertyStringVector getProperties(OperatorType opr) override;
 
 protected:
   /// If \p opr is limited, it has a non-zero latency.
-  virtual LogicalResult checkLatency(Operation *op) override;
+  LogicalResult checkLatency(Operation *op) override;
   /// \p opr is not oversubscribed in any time step.
   virtual LogicalResult verifyUtilization(ResourceType rsrc);
 
 public:
-  virtual LogicalResult verify() override;
+  LogicalResult verify() override;
 };
 
 class ChainingSharedOperatorsProblem : public virtual ChainingProblem,
@@ -573,10 +573,10 @@ public:
 protected:
   ChainingSharedOperatorsProblem() = default;
 
-  virtual PropertyStringVector getProperties(OperatorType opr) override;
+  PropertyStringVector getProperties(OperatorType opr) override;
 
 public:
-  virtual LogicalResult verify() override;
+  LogicalResult verify() override;
 };
 
 /// This class models the modulo scheduling problem as the composition of the
@@ -600,11 +600,10 @@ protected:
   ModuloProblem() = default;
 
   /// \p opr is not oversubscribed in any congruence class modulo II.
-  virtual LogicalResult verifyUtilization(ResourceType rsrc) override;
+  LogicalResult verifyUtilization(ResourceType rsrc) override;
 
 public:
-  virtual LogicalResult verify() override;
-  static ModuloProblem get(CyclicProblem &prob);
+  LogicalResult verify() override;
 };
 
 /// This class models the accumulation of physical propagation delays on
@@ -635,25 +634,22 @@ public:
   LogicalResult verify() override;
 };
 
-// class ChainingModuloProblem : public virtual ChainingCyclicProblem,
-//                       public virtual SharedOperatorsProblem {
-// public:
-//   static constexpr auto name = "ChainingModuloProblem";
-//   using ChainingCyclicProblem::ChainingCyclicProblem;
+class ChainingModuloProblem : public virtual ChainingCyclicProblem,
+                              public virtual ModuloProblem,
+                              public virtual ChainingSharedOperatorsProblem {
+public:
+  static constexpr auto name = "ChainingModuloProblem";
+  using ChainingCyclicProblem::ChainingCyclicProblem;
+  using ChainingCyclicProblem::CyclicProblem::getProperties;
 
-//   virtual PropertyStringVector getProperties(OperatorType opr) override;
+  PropertyStringVector getProperties(OperatorType opr) override;
 
-// protected:
-//   ChainingModuloProblem() = default;
+protected:
+  ChainingModuloProblem() = default;
 
-//   /// \p opr is not oversubscribed in any congruence class modulo II.
-//   virtual LogicalResult verifyUtilization(ResourceType rsrc) override;
-
-// public:
-//   virtual LogicalResult verify() override;
-//   static ModuloProblem get(CyclicProblem &prob);
-// };
-
+public:
+  LogicalResult verify() override;
+};
 
 } // namespace scheduling
 } // namespace circt

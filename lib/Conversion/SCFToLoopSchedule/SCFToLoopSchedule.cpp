@@ -91,12 +91,14 @@ private:
   LogicalResult populateChainingOperatorTypes(Operation *op, Region &body,
                                       ChainingSharedOperatorsProblem &problem);
   LogicalResult solveModuloProblem(scf::ForOp &loop, ModuloProblem &problem);
+  LogicalResult solveChainingModuloProblem(scf::ForOp &loop,
+                                           ChainingModuloProblem &problem);
   LogicalResult solveSharedOperatorsProblem(Region &region,
                                             SharedOperatorsProblem &problem);
   LogicalResult solveChainingSharedOperatorsProblem(Region &region,
                                             ChainingSharedOperatorsProblem &problem);
   LogicalResult createLoopSchedulePipeline(scf::ForOp &loop,
-                                           ModuloProblem &problem);
+                                           CyclicProblem &problem);
   LogicalResult createLoopScheduleSequential(scf::ForOp &loop,
                                              Problem &problem);
   LogicalResult createFuncLoopSchedule(FuncOp &funcOp,
@@ -158,10 +160,11 @@ void SCFToLoopSchedule::runOnOperation() {
       return signalPassFailure();
 
     // Populate the target operator types.
-    ModuloProblem moduloProblem = getModuloProblem(loop, *dependenceAnalysis);
+    ChainingModuloProblem moduloProblem =
+        getChainingModuloProblem(loop, *dependenceAnalysis);
 
-    if (failed(populateOperatorTypes(loop.getOperation(), loop.getRegion(),
-                                     moduloProblem)))
+    if (failed(populateChainingOperatorTypes(loop.getOperation(),
+                                             loop.getRegion(), moduloProblem)))
       return signalPassFailure();
 
     if (failed(addMemoryResources(loop.getOperation(), loop.getRegion(),
@@ -172,7 +175,7 @@ void SCFToLoopSchedule::runOnOperation() {
                              moduloProblem, predicateMap, predicateUse);
 
     // Solve the scheduling problem computed by the analysis.
-    if (failed(solveModuloProblem(loop, moduloProblem)))
+    if (failed(solveChainingModuloProblem(loop, moduloProblem)))
       return signalPassFailure();
 
     // Convert the IR.
@@ -603,6 +606,62 @@ LogicalResult SCFToLoopSchedule::solveModuloProblem(scf::ForOp &loop,
 }
 
 /// Solve the pre-computed scheduling problem.
+LogicalResult
+SCFToLoopSchedule::solveChainingModuloProblem(scf::ForOp &loop,
+                                              ChainingModuloProblem &problem) {
+  // Scheduling analyis only considers the innermost loop nest for now.
+  auto forOp = loop;
+
+  LLVM_DEBUG(forOp.dump());
+
+  // Optionally debug problem inputs.
+  LLVM_DEBUG(for (auto *op
+                  : problem.getOperations()) {
+    // if (auto parent = op->getParentOfType<LoopInterface>(); parent)
+    //   continue;
+    llvm::dbgs() << "Chaining Modulo scheduling inputs for " << *op;
+    auto opr = problem.getLinkedOperatorType(op);
+    llvm::dbgs() << "\n  opr = " << opr->getName();
+    llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
+    for (auto rsrc : problem.getLinkedResourceTypes(op))
+      llvm::dbgs() << "\n  resource = " << rsrc.getName()
+                   << " limit = " << problem.getResourceLimit(rsrc);
+    for (auto dep : problem.getDependences(op))
+      if (dep.isAuxiliary())
+        llvm::dbgs() << "\n  dep = { distance = " << problem.getDistance(dep)
+                     << ", source = " << *dep.getSource() << " }";
+    llvm::dbgs() << "\n\n";
+  });
+
+  // Verify and solve the problem.
+  if (failed(problem.check()))
+    return failure();
+
+  auto *anchor = forOp.getBody()->getTerminator();
+  if (failed(scheduleSimplex(problem, anchor, 1.0)))
+    return failure();
+
+  // Verify the solution.
+  if (failed(problem.verify()))
+    return failure();
+
+  // Optionally debug problem outputs.
+  LLVM_DEBUG({
+    llvm::dbgs() << "Scheduled initiation interval = "
+                 << problem.getInitiationInterval() << "\n\n";
+    for (auto *op : problem.getOperations()) {
+      if (auto parent = op->getParentOfType<LoopInterface>(); parent)
+        continue;
+      llvm::dbgs() << "Scheduling outputs for " << *op;
+      llvm::dbgs() << "\n  start = " << problem.getStartTime(op);
+      llvm::dbgs() << "\n\n";
+    }
+  });
+
+  return success();
+}
+
+/// Solve the pre-computed scheduling problem.
 LogicalResult SCFToLoopSchedule::solveSharedOperatorsProblem(
     Region &region, SharedOperatorsProblem &problem) {
 
@@ -702,7 +761,7 @@ LogicalResult SCFToLoopSchedule::solveChainingSharedOperatorsProblem(
 /// Create the pipeline op for a loop nest.
 LogicalResult
 SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
-                                              ModuloProblem &problem) {
+                                              CyclicProblem &problem) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
 
   builder.setInsertionPointToStart(

@@ -35,6 +35,10 @@ scheduling::ModuloProblem
 getModuloProblem(mlir::scf::ForOp forOp,
                  analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
+scheduling::ChainingModuloProblem getChainingModuloProblem(
+    mlir::scf::ForOp forOp,
+    analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
+
 scheduling::SharedOperatorsProblem getSharedOperatorsProblem(
     mlir::scf::ForOp forOp,
     analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);

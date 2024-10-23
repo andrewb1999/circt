@@ -445,31 +445,35 @@ LogicalResult ModuloProblem::verify() {
   return success();
 }
 
-// ModuloProblem ModuloProblem::get(CyclicProblem &prob) {
-//   auto modProb = ModuloProblem(prob.getContainingOp());
-//   for (auto *op : prob.getOperations()) {
-//     auto opr = prob.getLinkedOperatorType(op);
-//     if (opr.has_value()) {
-//       modProb.setLinkedOperatorType(op, opr.value());
-//       auto latency = prob.getLatency(opr.value());
-//       if (latency.has_value())
-//         modProb.setLatency(opr.value(), latency.value());
-//     }
-//     modProb.insertOperation(op);
-//   }
+//===----------------------------------------------------------------------===//
+// ChainingModuloProblem
+//===----------------------------------------------------------------------===//
 
-//   for (auto *op : prob.getOperations()) {
-//     for (auto dep : prob.getDependences(op)) {
-//       if (dep.isAuxiliary())
-//         assert(modProb.insertDependence(dep).succeeded());
-//       auto distance = prob.getDistance(dep);
-//       if (distance.has_value())
-//         modProb.setDistance(dep, distance.value());
-//     }
-//   }
+Problem::PropertyStringVector
+ChainingModuloProblem::getProperties(OperatorType opr) {
+  auto psv = Problem::getProperties(opr);
+  if (auto incDelay = getIncomingDelay(opr))
+    psv.emplace_back("incoming delay", std::to_string(*incDelay));
+  if (auto outDelay = getOutgoingDelay(opr))
+    psv.emplace_back("outgoing delay", std::to_string(*outDelay));
+  return psv;
+}
 
-//   return modProb;
-// }
+LogicalResult ChainingModuloProblem::verify() {
+  if (failed(CyclicProblem::verify()))
+    return failure();
+
+  // Don't call SharedOperatorsProblem::verify() here to prevent redundant
+  // verification of the base problem.
+  for (auto rsrc : getResourceTypes())
+    if (failed(verifyUtilization(rsrc)))
+      return failure();
+
+  if (ChainingProblem::check().failed())
+    return failure();
+
+  return success();
+}
 
 //===----------------------------------------------------------------------===//
 // ChainingCyclicProblem
