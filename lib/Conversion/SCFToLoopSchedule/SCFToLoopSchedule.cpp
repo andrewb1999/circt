@@ -80,18 +80,19 @@ using namespace circt::loopschedule;
 
 namespace {
 
-struct SCFToLoopSchedule
-    : public circt::impl::SCFToLoopScheduleBase<SCFToLoopSchedule> {
-  using SCFToLoopScheduleBase<SCFToLoopSchedule>::SCFToLoopScheduleBase;
+struct SCFToLoopSchedulePass
+    : public circt::impl::SCFToLoopScheduleBase<SCFToLoopSchedulePass> {
+  // using SCFToLoopScheduleBase<SCFToLoopSchedule>::SCFToLoopScheduleBase;
   void runOnOperation() override;
 
 private:
   LogicalResult populateOperatorTypes(Operation *op, Region &body,
                                       ChainingSharedOperatorsProblem &problem);
   LogicalResult solveChainingModuloProblem(scf::ForOp &loop,
-                                           ChainingModuloProblem &problem);
-  LogicalResult solveChainingSharedOperatorsProblem(Region &region,
-                                            ChainingSharedOperatorsProblem &problem);
+                                           ChainingModuloProblem &problem,
+                                           float cycleTime);
+  LogicalResult solveChainingSharedOperatorsProblem(
+      Region &region, ChainingSharedOperatorsProblem &problem, float cycleTime);
   LogicalResult createLoopSchedulePipeline(scf::ForOp &loop,
                                            CyclicProblem &problem);
   LogicalResult createLoopScheduleSequential(scf::ForOp &loop,
@@ -106,7 +107,9 @@ private:
 
 } // namespace
 
-void SCFToLoopSchedule::runOnOperation() {
+void SCFToLoopSchedulePass::runOnOperation() {
+  float cycleTime = prioritizeII ? 2.0 : 1.0;
+
   // Collect loops to pipeline and work on them.
   SmallVector<scf::ForOp> loops;
 
@@ -170,7 +173,7 @@ void SCFToLoopSchedule::runOnOperation() {
                              moduloProblem, predicateMap, predicateUse);
 
     // Solve the scheduling problem computed by the analysis.
-    if (failed(solveChainingModuloProblem(loop, moduloProblem)))
+    if (failed(solveChainingModuloProblem(loop, moduloProblem, cycleTime)))
       return signalPassFailure();
 
     // Convert the IR.
@@ -214,8 +217,8 @@ void SCFToLoopSchedule::runOnOperation() {
                              predicateMap, predicateUse);
 
     // Solve the scheduling problem computed by the analysis.
-    if (failed(solveChainingSharedOperatorsProblem(*loop.getLoopRegions().front(),
-                                           problem)))
+    if (failed(solveChainingSharedOperatorsProblem(
+            *loop.getLoopRegions().front(), problem, cycleTime)))
       return signalPassFailure();
 
     // Convert the IR.
@@ -251,7 +254,8 @@ void SCFToLoopSchedule::runOnOperation() {
                            predicateMap, predicateUse);
 
   // Solve the scheduling problem computed by the analysis.
-  if (failed(solveChainingSharedOperatorsProblem(funcOp.getBody(), problem)))
+  if (failed(solveChainingSharedOperatorsProblem(funcOp.getBody(), problem,
+                                                 cycleTime)))
     return signalPassFailure();
 
   // Convert the IR.
@@ -282,7 +286,7 @@ void SCFToLoopSchedule::runOnOperation() {
 /// targetting. Right now, we assume Calyx, which has a standard library with
 /// well-defined operator latencies. Ultimately, we should move this to a
 /// dialect interface in the Scheduling dialect.
-LogicalResult SCFToLoopSchedule::populateOperatorTypes(
+LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
     Operation *op, Region &loopBody, ChainingSharedOperatorsProblem &problem) {
   // Scheduling analyis only considers the innermost loop nest for now.
 
@@ -432,9 +436,8 @@ LogicalResult SCFToLoopSchedule::populateOperatorTypes(
 }
 
 /// Solve the pre-computed scheduling problem.
-LogicalResult
-SCFToLoopSchedule::solveChainingModuloProblem(scf::ForOp &loop,
-                                              ChainingModuloProblem &problem) {
+LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
+    scf::ForOp &loop, ChainingModuloProblem &problem, float cycleTime) {
   // Scheduling analyis only considers the innermost loop nest for now.
   auto forOp = loop;
 
@@ -464,7 +467,7 @@ SCFToLoopSchedule::solveChainingModuloProblem(scf::ForOp &loop,
     return failure();
 
   auto *anchor = forOp.getBody()->getTerminator();
-  if (failed(scheduleSimplex(problem, anchor, 1.0)))
+  if (failed(scheduleSimplex(problem, anchor, cycleTime)))
     return failure();
 
   // Verify the solution.
@@ -487,8 +490,8 @@ SCFToLoopSchedule::solveChainingModuloProblem(scf::ForOp &loop,
   return success();
 }
 
-LogicalResult SCFToLoopSchedule::solveChainingSharedOperatorsProblem(
-    Region &region, ChainingSharedOperatorsProblem &problem) {
+LogicalResult SCFToLoopSchedulePass::solveChainingSharedOperatorsProblem(
+    Region &region, ChainingSharedOperatorsProblem &problem, float cycleTime) {
 
   LLVM_DEBUG(region.getParentOp()->dump());
 
@@ -514,7 +517,7 @@ LogicalResult SCFToLoopSchedule::solveChainingSharedOperatorsProblem(
     return failure();
 
   auto *anchor = region.back().getTerminator();
-  if (failed(scheduleSimplex(problem, anchor, 1.0)))
+  if (failed(scheduleSimplex(problem, anchor, cycleTime)))
     return failure();
 
   // Verify the solution.
@@ -537,8 +540,8 @@ LogicalResult SCFToLoopSchedule::solveChainingSharedOperatorsProblem(
 
 /// Create the pipeline op for a loop nest.
 LogicalResult
-SCFToLoopSchedule::createLoopSchedulePipeline(scf::ForOp &loop,
-                                              CyclicProblem &problem) {
+SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
+                                                  CyclicProblem &problem) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
 
   builder.setInsertionPointToStart(
@@ -945,8 +948,9 @@ getOperationCycleMap(Problem &problem) {
 }
 
 /// Create loopschedule seq op for a sequential loop
-LogicalResult SCFToLoopSchedule::createLoopScheduleSequential(
-    scf::ForOp &loop, Problem &problem) {
+LogicalResult
+SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
+                                                    Problem &problem) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
 
   builder.setInsertionPointToStart(
@@ -1285,9 +1289,8 @@ int64_t opOrParentStartTime(Problem &problem, Operation *op) {
 }
 
 /// Create the loopschedule ops for an entire function.
-LogicalResult
-SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
-                                          Problem &problem) {
+LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
+                                                            Problem &problem) {
   auto *anchor = funcOp.getBody().back().getTerminator();
 
   auto opMap = getOperationCycleMap(problem);
@@ -1524,6 +1527,6 @@ SCFToLoopSchedule::createFuncLoopSchedule(FuncOp &funcOp,
   return success();
 }
 
-std::unique_ptr<mlir::Pass> circt::createSCFToLoopSchedulePass() {
-  return std::make_unique<SCFToLoopSchedule>();
+std::unique_ptr<OperationPass<FuncOp>> circt::createSCFToLoopSchedulePass() {
+  return std::make_unique<SCFToLoopSchedulePass>();
 }
