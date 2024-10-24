@@ -82,7 +82,7 @@ namespace {
 
 struct SCFToLoopSchedulePass
     : public circt::impl::SCFToLoopScheduleBase<SCFToLoopSchedulePass> {
-  // using SCFToLoopScheduleBase<SCFToLoopSchedule>::SCFToLoopScheduleBase;
+  using SCFToLoopScheduleBase::SCFToLoopScheduleBase;
   void runOnOperation() override;
 
 private:
@@ -1527,6 +1527,7 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
   return success();
 }
 
-std::unique_ptr<OperationPass<FuncOp>> circt::createSCFToLoopSchedulePass() {
-  return std::make_unique<SCFToLoopSchedulePass>();
+std::unique_ptr<OperationPass<FuncOp>>
+circt::createSCFToLoopSchedulePass(const SCFToLoopScheduleOptions &options) {
+  return std::make_unique<SCFToLoopSchedulePass>(options);
 }

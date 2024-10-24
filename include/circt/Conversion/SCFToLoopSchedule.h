@@ -19,7 +19,7 @@ namespace circt {
 #include "circt/Conversion/Passes.h.inc"
 
 std::unique_ptr<OperationPass<mlir::func::FuncOp>>
-createSCFToLoopSchedulePass();
+createSCFToLoopSchedulePass(const SCFToLoopScheduleOptions &options = {});
 
 } // namespace circt
 
