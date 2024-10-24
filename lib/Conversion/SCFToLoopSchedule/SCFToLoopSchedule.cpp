@@ -86,15 +86,10 @@ struct SCFToLoopSchedule
   void runOnOperation() override;
 
 private:
-  LogicalResult populateOperatorTypes(Operation *op, Region &loopBody,
-                                      SharedOperatorsProblem &problem);
-  LogicalResult populateChainingOperatorTypes(Operation *op, Region &body,
+  LogicalResult populateOperatorTypes(Operation *op, Region &body,
                                       ChainingSharedOperatorsProblem &problem);
-  LogicalResult solveModuloProblem(scf::ForOp &loop, ModuloProblem &problem);
   LogicalResult solveChainingModuloProblem(scf::ForOp &loop,
                                            ChainingModuloProblem &problem);
-  LogicalResult solveSharedOperatorsProblem(Region &region,
-                                            SharedOperatorsProblem &problem);
   LogicalResult solveChainingSharedOperatorsProblem(Region &region,
                                             ChainingSharedOperatorsProblem &problem);
   LogicalResult createLoopSchedulePipeline(scf::ForOp &loop,
@@ -163,8 +158,8 @@ void SCFToLoopSchedule::runOnOperation() {
     ChainingModuloProblem moduloProblem =
         getChainingModuloProblem(loop, *dependenceAnalysis);
 
-    if (failed(populateChainingOperatorTypes(loop.getOperation(),
-                                             loop.getRegion(), moduloProblem)))
+    if (failed(populateOperatorTypes(loop.getOperation(), loop.getRegion(),
+                                     moduloProblem)))
       return signalPassFailure();
 
     if (failed(addMemoryResources(loop.getOperation(), loop.getRegion(),
@@ -207,8 +202,8 @@ void SCFToLoopSchedule::runOnOperation() {
     auto problem = getChainingSharedOperatorsProblem(loop, *dependenceAnalysis);
 
     // Populate the target operator types.
-    if (failed(populateChainingOperatorTypes(loop.getOperation(),
-                                           *loop.getLoopRegions().front(), problem)))
+    if (failed(populateOperatorTypes(loop.getOperation(),
+                                     *loop.getLoopRegions().front(), problem)))
       return signalPassFailure();
 
     if (failed(addMemoryResources(loop.getOperation(), loop.getRegion(),
@@ -244,7 +239,7 @@ void SCFToLoopSchedule::runOnOperation() {
   auto problem = getChainingSharedOperatorsProblem(funcOp, *dependenceAnalysis);
 
   // Populate the target operator types.
-  if (failed(populateChainingOperatorTypes(funcOp.getOperation(), funcOp.getBody(),
+  if (failed(populateOperatorTypes(funcOp.getOperation(), funcOp.getBody(),
                                    problem)))
     return signalPassFailure();
 
@@ -283,9 +278,12 @@ void SCFToLoopSchedule::runOnOperation() {
   });
 }
 
-LogicalResult
-SCFToLoopSchedule::populateChainingOperatorTypes(Operation *op, Region &loopBody,
-                                                 ChainingSharedOperatorsProblem &problem) {
+/// Populate the schedling problem operator types for the dialect we are
+/// targetting. Right now, we assume Calyx, which has a standard library with
+/// well-defined operator latencies. Ultimately, we should move this to a
+/// dialect interface in the Scheduling dialect.
+LogicalResult SCFToLoopSchedule::populateOperatorTypes(
+    Operation *op, Region &loopBody, ChainingSharedOperatorsProblem &problem) {
   // Scheduling analyis only considers the innermost loop nest for now.
 
   // Load the Calyx operator library into the problem. This is a very minimal
@@ -297,16 +295,16 @@ SCFToLoopSchedule::populateChainingOperatorTypes(Operation *op, Region &loopBody
   problem.setOutgoingDelay(freeOpr, 0);
   OperatorType combOpr = problem.getOrInsertOperatorType("comb");
   problem.setLatency(combOpr, 0);
-  problem.setIncomingDelay(combOpr, 0.3);
-  problem.setOutgoingDelay(combOpr, 0.3);
+  problem.setIncomingDelay(combOpr, 0.2);
+  problem.setOutgoingDelay(combOpr, 0.2);
   OperatorType seqOpr = problem.getOrInsertOperatorType("seq");
   problem.setLatency(seqOpr, 1);
   problem.setIncomingDelay(seqOpr, 0.5);
   problem.setOutgoingDelay(seqOpr, 0.5);
   OperatorType loopOpr = problem.getOrInsertOperatorType("loop");
   problem.setLatency(loopOpr, 1);
-  problem.setIncomingDelay(loopOpr, 0.5);
-  problem.setOutgoingDelay(loopOpr, 0.5);
+  problem.setIncomingDelay(loopOpr, 0.0);
+  problem.setOutgoingDelay(loopOpr, 0.0);
   OperatorType mcOpr = problem.getOrInsertOperatorType("multicycle");
   problem.setLatency(mcOpr, 4);
   problem.setIncomingDelay(mcOpr, 0.5);
@@ -378,19 +376,24 @@ SCFToLoopSchedule::populateChainingOperatorTypes(Operation *op, Region &loopBody
         .Case<LoadInterface, StoreInterface>([&](Operation *op) {
           unsigned latency;
           std::string uniqueId;
+          float incomingDelay = 0.0;
+          float outgoingDelay = 0.0;
           if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*op)) {
             latency = loadOp.getLatency();
             uniqueId = loadOp.getUniqueId();
+            incomingDelay = loadOp.getIncomingDelay();
+            outgoingDelay = loadOp.getOutgoingDelay();
           } else {
             auto storeOp = cast<loopschedule::StoreInterface>(*op);
             latency = storeOp.getLatency();
             uniqueId = storeOp.getUniqueId();
+            incomingDelay = storeOp.getIncomingDelay();
           }
           OperatorType portOpr = problem.getOrInsertOperatorType(uniqueId);
           problem.setLatency(portOpr, latency);
           problem.setLinkedOperatorType(op, portOpr);
-          problem.setIncomingDelay(portOpr, 0.5);
-          problem.setOutgoingDelay(portOpr, 0.5);
+          problem.setIncomingDelay(portOpr, incomingDelay);
+          problem.setOutgoingDelay(portOpr, outgoingDelay);
 
           return WalkResult::advance();
         })
@@ -407,8 +410,8 @@ SCFToLoopSchedule::populateChainingOperatorTypes(Operation *op, Region &loopBody
             problem.addResourceType(op, rsrc);
           }
           problem.setLinkedOperatorType(op, opr);
-          problem.setIncomingDelay(opr, 0.5);
-          problem.setOutgoingDelay(opr, 0.5);
+          problem.setIncomingDelay(opr, schedOp.getIncomingDelay());
+          problem.setOutgoingDelay(opr, schedOp.getOutgoingDelay());
 
           return WalkResult::advance();
         })
@@ -424,183 +427,6 @@ SCFToLoopSchedule::populateChainingOperatorTypes(Operation *op, Region &loopBody
 
   if (result.wasInterrupted())
     return op->emitError("unsupported operation ") << *unsupported;
-
-  return success();
-}
-
-/// Populate the schedling problem operator types for the dialect we are
-/// targetting. Right now, we assume Calyx, which has a standard library with
-/// well-defined operator latencies. Ultimately, we should move this to a
-/// dialect interface in the Scheduling dialect.
-LogicalResult
-SCFToLoopSchedule::populateOperatorTypes(Operation *op, Region &loopBody,
-                                         SharedOperatorsProblem &problem) {
-  // Scheduling analyis only considers the innermost loop nest for now.
-
-  // Load the Calyx operator library into the problem. This is a very minimal
-  // set of arithmetic and memory operators for now. This should ultimately be
-  // pulled out into some sort of dialect interface.
-  OperatorType combOpr = problem.getOrInsertOperatorType("comb");
-  problem.setLatency(combOpr, 0);
-  OperatorType seqOpr = problem.getOrInsertOperatorType("seq");
-  problem.setLatency(seqOpr, 1);
-  OperatorType loopOpr = problem.getOrInsertOperatorType("loop");
-  problem.setLatency(loopOpr, 1);
-  OperatorType mcOpr = problem.getOrInsertOperatorType("multicycle");
-  problem.setLatency(mcOpr, 4);
-  OperatorType divOpr = problem.getOrInsertOperatorType("divider");
-  problem.setLatency(divOpr, 36);
-
-  Operation *unsupported;
-  WalkResult result = loopBody.walk([&](Operation *op) {
-    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
-        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr) {
-      return WalkResult::advance();
-    }
-
-    return TypeSwitch<Operation *, WalkResult>(op)
-        .Case<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
-              arith::TruncIOp, CmpIOp, IndexCastOp, memref::AllocaOp,
-              memref::AllocOp, loopschedule::AllocInterface, YieldOp,
-              func::ReturnOp, arith::SelectOp, AddIOp, SubIOp, ShLIOp, AndIOp,
-              ShRSIOp, ShRUIOp, XOrIOp>([&](Operation *combOp) {
-          // Some known combinational ops.
-          problem.setLinkedOperatorType(combOp, combOpr);
-          return WalkResult::advance();
-        })
-        .Case<MulIOp>([&](Operation *mcOp) {
-          // Multiplier
-          problem.setLinkedOperatorType(mcOp, mcOpr);
-          return WalkResult::advance();
-        })
-        .Case<RemUIOp, RemSIOp, DivSIOp>([&](Operation *op) {
-          // Divider ops
-          auto bitwidth = op->getResult(0).getType().getIntOrFloatBitWidth();
-          if (bitwidth != 32 && bitwidth != 64) {
-            unsupported = op;
-            return WalkResult::interrupt();
-          }
-          problem.setLinkedOperatorType(op, divOpr);
-          return WalkResult::advance();
-        })
-        .Case<LoopScheduleStoreOp, AffineStoreOp>([&](Operation *memOp) {
-          Value memRef = isa<AffineStoreOp>(*memOp)
-                             ? cast<AffineStoreOp>(*memOp).getMemRef()
-                             : cast<LoopScheduleStoreOp>(*memOp).getMemRef();
-          OperatorType memOpr = problem.getOrInsertOperatorType(
-              "mem_" + std::to_string(hash_value(memRef)));
-          problem.setLatency(memOpr, 1);
-          problem.setLinkedOperatorType(memOp, memOpr);
-          return WalkResult::advance();
-        })
-        .Case<LoopScheduleLoadOp, AffineLoadOp>([&](Operation *memOp) {
-          Value memRef = getMemref(memOp);
-          OperatorType memOpr = problem.getOrInsertOperatorType(
-              "mem_" + std::to_string(hash_value(memRef)));
-          problem.setLatency(memOpr, 1);
-          problem.setLinkedOperatorType(memOp, memOpr);
-          return WalkResult::advance();
-        })
-        .Case<LoadInterface, StoreInterface>([&](Operation *op) {
-          unsigned latency;
-          std::string uniqueId;
-          if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*op)) {
-            latency = loadOp.getLatency();
-            uniqueId = loadOp.getUniqueId();
-          } else {
-            auto storeOp = cast<loopschedule::StoreInterface>(*op);
-            latency = storeOp.getLatency();
-            uniqueId = storeOp.getUniqueId();
-          }
-          OperatorType portOpr = problem.getOrInsertOperatorType(uniqueId);
-          problem.setLatency(portOpr, latency);
-          problem.setLinkedOperatorType(op, portOpr);
-
-          return WalkResult::advance();
-        })
-        .Case<loopschedule::SchedulableInterface>([&](Operation *op) {
-          auto schedOp = cast<SchedulableInterface>(op);
-          auto latency = schedOp.getOpLatency();
-          auto limitOpt = schedOp.getOpLimit();
-          OperatorType opr =
-              problem.getOrInsertOperatorType(schedOp.getUniqueId());
-          problem.setLatency(opr, latency);
-          if (limitOpt.has_value()) {
-            auto rsrc = problem.getOrInsertResourceType(schedOp.getUniqueId());
-            problem.setResourceLimit(rsrc, limitOpt.value());
-            problem.addResourceType(op, rsrc);
-          }
-          problem.setLinkedOperatorType(op, opr);
-
-          return WalkResult::advance();
-        })
-        .Case<LoopInterface>([&](Operation *loopOp) {
-          problem.setLinkedOperatorType(loopOp, loopOpr);
-          return WalkResult::advance();
-        })
-        .Default([&](Operation *badOp) {
-          unsupported = op;
-          return WalkResult::interrupt();
-        });
-  });
-
-  if (result.wasInterrupted())
-    return op->emitError("unsupported operation ") << *unsupported;
-
-  return success();
-}
-
-/// Solve the pre-computed scheduling problem.
-LogicalResult SCFToLoopSchedule::solveModuloProblem(scf::ForOp &loop,
-                                                    ModuloProblem &problem) {
-  // Scheduling analyis only considers the innermost loop nest for now.
-  auto forOp = loop;
-
-  LLVM_DEBUG(forOp.dump());
-
-  // Optionally debug problem inputs.
-  LLVM_DEBUG(for (auto *op
-                  : problem.getOperations()) {
-    // if (auto parent = op->getParentOfType<LoopInterface>(); parent)
-    //   continue;
-    llvm::dbgs() << "Modulo scheduling inputs for " << *op;
-    auto opr = problem.getLinkedOperatorType(op);
-    llvm::dbgs() << "\n  opr = " << opr->getName();
-    llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
-    for (auto rsrc : problem.getLinkedResourceTypes(op))
-      llvm::dbgs() << "\n  resource = " << rsrc.getName()
-                   << " limit = " << problem.getResourceLimit(rsrc);
-    for (auto dep : problem.getDependences(op))
-      if (dep.isAuxiliary())
-        llvm::dbgs() << "\n  dep = { distance = " << problem.getDistance(dep)
-                     << ", source = " << *dep.getSource() << " }";
-    llvm::dbgs() << "\n\n";
-  });
-
-  // Verify and solve the problem.
-  if (failed(problem.check()))
-    return failure();
-
-  auto *anchor = forOp.getBody()->getTerminator();
-  if (failed(scheduleSimplex(problem, anchor)))
-    return failure();
-
-  // Verify the solution.
-  if (failed(problem.verify()))
-    return failure();
-
-  // Optionally debug problem outputs.
-  LLVM_DEBUG({
-    llvm::dbgs() << "Scheduled initiation interval = "
-                 << problem.getInitiationInterval() << "\n\n";
-    for (auto *op : problem.getOperations()) {
-      if (auto parent = op->getParentOfType<LoopInterface>(); parent)
-        continue;
-      llvm::dbgs() << "Scheduling outputs for " << *op;
-      llvm::dbgs() << "\n  start = " << problem.getStartTime(op);
-      llvm::dbgs() << "\n\n";
-    }
-  });
 
   return success();
 }
@@ -656,55 +482,6 @@ SCFToLoopSchedule::solveChainingModuloProblem(scf::ForOp &loop,
       llvm::dbgs() << "\n  start = " << problem.getStartTime(op);
       llvm::dbgs() << "\n\n";
     }
-  });
-
-  return success();
-}
-
-/// Solve the pre-computed scheduling problem.
-LogicalResult SCFToLoopSchedule::solveSharedOperatorsProblem(
-    Region &region, SharedOperatorsProblem &problem) {
-
-  LLVM_DEBUG(region.getParentOp()->dump());
-
-  // Optionally debug problem inputs.
-  LLVM_DEBUG(for (auto op
-                  : problem.getOperations()) {
-    llvm::dbgs() << "Shared Operator scheduling inputs for " << *op;
-    auto opr = problem.getLinkedOperatorType(op);
-    llvm::dbgs() << "\n  opr = " << opr->getName();
-    llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
-    for (auto rsrc : problem.getLinkedResourceTypes(op))
-      llvm::dbgs() << "\n  resource = " << rsrc.getName()
-                   << " limit = " << problem.getResourceLimit(rsrc);
-    for (auto dep : problem.getDependences(op))
-      if (dep.isAuxiliary())
-        llvm::dbgs() << "\n  dep = { "
-                     << "source = " << *dep.getSource() << " }";
-    llvm::dbgs() << "\n\n";
-  });
-
-  // Verify and solve the problem.
-  if (failed(problem.check()))
-    return failure();
-
-  auto *anchor = region.back().getTerminator();
-  if (failed(scheduleSimplex(problem, anchor)))
-    return failure();
-
-  // Verify the solution.
-  if (failed(problem.verify()))
-    return failure();
-
-  // Optionally debug problem outputs.
-  LLVM_DEBUG({
-    region.walk<WalkOrder::PreOrder>([&](Operation *op) {
-      if (auto parent = op->getParentOfType<LoopInterface>(); parent)
-        return;
-      llvm::dbgs() << "Scheduling outputs for " << *op;
-      llvm::dbgs() << "\n  start = " << problem.getStartTime(op);
-      llvm::dbgs() << "\n\n";
-    });
   });
 
   return success();

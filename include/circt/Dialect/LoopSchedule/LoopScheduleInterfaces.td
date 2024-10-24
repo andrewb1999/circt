@@ -117,6 +117,16 @@ def LoadOpInterface : OpInterface<"LoadInterface"> {
       "getLatency",
       (ins)>,
     InterfaceMethod<
+      "This returns the incoming delay of the load.",
+      "float",
+      "getIncomingDelay",
+      (ins)>,
+    InterfaceMethod<
+      "This returns the outgoing delay of the load.",
+      "float",
+      "getOutgoingDelay",
+      (ins)>,
+    InterfaceMethod<
       "This returns true if the load is dynamic.",
       "bool",
       "isDynamic",
@@ -180,6 +190,11 @@ def StoreOpInterface : OpInterface<"StoreInterface"> {
       "getLatency",
       (ins)>,
     InterfaceMethod<
+      "This returns the incoming delay of the store.",
+      "float",
+      "getIncomingDelay",
+      (ins)>,
+    InterfaceMethod<
       "This returns true if the store is dynamic.",
       "bool",
       "isDynamic",
@@ -241,6 +256,16 @@ def SchedulableOpInterface : OpInterface<"SchedulableInterface"> {
       "This returns the number of this op that can be scheduled at the same time.",
       "std::optional<uint32_t>",
       "getOpLimit",
+      (ins)>,
+    InterfaceMethod<
+      "This returns the incoming delay of the op.",
+      "float",
+      "getIncomingDelay",
+      (ins)>,
+    InterfaceMethod<
+      "This returns the outgoing delay of the op.",
+      "float",
+      "getOutgoingDelay",
       (ins)>,
     InterfaceMethod<
       "This returns a unique identifier for this op",
