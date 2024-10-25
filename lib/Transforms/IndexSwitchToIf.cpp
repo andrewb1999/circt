@@ -6,7 +6,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -26,11 +25,18 @@
 #include <cstdint>
 #include <limits>
 
+namespace circt {
+#define GEN_PASS_DEF_INDEXSWITCHTOIF
+#define GEN_PASS_DEF_INDEXSWITCHTOIFCALLS
+#include "circt/Transforms/Passes.h.inc"
+} // namespace circt
+
 using namespace mlir;
 using namespace mlir::affine;
 
 namespace {
-struct IndexSwitchToIf : public circt::IndexSwitchToIfBase<IndexSwitchToIf> {
+struct IndexSwitchToIf
+    : public circt::impl::IndexSwitchToIfBase<IndexSwitchToIf> {
   using IndexSwitchToIfBase<IndexSwitchToIf>::IndexSwitchToIfBase;
   void runOnOperation() override;
 };

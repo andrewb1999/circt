@@ -10,7 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
 #include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
@@ -32,6 +31,12 @@
 #include <cstdint>
 #include <limits>
 
+namespace circt {
+#define GEN_PASS_DEF_INDEXREMOVAL
+#define GEN_PASS_DEF_INDEXREMOVALCALLS
+#include "circt/Transforms/Passes.h.inc"
+} // namespace circt
+
 using namespace mlir;
 using namespace mlir::affine;
 using namespace mlir::arith;
@@ -39,7 +44,7 @@ using namespace circt;
 using namespace circt::loopschedule;
 
 namespace {
-struct IndexRemoval : public circt::IndexRemovalBase<IndexRemoval> {
+struct IndexRemoval : public circt::impl::IndexRemovalBase<IndexRemoval> {
   using IndexRemovalBase<IndexRemoval>::IndexRemovalBase;
   void runOnOperation() override;
 };

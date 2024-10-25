@@ -7,9 +7,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
 #include "circt/Transforms/Passes.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
@@ -21,15 +22,20 @@
 #include <cstdint>
 #include <limits>
 
+namespace circt {
+#define GEN_PASS_DEF_ARITHSTRENGTHREDUCTION
+#define GEN_PASS_DEF_ARITHSTRENGTHREDUCTIONCALLS
+#include "circt/Transforms/Passes.h.inc"
+} // namespace circt
+
 using namespace mlir;
 using namespace mlir::affine;
 using namespace mlir::arith;
 
 namespace {
 struct ArithStrengthReduction
-    : public circt::ArithStrengthReductionBase<ArithStrengthReduction> {
-  using ArithStrengthReductionBase<
-      ArithStrengthReduction>::ArithStrengthReductionBase;
+    : public circt::impl::ArithStrengthReductionBase<ArithStrengthReduction> {
+  using ArithStrengthReductionBase::ArithStrengthReductionBase;
   void runOnOperation() override;
 };
 } // namespace

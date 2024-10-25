@@ -18,9 +18,11 @@
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "circt/Dialect/HW/HWInstanceGraph.h"
 #include "circt/Scheduling/Problems.h"
+#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
@@ -87,18 +89,22 @@ void TestDependenceAnalysisPass::runOnOperation() {
 
     SmallVector<Attribute> deps;
 
-    for (auto dep : analysis.getDependences(op)) {
+    for (auto &dep : analysis.getDependences(op)) {
       if (dep.dependenceType != DependenceResult::HasDependence)
         continue;
 
       SmallVector<Attribute> comps;
       for (auto comp : dep.dependenceComponents) {
-        SmallVector<Attribute> vector;
-        vector.push_back(
-            IntegerAttr::get(IntegerType::get(context, 64), *comp.lb));
-        vector.push_back(
-            IntegerAttr::get(IntegerType::get(context, 64), *comp.ub));
-        comps.push_back(ArrayAttr::get(context, vector));
+        if (dep.dependenceType == DependenceResult::HasDependence) {
+          SmallVector<Attribute> vector;
+          if (comp.lb.has_value() && comp.ub.has_value()) {
+            vector.push_back(
+                IntegerAttr::get(IntegerType::get(context, 64), *comp.lb));
+            vector.push_back(
+                IntegerAttr::get(IntegerType::get(context, 64), *comp.ub));
+            comps.push_back(ArrayAttr::get(context, vector));
+          }
+        }
       }
 
       deps.push_back(ArrayAttr::get(context, comps));

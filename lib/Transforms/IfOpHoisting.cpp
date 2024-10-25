@@ -6,7 +6,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -27,12 +26,18 @@
 #include <cstdint>
 #include <limits>
 
+namespace circt {
+#define GEN_PASS_DEF_IFOPHOISTING
+#define GEN_PASS_DEF_IFOPHOISTINGCALLS
+#include "circt/Transforms/Passes.h.inc"
+} // namespace circt
+
 using namespace mlir;
 using namespace mlir::affine;
 using namespace circt::loopschedule;
 
 namespace {
-struct IfOpHoisting : public circt::IfOpHoistingBase<IfOpHoisting> {
+struct IfOpHoisting : public circt::impl::IfOpHoistingBase<IfOpHoisting> {
   using IfOpHoistingBase<IfOpHoisting>::IfOpHoistingBase;
   void runOnOperation() override;
 };
