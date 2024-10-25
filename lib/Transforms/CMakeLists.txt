@@ -8,6 +8,7 @@ add_circt_library(CIRCTTransforms
   IndexSwitchToIf.cpp
   ArithStrengthReduction.cpp
   IndexRemoval.cpp
+  PrintOpCount.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Transforms
@@ -15,6 +16,7 @@ add_circt_library(CIRCTTransforms
   LINK_LIBS PUBLIC
   CIRCTComb
   CIRCTHW
+  CIRCTOpCountAnalysis
   MLIRArithDialect
   MLIRControlFlowDialect
   MLIRFuncDialect

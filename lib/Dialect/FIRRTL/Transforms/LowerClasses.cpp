@@ -198,6 +198,13 @@ struct LoweringState {
   DenseMap<om::ClassLike, ClassLoweringState> classLoweringStateTable;
 };
 
+/// Helper struct to capture state about an object that needs RtlPorts added.
+struct RtlPortsInfo {
+  firrtl::PathOp containingModuleRef;
+  Value basePath;
+  om::ObjectOp object;
+};
+
 struct LowerClassesPass
     : public circt::firrtl::impl::LowerClassesBase<LowerClassesPass> {
   void runOnOperation() override;
@@ -213,7 +220,8 @@ private:
 
   // Create an OM Class op from a FIRRTL Class op.
   om::ClassLike createClass(FModuleLike moduleLike,
-                            const PathInfoTable &pathInfoTable);
+                            const PathInfoTable &pathInfoTable,
+                            std::mutex &intraPassMutex);
 
   // Lower the FIRRTL Class to OM Class.
   void lowerClassLike(FModuleLike moduleLike, om::ClassLike classLike,
@@ -225,7 +233,13 @@ private:
   // Update Object instantiations in a FIRRTL Module or OM Class.
   LogicalResult updateInstances(Operation *op, InstanceGraph &instanceGraph,
                                 const LoweringState &state,
-                                const PathInfoTable &pathInfoTable);
+                                const PathInfoTable &pathInfoTable,
+                                std::mutex &intraPassMutex);
+
+  /// Create and add all 'ports' lists of RtlPort objects for each object.
+  void createAllRtlPorts(const PathInfoTable &pathInfoTable,
+                         hw::InnerSymbolNamespaceCollection &namespaces,
+                         HierPathCache &hierPathCache);
 
   // Convert to OM ops and types in Classes or Modules.
   LogicalResult dialectConversion(
@@ -234,6 +248,9 @@ private:
 
   // State to memoize repeated calls to shouldCreateClass.
   DenseMap<StringAttr, bool> shouldCreateClassMemo;
+
+  // State used while creating the optional 'ports' list of RtlPort objects.
+  SmallVector<RtlPortsInfo> rtlPortsToCreate;
 };
 
 struct PathTracker {
@@ -293,6 +310,116 @@ private:
   SmallVector<PathInfoTableEntry> entries;
   SetVector<StringAttr> altBasePathRoots;
 };
+
+/// Constants and helpers for creating the RtlPorts on the fly.
+
+static constexpr StringRef kContainingModuleName = "containingModule";
+static constexpr StringRef kPortsName = "ports";
+static constexpr StringRef kRtlPortClassName = "RtlPort";
+
+static Type getRtlPortsType(MLIRContext *context) {
+  return om::ListType::get(om::ClassType::get(
+      context, FlatSymbolRefAttr::get(context, kRtlPortClassName)));
+}
+
+/// Create and add the 'ports' list of RtlPort objects for an object.
+static void createRtlPorts(const RtlPortsInfo &rtlPortToCreate,
+                           const PathInfoTable &pathInfoTable,
+                           hw::InnerSymbolNamespaceCollection &namespaces,
+                           HierPathCache &hierPathCache, OpBuilder &builder) {
+  firrtl::PathOp containingModuleRef = rtlPortToCreate.containingModuleRef;
+  Value basePath = rtlPortToCreate.basePath;
+  om::ObjectOp object = rtlPortToCreate.object;
+
+  // Set the builder to just before the object.
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPoint(object);
+
+  // Look up the module from the containingModuleRef.
+
+  FlatSymbolRefAttr containingModulePathRef =
+      pathInfoTable.table.at(containingModuleRef.getTarget()).symRef;
+
+  const SymbolTable &symbolTable = hierPathCache.getSymbolTable();
+
+  hw::HierPathOp containingModulePath =
+      symbolTable.lookup<hw::HierPathOp>(containingModulePathRef.getAttr());
+
+  assert(containingModulePath.isModule() &&
+         "expected containing module path to target a module");
+
+  StringAttr moduleName = containingModulePath.leafMod();
+
+  FModuleLike mod = symbolTable.lookup<FModuleLike>(moduleName);
+  MLIRContext *ctx = mod.getContext();
+  Location loc = mod.getLoc();
+
+  // Create the per-port information.
+
+  auto portClassName = StringAttr::get(ctx, kRtlPortClassName);
+  auto portClassType =
+      om::ClassType::get(ctx, FlatSymbolRefAttr::get(portClassName));
+
+  SmallVector<Value> ports;
+  for (unsigned i = 0, e = mod.getNumPorts(); i < e; ++i) {
+    // Only process ports that are not zero-width.
+    auto portType = type_dyn_cast<FIRRTLBaseType>(mod.getPortType(i));
+    if (!portType || portType.getBitWidthOrSentinel() == 0)
+      continue;
+
+    // Get a path to the port. This may modify port attributes or the global
+    // namespace of hierpaths, so use the mutex around those operations.
+
+    auto portTarget = PortAnnoTarget(mod, i);
+
+    auto portSym =
+        getInnerRefTo({portTarget.getPortNo(), portTarget.getOp(), 0},
+                      [&](FModuleLike m) -> hw::InnerSymbolNamespace & {
+                        return namespaces[m];
+                      });
+
+    FlatSymbolRefAttr portPathRef =
+        hierPathCache.getRefFor(ArrayAttr::get(ctx, {portSym}));
+
+    auto portPath = builder.create<om::PathCreateOp>(
+        loc, om::PathType::get(ctx),
+        om::TargetKindAttr::get(ctx, om::TargetKind::DontTouch), basePath,
+        portPathRef);
+
+    // Get a direction attribute.
+
+    StringRef portDirectionName =
+        mod.getPortDirection(i) == Direction::Out ? "Output" : "Input";
+
+    auto portDirection = builder.create<om::ConstantOp>(
+        loc, om::StringType::get(ctx),
+        StringAttr::get(portDirectionName, om::StringType::get(ctx)));
+
+    // Get a width attribute.
+
+    auto portWidth = builder.create<om::ConstantOp>(
+        loc, om::OMIntegerType::get(ctx),
+        om::IntegerAttr::get(
+            ctx, mlir::IntegerAttr::get(mlir::IntegerType::get(ctx, 64),
+                                        portType.getBitWidthOrSentinel())));
+
+    // Create an RtlPort object for this port, and add it to the list.
+
+    auto portObj = builder.create<om::ObjectOp>(
+        loc, portClassType, portClassName,
+        ArrayRef<Value>{portPath, portDirection, portWidth});
+
+    ports.push_back(portObj);
+  }
+
+  // Create a list of RtlPort objects to be included with the containingModule.
+
+  auto portsList = builder.create<om::ListCreateOp>(
+      UnknownLoc::get(builder.getContext()),
+      getRtlPortsType(builder.getContext()), ports);
+
+  object.getActualParamsMutable().append({portsList});
+}
 
 } // namespace
 
@@ -530,8 +657,10 @@ PathTracker::processPathTrackers(const AnnoTarget &target) {
     // to the start of the annotation's NLA.
     InstanceGraphNode *node = instanceGraph.lookup(moduleName);
     while (true) {
-      // If it's not a non-local target, we don't have to append anything.
-      if (!hierPathOp)
+      // If it's not a non-local target, we don't have to append anything,
+      // unless it needs an alternative base path, in which case we do need to
+      // make a hierarchical path.
+      if (!hierPathOp && !needsAltBasePath.value())
         break;
 
       // If we get to the owning module or the top, we're done.
@@ -701,6 +830,7 @@ LogicalResult LowerClassesPass::processPaths(
 /// Lower FIRRTL Class and Object ops to OM Class and Object ops
 void LowerClassesPass::runOnOperation() {
   MLIRContext *ctx = &getContext();
+  auto intraPassMutex = std::mutex();
 
   // Get the CircuitOp.
   CircuitOp circuit = getOperation();
@@ -742,7 +872,7 @@ void LowerClassesPass::runOnOperation() {
       continue;
 
     if (shouldCreateClass(moduleLike.getModuleNameAttr())) {
-      auto omClass = createClass(moduleLike, pathInfoTable);
+      auto omClass = createClass(moduleLike, pathInfoTable, intraPassMutex);
       auto &classLoweringState = loweringState.classLoweringStateTable[omClass];
       classLoweringState.moduleLike = moduleLike;
 
@@ -804,9 +934,13 @@ void LowerClassesPass::runOnOperation() {
   if (failed(
           mlir::failableParallelForEach(ctx, objectContainers, [&](auto *op) {
             return updateInstances(op, instanceGraph, loweringState,
-                                   pathInfoTable);
+                                   pathInfoTable, intraPassMutex);
           })))
     return signalPassFailure();
+
+  // If needed, create and add 'ports' lists of RtlPort objects.
+  if (!rtlPortsToCreate.empty())
+    createAllRtlPorts(pathInfoTable, namespaces, cache);
 
   // Convert to OM ops and types in Classes or Modules in parallel.
   if (failed(
@@ -817,6 +951,9 @@ void LowerClassesPass::runOnOperation() {
 
   // We keep the instance graph up to date, so mark that analysis preserved.
   markAnalysesPreserved<InstanceGraph>();
+
+  // Reset pass state.
+  rtlPortsToCreate.clear();
 }
 
 std::unique_ptr<mlir::Pass> circt::firrtl::createLowerClassesPass() {
@@ -829,10 +966,70 @@ bool LowerClassesPass::shouldCreateClass(StringAttr modName) {
   return shouldCreateClassMemo.at(modName);
 }
 
+void checkAddContainingModulePorts(bool hasContainingModule, OpBuilder builder,
+                                   SmallVector<Attribute> &fieldNames,
+                                   SmallVector<NamedAttribute> &fieldTypes) {
+  if (hasContainingModule) {
+    auto name = builder.getStringAttr(kPortsName);
+    fieldNames.push_back(name);
+    fieldTypes.push_back(NamedAttribute(
+        name, TypeAttr::get(getRtlPortsType(builder.getContext()))));
+  }
+}
+
+static om::ClassLike convertExtClass(FModuleLike moduleLike, OpBuilder builder,
+                                     Twine name,
+                                     ArrayRef<StringRef> formalParamNames,
+                                     bool hasContainingModule) {
+  SmallVector<Attribute> fieldNames;
+  SmallVector<NamedAttribute> fieldTypes;
+  for (unsigned i = 0, e = moduleLike.getNumPorts(); i < e; ++i) {
+    auto type = moduleLike.getPortType(i);
+    if (!isa<PropertyType>(type))
+      continue;
+
+    auto direction = moduleLike.getPortDirection(i);
+    if (direction != Direction::In) {
+      auto name = moduleLike.getPortNameAttr(i);
+      fieldNames.push_back(name);
+      fieldTypes.push_back(NamedAttribute(name, TypeAttr::get(type)));
+    }
+  }
+  checkAddContainingModulePorts(hasContainingModule, builder, fieldNames,
+                                fieldTypes);
+  return builder.create<om::ClassExternOp>(
+      moduleLike.getLoc(), name, formalParamNames, fieldNames, fieldTypes);
+}
+
+static om::ClassLike convertClass(FModuleLike moduleLike, OpBuilder builder,
+                                  Twine name,
+                                  ArrayRef<StringRef> formalParamNames,
+                                  bool hasContainingModule) {
+  // Collect output property assignments to get field names and types.
+  SmallVector<Attribute> fieldNames;
+  SmallVector<NamedAttribute> fieldTypes;
+  for (auto op : llvm::make_early_inc_range(
+           moduleLike->getRegion(0).getOps<PropAssignOp>())) {
+    auto outputPort = dyn_cast<BlockArgument>(op.getDest());
+    if (!outputPort)
+      continue;
+
+    StringAttr name = moduleLike.getPortNameAttr(outputPort.getArgNumber());
+
+    fieldNames.push_back(name);
+    fieldTypes.push_back(
+        NamedAttribute(name, TypeAttr::get(op.getSrc().getType())));
+  }
+  checkAddContainingModulePorts(hasContainingModule, builder, fieldNames,
+                                fieldTypes);
+  return builder.create<om::ClassOp>(moduleLike.getLoc(), name,
+                                     formalParamNames, fieldNames, fieldTypes);
+}
+
 // Create an OM Class op from a FIRRTL Class op or Module op with properties.
-om::ClassLike
-LowerClassesPass::createClass(FModuleLike moduleLike,
-                              const PathInfoTable &pathInfoTable) {
+om::ClassLike LowerClassesPass::createClass(FModuleLike moduleLike,
+                                            const PathInfoTable &pathInfoTable,
+                                            std::mutex &intraPassMutex) {
   // Collect the parameter names from input properties.
   SmallVector<StringRef> formalParamNames;
   // Every class gets a base path as its first parameter.
@@ -845,11 +1042,23 @@ LowerClassesPass::createClass(FModuleLike moduleLike,
     formalParamNames.push_back(StringAttr::get(
         moduleLike->getContext(), "alt_basepath_" + llvm::Twine(i)));
 
-  for (auto [index, port] : llvm::enumerate(moduleLike.getPorts()))
-    if (port.isInput() && isa<PropertyType>(port.type))
+  // Collect the input parameters.
+  bool hasContainingModule = false;
+  for (auto [index, port] : llvm::enumerate(moduleLike.getPorts())) {
+    if (port.isInput() && isa<PropertyType>(port.type)) {
       formalParamNames.push_back(port.name);
 
+      // Check if we have a 'containingModule' field.
+      if (port.name.strref().starts_with(kContainingModuleName))
+        hasContainingModule = true;
+    }
+  }
+
   OpBuilder builder = OpBuilder::atBlockEnd(getOperation().getBodyBlock());
+
+  // If there is a 'containingModule', add a parameter for 'ports'.
+  if (hasContainingModule)
+    formalParamNames.push_back(kPortsName);
 
   // Take the name from the FIRRTL Class or Module to create the OM Class name.
   StringRef className = moduleLike.getName();
@@ -866,12 +1075,14 @@ LowerClassesPass::createClass(FModuleLike moduleLike,
 
   // Construct the OM Class with the FIRRTL Class name and parameter names.
   om::ClassLike loweredClassOp;
-  if (isa<firrtl::ExtClassOp, firrtl::FExtModuleOp>(moduleLike.getOperation()))
-    loweredClassOp = builder.create<om::ClassExternOp>(
-        moduleLike.getLoc(), className + suffix, formalParamNames);
-  else
-    loweredClassOp = builder.create<om::ClassOp>(
-        moduleLike.getLoc(), className + suffix, formalParamNames);
+  if (isa<firrtl::ExtClassOp, firrtl::FExtModuleOp>(
+          moduleLike.getOperation())) {
+    loweredClassOp = convertExtClass(moduleLike, builder, className + suffix,
+                                     formalParamNames, hasContainingModule);
+  } else {
+    loweredClassOp = convertClass(moduleLike, builder, className + suffix,
+                                  formalParamNames, hasContainingModule);
+  }
 
   return loweredClassOp;
 }
@@ -898,14 +1109,20 @@ void LowerClassesPass::lowerClass(om::ClassOp classOp, FModuleLike moduleLike,
   // Collect information about property ports.
   SmallVector<Property> inputProperties;
   BitVector portsToErase(moduleLike.getNumPorts());
+  bool hasContainingModule = false;
   for (auto [index, port] : llvm::enumerate(moduleLike.getPorts())) {
     // For Module ports that aren't property types, move along.
     if (!isa<PropertyType>(port.type))
       continue;
 
     // Remember input properties to create the OM Class formal parameters.
-    if (port.isInput())
+    if (port.isInput()) {
       inputProperties.push_back({index, port.name, port.type, port.loc});
+
+      // Check if we have a 'containingModule' field.
+      if (port.name.strref().starts_with(kContainingModuleName))
+        hasContainingModule = true;
+    }
 
     // In case this is a Module, remember to erase this port.
     portsToErase.set(index);
@@ -936,6 +1153,8 @@ void LowerClassesPass::lowerClass(om::ClassOp classOp, FModuleLike moduleLike,
   // Clone the property ops from the FIRRTL Class or Module to the OM Class.
   SmallVector<Operation *> opsToErase;
   OpBuilder builder = OpBuilder::atBlockBegin(classOp.getBodyBlock());
+  llvm::SmallVector<mlir::Location> fieldLocs;
+  llvm::SmallVector<mlir::Value> fieldValues;
   for (auto &op : moduleLike->getRegion(0).getOps()) {
     // Check if any operand is a property.
     auto propertyOperands = llvm::any_of(op.getOperandTypes(), [](Type type) {
@@ -953,8 +1172,19 @@ void LowerClassesPass::lowerClass(om::ClassOp classOp, FModuleLike moduleLike,
     if (!needsClone && !propertyOperands && !propertyResults)
       continue;
 
-    // Actually clone the op over to the OM Class.
-    builder.clone(op, mapping);
+    bool isField = false;
+    if (auto propAssign = dyn_cast<PropAssignOp>(op)) {
+      if (isa<BlockArgument>(propAssign.getDest())) {
+        // Store any output property assignments into fields op inputs.
+        fieldLocs.push_back(op.getLoc());
+        fieldValues.push_back(mapping.lookup(propAssign.getSrc()));
+        isField = true;
+      }
+    }
+
+    if (!isField)
+      // Clone the op over to the OM Class.
+      builder.clone(op, mapping);
 
     // In case this is a Module, remember to erase this op, unless it is an
     // instance. Instances are handled later in updateInstances.
@@ -962,19 +1192,15 @@ void LowerClassesPass::lowerClass(om::ClassOp classOp, FModuleLike moduleLike,
       opsToErase.push_back(&op);
   }
 
-  // Convert any output property assignments to Field ops.
-  for (auto op : llvm::make_early_inc_range(classOp.getOps<PropAssignOp>())) {
-    // Property assignments will currently be pointing back to the original
-    // FIRRTL Class for output ports.
-    auto outputPort = dyn_cast<BlockArgument>(op.getDest());
-    if (!outputPort)
-      continue;
-
-    // Get the original port name, create a Field, and erase the propassign.
-    auto name = moduleLike.getPortName(outputPort.getArgNumber());
-    builder.create<ClassFieldOp>(op.getLoc(), name, op.getSrc());
-    op.erase();
+  // If there is a 'containingModule', add an argument for 'ports', and a field.
+  if (hasContainingModule) {
+    BlockArgument argumentValue = classBody->addArgument(
+        getRtlPortsType(&getContext()), UnknownLoc::get(&getContext()));
+    fieldLocs.push_back(argumentValue.getLoc());
+    fieldValues.push_back(argumentValue);
   }
+
+  classOp.addFields(builder, fieldLocs, fieldValues);
 
   // If the module-like is a Class, it will be completely erased later.
   // Otherwise, erase just the property ports and ops.
@@ -995,7 +1221,6 @@ void LowerClassesPass::lowerClassExtern(ClassExternOp classExternOp,
   // Add a class.extern.field op for each output.
   BitVector portsToErase(moduleLike.getNumPorts());
   Block *classBody = &classExternOp.getRegion().emplaceBlock();
-  OpBuilder builder = OpBuilder::atBlockBegin(classBody);
 
   // Every class gets a base path as its first parameter.
   classBody->addArgument(BasePathType::get(&getContext()),
@@ -1010,10 +1235,6 @@ void LowerClassesPass::lowerClassExtern(ClassExternOp classExternOp,
     auto direction = moduleLike.getPortDirection(i);
     if (direction == Direction::In)
       classBody->addArgument(type, loc);
-    else {
-      auto name = moduleLike.getPortNameAttr(i);
-      builder.create<om::ClassExternFieldOp>(loc, name, type);
-    }
 
     // In case this is a Module, remember to erase this port.
     portsToErase.set(i);
@@ -1029,10 +1250,10 @@ void LowerClassesPass::lowerClassExtern(ClassExternOp classExternOp,
 
 // Helper to update an Object instantiation. FIRRTL Object instances are
 // converted to OM Object instances.
-static LogicalResult
-updateObjectInClass(firrtl::ObjectOp firrtlObject,
-                    const PathInfoTable &pathInfoTable,
-                    SmallVectorImpl<Operation *> &opsToErase) {
+static LogicalResult updateObjectInClass(
+    firrtl::ObjectOp firrtlObject, const PathInfoTable &pathInfoTable,
+    SmallVectorImpl<RtlPortsInfo> &rtlPortsToCreate, std::mutex &intraPassMutex,
+    SmallVectorImpl<Operation *> &opsToErase) {
   // The 0'th argument is the base path.
   auto basePath = firrtlObject->getBlock()->getArgument(0);
   // build a table mapping the indices of input ports to their position in the
@@ -1067,6 +1288,7 @@ updateObjectInClass(firrtl::ObjectOp firrtlObject,
   for (auto [i, altBasePath] : llvm::enumerate(altBasePaths))
     args[1 + i] = altBasePath; // + 1 to skip default base path
 
+  firrtl::PathOp containingModuleRef;
   for (auto *user : llvm::make_early_inc_range(firrtlObject->getUsers())) {
     if (auto subfield = dyn_cast<ObjectSubfieldOp>(user)) {
       auto index = subfield.getIndex();
@@ -1088,6 +1310,16 @@ updateObjectInClass(firrtl::ObjectOp firrtlObject,
           if (dst == subfield.getResult()) {
             args[argIndexTable[index]] = src;
             opsToErase.push_back(propassign);
+
+            // Check if we have a 'containingModule' field.
+            if (firrtlClassType.getElement(index).name.strref().starts_with(
+                    kContainingModuleName)) {
+              assert(!containingModuleRef &&
+                     "expected exactly one containingModule");
+              assert(isa_and_nonnull<firrtl::PathOp>(src.getDefiningOp()) &&
+                     "expected containingModule to be a PathOp");
+              containingModuleRef = src.getDefiningOp<firrtl::PathOp>();
+            }
           }
         }
       }
@@ -1114,8 +1346,15 @@ updateObjectInClass(firrtl::ObjectOp firrtlObject,
 
   // Create the new Object op.
   OpBuilder builder(firrtlObject);
+
   auto object = builder.create<om::ObjectOp>(
       firrtlObject.getLoc(), classType, firrtlObject.getClassNameAttr(), args);
+
+  // If there is a 'containingModule', track that we need to add 'ports'.
+  if (containingModuleRef) {
+    std::lock_guard<std::mutex> guard(intraPassMutex);
+    rtlPortsToCreate.push_back({containingModuleRef, basePath, object});
+  }
 
   // Replace uses of the FIRRTL Object with the OM Object. The later dialect
   // conversion will take care of converting the types.
@@ -1275,13 +1514,15 @@ updateInstancesInModule(FModuleOp moduleOp, InstanceGraph &instanceGraph,
 static LogicalResult updateObjectsAndInstancesInClass(
     om::ClassOp classOp, InstanceGraph &instanceGraph,
     const LoweringState &state, const PathInfoTable &pathInfoTable,
+    SmallVectorImpl<RtlPortsInfo> &rtlPortsToCreate, std::mutex &intraPassMutex,
     SmallVectorImpl<Operation *> &opsToErase) {
   OpBuilder builder(classOp);
   auto &classState = state.classLoweringStateTable.at(classOp);
   auto it = classState.paths.begin();
   for (auto &op : classOp->getRegion(0).getOps()) {
     if (auto objectOp = dyn_cast<firrtl::ObjectOp>(op)) {
-      if (failed(updateObjectInClass(objectOp, pathInfoTable, opsToErase)))
+      if (failed(updateObjectInClass(objectOp, pathInfoTable, rtlPortsToCreate,
+                                     intraPassMutex, opsToErase)))
         return failure();
     } else if (auto instanceOp = dyn_cast<InstanceOp>(op)) {
       if (failed(updateInstanceInClass(instanceOp, *it++, instanceGraph,
@@ -1293,10 +1534,9 @@ static LogicalResult updateObjectsAndInstancesInClass(
 }
 
 // Update Object or Module instantiations in a FIRRTL Module or OM Class.
-LogicalResult
-LowerClassesPass::updateInstances(Operation *op, InstanceGraph &instanceGraph,
-                                  const LoweringState &state,
-                                  const PathInfoTable &pathInfoTable) {
+LogicalResult LowerClassesPass::updateInstances(
+    Operation *op, InstanceGraph &instanceGraph, const LoweringState &state,
+    const PathInfoTable &pathInfoTable, std::mutex &intraPassMutex) {
 
   // Track ops to erase at the end. We can't do this eagerly, since we want to
   // loop over each op in the container's body, and we may end up removing some
@@ -1314,7 +1554,8 @@ LowerClassesPass::updateInstances(Operation *op, InstanceGraph &instanceGraph,
             // Convert FIRRTL Module instance within a Class to OM
             // Object instance.
             return updateObjectsAndInstancesInClass(
-                classOp, instanceGraph, state, pathInfoTable, opsToErase);
+                classOp, instanceGraph, state, pathInfoTable, rtlPortsToCreate,
+                intraPassMutex, opsToErase);
           })
           .Default([](auto *op) { return success(); });
   if (failed(result))
@@ -1324,6 +1565,34 @@ LowerClassesPass::updateInstances(Operation *op, InstanceGraph &instanceGraph,
     op->erase();
 
   return success();
+}
+
+// Create and add all 'ports' lists of RtlPort objects for each object.
+void LowerClassesPass::createAllRtlPorts(
+    const PathInfoTable &pathInfoTable,
+    hw::InnerSymbolNamespaceCollection &namespaces,
+    HierPathCache &hierPathCache) {
+  MLIRContext *ctx = &getContext();
+
+  // Get a builder initialized to the end of the top-level module.
+  OpBuilder builder = OpBuilder::atBlockEnd(getOperation().getBodyBlock());
+
+  // Declare an RtlPort class on the fly.
+  om::ClassOp::buildSimpleClassOp(
+      builder, UnknownLoc::get(ctx), kRtlPortClassName,
+      {"ref", "direction", "width"}, {"ref", "direction", "width"},
+      {om::PathType::get(ctx), om::StringType::get(ctx),
+       om::OMIntegerType::get(ctx)});
+
+  // Sort the collected rtlPortsToCreate and process each.
+  llvm::stable_sort(rtlPortsToCreate, [](auto lhs, auto rhs) {
+    return lhs.object.getClassName() < rhs.object.getClassName();
+  });
+
+  // Create each 'ports' list.
+  for (auto rtlPortToCreate : rtlPortsToCreate)
+    createRtlPorts(rtlPortToCreate, pathInfoTable, namespaces, hierPathCache,
+                   builder);
 }
 
 // Pattern rewriters for dialect conversion.
@@ -1446,6 +1715,19 @@ struct IntegerShrOpConversion
   matchAndRewrite(firrtl::IntegerShrOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.replaceOpWithNewOp<om::IntegerShrOp>(op, adaptor.getLhs(),
+                                                  adaptor.getRhs());
+    return success();
+  }
+};
+
+struct IntegerShlOpConversion
+    : public OpConversionPattern<firrtl::IntegerShlOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(firrtl::IntegerShlOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<om::IntegerShlOp>(op, adaptor.getLhs(),
                                                   adaptor.getRhs());
     return success();
   }
@@ -1632,30 +1914,13 @@ struct ObjectSubfieldOpConversion
   const DenseMap<StringAttr, firrtl::ClassType> &classTypeTable;
 };
 
-struct ClassFieldOpConversion : public OpConversionPattern<ClassFieldOp> {
+struct ClassFieldsOpConversion : public OpConversionPattern<ClassFieldsOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(ClassFieldOp op, OpAdaptor adaptor,
+  matchAndRewrite(ClassFieldsOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<ClassFieldOp>(op, adaptor.getNameAttr(),
-                                              adaptor.getValue());
-    return success();
-  }
-};
-
-struct ClassExternFieldOpConversion
-    : public OpConversionPattern<ClassExternFieldOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(ClassExternFieldOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto type = typeConverter->convertType(adaptor.getType());
-    if (!type)
-      return failure();
-    rewriter.replaceOpWithNewOp<ClassExternFieldOp>(op, adaptor.getNameAttr(),
-                                                    type);
+    rewriter.replaceOpWithNewOp<ClassFieldsOp>(op, adaptor.getOperands());
     return success();
   }
 };
@@ -1675,28 +1940,41 @@ struct ObjectOpConversion : public OpConversionPattern<om::ObjectOp> {
   }
 };
 
+static LogicalResult convertClassLike(om::ClassLike classOp,
+                                      TypeConverter typeConverter,
+                                      ConversionPatternRewriter &rewriter) {
+  Block *body = classOp.getBodyBlock();
+  TypeConverter::SignatureConversion result(body->getNumArguments());
+
+  // Convert block argument types.
+  if (failed(
+          typeConverter.convertSignatureArgs(body->getArgumentTypes(), result)))
+    return failure();
+
+  // Convert the body.
+  if (failed(rewriter.convertRegionTypes(body->getParent(), typeConverter,
+                                         &result)))
+    return failure();
+
+  rewriter.modifyOpInPlace(classOp, [&]() {
+    mlir::AttrTypeReplacer replacer;
+    replacer.addReplacement([&](TypeAttr typeAttr) {
+      return mlir::TypeAttr::get(
+          typeConverter.convertType(typeAttr.getValue()));
+    });
+    classOp.replaceFieldTypes(replacer);
+  });
+
+  return success();
+}
+
 struct ClassOpSignatureConversion : public OpConversionPattern<om::ClassOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(om::ClassOp classOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Block *body = classOp.getBodyBlock();
-    TypeConverter::SignatureConversion result(body->getNumArguments());
-
-    // Convert block argument types.
-    if (failed(typeConverter->convertSignatureArgs(body->getArgumentTypes(),
-                                                   result)))
-      return failure();
-
-    // Convert the body.
-    if (failed(rewriter.convertRegionTypes(body->getParent(), *typeConverter,
-                                           &result)))
-      return failure();
-
-    rewriter.modifyOpInPlace(classOp, []() {});
-
-    return success();
+    return convertClassLike(classOp, *typeConverter, rewriter);
   }
 };
 
@@ -1707,22 +1985,7 @@ struct ClassExternOpSignatureConversion
   LogicalResult
   matchAndRewrite(om::ClassExternOp classOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Block *body = classOp.getBodyBlock();
-    TypeConverter::SignatureConversion result(body->getNumArguments());
-
-    // Convert block argument types.
-    if (failed(typeConverter->convertSignatureArgs(body->getArgumentTypes(),
-                                                   result)))
-      return failure();
-
-    // Convert the body.
-    if (failed(rewriter.convertRegionTypes(body->getParent(), *typeConverter,
-                                           &result)))
-      return failure();
-
-    rewriter.modifyOpInPlace(classOp, []() {});
-
-    return success();
+    return convertClassLike(classOp, *typeConverter, rewriter);
   }
 };
 
@@ -1773,17 +2036,19 @@ static void populateConversionTarget(ConversionTarget &target) {
     return noFIRRTLOperands && noFIRRTLResults;
   });
 
-  // the OM op class.extern.field doesn't have operands or results, so we must
-  // check it's type for a firrtl dialect.
-  target.addDynamicallyLegalOp<ClassExternFieldOp>(
-      [](ClassExternFieldOp op) { return !isa<FIRRTLType>(op.getType()); });
-
   // OM Class ops are legal if they don't use FIRRTL types for block arguments.
   target.addDynamicallyLegalOp<om::ClassOp, om::ClassExternOp>(
       [](Operation *op) -> std::optional<bool> {
         auto classLike = dyn_cast<om::ClassLike>(op);
         if (!classLike)
           return std::nullopt;
+        auto fieldNames = classLike.getFieldNames();
+        if (!llvm::all_of(fieldNames, [&](auto field) {
+              std::optional<Type> type =
+                  classLike.getFieldType(cast<StringAttr>(field));
+              return type.has_value() && !isa<FIRRTLType>(type.value());
+            }))
+          return false;
 
         return llvm::none_of(
             classLike.getBodyBlock()->getArgumentTypes(),
@@ -1831,6 +2096,9 @@ static void populateTypeConverter(TypeConverter &converter) {
 
   // Convert FIRRTL List type to OM List type.
   auto convertListType = [&converter](auto type) -> std::optional<mlir::Type> {
+    // If the element type is already in the OM dialect, there's nothing to do.
+    if (isa<om::OMDialect>(type.getElementType().getDialect()))
+      return type;
     auto elementType = converter.convertType(type.getElementType());
     if (!elementType)
       return {};
@@ -1888,8 +2156,7 @@ static void populateRewritePatterns(
   patterns.add<AnyCastOpConversion>(converter, patterns.getContext());
   patterns.add<ObjectSubfieldOpConversion>(converter, patterns.getContext(),
                                            classTypeTable);
-  patterns.add<ClassFieldOpConversion>(converter, patterns.getContext());
-  patterns.add<ClassExternFieldOpConversion>(converter, patterns.getContext());
+  patterns.add<ClassFieldsOpConversion>(converter, patterns.getContext());
   patterns.add<ClassOpSignatureConversion>(converter, patterns.getContext());
   patterns.add<ClassExternOpSignatureConversion>(converter,
                                                  patterns.getContext());
@@ -1902,6 +2169,7 @@ static void populateRewritePatterns(
   patterns.add<IntegerAddOpConversion>(converter, patterns.getContext());
   patterns.add<IntegerMulOpConversion>(converter, patterns.getContext());
   patterns.add<IntegerShrOpConversion>(converter, patterns.getContext());
+  patterns.add<IntegerShlOpConversion>(converter, patterns.getContext());
 }
 
 // Convert to OM ops and types in Classes or Modules.
