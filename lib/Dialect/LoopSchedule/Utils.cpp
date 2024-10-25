@@ -176,6 +176,90 @@ getModuloProblem(scf::ForOp forOp,
   return problem;
 }
 
+ChainingModuloProblem
+getChainingModuloProblem(scf::ForOp forOp,
+                         LoopScheduleDependenceAnalysis &dependenceAnalysis) {
+  // Create a modulo scheduling problem.
+  ChainingModuloProblem problem(forOp);
+
+  // Insert memory dependences into the problem.
+  forOp.getBody()->walk([&](Operation *op) {
+    // Insert every operation into the problem.
+    problem.insertOperation(op);
+
+    ArrayRef<LoopScheduleDependence> dependences =
+        dependenceAnalysis.getDependencies(op);
+    if (dependences.empty())
+      return;
+
+    for (LoopScheduleDependence memoryDep : dependences) {
+      // Don't insert a dependence into the problem if there is no dependence.
+      if (!forOp->isAncestor(memoryDep.source))
+        continue;
+
+      unsigned distance = memoryDep.distance;
+      // if (distance > 0)
+      //   continue;
+      // Insert a dependence into the problem.
+      Dependence dep(memoryDep.source, op);
+      if (isa<loopschedule::LoopScheduleStoreOp, StoreInterface,
+              memref::StoreOp>(memoryDep.source)) {
+        problem.setSrcAsStore(dep, true);
+      }
+      auto depInserted = problem.insertDependence(dep);
+
+      assert(succeeded(depInserted));
+      (void)depInserted;
+
+      // Use the lower bound of the innermost loop for this dependence. This
+      // assumes outer loops execute sequentially, i.e. one iteration of the
+      // inner loop completes before the next iteration is initiated. With
+      // proper analysis and lowerings, this can be relaxed.
+      // unsigned distance = memoryDep.distance;
+      if (distance > 0)
+        problem.setDistance(dep, distance);
+    }
+  });
+
+  // Set the anchor for scheduling. Insert dependences from all stores to the
+  // terminator to ensure the problem schedules them before the terminator.
+  auto *anchor = forOp.getBody()->getTerminator();
+  problem.insertOperation(anchor);
+  forOp.getBody()->walk([&](Operation *op) {
+    if (op == anchor || !problem.hasOperation(op))
+      return;
+    Dependence dep(op, anchor);
+    auto depInserted = problem.insertDependence(dep);
+    assert(succeeded(depInserted));
+    (void)depInserted;
+  });
+
+  // Handle explicitly computed loop-carried values, i.e. excluding the
+  // induction variable. Insert inter-iteration dependences from the definers of
+  // "iter_args" to their users.
+  if (unsigned nIterArgs = anchor->getNumOperands(); nIterArgs > 0) {
+    auto iterArgs = forOp.getRegionIterArgs();
+    for (unsigned i = 0; i < nIterArgs; ++i) {
+      Operation *iterArgDefiner = anchor->getOperand(i).getDefiningOp();
+      // If it's not an operation, we don't need to model the dependence.
+      if (!iterArgDefiner)
+        continue;
+
+      for (Operation *iterArgUser : iterArgs[i].getUsers()) {
+        Dependence dep(iterArgDefiner, iterArgUser);
+        auto depInserted = problem.insertDependence(dep);
+        assert(succeeded(depInserted));
+        (void)depInserted;
+
+        // Values always flow between subsequent iterations.
+        problem.setDistance(dep, 1);
+      }
+    }
+  }
+
+  return problem;
+}
+
 SharedOperatorsProblem
 getSharedOperatorsProblem(scf::ForOp forOp,
                           LoopScheduleDependenceAnalysis &dependenceAnalysis) {
@@ -248,10 +332,133 @@ getSharedOperatorsProblem(scf::ForOp forOp,
   return problem;
 }
 
+ChainingSharedOperatorsProblem
+getChainingSharedOperatorsProblem(scf::ForOp forOp,
+                          LoopScheduleDependenceAnalysis &dependenceAnalysis) {
+  ChainingSharedOperatorsProblem problem(forOp);
+
+  // Insert memory dependences into the problem.
+  assert(forOp.getLoopRegions().size() == 1);
+  forOp.getLoopRegions().front()->walk([&](Operation *op) {
+    if (op->getParentOfType<LoopInterface>() != nullptr)
+      return;
+
+    // Insert every operation into the problem.
+    problem.insertOperation(op);
+
+    if (auto loop = dyn_cast<LoopInterface>(op)) {
+      loop.getBodyBlock()->walk([&](Operation *innerOp) {
+        for (auto &operand : innerOp->getOpOperands()) {
+          auto *definingOp = operand.get().getDefiningOp();
+          if (definingOp && definingOp->getParentOp() == forOp) {
+            Dependence dep(definingOp, op);
+            auto depInserted = problem.insertDependence(dep);
+            assert(succeeded(depInserted));
+            (void)depInserted;
+          }
+        }
+      });
+    }
+
+    ArrayRef<LoopScheduleDependence> dependences =
+        dependenceAnalysis.getDependencies(op);
+    if (dependences.empty())
+      return;
+
+    for (const LoopScheduleDependence &memoryDep : dependences) {
+      assert(memoryDep.source != nullptr);
+      if (!forOp->isAncestor(memoryDep.source))
+        continue;
+
+      // Do not consider inter-iteration deps for seq loops
+      auto distance = memoryDep.distance;
+      if (distance > 0)
+        continue;
+
+      // Insert a dependence into the problem.
+      Dependence dep(memoryDep.source, op);
+      auto depInserted = problem.insertDependence(dep);
+      assert(succeeded(depInserted));
+      (void)depInserted;
+    }
+  });
+
+  // Set the anchor for scheduling. Insert dependences from all stores to the
+  // terminator to ensure the problem schedules them before the terminator.
+  assert(forOp.getLoopRegions().size() == 1);
+  auto *anchor = forOp.getLoopRegions().front()->back().getTerminator();
+  problem.insertOperation(anchor);
+  forOp.getLoopRegions().front()->walk([&](Operation *op) {
+    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
+        !problem.hasOperation(op))
+      return;
+    if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface>(op))
+      return;
+    Dependence dep(op, anchor);
+    auto depInserted = problem.insertDependence(dep);
+    assert(succeeded(depInserted));
+    (void)depInserted;
+  });
+
+  return problem;
+}
+
 SharedOperatorsProblem
 getSharedOperatorsProblem(func::FuncOp funcOp,
                           LoopScheduleDependenceAnalysis &dependenceAnalysis) {
   SharedOperatorsProblem problem(funcOp);
+
+  // Insert memory dependences into the problem.
+  funcOp.getBody().walk([&](Operation *op) {
+    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr)
+      return;
+
+    // Insert every operation into the problem.
+    problem.insertOperation(op);
+
+    ArrayRef<LoopScheduleDependence> dependences =
+        dependenceAnalysis.getDependencies(op);
+    if (dependences.empty())
+      return;
+
+    for (const LoopScheduleDependence &memoryDep : dependences) {
+      // Don't insert a dependence into the problem if there is no dependence.
+      if (!funcOp->isAncestor(memoryDep.source))
+        continue;
+      if (memoryDep.distance > 0)
+        continue;
+      // Insert a dependence into the problem.
+      Dependence dep(memoryDep.source, op);
+      auto depInserted = problem.insertDependence(dep);
+      assert(succeeded(depInserted));
+      (void)depInserted;
+    }
+  });
+
+  // Set the anchor for scheduling. Insert dependences from all stores to the
+  // terminator to ensure the problem schedules them before the terminator.
+  auto *anchor = funcOp.getBody().back().getTerminator();
+  problem.insertOperation(anchor);
+  funcOp.getBody().walk([&](Operation *op) {
+    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
+        !problem.hasOperation(op))
+      return;
+    Dependence dep(op, anchor);
+    auto depInserted = problem.insertDependence(dep);
+    assert(succeeded(depInserted));
+    (void)depInserted;
+  });
+
+  return problem;
+}
+
+ChainingSharedOperatorsProblem
+getChainingSharedOperatorsProblem(func::FuncOp funcOp,
+                          LoopScheduleDependenceAnalysis &dependenceAnalysis) {
+  ChainingSharedOperatorsProblem problem(funcOp);
 
   // Insert memory dependences into the problem.
   funcOp.getBody().walk([&](Operation *op) {

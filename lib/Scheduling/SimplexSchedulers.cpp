@@ -291,6 +291,24 @@ public:
   LogicalResult schedule() override;
 };
 
+class ChainingSharedOperatorsSimplexScheduler : public SimplexSchedulerBase {
+private:
+  ChainingSharedOperatorsProblem &prob;
+  float cycleTime;
+
+protected:
+  Problem &getProblem() override { return prob; }
+  void fillAdditionalConstraintRow(SmallVector<int> &row,
+                                   Dependence dep) override;
+
+public:
+  ChainingSharedOperatorsSimplexScheduler(ChainingSharedOperatorsProblem &prob, 
+                                          Operation *lastOp,
+                                          float cycleTime)
+      : SimplexSchedulerBase(lastOp), prob(prob), cycleTime(cycleTime) {}
+  LogicalResult schedule() override;
+};
+
 // This class solves the resource-free `ChainingCyclicProblem` by relying on
 // pre-computed chain-breaking constraints. The optimal initiation interval (II)
 // is determined as a side product of solving the parametric problem, and
@@ -311,6 +329,44 @@ public:
   ChainingCyclicSimplexScheduler(ChainingCyclicProblem &prob, Operation *lastOp,
                                  float cycleTime)
       : SimplexSchedulerBase(lastOp), prob(prob), cycleTime(cycleTime) {}
+  LogicalResult schedule() override;
+};
+
+class ChainingModuloSimplexScheduler : public ChainingCyclicSimplexScheduler {
+private:
+  struct MRT {
+    ChainingModuloSimplexScheduler &sched;
+
+    using TableType = SmallDenseMap<unsigned, DenseSet<Operation *>>;
+    using ReverseTableType = SmallDenseMap<Operation *, unsigned>;
+    SmallDenseMap<ResourceType, TableType> tables;
+    SmallDenseMap<ResourceType, ReverseTableType> reverseTables;
+
+    explicit MRT(ChainingModuloSimplexScheduler &sched) : sched(sched) {}
+    LogicalResult enter(Operation *op, unsigned timeStep);
+    void release(Operation *op);
+  };
+
+  ChainingModuloProblem &prob;
+  SmallVector<unsigned> asapTimes, alapTimes;
+  SmallVector<Operation *> unscheduled, scheduled;
+  MRT mrt;
+  float cycleTime;
+
+protected:
+  Problem &getProblem() override { return prob; }
+  LogicalResult checkLastOp() override;
+  enum { OBJ_LATENCY = 0, OBJ_AXAP /* i.e. either ASAP or ALAP */ };
+  bool fillObjectiveRow(SmallVector<int> &row, unsigned obj) override;
+  void updateMargins();
+  void scheduleOperation(Operation *n);
+  unsigned computeResMinII();
+
+public:
+  ChainingModuloSimplexScheduler(ChainingModuloProblem &prob, Operation *lastOp,
+                                 float cycleTime)
+      : ChainingCyclicSimplexScheduler(prob, lastOp, cycleTime), prob(prob),
+        mrt(*this), cycleTime(cycleTime) {}
   LogicalResult schedule() override;
 };
 
@@ -1396,12 +1452,142 @@ LogicalResult ChainingSimplexScheduler::schedule() {
 }
 
 //===----------------------------------------------------------------------===//
+// ChainingSharedOperatorsSimplexScheduler
+//===----------------------------------------------------------------------===//
+
+void ChainingSharedOperatorsSimplexScheduler::fillAdditionalConstraintRow(
+    SmallVector<int> &row, Dependence dep) {
+  fillConstraintRow(row, dep);
+  // One _extra_ time step breaks the chain (note that the latency is negative
+  // in the tableau).
+  row[parameter1Column] -= 1;
+}
+
+LogicalResult ChainingSharedOperatorsSimplexScheduler::schedule() {
+  if (failed(checkLastOp()) || failed(computeChainBreakingDependences(
+                                   prob, cycleTime, additionalConstraints)))
+    return failure();
+
+  parameterS = 0;
+  parameterT = 0;
+  buildTableau();
+
+  LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
+
+  if (failed(solveTableau()))
+    return prob.getContainingOp()->emitError() << "problem is infeasible";
+
+  LLVM_DEBUG(dbgs() << "After solving resource-free problem:\n"; dumpTableau());
+
+  // The *heuristic* part of this scheduler starts here:
+  // We will now *choose* start times for operations using a shared operator
+  // type, in a way that respects the allocation limits, and consecutively solve
+  // the LP with these added constraints. The individual LPs are still solved to
+  // optimality (meaning: the start times of the "last" operation is still
+  // optimal w.r.t. the already fixed operations), however the heuristic choice
+  // means we cannot guarantee the optimality for the overall problem.
+
+  // Determine which operations are subject to resource constraints.
+  auto &ops = prob.getOperations();
+  SmallVector<Operation *> limitedOps;
+  for (auto *op : ops)
+    if (isLimited(op, prob))
+      limitedOps.push_back(op);
+
+  // Build a priority list of the limited operations.
+  //
+  // We sort by the resource-free start times to produce a topological order of
+  // the operations. Better priority functions are known, but require computing
+  // additional properties, e.g. ASAP and ALAP times for mobility, or graph
+  // analysis for height. Assigning operators (=resources) in this order at
+  // least ensures that the (acyclic!) problem remains feasible throughout the
+  // process.
+  //
+  // TODO: Implement more sophisticated priority function.
+  std::stable_sort(limitedOps.begin(), limitedOps.end(),
+                   [&](Operation *a, Operation *b) {
+                     return getStartTime(startTimeVariables[a]) <
+                            getStartTime(startTimeVariables[b]);
+                   });
+
+  // Store the number of operations using an operator type in a particular time
+  // step.
+  SmallDenseMap<ResourceType, SmallDenseMap<unsigned, unsigned>>
+      reservationTable;
+
+  for (auto *op : limitedOps) {
+    auto resourceTypes = prob.getLinkedResourceTypes(op);
+
+    // Find the first time step (beginning at the current start time in the
+    // partial schedule) in which an operator instance is available.
+    unsigned startTimeVar = startTimeVariables[op];
+    unsigned candTime = getStartTime(startTimeVar);
+    auto canSchedule = [&](unsigned candTime) {
+      for (auto rsrc : resourceTypes) {
+        auto extraLimit = prob.getResourceLimit(rsrc);
+        if (extraLimit.has_value() &&
+            reservationTable[rsrc].lookup(candTime) == *extraLimit)
+          return false;
+      }
+      return true;
+    };
+    while (!canSchedule(candTime))
+      ++candTime;
+
+    // Fix the start time. As explained above, this cannot make the problem
+    // infeasible.
+    auto fixed = scheduleAt(startTimeVar, candTime);
+    assert(succeeded(fixed));
+    (void)fixed;
+
+    // Record the resource uses.
+    for (auto rsrc : resourceTypes)
+      ++reservationTable[rsrc][candTime];
+
+    LLVM_DEBUG(dbgs() << "After scheduling " << startTimeVar
+                      << " to t=" << candTime << ":\n";
+               dumpTableau());
+  }
+
+  assert(parameterT == 0);
+  LLVM_DEBUG(
+      dbgs() << "Final tableau:\n"; dumpTableau();
+      dbgs() << "Feasible solution found with start time of last operation = "
+             << -getParametricConstant(0) << '\n');
+
+  for (auto *op : ops)
+    prob.setStartTime(op, getStartTime(startTimeVariables[op]));
+
+  auto filledIn = computeStartTimesInCycle(prob);
+  assert(succeeded(filledIn)); // Problem is known to be acyclic at this point.
+  (void)filledIn;
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // ChainingCyclicSimplexScheduler
 //===----------------------------------------------------------------------===//
 
 void ChainingCyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
                                                        Dependence dep) {
-  SimplexSchedulerBase::fillConstraintRow(row, dep);
+
+  Operation *src = dep.getSource();
+  Operation *dst = dep.getDestination();
+  unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
+  if (auto dist = prob.getDistance(dep)) {
+    // the latency of the last op in a recurrence must be at least 1
+    if (latency == 0) {
+      if (!prob.isSrcStore(dep)) {
+        latency = 1;
+      }
+    }
+  }
+  row[parameter1Column] = -latency; // note the negation
+  if (src != dst) { // note that these coefficients just zero out in self-arcs.
+    row[startTimeLocations[startTimeVariables[src]]] = 1;
+    row[startTimeLocations[startTimeVariables[dst]]] = -1;
+  }
   if (auto dist = prob.getDistance(dep))
     row[parameterTColumn] = *dist;
 }
@@ -1445,6 +1631,324 @@ LogicalResult ChainingCyclicSimplexScheduler::schedule() {
 }
 
 //===----------------------------------------------------------------------===//
+// ChainingModuloSimplexScheduler
+//===----------------------------------------------------------------------===//
+
+LogicalResult ChainingModuloSimplexScheduler::checkLastOp() {
+  auto *contOp = prob.getContainingOp();
+  if (!prob.hasOperation(lastOp))
+    return contOp->emitError("problem does not include last operation");
+
+  // Determine which operations have no outgoing *intra*-iteration dependences.
+  auto &ops = prob.getOperations();
+  DenseSet<Operation *> sinks(ops.begin(), ops.end());
+  for (auto *op : ops)
+    for (auto &dep : prob.getDependences(op))
+      if (prob.getDistance(dep).value_or(0) == 0)
+        sinks.erase(dep.getSource());
+
+  if (!sinks.contains(lastOp))
+    return contOp->emitError("last operation is not a sink");
+  if (sinks.size() > 1)
+    return contOp->emitError("multiple sinks detected");
+
+  return success();
+}
+
+LogicalResult ChainingModuloSimplexScheduler::MRT::enter(Operation *op,
+                                                         unsigned timeStep) {
+
+  DenseSet<ResourceType> usedRsrcs;
+  SmallDenseMap<ResourceType, TableType> tempTables(tables);
+
+  // llvm::errs() << "here1\n";
+  unsigned slot = timeStep % sched.parameterT;
+  // llvm::errs() << "slot = " << slot << "\n";
+  for (auto rsrc : sched.prob.getLinkedResourceTypes(op)) {
+    // llvm::errs() << "resource type\n";
+    auto lim = sched.prob.getResourceLimit(rsrc);
+    assert(lim.has_value() && "resource type does not have limit");
+    assert(lim.value() > 0);
+
+    auto &revTab = reverseTables[rsrc];
+    assert(!revTab.count(op));
+
+    auto &tempCell = tempTables[rsrc][slot];
+    if (tempCell.size() >= lim)
+      return failure();
+    tempCell.insert(op);
+    usedRsrcs.insert(rsrc);
+  }
+
+  for (auto rsrc : usedRsrcs) {
+    // llvm::errs() << "usedRsrcs\n";
+    auto &revTab = reverseTables[rsrc];
+    assert(!revTab.count(op));
+    auto &cell = tables[rsrc][slot];
+    auto lim = sched.prob.getResourceLimit(rsrc);
+    assert(cell.size() < lim);
+    cell.insert(op);
+    revTab[op] = slot;
+  }
+
+  return success();
+}
+
+void ChainingModuloSimplexScheduler::MRT::release(Operation *op) {
+  for (auto rsrc : sched.prob.getLinkedResourceTypes(op)) {
+    // llvm::errs() << "release resource\n";
+    auto &revTab = reverseTables[rsrc];
+    auto it = revTab.find(op);
+    assert(it != revTab.end());
+    tables[rsrc][it->second].erase(op);
+    revTab.erase(it);
+  }
+}
+
+bool ChainingModuloSimplexScheduler::fillObjectiveRow(SmallVector<int> &row,
+                                                      unsigned obj) {
+  switch (obj) {
+  case OBJ_LATENCY:
+    // Minimize start time of user-specified last operation.
+    row[startTimeLocations[startTimeVariables[lastOp]]] = 1;
+    return true;
+  case OBJ_AXAP:
+    // Minimize sum of start times of all-but-the-last operation.
+    for (auto *op : getProblem().getOperations())
+      if (op != lastOp)
+        row[startTimeLocations[startTimeVariables[op]]] = 1;
+    return false;
+  default:
+    llvm_unreachable("Unsupported objective requested");
+  }
+}
+
+void ChainingModuloSimplexScheduler::updateMargins() {
+  // Assumption: current secondary objective is "ASAP".
+  // Negate the objective row once to effectively maximize the sum of start
+  // times, which yields the "ALAP" times after solving the tableau. Then,
+  // negate it again to restore the "ASAP" objective, and store these times as
+  // well.
+  for (auto *axapTimes : {&alapTimes, &asapTimes}) {
+    multiplyRow(OBJ_AXAP, -1);
+    // This should not fail for a feasible tableau.
+    auto dualFeasRestored = restoreDualFeasibility();
+    auto solved = solveTableau();
+    assert(succeeded(dualFeasRestored) && succeeded(solved));
+    (void)dualFeasRestored, (void)solved;
+
+    for (unsigned stv = 0; stv < startTimeLocations.size(); ++stv)
+      (*axapTimes)[stv] = getStartTime(stv);
+  }
+}
+
+void ChainingModuloSimplexScheduler::scheduleOperation(Operation *n) {
+  auto oprN = *prob.getLinkedOperatorType(n);
+  unsigned stvN = startTimeVariables[n];
+
+  // Get current state of the LP. We'll try to schedule at its current time step
+  // in the partial solution, and the II-1 following time steps. Scheduling the
+  // op to a later time step may increase the overall latency, however, as long
+  // as the solution is still feasible, we prefer that over incrementing the II
+  // to resolve resource conflicts.
+  unsigned stN = getStartTime(stvN);
+  unsigned ubN = stN + parameterT - 1;
+
+  LLVM_DEBUG(dbgs() << "Attempting to schedule in [" << stN << ", " << ubN
+                    << "]: " << *n << '\n');
+
+  for (unsigned ct = stN; ct <= ubN; ++ct)
+    if (succeeded(mrt.enter(n, ct))) {
+      // llvm::errs() << "entered, schedule at " << ct << "\n";
+      auto fixedN = scheduleAt(stvN, ct);
+      if (succeeded(fixedN)) {
+        LLVM_DEBUG(dbgs() << "Success at t=" << ct << " " << *n << '\n');
+        return;
+      }
+      // Problem became infeasible with `n` at `ct`, roll back the MRT
+      // assignment. Also, no later time can be feasible, so stop the search
+      // here.
+      mrt.release(n);
+      break;
+    }
+
+  // As a last resort, increase II to make room for the op. De Dinechin's
+  // Theorem 1 lays out conditions/guidelines to transform the current partial
+  // schedule for II to a valid one for a larger II'.
+
+  LLVM_DEBUG(dbgs() << "Incrementing II to " << (parameterT + 1)
+                    << " to resolve resource conflict for " << *n << '\n');
+
+  // Note that the approach below is much simpler than in the paper
+  // because of the fully-pipelined operators. In our case, it's always
+  // sufficient to increment the II by one.
+
+  // llvm::errs() << "parameterT: " << parameterT << "\n";
+
+  // Decompose start time.
+  unsigned phiN = stN / parameterT;
+  unsigned tauN = stN % parameterT;
+
+  // Keep track whether the following moves free at least one operator
+  // instance in the slot desired by the current op - then it can stay there.
+  unsigned deltaN = 1;
+
+  // We're going to revisit the current partial schedule.
+  SmallVector<Operation *> moved;
+  for (Operation *j : scheduled) {
+    auto oprJ = *prob.getLinkedOperatorType(j);
+    unsigned stvJ = startTimeVariables[j];
+    unsigned stJ = getStartTime(stvJ);
+    unsigned phiJ = stJ / parameterT;
+    unsigned tauJ = stJ % parameterT;
+    unsigned deltaJ = 0;
+
+    if (oprN == oprJ) {
+      // To actually resolve the resource conflicts, we will move operations
+      // that are "preceded" (cf. de Dinechin's ≺ relation) one slot to the
+      // right.
+      if (tauN < tauJ || (tauN == tauJ && phiN > phiJ) ||
+          (tauN == tauJ && phiN == phiJ && stvN < stvJ)) {
+        // TODO: Replace the last condition with a proper graph analysis.
+
+        deltaJ = 1;
+        moved.push_back(j);
+        if (tauN == tauJ)
+          deltaN = 0;
+      }
+    }
+
+    // j->dump();
+    // llvm::errs() << "phiJ: " << phiJ << "\n";
+    // llvm::errs() << "deltaJ: " << deltaJ << "\n";
+    // llvm::errs() << "========================\n";
+
+    // Move operation.
+    //
+    // In order to keep the op in its current MRT slot `tauJ` after incrementing
+    // the II, we add `phiJ`:
+    //   stJ + phiJ = (phiJ * parameterT + tauJ) + phiJ
+    //              = phiJ * (parameterT + 1) + tauJ
+    //
+    // Shifting an additional `deltaJ` time steps then moves the op to a
+    // different MRT slot, in order to make room for the operation that caused
+    // the resource conflict.
+    moveBy(stvJ, phiJ + deltaJ);
+  }
+
+  // Finally, increment the II and solve to apply the moves.
+  ++parameterT;
+  auto solved = solveTableau();
+  assert(succeeded(solved));
+  (void)solved;
+
+  // Re-enter moved operations into their new slots.
+  for (auto *m : moved)
+    mrt.release(m);
+  for (auto *m : moved) {
+    auto enteredM = mrt.enter(m, getStartTime(startTimeVariables[m]));
+    assert(succeeded(enteredM));
+    (void)enteredM;
+  }
+
+  // Finally, schedule the operation. Again, adding `phiN` accounts for the
+  // implicit shift caused by incrementing the II.
+  // llvm::errs() << "II shift schedule at " << stN + phiN + deltaN << "\n";
+  // llvm::errs() << "stN: " << stN << "\n";
+  // llvm::errs() << "phiN: " << phiN << "\n";
+  // llvm::errs() << "deltaN: " << deltaN << "\n";
+  auto fixedN = scheduleAt(stvN, stN + phiN + deltaN);
+  auto enteredN = mrt.enter(n, tauN + deltaN);
+  // n->dump();
+  assert(succeeded(enteredN));
+  assert(succeeded(fixedN));
+  (void)fixedN, (void)enteredN;
+}
+
+unsigned ChainingModuloSimplexScheduler::computeResMinII() {
+  unsigned resMinII = 1;
+  SmallDenseMap<ResourceType, unsigned> uses;
+  for (auto *op : prob.getOperations()) {
+    if (isLimited(op, prob)) {
+      for (auto rsrc : prob.getLinkedResourceTypes(op)) {
+        ++uses[rsrc];
+      }
+    }
+  }
+
+  for (auto pair : uses) {
+    resMinII =
+        std::max(resMinII, (unsigned)ceil(pair.second /
+                                          *prob.getResourceLimit(pair.first)));
+  }
+
+  // llvm::errs() << "resMinII = " << resMinII << "\n";
+  return resMinII;
+}
+
+LogicalResult ChainingModuloSimplexScheduler::schedule() {
+  if (failed(checkLastOp()) || failed(computeChainBreakingDependences(
+                                   prob, cycleTime, additionalConstraints)))
+    return failure();
+
+  parameterS = 0;
+  parameterT = computeResMinII();
+  LLVM_DEBUG(dbgs() << "ResMinII = " << parameterT << "\n");
+  buildTableau();
+  asapTimes.resize(startTimeLocations.size());
+  alapTimes.resize(startTimeLocations.size());
+
+  LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
+
+  if (failed(solveTableau()))
+    return prob.getContainingOp()->emitError() << "problem is infeasible";
+
+  // Determine which operations are subject to resource constraints.
+  auto &ops = prob.getOperations();
+  for (auto *op : ops)
+    if (isLimited(op, prob))
+      unscheduled.push_back(op);
+
+  // Main loop: Iteratively fix limited operations to time steps.
+  while (!unscheduled.empty()) {
+    // Update ASAP/ALAP times.
+    updateMargins();
+
+    // Heuristically (here: least amount of slack) pick the next operation to
+    // schedule.
+    auto *opIt =
+        std::min_element(unscheduled.begin(), unscheduled.end(),
+                         [&](Operation *opA, Operation *opB) {
+                           auto stvA = startTimeVariables[opA];
+                           auto stvB = startTimeVariables[opB];
+                           auto slackA = alapTimes[stvA] - asapTimes[stvA];
+                           auto slackB = alapTimes[stvB] - asapTimes[stvB];
+                           return slackA < slackB;
+                         });
+    Operation *op = *opIt;
+    unscheduled.erase(opIt);
+
+    scheduleOperation(op);
+    scheduled.push_back(op);
+  }
+
+  LLVM_DEBUG(dbgs() << "Final tableau:\n"; dumpTableau();
+             dbgs() << "Solution found with II = " << parameterT
+                    << " and start time of last operation = "
+                    << -getParametricConstant(0) << '\n');
+
+  prob.setInitiationInterval(parameterT);
+  for (auto *op : ops)
+    prob.setStartTime(op, getStartTime(startTimeVariables[op]));
+
+  auto filledIn = computeStartTimesInCycle(prob);
+  assert(succeeded(filledIn));
+  (void)filledIn;
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Public API
 //===----------------------------------------------------------------------===//
 
@@ -1477,8 +1981,20 @@ LogicalResult scheduling::scheduleSimplex(ChainingProblem &prob,
   return simplex.schedule();
 }
 
+LogicalResult scheduling::scheduleSimplex(ChainingSharedOperatorsProblem &prob,
+                                          Operation *lastOp, float cycleTime) {
+  ChainingSharedOperatorsSimplexScheduler simplex(prob, lastOp, cycleTime);
+  return simplex.schedule();
+}
+
 LogicalResult scheduling::scheduleSimplex(ChainingCyclicProblem &prob,
                                           Operation *lastOp, float cycleTime) {
   ChainingCyclicSimplexScheduler simplex(prob, lastOp, cycleTime);
+  return simplex.schedule();
+}
+
+LogicalResult scheduling::scheduleSimplex(ChainingModuloProblem &prob,
+                                          Operation *lastOp, float cycleTime) {
+  ChainingModuloSimplexScheduler simplex(prob, lastOp, cycleTime);
   return simplex.schedule();
 }

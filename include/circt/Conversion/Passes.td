@@ -36,6 +36,10 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::func::FuncOp"
     "mlir::scf::SCFDialect",
     "mlir::func::FuncDialect"
   ];
+  let options = [
+    Option<"prioritizeII", "prioritize-II", "bool", "",
+            "Whether to prioritize lower II over cycle time.">
+  ];
 }
 
 //===----------------------------------------------------------------------===//

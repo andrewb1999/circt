@@ -10,14 +10,17 @@
 #ifndef CIRCT_CONVERSION_SCFTOLOOPSCHEDULE_H_
 #define CIRCT_CONVERSION_SCFTOLOOPSCHEDULE_H_
 
+#include "circt/Support/LLVM.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include <memory>
 
-namespace mlir {
-class Pass;
-} // namespace mlir
-
 namespace circt {
-std::unique_ptr<mlir::Pass> createSCFToLoopSchedulePass();
+#define GEN_PASS_DECL_SCFTOLOOPSCHEDULE
+#include "circt/Conversion/Passes.h.inc"
+
+std::unique_ptr<OperationPass<mlir::func::FuncOp>>
+createSCFToLoopSchedulePass(const SCFToLoopScheduleOptions &options = {});
+
 } // namespace circt
 
 #endif // CIRCT_CONVERSION_SCFTOLOOPSCHEDULE_H_
