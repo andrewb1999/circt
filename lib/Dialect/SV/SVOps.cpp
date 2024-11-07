@@ -1456,14 +1456,18 @@ void InterfaceInstanceOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
 LogicalResult InterfaceInstanceOp::verify() {
   if (getName().empty())
     return emitOpError("requires non-empty name");
+  return success();
+}
 
+LogicalResult
+InterfaceInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   auto *symtable = SymbolTable::getNearestSymbolTable(*this);
   if (!symtable)
     return emitError("sv.interface.instance must exist within a region "
                      "which has a symbol table.");
   auto ifaceTy = getType();
-  auto referencedOp =
-      SymbolTable::lookupSymbolIn(symtable, ifaceTy.getInterface());
+  auto *referencedOp =
+      symbolTable.lookupSymbolIn(symtable, ifaceTy.getInterface());
   if (!referencedOp)
     return emitError("Symbol not found: ") << ifaceTy.getInterface() << ".";
   if (!isa<InterfaceOp>(referencedOp))
@@ -1474,14 +1478,16 @@ LogicalResult InterfaceInstanceOp::verify() {
 
 /// Ensure that the symbol being instantiated exists and is an
 /// InterfaceModportOp.
-LogicalResult GetModportOp::verify() {
+LogicalResult
+GetModportOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   auto *symtable = SymbolTable::getNearestSymbolTable(*this);
   if (!symtable)
     return emitError("sv.interface.instance must exist within a region "
                      "which has a symbol table.");
+
   auto ifaceTy = getType();
-  auto referencedOp =
-      SymbolTable::lookupSymbolIn(symtable, ifaceTy.getModport());
+  auto *referencedOp =
+      symbolTable.lookupSymbolIn(symtable, ifaceTy.getModport());
   if (!referencedOp)
     return emitError("Symbol not found: ") << ifaceTy.getModport() << ".";
   if (!isa<InterfaceModportOp>(referencedOp))
@@ -1703,13 +1709,13 @@ LogicalResult IndexedPartSelectInOutOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
     DictionaryAttr attrs, mlir::OpaqueProperties properties,
     mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
-  auto width = attrs.get("width");
+  Adaptor adaptor(operands, attrs, properties, regions);
+  auto width = adaptor.getWidthAttr();
   if (!width)
     return failure();
 
-  auto typ =
-      getElementTypeOfWidth(operands[0].getType(),
-                            cast<IntegerAttr>(width).getValue().getZExtValue());
+  auto typ = getElementTypeOfWidth(operands[0].getType(),
+                                   width.getValue().getZExtValue());
   if (!typ)
     return failure();
   results.push_back(typ);
@@ -1756,12 +1762,12 @@ LogicalResult IndexedPartSelectOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
     DictionaryAttr attrs, mlir::OpaqueProperties properties,
     mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
-  auto width = attrs.get("width");
+  Adaptor adaptor(operands, attrs, properties, regions);
+  auto width = adaptor.getWidthAttr();
   if (!width)
     return failure();
 
-  results.push_back(
-      IntegerType::get(context, cast<IntegerAttr>(width).getInt()));
+  results.push_back(IntegerType::get(context, width.getInt()));
   return success();
 }
 
@@ -1786,12 +1792,13 @@ LogicalResult StructFieldInOutOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
     DictionaryAttr attrs, mlir::OpaqueProperties properties,
     mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
-  auto field = attrs.get("field");
+  Adaptor adaptor(operands, attrs, properties, regions);
+  auto field = adaptor.getFieldAttr();
   if (!field)
     return failure();
   auto structType =
       hw::type_cast<hw::StructType>(getInOutElementType(operands[0].getType()));
-  auto resultType = structType.getFieldType(cast<StringAttr>(field));
+  auto resultType = structType.getFieldType(field);
   if (!resultType)
     return failure();
 

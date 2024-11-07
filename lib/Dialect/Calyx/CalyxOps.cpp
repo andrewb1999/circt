@@ -208,10 +208,7 @@ LogicalResult calyx::verifyComponent(Operation *op) {
 }
 
 LogicalResult calyx::verifyCell(Operation *op) {
-  auto opParent = op->getParentOp();
-  if (!isa<ComponentInterface>(opParent))
-    return op->emitOpError()
-           << "has parent: " << opParent << ", expected ComponentInterface.";
+  // auto opParent = op->getParentOp();
   return success();
 }
 
@@ -1681,12 +1678,14 @@ static LogicalResult
 verifyPrimitiveOpType(PrimitiveOp instance,
                       hw::HWModuleExternOp referencedPrimitive) {
   auto module = instance->getParentOfType<ModuleOp>();
-  StringRef entryPointName =
-      module->getAttrOfType<StringAttr>("calyx.entrypoint");
-  if (instance.getPrimitiveName() == entryPointName)
-    return instance.emitOpError()
-           << "cannot reference the entry-point component: '" << entryPointName
-           << "'.";
+  if (module->hasAttrOfType<StringAttr>("calyx.entrypoint")) {
+    StringRef entryPointName =
+        module->getAttrOfType<StringAttr>("calyx.entrypoint");
+    if (instance.getPrimitiveName() == entryPointName)
+      return instance.emitOpError()
+             << "cannot reference the entry-point component: '"
+             << entryPointName << "'.";
+  }
 
   // Verify the instance result ports with those of its referenced component.
   auto primitivePorts = referencedPrimitive.getPortList();
@@ -1959,6 +1958,74 @@ void GroupDoneOp::print(OpAsmPrinter &p) { printGroupPort(p, *this); }
 ParseResult GroupDoneOp::parse(OpAsmParser &parser, OperationState &result) {
   return parseGroupPort(parser, result);
 }
+
+//===----------------------------------------------------------------------===//
+// ConstantOp
+//===----------------------------------------------------------------------===//
+void ConstantOp::getAsmResultNames(
+    function_ref<void(Value, StringRef)> setNameFn) {
+  if (isa<FloatAttr>(getValue())) {
+    setNameFn(getResult(), "cst");
+    return;
+  }
+  auto intCst = llvm::dyn_cast<IntegerAttr>(getValue());
+  auto intType = llvm::dyn_cast<IntegerType>(getType());
+
+  // Sugar i1 constants with 'true' and 'false'.
+  if (intType && intType.getWidth() == 1)
+    return setNameFn(getResult(), intCst.getInt() > 0 ? "true" : "false");
+
+  // Otherwise, build a complex name with the value and type.
+  SmallString<32> specialNameBuffer;
+  llvm::raw_svector_ostream specialName(specialNameBuffer);
+  specialName << 'c' << intCst.getValue();
+  if (intType)
+    specialName << '_' << getType();
+  setNameFn(getResult(), specialName.str());
+}
+
+LogicalResult ConstantOp::verify() {
+  auto type = getType();
+  // The value's type must match the return type.
+  if (auto valType = getValue().getType(); valType != type) {
+    return emitOpError() << "value type " << valType
+                         << " must match return type: " << type;
+  }
+  // Integer values must be signless.
+  if (llvm::isa<IntegerType>(type) &&
+      !llvm::cast<IntegerType>(type).isSignless())
+    return emitOpError("integer return type must be signless");
+  // Any float or integers attribute are acceptable.
+  if (!llvm::isa<IntegerAttr, FloatAttr>(getValue())) {
+    return emitOpError("value must be an integer or float attribute");
+  }
+
+  return success();
+}
+
+OpFoldResult calyx::ConstantOp::fold(FoldAdaptor adaptor) {
+  return getValueAttr();
+}
+
+void calyx::ConstantOp::build(OpBuilder &builder, OperationState &state,
+                              StringRef symName, TypedAttr attr) {
+  state.addAttribute(SymbolTable::getSymbolAttrName(),
+                     builder.getStringAttr(symName));
+  state.addAttribute("value", attr);
+  SmallVector<Type> types;
+  types.push_back(attr.getType()); // Out
+  state.addTypes(types);
+}
+
+SmallVector<StringRef> ConstantOp::portNames() { return {"out"}; }
+
+SmallVector<Direction> ConstantOp::portDirections() { return {Output}; }
+
+SmallVector<DictionaryAttr> ConstantOp::portAttributes() {
+  return {DictionaryAttr::get(getContext())};
+}
+
+bool ConstantOp::isCombinational() { return true; }
 
 //===----------------------------------------------------------------------===//
 // RegisterOp

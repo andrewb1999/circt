@@ -144,7 +144,7 @@ circuit trailing_comma :
   public module trailing_comma :
    input in0 : SInt<8>
    input in1 : SInt<8>
-   ; expected-error @+1 {{expected expression in primitive operand}}
+   ; expected-error @+1 {{expected ')'}}
    node n = add(in0, in1,)
 
 ;// -----
@@ -164,7 +164,7 @@ circuit invalid_add :
   public module invalid_add :
    input in : SInt<8>
    input c : Clock
-   ; expected-error @+1 {{operation requires two operands}}
+   ; expected-error @+1 {{expected ')'}}
    node n = add(in, in, in)
 
 ;// -----
@@ -266,7 +266,7 @@ circuit Issue418:
     input a: UInt<1>
     output b: UInt<1>
 
-    ; expected-error @+1 {{operation requires one operand}}
+    ; expected-error @+1 {{expected ')'}}
     connect b, not(a, a)
 
 ;// -----
@@ -1624,3 +1624,32 @@ circuit IntrinsicModule:
   ; expected-error @below {{intrinsic modules were removed in FIRRTL 4.0.0}}
   intmodule MyIntModule :
     intrinsic = testIntrinsic1
+
+;// -----
+FIRRTL version 3.0.0
+circuit RegWith:
+  module RegWith:
+    input clock: Clock
+
+    ; expected-error @below {{'reg with' registers were removed in FIRRTL 3.0.0}}
+    reg r_0 : UInt<5>, clock with :
+      reset => (UInt<1>(0h0), r_0)
+
+;// -----
+FIRRTL version 3.0.0
+circuit IsInvalid:
+  module IsInvalid:
+    output a: UInt<1>
+
+    ; expected-error @below {{'is invalid' statements were removed in FIRRTL 3.0.0}}
+    a is invalid
+
+;// -----
+FIRRTL version 3.0.0
+circuit IsInvalid:
+  module IsInvalid:
+    input a: UInt<1>
+    output b: UInt<1>
+
+    ; expected-error @below {{'<=' connections were removed in FIRRTL 3.0.0}}
+    b <= a

@@ -775,8 +775,8 @@ void InlineCombGroups::recurseInlineCombGroups(
         isa<calyx::RegisterOp, calyx::MemoryOp, calyx::SeqMemoryOp,
             hw::ConstantOp, mlir::arith::ConstantOp, calyx::SeqMultLibOp,
             calyx::SeqDivULibOp, calyx::SeqDivSLibOp, calyx::SeqRemSLibOp,
-            calyx::SeqRemULibOp, mlir::scf::WhileOp, calyx::InstanceOp>(
-            src.getDefiningOp()))
+            calyx::SeqRemULibOp, mlir::scf::WhileOp, calyx::InstanceOp,
+            calyx::ConstantOp, calyx::AddFNOp>(src.getDefiningOp()))
       continue;
 
     auto evalGroupOpt = state.getEvaluatingGroup(src);
@@ -875,11 +875,11 @@ BuildReturnRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
 
   for (auto argType : enumerate(funcOp.getResultTypes())) {
     auto convArgType = calyx::convIndexType(rewriter, argType.value());
-    assert(isa<IntegerType>(convArgType) && "unsupported return type");
-    unsigned width = convArgType.getIntOrFloatBitWidth();
+    assert((isa<IntegerType>(convArgType) || isa<FloatType>(convArgType)) &&
+           "unsupported return type");
     std::string name = "ret_arg" + std::to_string(argType.index());
-    auto reg =
-        createRegister(funcOp.getLoc(), rewriter, getComponent(), width, name);
+    auto reg = createRegister(funcOp.getLoc(), rewriter, getComponent(),
+                              convArgType, name);
     getState().addReturnReg(reg, argType.index());
 
     rewriter.setInsertionPointToStart(

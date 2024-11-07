@@ -9,6 +9,7 @@
 ##
 ##===----------------------------------------------------------------------===//
 
+add_subdirectory(AIG)
 add_subdirectory(Arc)
 add_subdirectory(Calyx)
 add_subdirectory(Comb)
@@ -30,6 +31,7 @@ add_subdirectory(LTL)
 add_subdirectory(Moore)
 add_subdirectory(MSFT)
 add_subdirectory(OM)
+add_subdirectory(OpLib)
 add_subdirectory(Pipeline)
 add_subdirectory(STG)
 add_subdirectory(Seq)

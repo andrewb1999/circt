@@ -24,6 +24,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MathExtras.h"
 
 namespace circt {
@@ -46,6 +47,21 @@ struct FunctionRewrite {
   FunctionType type;
 };
 
+static std::atomic<unsigned> globalCounter(0);
+static DenseMap<StringAttr, StringAttr> globalNameMap;
+
+static MemRefType getFlattenedMemRefType(MemRefType type) {
+  return MemRefType::get(SmallVector<int64_t>{type.getNumElements()},
+                         type.getElementType());
+}
+
+static std::string getFlattenedMemRefName(StringAttr baseName,
+                                          MemRefType type) {
+  unsigned uniqueID = globalCounter++;
+  return llvm::formatv("{0}_{1}x{2}_{3}", baseName, type.getNumElements(),
+                       type.getElementType(), uniqueID);
+}
+
 // Flatten indices by generating the product of the i'th index and the [0:i-1]
 // shapes, for each index, and then summing these.
 static Value flattenIndices(ConversionPatternRewriter &rewriter, Operation *op,
@@ -65,7 +81,8 @@ static Value flattenIndices(ConversionPatternRewriter &rewriter, Operation *op,
     int64_t indexMulFactor = 1;
 
     // Calculate the product of the i'th index and the [0:i-1] shape dims.
-    for (unsigned i = 0; i <= memIdx.index(); ++i) {
+    for (unsigned i = memIdx.index() + 1; i < memrefType.getShape().size();
+         ++i) {
       int64_t dimSize = memrefType.getShape()[i];
       indexMulFactor *= dimSize;
     }
@@ -77,15 +94,15 @@ static Value flattenIndices(ConversionPatternRewriter &rewriter, Operation *op,
               .create<arith::ConstantOp>(
                   loc, rewriter.getIndexAttr(llvm::Log2_64(indexMulFactor)))
               .getResult();
-      partialIdx =
-          rewriter.create<arith::ShLIOp>(loc, partialIdx, constant).getResult();
+      finalIdx =
+          rewriter.create<arith::ShLIOp>(loc, finalIdx, constant).getResult();
     } else {
       auto constant = rewriter
                           .create<arith::ConstantOp>(
                               loc, rewriter.getIndexAttr(indexMulFactor))
                           .getResult();
-      partialIdx =
-          rewriter.create<arith::MulIOp>(loc, partialIdx, constant).getResult();
+      finalIdx =
+          rewriter.create<arith::MulIOp>(loc, finalIdx, constant).getResult();
     }
 
     // Sum up with the prior lower dimension accessors.
@@ -153,9 +170,70 @@ struct AllocOpConversion : public OpConversionPattern<memref::AllocOp> {
     MemRefType type = op.getType();
     if (isUniDimensional(type) || !type.hasStaticShape())
       return failure();
-    MemRefType newType = MemRefType::get(
-        SmallVector<int64_t>{type.getNumElements()}, type.getElementType());
+    MemRefType newType = getFlattenedMemRefType(type);
     rewriter.replaceOpWithNewOp<memref::AllocOp>(op, newType);
+    return success();
+  }
+};
+
+struct GlobalOpConversion : public OpConversionPattern<memref::GlobalOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(memref::GlobalOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    MemRefType type = op.getType();
+    if (isUniDimensional(type) || !type.hasStaticShape())
+      return failure();
+    MemRefType newType = getFlattenedMemRefType(type);
+
+    auto cstAttr =
+        llvm::dyn_cast_or_null<DenseElementsAttr>(op.getConstantInitValue());
+
+    SmallVector<Attribute> flattenedVals;
+    for (auto attr : cstAttr.getValues<Attribute>())
+      flattenedVals.push_back(attr);
+
+    auto newTypeAttr = TypeAttr::get(newType);
+    auto newNameStr = getFlattenedMemRefName(op.getConstantAttrName(), type);
+    auto newName = rewriter.getStringAttr(newNameStr);
+    globalNameMap[op.getSymNameAttr()] = newName;
+
+    RankedTensorType tensorType = RankedTensorType::get(
+        {static_cast<int64_t>(flattenedVals.size())}, type.getElementType());
+    auto newInitValue = DenseElementsAttr::get(tensorType, flattenedVals);
+
+    rewriter.replaceOpWithNewOp<memref::GlobalOp>(
+        op, newName, op.getSymVisibilityAttr(), newTypeAttr, newInitValue,
+        op.getConstantAttr(), op.getAlignmentAttr());
+
+    return success();
+  }
+};
+
+struct GetGlobalOpConversion : public OpConversionPattern<memref::GetGlobalOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(memref::GetGlobalOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto *symbolTableOp = op->getParentWithTrait<mlir::OpTrait::SymbolTable>();
+    auto globalOp = dyn_cast_or_null<memref::GlobalOp>(
+        SymbolTable::lookupSymbolIn(symbolTableOp, op.getNameAttr()));
+
+    MemRefType type = globalOp.getType();
+    if (isUniDimensional(type) || !type.hasStaticShape())
+      return failure();
+
+    MemRefType newType = getFlattenedMemRefType(type);
+    auto originalName = globalOp.getSymNameAttr();
+    auto newNameIt = globalNameMap.find(originalName);
+    if (newNameIt == globalNameMap.end())
+      return failure();
+    auto newName = newNameIt->second;
+
+    rewriter.replaceOpWithNewOp<memref::GetGlobalOp>(op, newType, newName);
+
     return success();
   }
 };
@@ -255,7 +333,10 @@ static void populateFlattenMemRefsLegality(ConversionTarget &target) {
       [](memref::StoreOp op) { return op.getIndices().size() == 1; });
   target.addDynamicallyLegalOp<memref::LoadOp>(
       [](memref::LoadOp op) { return op.getIndices().size() == 1; });
-
+  target.addDynamicallyLegalOp<memref::GlobalOp>(
+      [](memref::GlobalOp op) { return isUniDimensional(op.getType()); });
+  target.addDynamicallyLegalOp<memref::GetGlobalOp>(
+      [](memref::GetGlobalOp op) { return isUniDimensional(op.getType()); });
   addGenericLegalityConstraint<mlir::cf::CondBranchOp, mlir::cf::BranchOp,
                                func::CallOp, func::ReturnOp, memref::DeallocOp,
                                memref::CopyOp>(target);
@@ -322,6 +403,7 @@ public:
     RewritePatternSet patterns(ctx);
     SetVector<StringRef> rewrittenCallees;
     patterns.add<LoadOpConversion, StoreOpConversion, AllocOpConversion,
+                 GlobalOpConversion, GetGlobalOpConversion,
                  OperandConversionPattern<func::ReturnOp>,
                  OperandConversionPattern<memref::DeallocOp>,
                  CondBranchOpConversion,

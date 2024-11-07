@@ -134,11 +134,12 @@ def FModuleOp : FIRRTLModuleLike<"module", [SingleBlock, NoTerminator]> {
     the module.
   }];
   let arguments =
-      (ins ConventionAttr:$convention,
+      (ins SymbolNameAttr:$sym_name,
+           ConventionAttr:$convention,
            DenseBoolArrayAttr:$portDirections,
            ArrayRefAttr:$portLocations,
            ArrayRefAttr:$portAnnotations,
-           ArrayRefAttr:$portSyms,
+           ArrayRefAttr:$portSymbols,
            ArrayRefAttr:$portNames,
            ArrayRefAttr:$portTypes,
            DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations,
@@ -180,7 +181,6 @@ def FModuleOp : FIRRTLModuleLike<"module", [SingleBlock, NoTerminator]> {
 
     void getAsmBlockArgumentNames(mlir::Region &region,
                                   mlir::OpAsmSetValueNameFn setNameFn);
-    ArrayAttr getParameters();
   }];
 
 }
@@ -197,13 +197,14 @@ def FExtModuleOp : FIRRTLModuleLike<"extmodule"> {
     port must be removed by LowerXMR pass.
   }];
   let arguments = 
-      (ins OptionalAttr<StrAttr>:$defname,
+      (ins SymbolNameAttr:$sym_name,
+           OptionalAttr<StrAttr>:$defname,
            ParamDeclArrayAttr:$parameters,
            ConventionAttr:$convention,
            DenseBoolArrayAttr:$portDirections,
            ArrayRefAttr:$portLocations,
            ArrayRefAttr:$portAnnotations,
-           ArrayRefAttr:$portSyms,
+           ArrayRefAttr:$portSymbols,
            ArrayRefAttr:$portNames,
            ArrayRefAttr:$portTypes,
            DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations,
@@ -240,12 +241,13 @@ def FIntModuleOp : FIRRTLModuleLike<"intmodule"> {
     The "firrtl.intmodule" operation represents a compiler intrinsic.
   }];
   let arguments = 
-      (ins StrAttr:$intrinsic,
+      (ins SymbolNameAttr:$sym_name,
+           StrAttr:$intrinsic,
            ParamDeclArrayAttr:$parameters,
            DenseBoolArrayAttr:$portDirections,
            ArrayRefAttr:$portLocations,
            ArrayRefAttr:$portAnnotations,
-           ArrayRefAttr:$portSyms,
+           ArrayRefAttr:$portSymbols,
            ArrayRefAttr:$portNames,
            ArrayRefAttr:$portTypes,
            DefaultValuedAttr<AnnotationArrayAttr, "ArrayAttr()">:$annotations,
@@ -286,14 +288,15 @@ def FMemModuleOp : FIRRTLModuleLike<"memmodule"> {
     are not directly lowered to registers by the compiler.
   }];
   let arguments =
-      (ins UI32Attr:$numReadPorts, UI32Attr:$numWritePorts,
+      (ins SymbolNameAttr:$sym_name,
+           UI32Attr:$numReadPorts, UI32Attr:$numWritePorts,
            UI32Attr:$numReadWritePorts, UI32Attr:$dataWidth, UI32Attr:$maskBits,
            UI32Attr:$readLatency, UI32Attr:$writeLatency, UI64Attr:$depth,
            ArrayAttr:$extraPorts,
            DenseBoolArrayAttr:$portDirections,
            ArrayRefAttr:$portLocations,
            ArrayRefAttr:$portAnnotations,
-           ArrayRefAttr:$portSyms,
+           ArrayRefAttr:$portSymbols,
            ArrayRefAttr:$portNames,
            ArrayRefAttr:$portTypes,
            AnnotationArrayAttr:$annotations,
@@ -319,7 +322,6 @@ def FMemModuleOp : FIRRTLModuleLike<"memmodule"> {
     bool isMasked() { return getMaskBits() > 1; }
     void getAsmBlockArgumentNames(mlir::Region &region,
                                   mlir::OpAsmSetValueNameFn setNameFn);
-    ArrayAttr getParameters();
   }];
 
   let hasCustomAssemblyFormat = 1;
@@ -346,7 +348,7 @@ def ClassOp : FIRRTLModuleLike<"class", [
   let arguments = (ins SymbolNameAttr:$sym_name,
                        DenseBoolArrayAttr:$portDirections,
                        ArrayRefAttr:$portNames, ArrayRefAttr:$portTypes,
-                       ArrayRefAttr:$portSyms, ArrayRefAttr:$portLocations);
+                       ArrayRefAttr:$portSymbols, ArrayRefAttr:$portLocations);
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);
 
@@ -392,7 +394,6 @@ def ClassOp : FIRRTLModuleLike<"class", [
 
     void getAsmBlockArgumentNames(mlir::Region &region,
                                   mlir::OpAsmSetValueNameFn setNameFn);
-    ArrayAttr getParameters();
   }];
 }
 
@@ -419,7 +420,7 @@ def ExtClassOp : FIRRTLModuleLike<"extclass", [
   let arguments = (ins SymbolNameAttr:$sym_name, 
                        DenseBoolArrayAttr:$portDirections,
                        ArrayRefAttr:$portNames, ArrayRefAttr:$portTypes,
-                       ArrayRefAttr:$portSyms, ArrayRefAttr:$portLocations);
+                       ArrayRefAttr:$portSymbols, ArrayRefAttr:$portLocations);
   let results = (outs);
   let regions = (region AnyRegion:$body);
   let skipDefaultBuilders = 1;
@@ -433,7 +434,6 @@ def ExtClassOp : FIRRTLModuleLike<"extclass", [
     void getAsmBlockArgumentNames(mlir::Region &region,
                                   mlir::OpAsmSetValueNameFn setNameFn);
 
-    ArrayAttr getParameters();
   }];
   let hasCustomAssemblyFormat = 1;
 }

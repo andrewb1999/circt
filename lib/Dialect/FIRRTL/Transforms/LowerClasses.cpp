@@ -429,8 +429,6 @@ PathTracker::run(CircuitOp circuit, InstanceGraph &instanceGraph,
                  HierPathCache &cache, PathInfoTable &pathInfoTable,
                  const SymbolTable &symbolTable,
                  const DenseMap<DistinctAttr, FModuleOp> &owningModules) {
-  SmallVector<PathTracker> trackers;
-
   // First allocate module namespaces. Don't capture a namespace reference at
   // this point since they could be invalidated when DenseMap grows.
   for (auto *node : instanceGraph)
@@ -439,6 +437,9 @@ PathTracker::run(CircuitOp circuit, InstanceGraph &instanceGraph,
 
   for (auto *node : instanceGraph)
     if (auto module = node->getModule<FModuleLike>()) {
+      // Classes do not have path trackers on them.
+      if (isa<firrtl::ClassOp, firrtl::ExtClassOp>(module))
+        continue;
       PathTracker tracker(module, namespaces, instanceGraph, symbolTable,
                           owningModules);
       if (failed(tracker.runOnModule()))
@@ -1200,7 +1201,7 @@ void LowerClassesPass::lowerClass(om::ClassOp classOp, FModuleLike moduleLike,
     fieldValues.push_back(argumentValue);
   }
 
-  classOp.addFields(builder, fieldLocs, fieldValues);
+  classOp.addNewFieldsOp(builder, fieldLocs, fieldValues);
 
   // If the module-like is a Class, it will be completely erased later.
   // Otherwise, erase just the property ports and ops.

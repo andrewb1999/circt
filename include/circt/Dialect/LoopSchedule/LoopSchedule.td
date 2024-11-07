@@ -18,7 +18,7 @@ def LoopSchedule_Dialect : Dialect {
   let summary = "Representation of scheduled loops";
 
   // Opt-out of properties for now, must migrate by LLVM 19.  #5273.
-  let usePropertiesForAttributes = 1;
+  // let usePropertiesForAttributes = 1;
 
   let extraClassDeclaration = [{
     /// Register all LoopSchedule attributes.

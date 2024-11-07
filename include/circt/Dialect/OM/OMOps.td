@@ -121,7 +121,7 @@ def ClassOp : OMClassLike<"class", [
       return mlir::cast<ClassFieldsOp>(this->getBodyBlock()->getTerminator());
     }
 
-    // The addFields API encapsulates the logic used to represent field
+    // The addNewFieldsOp API encapsulates the logic used to represent field
     // locations under the hood.  Users should invoke this method rather
     // than construct the operation directly, otherwise logic to retrieve
     // the field location will break.
@@ -131,18 +131,27 @@ def ClassOp : OMClassLike<"class", [
     // to store the original array of locations, so that the specific location
     // of a field may be easily retrieved by index using the
     // `getFieldLocByIndex` API.
-    void addFields(mlir::OpBuilder &builder, mlir::ArrayRef<mlir::Location>
+    void addNewFieldsOp(mlir::OpBuilder &builder, mlir::ArrayRef<mlir::Location>
                    locs, mlir::ArrayRef<mlir::Value> values);
 
+    // Add additional fields to the class. This updates the ClassOp output type
+    //  with the additional field types and field names and adds the field
+    // values to the fieldsOp.
+    void updateFields(mlir::ArrayRef<mlir::Location> newLocations,
+                   mlir::ArrayRef<mlir::Value> newValues,
+                   mlir::ArrayRef<mlir::Attribute> newNames);
+
     // Return the location for a field referenced by index in the fieldNames
-    // array attribute.  If the field has a location added by addFields API,
+    // array attribute.  If the field has a location added by addNewFieldsOp API,
     // its location will be retrieved from the array of per field locations.
     // Otherwise, it will inherit the location of the class op Using this with
     // a ClassFieldsOp that has been constructed with a FusedLoc but not
-    // following the internal storage format of `addFields` will result in an
+    // following the internal storage format of `addNewFieldsOp` will result in an
     // assertion error
     mlir::Location getFieldLocByIndex(size_t i);
   }];
+
+  let hasRegionVerifier = 1;
 }
 
 def ClassFieldsOp : OMOp<"class.fields", [Terminator, ReturnLike, Pure,
@@ -158,7 +167,7 @@ def ClassFieldsOp : OMOp<"class.fields", [Terminator, ReturnLike, Pure,
 def ClassExternOp : OMClassLike<"class.extern", [NoTerminator]> {
   let extraClassDeclaration = [{
     mlir::Block *getBodyBlock() { return &getBody().front(); }
-    
+
     // Implement RegionKindInterface.
     static mlir::RegionKind getRegionKind(unsigned index) {
       return mlir::RegionKind::Graph;
@@ -354,7 +363,7 @@ def MapCreateOp : OMOp<"map_create", [Pure, SameTypeOperands]> {
   let hasCustomAssemblyFormat = true;
 }
 
-def BasePathCreateOp : OMOp<"basepath_create", [Pure, 
+def BasePathCreateOp : OMOp<"basepath_create", [Pure,
       DeclareOpInterfaceMethods<SymbolUserOpInterface>
     ]> {
   let summary = "Produce a base path value";
