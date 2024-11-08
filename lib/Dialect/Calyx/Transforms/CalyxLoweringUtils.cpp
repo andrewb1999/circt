@@ -163,6 +163,8 @@ Value getComponentOutput(calyx::ComponentOp compOp, unsigned outPortIdx) {
 Type convIndexType(OpBuilder &builder, Type type) {
   if (type.isIndex())
     return builder.getI32Type();
+  if (type.isIntOrFloat() && !type.isInteger())
+    return builder.getIntegerType(type.getIntOrFloatBitWidth());
   return type;
 }
 
@@ -272,6 +274,17 @@ Value MemoryInterface::done() {
   auto done = doneOpt();
   assert(done.has_value() && "Memory does not have done");
   return done.value();
+}
+
+std::string MemoryInterface::memName() {
+  if (auto *memOp = std::get_if<calyx::MemoryOp>(&impl); memOp) {
+    return memOp->getName().str();
+  }
+
+  if (auto *memOp = std::get_if<calyx::SeqMemoryOp>(&impl); memOp) {
+    return memOp->getName().str();
+  }
+  return std::get<MemoryPortsImpl>(impl).memName;
 }
 
 std::optional<Value> MemoryInterface::readDataOpt() {
@@ -879,7 +892,7 @@ BuildReturnRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
            "unsupported return type");
     std::string name = "ret_arg" + std::to_string(argType.index());
     auto reg = createRegister(funcOp.getLoc(), rewriter, getComponent(),
-                              convArgType, name);
+                              convArgType.getIntOrFloatBitWidth(), name);
     getState().addReturnReg(reg, argType.index());
 
     rewriter.setInsertionPointToStart(

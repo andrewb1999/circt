@@ -99,6 +99,7 @@ void buildAssignmentsForRegisterWrite(OpBuilder &builder,
 // A structure representing a set of ports which act as a memory interface for
 // external memories.
 struct MemoryPortsImpl {
+  std::string memName;
   std::optional<Value> readData;
   std::optional<Value> readOrContentEn;
   std::optional<Value> writeData;
@@ -151,6 +152,7 @@ struct MemoryInterface {
   }
 
   // Getter methods for each memory interface port.
+  std::string memName();
   Value readData();
   Value readEn();
   Value contentEn();

@@ -1986,10 +1986,13 @@ void ConstantOp::getAsmResultNames(
 
 LogicalResult ConstantOp::verify() {
   auto type = getType();
-  // The value's type must match the return type.
-  if (auto valType = getValue().getType(); valType != type) {
-    return emitOpError() << "value type " << valType
-                         << " must match return type: " << type;
+  assert(isa<IntegerType>(type) && "must be an IntegerType");
+  // The value's bit width must match the return type bitwidth.
+  if (auto valTyBitWidth = getValue().getType().getIntOrFloatBitWidth();
+      valTyBitWidth != type.getIntOrFloatBitWidth()) {
+    return emitOpError() << "value type bit width" << valTyBitWidth
+                         << " must match return type: "
+                         << type.getIntOrFloatBitWidth();
   }
   // Integer values must be signless.
   if (llvm::isa<IntegerType>(type) &&
@@ -2008,12 +2011,12 @@ OpFoldResult calyx::ConstantOp::fold(FoldAdaptor adaptor) {
 }
 
 void calyx::ConstantOp::build(OpBuilder &builder, OperationState &state,
-                              StringRef symName, TypedAttr attr) {
+                              StringRef symName, Attribute attr, Type type) {
   state.addAttribute(SymbolTable::getSymbolAttrName(),
                      builder.getStringAttr(symName));
   state.addAttribute("value", attr);
   SmallVector<Type> types;
-  types.push_back(attr.getType()); // Out
+  types.push_back(type); // Out
   state.addTypes(types);
 }
 
@@ -2727,6 +2730,30 @@ ParseResult InvokeOp::parse(OpAsmParser &parser, OperationState &result) {
     return failure();
   FlatSymbolRefAttr callee = FlatSymbolRefAttr::get(componentName);
   SMLoc loc = parser.getCurrentLocation();
+
+  SmallVector<Attribute, 4> refCells;
+  if (succeeded(parser.parseOptionalLSquare())) {
+    if (parser.parseCommaSeparatedList([&]() -> ParseResult {
+          std::string refCellName;
+          std::string externalMem;
+          NamedAttrList refCellAttr;
+          if (parser.parseKeywordOrString(&refCellName) ||
+              parser.parseEqual() || parser.parseKeywordOrString(&externalMem))
+            return failure();
+          auto externalMemAttr =
+              SymbolRefAttr::get(parser.getContext(), externalMem);
+          refCellAttr.append(StringAttr::get(parser.getContext(), refCellName),
+                             externalMemAttr);
+          refCells.push_back(
+              DictionaryAttr::get(parser.getContext(), refCellAttr));
+          return success();
+        }) ||
+        parser.parseRSquare())
+      return failure();
+  }
+  result.addAttribute("refCellsMap",
+                      ArrayAttr::get(parser.getContext(), refCells));
+
   result.addAttribute("callee", callee);
   if (parseParameterList(parser, result, ports, inputs, portNames, inputNames,
                          types))
@@ -2743,7 +2770,19 @@ ParseResult InvokeOp::parse(OpAsmParser &parser, OperationState &result) {
 }
 
 void InvokeOp::print(OpAsmPrinter &p) {
-  p << " @" << getCallee() << "(";
+  p << " @" << getCallee() << "[";
+  auto refCellNamesMap = getRefCellsMap();
+  llvm::interleaveComma(refCellNamesMap, p, [&](Attribute attr) {
+    auto dictAttr = cast<DictionaryAttr>(attr);
+    llvm::interleaveComma(dictAttr, p, [&](NamedAttribute namedAttr) {
+      auto refCellName = namedAttr.getName().str();
+      auto externalMem =
+          cast<FlatSymbolRefAttr>(namedAttr.getValue()).getValue();
+      p << refCellName << " = " << externalMem;
+    });
+  });
+  p << "](";
+
   auto ports = getPorts();
   auto inputs = getInputs();
   llvm::interleaveComma(llvm::zip(ports, inputs), p, [&](auto arg) {
@@ -2868,10 +2907,12 @@ LogicalResult InvokeOp::verify() {
     return emitOpError() << "with instance '@" << callee
                          << "', which does not exist.";
   // The argument list of invoke is empty.
-  if (getInputs().empty())
+  if (getInputs().empty() && getRefCellsMap().empty()) {
     return emitOpError() << "'@" << callee
-                         << "' has zero input and output port connections; "
+                         << "' has zero input and output port connections and "
+                            "has no passing-by-reference cells; "
                             "expected at least one.";
+  }
   size_t goPortNum = 0, donePortNum = 0;
   // They both have a go port and a done port, but the "go" port for
   // registers and memrey should be "write_en" port.
