@@ -104,7 +104,7 @@ public:
 // Lowering state classes
 //===----------------------------------------------------------------------===//
 
-struct IfScheduleable {
+struct IfSchedulable {
   scf::IfOp ifOp;
 };
 
@@ -113,24 +113,24 @@ struct WhileSchedulable {
   ScfWhileOp whileOp;
 };
 
-struct ForScheduleable {
+struct ForSchedulable {
   /// For operation to schedule.
   ScfForOp forOp;
   /// Bound
   uint64_t bound;
 };
 
-struct CallScheduleable {
+struct CallSchedulable {
   /// Instance for invoking.
   calyx::InstanceOp instanceOp;
   // CallOp for getting the arguments.
   func::CallOp callOp;
 };
 
-/// A variant of types representing scheduleable operations.
-using Scheduleable =
-    std::variant<calyx::GroupOp, WhileSchedulable, ForScheduleable,
-                 IfScheduleable, CallScheduleable>;
+/// A variant of types representing schedulable operations.
+using Schedulable =
+    std::variant<calyx::GroupOp, WhileSchedulable, ForSchedulable,
+                 IfSchedulable, CallSchedulable>;
 
 class IfLoweringStateInterface {
 public:
@@ -258,7 +258,7 @@ class ComponentLoweringState : public calyx::ComponentLoweringStateInterface,
                                public WhileLoopLoweringStateInterface,
                                public ForLoopLoweringStateInterface,
                                public IfLoweringStateInterface,
-                               public calyx::SchedulerInterface<Scheduleable> {
+                               public calyx::SchedulerInterface<Schedulable> {
 public:
   ComponentLoweringState(calyx::ComponentOp component)
       : calyx::ComponentLoweringStateInterface(component) {}
@@ -684,7 +684,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
       storeOp.getMemref());
   auto group = createGroupForOp<calyx::GroupOp>(rewriter, storeOp);
 
-  // This is a sequential group, so register it as being scheduleable for the
+  // This is a sequential group, so register it as being schedulable for the
   // block.
   getState<ComponentLoweringState>().addBlockSchedulable(storeOp->getBlock(),
                                                          group);
@@ -951,8 +951,6 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
       }
     }
   }
-
-  return success();
   return success();
 }
 
@@ -1169,7 +1167,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
               "running --lower-scf-to-calyx.";
   }
   getState<ComponentLoweringState>().addBlockSchedulable(
-      forOp.getOperation()->getBlock(), ForScheduleable{
+      forOp.getOperation()->getBlock(), ForSchedulable{
                                             scfForOp,
                                             bound.value(),
                                         });
@@ -1179,7 +1177,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      scf::IfOp ifOp) const {
   getState<ComponentLoweringState>().addBlockSchedulable(
-      ifOp.getOperation()->getBlock(), IfScheduleable{ifOp});
+      ifOp.getOperation()->getBlock(), IfSchedulable{ifOp});
   return success();
 }
 
@@ -1202,7 +1200,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   // CallScheduleanle requires an instance, while CallOp can be used to get the
   // input ports.
   getState<ComponentLoweringState>().addBlockSchedulable(
-      callOp.getOperation()->getBlock(), CallScheduleable{instanceOp, callOp});
+      callOp.getOperation()->getBlock(), CallSchedulable{instanceOp, callOp});
   return success();
 }
 
@@ -1442,8 +1440,8 @@ class BuildWhileGroups : public calyx::FuncOpPartialLoweringPattern {
       }
 
       /// Create iter args initial value assignment group(s), one per register.
-      auto numOperands = whileOp.getOperation()->getNumOperands();
       SmallVector<calyx::GroupOp> initGroups;
+      auto numOperands = whileOp.getOperation()->getNumOperands();
       for (size_t i = 0; i < numOperands; ++i) {
         auto initGroupOp =
             getState<ComponentLoweringState>().buildWhileLoopIterArgAssignments(
@@ -1639,7 +1637,7 @@ private:
 
         if (res.failed())
           return res;
-      } else if (auto *forSchedPtr = std::get_if<ForScheduleable>(&group);
+      } else if (auto *forSchedPtr = std::get_if<ForSchedulable>(&group);
                  forSchedPtr) {
         auto forOp = forSchedPtr->forOp;
 
@@ -1664,7 +1662,7 @@ private:
                                          forLatchGroup.getName());
         if (res.failed())
           return res;
-      } else if (auto *ifSchedPtr = std::get_if<IfScheduleable>(&group);
+      } else if (auto *ifSchedPtr = std::get_if<IfSchedulable>(&group);
                  ifSchedPtr) {
         auto ifOp = ifSchedPtr->ifOp;
 
@@ -1718,7 +1716,7 @@ private:
           rewriter.create<calyx::EnableOp>(elseGroup.getLoc(),
                                            elseGroup.getName());
         }
-      } else if (auto *callSchedPtr = std::get_if<CallScheduleable>(&group)) {
+      } else if (auto *callSchedPtr = std::get_if<CallSchedulable>(&group)) {
         auto instanceOp = callSchedPtr->instanceOp;
         OpBuilder::InsertionGuard g(rewriter);
         auto callBody = rewriter.create<calyx::SeqOp>(instanceOp.getLoc());
@@ -1776,7 +1774,7 @@ private:
             inputPorts, refCellsAttr, ArrayAttr::get(rewriter.getContext(), {}),
             ArrayAttr::get(rewriter.getContext(), {}));
       } else
-        llvm_unreachable("Unknown scheduleable");
+        llvm_unreachable("Unknown schedulable");
     }
     return success();
   }
@@ -1981,6 +1979,12 @@ class CleanupFuncOps : public calyx::FuncOpPartialLoweringPattern {
   }
 };
 
+} // namespace scftocalyx
+
+namespace {
+
+using namespace circt::scftocalyx;
+
 //===----------------------------------------------------------------------===//
 // Pass driver
 //===----------------------------------------------------------------------===//
@@ -2095,7 +2099,8 @@ public:
     // will only be established later in the conversion process, so ensure
     // that rewriter optimizations (especially DCE) are disabled.
     GreedyRewriteConfig config;
-    config.enableRegionSimplification = mlir::GreedySimplifyRegionLevel::Disabled;
+    config.enableRegionSimplification =
+        mlir::GreedySimplifyRegionLevel::Disabled;
     if (runOnce)
       config.maxIterations = 1;
 
@@ -2362,6 +2367,8 @@ void SCFToCalyxPass::runOnOperation() {
   addOncePattern<BuildForGroups>(loweringPatterns, patternState, funcMap,
                                  *loweringState);
 
+  addOncePattern<BuildIfGroups>(loweringPatterns, patternState, funcMap,
+                                *loweringState);
   /// This pattern converts operations within basic blocks to Calyx library
   /// operators. Combinational operations are assigned inside a
   /// calyx::CombGroupOp, and sequential inside calyx::GroupOps.
@@ -2414,9 +2421,9 @@ void SCFToCalyxPass::runOnOperation() {
     return;
   }
 
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
   // Cleanup patterns
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
   RewritePatternSet cleanupPatterns(&getContext());
   cleanupPatterns.add<calyx::MultipleGroupDonePattern,
                       calyx::NonTerminatingGroupDonePattern>(&getContext());
@@ -2439,15 +2446,14 @@ void SCFToCalyxPass::runOnOperation() {
                             ArrayAttr::get(context, sourceLocations));
   }
 }
-
-} // namespace scftocalyx
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // Pass initialization
 //===----------------------------------------------------------------------===//
 
 std::unique_ptr<OperationPass<ModuleOp>> createSCFToCalyxPass() {
-  return std::make_unique<scftocalyx::SCFToCalyxPass>();
+  return std::make_unique<SCFToCalyxPass>();
 }
 
 } // namespace circt
