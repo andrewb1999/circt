@@ -36,9 +36,27 @@ def LibraryOp : OpLibOp<"library", [IsolatedFromAbove, SingleBlock,
 
   let arguments = (ins SymbolNameAttr:$sym_name);
   let results = (outs);
-  let regions = (region SizedRegion<1>:$bodyRegion);
+  let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
-    $sym_name attr-dict-with-keyword $bodyRegion
+    $sym_name attr-dict-with-keyword $body
+  }];
+
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins "mlir::StringAttr":$sym_name), [{
+      Region* region = $_state.addRegion();
+      region->push_back(new Block());
+      $_state.addAttribute($_builder.getStringAttr("sym_name"), sym_name);
+    }]>
+  ];
+
+  let extraClassDeclaration = [{
+    static bool isOptionalSymbol() { return false; }
+
+    // Convenience
+    ::mlir::Block *getBodyBlock() {
+      return &getBody().getBlocks().front();
+    }
   }];
 
   let hasVerifier = 1;
@@ -60,10 +78,41 @@ def OperatorOp : OpLibOp<"operator", [IsolatedFromAbove,
                        OptionalAttr<F64Attr>:$incDelay,
                        OptionalAttr<F64Attr>:$outDelay);
   let results = (outs);
-  let regions = (region SizedRegion<1>:$bodyRegion);
+  let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
     $sym_name `latency` `<` $latency `>` (`,` `incDelay` `<` $incDelay^ `>`)? 
-    (`,` `outDelay` `<` $outDelay^ `>`)? attr-dict-with-keyword $bodyRegion
+    (`,` `outDelay` `<` $outDelay^ `>`)? attr-dict-with-keyword $body
+  }];
+
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins "mlir::StringAttr":$sym_name,
+                   "mlir::IntegerAttr":$latency), [{
+      Region* region = $_state.addRegion();
+      region->push_back(new Block());
+      $_state.addAttribute($_builder.getStringAttr("sym_name"), sym_name);
+      $_state.addAttribute($_builder.getStringAttr("latency"), latency);
+    }]>,
+    OpBuilder<(ins "mlir::StringAttr":$sym_name,
+                   "mlir::IntegerAttr":$latency,
+                   "mlir::FloatAttr":$incDelay,
+                   "mlir::FloatAttr":$outDelay), [{
+      Region* region = $_state.addRegion();
+      region->push_back(new Block());
+      $_state.addAttribute($_builder.getStringAttr("sym_name"), sym_name);
+      $_state.addAttribute($_builder.getStringAttr("latency"), latency);
+      $_state.addAttribute($_builder.getStringAttr("incDelay"), incDelay);
+      $_state.addAttribute($_builder.getStringAttr("outDelay"), outDelay);
+    }]>
+  ];
+
+  let extraClassDeclaration = [{
+    static bool isOptionalSymbol() { return false; }
+
+    // Convenience
+    ::mlir::Block *getBodyBlock() {
+      return &getBody().getBlocks().front();
+    }
   }];
 
   let hasVerifier = 1;
@@ -83,10 +132,39 @@ def TargetOp : OpLibOp<"target", [Symbol,
                        OptionalAttr<DictArrayAttr>:$res_attrs);
 
   let results = (outs);
-  let regions = (region SizedRegion<1>:$bodyRegion);
+  let regions = (region SizedRegion<1>:$body);
   let hasCustomAssemblyFormat = 1;
 
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins "mlir::StringAttr":$sym_name,
+                   "mlir::TypeAttr":$function_type), [{
+      Region* region = $_state.addRegion();
+      region->push_back(new Block());
+      $_state.addAttribute($_builder.getStringAttr("sym_name"), sym_name);
+      $_state.addAttribute($_builder.getStringAttr("function_type"), function_type);
+    }]>,
+    OpBuilder<(ins "mlir::StringAttr":$sym_name,
+                   "mlir::TypeAttr":$function_type,
+                   "mlir::ArrayAttr":$arg_attrs,
+                   "mlir::ArrayAttr":$res_attrs), [{
+      Region* region = $_state.addRegion();
+      region->push_back(new Block());
+      $_state.addAttribute($_builder.getStringAttr("sym_name"), sym_name);
+      $_state.addAttribute($_builder.getStringAttr("function_type"), function_type);
+      $_state.addAttribute($_builder.getStringAttr("arg_attrs"), arg_attrs);
+      $_state.addAttribute($_builder.getStringAttr("res_attrs"), res_attrs);
+    }]>
+  ];
+
   let extraClassDeclaration = [{
+    static bool isOptionalSymbol() { return false; }
+
+    // Convenience
+    ::mlir::Block *getBodyBlock() {
+      return &getBody().getBlocks().front();
+    }
+
     /// Returns the argument types of this function.
     ArrayRef<Type> getArgumentTypes() { return getFunctionType().getInputs(); }
 
@@ -111,7 +189,7 @@ def TargetOp : OpLibOp<"target", [Symbol,
     }
   }];
   // let assemblyFormat = [{
-  //   $sym_name custom<FunctionType>($function_type) attr-dict-with-keyword $bodyRegion
+  //   $sym_name custom<FunctionType>($function_type) attr-dict-with-keyword $body
   // }];
   // let hasVerifier = 1;
 }
@@ -145,10 +223,30 @@ def CalyxMatchOp : OpLibOp<"calyx_match",
                        TypeAttrOf<FunctionType>:$targetType);
 
   let results = (outs);
-  let regions = (region SizedRegion<1>:$bodyRegion);
+  let regions = (region SizedRegion<1>:$body);
+
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins "mlir::StringAttr":$sym_name,
+                   "mlir::TypeAttr":$targetType), [{
+      Region* region = $_state.addRegion();
+      region->push_back(new Block());
+      $_state.addAttribute($_builder.getStringAttr("sym_name"), sym_name);
+      $_state.addAttribute($_builder.getStringAttr("targetType"), targetType);
+    }]>
+  ];
+
+  let extraClassDeclaration = [{
+    static bool isOptionalSymbol() { return false; }
+
+    // Convenience
+    ::mlir::Block *getBodyBlock() {
+      return &getBody().getBlocks().front();
+    }
+  }];
 
   let assemblyFormat = [{
-    `(` $target `:` $targetType `)` `produce` attr-dict-with-keyword $bodyRegion
+    `(` $target `:` $targetType `)` `produce` attr-dict-with-keyword $body
   }];
   // let hasVerifier = 1;
 }
