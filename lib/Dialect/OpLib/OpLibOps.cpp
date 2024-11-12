@@ -14,6 +14,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/OpLib/OpLibAttributes.h"
 #include "mlir/IR/Attributes.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
@@ -41,6 +42,9 @@ LogicalResult LibraryOp::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult OperatorOp::verify() {
+  if (!getBodyBlock()->mightHaveTerminator()) {
+    return emitOpError("body block does not have terminator");
+  }
   auto *term = getBodyRegion().front().getTerminator();
   if (!isa<CalyxMatchOp>(term)) {
     return emitOpError("region terminator must be supported match op");
@@ -84,6 +88,31 @@ void TargetOp::print(OpAsmPrinter &p) {
       getArgAttrsAttrName(), getResAttrsAttrName());
 }
 
+void TargetOp::build(OpBuilder &builder, OperationState &state,
+                     StringAttr symName, FunctionType functionType,
+                     ArrayRef<DictionaryAttr> argAttrs,
+                     ArrayRef<DictionaryAttr> resAttrs) {
+  state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), symName);
+  state.addAttribute(TargetOp::getFunctionTypeAttrName(state.name),
+                     TypeAttr::get(functionType));
+
+  Region *region = state.addRegion();
+  Block *body = new Block();
+  region->push_back(body);
+  body->addArguments(functionType.getInputs(),
+                     SmallVector<Location, 4>(functionType.getNumInputs(),
+                                              builder.getUnknownLoc()));
+
+  if (argAttrs.empty() && resAttrs.empty())
+    return;
+  assert(functionType.getNumInputs() == argAttrs.size());
+  assert(functionType.getNumResults() == resAttrs.size());
+  function_interface_impl::addArgAndResultAttrs(
+      builder, state, argAttrs, resAttrs,
+      TargetOp::getArgAttrsAttrName(state.name),
+      TargetOp::getResAttrsAttrName(state.name));
+}
+
 //===----------------------------------------------------------------------===//
 // CalyxMatchOp
 //===----------------------------------------------------------------------===//
@@ -104,6 +133,49 @@ CalyxMatchOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   // Check that the referenced function has the correct type.
   if (fn.getFunctionType() != type)
     return emitOpError("reference to target with mismatched type");
+
+  return success();
+}
+
+LogicalResult CalyxMatchOp::verify() {
+  if (!getBodyBlock()->mightHaveTerminator()) {
+    return emitOpError("must be terminated by a YieldOp");
+  }
+
+  auto yieldOp = cast<oplib::YieldOp>(getBodyBlock()->getTerminator());
+
+  auto inputTypes = yieldOp.getInputs().getTypes();
+  auto outputTypes = yieldOp.getOutputs().getTypes();
+
+  if (inputTypes.size() != getTargetType().getNumInputs()) {
+    return emitOpError("yielded different number of inputs than expected"
+                       " by target type");
+  }
+
+  if (outputTypes.size() != getTargetType().getNumResults()) {
+    return emitOpError("yielded different number of outputs than expected"
+                       " by target type");
+  }
+
+  for (auto iv : llvm::enumerate(inputTypes)) {
+    auto i = iv.index();
+    auto type = iv.value();
+    if (type.getIntOrFloatBitWidth() !=
+        getTargetType().getInput(i).getIntOrFloatBitWidth()) {
+      return emitOpError(
+          "yield input type does not have same bitwidth as target type");
+    }
+  }
+
+  for (auto iv : llvm::enumerate(outputTypes)) {
+    auto i = iv.index();
+    auto type = iv.value();
+    if (type.getIntOrFloatBitWidth() !=
+        getTargetType().getResult(i).getIntOrFloatBitWidth()) {
+      return emitOpError(
+          "yield output type does not have same bitwidth as target type");
+    }
+  }
 
   return success();
 }

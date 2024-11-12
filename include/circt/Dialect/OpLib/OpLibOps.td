@@ -119,9 +119,9 @@ def OperatorOp : OpLibOp<"operator", [IsolatedFromAbove,
 }
 
 def TargetOp : OpLibOp<"target", [Symbol, 
-                                     FunctionOpInterface,
-                                     SingleBlockImplicitTerminator<"OutputOp">,
-                                     HasParent<"OperatorOp">]> {
+                                  FunctionOpInterface,
+                                  SingleBlockImplicitTerminator<"OutputOp">,
+                                  HasParent<"OperatorOp">]> {
   let summary = "OpLib dialect Target operation";
   let description = [{
   }];
@@ -137,24 +137,10 @@ def TargetOp : OpLibOp<"target", [Symbol,
 
   let skipDefaultBuilders = 1;
   let builders = [
-    OpBuilder<(ins "mlir::StringAttr":$sym_name,
-                   "mlir::TypeAttr":$function_type), [{
-      Region* region = $_state.addRegion();
-      region->push_back(new Block());
-      $_state.addAttribute($_builder.getStringAttr("sym_name"), sym_name);
-      $_state.addAttribute($_builder.getStringAttr("function_type"), function_type);
-    }]>,
-    OpBuilder<(ins "mlir::StringAttr":$sym_name,
-                   "mlir::TypeAttr":$function_type,
-                   "mlir::ArrayAttr":$arg_attrs,
-                   "mlir::ArrayAttr":$res_attrs), [{
-      Region* region = $_state.addRegion();
-      region->push_back(new Block());
-      $_state.addAttribute($_builder.getStringAttr("sym_name"), sym_name);
-      $_state.addAttribute($_builder.getStringAttr("function_type"), function_type);
-      $_state.addAttribute($_builder.getStringAttr("arg_attrs"), arg_attrs);
-      $_state.addAttribute($_builder.getStringAttr("res_attrs"), res_attrs);
-    }]>
+    OpBuilder<(ins "mlir::StringAttr":$symName,
+                   "mlir::FunctionType":$functionType,
+                   CArg<"ArrayRef<DictionaryAttr>", "{}">:$argAttrs,
+                   CArg<"ArrayRef<DictionaryAttr>", "{}">:$resAttrs)>
   ];
 
   let extraClassDeclaration = [{
@@ -227,11 +213,11 @@ def CalyxMatchOp : OpLibOp<"calyx_match",
 
   let skipDefaultBuilders = 1;
   let builders = [
-    OpBuilder<(ins "mlir::StringAttr":$sym_name,
+    OpBuilder<(ins "mlir::FlatSymbolRefAttr":$target,
                    "mlir::TypeAttr":$targetType), [{
       Region* region = $_state.addRegion();
       region->push_back(new Block());
-      $_state.addAttribute($_builder.getStringAttr("sym_name"), sym_name);
+      $_state.addAttribute($_builder.getStringAttr("target"), target);
       $_state.addAttribute($_builder.getStringAttr("targetType"), targetType);
     }]>
   ];
@@ -248,7 +234,7 @@ def CalyxMatchOp : OpLibOp<"calyx_match",
   let assemblyFormat = [{
     `(` $target `:` $targetType `)` `produce` attr-dict-with-keyword $body
   }];
-  // let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 def OutputOp : OpLibOp<"output", [Terminator,

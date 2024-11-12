@@ -1698,35 +1698,37 @@ verifyPrimitiveOpType(PrimitiveOp instance,
            << " but got " << numResults;
 
   // Verify parameters match up
-  ArrayAttr modParameters = referencedPrimitive.getParameters();
-  ArrayAttr parameters = instance.getParameters().value_or(ArrayAttr());
-  size_t numExpected = modParameters.size();
-  size_t numParams = parameters.size();
-  if (numParams != numExpected)
-    return instance.emitOpError()
-           << "has the wrong number of parameters; expected: " << numExpected
-           << " but got " << numParams;
-
-  for (size_t i = 0; i != numExpected; ++i) {
-    auto param = cast<circt::hw::ParamDeclAttr>(parameters[i]);
-    auto modParam = cast<circt::hw::ParamDeclAttr>(modParameters[i]);
-
-    auto paramName = param.getName();
-    if (paramName != modParam.getName())
+  if (instance.getParameters().has_value()) {
+    ArrayAttr modParameters = referencedPrimitive.getParameters();
+    ArrayAttr parameters = instance.getParameters().value();
+    size_t numExpected = modParameters.size();
+    size_t numParams = parameters.size();
+    if (numParams != numExpected)
       return instance.emitOpError()
-             << "parameter #" << i << " should have name " << modParam.getName()
-             << " but has name " << paramName;
+             << "has the wrong number of parameters; expected: " << numExpected
+             << " but got " << numParams;
 
-    if (param.getType() != modParam.getType())
-      return instance.emitOpError()
-             << "parameter " << paramName << " should have type "
-             << modParam.getType() << " but has type " << param.getType();
+    for (size_t i = 0; i != numExpected; ++i) {
+      auto param = cast<circt::hw::ParamDeclAttr>(parameters[i]);
+      auto modParam = cast<circt::hw::ParamDeclAttr>(modParameters[i]);
 
-    // All instance parameters must have a value.  Specify the same value as
-    // a module's default value if you want the default.
-    if (!param.getValue())
-      return instance.emitOpError("parameter ")
-             << paramName << " must have a value";
+      auto paramName = param.getName();
+      if (paramName != modParam.getName())
+        return instance.emitOpError()
+               << "parameter #" << i << " should have name "
+               << modParam.getName() << " but has name " << paramName;
+
+      if (param.getType() != modParam.getType())
+        return instance.emitOpError()
+               << "parameter " << paramName << " should have type "
+               << modParam.getType() << " but has type " << param.getType();
+
+      // All instance parameters must have a value.  Specify the same value as
+      // a module's default value if you want the default.
+      if (!param.getValue())
+        return instance.emitOpError("parameter ")
+               << paramName << " must have a value";
+    }
   }
 
   for (size_t i = 0; i != numResults; ++i) {
@@ -1892,7 +1894,7 @@ static ParseResult parseParameterList(OpAsmParser &parser,
 /// Print a parameter list for a module or instance. Same format as HW dialect.
 static void printParameterList(OpAsmPrinter &p, Operation *op,
                                ArrayAttr parameters) {
-  if (parameters.empty())
+  if (parameters == nullptr || parameters.empty())
     return;
 
   p << '<';
