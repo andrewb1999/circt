@@ -19,6 +19,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Pass/AnalysisManager.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <cassert>
@@ -546,13 +547,17 @@ void ComponentLoweringStateInterface::addInstance(StringRef calleeName,
 //===----------------------------------------------------------------------===//
 
 CalyxLoweringState::CalyxLoweringState(mlir::ModuleOp module,
+                                       mlir::AnalysisManager am,
                                        StringRef topLevelFunction)
-    : topLevelFunction(topLevelFunction), module(module), asmState(module) {}
+    : topLevelFunction(topLevelFunction), module(module), am(am),
+      asmState(module) {}
 
 mlir::ModuleOp CalyxLoweringState::getModule() {
   assert(module.getOperation() != nullptr);
   return module;
 }
+
+mlir::AnalysisManager &CalyxLoweringState::getAnalysisManager() { return am; }
 
 StringRef CalyxLoweringState::getTopLevelFunction() const {
   return topLevelFunction;

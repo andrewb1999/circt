@@ -2318,8 +2318,8 @@ void SCFToCalyxPass::runOnOperation() {
     signalPassFailure();
     return;
   }
-  loweringState = std::make_shared<calyx::CalyxLoweringState>(getOperation(),
-                                                              topLevelFunction);
+  loweringState = std::make_shared<calyx::CalyxLoweringState>(
+      getOperation(), getAnalysisManager(), topLevelFunction);
 
   /// --------------------------------------------------------------------------
   /// If you are a developer, it may be helpful to add a

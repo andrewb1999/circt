@@ -25,6 +25,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Pass/AnalysisManager.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -562,11 +563,14 @@ Value buildCombAndTree(OpBuilder &builder,
 /// state during the lowering of a Calyx program.
 class CalyxLoweringState {
 public:
-  explicit CalyxLoweringState(mlir::ModuleOp module,
+  explicit CalyxLoweringState(mlir::ModuleOp module, mlir::AnalysisManager am,
                               StringRef topLevelFunction);
 
   /// Returns the current program.
   mlir::ModuleOp getModule();
+
+  // Returns the analysis manager
+  mlir::AnalysisManager &getAnalysisManager();
 
   /// Returns the name of the top-level function in the source program.
   StringRef getTopLevelFunction() const;
@@ -607,6 +611,8 @@ private:
   StringRef topLevelFunction;
   /// The program associated with this state.
   mlir::ModuleOp module;
+  // Analysis manager
+  mlir::AnalysisManager am;
   // ASM State
   mlir::AsmState asmState;
   // Mapping from Blocks to Names

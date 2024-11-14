@@ -10,6 +10,7 @@ add_circt_conversion_library(CIRCTLoopScheduleToCalyx
 
   LINK_LIBS PUBLIC
   CIRCTCalyx
+  CIRCTOpLib
   CIRCTCalyxTransforms
   CIRCTLoopSchedule
   MLIRIR

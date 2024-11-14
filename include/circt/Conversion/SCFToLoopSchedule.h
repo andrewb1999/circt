@@ -10,6 +10,7 @@
 #ifndef CIRCT_CONVERSION_SCFTOLOOPSCHEDULE_H_
 #define CIRCT_CONVERSION_SCFTOLOOPSCHEDULE_H_
 
+#include "circt/Dialect/OpLib/OpLibDialect.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include <memory>

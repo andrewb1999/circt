@@ -7,6 +7,7 @@ set(LLVM_OPTIONAL_SOURCES
   OpCountAnalysis.cpp
   SchedulingAnalysis.cpp
   LoopScheduleDependenceAnalysis.cpp
+  OperatorLibraryAnalysis.cpp
   TestPasses.cpp
 )
 
@@ -46,6 +47,16 @@ add_circt_library(CIRCTLoopScheduleDependenceAnalysis
   MLIRAffineUtils
   CIRCTNameAnalysis
   MLIRTransformUtils
+)
+
+add_circt_library(CIRCTOperatorLibraryAnalysis
+  OperatorLibraryAnalysis.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRIR
+  MLIRTransformUtils
+  CIRCTOpLib
+  CIRCTCalyx
 )
 
 add_circt_library(CIRCTOpCountAnalysis

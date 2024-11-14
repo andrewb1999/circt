@@ -12,6 +12,7 @@ add_circt_conversion_library(CIRCTSCFToLoopSchedule
   MLIRPass
   CIRCTScheduling
   CIRCTSchedulingAnalysis
+  CIRCTOperatorLibraryAnalysis
   CIRCTLoopSchedule
   MLIRArithTransforms
 )

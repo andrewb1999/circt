@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/LoopScheduleToCalyx.h"
+#include "circt/Analysis/OperatorLibraryAnalysis.h"
 #include "circt/Dialect/Calyx/CalyxHelpers.h"
 #include "circt/Dialect/Calyx/CalyxLoweringUtils.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
@@ -35,6 +36,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -330,10 +332,30 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
   LogicalResult
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
+    // Get operator library analysis
+    auto operatorLibraryAnalysis =
+        loweringState()
+            .getAnalysisManager()
+            .nest(funcOp)
+            .getAnalysis<analysis::OperatorLibraryAnalysis>();
+
     /// We walk the operations of the funcOp to ensure that all def's have
     /// been visited before their uses.
     bool opBuiltSuccessfully = true;
     funcOp.walk([&](Operation *op) {
+      auto potentialOperators =
+          operatorLibraryAnalysis.getPotentialOperators(op);
+
+      if (!potentialOperators.empty()) {
+        auto res = buildOpFromOperator(rewriter, op, operatorLibraryAnalysis);
+        if (res.succeeded()) {
+          return WalkResult::advance();
+        }
+        op->emitOpError("Operation matched operator ")
+            << potentialOperators.front() << " but failed to build.";
+        return WalkResult::interrupt();
+      }
+
       opBuiltSuccessfully &=
           TypeSwitch<mlir::Operation *, bool>(op)
               .template Case<
@@ -372,6 +394,11 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
   }
 
 private:
+  /// OpLib builder.
+  LogicalResult buildOpFromOperator(
+      PatternRewriter &rewriter, Operation *op,
+      analysis::OperatorLibraryAnalysis &operatorLibraryAnalysis) const;
+
   /// Op builder specializations.
   LogicalResult buildOp(PatternRewriter &rewriter,
                         BranchOpInterface brOp) const;
@@ -586,6 +613,73 @@ private:
     }
   }
 };
+
+LogicalResult BuildOpGroups::buildOpFromOperator(
+    PatternRewriter &rewriter, Operation *op,
+    analysis::OperatorLibraryAnalysis &operatorLibraryAnalysis) const {
+  auto potentialOperators = operatorLibraryAnalysis.getPotentialOperators(op);
+  // TODO: Actually implement allocation to choose best potential operator
+  assert(potentialOperators.size() == 1 &&
+         "multiple potential operators not yet supported");
+
+  auto operatorName = potentialOperators.front();
+  auto latency = operatorLibraryAnalysis.getOperatorLatency(operatorName);
+  auto *templateOp =
+      operatorLibraryAnalysis.getOperatorTemplateOp(operatorName);
+  auto cellInterface = cast<calyx::CellInterface>(templateOp);
+  auto templateName = cellInterface.instanceName();
+  auto compOp = getState<ComponentLoweringState>().getComponentOp();
+  auto uniqueName =
+      getState<ComponentLoweringState>().getUniqueName(templateName);
+  rewriter.setInsertionPoint(compOp.getWiresOp());
+  auto *clonedOp = rewriter.clone(*templateOp);
+  // clonedOp->setAttr("sym_name", rewriter.getStringAttr(uniqueName));
+  auto res =
+      compOp.replaceAllSymbolUses(rewriter.getStringAttr(uniqueName), clonedOp);
+  if (res.failed()) {
+    op->emitError("Failed to replace all symbol uses");
+    return failure();
+  }
+  auto group = createStaticGroupForOp(rewriter, op, 1);
+
+  // Assign CE if it exists
+  auto constOne = calyx::createConstant(op->getLoc(), rewriter, compOp, 1, 1);
+  rewriter.setInsertionPointToEnd(group.getBodyBlock());
+  auto ceResNum = operatorLibraryAnalysis.getCEResultNum(operatorName);
+  if (ceResNum.has_value()) {
+    auto ce = clonedOp->getResult(ceResNum.value());
+    rewriter.create<calyx::AssignOp>(op->getLoc(), ce, constOne);
+    // if (latency > 1) {
+    //   auto phase = op->getParentOfType<PhaseInterface>();
+    //   for (unsigned i = 0; i < latency - 1; ++i) {
+    //     phase = cast<PhaseInterface>(phase->getNextNode());
+    //     getState<ComponentLoweringState>().setHoldCEInPhase(ce, phase);
+    //   }
+    // }
+  }
+
+  // Assign inputs
+  for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+    auto targetOperand = op->getOperand(i);
+    auto resultNum =
+        operatorLibraryAnalysis.getCellResultForOperandNum(operatorName, i);
+    auto cellResult = clonedOp->getOpResult(resultNum);
+    rewriter.create<calyx::AssignOp>(op->getLoc(), cellResult, targetOperand);
+  }
+
+  // Assign outputs
+  for (unsigned i = 0; i < op->getNumResults(); ++i) {
+    auto targetResult = op->getResult(i);
+    auto resultNum =
+        operatorLibraryAnalysis.getCellResultForResultNum(operatorName, i);
+    auto cellResult = clonedOp->getOpResult(resultNum);
+    targetResult.replaceAllUsesWith(cellResult);
+    getState<ComponentLoweringState>().registerEvaluatingGroup(cellResult,
+                                                               group);
+  }
+
+  return success();
+}
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      LoopScheduleLoadOp loadOp) const {
@@ -1650,7 +1744,12 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
             cell && !cell.isCombinational() && !isa<calyx::RegisterOp>(cell)) {
           auto *op = cell.getOperation();
           Value v;
-          if (auto mul = dyn_cast<calyx::PipelinedMultLibOp>(op); mul) {
+          if (auto prim = dyn_cast<calyx::PrimitiveOp>(op)) {
+            assert(
+                prim.getOutputPorts().size() == 1 &&
+                "only pipelined primitives with a single output are supported");
+            v = prim.getOutputPorts().front();
+          } else if (auto mul = dyn_cast<calyx::PipelinedMultLibOp>(op); mul) {
             v = mul.getOut();
           } else if (auto divs = dyn_cast<calyx::PipelinedDivSLibOp>(op);
                      divs) {
@@ -1700,8 +1799,7 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
 
         // Create a register for passing this result to later phases.
         Type resultType = value.getType();
-        assert(isa<IntegerType>(resultType) &&
-               "unsupported pipeline result type");
+        assert(resultType.isIntOrFloat() && "unsupported pipeline result type");
 
         assert(phase->getParentOp() != nullptr);
 
@@ -2774,6 +2872,28 @@ class CleanupFuncOps : public calyx::FuncOpPartialLoweringPattern {
   }
 };
 
+/// Erases FuncOp operations.
+class CleanupOpLibraryOps : public calyx::FuncOpPartialLoweringPattern {
+  using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
+
+  LogicalResult matchAndRewrite(FuncOp funcOp,
+                                PatternRewriter &rewriter) const override {
+    if (funcOp->hasAttr("oplib.library")) {
+      auto libraryName = funcOp->getAttrOfType<SymbolRefAttr>("oplib.library");
+      auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+      auto *libraryOp = moduleOp.lookupSymbol(libraryName);
+      rewriter.eraseOp(libraryOp);
+    }
+    return success();
+  }
+
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Pass driver
 //===----------------------------------------------------------------------===//
@@ -2837,6 +2957,7 @@ public:
     target.addLegalDialect<scf::SCFDialect>();
     target.addIllegalDialect<hw::HWDialect>();
     target.addIllegalDialect<comb::CombDialect>();
+    target.addLegalOp<hw::HWModuleOp, hw::HWModuleExternOp>();
 
     // For loops should have been lowered to while loops
     target.addIllegalOp<scf::ForOp>();
@@ -2849,6 +2970,19 @@ public:
                       BranchOp, MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp,
                       ReturnOp, arith::ConstantOp, IndexCastOp, FuncOp, ExtSIOp,
                       SelectOp>();
+
+    getOperation().walk([&](func::FuncOp funcOp) {
+      auto operatorLibraryAnalysis =
+          getAnalysisManager()
+              .nest(funcOp)
+              .getAnalysis<analysis::OperatorLibraryAnalysis>();
+
+      for (auto operationTarget :
+           operatorLibraryAnalysis.getAllSupportedTargets()) {
+        auto operationName = OperationName(operationTarget, &getContext());
+        target.addLegalOp(operationName);
+      }
+    });
 
     RewritePatternSet legalizePatterns(&getContext());
     legalizePatterns.add<DummyPattern>(&getContext());
@@ -2926,8 +3060,8 @@ void LoopScheduleToCalyxPass::runOnOperation() {
     signalPassFailure();
     return;
   }
-  loweringState = std::make_shared<calyx::CalyxLoweringState>(getOperation(),
-                                                              topLevelFunction);
+  loweringState = std::make_shared<calyx::CalyxLoweringState>(
+      getOperation(), getAnalysisManager(), topLevelFunction);
 
   /// --------------------------------------------------------------------------
   /// If you are a developer, it may be helpful to add a
@@ -3020,6 +3154,9 @@ void LoopScheduleToCalyxPass::runOnOperation() {
   /// index types being converted to a fixed-width integer type.
   addOncePattern<calyx::RewriteMemoryAccesses>(loweringPatterns, patternState,
                                                *loweringState);
+
+  addOncePattern<CleanupOpLibraryOps>(loweringPatterns, patternState, funcMap,
+                                      *loweringState);
 
   /// This pattern removes the source FuncOp which has now been converted into
   /// a Calyx component.

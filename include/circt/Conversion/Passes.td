@@ -34,7 +34,8 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::func::FuncOp"
     "mlir::cf::ControlFlowDialect",
     "mlir::memref::MemRefDialect",
     "mlir::scf::SCFDialect",
-    "mlir::func::FuncDialect"
+    "mlir::func::FuncDialect",
+    "circt::oplib::OpLibDialect"
   ];
   let options = [
     Option<"prioritizeII", "prioritize-II", "bool", "",
@@ -236,7 +237,7 @@ def LoopScheduleToCalyx : Pass<"lower-loopschedule-to-calyx", "mlir::ModuleOp"> 
   let constructor = "circt::createLoopScheduleToCalyxPass()";
   let dependentDialects = [
     "calyx::CalyxDialect", "loopschedule::LoopScheduleDialect", "hw::HWDialect",
-    "comb::CombDialect"
+    "comb::CombDialect", "oplib::OpLibDialect"
   ];
   let options = [
     Option<"topLevelFunctionOpt", "top-level-function", "std::string", "",

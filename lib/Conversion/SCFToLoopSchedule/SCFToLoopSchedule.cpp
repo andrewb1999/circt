@@ -10,6 +10,7 @@
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Analysis/LoopScheduleDependenceAnalysis.h"
 #include "circt/Analysis/NameAnalysis.h"
+#include "circt/Analysis/OperatorLibraryAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/LoopSchedule/Utils.h"
@@ -101,6 +102,7 @@ private:
                                        Problem &problem);
 
   std::optional<LoopScheduleDependenceAnalysis> dependenceAnalysis;
+  std::optional<OperatorLibraryAnalysis> operatorLibraryAnalysis;
   PredicateUse predicateUse;
   PredicateMap predicateMap;
 };
@@ -144,6 +146,8 @@ void SCFToLoopSchedulePass::runOnOperation() {
 
   // Get dependence analysis for the whole function.
   dependenceAnalysis = getAnalysis<LoopScheduleDependenceAnalysis>();
+
+  operatorLibraryAnalysis = getAnalysis<OperatorLibraryAnalysis>();
 
   // Schedule all pipelined loops first
   for (auto loop : llvm::make_early_inc_range(loops)) {
@@ -322,6 +326,27 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
   WalkResult result = loopBody.walk([&](Operation *op) {
     if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
         op->getParentOfType<LoopSchedulePipelineOp>() != nullptr) {
+      return WalkResult::advance();
+    }
+
+    auto potentialOperators =
+        operatorLibraryAnalysis->getPotentialOperators(op);
+    if (!potentialOperators.empty()) {
+      // Just pick the first potential operator for now
+      // TODO: Perform better allocation
+      auto selectedOperator = potentialOperators.front();
+      OperatorType libOpr = problem.getOrInsertOperatorType(selectedOperator);
+      problem.setLatency(libOpr, operatorLibraryAnalysis->getOperatorLatency(
+                                     selectedOperator));
+      problem.setIncomingDelay(
+          libOpr,
+          operatorLibraryAnalysis->getOperatorIncomingDelay(selectedOperator)
+              .value_or(0.0));
+      problem.setOutgoingDelay(
+          libOpr,
+          operatorLibraryAnalysis->getOperatorOutgoingDelay(selectedOperator)
+              .value_or(0.0));
+      problem.setLinkedOperatorType(op, libOpr);
       return WalkResult::advance();
     }
 

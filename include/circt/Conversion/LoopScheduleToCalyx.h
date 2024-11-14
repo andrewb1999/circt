@@ -15,6 +15,7 @@
 #define CIRCT_CONVERSION_LOOPSCHEDULETOCALYX_H
 
 #include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
+#include "circt/Dialect/OpLib/OpLibDialect.h"
 #include "circt/Support/LLVM.h"
 #include <memory>
 
