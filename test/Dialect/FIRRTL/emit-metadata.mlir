@@ -4,7 +4,18 @@
 // RetimeModules
 //===----------------------------------------------------------------------===//
 
-firrtl.circuit "retime0" attributes {
+// Test that both flavors of retiming metadata are generated:
+//
+//   1. Class-based metadata
+//   2. JSON file-based metadata
+//
+// This retiming information should only be generated for things in the
+// "design".  This test works by instantiating modules that are wholly in the
+// design, wholly _not_ in the design, or in a mixture of both.  It then expects
+// that only modules which have at least one instance in the design will get
+// metadata.
+
+firrtl.circuit "TestHarness" attributes {
   annotations = [
     {
       class = "sifive.enterprise.firrtl.RetimeModulesAnnotation",
@@ -12,50 +23,141 @@ firrtl.circuit "retime0" attributes {
     }
   ]
 } {
-  firrtl.module @retime0() attributes {
+  firrtl.layer @A bind {}
+  firrtl.module @Foo() attributes {
     annotations = [
       {
         class = "freechips.rocketchip.util.RetimeModuleAnnotation"
       }
     ]
   } {}
-
-  firrtl.module @retime1() { }
-
-  firrtl.module @retime2() attributes {
+  firrtl.module @Bar() attributes {
     annotations = [
       {
         class = "freechips.rocketchip.util.RetimeModuleAnnotation"
       }
     ]
   } {}
+  firrtl.module @Baz() attributes {
+    annotations = [
+      {
+        class = "freechips.rocketchip.util.RetimeModuleAnnotation"
+      }
+    ]
+  } {}
+  firrtl.module @Qux() attributes {
+    annotations = [
+      {
+        class = "freechips.rocketchip.util.RetimeModuleAnnotation"
+      }
+    ]
+  } {}
+  firrtl.module @Quz() attributes {
+    annotations = [
+      {
+        class = "freechips.rocketchip.util.RetimeModuleAnnotation"
+      }
+    ]
+  } {}
+  firrtl.module @DUT() attributes {
+    annotations = [
+      {
+        class = "sifive.enterprise.firrtl.MarkDUTAnnotation"
+      }
+    ]
+  } {
+    firrtl.instance baz @Foo()
+    firrtl.instance bar @Bar()
+    firrtl.instance quz1 @Quz()
+    firrtl.layerblock @A {
+      firrtl.instance qux @Qux()
+      firrtl.instance quz2 @Quz()
+    }
+  }
+  firrtl.module @TestHarness() {
+    firrtl.instance dut @DUT()
+    firrtl.instance bar @Bar()
+    firrtl.instance baz @Baz()
+  }
 }
-// CHECK-LABEL: firrtl.circuit "retime0"   {
-// CHECK:         firrtl.module @retime0(out %metadataObj: !firrtl.any
-// CHECK:           [[SIFIVE_METADATA:%.+]] = firrtl.object @SiFive_Metadata
-// CHECK:           [[METADATA_OBJ:%.+]] = firrtl.object.anyref_cast [[SIFIVE_METADATA]]
-// CHECK:           propassign %metadataObj, [[METADATA_OBJ]]
-// CHECK:         firrtl.module @retime1() {
-// CHECK:         firrtl.module @retime2()
 
-// CHECK:    firrtl.class @RetimeModulesSchema(in %[[moduleName_in:.+]]: !firrtl.string, out %moduleName: !firrtl.string) {
-// CHECK:    firrtl.propassign %moduleName, %[[moduleName_in]]
-
-// CHECK:  firrtl.class @RetimeModulesMetadata
-// CHECK-SAME: (out %[[retime0_field:[a-zA-Z][a-zA-Z0-9_]*]]: !firrtl.class<@RetimeModulesSchema
-// CHECK:    %[[v0:.+]] = firrtl.string "retime0"
-// CHECK:    %retime0 = firrtl.object @RetimeModulesSchema
-// CHECK-NEXT:    %[[v1:.+]] = firrtl.object.subfield %retime0
-// CHECK-NEXT:    firrtl.propassign %[[v1]], %[[v0]] : !firrtl.string
-// CHECK-NEXT:    firrtl.propassign %[[retime0_field]], %retime0
-// CHECK:    %2 = firrtl.string "retime2"
-// CHECK:    %retime2 = firrtl.object @RetimeModulesSchema
-// CHECK:    firrtl.object.subfield %retime2
-// CHECK:    firrtl.propassign %[[retime2field:.+]], %retime2
-
-// CHECK:               emit.file "retime_modules.json" {
-// CHECK-NEXT{LITERAL}:   sv.verbatim "[\0A \22{{0}}\22,\0A \22{{1}}\22\0A]" {symbols = [@retime0, @retime2]}
+// (1) Class-based metadata ----------------------------------------------------
+//
+// CHECK:               firrtl.class @RetimeModulesSchema(
+// CHECK-SAME:            in %[[moduleName_in:.+]]: !firrtl.string,
+// CHECK-SAME:            out %moduleName: !firrtl.string
+// CHECK-SAME:          ) {
+// CHECK-NEXT:            firrtl.propassign %moduleName, %[[moduleName_in]]
 // CHECK-NEXT:          }
+//
+// CHECK-LABEL:         firrtl.class @RetimeModulesMetadata(
+// CHECK-SAME:            out %Foo_field: !firrtl.class<@RetimeModulesSchema
+// CHECK-SAME:            out %Bar_field: !firrtl.class<@RetimeModulesSchema
+// CHECK-SAME:            out %Quz_field: !firrtl.class<@RetimeModulesSchema
+// CHECK-SAME:          ) {{.*}} {
+//
+// CHECK-NEXT:            %[[#name:]] = firrtl.string "Foo"
+// CHECK-NEXT:            %[[schema:.+]] = firrtl.object @RetimeModulesSchema(
+// CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[schema]][moduleName_in]
+// CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#name]]
+// CHECK-NEXT:            firrtl.propassign %Foo_field, %[[schema]]
+//
+// CHECK-NEXT:            %[[#name:]] = firrtl.string "Bar"
+// CHECK-NEXT:            %[[schema:.+]] = firrtl.object @RetimeModulesSchema(
+// CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[schema]][moduleName_in]
+// CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#name]]
+// CHECK-NEXT:            firrtl.propassign %Bar_field, %[[schema]]
+//
+// CHECK-NEXT:            %[[#name:]] = firrtl.string "Quz"
+// CHECK-NEXT:            %[[schema:.+]] = firrtl.object @RetimeModulesSchema(
+// CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[schema]][moduleName_in]
+// CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#name]]
+// CHECK-NEXT:            firrtl.propassign %Quz_field, %[[schema]]
+//
+// CHECK-NEXT:          }
+
+// (2) JSON file-based metadata ------------------------------------------------
+//
+// CHECK-LABEL:         emit.file "retime_modules.json"
+// CHECK-NEXT:            sv.verbatim "[
+// CHECK-SAME{LITERAL}:     \22{{0}}\22,\0A
+// CHECK-SAME{LITERAL}:     \22{{1}}\22,\0A
+// CHECK-SAME{LITERAL}:     \22{{2}}\22
+// CHECK-SAME:            ]"
+// CHECK-SAME:            symbols = [@Foo, @Bar, @Quz]
+
+// -----
+
+// Test that retime information is always emited if there is no
+// design-under-test (DUT) specified.
+
+firrtl.circuit "Foo" attributes {
+  annotations = [
+    {
+      class = "sifive.enterprise.firrtl.RetimeModulesAnnotation",
+      filename = "retime_modules.json"
+    }
+  ]
+} {
+  firrtl.module @Bar() attributes {
+    annotations = [
+      {
+        class = "freechips.rocketchip.util.RetimeModuleAnnotation"
+      }
+    ]
+  } {}
+  firrtl.module @Foo() {
+  }
+}
+
+// CHECK-LABEL:         firrtl.class @RetimeModulesMetadata(
+// CHECK-SAME:            out %Bar_field: !firrtl.class<@RetimeModulesSchema
+
+// CHECK-LABEL:         emit.file "retime_modules.json"
+// CHECK-NEXT:            sv.verbatim "[
+// CHECK-SAME{LITERAL}:     \22{{0}}\22
+// CHECK-SAME:            ]"
+// CHECK-SAME:            symbols = [@Bar]
 
 // -----
 
@@ -72,9 +174,13 @@ firrtl.circuit "DUTBlackboxes" attributes {
     }
   ]
 } {
-  firrtl.module @DUTBlackboxes() attributes {annotations = [
-      {class = "sifive.enterprise.firrtl.MarkDUTAnnotation"}]} {
-  }
+  firrtl.module @DUTBlackboxes() attributes {
+    annotations = [
+      {
+        class = "sifive.enterprise.firrtl.MarkDUTAnnotation"
+      }
+    ]
+  } {}
 // CHECK-NOT:  emit.file ""
 // CHECK:      emit.file "dut_blackboxes.json" {
 // CHECK-NEXT:   emit.verbatim "[]"
@@ -93,9 +199,13 @@ firrtl.circuit "TestBlackboxes" attributes {
     }
   ]
 } {
-  firrtl.module @TestBlackboxes() attributes {annotations = [
-      {class = "sifive.enterprise.firrtl.MarkDUTAnnotation"}]} {
-  }
+  firrtl.module @TestBlackboxes() attributes {
+    annotations = [
+      {
+        class = "sifive.enterprise.firrtl.MarkDUTAnnotation"
+      }
+    ]
+  } {}
 // CHECK-NOT:  emit.file ""
 // CHECK:      emit.file "test_blackboxes.json" {
 // CHECK-NEXT:   emit.verbatim "[]"
@@ -105,7 +215,6 @@ firrtl.circuit "TestBlackboxes" attributes {
 
 // -----
 
-// CHECK-LABEL: firrtl.circuit "BasicBlackboxes"   {
 firrtl.circuit "BasicBlackboxes" attributes {
   annotations = [
     {
@@ -118,6 +227,7 @@ firrtl.circuit "BasicBlackboxes" attributes {
     }
   ]
 } {
+  firrtl.layer @A bind {}
   firrtl.module @BasicBlackboxes() attributes {
     annotations = [
       {
@@ -128,6 +238,11 @@ firrtl.circuit "BasicBlackboxes" attributes {
     firrtl.instance test @DUTBlackbox_0()
     firrtl.instance test @DUTBlackbox_1()
     firrtl.instance test @DUTBlackbox_2()
+    firrtl.instance layerBlackboxInDesign1 @LayerBlackboxInDesign()
+    firrtl.layerblock @A {
+      firrtl.instance layerBlackboxInDesign2 @LayerBlackboxInDesign()
+      firrtl.instance layerBlackbox @LayerBlackbox()
+    }
   }
 
   // These should all be ignored.
@@ -172,38 +287,84 @@ firrtl.circuit "BasicBlackboxes" attributes {
     defname = "ignored4"
   }
 
-// CHECK:    firrtl.class @SitestBlackBoxModulesSchema(in %[[moduleName_in:.+]]: !firrtl.string, out %moduleName: !firrtl.string) {
-// CHECK:      firrtl.propassign %moduleName, %[[moduleName_in]]
-// CHECK:    }
-
-// CHECK:    firrtl.class @SitestBlackBoxMetadata(out %TestBlackbox_field: !firrtl.class<@SitestBlackBoxModulesSchema(in moduleName_in: !firrtl.string, out moduleName: !firrtl.string)>, out %DUTBlackbox_0_field: !firrtl.class<@SitestBlackBoxModulesSchema(in moduleName_in: !firrtl.string, out moduleName: !firrtl.string)>, out %DUTBlackbox_1_field: !firrtl.class<@SitestBlackBoxModulesSchema(in moduleName_in: !firrtl.string, out moduleName: !firrtl.string)>) attributes {portAnnotations = []} {
-// CHECK:      firrtl.string "TestBlackbox"
-// CHECK:      %TestBlackbox = firrtl.object @SitestBlackBoxModulesSchema
-// CHECK:      firrtl.propassign %TestBlackbox_field, %TestBlackbox
-// CHECK:      firrtl.string "DUTBlackbox2"
-// CHECK:      %DUTBlackbox_0 = firrtl.object @SitestBlackBoxModulesSchema
-// CHECK:      firrtl.propassign %DUTBlackbox_0_field, %DUTBlackbox_0
-// CHECK:      firrtl.string "DUTBlackbox1"
-// CHECK:      %DUTBlackbox_1 = firrtl.object @SitestBlackBoxModulesSchema
-// CHECK:      firrtl.propassign %DUTBlackbox_1_field, %DUTBlackbox_1
-// CHECK:    }
   // Gracefully handle missing defnames.
   firrtl.extmodule @NoDefName()
 
   firrtl.extmodule @TestBlackbox() attributes {defname = "TestBlackbox"}
 
-  // CHECK:               emit.file "test_blackboxes.json" {
-  // CHECK-NEXT{LITERAL}:   emit.verbatim "[\0A \22TestBlackbox\22\0A]"
-  // CHECK-NEXT:          }
-
   // Should be de-duplicated and sorted.
   firrtl.extmodule @DUTBlackbox_0() attributes {defname = "DUTBlackbox2"}
   firrtl.extmodule @DUTBlackbox_1() attributes {defname = "DUTBlackbox1"}
   firrtl.extmodule @DUTBlackbox_2() attributes {defname = "DUTBlackbox1"}
-  // CHECK:               emit.file "dut_blackboxes.json" {
-  // CHECK-NEXT{LITERAL}:   emit.verbatim "[\0A \22DUTBlackbox1\22,\0A \22DUTBlackbox2\22\0A]"
-  // CHECK-NEXT:          }
+  firrtl.extmodule @LayerBlackboxInDesign() attributes {defname = "LayerBlackboxInDesign"}
+  firrtl.extmodule @LayerBlackbox() attributes {defname = "LayerBlackbox"}
 }
+
+// (1) Class-based metadata ----------------------------------------------------
+//
+// CHECK:               firrtl.class @SitestBlackBoxModulesSchema(
+// CHECK-SAME:            in %[[moduleName_in:.+]]: !firrtl.string,
+// CHECK-SAME:            out %moduleName: !firrtl.string
+// CHECK-SAME:          ) {
+// CHECK-NEXT:            firrtl.propassign %moduleName, %[[moduleName_in]]
+// CHECK:               }
+//
+// CHECK:               firrtl.class @SitestBlackBoxMetadata(
+// CHECK-SAME:            out %TestBlackbox_field: !firrtl.class<@SitestBlackBoxModulesSchema(
+// CHECK-SAME:            out %DUTBlackbox_0_field: !firrtl.class<@SitestBlackBoxModulesSchema(
+// CHECK-SAME:            out %DUTBlackbox_1_field: !firrtl.class<@SitestBlackBoxModulesSchema(
+// CHECK-SAME:            out %LayerBlackboxInDesign_field: !firrtl.class<@SitestBlackBoxModulesSchema(
+// CHECK-SAME:            out %LayerBlackbox_field: !firrtl.class<@SitestBlackBoxModulesSchema(
+// CHECK-NOT:             !firrtl.class<@SitestBlackBoxModulesSchema(
+//
+// CHECK-NEXT:            %[[#defname:]] = firrtl.string "TestBlackbox"
+// CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
+// CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
+// CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            firrtl.propassign %TestBlackbox_field, %[[object]]
+//
+// CHECK-NEXT:            %[[#defname:]] = firrtl.string "DUTBlackbox2"
+// CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
+// CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
+// CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            firrtl.propassign %DUTBlackbox_0_field, %[[object]]
+//
+// CHECK-NEXT:            %[[#defname:]] = firrtl.string "DUTBlackbox1"
+// CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
+// CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
+// CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            firrtl.propassign %DUTBlackbox_1_field, %[[object]]
+//
+// CHECK-NEXT:            %[[#defname:]] = firrtl.string "LayerBlackboxInDesign"
+// CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
+// CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
+// CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            firrtl.propassign %LayerBlackboxInDesign_field, %[[object]]
+//
+// CHECK-NEXT:            %[[#defname:]] = firrtl.string "LayerBlackbox"
+// CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
+// CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
+// CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            firrtl.propassign %LayerBlackbox_field, %[[object]]
+//
+// CHECK-NOT:             firrtl.object
+
+// (2) JSON file-based metadata ------------------------------------------------
+//
+// CHECK:               emit.file "test_blackboxes.json" {
+// CHECK-NEXT{LITERAL}:   emit.verbatim "[\0A
+// CHECK-SAME:              \22LayerBlackbox\22,\0A
+// CHECK-SAME:              \22TestBlackbox\22\0A
+// CHECK-SAME:            ]"
+// CHECK-NEXT:          }
+//
+// CHECK:               emit.file "dut_blackboxes.json" {
+// CHECK-NEXT{LITERAL}:   emit.verbatim "[\0A
+// CHECK-SAME:              \22DUTBlackbox1\22,\0A
+// CHECK-SAME:              \22DUTBlackbox2\22,\0A
+// CHECK-SAME:              \22LayerBlackboxInDesign\22\0A
+// CHECK-SAME:            ]"
+// CHECK-NEXT:          }
 
 // -----
 
@@ -226,7 +387,7 @@ firrtl.circuit "Foo" {
 }
 
 // CHECK-LABEL:         firrtl.circuit "Foo"
-// CHECK:                 hw.hierpath @[[dutPathSym:.+]] [@Foo::@bar]
+// CHECK:                 hw.hierpath private @[[dutPathSym:.+]] [@Foo::@bar]
 
 // CHECK-LABEL:         firrtl.module @Foo(
 // CHECK-NEXT:            firrtl.instance bar
@@ -234,9 +395,9 @@ firrtl.circuit "Foo" {
 
 // CHECK-LABEL:         firrtl.class @SiFive_Metadata(
 // CHECK-SAME:            out %[[dutModulePath:dutModulePath.*]]: !firrtl.list<path>
-// CHECK:                 %[[a:.+]] = firrtl.path instance distinct[[[dutId]]]<>
-// CHECK-NEXT:            %[[b:.+]] = firrtl.list.create %[[a]] : !firrtl.list<path>
-// CHECK-NEXT:            firrtl.propassign %[[dutModulePath]], %[[b]] : !firrtl.list<path>
+// CHECK:                 %[[#a:]] = firrtl.path instance distinct[[[dutId]]]<>
+// CHECK-NEXT:            %[[#b:]] = firrtl.list.create %[[#a]] : !firrtl.list<path>
+// CHECK-NEXT:            firrtl.propassign %[[dutModulePath]], %[[#b]] : !firrtl.list<path>
 
 // -----
 
@@ -322,7 +483,7 @@ firrtl.circuit "Foo" {
 
 // (1) OM Info -----------------------------------------------------------------
 // CHECK-LABEL:         firrtl.circuit "Foo"
-// CHECK:                 hw.hierpath @[[memPathSym:.+]] [@Bar::@baz, @Baz::@m]
+// CHECK:                 hw.hierpath private @[[memPathSym:.+]] [@Bar::@baz, @Baz::@m]
 
 // CHECK-LABEL:         firrtl.module @Baz()
 // CHECK-NEXT:            firrtl.instance m
@@ -463,7 +624,7 @@ firrtl.circuit "Foo" {
   }
 }
 
-//------------------------------------------------------------------ (1) OM Info
+// (1) OM Info -----------------------------------------------------------------
 // CHECK-LABEL:         firrtl.class @MemoryMetadata({{.*$}}
 // CHECK:                 %[[memoryObject:.+]] = firrtl.object @MemorySchema
 // CHECK:                 %[[#zero:]] = firrtl.integer 0
@@ -476,14 +637,14 @@ firrtl.circuit "Foo" {
 // CHECK-NEXT:            %[[#rw:]] = firrtl.object.subfield %[[memoryObject]][readwritePorts_in]
 // CHECK-NEXT:            firrtl.propassign %[[#rw]], %[[#zero]]
 
-//-------------------------------------------------------------- (2) Memory JSON
+// (2) Memory JSON -------------------------------------------------------------
 // CHECK-LABEL:         emit.file "metadata{{/|\\\\}}seq_mems.json"
 // CHECK-NEXT:            sv.verbatim
 // CHECK-SAME:              \22read\22: 0
 // CHECK-SAME:              \22write\22: 0
 // CHECK-SAME:              \22readwrite\22: 0
 
-//------------------------------------------------------- (3) Configuration File
+// (3) Configuration File ------------------------------------------------------
 // CHECK-LABEL:         emit.file "mems.conf"
 // CHECK-NEXT{LITERAL}:   sv.verbatim "name {{0}} depth 16 width 8 ports \0A"
 
@@ -523,7 +684,7 @@ firrtl.circuit "Foo" {
   }
 }
 
-//------------------------------------------------------------------ (1) OM Info
+// (1) OM Info -----------------------------------------------------------------
 // CHECK-LABEL:         firrtl.class @MemoryMetadata({{.*$}}
 // CHECK:                 %[[memoryObject:.+]] = firrtl.object @MemorySchema
 // CHECK:                 firrtl.object.subfield %[[memoryObject]][maskBits_in]
@@ -537,161 +698,373 @@ firrtl.circuit "Foo" {
 // CHECK-NEXT:            %[[#rw:]] = firrtl.object.subfield %[[memoryObject]][readwritePorts_in]
 // CHECK-NEXT:            firrtl.propassign %[[#rw]], %[[#zero]]
 
-//-------------------------------------------------------------- (2) Memory JSON
+// (2) Memory JSON -------------------------------------------------------------
 // CHECK-LABEL:         emit.file "metadata{{/|\\\\}}seq_mems.json"
 // CHECK-NEXT:            sv.verbatim
 // CHECK-SAME:              \22read\22: 1
 // CHECK-SAME:              \22write\22: 0
 // CHECK-SAME:              \22readwrite\22: 0
 
-//------------------------------------------------------- (3) Configuration File
+// (3) Configuration File ------------------------------------------------------
 // CHECK-LABEL:         emit.file "mems.conf"
 // CHECK-NEXT{LITERAL}:   sv.verbatim "name {{0}} depth 16 width 8 ports read\0A"
 
 // -----
 
-// CHECK-LABEL: firrtl.circuit "top"
-firrtl.circuit "top" {
-    // CHECK: hw.hierpath @[[DUTNLA:.+]] [@top::@sym]
-    // CHECK-LABEL: firrtl.module @top
-    firrtl.module @top()  {
-      // CHECK: firrtl.instance dut sym @[[DUT_SYM:.+]] {annotations = [{circt.nonlocal = @dutNLA, class = "circt.tracker", id = distinct[0]<>}]} @DUT()
-      firrtl.instance dut @DUT()
-      firrtl.instance mem1 @Mem1()
-      firrtl.instance mem2 @Mem2()
-    }
-    firrtl.module private @Mem1() {
-      %0:4 = firrtl.instance head_ext @head_ext(
-        in W0_addr: !firrtl.uint<5>,
-        in W0_en: !firrtl.uint<1>,
-        in W0_clk: !firrtl.clock,
-        in W0_data: !firrtl.uint<5>
-      )
-    }
-    firrtl.module private @Mem2() {
-      %0:4 =  firrtl.instance head_0_ext @head_0_ext(
-        in W0_addr: !firrtl.uint<5>,
-        in W0_en: !firrtl.uint<1>,
-        in W0_clk: !firrtl.clock,
-        in W0_data: !firrtl.uint<5>
-      )
-    }
-    // CHECK-LABEL: firrtl.module private @DUT(
-    firrtl.module private @DUT() attributes {annotations = [
-      {class = "sifive.enterprise.firrtl.MarkDUTAnnotation"}]} {
-      // CHECK: firrtl.instance mem1 sym @[[MEM1_SYM:.+]] {annotations = [{
-      // CHECK-SAME: circt.nonlocal = @memNLA, class = "circt.tracker", id = distinct
-      firrtl.instance mem1 @Mem()
-    }
-    firrtl.module private @Mem() {
-      %0:10 = firrtl.instance memory_ext @memory_ext(
-        in R0_addr: !firrtl.uint<4>,
-        in R0_en: !firrtl.uint<1>,
-        in R0_clk: !firrtl.clock,
-        out R0_data: !firrtl.uint<8>,
-        in RW0_addr: !firrtl.uint<4>,
-        in RW0_en: !firrtl.uint<1>,
-        in RW0_clk: !firrtl.clock,
-        in RW0_wmode: !firrtl.uint<1>,
-        in RW0_wdata: !firrtl.uint<8>,
-        out RW0_rdata: !firrtl.uint<8>
-      )
-      %1:8 = firrtl.instance dumm_ext @dumm_ext(
-        in R0_addr: !firrtl.uint<5>,
-        in R0_en: !firrtl.uint<1>,
-        in R0_clk: !firrtl.clock,
-        out R0_data: !firrtl.uint<5>,
-        in W0_addr: !firrtl.uint<5>,
-        in W0_en: !firrtl.uint<1>,
-        in W0_clk: !firrtl.clock,
-        in W0_data: !firrtl.uint<5>
-      )
-    }
-    firrtl.memmodule private @head_ext(
-      in W0_addr: !firrtl.uint<5>,
-      in W0_en: !firrtl.uint<1>,
-      in W0_clk: !firrtl.clock,
-      in W0_data: !firrtl.uint<5>) attributes {dataWidth = 5 : ui32,
-      depth = 20 : ui64,
-      extraPorts = [],
-      maskBits = 1 : ui32,
-      numReadPorts = 0 : ui32,
-      numReadWritePorts = 0 : ui32,
-      numWritePorts = 1 : ui32,
-      readLatency = 1 : ui32,
-      writeLatency = 1 : ui32
-    }
-    firrtl.memmodule private @head_0_ext(
-      in W0_addr: !firrtl.uint<5>,
-      in W0_en: !firrtl.uint<1>,
-      in W0_clk: !firrtl.clock,
-      in W0_data: !firrtl.uint<5>) attributes {dataWidth = 5 : ui32,
-      depth = 20 : ui64,
-      extraPorts = [],
-      maskBits = 1 : ui32,
-      numReadPorts = 0 : ui32,
-      numReadWritePorts = 0 : ui32,
-      numWritePorts = 1 : ui32,
-      readLatency = 1 : ui32,
-      writeLatency = 1 : ui32
-    }
-    firrtl.memmodule private @memory_ext(
-      in R0_addr: !firrtl.uint<4>,
-      in R0_en: !firrtl.uint<1>,
-      in R0_clk: !firrtl.clock,
-      out R0_data: !firrtl.uint<8>,
-      in RW0_addr: !firrtl.uint<4>,
-      in RW0_en: !firrtl.uint<1>,
-      in RW0_clk: !firrtl.clock,
-      in RW0_wmode: !firrtl.uint<1>,
-      in RW0_wdata: !firrtl.uint<8>,
-      out RW0_rdata: !firrtl.uint<8>) attributes {dataWidth = 8 : ui32,
-      depth = 16 : ui64,
-      extraPorts = [],
-      maskBits = 1 : ui32,
-      numReadPorts = 1 : ui32,
-      numReadWritePorts = 1 : ui32,
-      numWritePorts = 0 : ui32,
-      readLatency = 1 : ui32,
-      writeLatency = 1 : ui32
-    }
-    firrtl.memmodule private @dumm_ext(
-      in R0_addr: !firrtl.uint<5>,
-      in R0_en: !firrtl.uint<1>,
-      in R0_clk: !firrtl.clock,
-      out R0_data: !firrtl.uint<5>,
-      in W0_addr: !firrtl.uint<5>,
-      in W0_en: !firrtl.uint<1>,
-      in W0_clk: !firrtl.clock,
-      in W0_data: !firrtl.uint<5>) attributes {dataWidth = 5 : ui32,
-      depth = 20 : ui64,
-      extraPorts = [],
-      maskBits = 1 : ui32,
-      numReadPorts = 1 : ui32,
-      numReadWritePorts = 0 : ui32,
-      numWritePorts = 1 : ui32,
-      readLatency = 1 : ui32,
-      writeLatency = 1 : ui32
-    }
+// Test that a memory that is not readLatency=1 and writeLatency=1 produces OM
+// metadata, but not Memory JSON or Configuration File metadata.
 
-  // CHECK-LABEL:  firrtl.class @MemoryMetadata
-  // CHECK:  %[[V2:.+]] = firrtl.string "memory_ext"
-  // CHECK:  %[[V3:.+]] = firrtl.path instance distinct[1]<>
-  // CHECK:  firrtl.list.create %[[V2]] : !firrtl.list<string>
-  // CHECK:  firrtl.list.create %[[V3]] : !firrtl.list<path>
-
-  // CHECK:               emit.file "metadata{{/|\\\\}}seq_mems.json" {
-  // CHECK-NEXT{LITERAL}:   sv.verbatim "[\0A {\0A \22module_name\22: \22{{0}}\22,\0A \22depth\22: 16,\0A \22width\22: 8,\0A \22masked\22: false,\0A \22read\22: 1,\0A \22write\22: 0,\0A \22readwrite\22: 1,\0A \22extra_ports\22: [],\0A \22hierarchy\22: [\0A \22{{3}}.{{4}}.memory_ext\22\0A ]\0A },\0A {\0A \22module_name\22: \22{{5}}\22,\0A \22depth\22: 20,\0A \22width\22: 5,\0A \22masked\22: false,\0A \22read\22: 1,\0A \22write\22: 1,\0A \22readwrite\22: 0,\0A \22extra_ports\22: [],\0A \22hierarchy\22: [\0A \22{{3}}.{{4}}.dumm_ext\22\0A ]\0A }\0A]"
-  // CHECK-SAME:              {symbols = [@memory_ext, @top, #hw.innerNameRef<@top::@[[DUT_SYM]]>, @DUT, #hw.innerNameRef<@DUT::@[[MEM1_SYM]]>, @dumm_ext]}
-  // CHECK-NEXT:          }
-
-  // CHECK:               emit.file "mems.conf" {
-  // CHECK-NEXT{LITERAL}:   sv.verbatim "name {{0}} depth 20 width 5 ports write\0Aname {{1}} depth 20 width 5 ports write\0Aname {{2}} depth 16 width 8 ports read,rw\0Aname {{3}} depth 20 width 5 ports write,read\0A"
-  // CHECK-SAME:              {symbols = [@head_ext, @head_0_ext, @memory_ext, @dumm_ext]}
-  // CHECK-NEXT:          }
-
-  // CHECK-LABEL:  firrtl.class @SiFive_Metadata
-  // CHECK:    %[[V0:.+]] = firrtl.path instance distinct[0]<>
-  // CHECK-NEXT:    %[[V1:.+]] = firrtl.list.create %[[V0]] : !firrtl.list<path>
-  // CHECK-NEXT:    firrtl.propassign %dutModulePath_field_1, %[[V1]] : !firrtl.list<path>
+firrtl.circuit "Foo" {
+  firrtl.module private @m() {
+    firrtl.instance m_ext @m_ext()
+  }
+  firrtl.memmodule private @m_ext() attributes {
+    dataWidth = 8 : ui32,
+    depth = 16 : ui64,
+    extraPorts = [],
+    maskBits = 1 : ui32,
+    numReadPorts = 1 : ui32,
+    numWritePorts = 0 : ui32,
+    numReadWritePorts = 0 : ui32,
+    readLatency = 42 : ui32,
+    writeLatency = 9001 : ui32
+  }
+  firrtl.module @Baz() {
+    firrtl.instance m sym @m @m()
+  }
+  firrtl.module @Bar() attributes {
+    annotations = [
+      {
+        class = "sifive.enterprise.firrtl.MarkDUTAnnotation"
+      }
+    ]
+  } {
+    firrtl.instance baz sym @baz @Baz()
+  }
+  firrtl.module @Foo() {
+    firrtl.instance bar sym @bar @Bar()
+  }
 }
+
+// CHECK-LABEL:         firrtl.module @Baz()
+// CHECK-NEXT:            firrtl.instance m
+// CHECK-SAME:              id = distinct[[[#memId:]]]<>
+
+// (1) OM Info -----------------------------------------------------------------
+// CHECK-LABEL:         firrtl.class @MemoryMetadata({{.*$}}
+// CHECK:                 %[[#memIdPath:]] = firrtl.path instance distinct[[[#memId]]]<>
+// CHECK:                 firrtl.list.create %[[#memIdPath]]
+// CHECK:                 %[[memoryObject:.+]] = firrtl.object @MemorySchema
+// CHECK:                 %[[#a:]] = firrtl.integer 9001
+// CHECK-NEXT:            %[[#writeLatency:]] = firrtl.object.subfield %[[memoryObject]][writeLatency_in]
+// CHECK-NEXT:            firrtl.propassign %[[#writeLatency]], %[[#a]]
+// CHECK-NEXT:            %[[#b:]] = firrtl.integer 42
+// CHECK-NEXT:            %[[#readLatency:]] = firrtl.object.subfield %[[memoryObject]][readLatency_in]
+// CHECK-NEXT:            firrtl.propassign %[[#readLatency]], %[[#b]]
+
+// (2) Memory JSON -------------------------------------------------------------
+// CHECK-LABEL:         emit.file "metadata{{/|\\\\}}seq_mems.json"
+// CHECK-NEXT:            sv.verbatim "[]"
+
+// (3) Configuration File ------------------------------------------------------
+// CHECK-LABEL:         emit.file "mems.conf"
+// CHECK-NEXT{LITERAL}:   sv.verbatim ""
+
+// -----
+
+// Memories that are outside the design should have empty OM hierarchies, empty
+// JSON files, and populated configuration files.
+//
+// This test is checking three "outside the design" situations:
+//
+//   1. @m1 is instantiated in the test-harness
+//   2. @m2 is instantiated under a layer in the test harness
+//   3. @m3 is instantiated under a layer in the design
+
+firrtl.circuit "Foo" {
+  firrtl.layer @A bind {}
+  firrtl.memmodule private @m1() attributes {
+    dataWidth = 8 : ui32,
+    depth = 16 : ui64,
+    extraPorts = [],
+    maskBits = 1 : ui32,
+    numReadPorts = 1 : ui32,
+    numWritePorts = 0 : ui32,
+    numReadWritePorts = 0 : ui32,
+    readLatency = 1 : ui32,
+    writeLatency = 1 : ui32
+  }
+  firrtl.memmodule private @m2() attributes {
+    dataWidth = 8 : ui32,
+    depth = 32 : ui64,
+    extraPorts = [],
+    maskBits = 1 : ui32,
+    numReadPorts = 1 : ui32,
+    numWritePorts = 0 : ui32,
+    numReadWritePorts = 0 : ui32,
+    readLatency = 1 : ui32,
+    writeLatency = 1 : ui32
+  }
+  firrtl.memmodule private @m3() attributes {
+    dataWidth = 8 : ui32,
+    depth = 64 : ui64,
+    extraPorts = [],
+    maskBits = 1 : ui32,
+    numReadPorts = 1 : ui32,
+    numWritePorts = 0 : ui32,
+    numReadWritePorts = 0 : ui32,
+    readLatency = 1 : ui32,
+    writeLatency = 1 : ui32
+  }
+  firrtl.module @Foo() {
+    firrtl.instance m1 @m1()
+    firrtl.layerblock @A {
+      firrtl.instance m2 @m2()
+    }
+    firrtl.instance bar sym @bar @Bar()
+  }
+  firrtl.module @Bar() attributes {
+    annotations = [
+      {
+        class = "sifive.enterprise.firrtl.MarkDUTAnnotation"
+      }
+    ]
+  } {
+    firrtl.layerblock @A {
+      firrtl.instance m3 @m3()
+    }
+  }
+}
+
+// (1) OM Info -----------------------------------------------------------------
+// No distinct annotations are added to memory instances.
+//
+// CHECK-LABEL:         firrtl.module @Foo(
+// CHECK-NEXT:            firrtl.instance m1
+// CHECK-NOT:               id = distinct
+// CHECK-SAME:              @m1()
+// CHECK-NEXT:            firrtl.layerblock @A {
+// CHECK-NEXT:              firrtl.instance m2
+// CHECK-NOT:                 id = distinct
+// CHECK-SAME:                @m2()
+//
+// CHECK-LABEL:         firrtl.module @Bar()
+// CHECK-NEXT:            firrtl.layerblock @A {
+// CHECK-NEXT:              firrtl.instance m3
+// CHECK-NOT:                 id = distinct
+// CHECK-SAME:                @m3()
+//
+// Use empty paths for the memories.
+//
+// CHECK-LABEL:         firrtl.class @MemoryMetadata({{.*$}}
+// CHECK:                 %[[#pathList:]] = firrtl.list.create : !firrtl.list<path>
+// CHECK:                 %[[memoryObject:.+]] = firrtl.object @MemorySchema(
+// CHECK:                 %[[#memPaths:]] = firrtl.object.subfield %[[memoryObject]][hierarchy_in]
+// CHECK-NEXT:            firrtl.propassign %[[#memPaths]], %[[#pathList]]
+//
+// CHECK:                 %[[#pathList:]] = firrtl.list.create : !firrtl.list<path>
+// CHECK:                 %[[memoryObject:.+]] = firrtl.object @MemorySchema(
+// CHECK:                 %[[#memPaths:]] = firrtl.object.subfield %[[memoryObject]][hierarchy_in]
+// CHECK-NEXT:            firrtl.propassign %[[#memPaths]], %[[#pathList]]
+//
+// CHECK:                 %[[#pathList:]] = firrtl.list.create : !firrtl.list<path>
+// CHECK:                 %[[memoryObject:.+]] = firrtl.object @MemorySchema(
+// CHECK:                 %[[#memPaths:]] = firrtl.object.subfield %[[memoryObject]][hierarchy_in]
+// CHECK-NEXT:            firrtl.propassign %[[#memPaths]], %[[#pathList]]
+
+// (2) Memory JSON -------------------------------------------------------------
+// CHECK-LABEL:         emit.file "metadata{{/|\\\\}}seq_mems.json"
+// CHECK-NEXT:            sv.verbatim "[]"
+
+// (3) Configuration File ------------------------------------------------------
+// CHECK-LABEL:         emit.file "mems.conf"
+// CHECK-NEXT:            sv.verbatim
+// CHECK-SAME{LITERAL}:    name {{0}} depth 16 width 8 ports read\0A
+// CHECK-SAME{LITERAL}:    name {{1}} depth 32 width 8 ports read\0A
+// CHECK-SAME{LITERAL}:    name {{2}} depth 64 width 8 ports read\0A
+// CHECK-SAME:             symbols = [@m1, @m2, @m3]
+
+// -----
+
+// Test that a memory that is instantiated both in the design and not in the
+// design produces the correct metadata.  Test the following combiations of in
+// and out of the design:
+//
+//   1. @m1 is testharness and design
+//   2. @m2 is layer and design
+
+firrtl.circuit "Foo" {
+  firrtl.layer @A bind {}
+  firrtl.memmodule private @m1() attributes {
+    dataWidth = 8 : ui32,
+    depth = 16 : ui64,
+    extraPorts = [],
+    maskBits = 1 : ui32,
+    numReadPorts = 1 : ui32,
+    numWritePorts = 0 : ui32,
+    numReadWritePorts = 0 : ui32,
+    readLatency = 1 : ui32,
+    writeLatency = 1 : ui32
+  }
+  firrtl.module private @m1_ext() {
+    firrtl.instance m @m1()
+  }
+  firrtl.memmodule private @m2() attributes {
+    dataWidth = 8 : ui32,
+    depth = 32 : ui64,
+    extraPorts = [],
+    maskBits = 1 : ui32,
+    numReadPorts = 1 : ui32,
+    numWritePorts = 0 : ui32,
+    numReadWritePorts = 0 : ui32,
+    readLatency = 1 : ui32,
+    writeLatency = 1 : ui32
+  }
+  firrtl.module private @m2_ext() {
+    firrtl.instance m @m2()
+  }
+  firrtl.module @Foo() {
+    firrtl.instance m1 @m1_ext()
+    firrtl.instance bar sym @bar @Bar()
+  }
+  firrtl.module @Bar() attributes {
+    annotations = [
+      {
+        class = "sifive.enterprise.firrtl.MarkDUTAnnotation"
+      }
+    ]
+  } {
+    firrtl.instance m1 sym @m1 @m1_ext()
+    firrtl.instance m2_1 sym @m2_1 @m2_ext()
+    firrtl.layerblock @A {
+      firrtl.instance m2_2 sym @m2_2 @m2_ext()
+    }
+  }
+}
+
+// (1) OM Info -----------------------------------------------------------------
+//
+// Hierarchical paths are added for the two paths in the design.
+//
+// CHECK-LABEL:         firrtl.circuit "Foo"
+// CHECK-DAG:             hw.hierpath private @[[hierPath_m1:.+]] [@Bar::@m1]
+// CHECK-DAG:             hw.hierpath private @[[hierPath_m2_1:.+]] [@Bar::@m2_1]
+//
+// Trackers are added only for instances in the design.
+//
+// CHECK-LABEL:         firrtl.module @Foo(
+// CHECK-NEXT:            firrtl.instance m1
+// CHECK-NOT:               id = distinct
+// CHECK-SAME:              @m1
+//
+// CHECK-LABEL:         firrtl.module @Bar()
+// CHECK-NEXT:            firrtl.instance m1
+// CHECK-SAME:              {circt.nonlocal = @[[hierPath_m1]], class = "circt.tracker", id = distinct[[[#m1Id:]]]<>}
+// CHECK-SAME:              @m1_ext()
+// CHECK-NEXT:            firrtl.instance m2_1
+// CHECK-SAME:              {circt.nonlocal = @[[hierPath_m2_1]], class = "circt.tracker", id = distinct[[[#m2_1Id:]]]<>}
+// CHECK-SAME:              @m2_ext()
+// CHECK-NEXT:            firrtl.layerblock @A {
+// CHECK-NEXT:              firrtl.instance m2_2
+// CHECK-NOT:                 id = distinct
+// CHECK-SAME:                @m2_ext()
+//
+// This uses an unresolvable path for the memory that is not in the design.  An
+// unresolvable path is one which references a tracker with an ID that does not
+// exist.  This relies on later passes to interpret this as "optimized away" and
+// not emit it.  This is admittedly janky and should be cleaned up---there's no
+// point in generating this and putting it in the path list if the path is
+// definitely unresolvable.
+//
+// CHECK-LABEL:         firrtl.class @MemoryMetadata({{.*$}}
+//
+// CHECK:                 %[[#memIdPath:]] = firrtl.path instance distinct[[[#m1Id]]]<>
+// CHECK:                 %[[#unresolvablePath:]] = firrtl.path reference distinct[[[#]]]<>
+// CHECK:                 %[[#pathList:]] = firrtl.list.create %[[#memIdPath]], %[[#unresolvablePath]] : !firrtl.list<path>
+// CHECK:                 %[[memoryObject:.+]] = firrtl.object @MemorySchema(
+// CHECK:                 %[[#memPaths:]] = firrtl.object.subfield %[[memoryObject]][hierarchy_in]
+// CHECK-NEXT:            firrtl.propassign %[[#memPaths]], %[[#pathList]]
+//
+// CHECK:                 %[[#unresolvablePath:]] = firrtl.path reference distinct[[[#]]]<>
+// CHECK:                 %[[#memIdPath:]] = firrtl.path instance distinct[[[#m2_1Id]]]<>
+// CHECK:                 %[[#pathList:]] = firrtl.list.create %[[#unresolvablePath]], %[[#memIdPath]] : !firrtl.list<path>
+// CHECK:                 %[[memoryObject:.+]] = firrtl.object @MemorySchema(
+// CHECK:                 %[[#memPaths:]] = firrtl.object.subfield %[[memoryObject]][hierarchy_in]
+// CHECK-NEXT:            firrtl.propassign %[[#memPaths]], %[[#pathList]]
+
+// (2) Memory JSON -------------------------------------------------------------
+// CHECK-LABEL:         emit.file "metadata{{/|\\\\}}seq_mems.json"
+// CHECK-NEXT:            sv.verbatim "[
+// CHECK-SAME:              \22hierarchy\22: [
+// CHECK-SAME{LITERAL}:       \22{{3}}.{{4}}.m\22
+// CHECK-SAME{LITERAL}:       \22{{3}}.{{6}}.m\22
+// CHECK-SAME:              ]
+// The regex `{{(@|\#)[^,]+,}}` is matching a symbol or inner name ref.
+// CHECK-SAME:              symbols = [{{(@|\#)[^,]+,}} {{(@|\#)[^,]+,}} {{(@|\#)[^,]+,}} @Bar, #hw.innerNameRef<@Bar::@m1>, {{(@|\#)[^,]+,}} #hw.innerNameRef<@Bar::@m2_1>
+
+// (3) Configuration File ------------------------------------------------------
+// CHECK-LABEL:         emit.file "mems.conf"
+// CHECK-NEXT:            sv.verbatim
+// CHECK-SAME{LITERAL}:     name {{0}} depth 16 width 8 ports read\0
+// CHECK-SAME{LITERAL}:     name {{1}} depth 32 width 8 ports read\0
+// CHECK-SAME:              symbols = [@m1, @m2]
+
+// -----
+
+// Test behavior of multiple memories.
+
+firrtl.circuit "Foo" {
+  firrtl.memmodule private @m2() attributes {
+    dataWidth = 8 : ui32,
+    depth = 32 : ui64,
+    extraPorts = [],
+    maskBits = 1 : ui32,
+    numReadPorts = 1 : ui32,
+    numWritePorts = 0 : ui32,
+    numReadWritePorts = 0 : ui32,
+    readLatency = 1 : ui32,
+    writeLatency = 1 : ui32
+  }
+  firrtl.memmodule private @m1() attributes {
+    dataWidth = 8 : ui32,
+    depth = 16 : ui64,
+    extraPorts = [],
+    maskBits = 1 : ui32,
+    numReadPorts = 0 : ui32,
+    numWritePorts = 1 : ui32,
+    numReadWritePorts = 0 : ui32,
+    readLatency = 1 : ui32,
+    writeLatency = 1 : ui32
+  }
+  firrtl.module @Bar() attributes {
+    annotations = [
+      {
+        class = "sifive.enterprise.firrtl.MarkDUTAnnotation"
+      }
+    ]
+  } {
+    firrtl.instance m sym @m1 @m1()
+    firrtl.instance m sym @m2 @m2()
+  }
+  firrtl.module @Foo() {
+    firrtl.instance bar sym @bar @Bar()
+  }
+}
+
+//------------------------------------------------------------------ (1) OM Info
+// CHECK-LABEL:         firrtl.class @MemoryMetadata({{.*$}}
+// CHECK-COUNT-2:         %{{.+}} = firrtl.object @MemorySchema(
+// CHECK-NOT:             %{{.+}} = firrtl.object @MemorySchema(
+
+//-------------------------------------------------------------- (2) Memory JSON
+// CHECK-LABEL:         emit.file "metadata{{/|\\\\}}seq_mems.json"
+// CHECK-NEXT:            sv.verbatim "[
+// CHECK-COUNT-2:           \22hierarchy\22: [
+// CHECK-NOT:               \22hierarchy\22: [
+
+//------------------------------------------------------- (3) Configuration File
+// CHECK-LABEL:         emit.file "mems.conf"
+// CHECK-NEXT:            sv.verbatim
+// CHECK-SAME{LITERAL}:     name {{0}} depth 32 width 8 ports read\0A
+// CHECK-SAME{LITERAL}:     name {{1}} depth 16 width 8 ports write\0A
+// CHECK-SAME:              symbols = [@m2, @m1]

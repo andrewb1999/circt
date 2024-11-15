@@ -70,8 +70,6 @@ struct SharedParserConstants {
         loIdentifier(StringAttr::get(context, "lo")),
         hiIdentifier(StringAttr::get(context, "hi")),
         amountIdentifier(StringAttr::get(context, "amount")),
-        fieldIndexIdentifier(StringAttr::get(context, "fieldIndex")),
-        indexIdentifier(StringAttr::get(context, "index")),
         placeholderInnerRef(
             hw::InnerRefAttr::get(StringAttr::get(context, "module"),
                                   StringAttr::get(context, "placeholder"))) {}
@@ -93,7 +91,6 @@ struct SharedParserConstants {
 
   /// Cached identifiers used in primitives.
   const StringAttr loIdentifier, hiIdentifier, amountIdentifier;
-  const StringAttr fieldIndexIdentifier, indexIdentifier;
 
   /// Cached placeholder inner-ref used until fixed up.
   const hw::InnerRefAttr placeholderInnerRef;
@@ -893,7 +890,7 @@ ParseResult FIRParser::parseType(FIRRTLType &result, const Twine &message) {
     break;
 
   case FIRToken::kw_Inst: {
-    if (requireFeature(nextFIRVersion, "Inst types"))
+    if (requireFeature(missingSpecFIRVersion, "Inst types"))
       return failure();
 
     consumeToken(FIRToken::kw_Inst);
@@ -921,7 +918,7 @@ ParseResult FIRParser::parseType(FIRRTLType &result, const Twine &message) {
   }
 
   case FIRToken::kw_AnyRef: {
-    if (requireFeature(nextFIRVersion, "AnyRef types"))
+    if (requireFeature(missingSpecFIRVersion, "AnyRef types"))
       return failure();
 
     consumeToken(FIRToken::kw_AnyRef);
@@ -1106,19 +1103,19 @@ ParseResult FIRParser::parseType(FIRRTLType &result, const Twine &message) {
     result = FIntegerType::get(getContext());
     break;
   case FIRToken::kw_Bool:
-    if (requireFeature(nextFIRVersion, "Bools"))
+    if (requireFeature(missingSpecFIRVersion, "Bools"))
       return failure();
     consumeToken(FIRToken::kw_Bool);
     result = BoolType::get(getContext());
     break;
   case FIRToken::kw_Double:
-    if (requireFeature(nextFIRVersion, "Doubles"))
+    if (requireFeature(missingSpecFIRVersion, "Doubles"))
       return failure();
     consumeToken(FIRToken::kw_Double);
     result = DoubleType::get(getContext());
     break;
   case FIRToken::kw_Path:
-    if (requireFeature(nextFIRVersion, "Paths"))
+    if (requireFeature(missingSpecFIRVersion, "Paths"))
       return failure();
     consumeToken(FIRToken::kw_Path);
     result = PathType::get(getContext());
@@ -1765,9 +1762,7 @@ private:
   ParseResult parseOptionalParams(ArrayAttr &resultParameters);
 
   template <typename subop>
-  FailureOr<Value> emitCachedSubAccess(Value base,
-                                       ArrayRef<NamedAttribute> attrs,
-                                       unsigned indexNo, SMLoc loc);
+  FailureOr<Value> emitCachedSubAccess(Value base, unsigned indexNo, SMLoc loc);
   ParseResult parseOptionalExpPostscript(Value &result,
                                          bool allowDynamic = true);
   ParseResult parsePostFixFieldId(Value &result);
@@ -1981,7 +1976,7 @@ ParseResult FIRStmtParser::parseExpImpl(Value &result, const Twine &message,
   case FIRToken::lp_integer_mul:
   case FIRToken::lp_integer_shr:
   case FIRToken::lp_integer_shl:
-    if (requireFeature({4, 0, 0}, "Integer arithmetic expressions"))
+    if (requireFeature(nextFIRVersion, "Integer arithmetic expressions"))
       return failure();
     break;
   default:
@@ -2061,7 +2056,7 @@ ParseResult FIRStmtParser::parseExpImpl(Value &result, const Twine &message,
     break;
   }
   case FIRToken::kw_Bool: {
-    if (requireFeature(nextFIRVersion, "Bools"))
+    if (requireFeature(missingSpecFIRVersion, "Bools"))
       return failure();
     locationProcessor.setLoc(getToken().getLoc());
     consumeToken(FIRToken::kw_Bool);
@@ -2082,7 +2077,7 @@ ParseResult FIRStmtParser::parseExpImpl(Value &result, const Twine &message,
     break;
   }
   case FIRToken::kw_Double: {
-    if (requireFeature(nextFIRVersion, "Doubles"))
+    if (requireFeature(missingSpecFIRVersion, "Doubles"))
       return failure();
     locationProcessor.setLoc(getToken().getLoc());
     consumeToken(FIRToken::kw_Double);
@@ -2125,12 +2120,12 @@ ParseResult FIRStmtParser::parseExpImpl(Value &result, const Twine &message,
   case FIRToken::lp_path:
     if (isLeadingStmt)
       return emitError("unexpected path() as start of statement");
-    if (requireFeature(nextFIRVersion, "paths") || parsePathExp(result))
+    if (requireFeature(missingSpecFIRVersion, "Paths") || parsePathExp(result))
       return failure();
     break;
 
   case FIRToken::lp_intrinsic:
-    if (requireFeature({4, 0, 0}, "generic intrinsics") ||
+    if (requireFeature(nextFIRVersion, "generic intrinsics") ||
         parseIntrinsicExp(result))
       return failure();
     break;
@@ -2240,8 +2235,12 @@ ParseResult FIRStmtParser::parseOptionalExpPostscript(Value &result,
 
 template <typename subop>
 FailureOr<Value>
-FIRStmtParser::emitCachedSubAccess(Value base, ArrayRef<NamedAttribute> attrs,
-                                   unsigned indexNo, SMLoc loc) {
+FIRStmtParser::emitCachedSubAccess(Value base, unsigned indexNo, SMLoc loc) {
+  // Check if we already have created this Subindex op.
+  auto &value = moduleContext.getCachedSubaccess(base, indexNo);
+  if (value)
+    return value;
+
   // Make sure the field name matches up with the input value's type and
   // compute the result type for the expression.
   auto baseType = cast<FIRRTLType>(base.getType());
@@ -2252,17 +2251,12 @@ FIRStmtParser::emitCachedSubAccess(Value base, ArrayRef<NamedAttribute> attrs,
     return failure();
   }
 
-  // Check if we already have created this Subindex op.
-  auto &value = moduleContext.getCachedSubaccess(base, indexNo);
-  if (value)
-    return value;
-
   // Create the result operation, inserting at the location of the declaration.
   // This will cache the subfield operation for further uses.
   locationProcessor.setLoc(loc);
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointAfterValue(base);
-  auto op = builder.create<subop>(resultType, base, attrs);
+  auto op = builder.create<subop>(resultType, base, indexNo);
 
   // Insert the newly created operation into the cache.
   return value = op.getResult();
@@ -2296,25 +2290,14 @@ ParseResult FIRStmtParser::parsePostFixFieldId(Value &result) {
     auto indexNo = *indexV;
 
     FailureOr<Value> subResult;
-    if (type_isa<RefType>(result.getType())) {
-      NamedAttribute attrs = {getConstants().indexIdentifier,
-                              builder.getI32IntegerAttr(indexNo)};
-      subResult = emitCachedSubAccess<RefSubOp>(result, attrs, indexNo, loc);
-    } else if (type_isa<ClassType>(type)) {
-      NamedAttribute attrs = {getConstants().indexIdentifier,
-                              builder.getI32IntegerAttr(indexNo)};
-      subResult =
-          emitCachedSubAccess<ObjectSubfieldOp>(result, attrs, indexNo, loc);
-    } else {
-      NamedAttribute attrs = {getConstants().fieldIndexIdentifier,
-                              builder.getI32IntegerAttr(indexNo)};
-      if (type_isa<BundleType>(type))
-        subResult =
-            emitCachedSubAccess<SubfieldOp>(result, attrs, indexNo, loc);
-      else
-        subResult =
-            emitCachedSubAccess<OpenSubfieldOp>(result, attrs, indexNo, loc);
-    }
+    if (type_isa<RefType>(result.getType()))
+      subResult = emitCachedSubAccess<RefSubOp>(result, indexNo, loc);
+    else if (type_isa<ClassType>(type))
+      subResult = emitCachedSubAccess<ObjectSubfieldOp>(result, indexNo, loc);
+    else if (type_isa<BundleType>(type))
+      subResult = emitCachedSubAccess<SubfieldOp>(result, indexNo, loc);
+    else
+      subResult = emitCachedSubAccess<OpenSubfieldOp>(result, indexNo, loc);
 
     if (failed(subResult))
       return failure();
@@ -2337,21 +2320,13 @@ ParseResult FIRStmtParser::parsePostFixIntSubscript(Value &result) {
   if (indexNo < 0)
     return emitError(loc, "invalid index specifier"), failure();
 
-  // Make sure the index expression is valid and compute the result type for the
-  // expression.
-  // TODO: This should ideally be folded into a `tryCreate` method on the
-  // builder (https://llvm.discourse.group/t/3504).
-  NamedAttribute attrs = {getConstants().indexIdentifier,
-                          builder.getI32IntegerAttr(indexNo)};
-
   FailureOr<Value> subResult;
   if (type_isa<RefType>(result.getType()))
-    subResult = emitCachedSubAccess<RefSubOp>(result, attrs, indexNo, loc);
+    subResult = emitCachedSubAccess<RefSubOp>(result, indexNo, loc);
   else if (type_isa<FVectorType>(result.getType()))
-    subResult = emitCachedSubAccess<SubindexOp>(result, attrs, indexNo, loc);
+    subResult = emitCachedSubAccess<SubindexOp>(result, indexNo, loc);
   else
-    subResult =
-        emitCachedSubAccess<OpenSubindexOp>(result, attrs, indexNo, loc);
+    subResult = emitCachedSubAccess<OpenSubindexOp>(result, indexNo, loc);
 
   if (failed(subResult))
     return failure();
@@ -2691,15 +2666,15 @@ ParseResult FIRStmtParser::parseSimpleStmtImpl(unsigned stmtIndent) {
     return parseRefReleaseInitial();
   case FIRToken::kw_group:
     if (requireFeature({3, 2, 0}, "optional groups") ||
-        removedFeature({4, 0, 0}, "optional groups"))
+        removedFeature(nextFIRVersion, "optional groups"))
       return failure();
     return parseLayerBlockOrGroup(stmtIndent);
   case FIRToken::kw_layerblock:
-    if (requireFeature({4, 0, 0}, "layers"))
+    if (requireFeature(nextFIRVersion, "layers"))
       return failure();
     return parseLayerBlockOrGroup(stmtIndent);
   case FIRToken::lp_intrinsic:
-    if (requireFeature({4, 0, 0}, "generic intrinsics"))
+    if (requireFeature(nextFIRVersion, "generic intrinsics"))
       return failure();
     return parseIntrinsicStmt();
   default: {
@@ -4111,7 +4086,7 @@ ParseResult FIRStmtParser::parseInstanceChoice() {
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
     return *isExpr;
 
-  if (requireFeature({4, 0, 0}, "option groups/instance choices"))
+  if (requireFeature(nextFIRVersion, "option groups/instance choices"))
     return failure();
 
   StringRef id;
@@ -4222,7 +4197,7 @@ ParseResult FIRStmtParser::parseObject() {
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
     return *isExpr;
 
-  if (requireFeature(nextFIRVersion, "object statements"))
+  if (requireFeature(missingSpecFIRVersion, "object statements"))
     return failure();
 
   StringRef id;
@@ -4843,7 +4818,7 @@ ParseResult FIRCircuitParser::parseOptionalEnabledLayers(ArrayAttr &result) {
     return success();
   }
 
-  if (requireFeature({4, 0, 0}, "modules with layers enabled"))
+  if (requireFeature(nextFIRVersion, "modules with layers enabled"))
     return failure();
 
   SmallVector<Attribute> layers;
@@ -4939,7 +4914,7 @@ ParseResult FIRCircuitParser::parseRefList(ArrayRef<PortInfo> portList,
 
   // Ref statements were removed in 4.0.0, check.
   if (getToken().is(FIRToken::kw_ref) &&
-      removedFeature({4, 0, 0}, "ref statements"))
+      removedFeature(nextFIRVersion, "ref statements"))
     return failure();
 
   // Parse the ref statements.
@@ -5080,7 +5055,7 @@ ParseResult FIRCircuitParser::parseClass(CircuitOp circuit, unsigned indent) {
   SmallVector<SMLoc> portLocs;
   LocWithInfo info(getToken().getLoc(), this);
 
-  if (requireFeature(nextFIRVersion, "classes"))
+  if (requireFeature(missingSpecFIRVersion, "classes"))
     return failure();
 
   consumeToken(FIRToken::kw_class);
@@ -5118,7 +5093,7 @@ ParseResult FIRCircuitParser::parseExtClass(CircuitOp circuit,
   SmallVector<SMLoc> portLocs;
   LocWithInfo info(getToken().getLoc(), this);
 
-  if (requireFeature(nextFIRVersion, "classes"))
+  if (requireFeature(missingSpecFIRVersion, "classes"))
     return failure();
 
   consumeToken(FIRToken::kw_extclass);
@@ -5175,7 +5150,7 @@ ParseResult FIRCircuitParser::parseExtModule(CircuitOp circuit,
   if (parseParameterList(parameters) || parseRefList(portList, internalPaths))
     return failure();
 
-  if (version >= FIRVersion{4, 0, 0}) {
+  if (version >= nextFIRVersion) {
     for (auto [pi, loc] : llvm::zip_equal(portList, portLocs)) {
       if (auto ftype = type_dyn_cast<FIRRTLType>(pi.type)) {
         if (ftype.hasUninferredWidth())
@@ -5256,12 +5231,13 @@ ParseResult FIRCircuitParser::parseModule(CircuitOp circuit, bool isPublic,
 
   // The main module is implicitly public.
   if (name == circuit.getName()) {
-    if (!isPublic && removedFeature({4, 0, 0}, "private main modules", modLoc))
+    if (!isPublic &&
+        removedFeature(nextFIRVersion, "private main modules", modLoc))
       return failure();
     isPublic = true;
   }
 
-  if (isPublic && version >= FIRVersion{4, 0, 0}) {
+  if (isPublic && version >= nextFIRVersion) {
     for (auto [pi, loc] : llvm::zip_equal(portList, portLocs)) {
       if (auto ftype = type_dyn_cast<FIRRTLType>(pi.type)) {
         if (ftype.hasUninferredWidth())
@@ -5338,7 +5314,7 @@ ParseResult FIRCircuitParser::parseToplevelDefinition(CircuitOp circuit,
     return parseClass(circuit, indent);
   case FIRToken::kw_declgroup:
     if (requireFeature({3, 2, 0}, "optional groups") ||
-        removedFeature({4, 0, 0}, "optional groups"))
+        removedFeature(nextFIRVersion, "optional groups"))
       return failure();
     return parseLayer(circuit);
   case FIRToken::kw_extclass:
@@ -5346,21 +5322,21 @@ ParseResult FIRCircuitParser::parseToplevelDefinition(CircuitOp circuit,
   case FIRToken::kw_extmodule:
     return parseExtModule(circuit, indent);
   case FIRToken::kw_formal:
-    if (requireFeature({4, 0, 0}, "inline formal tests"))
+    if (requireFeature(nextFIRVersion, "inline formal tests"))
       return failure();
     return parseFormal(circuit, indent);
   case FIRToken::kw_intmodule:
-    if (removedFeature({4, 0, 0}, "intrinsic modules"))
+    if (removedFeature(nextFIRVersion, "intrinsic modules"))
       return failure();
     return parseIntModule(circuit, indent);
   case FIRToken::kw_layer:
-    if (requireFeature({4, 0, 0}, "layers"))
+    if (requireFeature(nextFIRVersion, "layers"))
       return failure();
     return parseLayer(circuit);
   case FIRToken::kw_module:
     return parseModule(circuit, /*isPublic=*/false, indent);
   case FIRToken::kw_public:
-    if (requireFeature({4, 0, 0}, "public modules"))
+    if (requireFeature(nextFIRVersion, "public modules"))
       return failure();
     consumeToken();
     if (getToken().getKind() == FIRToken::kw_module)
@@ -5369,7 +5345,7 @@ ParseResult FIRCircuitParser::parseToplevelDefinition(CircuitOp circuit,
   case FIRToken::kw_type:
     return parseTypeDecl();
   case FIRToken::kw_option:
-    if (requireFeature({4, 0, 0}, "option groups/instance choices"))
+    if (requireFeature(nextFIRVersion, "option groups/instance choices"))
       return failure();
     return parseOptionDecl(circuit);
   default:

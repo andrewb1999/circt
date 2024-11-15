@@ -451,9 +451,20 @@ private:
     llvm::append_range(types, srcTypes);
     llvm::append_range(types, dstTypes);
 
+    // Cast floats to integer types
+    SmallVector<Type> newTypes;
+    for (auto type : types) {
+      auto newType = type;
+      if (isa<FloatType>(type)) {
+        auto bitwidth = type.getIntOrFloatBitWidth();
+        newType = rewriter.getIntegerType(bitwidth);
+      }
+      newTypes.push_back(newType);
+    }
+
     auto calyxOp =
         getState<ComponentLoweringState>().getNewLibraryOpInstance<TCalyxLibOp>(
-            rewriter, op.getLoc(), types);
+            rewriter, op.getLoc(), newTypes);
 
     auto directions = calyxOp.portDirections();
     SmallVector<Value, 4> opInputPorts;
@@ -622,6 +633,8 @@ LogicalResult BuildOpGroups::buildOpFromOperator(
   assert(potentialOperators.size() == 1 &&
          "multiple potential operators not yet supported");
 
+  auto phase = op->getParentOfType<PhaseInterface>();
+  auto isPipeline = isa<LoopSchedulePipelineStageOp>(phase);
   auto operatorName = potentialOperators.front();
   auto latency = operatorLibraryAnalysis.getOperatorLatency(operatorName);
   auto *templateOp =
@@ -633,14 +646,14 @@ LogicalResult BuildOpGroups::buildOpFromOperator(
       getState<ComponentLoweringState>().getUniqueName(templateName);
   rewriter.setInsertionPoint(compOp.getWiresOp());
   auto *clonedOp = rewriter.clone(*templateOp);
-  // clonedOp->setAttr("sym_name", rewriter.getStringAttr(uniqueName));
+  clonedOp->setAttr("sym_name", rewriter.getStringAttr(uniqueName));
   auto res =
       compOp.replaceAllSymbolUses(rewriter.getStringAttr(uniqueName), clonedOp);
   if (res.failed()) {
     op->emitError("Failed to replace all symbol uses");
     return failure();
   }
-  auto group = createStaticGroupForOp(rewriter, op, 1);
+  auto group = createStaticGroupForOp(rewriter, op, isPipeline ? 1 : latency);
 
   // Assign CE if it exists
   auto constOne = calyx::createConstant(op->getLoc(), rewriter, compOp, 1, 1);
@@ -649,13 +662,12 @@ LogicalResult BuildOpGroups::buildOpFromOperator(
   if (ceResNum.has_value()) {
     auto ce = clonedOp->getResult(ceResNum.value());
     rewriter.create<calyx::AssignOp>(op->getLoc(), ce, constOne);
-    // if (latency > 1) {
-    //   auto phase = op->getParentOfType<PhaseInterface>();
-    //   for (unsigned i = 0; i < latency - 1; ++i) {
-    //     phase = cast<PhaseInterface>(phase->getNextNode());
-    //     getState<ComponentLoweringState>().setHoldCEInPhase(ce, phase);
-    //   }
-    // }
+    if (latency > 1 && isPipeline) {
+      for (unsigned i = 0; i < latency - 1; ++i) {
+        phase = cast<PhaseInterface>(phase->getNextNode());
+        getState<ComponentLoweringState>().setHoldCEInPhase(ce, phase);
+      }
+    }
   }
 
   // Assign inputs
@@ -1259,12 +1271,27 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      arith::ConstantOp constOp) const {
   /// Move constant operations to the compOp body as hw::ConstantOp's.
-  APInt value;
-  calyx::matchConstantOp(constOp, value);
-  auto hwConstOp =
-      calyx::createConstant(constOp.getLoc(), rewriter, getComponent(),
-                            value.getBitWidth(), value.getLimitedValue());
-  rewriter.replaceAllUsesWith(constOp.getResult(), hwConstOp.getResult());
+  if (isa<IntegerType>(constOp.getValue().getType())) {
+    APInt value;
+    calyx::matchConstantOp(constOp, value);
+    auto hwConstOp =
+        calyx::createConstant(constOp.getLoc(), rewriter, getComponent(),
+                              value.getBitWidth(), value.getLimitedValue());
+    rewriter.replaceAllUsesWith(constOp.getResult(), hwConstOp.getResult());
+  } else if (isa<FloatType>(constOp.getValue().getType())) {
+    std::string name = getState<ComponentLoweringState>().getUniqueName("cst");
+    auto floatAttr = cast<FloatAttr>(constOp.getValueAttr());
+    auto intType =
+        rewriter.getIntegerType(floatAttr.getType().getIntOrFloatBitWidth());
+    auto calyxConstOp = rewriter.create<calyx::ConstantOp>(
+        constOp.getLoc(), name, floatAttr, intType);
+    calyxConstOp->moveAfter(getComponent().getBodyBlock(),
+                            getComponent().getBodyBlock()->begin());
+    rewriter.replaceAllUsesWith(constOp, calyxConstOp.getOut());
+  } else {
+    constOp.emitError("Unsupported constant type ")
+        << constOp.getValue().getType();
+  }
 
   return success();
 }

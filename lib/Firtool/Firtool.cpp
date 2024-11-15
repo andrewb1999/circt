@@ -59,15 +59,14 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
 
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createInjectDUTHierarchyPass());
 
+  if (!opt.shouldDisableOptimization())
+    pm.nest<firrtl::CircuitOp>().nestAny().addPass(mlir::createCSEPass());
+
   pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
       firrtl::createPassiveWiresPass());
 
   pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
       firrtl::createDropNamesPass(opt.getPreserveMode()));
-
-  if (!opt.shouldDisableOptimization())
-    pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
-        mlir::createCSEPass());
 
   pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
       firrtl::createLowerCHIRRTLPass());
@@ -135,6 +134,8 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
   if (opt.shouldConvertProbesToSignals())
     pm.nest<firrtl::CircuitOp>().addPass(firrtl::createProbesToSignalsPass());
 
+  pm.nest<firrtl::CircuitOp>().addPass(firrtl::createInlinerPass());
+
   pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
       firrtl::createLayerMergePass());
 
@@ -143,8 +144,6 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
   else
     pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
         firrtl::createLayerSinkPass());
-
-  pm.nest<firrtl::CircuitOp>().addPass(firrtl::createInlinerPass());
 
   // Preset the random initialization parameters for each module. The current
   // implementation assumes it can run at a time where every register is
@@ -177,8 +176,6 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
   if (!opt.shouldDisableOptimization())
     pm.nest<firrtl::CircuitOp>().addPass(firrtl::createIMConstPropPass());
 
-  pm.nest<firrtl::CircuitOp>().addPass(firrtl::createLowerLayersPass());
-
   pm.addNestedPass<firrtl::CircuitOp>(firrtl::createAddSeqMemPortsPass());
 
   pm.addPass(firrtl::createCreateSiFiveMetadataPass(
@@ -186,6 +183,8 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
       opt.getReplaceSequentialMemoriesFile()));
 
   pm.addNestedPass<firrtl::CircuitOp>(firrtl::createExtractInstancesPass());
+
+  pm.nest<firrtl::CircuitOp>().addPass(firrtl::createLowerLayersPass());
 
   // Run passes to resolve Grand Central features.  This should run before
   // BlackBoxReader because Grand Central needs to inform BlackBoxReader where
@@ -212,6 +211,8 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
     // Re-run IMConstProp to propagate constants produced by register
     // optimizations.
     pm.nest<firrtl::CircuitOp>().addPass(firrtl::createIMConstPropPass());
+    pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
+        createSimpleCanonicalizerPass());
     pm.addPass(firrtl::createIMDeadCodeElimPass());
   }
 

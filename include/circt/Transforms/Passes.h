@@ -15,6 +15,7 @@
 
 #include "circt/Dialect/HW/HWOpInterfaces.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -49,6 +50,8 @@ std::unique_ptr<mlir::Pass> createIndexRemovalPass();
 std::unique_ptr<mlir::Pass> createMaximizeSSAPass();
 std::unique_ptr<mlir::Pass> createInsertMergeBlocksPass();
 std::unique_ptr<mlir::Pass> createPrintOpCountPass();
+std::unique_ptr<mlir::Pass>
+createMemoryBankingPass(std::optional<unsigned> bankingFactor = std::nullopt);
 
 //===----------------------------------------------------------------------===//
 // Utility functions.

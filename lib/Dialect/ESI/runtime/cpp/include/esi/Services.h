@@ -211,6 +211,9 @@ public:
     bool useLargePages = false;
   };
 
+  /// In cases where necessary, enable host memory services.
+  virtual void start() {}
+
   /// Allocate a region of host memory in accelerator accessible address space.
   virtual std::unique_ptr<HostMemRegion> allocate(std::size_t size,
                                                   Options opts) const = 0;
@@ -288,12 +291,23 @@ public:
              const std::map<std::string, ChannelPort &> &channels);
 
   public:
+    static Callback *get(AcceleratorConnection &acc, AppID id,
+                         WriteChannelPort &result, ReadChannelPort &arg);
+
     /// Connect a callback to code which will be executed when the accelerator
     /// invokes the callback. The 'quick' flag indicates that the callback is
     /// sufficiently fast that it could be called in the same thread as the
     /// port callback.
     void connect(std::function<MessageData(const MessageData &)> callback,
                  bool quick = false);
+
+    virtual std::optional<std::string> toString() const override {
+      const esi::Type *argType =
+          dynamic_cast<const ChannelType *>(arg.getType())->getInner();
+      const esi::Type *resultType =
+          dynamic_cast<const ChannelType *>(result.getType())->getInner();
+      return "callback " + resultType->getID() + "(" + argType->getID() + ")";
+    }
 
   private:
     ReadChannelPort &arg;

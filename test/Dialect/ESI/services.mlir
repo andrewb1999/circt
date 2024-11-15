@@ -1,12 +1,13 @@
 // RUN: circt-opt --esi-connect-services --canonicalize %s | circt-opt | FileCheck %s --check-prefix=CONN
 // RUN: circt-opt --esi-connect-services --lower-esi-bundles %s
 
+!sendAny = !esi.bundle<[!esi.channel<!esi.any> from "send"]>
 !sendI8 = !esi.bundle<[!esi.channel<i8> from "send"]>
 !recvI8 = !esi.bundle<[!esi.channel<i8> to "recv"]>
 !reqResp = !esi.bundle<[!esi.channel<i16> to "req", !esi.channel<i8> from "resp"]>
 
 esi.service.decl @HostComms {
-  esi.service.port @Send : !sendI8
+  esi.service.port @Send : !sendAny
   esi.service.port @Recv : !recvI8
   esi.service.port @ReqResp : !reqResp
 }
@@ -225,4 +226,26 @@ hw.module @MMIOManifest(in %clk: !seq.clock, in %rst: i1) {
   %reqRW = esi.service.req <@mmio::@read_write> (#esi.appid<"manifestRW">) : !mmioRWReq
   %dataChannel, %dataChannelReady = esi.wrap.vr %data, %valid: i64
   %cmdChannel = esi.bundle.unpack %dataChannel from %reqRW : !mmioRWReq
+}
+
+// CONN-LABEL:  esi.service.std.hostmem @hostmem
+// CONN-LABEL:  hw.module @HostmemRW(in %clk : !seq.clock, in %rst : i1, in %write : !esi.channel<!hw.struct<address: ui64, tag: ui8, data: i128>>, in %readAddress : !esi.channel<!hw.struct<address: ui64, tag: ui8>>, in %hostmemWrite : !esi.bundle<[!esi.channel<!hw.struct<address: ui64, tag: ui8, data: i128>> from "req", !esi.channel<ui8> to "ackTag"]>, in %hostmemRead : !esi.bundle<[!esi.channel<!hw.struct<address: ui64, tag: ui8>> from "req", !esi.channel<!hw.struct<tag: ui8, data: i64>> to "resp"]>, out readData : !esi.channel<!hw.struct<tag: ui8, data: i64>>, out writeDone : !esi.channel<ui8>) {
+// CONN-NEXT:     esi.manifest.req #esi.appid<"hostmemWrite">, <@hostmem::@write> std "esi.service.std.hostmem", !esi.bundle<[!esi.channel<!hw.struct<address: ui64, tag: ui8, data: i128>> from "req", !esi.channel<ui8> to "ackTag"]>
+// CONN-NEXT:     %ackTag = esi.bundle.unpack %write from %hostmemWrite : !esi.bundle<[!esi.channel<!hw.struct<address: ui64, tag: ui8, data: i128>> from "req", !esi.channel<ui8> to "ackTag"]>
+// CONN-NEXT:     esi.manifest.req #esi.appid<"hostmemRead">, <@hostmem::@read> std "esi.service.std.hostmem", !esi.bundle<[!esi.channel<!hw.struct<address: ui64, tag: ui8>> from "req", !esi.channel<!hw.struct<tag: ui8, data: i64>> to "resp"]>
+// CONN-NEXT:     %resp = esi.bundle.unpack %readAddress from %hostmemRead : !esi.bundle<[!esi.channel<!hw.struct<address: ui64, tag: ui8>> from "req", !esi.channel<!hw.struct<tag: ui8, data: i64>> to "resp"]>
+// CONN-NEXT:     hw.output %resp, %ackTag : !esi.channel<!hw.struct<tag: ui8, data: i64>>, !esi.channel<ui8>
+
+esi.service.std.hostmem @hostmem
+!hostmemReadReq = !esi.bundle<[!esi.channel<!hw.struct<address: ui64, tag: ui8>> from "req", !esi.channel<!hw.struct<tag: ui8, data: i64>> to "resp"]>
+!hostmemWriteReq = !esi.bundle<[!esi.channel<!hw.struct<address: ui64, tag: ui8, data: i128>> from "req", !esi.channel<ui8> to "ackTag"]>
+
+hw.module @HostmemRW(in %clk : !seq.clock, in %rst : i1, in %write : !esi.channel<!hw.struct<address: ui64, tag: ui8, data: i128>>, in %readAddress : !esi.channel<!hw.struct<address: ui64, tag: ui8>>, out readData : !esi.channel<!hw.struct<tag: ui8, data: i64>>, out writeDone : !esi.channel<ui8>) {
+  %writeBundle = esi.service.req <@hostmem::@write> (#esi.appid<"hostmemWrite">) : !hostmemWriteReq
+  %ackTag = esi.bundle.unpack %write from %writeBundle : !hostmemWriteReq
+
+  %readBundle = esi.service.req <@hostmem::@read> (#esi.appid<"hostmemRead">) : !hostmemReadReq
+  %readData = esi.bundle.unpack %readAddress from %readBundle : !hostmemReadReq
+
+  hw.output %readData, %ackTag: !esi.channel<!hw.struct<tag: ui8, data: i64>>, !esi.channel<ui8>
 }

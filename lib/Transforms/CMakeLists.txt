@@ -9,6 +9,7 @@ add_circt_library(CIRCTTransforms
   ArithStrengthReduction.cpp
   IndexRemoval.cpp
   PrintOpCount.cpp
+  MemoryBanking.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Transforms
@@ -24,6 +25,8 @@ add_circt_library(CIRCTTransforms
   MLIRMemRefDialect
   MLIRSupport
   MLIRTransforms
+  MLIRAffineDialect
+  MLIRSCFDialect
 
   DEPENDS
   CIRCTTransformsPassIncGen
