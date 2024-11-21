@@ -68,6 +68,11 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
 
     auto clockResultNum = cast<OpResult>(yieldOp.getClock()).getResultNumber();
     operatorStruct.clock = clockResultNum;
+
+    auto resetResultNum =
+        cast<OpResult>(yieldOp.getReset()).getResultNumber();
+    operatorStruct.reset = resetResultNum;
+
     auto ceResultNum =
         cast<OpResult>(yieldOp.getClockEnable()).getResultNumber();
     operatorStruct.ce = ceResultNum;
