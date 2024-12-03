@@ -45,7 +45,6 @@
 #endif
 #include "circt/Dialect/SMT/SMTDialect.h"
 #include "circt/Dialect/SSP/SSPDialect.h"
-#include "circt/Dialect/STG/STG.h"
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Sim/SimDialect.h"
