@@ -27,7 +27,7 @@
 #include "circt/Dialect/HLS/HLSPasses.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/Handshake/HandshakePasses.h"
-#include "circt/Dialect/Ibis/IbisPasses.h"
+#include "circt/Dialect/Kanagawa/KanagawaPasses.h"
 #include "circt/Dialect/LLHD/Transforms/Passes.h"
 #include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h"
 #include "circt/Dialect/MSFT/MSFTPasses.h"
@@ -75,7 +75,7 @@ inline void registerAllPasses() {
   sv::registerPasses();
   handshake::registerPasses();
   hls::registerPasses();
-  ibis::registerPasses();
+  kanagawa::registerPasses();
   hw::registerPasses();
   loopschedule::registerPasses();
   pipeline::registerPasses();

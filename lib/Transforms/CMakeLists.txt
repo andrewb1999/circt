@@ -10,6 +10,7 @@ add_circt_library(CIRCTTransforms
   IndexRemoval.cpp
   PrintOpCount.cpp
   MemoryBanking.cpp
+  IndexSwitchToIf.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Transforms

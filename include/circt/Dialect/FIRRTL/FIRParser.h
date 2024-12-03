@@ -47,8 +47,7 @@ struct FIRParserOptions {
   InfoLocHandling infoLocatorHandling = InfoLocHandling::PreferInfo;
 
   /// The number of annotation files that were specified on the command line.
-  /// This, along with numOMIRFiles provides structure to the buffers in the
-  /// source manager.
+  /// This, provides structure to the buffers in the source manager.
   unsigned numAnnotationFiles;
   bool scalarizePublicModules = false;
   bool scalarizeInternalModules = false;
@@ -124,7 +123,7 @@ constexpr FIRVersion minimumFIRVersion(2, 0, 0);
 /// new version of the spec is released, all uses of `nextFIRVersion` in the
 /// parser are replaced with the concrete version `{x, y, z}`, and this
 /// declaration here is bumped to the next probable version number.
-constexpr FIRVersion nextFIRVersion(4, 0, 0);
+constexpr FIRVersion nextFIRVersion(4, 1, 0);
 
 /// A marker for parser features that are currently missing from the spec.
 ///

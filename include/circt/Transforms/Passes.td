@@ -53,14 +53,6 @@ def StripDebugInfoWithPred : Pass<"strip-debuginfo-with-pred", "::mlir::ModuleOp
            "intended to be used for testing."> ];
 }
 
-def IndexSwitchToIf : Pass<"index-switch-to-if", "::mlir::func::FuncOp"> {
-  let summary = "Lower scf index_switch ops to a series of scf if ops";
-  let description = [{Lower scf index_switch ops to a series of scf if ops}];
-  let constructor = "circt::createIndexSwitchToIfPass()";
-  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::arith::ArithDialect",
-                           "mlir::func::FuncDialect"];
-}
-
 def IfOpHoisting : Pass<"if-op-hoisting", "::mlir::func::FuncOp"> {
   let summary = "Hoist scf IfOps to arith.select when possible";
   let description = [{Hoist scf IfOps to arith.select when possible}];
@@ -162,6 +154,37 @@ def MemoryBanking : Pass<"memory-banking", "::mlir::func::FuncOp"> {
            "Use this banking factor for all memories being partitioned">
   ];
   let dependentDialects = ["mlir::memref::MemRefDialect, mlir::scf::SCFDialect, mlir::affine::AffineDialect"];
+}
+
+def IndexSwitchToIf : Pass<"switch-to-if", "::mlir::func::FuncOp"> {
+  let summary = "Index switch to if";
+  let description = [{
+      Transform `scf.index_switch` to a series of `scf.if` operations.
+      This is necessary for dialects that don't support switch statements, e.g., Calyx.
+      An example:
+      ```
+        %0 = scf.index_switch %cond -> i32
+          case 0 { ... }
+          case 1 { ... }
+          ...
+
+        =>
+
+        %c0 = arith.cmpi eq %0, 0
+        %c1 = arith.cmpi eq %0, 1
+        %0 = scf.if %c0 {
+         ...
+        } else {
+          %1 = scf.if %c1 {
+            ...
+          } else {
+            ...
+          }
+        }
+      ```
+  }];
+  let constructor = "circt::createIndexSwitchToIfPass()";
+  let dependentDialects = ["mlir::scf::SCFDialect"];
 }
 
 #endif // CIRCT_TRANSFORMS_PASSES
