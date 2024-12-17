@@ -45,7 +45,7 @@ LogicalResult unrollSubLoops(scf::ForOp &forOp) {
     assert(lbCst >= 0 && ubCst >= 0 && stepCst >= 0 &&
            "expected positive loop bounds and step");
     int64_t tripCount = llvm::divideCeilSigned(ubCst - lbCst, stepCst);
-    if (loopUnrollByFactor(op, tripCount).failed())
+    if (failed(loopUnrollByFactor(op, tripCount)))
       return WalkResult::interrupt();
     return WalkResult::advance();
   });
