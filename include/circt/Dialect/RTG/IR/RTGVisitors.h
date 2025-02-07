@@ -41,8 +41,11 @@ public:
             FixedRegisterOp, VirtualRegisterOp,
             // RTG tests
             TestOp, TargetOp, YieldOp,
+            // Integers
+            RandomNumberInRangeOp,
             // Sequences
-            SequenceOp, SequenceClosureOp, InvokeSequenceOp,
+            SequenceOp, GetSequenceOp, SubstituteSequenceOp,
+            RandomizeSequenceOp, EmbedSequenceOp,
             // Sets
             SetCreateOp, SetSelectRandomOp, SetDifferenceOp, SetUnionOp,
             SetSizeOp>([&](auto expr) -> ResultType {
@@ -87,8 +90,11 @@ public:
   }
 
   HANDLE(SequenceOp, Unhandled);
-  HANDLE(SequenceClosureOp, Unhandled);
-  HANDLE(InvokeSequenceOp, Unhandled);
+  HANDLE(GetSequenceOp, Unhandled);
+  HANDLE(SubstituteSequenceOp, Unhandled);
+  HANDLE(RandomizeSequenceOp, Unhandled);
+  HANDLE(EmbedSequenceOp, Unhandled);
+  HANDLE(RandomNumberInRangeOp, Unhandled);
   HANDLE(SetCreateOp, Unhandled);
   HANDLE(SetSelectRandomOp, Unhandled);
   HANDLE(SetDifferenceOp, Unhandled);

@@ -26,8 +26,25 @@ void circt::python::populateDialectRTGSubmodule(nb::module_ &m) {
   mlir_type_subclass(m, "SequenceType", rtgTypeIsASequence)
       .def_classmethod(
           "get",
+          [](nb::object cls, std::vector<MlirType> &elementTypes,
+             MlirContext ctxt) {
+            return cls(rtgSequenceTypeGet(ctxt, elementTypes.size(),
+                                          elementTypes.data()));
+          },
+          nb::arg("self"), nb::arg("elementTypes") = std::vector<MlirType>(),
+          nb::arg("ctxt") = nullptr)
+      .def_property_readonly(
+          "num_elements",
+          [](MlirType self) { return rtgSequenceTypeGetNumElements(self); })
+      .def("get_element", [](MlirType self, unsigned i) {
+        return rtgSequenceTypeGetElement(self, i);
+      });
+
+  mlir_type_subclass(m, "RandomizedSequenceType", rtgTypeIsARandomizedSequence)
+      .def_classmethod(
+          "get",
           [](nb::object cls, MlirContext ctxt) {
-            return cls(rtgSequenceTypeGet(ctxt));
+            return cls(rtgRandomizedSequenceTypeGet(ctxt));
           },
           nb::arg("self"), nb::arg("ctxt") = nullptr);
 
@@ -72,4 +89,22 @@ void circt::python::populateDialectRTGSubmodule(nb::module_ &m) {
           nb::arg("self"), nb::arg("ctxt") = nullptr,
           nb::arg("entries") =
               std::vector<std::pair<MlirAttribute, MlirType>>());
+
+  nb::enum_<RTGLabelVisibility>(m, "LabelVisibility")
+      .value("LOCAL", RTG_LABEL_VISIBILITY_LOCAL)
+      .value("GLOBAL", RTG_LABEL_VISIBILITY_GLOBAL)
+      .value("EXTERNAL", RTG_LABEL_VISIBILITY_EXTERNAL)
+      .export_values();
+
+  mlir_attribute_subclass(m, "LabelVisibilityAttr",
+                          rtgAttrIsALabelVisibilityAttr)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, RTGLabelVisibility visibility, MlirContext ctxt) {
+            return cls(rtgLabelVisibilityAttrGet(ctxt, visibility));
+          },
+          nb::arg("self"), nb::arg("visibility"), nb::arg("ctxt") = nullptr)
+      .def_property_readonly("value", [](MlirAttribute self) {
+        return rtgLabelVisibilityAttrGetValue(self);
+      });
 }

@@ -41,12 +41,11 @@ with Context() as ctx, Location.unknown():
   circt.register_dialects(ctx)
   m = Module.create()
   with InsertionPoint(m.body):
-    seq = rtg.SequenceOp('seq')
     setTy = rtg.SetType.get(rtg.SequenceType.get())
+    seq = rtg.SequenceOp('seq', TypeAttr.get(rtg.SequenceType.get([setTy])))
     seqBlock = Block.create_at_start(seq.bodyRegion, [setTy])
 
-  # CHECK: rtg.sequence @seq {
-  # CHECK: ^bb{{.*}}(%{{.*}}: !rtg.set<!rtg.sequence>):
+  # CHECK: rtg.sequence @seq(%{{.*}}: !rtg.set<!rtg.sequence>) {
   # CHECK: }
   print(m)
 
@@ -54,16 +53,18 @@ with Context() as ctx, Location.unknown():
   circt.register_dialects(ctx)
   m = Module.create()
   with InsertionPoint(m.body):
-    seq = rtg.SequenceOp('sequence_name')
+    seq = rtg.SequenceOp('sequence_name', TypeAttr.get(rtg.SequenceType.get()))
     Block.create_at_start(seq.bodyRegion, [])
 
     test = rtg.TestOp('test_name', TypeAttr.get(rtg.DictType.get()))
     block = Block.create_at_start(test.bodyRegion, [])
     with InsertionPoint(block):
-      seq_closure = rtg.SequenceClosureOp('sequence_name', [])
+      seq_get = rtg.GetSequenceOp(rtg.SequenceType.get(), 'sequence_name')
+      rtg.RandomizeSequenceOp(seq_get)
 
   # CHECK: rtg.test @test_name : !rtg.dict<> {
-  # CHECK-NEXT:   rtg.sequence_closure
+  # CHECK-NEXT:   [[SEQ:%.+]] = rtg.get_sequence @sequence_name
+  # CHECK-NEXT:   rtg.randomize_sequence [[SEQ]]
   # CHECK-NEXT: }
   print(m)
 
@@ -88,11 +89,19 @@ with Context() as ctx, Location.unknown():
     labelTy = rtg.LabelType.get()
     setTy = rtg.SetType.get(indexTy)
     bagTy = rtg.BagType.get(indexTy)
-    seq = rtg.SequenceOp('seq')
-    Block.create_at_start(seq.bodyRegion, [sequenceTy, labelTy, setTy, bagTy])
+    ireg = rtgtest.IntegerRegisterType.get()
+    randomizedSequenceTy = rtg.RandomizedSequenceType.get()
+    seq = rtg.SequenceOp(
+        'seq',
+        TypeAttr.get(
+            rtg.SequenceType.get(
+                [sequenceTy, labelTy, setTy, bagTy, ireg,
+                 randomizedSequenceTy])))
+    Block.create_at_start(
+        seq.bodyRegion,
+        [sequenceTy, labelTy, setTy, bagTy, ireg, randomizedSequenceTy])
 
-  # CHECK: rtg.sequence @seq
-  # CHECK: (%{{.*}}: !rtg.sequence, %{{.*}}: !rtg.label, %{{.*}}: !rtg.set<index>, %{{.*}}: !rtg.bag<index>):
+  # CHECK: rtg.sequence @seq(%{{.*}}: !rtg.sequence, %{{.*}}: !rtg.label, %{{.*}}: !rtg.set<index>, %{{.*}}: !rtg.bag<index>, %{{.*}}: !rtgtest.ireg, %{{.*}}: !rtg.randomized_sequence)
   print(m)
 
 with Context() as ctx, Location.unknown():
@@ -164,4 +173,38 @@ with Context() as ctx, Location.unknown():
     # CHECK: rtg.fixed_reg #rtgtest.t6
     rtg.FixedRegisterOp(rtgtest.RegT6Attr.get())
 
+  print(m)
+
+with Context() as ctx, Location.unknown():
+  circt.register_dialects(ctx)
+  m = Module.create()
+  with InsertionPoint(m.body):
+    # CHECK: rtgtest.immediate #rtgtest.imm5<3> : !rtgtest.imm5
+    rtgtest.ImmediateOp(rtgtest.Imm5Attr.get(3))
+    # CHECK: rtgtest.immediate #rtgtest.imm12<3> : !rtgtest.imm12
+    rtgtest.ImmediateOp(rtgtest.Imm12Attr.get(3))
+    # CHECK: rtgtest.immediate #rtgtest.imm13<3> : !rtgtest.imm13
+    rtgtest.ImmediateOp(rtgtest.Imm13Attr.get(3))
+    # CHECK: rtgtest.immediate #rtgtest.imm21<3> : !rtgtest.imm21
+    rtgtest.ImmediateOp(rtgtest.Imm21Attr.get(3))
+    # CHECK: rtgtest.immediate #rtgtest.imm32<3> : !rtgtest.imm32
+    rtgtest.ImmediateOp(rtgtest.Imm32Attr.get(3))
+
+  print(m)
+
+with Context() as ctx, Location.unknown():
+  circt.register_dialects(ctx)
+  m = Module.create()
+  with InsertionPoint(m.body):
+    seq = rtg.SequenceOp('seq', TypeAttr.get(rtg.SequenceType.get([])))
+    block = Block.create_at_start(seq.bodyRegion, [])
+    with InsertionPoint(block):
+      l = rtg.label_decl("label", [])
+      visibility = rtg.LabelVisibilityAttr.get(rtg.GLOBAL)
+      rtg.label(visibility, l)
+      assert visibility.value == rtg.GLOBAL
+
+  # CHECK: rtg.sequence @seq
+  # CHECK: rtg.label_decl "label"
+  # CHECK: rtg.label global {{%.+}}
   print(m)

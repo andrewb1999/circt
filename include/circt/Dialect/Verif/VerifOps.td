@@ -10,6 +10,7 @@
 #define CIRCT_DIALECT_VERIF_VERIFOPS_TD
 
 include "circt/Dialect/Verif/VerifDialect.td"
+include "circt/Dialect/Verif/VerifOpInterfaces.td"
 include "circt/Dialect/LTL/LTLDialect.td"
 include "circt/Dialect/LTL/LTLTypes.td"
 include "circt/Dialect/HW/HWTypes.td"
@@ -346,13 +347,14 @@ def FormalOp : VerifOp<"formal", [
 }
 
 def SymbolicValueOp : VerifOp<"symbolic_value", [
-  HasParent<"verif::FormalOp">,
+  ParentOneOf<["verif::FormalOp", "hw::HWModuleOp"]>,
 ]>{
   let summary = "Create a symbolic value for formal verification";
   let description = [{
     This operation creates a new symbolic value that can be used to formally
     verify designs. Verification tools will try to find concrete assignments for
-    symbolic values that violate asserts or make covers true.
+    symbolic values that violate asserts or make covers true. This value is not
+    fixed - the value taken can vary arbitrarily between timesteps.
   }];
   let results = (outs AnyType:$result);
   let assemblyFormat = "attr-dict `:` type($result)";
@@ -403,19 +405,17 @@ def ContractOp : VerifOp<"contract", [
 }
 
 class RequireLikeOp<string mnemonic> : VerifOp<mnemonic, [
-  AttrSizedOperandSegments,
   HasParent<"verif::ContractOp">,
+  DeclareOpInterfaceMethods<RequireLike>
 ]> {
   let arguments = (ins
     LTLAnyPropertyType:$property,
-    Optional<ClockType>:$clock,
     Optional<I1>:$enable,
     OptionalAttr<StrAttr>:$label
   );
   let assemblyFormat = [{
     $property
     (`if` $enable^)?
-    (`clock` $clock^)?
     (`label` $label^)?
     attr-dict `:` type($property)
   }];

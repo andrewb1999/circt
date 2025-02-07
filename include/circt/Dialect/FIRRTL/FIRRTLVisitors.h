@@ -242,7 +242,8 @@ public:
             PropAssignOp, RefForceOp, RefForceInitialOp, RefReleaseOp,
             RefReleaseInitialOp, FPGAProbeIntrinsicOp, VerifAssertIntrinsicOp,
             VerifAssumeIntrinsicOp, UnclockedAssumeIntrinsicOp,
-            VerifCoverIntrinsicOp, LayerBlockOp, MatchOp, ViewIntrinsicOp>(
+            VerifCoverIntrinsicOp, VerifRequireIntrinsicOp,
+            VerifEnsureIntrinsicOp, LayerBlockOp, MatchOp, ViewIntrinsicOp>(
             [&](auto opNode) -> ResultType {
               return thisCast->visitStmt(opNode, args...);
             })
@@ -289,6 +290,8 @@ public:
   HANDLE(VerifAssertIntrinsicOp);
   HANDLE(VerifAssumeIntrinsicOp);
   HANDLE(VerifCoverIntrinsicOp);
+  HANDLE(VerifRequireIntrinsicOp);
+  HANDLE(VerifEnsureIntrinsicOp);
   HANDLE(UnclockedAssumeIntrinsicOp);
   HANDLE(LayerBlockOp);
   HANDLE(MatchOp);
@@ -306,7 +309,7 @@ public:
     auto *thisCast = static_cast<ConcreteType *>(this);
     return TypeSwitch<Operation *, ResultType>(op)
         .template Case<InstanceOp, InstanceChoiceOp, ObjectOp, MemOp, NodeOp,
-                       RegOp, RegResetOp, WireOp, VerbatimWireOp>(
+                       RegOp, RegResetOp, WireOp, VerbatimWireOp, ContractOp>(
             [&](auto opNode) -> ResultType {
               return thisCast->visitDecl(opNode, args...);
             })
@@ -341,6 +344,7 @@ public:
   HANDLE(RegResetOp);
   HANDLE(WireOp);
   HANDLE(VerbatimWireOp);
+  HANDLE(ContractOp);
 #undef HANDLE
 };
 

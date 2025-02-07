@@ -101,6 +101,11 @@ void registerCallbacks(AcceleratorConnection *conn, Accelerator *accel) {
             return MessageData();
           },
           true);
+    else
+      std::cerr << "PrintfExample port is not a CallService::Callback"
+                << std::endl;
+  } else {
+    std::cerr << "No PrintfExample port found" << std::endl;
   }
 }
 
@@ -150,19 +155,56 @@ void dmaTest(Accelerator *acc, esi::services::HostMem::HostMemRegion &region,
 
   // Initiate a test write.
   if (write) {
-    auto *writeMem = acc->getPorts()
-                         .at(AppID("WriteMem"))
-                         .getAs<services::MMIO::MMIORegion>();
-    *dataPtr = 0;
-    writeMem->write(0, (uint64_t)dataPtr);
+    assert(width % 8 == 0);
+    auto check = [&](bool print) {
+      bool ret = true;
+      for (size_t i = 0; i < 8; ++i) {
+        if (print)
+          std::cout << "dataPtr[" << i << "] = 0x" << esi::toHex(dataPtr[i])
+                    << std::endl;
+        if (i < (width + 63) / 64 && dataPtr[i] == 0xFFFFFFFFFFFFFFFFull)
+          ret = false;
+      }
+      return ret;
+    };
+
+    auto writeMemChildIter = acc->getChildren().find(AppID("writemem", width));
+    if (writeMemChildIter == acc->getChildren().end())
+      throw std::runtime_error("DMA test failed. No writemem child found");
+    auto &writeMemPorts = writeMemChildIter->second->getPorts();
+    auto writeMemPortIter = writeMemPorts.find(AppID("WriteMem"));
+    if (writeMemPortIter == writeMemPorts.end())
+      throw std::runtime_error("DMA test failed. No WriteMem port found");
+    auto *writeMem =
+        writeMemPortIter->second.getAs<services::MMIO::MMIORegion>();
+    if (!writeMem)
+      throw std::runtime_error("DMA test failed. WriteMem port is not MMIO");
+
+    for (size_t i = 0, e = 8; i < e; ++i)
+      dataPtr[i] = 0xFFFFFFFFFFFFFFFFull;
+    region.flush();
+
+    // Command the accelerator to write to 'devicePtr', the pointer which the
+    // device should use for 'dataPtr'.
+    writeMem->write(0, reinterpret_cast<uint64_t>(devicePtr));
     // Wait for the accelerator to write. Timeout and fail after 10ms.
     for (int i = 0; i < 100; ++i) {
-      if (*dataPtr != 0)
+      if (check(false))
         break;
       std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
-    if (*dataPtr == 0)
+    if (!check(true))
       throw std::runtime_error("DMA write test failed");
+
+    // Check that the accelerator didn't write too far.
+    size_t widthInBytes = width / 8;
+    uint8_t *dataPtr8 = reinterpret_cast<uint8_t *>(region.getPtr());
+    for (size_t i = widthInBytes; i < 64; ++i) {
+      std::cout << "endcheck dataPtr8[" << i << "] = 0x"
+                << esi::toHex(dataPtr8[i]) << std::endl;
+      if (dataPtr8[i] != 0xFF)
+        throw std::runtime_error("DMA write test failed -- write went too far");
+    }
   }
 }
 

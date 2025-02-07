@@ -32,6 +32,47 @@ MlirType rtgtestCPUTypeGet(MlirContext ctxt) {
   return wrap(CPUType::get(unwrap(ctxt)));
 }
 
+bool rtgtestTypeIsAIntegerRegister(MlirType type) {
+  return isa<IntegerRegisterType>(unwrap(type));
+}
+
+MlirType rtgtestIntegerRegisterTypeGet(MlirContext ctxt) {
+  return wrap(IntegerRegisterType::get(unwrap(ctxt)));
+}
+
+// Immediates.
+//===----------------------------------------------------------------------===//
+
+bool rtgtestTypeIsAImm5(MlirType type) { return isa<Imm5Type>(unwrap(type)); }
+
+MlirType rtgtestImm5TypeGet(MlirContext ctxt) {
+  return wrap(Imm5Type::get(unwrap(ctxt)));
+}
+
+bool rtgtestTypeIsAImm12(MlirType type) { return isa<Imm12Type>(unwrap(type)); }
+
+MlirType rtgtestImm12TypeGet(MlirContext ctxt) {
+  return wrap(Imm12Type::get(unwrap(ctxt)));
+}
+
+bool rtgtestTypeIsAImm13(MlirType type) { return isa<Imm13Type>(unwrap(type)); }
+
+MlirType rtgtestImm13TypeGet(MlirContext ctxt) {
+  return wrap(Imm13Type::get(unwrap(ctxt)));
+}
+
+bool rtgtestTypeIsAImm21(MlirType type) { return isa<Imm21Type>(unwrap(type)); }
+
+MlirType rtgtestImm21TypeGet(MlirContext ctxt) {
+  return wrap(Imm21Type::get(unwrap(ctxt)));
+}
+
+bool rtgtestTypeIsAImm32(MlirType type) { return isa<Imm32Type>(unwrap(type)); }
+
+MlirType rtgtestImm32TypeGet(MlirContext ctxt) {
+  return wrap(Imm32Type::get(unwrap(ctxt)));
+}
+
 //===----------------------------------------------------------------------===//
 // Attribute API.
 //===----------------------------------------------------------------------===//
@@ -305,4 +346,67 @@ bool rtgtestAttrIsARegT6(MlirAttribute attr) {
 
 MlirAttribute rtgtestRegT6AttrGet(MlirContext ctxt) {
   return wrap(RegT6Attr::get(unwrap(ctxt)));
+}
+
+// Immediates.
+//===----------------------------------------------------------------------===//
+
+bool rtgtestAttrIsAImm5(MlirAttribute attr) {
+  return isa<Imm5Attr>(unwrap(attr));
+}
+
+MlirAttribute rtgtestImm5AttrGet(MlirContext ctxt, unsigned value) {
+  return wrap(Imm5Attr::get(unwrap(ctxt), value));
+}
+
+unsigned rtgtestImm5AttrGetValue(MlirAttribute attr) {
+  return cast<Imm5Attr>(unwrap(attr)).getValue();
+}
+
+bool rtgtestAttrIsAImm12(MlirAttribute attr) {
+  return isa<Imm12Attr>(unwrap(attr));
+}
+
+MlirAttribute rtgtestImm12AttrGet(MlirContext ctxt, unsigned value) {
+  return wrap(Imm12Attr::get(unwrap(ctxt), value));
+}
+
+unsigned rtgtestImm12AttrGetValue(MlirAttribute attr) {
+  return cast<Imm12Attr>(unwrap(attr)).getValue();
+}
+
+bool rtgtestAttrIsAImm13(MlirAttribute attr) {
+  return isa<Imm13Attr>(unwrap(attr));
+}
+
+MlirAttribute rtgtestImm13AttrGet(MlirContext ctxt, unsigned value) {
+  return wrap(Imm13Attr::get(unwrap(ctxt), value));
+}
+
+unsigned rtgtestImm13AttrGetValue(MlirAttribute attr) {
+  return cast<Imm13Attr>(unwrap(attr)).getValue();
+}
+
+bool rtgtestAttrIsAImm21(MlirAttribute attr) {
+  return isa<Imm21Attr>(unwrap(attr));
+}
+
+MlirAttribute rtgtestImm21AttrGet(MlirContext ctxt, unsigned value) {
+  return wrap(Imm21Attr::get(unwrap(ctxt), value));
+}
+
+unsigned rtgtestImm21AttrGetValue(MlirAttribute attr) {
+  return cast<Imm21Attr>(unwrap(attr)).getValue();
+}
+
+bool rtgtestAttrIsAImm32(MlirAttribute attr) {
+  return isa<Imm32Attr>(unwrap(attr));
+}
+
+MlirAttribute rtgtestImm32AttrGet(MlirContext ctxt, unsigned value) {
+  return wrap(Imm32Attr::get(unwrap(ctxt), value));
+}
+
+unsigned rtgtestImm32AttrGetValue(MlirAttribute attr) {
+  return cast<Imm32Attr>(unwrap(attr)).getValue();
 }
