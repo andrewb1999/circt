@@ -484,9 +484,10 @@ private:
     /// Create assignments to the inputs of the library op.
     auto group = createGroupForOp<TGroupOp>(rewriter, op);
     rewriter.setInsertionPointToEnd(group.getBodyBlock());
-    for (auto dstOp : enumerate(opInputPorts))
+    for (auto dstOp : enumerate(opInputPorts)) {
       rewriter.create<calyx::AssignOp>(op.getLoc(), dstOp.value(),
                                        op->getOperand(dstOp.index()));
+    }
 
     /// Replace the result values of the source operator with the new operator.
     for (auto res : enumerate(opOutputPorts)) {
@@ -1374,8 +1375,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      IndexCastOp op) const {
-  Type sourceType = calyx::convIndexType(rewriter, op.getOperand().getType());
-  Type targetType = calyx::convIndexType(rewriter, op.getResult().getType());
+  Type sourceType = calyx::normalizeType(rewriter, op.getOperand().getType());
+  Type targetType = calyx::normalizeType(rewriter, op.getResult().getType());
   unsigned targetBits = targetType.getIntOrFloatBitWidth();
   unsigned sourceBits = sourceType.getIntOrFloatBitWidth();
   LogicalResult res = success();
@@ -1645,7 +1646,7 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
         funcOpArgRewrites[arg.value()] = inPorts.size();
         inPorts.push_back(calyx::PortInfo{
             rewriter.getStringAttr(inName),
-            calyx::convIndexType(rewriter, arg.value().getType()),
+            calyx::normalizeType(rewriter, arg.value().getType()),
             calyx::Direction::Input,
             DictionaryAttr::get(rewriter.getContext(), {})});
       }
@@ -1654,7 +1655,7 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
       funcOpResultMapping[res.index()] = outPorts.size();
       outPorts.push_back(calyx::PortInfo{
           rewriter.getStringAttr("out" + std::to_string(res.index())),
-          calyx::convIndexType(rewriter, res.value()), calyx::Direction::Output,
+          calyx::normalizeType(rewriter, res.value()), calyx::Direction::Output,
           DictionaryAttr::get(rewriter.getContext(), {})});
     }
 
@@ -1991,7 +1992,7 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
 
       if (auto *valuePtr = std::get_if<Value>(&reg); valuePtr) {
         auto evaluatingGroup =
-            getState<ComponentLoweringState>().getEvaluatingGroup(value);
+            getState<ComponentLoweringState>().findEvaluatingGroup(value);
         assert(isa<calyx::StaticGroupOp>(evaluatingGroup.value()));
         addBodyGroup(outerVal, dyn_cast<calyx::StaticGroupOp>(
                                    evaluatingGroup.value().getOperation()));
@@ -2020,7 +2021,7 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
 
       // Get the evaluating group for that value.
       auto evaluatingGroup =
-          getState<ComponentLoweringState>().getEvaluatingGroup(value);
+          getState<ComponentLoweringState>().findEvaluatingGroup(value);
 
       if (!evaluatingGroup.has_value()) {
         auto name =
@@ -2759,7 +2760,7 @@ class InlineCombGroupsIf : public calyx::FuncOpPartialLoweringPattern {
               src.getDefiningOp()))
         continue;
 
-      auto evalGroupOpt = state.getEvaluatingGroup(src);
+      auto evalGroupOpt = state.findEvaluatingGroup(src);
       if (!evalGroupOpt.has_value()) {
         continue;
       }
@@ -3058,11 +3059,10 @@ public:
     if (runOnce)
       config.maxIterations = 1;
 
-    /// Can't return applyPatternsAndFoldGreedily. Root isn't
+    /// Can't return applyPatternsGreedily. Root isn't
     /// necessarily erased so it will always return failed(). Instead,
     /// forward the 'succeeded' value from PartialLoweringPatternBase.
-    (void)applyPatternsAndFoldGreedily(getOperation(), std::move(pattern),
-                                       config);
+    (void)applyPatternsGreedily(getOperation(), std::move(pattern), config);
     return partialPatternRes;
   }
 
@@ -3164,6 +3164,9 @@ void LoopScheduleToCalyxPass::runOnOperation() {
   addOncePattern<calyx::InlineCombGroups>(loweringPatterns, patternState,
                                           *loweringState);
 
+  addGreedyPattern<calyx::DeduplicateParallelOp>(loweringPatterns);
+  addGreedyPattern<calyx::DeduplicateStaticParallelOp>(loweringPatterns);
+
   /// This pattern performs various SSA replacements that must be done
   /// after control generation.
   addOncePattern<LateSSAReplacement>(loweringPatterns, patternState, funcMap,
@@ -3207,8 +3210,8 @@ void LoopScheduleToCalyxPass::runOnOperation() {
   RewritePatternSet cleanupPatterns(&getContext());
   cleanupPatterns.add<calyx::MultipleGroupDonePattern,
                       calyx::NonTerminatingGroupDonePattern>(&getContext());
-  if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                          std::move(cleanupPatterns)))) {
+  if (failed(
+          applyPatternsGreedily(getOperation(), std::move(cleanupPatterns)))) {
     signalPassFailure();
     return;
   }

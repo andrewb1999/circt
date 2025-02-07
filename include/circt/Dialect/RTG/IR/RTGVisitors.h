@@ -31,16 +31,22 @@ public:
   ResultType dispatchOpVisitor(Operation *op, ExtraArgs... args) {
     auto *thisCast = static_cast<ConcreteType *>(this);
     return TypeSwitch<Operation *, ResultType>(op)
-        .template Case<SequenceOp, SequenceClosureOp, SetCreateOp,
-                       SetSelectRandomOp, SetDifferenceOp, SetUnionOp,
-                       SetSizeOp, TestOp, InvokeSequenceOp, BagCreateOp,
-                       BagSelectRandomOp, BagDifferenceOp, BagUnionOp,
-                       BagUniqueSizeOp, TargetOp, YieldOp>(
-            [&](auto expr) -> ResultType {
-              return thisCast->visitOp(expr, args...);
-            })
-        .template Case<RegisterOpInterface>([&](auto expr) -> ResultType {
-          return thisCast->visitRegisterOp(expr, args...);
+        .template Case<
+            // Bags
+            BagCreateOp, BagSelectRandomOp, BagDifferenceOp, BagUnionOp,
+            BagUniqueSizeOp,
+            // Labels
+            LabelDeclOp, LabelUniqueDeclOp, LabelOp,
+            // Registers
+            FixedRegisterOp, VirtualRegisterOp,
+            // RTG tests
+            TestOp, TargetOp, YieldOp,
+            // Sequences
+            SequenceOp, SequenceClosureOp, InvokeSequenceOp,
+            // Sets
+            SetCreateOp, SetSelectRandomOp, SetDifferenceOp, SetUnionOp,
+            SetSizeOp>([&](auto expr) -> ResultType {
+          return thisCast->visitOp(expr, args...);
         })
         .template Case<ContextResourceOpInterface>(
             [&](auto expr) -> ResultType {
@@ -65,10 +71,6 @@ public:
   /// This callback is invoked on any operations that are not
   /// handled by the concrete visitor.
   ResultType visitUnhandledOp(Operation *op, ExtraArgs... args);
-
-  ResultType visitRegisterOp(RegisterOpInterface op, ExtraArgs... args) {
-    return static_cast<ConcreteType *>(this)->visitUnhandledOp(op, args...);
-  }
 
   ResultType visitContextResourceOp(ContextResourceOpInterface op,
                                     ExtraArgs... args) {
@@ -97,9 +99,14 @@ public:
   HANDLE(BagDifferenceOp, Unhandled);
   HANDLE(BagUnionOp, Unhandled);
   HANDLE(BagUniqueSizeOp, Unhandled);
+  HANDLE(LabelDeclOp, Unhandled);
+  HANDLE(LabelUniqueDeclOp, Unhandled);
+  HANDLE(LabelOp, Unhandled);
   HANDLE(TestOp, Unhandled);
   HANDLE(TargetOp, Unhandled);
   HANDLE(YieldOp, Unhandled);
+  HANDLE(FixedRegisterOp, Unhandled);
+  HANDLE(VirtualRegisterOp, Unhandled);
 #undef HANDLE
 };
 
@@ -111,8 +118,8 @@ public:
   ResultType dispatchTypeVisitor(Type type, ExtraArgs... args) {
     auto *thisCast = static_cast<ConcreteType *>(this);
     return TypeSwitch<Type, ResultType>(type)
-        .template Case<SequenceType, SetType, BagType, DictType, IndexType,
-                       IntegerType>([&](auto expr) -> ResultType {
+        .template Case<SequenceType, SetType, BagType, DictType, LabelType,
+                       IndexType, IntegerType>([&](auto expr) -> ResultType {
           return thisCast->visitType(expr, args...);
         })
         .template Case<ContextResourceTypeInterface>(
@@ -160,6 +167,7 @@ public:
   HANDLE(DictType, Unhandled);
   HANDLE(IndexType, Unhandled);
   HANDLE(IntegerType, Unhandled);
+  HANDLE(LabelType, Unhandled);
 #undef HANDLE
 };
 

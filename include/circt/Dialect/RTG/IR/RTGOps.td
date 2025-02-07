@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+include "mlir/IR/EnumAttr.td"
 include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/IR/CommonAttrConstraints.td"
 include "mlir/IR/Properties.td"
@@ -18,6 +19,7 @@ include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "circt/Dialect/RTG/IR/RTGInterfaces.td"
+include "circt/Dialect/RTG/IR/RTGISAAssemblyInterfaces.td"
 
 // Base class for the operation in this dialect.
 class RTGOp<string mnemonic, list<Trait> traits = []> :
@@ -95,6 +97,62 @@ def InvokeSequenceOp : RTGOp<"invoke_sequence", []> {
   let arguments = (ins SequenceType:$sequence);
 
   let assemblyFormat = "$sequence attr-dict";
+}
+
+//===- Label Operations ---------------------------------------------------===//
+
+class LabelDeclBase<string mnemonic,
+                    list<Trait> traits> : RTGOp<mnemonic, traits> {
+  let description = [{
+    Declares a label that can then be placed by an `rtg.label` operation in an
+    instruction sequence, passed on to sequences via their arguments, and used
+    by instructions (e.g., as jump targets) by allowing ISA dialects to use them
+    directly as an operand of an instruction or by casting it to a value
+    representing an immediate.
+
+    The format string may contain placeholders of the form `{i}` where `i`
+    refers to the i-th element in `args`.
+    The declared label is uniqued by the compiler to no collide with any other
+    label declarations.
+  }];
+
+  // TODO: 'args' can be generalized to more types
+  let arguments = (ins StrAttr:$formatString, Variadic<Index>:$args);
+
+  let assemblyFormat = [{
+    $formatString (`,` $args^)? attr-dict
+  }];
+}
+
+def LabelDeclOp : LabelDeclBase<"label_decl", [Pure]> {
+  let summary = "declares a label for an instruction sequence";
+  let results = (outs LabelType:$label);
+}
+
+def LabelUniqueDeclOp : LabelDeclBase<"label_unique_decl", []> {
+  let summary = "declares a unique label for an instruction sequence";
+  let results = (outs Res<LabelType, "", [MemAlloc]>:$label);
+}
+
+def LabelVisibilityAttr : I32EnumAttr<"LabelVisibility",
+                                      "visibility specifiers for labels", [
+  I32EnumAttrCase<"local",  0>,
+  I32EnumAttrCase<"global", 1>,
+  I32EnumAttrCase<"external", 2>,
+]> {
+  let cppNamespace = "::circt::rtg";
+}
+
+def LabelOp : RTGOp<"label", []> {
+  let summary = "places a label in an instruction sequence";
+  let description = [{
+    Any declared label must only be placed at most once in any fully elaborated
+    instruction sequence.
+  }];
+
+  let arguments = (ins LabelVisibilityAttr:$visibility, LabelType:$label);
+
+  let assemblyFormat = "$visibility $label attr-dict";
 }
 
 //===- Set Operations ------------------------------------------------------===//
@@ -265,6 +323,44 @@ def BagUniqueSizeOp : RTGOp<"bag_unique_size", [Pure]> {
   let assemblyFormat = [{
     $bag `:` qualified(type($bag)) attr-dict
   }];
+}
+
+//===- ISA Register Handling Operations -----------------------------------===//
+
+def FixedRegisterOp : RTGOp<"fixed_reg", [
+  Pure, ConstantLike,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>,
+]> {
+  let summary = "returns a value representing a fixed register";
+  let description = [{
+    This operation creates a value representing the register given as the 'reg'
+    attribute. This is always a concrete ISA register.
+    The return type always matches the register attribute type.
+  }];
+
+  let arguments = (ins RegisterAttrInterface:$reg);
+  let results = (outs RegisterTypeInterface:$result);
+
+  let assemblyFormat = "$reg attr-dict";
+  let hasFolder = 1;
+}
+
+def VirtualRegisterOp : RTGOp<"virtual_reg", [
+  DeclareOpInterfaceMethods<InferTypeOpInterface>,
+]> {
+  let summary = "returns a value representing a virtual register";
+  let description = [{
+    This operation creates a value representing a virtual register. The
+    'allowedRegisters' attribute specifies the concrete registers that may be
+    chosen during register allocation.
+  }];
+
+  // ArrayAttr of RegisterAttrInterfaces
+  let arguments = (ins ArrayAttr:$allowedRegs);
+  let results = (outs RegisterTypeInterface:$result);
+
+  let assemblyFormat = "$allowedRegs attr-dict";
+  let hasVerifier = 1;
 }
 
 //===- Test Specification Operations --------------------------------------===//

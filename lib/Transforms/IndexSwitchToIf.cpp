@@ -46,45 +46,57 @@ struct IndexSwitchToIfPattern : OpConversionPattern<scf::IndexSwitchOp> {
   using OpConversionPattern<scf::IndexSwitchOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(scf::IndexSwitchOp op, OpAdaptor adaptor,
+  matchAndRewrite(scf::IndexSwitchOp switchOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    SmallVector<Value> comparisons;
-    for (unsigned int i = 0; i < op.getNumCases(); ++i) {
-      auto constOp = rewriter.create<arith::ConstantOp>(
-          op.getLoc(), rewriter.getIndexAttr(op.getCases()[i]));
-      auto cmpiOp =
-          rewriter.create<arith::CmpIOp>(op.getLoc(), arith::CmpIPredicate::eq,
-                                         op.getArg(), constOp.getResult());
-      comparisons.push_back(cmpiOp.getResult());
-    }
+    auto loc = switchOp.getLoc();
 
-    scf::IfOp outerIfOp;
-    for (unsigned int i = 0; i < op.getNumCases(); ++i) {
-      bool lastCase = i == op.getNumCases() - 1;
-      auto ifOp = rewriter.create<scf::IfOp>(op.getLoc(), op.getResultTypes(),
-                                             comparisons[i], false, false);
-      rewriter.inlineRegionBefore(op.getCaseRegions()[i], ifOp.getThenRegion(),
+    Region &defaultRegion = switchOp.getDefaultRegion();
+    bool hasResults = !switchOp.getResultTypes().empty();
+
+    Value finalResult;
+    scf::IfOp prevIfOp = nullptr;
+
+    rewriter.setInsertionPointAfter(switchOp);
+    auto switchCases = switchOp.getCases();
+    for (size_t i = 0; i < switchCases.size(); i++) {
+      auto caseValueInt = switchCases[i];
+      if (prevIfOp)
+        rewriter.setInsertionPointToStart(&prevIfOp.getElseRegion().front());
+
+      Value caseValue =
+          rewriter.create<arith::ConstantIndexOp>(loc, caseValueInt);
+      Value cond = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, switchOp.getOperand(), caseValue);
+
+      auto ifOp = rewriter.create<scf::IfOp>(loc, switchOp.getResultTypes(),
+                                             cond, /*hasElseRegion=*/true);
+
+      Region &caseRegion = switchOp.getCaseRegions()[i];
+      rewriter.eraseBlock(&ifOp.getThenRegion().front());
+      rewriter.inlineRegionBefore(caseRegion, ifOp.getThenRegion(),
                                   ifOp.getThenRegion().end());
-      if (lastCase) {
-        rewriter.inlineRegionBefore(op.getDefaultRegion(), ifOp.getElseRegion(),
+
+      if (i + 1 == switchCases.size()) {
+        rewriter.eraseBlock(&ifOp.getElseRegion().front());
+        rewriter.inlineRegionBefore(defaultRegion, ifOp.getElseRegion(),
                                     ifOp.getElseRegion().end());
-      } else {
-        rewriter.createBlock(&ifOp.getElseRegion());
       }
 
-      if (i == 0) {
-        outerIfOp = ifOp;
-      } else {
-        rewriter.setInsertionPointAfter(ifOp);
-        rewriter.create<scf::YieldOp>(op.getLoc(), ifOp.getResults());
+      if (prevIfOp && hasResults) {
+        rewriter.setInsertionPointToEnd(&prevIfOp.getElseRegion().front());
+        rewriter.create<scf::YieldOp>(loc, ifOp.getResult(0));
       }
-      rewriter.setInsertionPointToStart(&ifOp.getElseRegion().front());
+
+      if (i == 0 && hasResults)
+        finalResult = ifOp.getResult(0);
+
+      prevIfOp = ifOp;
     }
 
-    if (outerIfOp == nullptr)
-      return failure();
-
-    rewriter.replaceOp(op, outerIfOp);
+    if (hasResults)
+      rewriter.replaceOp(switchOp, finalResult);
+    else
+      rewriter.eraseOp(switchOp);
 
     return success();
   }

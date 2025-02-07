@@ -26,11 +26,14 @@ using namespace rtgtest;
 
 void RTGTestDialect::initialize() {
   registerTypes();
+  registerAttributes();
   // Register operations.
   addOperations<
 #define GET_OP_LIST
 #include "circt/Dialect/RTGTest/IR/RTGTest.cpp.inc"
       >();
 }
+
+#include "circt/Dialect/RTGTest/IR/RTGTestEnums.cpp.inc"
 
 #include "circt/Dialect/RTGTest/IR/RTGTestDialect.cpp.inc"

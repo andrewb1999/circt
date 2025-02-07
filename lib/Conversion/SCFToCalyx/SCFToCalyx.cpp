@@ -306,6 +306,7 @@ public:
                              /// SCF
                              scf::YieldOp, scf::WhileOp, scf::ForOp, scf::IfOp,
                              scf::ParallelOp, scf::ReduceOp,
+                             scf::ExecuteRegionOp,
                              /// memref
                              memref::AllocOp, memref::AllocaOp, memref::LoadOp,
                              memref::StoreOp, memref::GetGlobalOp,
@@ -349,7 +350,7 @@ public:
           return failure();
         }
         llvm::raw_os_ostream llvmOut(outFile);
-        llvm::json::OStream jsonOS(llvmOut, 2);
+        llvm::json::OStream jsonOS(llvmOut, /*IndentSize=*/2);
         jsonOS.value(getState<ComponentLoweringState>().getExtMemData());
         jsonOS.flush();
         outFile.close();
@@ -412,6 +413,8 @@ private:
                         scf::ReduceOp reduceOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter,
                         scf::ParallelOp parallelOp) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        scf::ExecuteRegionOp executeRegionOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, CallOp callOp) const;
 
   /// buildLibraryOp will build a TCalyxLibOp inside a TGroupOp based on the
@@ -420,8 +423,10 @@ private:
   LogicalResult buildLibraryOp(PatternRewriter &rewriter, TSrcOp op,
                                TypeRange srcTypes, TypeRange dstTypes) const {
     SmallVector<Type> types;
-    llvm::append_range(types, srcTypes);
-    llvm::append_range(types, dstTypes);
+    for (Type srcType : srcTypes)
+      types.push_back(calyx::toBitVector(srcType));
+    for (Type dstType : dstTypes)
+      types.push_back(calyx::toBitVector(dstType));
 
     auto calyxOp =
         getState<ComponentLoweringState>().getNewLibraryOpInstance<TCalyxLibOp>(
@@ -997,7 +1002,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   case CombLogic::None: {
     // it's guaranteed to be either ORD or UNO
     outputValue = inputRegs[0].getOut();
-    doneValue = inputRegs[0].getOut();
+    doneValue = inputRegs[0].getDone();
     break;
   }
   case CombLogic::And: {
@@ -1188,70 +1193,74 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      scf::YieldOp yieldOp) const {
   if (yieldOp.getOperands().empty()) {
-    // If yield operands are empty, we assume we have a for loop.
-    auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp());
-    assert(forOp && "Empty yieldOps should only be located within ForOps");
-    ScfForOp forOpInterface(forOp);
+    if (auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
+      ScfForOp forOpInterface(forOp);
 
-    // Get the ForLoop's Induction Register.
-    auto inductionReg =
-        getState<ComponentLoweringState>().getForLoopIterReg(forOpInterface, 0);
+      // Get the ForLoop's Induction Register.
+      auto inductionReg = getState<ComponentLoweringState>().getForLoopIterReg(
+          forOpInterface, 0);
 
-    Type regWidth = inductionReg.getOut().getType();
-    // Adder should have same width as the inductionReg.
-    SmallVector<Type> types(3, regWidth);
-    auto addOp = getState<ComponentLoweringState>()
-                     .getNewLibraryOpInstance<calyx::AddLibOp>(
-                         rewriter, forOp.getLoc(), types);
+      Type regWidth = inductionReg.getOut().getType();
+      // Adder should have same width as the inductionReg.
+      SmallVector<Type> types(3, regWidth);
+      auto addOp = getState<ComponentLoweringState>()
+                       .getNewLibraryOpInstance<calyx::AddLibOp>(
+                           rewriter, forOp.getLoc(), types);
 
-    auto directions = addOp.portDirections();
-    // For an add operation, we expect two input ports and one output port
-    SmallVector<Value, 2> opInputPorts;
-    Value opOutputPort;
-    for (auto dir : enumerate(directions)) {
-      switch (dir.value()) {
-      case calyx::Direction::Input: {
-        opInputPorts.push_back(addOp.getResult(dir.index()));
-        break;
+      auto directions = addOp.portDirections();
+      // For an add operation, we expect two input ports and one output port.
+      SmallVector<Value, 2> opInputPorts;
+      Value opOutputPort;
+      for (auto dir : enumerate(directions)) {
+        switch (dir.value()) {
+        case calyx::Direction::Input: {
+          opInputPorts.push_back(addOp.getResult(dir.index()));
+          break;
+        }
+        case calyx::Direction::Output: {
+          opOutputPort = addOp.getResult(dir.index());
+          break;
+        }
+        }
       }
-      case calyx::Direction::Output: {
-        opOutputPort = addOp.getResult(dir.index());
-        break;
-      }
-      }
+
+      // "Latch Group" increments inductionReg by forLoop's step value.
+      calyx::ComponentOp componentOp =
+          getState<ComponentLoweringState>().getComponentOp();
+      SmallVector<StringRef, 4> groupIdentifier = {
+          "incr", getState<ComponentLoweringState>().getUniqueName(forOp),
+          "induction", "var"};
+      auto groupOp = calyx::createGroup<calyx::GroupOp>(
+          rewriter, componentOp, forOp.getLoc(),
+          llvm::join(groupIdentifier, "_"));
+      rewriter.setInsertionPointToEnd(groupOp.getBodyBlock());
+
+      // Assign inductionReg.out to the left port of the adder.
+      Value leftOp = opInputPorts.front();
+      rewriter.create<calyx::AssignOp>(forOp.getLoc(), leftOp,
+                                       inductionReg.getOut());
+      // Assign forOp.getConstantStep to the right port of the adder.
+      Value rightOp = opInputPorts.back();
+      rewriter.create<calyx::AssignOp>(
+          forOp.getLoc(), rightOp,
+          createConstant(forOp->getLoc(), rewriter, componentOp,
+                         regWidth.getIntOrFloatBitWidth(),
+                         forOp.getConstantStep().value().getSExtValue()));
+      // Assign adder's output port to inductionReg.
+      buildAssignmentsForRegisterWrite(rewriter, groupOp, componentOp,
+                                       inductionReg, opOutputPort);
+      // Set group as For Loop's "latch" group.
+      getState<ComponentLoweringState>().setForLoopLatchGroup(forOpInterface,
+                                                              groupOp);
+      getState<ComponentLoweringState>().registerEvaluatingGroup(opOutputPort,
+                                                                 groupOp);
+      return success();
     }
-
-    // "Latch Group" increments inductionReg by forLoop's step value.
-    calyx::ComponentOp componentOp =
-        getState<ComponentLoweringState>().getComponentOp();
-    SmallVector<StringRef, 4> groupIdentifier = {
-        "incr", getState<ComponentLoweringState>().getUniqueName(forOp),
-        "induction", "var"};
-    auto groupOp = calyx::createGroup<calyx::GroupOp>(
-        rewriter, componentOp, forOp.getLoc(),
-        llvm::join(groupIdentifier, "_"));
-    rewriter.setInsertionPointToEnd(groupOp.getBodyBlock());
-
-    // Assign inductionReg.out to the left port of the adder.
-    Value leftOp = opInputPorts.front();
-    rewriter.create<calyx::AssignOp>(forOp.getLoc(), leftOp,
-                                     inductionReg.getOut());
-    // Assign forOp.getConstantStep to the right port of the adder.
-    Value rightOp = opInputPorts.back();
-    rewriter.create<calyx::AssignOp>(
-        forOp.getLoc(), rightOp,
-        createConstant(forOp->getLoc(), rewriter, componentOp,
-                       regWidth.getIntOrFloatBitWidth(),
-                       forOp.getConstantStep().value().getSExtValue()));
-    // Assign adder's output port to inductionReg.
-    buildAssignmentsForRegisterWrite(rewriter, groupOp, componentOp,
-                                     inductionReg, opOutputPort);
-    // Set group as For Loop's "latch" group.
-    getState<ComponentLoweringState>().setForLoopLatchGroup(forOpInterface,
-                                                            groupOp);
-    getState<ComponentLoweringState>().registerEvaluatingGroup(opOutputPort,
-                                                               groupOp);
-    return success();
+    if (auto ifOp = dyn_cast<scf::IfOp>(yieldOp->getParentOp()))
+      // Empty yield inside ifOp, essentially a no-op.
+      return success();
+    return yieldOp.getOperation()->emitError()
+           << "Unsupported empty yieldOp outside ForOp or IfOp.";
   }
   // If yieldOp for a for loop is not empty, then we do not transform for loop.
   if (dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
@@ -1475,8 +1484,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      IndexCastOp op) const {
-  Type sourceType = calyx::convIndexType(rewriter, op.getOperand().getType());
-  Type targetType = calyx::convIndexType(rewriter, op.getResult().getType());
+  Type sourceType = calyx::normalizeType(rewriter, op.getOperand().getType());
+  Type targetType = calyx::normalizeType(rewriter, op.getResult().getType());
   unsigned targetBits = targetType.getIntOrFloatBitWidth();
   unsigned sourceBits = sourceType.getIntOrFloatBitWidth();
   LogicalResult res = success();
@@ -1549,6 +1558,15 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      scf::ParallelOp parOp) const {
   getState<ComponentLoweringState>().addBlockSchedulable(
       parOp.getOperation()->getBlock(), ParSchedulable{parOp});
+  return success();
+}
+
+LogicalResult
+BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                       scf::ExecuteRegionOp executeRegionOp) const {
+  // Simply return success because the only remaining `scf.execute_region` op
+  // are generated by the `BuildParGroups` pass - the rest of them are inlined
+  // by the `InlineExecuteRegionOpPattern`.
   return success();
 }
 
@@ -1665,7 +1683,7 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
         funcOpArgRewrites[arg.value()] = inPorts.size();
         inPorts.push_back(calyx::PortInfo{
             rewriter.getStringAttr(inName),
-            calyx::convIndexType(rewriter, arg.value().getType()),
+            calyx::normalizeType(rewriter, arg.value().getType()),
             calyx::Direction::Input,
             DictionaryAttr::get(rewriter.getContext(), {})});
       }
@@ -1681,7 +1699,7 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
 
       outPorts.push_back(calyx::PortInfo{
           rewriter.getStringAttr(resName),
-          calyx::convIndexType(rewriter, res.value()), calyx::Direction::Output,
+          calyx::normalizeType(rewriter, res.value()), calyx::Direction::Output,
           DictionaryAttr::get(rewriter.getContext(), {})});
     }
 
@@ -1908,6 +1926,12 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
 
       auto scfIfOp = cast<scf::IfOp>(op);
 
+      // There is no need to build `thenGroup` and `elseGroup` if `scfIfOp`
+      // doesn't yield any result since these groups are created for managing
+      // the result values.
+      if (scfIfOp.getResults().empty())
+        return WalkResult::advance();
+
       calyx::ComponentOp componentOp =
           getState<ComponentLoweringState>().getComponentOp();
 
@@ -1978,9 +2002,8 @@ private:
     auto loc = newParOp.getLoc();
     rewriter.insert(newParOp);
     OpBuilder insideBuilder(newParOp);
-    Block *currBlock = nullptr;
     auto &region = newParOp.getRegion();
-    IRMapping operandMap;
+    auto *newParBodyBlock = &region.emplaceBlock();
 
     // extract lower bounds, upper bounds, and steps as integer index values
     SmallVector<int64_t> lbVals, ubVals, stepVals;
@@ -2006,20 +2029,32 @@ private:
     SmallVector<int64_t> indices = lbVals;
 
     while (true) {
-      // Create a new block in the region for the current combination of indices
-      currBlock = &region.emplaceBlock();
-      insideBuilder.setInsertionPointToEnd(currBlock);
+      insideBuilder.setInsertionPointToEnd(newParBodyBlock);
+      // Create an `scf.execute_region` to wrap each unrolled block since
+      // `scf.parallel` requires only one block in the body region.
+      auto execRegionOp =
+          insideBuilder.create<scf::ExecuteRegionOp>(loc, TypeRange{});
+      auto &execRegion = execRegionOp.getRegion();
+      Block *execBlock = &execRegion.emplaceBlock();
+      OpBuilder regionBuilder(execRegionOp);
+      // Each iteration starts with a fresh mapping, so each new block’s
+      // argument of a region-based operation (such as `scf.for`) get re-mapped
+      // independently.
+      IRMapping operandMap;
 
+      regionBuilder.setInsertionPointToEnd(execBlock);
       // Map induction variables to constant indices
       for (unsigned i = 0; i < indices.size(); ++i) {
         Value ivConstant =
-            insideBuilder.create<arith::ConstantIndexOp>(loc, indices[i]);
+            regionBuilder.create<arith::ConstantIndexOp>(loc, indices[i]);
         operandMap.map(parOpIVs[i], ivConstant);
       }
 
       for (auto it = body->begin(); it != std::prev(body->end()); ++it)
-        insideBuilder.clone(*it, operandMap);
+        regionBuilder.clone(*it, operandMap);
 
+      // A terminator should always be inserted in `scf.execute_region`'s block.
+      regionBuilder.create<scf::ReduceOp>(loc);
       // Increment indices using `step`
       bool done = false;
       for (int dim = indices.size() - 1; dim >= 0; --dim) {
@@ -2035,7 +2070,30 @@ private:
         break;
     }
 
+    rewriter.setInsertionPointToEnd(newParOp.getBody());
+    rewriter.create<scf::ReduceOp>(newParOp.getLoc());
+
     rewriter.replaceOp(scfParOp, newParOp);
+
+    auto containsIfOp = [](scf::ParallelOp parOp) -> bool {
+      bool hasIfOp = false;
+      parOp.walk([&](scf::IfOp ifOp) {
+        hasIfOp = true;
+        return WalkResult::interrupt();
+      });
+      return hasIfOp;
+    };
+    if (containsIfOp(newParOp)) {
+      auto *context = newParOp.getContext();
+      RewritePatternSet patterns(newParOp.getContext());
+      scf::IfOp::getCanonicalizationPatterns(patterns, context);
+      if (failed(
+              applyPatternsGreedily(newParOp->getParentOfType<func::FuncOp>(),
+                                    std::move(patterns)))) {
+        return failure();
+      }
+    }
+
     return success();
   }
 };
@@ -2112,15 +2170,25 @@ private:
       } else if (auto *parSchedPtr = std::get_if<ParSchedulable>(&group)) {
         auto parOp = parSchedPtr->parOp;
         auto calyxParOp = rewriter.create<calyx::ParOp>(parOp.getLoc());
-        for (auto &innerBlock : parOp.getRegion().getBlocks()) {
-          rewriter.setInsertionPointToEnd(calyxParOp.getBodyBlock());
-          auto seqOp = rewriter.create<calyx::SeqOp>(parOp.getLoc());
-          rewriter.setInsertionPointToEnd(seqOp.getBodyBlock());
-          if (LogicalResult res = scheduleBasicBlock(
-                  rewriter, path, seqOp.getBodyBlock(), &innerBlock);
-              res.failed())
-            return res;
-        }
+
+        WalkResult walkResult =
+            parOp.walk([&](scf::ExecuteRegionOp execRegion) {
+              rewriter.setInsertionPointToEnd(calyxParOp.getBodyBlock());
+              auto seqOp = rewriter.create<calyx::SeqOp>(execRegion.getLoc());
+              rewriter.setInsertionPointToEnd(seqOp.getBodyBlock());
+
+              for (auto &execBlock : execRegion.getRegion().getBlocks()) {
+                if (LogicalResult res = scheduleBasicBlock(
+                        rewriter, path, seqOp.getBodyBlock(), &execBlock);
+                    res.failed()) {
+                  return WalkResult::interrupt();
+                }
+              }
+              return WalkResult::advance();
+            });
+
+        if (walkResult.wasInterrupted())
+          return failure();
       } else if (auto *forSchedPtr = std::get_if<ForSchedulable>(&group);
                  forSchedPtr) {
         auto forOp = forSchedPtr->forOp;
@@ -2157,7 +2225,7 @@ private:
                              .getEvaluatingGroup<calyx::CombGroupOp>(cond);
 
         auto symbolAttr = FlatSymbolRefAttr::get(
-            StringAttr::get(getContext(), condGroup->getSymName()));
+            StringAttr::get(getContext(), condGroup.getSymName()));
 
         bool initElse = !ifOp.getElseRegion().empty();
         auto ifCtrlOp = rewriter.create<calyx::IfOp>(
@@ -2175,11 +2243,15 @@ private:
         if (res.failed())
           return res;
 
-        rewriter.setInsertionPointToEnd(thenSeqOpBlock);
-        calyx::GroupOp thenGroup =
-            getState<ComponentLoweringState>().getThenGroup(ifOp);
-        rewriter.create<calyx::EnableOp>(thenGroup.getLoc(),
-                                         thenGroup.getName());
+        // `thenGroup`s won't be created in the first place if there's no
+        // yielded results for this `ifOp`.
+        if (!ifOp.getResults().empty()) {
+          rewriter.setInsertionPointToEnd(thenSeqOpBlock);
+          calyx::GroupOp thenGroup =
+              getState<ComponentLoweringState>().getThenGroup(ifOp);
+          rewriter.create<calyx::EnableOp>(thenGroup.getLoc(),
+                                           thenGroup.getName());
+        }
 
         if (!ifOp.getElseRegion().empty()) {
           rewriter.setInsertionPointToEnd(ifCtrlOp.getElseBody());
@@ -2194,19 +2266,19 @@ private:
           if (res.failed())
             return res;
 
-          rewriter.setInsertionPointToEnd(elseSeqOpBlock);
-          calyx::GroupOp elseGroup =
-              getState<ComponentLoweringState>().getElseGroup(ifOp);
-          rewriter.create<calyx::EnableOp>(elseGroup.getLoc(),
-                                           elseGroup.getName());
+          if (!ifOp.getResults().empty()) {
+            rewriter.setInsertionPointToEnd(elseSeqOpBlock);
+            calyx::GroupOp elseGroup =
+                getState<ComponentLoweringState>().getElseGroup(ifOp);
+            rewriter.create<calyx::EnableOp>(elseGroup.getLoc(),
+                                             elseGroup.getName());
+          }
         }
       } else if (auto *callSchedPtr = std::get_if<CallSchedulable>(&group)) {
         auto instanceOp = callSchedPtr->instanceOp;
         OpBuilder::InsertionGuard g(rewriter);
         auto callBody = rewriter.create<calyx::SeqOp>(instanceOp.getLoc());
         rewriter.setInsertionPointToStart(callBody.getBodyBlock());
-        std::string initGroupName = "init_" + instanceOp.getSymName().str();
-        rewriter.create<calyx::EnableOp>(instanceOp.getLoc(), initGroupName);
 
         auto callee = callSchedPtr->callOp.getCallee();
         auto *calleeOp = SymbolTable::lookupNearestSymbolFrom(
@@ -2317,7 +2389,7 @@ private:
         auto condGroup = getState<ComponentLoweringState>()
                              .getEvaluatingGroup<calyx::CombGroupOp>(cond);
         auto symbolAttr = FlatSymbolRefAttr::get(
-            StringAttr::get(getContext(), condGroup->getSymName()));
+            StringAttr::get(getContext(), condGroup.getSymName()));
 
         auto ifOp = rewriter.create<calyx::IfOp>(
             brOp->getLoc(), cond, symbolAttr, /*initializeElseBody=*/true);
@@ -2373,7 +2445,7 @@ private:
     auto condGroup = getState<ComponentLoweringState>()
                          .getEvaluatingGroup<calyx::CombGroupOp>(cond);
     auto symbolAttr = FlatSymbolRefAttr::get(
-        StringAttr::get(getContext(), condGroup->getSymName()));
+        StringAttr::get(getContext(), condGroup.getSymName()));
     return rewriter.create<calyx::WhileOp>(loc, cond, symbolAttr);
   }
 
@@ -2588,11 +2660,10 @@ public:
     if (runOnce)
       config.maxIterations = 1;
 
-    /// Can't return applyPatternsAndFoldGreedily. Root isn't
+    /// Can't return applyPatternsGreedily. Root isn't
     /// necessarily erased so it will always return failed(). Instead,
     /// forward the 'succeeded' value from PartialLoweringPatternBase.
-    (void)applyPatternsAndFoldGreedily(getOperation(), std::move(pattern),
-                                       config);
+    (void)applyPatternsGreedily(getOperation(), std::move(pattern), config);
     return partialPatternRes;
   }
 
@@ -2742,6 +2813,7 @@ private:
     builder.setInsertionPointToEnd(callerEntryBlock);
     builder.create<CallOp>(caller.getLoc(), calleeName, resultTypes,
                            fnOperands);
+    builder.create<ReturnOp>(caller.getLoc());
   }
 
   /// Conditionally creates an optional new top-level function; and inserts a
@@ -2824,6 +2896,8 @@ void SCFToCalyxPass::runOnOperation() {
   /// This pass inlines scf.ExecuteRegionOp's by adding control-flow.
   addGreedyPattern<InlineExecuteRegionOpPattern>(loweringPatterns);
 
+  /// Partial evaluate the scf.ParallelOp and apply the scf.IfOp
+  /// canonicalization optionally.
   addOncePattern<BuildParGroups>(loweringPatterns, patternState, funcMap,
                                  *loweringState);
 
@@ -2915,8 +2989,8 @@ void SCFToCalyxPass::runOnOperation() {
   RewritePatternSet cleanupPatterns(&getContext());
   cleanupPatterns.add<calyx::MultipleGroupDonePattern,
                       calyx::NonTerminatingGroupDonePattern>(&getContext());
-  if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                          std::move(cleanupPatterns)))) {
+  if (failed(
+          applyPatternsGreedily(getOperation(), std::move(cleanupPatterns)))) {
     signalPassFailure();
     return;
   }

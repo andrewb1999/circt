@@ -494,6 +494,66 @@ function void ForeverLoopStatements(bit x, bit y);
   forever dummyA();
 endfunction
 
+// CHECK: func.func private @ForeachStatements(%[[ARG0:.*]]: !moore.i32, %[[ARG1:.*]]: !moore.i1) {
+function void ForeachStatements(int x, bit y);
+// CHECK: %[[ARRAY:.*]] = moore.variable : <uarray<3 x uarray<3 x uarray<3 x uarray<8 x l8>>>>>
+  logic [7:0] array [3:1][4:2][5:3][6:-1];
+// CHECK: %[[C2:.*]] = moore.constant 2 : i32
+// CHECK: %[[I:.*]] = moore.variable %[[C2]] : <i32>
+// CHECK: cf.br ^[[BB1:.*]]
+// CHECK: ^[[BB1]]:
+// CHECK: %[[C4:.*]] = moore.constant 4 : i32
+// CHECK: %[[I_VAL:.*]] = moore.read %[[I]] : <i32>
+// CHECK: %[[CMP1:.*]] = moore.sle %[[I_VAL]], %[[C4]] : i32 -> i1
+// CHECK: %[[CONV1:.*]] = moore.conversion %[[CMP1]] : !moore.i1 -> i1
+// CHECK: cf.cond_br %[[CONV1]], ^[[BB2:.*]], ^[[BB10:.*]]
+// CHECK: ^[[BB2]]:
+// CHECK: %[[CM1:.*]] = moore.constant -1 : i32
+// CHECK: %[[J:.*]] = moore.variable %[[CM1]] : <i32>
+// CHECK: cf.br ^[[BB3:.*]]
+// CHECK: ^[[BB3]]:
+// CHECK: %[[C6:.*]] = moore.constant 6 : i32
+// CHECK: %[[J_VAL:.*]] = moore.read %[[J]] : <i32>
+// CHECK: %[[CMP2:.*]] = moore.sle %[[J_VAL]], %[[C6]] : i32 -> i1
+// CHECK: %[[CONV2:.*]] = moore.conversion %[[CMP2]] : !moore.i1 -> i1
+// CHECK: cf.cond_br %[[CONV2]], ^[[BB4:.*]], ^[[BB8:.*]]
+  foreach (array[, i, ,j]) begin
+// CHECK: ^[[BB4]]:
+// CHECK: %[[CONV3:.*]] = moore.conversion %[[ARG1]] : !moore.i1 -> i1
+// CHECK: cf.cond_br %[[CONV3]], ^[[BB5:.*]], ^[[BB6:.*]]
+    if (y) begin
+// CHECK: ^[[BB5]]:
+// CHECK: call @dummyA() : () -> ()
+// CHECK: cf.br ^[[BB8]]
+      dummyA();
+      break;
+    end else begin
+// CHECK: ^[[BB6]]:
+// CHECK: call @dummyB() : () -> ()
+// CHECK: cf.br ^[[BB7:.*]]
+      dummyB();
+      continue;
+    end
+// CHECK: ^[[BB7]]:
+// CHECK: %[[J_VAL2:.*]] = moore.read %[[J]] : <i32>
+// CHECK: %[[C1_1:.*]] = moore.constant 1 : i32
+// CHECK: %[[ADD1:.*]] = moore.add %[[J_VAL2]], %[[C1_1]] : i32
+// CHECK: moore.blocking_assign %[[J]], %[[ADD1]] : i32
+// CHECK: cf.br ^[[BB3]]
+// CHECK: ^[[BB8]]:
+// CHECK: cf.br ^[[BB9:.*]]
+// CHECK: ^[[BB9]]:
+// CHECK: %[[I_VAL2:.*]] = moore.read %[[I]] : <i32>
+// CHECK: %[[C1_2:.*]] = moore.constant 1 : i32
+// CHECK: %[[ADD2:.*]] = moore.add %[[I_VAL2]], %[[C1_2]] : i32
+// CHECK: moore.blocking_assign %[[I]], %[[ADD2]] : i32
+// CHECK: cf.br ^[[BB1]]
+// CHECK: ^[[BB10]]:
+// CHECK: return
+  end
+endfunction
+
+
 // CHECK-LABEL: func.func private @WhileLoopStatements(
 // CHECK-SAME: %arg0: !moore.i1
 // CHECK-SAME: %arg1: !moore.i1
@@ -2105,49 +2165,49 @@ endmodule
 module ImmediateAssertiWithActionBlock;
   logic x;
   int a;
-// CHEK: moore.procedure always {
-  // CHEK: [[READ_X:%.+]] = moore.read %x : <l1>
-  // CHEK: [[CONV_X:%.+]] = moore.conversion [[READ_X]] : !moore.l1 -> i1
-  // CHEK: cf.cond_br [[CONV_X]], ^bb1, ^bb2
-// CHEK: ^bb1:  // pred: ^bb0
-  // CHEK: [[C1:%.+]] = moore.constant 1 : i32
-  // CHEK: moore.blocking_assign %a, [[C1]] : i32
-  // CHEK: cf.br ^bb2
-// CHEK: ^bb2:  // 2 preds: ^bb0, ^bb1
-  // CHEK:   moore.return
-// CHEK: }
+// CHECK: moore.procedure always {
+  // CHECK: [[READ_X:%.+]] = moore.read %x : <l1>
+  // CHECK: [[CONV_X:%.+]] = moore.conversion [[READ_X]] : !moore.l1 -> i1
+  // CHECK: cf.cond_br [[CONV_X]], ^bb1, ^bb2
+// CHECK: ^bb1:  // pred: ^bb0
+  // CHECK: [[C1:%.+]] = moore.constant 1 : i32
+  // CHECK: moore.blocking_assign %a, [[C1]] : i32
+  // CHECK: cf.br ^bb2
+// CHECK: ^bb2:  // 2 preds: ^bb0, ^bb1
+  // CHECK:   moore.return
+// CHECK: }
   assert (x) a = 1;
 
-// CHEK: moore.procedure always {
-  // CHEK: [[READ_X:%.+]] = moore.read %x : <l1>
-  // CHEK: [[CONV_X:%.+]] = moore.conversion [[READ_X]] : !moore.l1 -> i1
-  // CHEK: cf.cond_br [[CONV_X]], ^bb1, ^bb2
-// CHEK: ^bb1:  // pred: ^bb0
-  // CHEK: cf.br ^bb3
-// CHEK: ^bb2:  // pred: ^bb0
-  // CHEK: [[C0:%.+]] = moore.constant 0 : i32
-  // CHEK: moore.blocking_assign %a, [[C0]] : i32
-  // CHEK: cf.br ^bb3
-// CHEK: ^bb3:  // 2 preds: ^bb1, ^bb2
-  // CHEK: moore.return
-// CHEK: }
+// CHECK: moore.procedure always {
+  // CHECK: [[READ_X:%.+]] = moore.read %x : <l1>
+  // CHECK: [[CONV_X:%.+]] = moore.conversion [[READ_X]] : !moore.l1 -> i1
+  // CHECK: cf.cond_br [[CONV_X]], ^bb1, ^bb2
+// CHECK: ^bb1:  // pred: ^bb0
+  // CHECK: cf.br ^bb3
+// CHECK: ^bb2:  // pred: ^bb0
+  // CHECK: [[C0:%.+]] = moore.constant 0 : i32
+  // CHECK: moore.blocking_assign %a, [[C0]] : i32
+  // CHECK: cf.br ^bb3
+// CHECK: ^bb3:  // 2 preds: ^bb1, ^bb2
+  // CHECK: moore.return
+// CHECK: }
   assert (x) else a = 0;
 
-// CHEK: moore.procedure always {
-  // CHEK: [[READ_X:%.+]] = moore.read %x : <l1>
-  // CHEK: [[CONV_X:%.+]] = moore.conversion [[READ_X]] : !moore.l1 -> i1
-  // CHEK: cf.cond_br [[CONV_X]], ^bb1, ^bb2
-// CHEK: ^bb1:  // pred: ^bb0
-  // CHEK: [[C1:%.+]] = moore.constant 1 : i32
-  // CHEK: moore.blocking_assign %a, [[C1]] : i32
-  // CHEK: cf.br ^bb3
-// CHEK: ^bb2:  // pred: ^bb0
-  // CHEK: [[C0:%.+]] = moore.constant 0 : i32
-  // CHEK: moore.blocking_assign %a, [[C0]] : i32
-  // CHEK: cf.br ^bb3
-// CHEK: ^bb3:  // 2 preds: ^bb1, ^bb2
-  // CHEK: moore.return
-// CHEK: }
+// CHECK: moore.procedure always {
+  // CHECK: [[READ_X:%.+]] = moore.read %x : <l1>
+  // CHECK: [[CONV_X:%.+]] = moore.conversion [[READ_X]] : !moore.l1 -> i1
+  // CHECK: cf.cond_br [[CONV_X]], ^bb1, ^bb2
+// CHECK: ^bb1:  // pred: ^bb0
+  // CHECK: [[C1:%.+]] = moore.constant 1 : i32
+  // CHECK: moore.blocking_assign %a, [[C1]] : i32
+  // CHECK: cf.br ^bb3
+// CHECK: ^bb2:  // pred: ^bb0
+  // CHECK: [[C0:%.+]] = moore.constant 0 : i32
+  // CHECK: moore.blocking_assign %a, [[C0]] : i32
+  // CHECK: cf.br ^bb3
+// CHECK: ^bb3:  // 2 preds: ^bb1, ^bb2
+  // CHECK: moore.return
+// CHECK: }
   assert (x) a = 1; else a = 0;
 endmodule
 

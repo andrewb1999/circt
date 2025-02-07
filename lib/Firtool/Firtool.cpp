@@ -55,6 +55,10 @@ LogicalResult firtool::populatePreprocessTransforms(mlir::PassManager &pm,
 LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
                                                   const FirtoolOptions &opt,
                                                   StringRef inputFilename) {
+  // TODO: Ensure instance graph and other passes can handle instance choice
+  // then run this pass after all diagnostic passes have run.
+  pm.addNestedPass<firrtl::CircuitOp>(firrtl::createSpecializeOptionPass(
+      opt.shouldSelectDefaultInstanceChoice()));
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createLowerSignaturesPass());
 
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createInjectDUTHierarchyPass());
@@ -131,10 +135,8 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
 
   pm.addNestedPass<firrtl::CircuitOp>(firrtl::createCheckCombLoopsPass());
 
-  // Must run the specialize instance-choice and layers passes after all
-  // diagnostic passes have run, otherwise it can hide errors.
-  pm.addNestedPass<firrtl::CircuitOp>(firrtl::createSpecializeOptionPass(
-      opt.shouldSelectDefaultInstanceChoice()));
+  // Must run this pass after all diagnostic passes have run, otherwise it can
+  // hide errors.
   pm.addNestedPass<firrtl::CircuitOp>(firrtl::createSpecializeLayersPass());
 
   // Run after inference, layer specialization.
@@ -183,13 +185,6 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
 
   pm.addNestedPass<firrtl::CircuitOp>(firrtl::createExtractInstancesPass());
 
-  // Run passes to resolve Grand Central features.  This should run before
-  // BlackBoxReader because Grand Central needs to inform BlackBoxReader where
-  // certain black boxes should be placed.  Note: all Grand Central Taps related
-  // collateral is resolved entirely by LowerAnnotations.
-  pm.addNestedPass<firrtl::CircuitOp>(
-      firrtl::createGrandCentralPass(opt.getCompanionMode()));
-
   // Run SymbolDCE as late as possible, but before InnerSymbolDCE. This is for
   // hierpathop's and just for general cleanup.
   pm.addNestedPass<firrtl::CircuitOp>(mlir::createSymbolDCEPass());
@@ -228,11 +223,14 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
   //
   // TODO: Improve LowerLayers to avoid the need for canonicalization. See:
   //   https://github.com/llvm/circt/issues/7896
-  if (opt.shouldAdvancedLayerSink())
-    pm.nest<firrtl::CircuitOp>().addPass(firrtl::createAdvancedLayerSinkPass());
-  else
-    pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
-        firrtl::createLayerSinkPass());
+  if (!opt.shouldDisableLayerSink()) {
+    if (opt.shouldAdvancedLayerSink())
+      pm.nest<firrtl::CircuitOp>().addPass(
+          firrtl::createAdvancedLayerSinkPass());
+    else
+      pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
+          firrtl::createLayerSinkPass());
+  }
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createLowerLayersPass());
   if (!opt.shouldDisableOptimization())
     pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
@@ -244,6 +242,15 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
 
   pm.nest<firrtl::CircuitOp>().addPass(
       firrtl::createAssignOutputDirsPass(outputFilename));
+
+  // Run passes to resolve Grand Central features.  This should run before
+  // BlackBoxReader because Grand Central needs to inform BlackBoxReader where
+  // certain black boxes should be placed.  Note: all Grand Central Taps related
+  // collateral is resolved entirely by LowerAnnotations.
+  // Run this after output directories are (otherwise) assigned,
+  // so generated interfaces can be appropriately marked.
+  pm.addNestedPass<firrtl::CircuitOp>(
+      firrtl::createGrandCentralPass(opt.getCompanionMode()));
 
   // Read black box source files into the IR.
   StringRef blackBoxRoot = opt.getBlackBoxRootPath().empty()
@@ -522,6 +529,10 @@ struct FirtoolCmdOptions {
                                   "release", "Compile with optimizations")),
       llvm::cl::init(firtool::FirtoolOptions::BuildModeDefault)};
 
+  llvm::cl::opt<bool> disableLayerSink{"disable-layer-sink",
+                                       llvm::cl::desc("Disable layer sink"),
+                                       cl::init(false)};
+
   llvm::cl::opt<bool> disableOptimization{
       "disable-opt",
       llvm::cl::desc("Disable optimizations"),
@@ -760,9 +771,10 @@ circt::firtool::FirtoolOptions::FirtoolOptions()
       allowAddingPortsOnPublic(false), probesToSignals(false),
       preserveAggregate(firrtl::PreserveAggregate::None),
       preserveMode(firrtl::PreserveValues::None), enableDebugInfo(false),
-      buildMode(BuildModeRelease), disableOptimization(false),
-      exportChiselInterface(false), chiselInterfaceOutDirectory(""),
-      vbToBV(false), noDedup(false), companionMode(firrtl::CompanionMode::Bind),
+      buildMode(BuildModeRelease), disableLayerSink(false),
+      disableOptimization(false), exportChiselInterface(false),
+      chiselInterfaceOutDirectory(""), vbToBV(false), noDedup(false),
+      companionMode(firrtl::CompanionMode::Bind),
       disableAggressiveMergeConnections(false), advancedLayerSink(false),
       lowerMemories(false), blackBoxRootPath(""), replSeqMem(false),
       replSeqMemFile(""), extractTestCode(false), ignoreReadEnableMem(false),
@@ -789,6 +801,7 @@ circt::firtool::FirtoolOptions::FirtoolOptions()
   preserveMode = clOptions->preserveMode;
   enableDebugInfo = clOptions->enableDebugInfo;
   buildMode = clOptions->buildMode;
+  disableLayerSink = clOptions->disableLayerSink;
   disableOptimization = clOptions->disableOptimization;
   exportChiselInterface = clOptions->exportChiselInterface;
   chiselInterfaceOutDirectory = clOptions->chiselInterfaceOutDirectory;

@@ -32,6 +32,28 @@ using namespace mlir::arith;
 namespace circt {
 namespace calyx {
 
+template <typename OpTy>
+static LogicalResult deduplicateParallelOperation(OpTy parOp,
+                                                  PatternRewriter &rewriter) {
+  auto *body = parOp.getBodyBlock();
+  if (body->getOperations().size() < 2)
+    return failure();
+
+  LogicalResult result = LogicalResult::failure();
+  SetVector<StringRef> members;
+  for (auto &op : make_early_inc_range(*body)) {
+    auto enableOp = dyn_cast<EnableOp>(&op);
+    if (enableOp == nullptr)
+      continue;
+    bool inserted = members.insert(enableOp.getGroupName());
+    if (!inserted) {
+      rewriter.eraseOp(enableOp);
+      result = LogicalResult::success();
+    }
+  }
+  return result;
+}
+
 void appendPortsForExternalMemref(PatternRewriter &rewriter, StringRef memName,
                                   Value memref, unsigned memoryID,
                                   SmallVectorImpl<calyx::PortInfo> &inPorts,
@@ -161,11 +183,11 @@ Value getComponentOutput(calyx::ComponentOp compOp, unsigned outPortIdx) {
   return compOp.getArgument(index);
 }
 
-Type convIndexType(OpBuilder &builder, Type type) {
+Type normalizeType(OpBuilder &builder, Type type) {
   if (type.isIndex())
     return builder.getI32Type();
-  if (type.isIntOrFloat() && !type.isInteger())
-    return builder.getIntegerType(type.getIntOrFloatBitWidth());
+  if (type.isIntOrFloat())
+    return toBitVector(type);
   return type;
 }
 
@@ -637,12 +659,12 @@ LogicalResult
 ConvertIndexTypes::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
                                             PatternRewriter &rewriter) const {
   for (auto arg : funcOp.getArguments()) {
-    arg.setType(calyx::convIndexType(rewriter, arg.getType()));
+    arg.setType(calyx::normalizeType(rewriter, arg.getType()));
   }
 
   funcOp.walk([&](Block *block) {
     for (Value arg : block->getArguments())
-      arg.setType(calyx::convIndexType(rewriter, arg.getType()));
+      arg.setType(calyx::normalizeType(rewriter, arg.getType()));
   });
 
   funcOp.walk([&](Operation *op) {
@@ -651,7 +673,7 @@ ConvertIndexTypes::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
       if (!resType.isIndex())
         continue;
 
-      result.setType(calyx::convIndexType(rewriter, resType));
+      result.setType(calyx::normalizeType(rewriter, resType));
       auto constant = dyn_cast<mlir::arith::ConstantOp>(op);
       if (!constant)
         continue;
@@ -730,6 +752,22 @@ EliminateUnusedCombGroups::matchAndRewrite(calyx::CombGroupOp combGroupOp,
 }
 
 //===----------------------------------------------------------------------===//
+// DeduplicateParallelOperations
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+DeduplicateParallelOp::matchAndRewrite(calyx::ParOp parOp,
+                                       PatternRewriter &rewriter) const {
+  return deduplicateParallelOperation<calyx::ParOp>(parOp, rewriter);
+}
+
+LogicalResult
+DeduplicateStaticParallelOp::matchAndRewrite(calyx::StaticParOp parOp,
+                                             PatternRewriter &rewriter) const {
+  return deduplicateParallelOperation<calyx::StaticParOp>(parOp, rewriter);
+}
+
+//===----------------------------------------------------------------------===//
 // InlineCombGroups
 //===----------------------------------------------------------------------===//
 
@@ -798,7 +836,7 @@ void InlineCombGroups::recurseInlineCombGroups(
             calyx::CompareFOpIEEE754>(src.getDefiningOp()))
       continue;
 
-    auto evalGroupOpt = state.getEvaluatingGroup(src);
+    auto evalGroupOpt = state.findEvaluatingGroup(src);
     if (!evalGroupOpt.has_value()) {
       continue;
     }
@@ -893,7 +931,7 @@ BuildReturnRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
                                           PatternRewriter &rewriter) const {
 
   for (auto argType : enumerate(funcOp.getResultTypes())) {
-    auto convArgType = calyx::convIndexType(rewriter, argType.value());
+    auto convArgType = calyx::normalizeType(rewriter, argType.value());
     assert((isa<IntegerType>(convArgType) || isa<FloatType>(convArgType)) &&
            "unsupported return type");
     std::string name = "ret_arg" + std::to_string(argType.index());
@@ -936,24 +974,6 @@ BuildCallInstance::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
           createInstance(callOp.getLoc(), rewriter, getComponent(), resultTypes,
                          instanceName, componentOp.getName());
       getState().addInstance(instanceName, instanceOp);
-      hw::ConstantOp constantOp =
-          createConstant(callOp.getLoc(), rewriter, getComponent(), 1, 1);
-      OpBuilder::InsertionGuard g(rewriter);
-      rewriter.setInsertionPointToStart(
-          getComponent().getWiresOp().getBodyBlock());
-
-      // Creates the group that initializes the instance.
-      calyx::GroupOp groupOp = rewriter.create<calyx::GroupOp>(
-          callOp.getLoc(), "init_" + instanceName);
-      rewriter.setInsertionPointToStart(groupOp.getBodyBlock());
-      auto portInfos = instanceOp.getReferencedComponent().getPortInfo();
-      auto results = instanceOp.getResults();
-      for (const auto &[portInfo, result] : llvm::zip(portInfos, results)) {
-        if (portInfo.hasAttribute(goPort) || portInfo.hasAttribute(resetPort))
-          rewriter.create<calyx::AssignOp>(callOp.getLoc(), result, constantOp);
-        else if (portInfo.hasAttribute(donePort))
-          rewriter.create<calyx::GroupDoneOp>(callOp.getLoc(), result);
-      }
     }
     WalkResult::advance();
   });

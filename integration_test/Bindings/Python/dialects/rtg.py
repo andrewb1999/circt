@@ -19,16 +19,17 @@ with Context() as ctx, Location.unknown():
     target = rtg.TargetOp('target_name', TypeAttr.get(dictTy))
     targetBlock = Block.create_at_start(target.bodyRegion, [])
     with InsertionPoint(targetBlock):
-      cpu0 = rtgtest.CPUDeclOp(cpuTy, 0)
-      cpu1 = rtgtest.CPUDeclOp(cpuTy, 1)
+      cpuAttr = rtgtest.CPUAttr.get(0)
+      cpu0 = rtgtest.CPUDeclOp(cpuAttr)
+      cpu1 = rtgtest.CPUDeclOp(rtgtest.CPUAttr.get(cpuAttr.id + 1))
       rtg.YieldOp([cpu0, cpu1])
 
     test = rtg.TestOp('test_name', TypeAttr.get(dictTy))
     Block.create_at_start(test.bodyRegion, [cpuTy, cpuTy])
 
   # CHECK: rtg.target @target_name : !rtg.dict<cpu0: !rtgtest.cpu, cpu1: !rtgtest.cpu> {
-  # CHECK:   [[V0:%.+]] = rtgtest.cpu_decl 0
-  # CHECK:   [[V1:%.+]] = rtgtest.cpu_decl 1
+  # CHECK:   [[V0:%.+]] = rtgtest.cpu_decl <0>
+  # CHECK:   [[V1:%.+]] = rtgtest.cpu_decl <1>
   # CHECK:   rtg.yield [[V0]], [[V1]] : !rtgtest.cpu, !rtgtest.cpu
   # CHECK: }
   # CHECK: rtg.test @test_name : !rtg.dict<cpu0: !rtgtest.cpu, cpu1: !rtgtest.cpu> {
@@ -84,11 +85,83 @@ with Context() as ctx, Location.unknown():
   with InsertionPoint(m.body):
     indexTy = IndexType.get()
     sequenceTy = rtg.SequenceType.get()
+    labelTy = rtg.LabelType.get()
     setTy = rtg.SetType.get(indexTy)
     bagTy = rtg.BagType.get(indexTy)
     seq = rtg.SequenceOp('seq')
-    Block.create_at_start(seq.bodyRegion, [sequenceTy, setTy, bagTy])
+    Block.create_at_start(seq.bodyRegion, [sequenceTy, labelTy, setTy, bagTy])
 
   # CHECK: rtg.sequence @seq
-  # CHECK: (%{{.*}}: !rtg.sequence, %{{.*}}: !rtg.set<index>, %{{.*}}: !rtg.bag<index>):
+  # CHECK: (%{{.*}}: !rtg.sequence, %{{.*}}: !rtg.label, %{{.*}}: !rtg.set<index>, %{{.*}}: !rtg.bag<index>):
+  print(m)
+
+with Context() as ctx, Location.unknown():
+  circt.register_dialects(ctx)
+  m = Module.create()
+  with InsertionPoint(m.body):
+    # CHECK: rtg.fixed_reg #rtgtest.zero
+    rtg.FixedRegisterOp(rtgtest.RegZeroAttr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.ra
+    rtg.FixedRegisterOp(rtgtest.RegRaAttr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.sp
+    rtg.FixedRegisterOp(rtgtest.RegSpAttr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.gp
+    rtg.FixedRegisterOp(rtgtest.RegGpAttr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.tp
+    rtg.FixedRegisterOp(rtgtest.RegTpAttr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.t0
+    rtg.FixedRegisterOp(rtgtest.RegT0Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.t1
+    rtg.FixedRegisterOp(rtgtest.RegT1Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.t2
+    rtg.FixedRegisterOp(rtgtest.RegT2Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s0
+    rtg.FixedRegisterOp(rtgtest.RegS0Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s1
+    rtg.FixedRegisterOp(rtgtest.RegS1Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.a0
+    rtg.FixedRegisterOp(rtgtest.RegA0Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.a1
+    rtg.FixedRegisterOp(rtgtest.RegA1Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.a2
+    rtg.FixedRegisterOp(rtgtest.RegA2Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.a3
+    rtg.FixedRegisterOp(rtgtest.RegA3Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.a4
+    rtg.FixedRegisterOp(rtgtest.RegA4Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.a5
+    rtg.FixedRegisterOp(rtgtest.RegA5Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.a6
+    rtg.FixedRegisterOp(rtgtest.RegA6Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.a7
+    rtg.FixedRegisterOp(rtgtest.RegA7Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s2
+    rtg.FixedRegisterOp(rtgtest.RegS2Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s3
+    rtg.FixedRegisterOp(rtgtest.RegS3Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s4
+    rtg.FixedRegisterOp(rtgtest.RegS4Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s5
+    rtg.FixedRegisterOp(rtgtest.RegS5Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s6
+    rtg.FixedRegisterOp(rtgtest.RegS6Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s7
+    rtg.FixedRegisterOp(rtgtest.RegS7Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s8
+    rtg.FixedRegisterOp(rtgtest.RegS8Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s9
+    rtg.FixedRegisterOp(rtgtest.RegS9Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s10
+    rtg.FixedRegisterOp(rtgtest.RegS10Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.s11
+    rtg.FixedRegisterOp(rtgtest.RegS11Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.t3
+    rtg.FixedRegisterOp(rtgtest.RegT3Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.t4
+    rtg.FixedRegisterOp(rtgtest.RegT4Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.t5
+    rtg.FixedRegisterOp(rtgtest.RegT5Attr.get())
+    # CHECK: rtg.fixed_reg #rtgtest.t6
+    rtg.FixedRegisterOp(rtgtest.RegT6Attr.get())
+
   print(m)
