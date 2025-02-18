@@ -417,6 +417,22 @@ struct StoreInterfaceAddressNarrowingPattern
   }
 };
 
+namespace {
+class DataFlowListener : public RewriterBase::Listener {
+public:
+  DataFlowListener(DataFlowSolver &s) : s(s) {}
+
+protected:
+  void notifyOperationErased(Operation *op) override {
+    s.eraseState(s.getProgramPointAfter(op));
+    for (Value res : op->getResults())
+      s.eraseState(res);
+  }
+
+  DataFlowSolver &s;
+};
+} // namespace
+
 void BitwidthReductionForLoopSchedule::runOnOperation() {
   auto op = getOperation();
   auto &context = getContext();
@@ -427,7 +443,7 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   patterns.add<SCFForIterationReduction>(&context);
 
   GreedyRewriteConfig config;
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
+  if (failed(applyPatternsGreedily(op, std::move(patterns), config))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");
     signalPassFailure();
   }
@@ -438,18 +454,24 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   for (unsigned i = 1; i <= 128; ++i) {
     bitwidthsSupported.push_back(i);
   }
+
   DataFlowSolver solver;
   solver.load<dataflow::DeadCodeAnalysis>();
   solver.load<dataflow::IntegerRangeAnalysis>();
   if (failed(solver.initializeAndRun(op)))
     return signalPassFailure();
-  patterns.clear();
+  
+  DataFlowListener listener(solver);
+
   populateIntRangeNarrowingPatterns(patterns, solver, bitwidthsSupported);
+
   GreedyRewriteConfig narrowingConfig;
   // We specifically need bottom-up traversal as cmpi pattern needs range
   // data, attached to its original argument values.
   narrowingConfig.useTopDownTraversal = false;
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), narrowingConfig))) {
+  narrowingConfig.listener = &listener;
+
+  if (failed(applyPatternsGreedily(op, std::move(patterns), narrowingConfig))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");
     signalPassFailure();
   }
@@ -466,7 +488,7 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   patterns.add<LoadInterfaceAddressNarrowingPattern>(&context);
   patterns.add<StoreInterfaceAddressNarrowingPattern>(&context);
 
-  if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns), config))) {
+  if (failed(applyPatternsGreedily(op, std::move(patterns), config))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");
     signalPassFailure();
   }
