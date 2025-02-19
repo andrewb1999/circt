@@ -1870,7 +1870,7 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
 
       if (!loop.isPipelined()) {
         condGroup = getState<ComponentLoweringState>()
-                        .getEvaluatingGroup<calyx::CombGroupOp>(condValue);
+                        .findEvaluatingGroup<calyx::CombGroupOp>(condValue);
       }
 
       for (auto phase : bodyBlock->getOps<PhaseInterface>()) {
@@ -2786,9 +2786,9 @@ class InlineCombGroupsIf : public calyx::FuncOpPartialLoweringPattern {
     componentOp.walk([&](Operation *op) {
       std::optional<Operation *> evalGroupOpt;
       if (auto ifOp = dyn_cast<calyx::StaticIfOp>(op)) {
-        evalGroupOpt = state.getEvaluatingGroup(ifOp.getCond());
+        evalGroupOpt = state.findEvaluatingGroup(ifOp.getCond());
       } else if (auto ifOp = dyn_cast<calyx::IfOp>(op)) {
-        evalGroupOpt = state.getEvaluatingGroup(ifOp.getCond());
+        evalGroupOpt = state.findEvaluatingGroup(ifOp.getCond());
       } else {
         return;
       }
