@@ -936,6 +936,29 @@ moore.module @WaitEvent() {
   }
 }
 
+// CHECK-LABEL: hw.module @EmptyWaitEvent(
+moore.module @EmptyWaitEvent(out out : !moore.l32) {
+  // CHECK: [[OUT:%.+]] = llhd.sig %c0_i32
+  // CHECK: llhd.process {
+  // CHECK:   cf.br
+  // CHECK: ^bb
+  // CHECK:   llhd.halt
+  // CHECK: ^bb{{.*}} // no predecessors
+  // CHECK: }
+  // CHECK: [[PRB:%.+]] = llhd.prb [[OUT]] : !hw.inout<i32>
+  // CHECK: hw.output [[PRB]] : i32
+  %0 = moore.constant 0 : l32
+  %out = moore.variable : <l32>
+  moore.procedure always {
+    moore.wait_event {
+    }
+    moore.blocking_assign %out, %0 : l32
+    moore.return
+  }
+  %1 = moore.read %out : <l32>
+  moore.output %1 : !moore.l32
+}
+
 // Just check that block without predecessors are handled without crashing
 // CHECK-LABEL: @NoPredecessorBlockErasure
 moore.module @NoPredecessorBlockErasure(in %clk_i : !moore.l1, in %raddr_i : !moore.array<2 x l5>, out rdata_o : !moore.array<2 x l32>, in %waddr_i : !moore.array<1 x l5>, in %wdata_i : !moore.array<1 x l32>, in %we_i : !moore.l1) {
@@ -1094,6 +1117,25 @@ moore.module @scfInsideProcess(in %in0: !moore.i32, in %in1: !moore.i32) {
   moore.procedure initial {
     %0 = moore.pows %in0, %in1 : !moore.i32
     moore.blocking_assign %var, %0 : !moore.i32
+    moore.return
+  }
+}
+
+// CHECK-LABEL: @blockArgAsObservedValue
+moore.module @blockArgAsObservedValue(in %in0: !moore.i32, in %in1: !moore.i32) {
+  %var = moore.variable : <!moore.i32>
+  // CHECK: [[PRB:%.+]] = llhd.prb %var : !hw.inout<i32>
+  // CHECK: llhd.process
+  moore.procedure always_comb {
+    // CHECK: ^bb1:  // 2 preds: ^bb0, ^bb5
+      // CHECK: [[COND:%.+]] = comb.icmp slt %in1, %{{.*}} : i32
+      // CHECK: comb.mux [[COND]], %{{.*}}, %in0 : i32
+      // CHECK: comb.mux [[COND]], %{{.*}}, %in1 : i32
+    %0 = moore.pows %in0, %in1 : !moore.i32
+    moore.blocking_assign %var, %0 : !moore.i32
+    
+    // CHECK: ^bb5:  // pred: ^bb4
+    // CHECK:   llhd.wait (%in0, %in1, [[PRB]] : i32, i32, i32), ^bb1
     moore.return
   }
 }

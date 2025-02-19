@@ -107,7 +107,7 @@ void TargetOp::build(OpBuilder &builder, OperationState &state,
     return;
   assert(functionType.getNumInputs() == argAttrs.size());
   assert(functionType.getNumResults() == resAttrs.size());
-  function_interface_impl::addArgAndResultAttrs(
+  call_interface_impl::addArgAndResultAttrs(
       builder, state, argAttrs, resAttrs,
       TargetOp::getArgAttrsAttrName(state.name),
       TargetOp::getResAttrsAttrName(state.name));

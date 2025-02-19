@@ -9,7 +9,7 @@ from .module import (generator, modparams, Module, ModuleLikeBuilderBase,
                      PortProxyBase)
 from .signals import (BitsSignal, BundleSignal, ChannelSignal, Signal,
                       _FromCirctValue, UIntSignal)
-from .support import optional_dict_to_dict_attr, get_user_loc
+from .support import clog2, optional_dict_to_dict_attr, get_user_loc
 from .system import System
 from .types import (Any, Bits, Bundle, BundledChannel, Channel,
                     ChannelDirection, StructType, Type, UInt, types,
@@ -129,6 +129,22 @@ def Cosim(decl: ServiceDecl, clk, rst):
   decl.instantiate_builtin(AppID("cosim", 0), "cosim", [], [clk, rst])
 
 
+class EngineModule(Module):
+  """A module which implements an ESI engines. Engines have the responsibility
+  of transporting messages between two different devices."""
+
+  @property
+  def TypeName(self):
+    assert False, "Engine modules must have a TypeName property."
+
+  def __init__(self, appid: AppID, **inputs):
+    super(EngineModule, self).__init__(appid=appid, **inputs)
+
+  @property
+  def appid(self) -> AppID:
+    return AppID(self.inst.attributes["esi.appid"])
+
+
 class NamedChannelValue(ChannelSignal):
   """A ChannelValue with the name of the client request."""
 
@@ -189,12 +205,46 @@ class _OutputBundleSetter(AssignableSignal):
           f"Channel type mismatch. Expected {self.type}, got {new_value.type}.")
     msft.replaceAllUsesWith(self._bundle_to_replace, new_value.value)
     self._bundle_to_replace = None
-    self.req = None
 
   def cleanup(self):
     """Null out all the references to all the ops to allow them to be GC'd."""
     self.req = None
     self.rec = None
+
+
+class EngineServiceRecord:
+  """Represents a record in the engine section of the manifest."""
+
+  def __init__(self,
+               engine: EngineModule,
+               details: Optional[Dict[str, object]] = None):
+    rec_appid = AppID(f"{engine.appid.name}_record", engine.appid.index)
+    self._rec = raw_esi.ServiceImplRecordOp(appID=rec_appid._appid,
+                                            serviceImplName=engine.TypeName,
+                                            implDetails=details,
+                                            isEngine=True)
+    self._rec.regions[0].blocks.append()
+
+  def add_record(self,
+                 client: _OutputBundleSetter,
+                 channel_assignments: Optional[Dict] = None,
+                 details: Optional[Dict[str, object]] = None):
+    """Add a record to the manifest for this client request. Generally used to
+    give the runtime necessary information about how to connect to the client
+    through the generated service. For instance, offsets into an MMIO space."""
+
+    channel_assignments = optional_dict_to_dict_attr(channel_assignments)
+    details = optional_dict_to_dict_attr(details)
+
+    with get_user_loc(), ir.InsertionPoint.at_block_begin(
+        self._rec.reqDetails.blocks[0]):
+      raw_esi.ServiceImplClientRecordOp(
+          client.req.relativeAppIDPath,
+          client.req.servicePort,
+          ir.TypeAttr.get(client.req.toClient.type),
+          channelAssignments=channel_assignments,
+          implDetails=details,
+      )
 
 
 class _ServiceGeneratorBundles:
@@ -219,6 +269,14 @@ class _ServiceGeneratorBundles:
         for idx, req in enumerate(to_client_reqs)
     ]
     assert len(self._output_reqs) == len(req.results) - num_output_ports
+
+  def emit_engine(self,
+                  engine: EngineModule,
+                  details: Dict[str, object] = None):
+    """Emit and return an engine record."""
+    details = optional_dict_to_dict_attr(details)
+    with get_user_loc(), ir.InsertionPoint(self._rec):
+      return EngineServiceRecord(engine, details)
 
   @property
   def to_client_reqs(self) -> List[_OutputBundleSetter]:
@@ -582,8 +640,6 @@ class _HostMem(ServiceDecl):
 
   def write(self, appid: AppID, req: ChannelSignal) -> ChannelSignal:
     """Create a write request to the host memory out of a request channel."""
-    self._materialize_service_decl()
-
     # Extract the data type from the request channel and call the helper to get
     # the write bundle type for the req channel.
     req_data_type = req.type.inner_type.data
@@ -596,8 +652,6 @@ class _HostMem(ServiceDecl):
                 write_bundle_type._type,
                 hw.InnerRefAttr.get(self.symbol, ir.StringAttr.get("write")),
                 appid._appid).toClient))
-    resp = bundle.unpack(req=req)['ackTag']
-    return resp
 
   # Create a read request to the host memory out of a request channel and return
   # the response channel with the specified data type.
@@ -866,34 +920,58 @@ def ChannelDemux2(data_type: Type):
   return ChannelDemux2
 
 
-def ChannelDemux(input: ChannelSignal, sel: BitsSignal,
-                 num_outs: int) -> List[ChannelSignal]:
-  """Build a demultiplexer of ESI channels. Ideally, this would be a
-  parameterized module with an array of output channels, but the current ESI
-  channel-port lowering doesn't deal with arrays of channels. Independent of the
-  signaling protocol."""
+def ChannelDemux(input: ChannelSignal,
+                 sel: BitsSignal,
+                 num_outs: int,
+                 instance_name: Optional[str] = None) -> List[ChannelSignal]:
+  """Build a demultiplexer of ESI channels. 'num_outs' is the number of outputs,
+  sel it the select signal, and input is the input channel. Function simply
+  passes though to the module and is provided to legacy reasons."""
+  demux = ChannelDemuxMod(input.type, num_outs)(input=input,
+                                                sel=sel,
+                                                instance_name=instance_name)
+  return [getattr(demux, f"output_{i}") for i in range(num_outs)]
 
-  dmux2 = ChannelDemux2(input.type)
 
-  def build_tree(inter_input: ChannelSignal, inter_sel: BitsSignal,
-                 inter_num_outs: int, path: str) -> List[ChannelSignal]:
-    """Builds a binary tree of demuxes to demux the input channel."""
-    if inter_num_outs == 0:
-      return []
-    if inter_num_outs == 1:
-      return [inter_input]
+@modparams
+def ChannelDemuxMod(input_channel_type: Type, num_outs: int):
+  """Build a demultiplexer of ESI channels."""
 
-    demux2 = dmux2(sel=inter_sel[-1].as_bits(),
-                   inp=inter_input,
-                   instance_name=f"demux2_path{path}")
-    next_sel = inter_sel[:-1].as_bits()
-    tree0 = build_tree(demux2.output0, next_sel, (inter_num_outs + 1) // 2,
-                       path + "0")
-    tree1 = build_tree(demux2.output1, next_sel, (inter_num_outs + 1) // 2,
-                       path + "1")
-    return tree0 + tree1
+  class ChannelDemuxImpl(Module):
+    input = Input(input_channel_type)
+    sel = Input(Bits(clog2(num_outs)))
 
-  return build_tree(input, sel, num_outs, "")
+    # Add an output port for each read client.
+    for i in range(num_outs):
+      locals()[f"output_{i}"] = Output(input_channel_type)
+
+    @generator
+    def build(ports) -> None:
+      dmux2 = ChannelDemux2(ports.input.type)
+
+      def build_tree(inter_input: ChannelSignal, inter_sel: BitsSignal,
+                     inter_num_outs: int, path: str) -> List[ChannelSignal]:
+        """Builds a binary tree of demuxes to demux the input channel."""
+        if inter_num_outs == 0:
+          return []
+        if inter_num_outs == 1:
+          return [inter_input]
+
+        demux2 = dmux2(sel=inter_sel[-1].as_bits(),
+                       inp=inter_input,
+                       instance_name=f"demux2_path{path}")
+        next_sel = inter_sel[:-1].as_bits()
+        tree0 = build_tree(demux2.output0, next_sel, (inter_num_outs + 1) // 2,
+                           path + "0")
+        tree1 = build_tree(demux2.output1, next_sel, (inter_num_outs + 1) // 2,
+                           path + "1")
+        return tree0 + tree1
+
+      outputs = build_tree(ports.input, ports.sel, num_outs, "")
+      for idx, output in enumerate(outputs):
+        setattr(ports, f"output_{idx}", output)
+
+  return ChannelDemuxImpl
 
 
 def ChannelMux2(data_type: Channel):

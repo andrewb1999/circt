@@ -195,6 +195,9 @@ static void getValuesToObserve(Region *region,
   region->getParentOp()->walk<WalkOrder::PreOrder, ForwardDominanceIterator<>>(
       [&](Operation *operation) {
         for (auto value : operation->getOperands()) {
+          if (isa<BlockArgument>(value))
+            value = rewriter.getRemappedValue(value);
+
           if (region->isAncestor(value.getParentRegion()))
             continue;
           if (auto *defOp = value.getDefiningOp();
@@ -339,6 +342,18 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
     //     opB
     auto *resumeBlock =
         rewriter.splitBlock(op->getBlock(), ++Block::iterator(op));
+
+    // If the 'wait_event' op is empty, we can lower it to a 'llhd.wait' op
+    // without any observed values, but since the process will never wake up
+    // from suspension anyway, we can also just terminate it using the
+    // 'llhd.halt' op.
+    if (op.getBody().front().empty()) {
+      // Let the cleanup iteration after the dialect conversion clean up all
+      // remaining unreachable blocks.
+      rewriter.replaceOpWithNewOp<llhd::HaltOp>(op);
+      return success();
+    }
+
     auto *waitBlock = rewriter.createBlock(resumeBlock);
     auto *checkBlock = rewriter.createBlock(resumeBlock);
 
