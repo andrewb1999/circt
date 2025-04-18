@@ -12,5 +12,6 @@ add_circt_dialect_library(CIRCTExportCalyx
   ${srcs}
   LINK_LIBS PUBLIC
   CIRCTCalyx
+  CIRCTExportVerilog
   MLIRTranslateLib
   )

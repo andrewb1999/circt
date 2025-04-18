@@ -359,7 +359,7 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
       opBuiltSuccessfully &=
           TypeSwitch<mlir::Operation *, bool>(op)
               .template Case<
-                  arith::ConstantOp, ReturnOp, BranchOpInterface,
+                  arith::ConstantOp, BranchOpInterface,
                   /// memory ops
                   memref::AllocOp, memref::AllocaOp, LoopScheduleLoadOp,
                   LoopScheduleStoreOp,
@@ -374,11 +374,11 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                   LoopInterface, LoopScheduleTerminatorOp, LoopScheduleYieldOp,
                   LoopScheduleIfOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
-              .template Case<FuncOp, LoopScheduleRegisterOp, PhaseInterface>(
-                  [&](auto) {
-                    /// Skip: these special cases will be handled separately.
-                    return true;
-                  })
+              .template Case<FuncOp, LoopScheduleRegisterOp, PhaseInterface,
+                             ReturnOp>([&](auto) {
+                /// Skip: these special cases will be handled separately.
+                return true;
+              })
               .Default([&](auto op) {
                 op->dump();
                 op->emitError()
@@ -1264,8 +1264,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
         reg, op.value());
   }
   /// Schedule group for execution for when executing the return op block.
-  getState<ComponentLoweringState>().addBlockSchedulable(retOp->getBlock(),
-                                                         groupOp);
+  // getState<ComponentLoweringState>().addBlockSchedulable(retOp->getBlock(),
+  //                                                        groupOp);
   return success();
 }
 
@@ -1920,6 +1920,27 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
                                   rewriter)))
         return failure();
     }
+
+    // Handle return op
+    auto retOp =
+        cast<func::ReturnOp>(funcOp.getFunctionBody().back().getTerminator());
+    if (retOp.getNumOperands() == 0)
+      return success();
+
+    std::string groupName =
+        getState<ComponentLoweringState>().getUniqueName("ret_assign");
+    auto groupOp = calyx::createStaticGroup(rewriter, getComponent(),
+                                            retOp.getLoc(), groupName, 1);
+    for (auto op : enumerate(retOp.getOperands())) {
+      auto reg = getState<ComponentLoweringState>().getReturnReg(op.index());
+      calyx::buildAssignmentsForRegisterWrite(
+          rewriter, groupOp,
+          getState<ComponentLoweringState>().getComponentOp(), reg, op.value());
+    }
+
+    /// Schedule group for execution for when executing the return op block.
+    getState<ComponentLoweringState>().addBlockSchedulable(retOp->getBlock(),
+                                                           groupOp);
 
     return success();
   }

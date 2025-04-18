@@ -338,7 +338,7 @@ def PrimitiveOp : CalyxCell<"primitive", [
   let extraClassDeclaration = [{
     /// Lookup the component for the symbol. This returns null on
     /// invalid IR.
-    hw::HWModuleExternOp getReferencedPrimitive();
+    hw::HWModuleLike getReferencedPrimitive();
   }];
 
   let arguments = (ins

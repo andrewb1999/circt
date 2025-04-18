@@ -12,13 +12,18 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/Calyx/CalyxEmitter.h"
+#include "circt/Conversion/ExportVerilog.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/SV/SVAttributes.h"
+#include "circt/Dialect/SV/SVDialect.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -51,6 +56,10 @@ static constexpr std::string_view quote() { return "\""; }
 static constexpr std::string_view apostrophe() { return "'"; }
 static constexpr std::string_view LBraceEndL() { return "{\n"; }
 static constexpr std::string_view RBraceEndL() { return "}\n"; }
+static constexpr std::string_view BeginEndL() { return "begin\n"; }
+static constexpr std::string_view EndEndL() { return "end\n"; }
+static constexpr std::string_view Begin() { return "begin"; }
+static constexpr std::string_view End() { return "end"; }
 static constexpr std::string_view semicolonEndL() { return ";\n"; }
 static constexpr std::string_view addressSymbol() { return "@"; }
 static constexpr std::string_view endl() { return "\n"; }
@@ -187,7 +196,7 @@ private:
 
 /// An emitter for Calyx dialect operations to .futil output.
 struct Emitter {
-  Emitter(llvm::raw_ostream &os) : os(os) {}
+  Emitter(llvm::raw_ostream &os) : logicCount(0), os(os) {}
   LogicalResult finalize();
 
   // Indentation
@@ -244,7 +253,19 @@ struct Emitter {
 
   // HWModuleExtern emission
   void emitPrimitiveExtern(hw::HWModuleExternOp op);
-  void emitPrimitivePorts(hw::HWModuleExternOp op);
+  void emitPrimitiveModule(hw::HWModuleOp op);
+  void emitPrimitivePorts(hw::HWModuleLike op);
+
+  // SV emission
+  void emitSVStmt(Operation *op);
+  void emitLogic(sv::LogicOp op);
+  void emitHWConstant(hw::ConstantOp op);
+  void emitConstantZ(sv::ConstantZOp op);
+  void emitAlwaysFF(sv::AlwaysFFOp op);
+  void emitCase(sv::CaseOp op);
+  void emitIf(sv::IfOp op);
+  void emitPAssign(sv::PAssignOp op);
+  void emitReadInOut(sv::ReadInOutOp op);
 
   // Instance emission
   void emitInstance(InstanceOp op);
@@ -319,7 +340,23 @@ struct Emitter {
   // Emits a library floating point primitives
   void emitLibraryFloatingPoint(Operation *op);
 
+  std::string getUniqueLogic() {
+    auto name = "GEN" + std::to_string(logicCount) + "_";
+    logicCount++;
+    return name;
+  }
+
+  std::string getUniqueConstantName(hw::ConstantOp op) {
+    auto name = "I" + std::to_string(op.getType().getIntOrFloatBitWidth()) +
+                "_CONST_" + std::to_string(op.getValue().getZExtValue());
+    return name;
+  }
+
 private:
+  unsigned int logicCount;
+
+  DenseMap<Value, std::string> logicNameMap;
+
   /// Used to track which imports are required for this program.
   ImportTracker importTracker;
 
@@ -648,6 +685,8 @@ void Emitter::emitModule(ModuleOp op) {
       emitComponent(componentOp);
     else if (auto hwModuleExternOp = dyn_cast<hw::HWModuleExternOp>(bodyOp))
       emitPrimitiveExtern(hwModuleExternOp);
+    else if (auto hwModuleOp = dyn_cast<hw::HWModuleOp>(bodyOp))
+      emitPrimitiveModule(hwModuleOp);
     else
       emitOpError(&bodyOp, "Unexpected op");
   }
@@ -761,8 +800,54 @@ void Emitter::emitPrimitiveExtern(hw::HWModuleExternOp op) {
   os << RBraceEndL();
 }
 
+static void createInputLogicMap(hw::HWModuleOp op,
+                                DenseMap<Value, std::string> &logicNameMap) {
+  for (unsigned i = 0; i < op.getNumInputPorts(); ++i) {
+    auto name = op.getInputName(i);
+    auto val = op.getArgumentForInput(i);
+    logicNameMap[val] = name;
+  }
+}
+
+void Emitter::emitPrimitiveModule(hw::HWModuleOp op) {
+  op.dump();
+  indent() << "primitive " << op.getName();
+
+  if (!op.getParameters().empty()) {
+    os << LSquare();
+    llvm::interleaveComma(op.getParameters(), os, [&](Attribute param) {
+      auto paramAttr = cast<hw::ParamDeclAttr>(param);
+      os << paramAttr.getName().str();
+    });
+    os << RSquare();
+  }
+  os << getAttributes(op, /*atFormat=*/false);
+  // Emit the ports.
+  emitPrimitivePorts(op);
+  createInputLogicMap(op, logicNameMap);
+  os << space() << LBraceEndL();
+  addIndent();
+
+  for (auto &&bodyOp : *op.getBodyBlock()) {
+    emitSVStmt(&bodyOp);
+  }
+
+  auto outputOp = cast<hw::OutputOp>(op.getBodyBlock()->getTerminator());
+
+  for (auto [src, dst] :
+       llvm::zip(outputOp.getOutputs(), op.getOutputNames())) {
+    auto srcName = logicNameMap[src];
+    auto dstName = cast<StringAttr>(dst).str();
+    indent() << "assign" << space() << dstName << space() << equals() << space()
+             << srcName << semicolonEndL();
+  }
+
+  reduceIndent();
+  indent() << RBraceEndL();
+}
+
 /// Emit the ports of a component.
-void Emitter::emitPrimitivePorts(hw::HWModuleExternOp op) {
+void Emitter::emitPrimitivePorts(hw::HWModuleLike op) {
   auto emitPorts = [&](auto ports, bool isInput) {
     auto e = static_cast<size_t>(std::distance(ports.begin(), ports.end()));
     os << LParen();
@@ -794,6 +879,138 @@ void Emitter::emitPrimitivePorts(hw::HWModuleExternOp op) {
   emitPorts(ports.getInputs(), true);
   os << arrow();
   emitPorts(ports.getOutputs(), false);
+}
+
+void Emitter::emitSVStmt(Operation *op) {
+  TypeSwitch<Operation *>(op)
+      .Case<sv::LogicOp>([&](auto op) { emitLogic(op); })
+      .Case<hw::ConstantOp>([&](auto op) { emitHWConstant(op); })
+      .Case<sv::ConstantZOp>([&](auto op) { emitConstantZ(op); })
+      .Case<sv::AlwaysFFOp>([&](auto op) { emitAlwaysFF(op); })
+      .Case<sv::CaseOp>([&](auto op) { emitCase(op); })
+      .Case<sv::IfOp>([&](auto op) { emitIf(op); })
+      .Case<sv::PAssignOp>([&](auto op) { emitPAssign(op); })
+      .Case<sv::ReadInOutOp>([&](auto op) { emitReadInOut(op); })
+      .Case<hw::OutputOp>([&](auto op) { /* Do nothing */ })
+      .Default([&](auto op) {
+        emitOpError(op, "not supported for emission inside HWModuleOp body");
+      });
+}
+
+void Emitter::emitConstantZ(sv::ConstantZOp op) {
+  indent() << "logic ";
+  if (op.getWidth() > 1) {
+    os << "[" << std::to_string(op.getWidth() - 1) << ":0]" << space();
+  }
+  std::string name = getUniqueLogic();
+  os << name << space() << equals() << space() << "'z" << semicolonEndL();
+  logicNameMap[op.getResult()] = name;
+}
+
+void Emitter::emitHWConstant(hw::ConstantOp op) {
+  indent() << "localparam ";
+  std::string name = getUniqueConstantName(op);
+  os << name << space() << equals() << space() << op.getValue().getZExtValue()
+     << semicolonEndL();
+  logicNameMap[op.getResult()] = name;
+}
+
+void Emitter::emitLogic(sv::LogicOp op) {
+  indent() << "logic ";
+  if (op.getElementType().getIntOrFloatBitWidth() > 1) {
+    os << "[" << std::to_string(op.getElementType().getIntOrFloatBitWidth() - 1)
+       << ":0]" << space();
+  }
+  std::string name;
+  if (!op.getName().empty()) {
+    name = op.getName();
+  } else {
+    name = getUniqueLogic();
+  }
+  logicNameMap[op.getResult()] = name;
+  os << name << semicolonEndL();
+}
+
+void Emitter::emitPAssign(sv::PAssignOp op) {
+  indent() << logicNameMap[op.getDest()] << space() << "<=" << space()
+           << logicNameMap[op.getSrc()] << semicolonEndL();
+}
+
+void Emitter::emitReadInOut(sv::ReadInOutOp op) {
+  logicNameMap[op.getResult()] = logicNameMap[op.getInput()];
+}
+
+void Emitter::emitIf(sv::IfOp op) {
+  indent() << "if" << space() << LParen();
+  os << logicNameMap[op.getCond()] << RParen() << space() << BeginEndL();
+  addIndent();
+  for (auto &&bodyOp : *op.getThenBlock()) {
+    emitSVStmt(&bodyOp);
+  }
+  reduceIndent();
+  indent() << End();
+  if (!op.hasElse()) {
+    os << endl();
+    return;
+  }
+
+  os << space() << "else" << space() << BeginEndL();
+  addIndent();
+  for (auto &&bodyOp : *op.getElseBlock()) {
+    emitSVStmt(&bodyOp);
+  }
+  reduceIndent();
+  indent() << EndEndL();
+}
+
+void Emitter::emitCase(sv::CaseOp op) {
+  indent() << "case" << LParen() << logicNameMap[op.getCond()] << RParen()
+           << endl();
+  addIndent();
+  for (auto &c : op.getCases()) {
+    if (auto *pattern = dyn_cast<sv::CaseDefaultPattern>(c.pattern.get())) {
+      indent() << "default: " << BeginEndL();
+    } else if (auto *pattern = dyn_cast<sv::CaseBitPattern>(c.pattern.get())) {
+      auto width = pattern->getWidth();
+      indent() << std::to_string(width) << "'b";
+      for (int i = width - 1; i >= 0; --i) {
+        os << sv::getLetter(pattern->getBit(i));
+      }
+      os << ":" << space() << BeginEndL();
+    } else {
+      assert(false && "unsupported case pattern");
+    }
+    addIndent();
+    addIndent();
+    for (auto &&bodyOp : *c.block) {
+      emitSVStmt(&bodyOp);
+    }
+    reduceIndent();
+    indent() << EndEndL();
+    reduceIndent();
+  }
+  reduceIndent();
+  indent() << "endcase" << endl();
+}
+
+void Emitter::emitAlwaysFF(sv::AlwaysFFOp op) {
+  indent() << "always_ff" << space() << "@" << LParen();
+  if (op.getClockEdge() == sv::EventControl::AtPosEdge) {
+    os << "posedge";
+  } else if (op.getClockEdge() == sv::EventControl::AtNegEdge) {
+    os << "negedge";
+  }
+  assert(logicNameMap.contains(op.getClock()));
+  auto clkName = logicNameMap[op.getClock()];
+  os << space() << clkName << RParen() << space() << BeginEndL();
+  addIndent();
+
+  for (auto &&bodyOp : *op.getBodyBlock()) {
+    emitSVStmt(&bodyOp);
+  }
+
+  reduceIndent();
+  indent() << EndEndL();
 }
 
 void Emitter::emitInstance(InstanceOp op) {
@@ -1165,7 +1382,7 @@ void circt::calyx::registerToCalyxTranslation() {
         return exportCalyx(module, os);
       },
       [](mlir::DialectRegistry &registry) {
-        registry
-            .insert<calyx::CalyxDialect, comb::CombDialect, hw::HWDialect>();
+        registry.insert<calyx::CalyxDialect, comb::CombDialect, hw::HWDialect,
+                        sv::SVDialect>();
       });
 }

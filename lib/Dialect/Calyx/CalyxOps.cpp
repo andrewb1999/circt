@@ -14,6 +14,7 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/FSM/FSMOps.h"
 #include "circt/Dialect/HW/HWAttributes.h"
+#include "circt/Dialect/HW/HWOpInterfaces.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "mlir/IR/AsmState.h"
@@ -34,6 +35,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include <cassert>
 
 using namespace circt;
 using namespace circt::calyx;
@@ -1684,12 +1686,24 @@ bool InstanceOp::isCombinational() {
 
 /// Lookup the component for the symbol. This returns null on
 /// invalid IR.
-hw::HWModuleExternOp PrimitiveOp::getReferencedPrimitive() {
+hw::HWModuleLike PrimitiveOp::getReferencedPrimitive() {
   auto module = (*this)->getParentOfType<ModuleOp>();
   if (!module)
     return nullptr;
 
-  return module.lookupSymbol<hw::HWModuleExternOp>(getPrimitiveName());
+  return module.lookupSymbol<hw::HWModuleLike>(getPrimitiveName());
+}
+
+static ArrayAttr getModuleParameters(hw::HWModuleLike hwModule) {
+  if (auto op = dyn_cast<hw::HWModuleExternOp>(hwModule.getOperation())) {
+    return op.getParameters();
+  }
+
+  if (auto op = dyn_cast<hw::HWModuleOp>(hwModule.getOperation())) {
+    return op.getParameters();
+  }
+  assert(false &&
+         "Only HWModuleExtern and HWModule are supported for calyx primitives");
 }
 
 /// Verifies the port information in comparison with the referenced component
@@ -1697,7 +1711,7 @@ hw::HWModuleExternOp PrimitiveOp::getReferencedPrimitive() {
 /// referenced component twice.
 static LogicalResult
 verifyPrimitiveOpType(PrimitiveOp instance,
-                      hw::HWModuleExternOp referencedPrimitive) {
+                      hw::HWModuleLike referencedPrimitive) {
   auto module = instance->getParentOfType<ModuleOp>();
   if (module->hasAttrOfType<StringAttr>("calyx.entrypoint")) {
     StringRef entryPointName =
@@ -1720,7 +1734,7 @@ verifyPrimitiveOpType(PrimitiveOp instance,
 
   // Verify parameters match up
   if (instance.getParameters().has_value()) {
-    ArrayAttr modParameters = referencedPrimitive.getParameters();
+    ArrayAttr modParameters = getModuleParameters(referencedPrimitive);
     ArrayAttr parameters = instance.getParameters().value();
     size_t numExpected = modParameters.size();
     size_t numParams = parameters.size();
@@ -1785,16 +1799,16 @@ PrimitiveOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
                        << "' is already a symbol for another primitive.";
 
   // Verify the referenced primitive is not instantiating itself.
-  auto parentPrimitive = op->getParentOfType<hw::HWModuleExternOp>();
+  auto parentPrimitive = op->getParentOfType<hw::HWModuleLike>();
   if (parentPrimitive == referencedPrimitive)
     return emitError() << "recursive instantiation of its parent primitive: '"
                        << getPrimitiveName() << "'";
 
-  assert(isa<hw::HWModuleExternOp>(referencedPrimitive) &&
+  assert(isa<hw::HWModuleLike>(referencedPrimitive) &&
          "Should be a HardwareModuleExternOp.");
 
   return verifyPrimitiveOpType(*this,
-                               cast<hw::HWModuleExternOp>(referencedPrimitive));
+                               cast<hw::HWModuleLike>(referencedPrimitive));
 }
 
 /// Provide meaningful names to the result values of an PrimitiveOp.
@@ -1854,11 +1868,11 @@ static DictionaryAttr cleanCalyxPortAttrs(OpBuilder builder,
   return builder.getDictionaryAttr(attrs);
 }
 
-// Grabs calyx port attributes from the HWModuleExternOp arg/result attributes.
+// Grabs calyx port attributes from the HWModuleLike arg/result attributes.
 SmallVector<DictionaryAttr> PrimitiveOp::portAttributes() {
   SmallVector<DictionaryAttr> portAttributes;
   OpBuilder builder(getContext());
-  hw::HWModuleExternOp prim = getReferencedPrimitive();
+  hw::HWModuleLike prim = getReferencedPrimitive();
   auto argAttrs = prim.getAllInputAttrs();
   auto resAttrs = prim.getAllOutputAttrs();
   for (auto a : argAttrs)
@@ -2906,12 +2920,11 @@ Value InvokeOp::getInstDoneValue() {
 
 // A helper function that gets the number of go or done ports in
 // hw.module.extern.
-static size_t
-getHwModuleExtGoOrDonePortNumber(hw::HWModuleExternOp &moduleExternOp,
-                                 bool isGo) {
+static size_t getHwModuleExtGoOrDonePortNumber(hw::HWModuleLike &moduleLike,
+                                               bool isGo) {
   size_t ret = 0;
   std::string str = isGo ? "calyx.go" : "calyx.done";
-  for (Attribute attr : moduleExternOp.getAllInputAttrs()) {
+  for (Attribute attr : moduleLike.getAllInputAttrs()) {
     if (DictionaryAttr dictAttr = dyn_cast<DictionaryAttr>(attr)) {
       ret = llvm::count_if(dictAttr, [&](NamedAttribute iter) {
         return iter.getName().getValue() == str;
