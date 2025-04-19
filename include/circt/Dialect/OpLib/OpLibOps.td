@@ -262,6 +262,12 @@ def YieldOp : OpLibOp<"yield", [Terminator,
                        Optional<AnyType>:$reset,
                        Variadic<AnyType>:$inputs,
                        Variadic<AnyType>:$outputs);
+
+  let builders = [
+    OpBuilder<(ins "ValueRange":$inputs, "ValueRange":$outputs), [{
+      build($_builder, $_state, nullptr, nullptr, nullptr, inputs, outputs);
+    }]>
+  ];
   let assemblyFormat = [{
     attr-dict (`clk` `(` $clock^ `:` qualified(type($clock)) `)` `,` )? 
               (`ce` `(` $clockEnable^ `:` qualified(type($clockEnable)) `)` `,` )?
