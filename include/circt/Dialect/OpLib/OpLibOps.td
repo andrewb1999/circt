@@ -265,7 +265,7 @@ def YieldOp : OpLibOp<"yield", [Terminator,
 
   let builders = [
     OpBuilder<(ins "ValueRange":$inputs, "ValueRange":$outputs), [{
-      build($_builder, $_state, nullptr, nullptr, nullptr, inputs, outputs);
+      build($_builder, $_state, Value(), Value(), Value(), inputs, outputs);
     }]>
   ];
   let assemblyFormat = [{

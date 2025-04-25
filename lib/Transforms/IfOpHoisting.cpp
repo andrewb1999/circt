@@ -117,6 +117,9 @@ struct IfOpHoistingPattern : OpConversionPattern<scf::IfOp> {
 };
 
 static bool ifOpLegalityCallback(scf::IfOp op) {
+  if (!op.elseBlock()) {
+    return true;
+  }
   auto res = op.getThenRegion().walk([&](Operation *op) {
     if (isa<scf::YieldOp>(op))
       return WalkResult::advance();

@@ -654,11 +654,21 @@ LogicalResult BuildOpGroups::buildOpFromOperator(
     op->emitError("Failed to replace all symbol uses");
     return failure();
   }
-  auto group = createStaticGroupForOp(rewriter, op, isPipeline ? 1 : latency);
+  calyx::GroupInterface group;
+  if (latency == 0) {
+    auto name = op->getName().getStringRef().split(".").second;
+    llvm::errs() << "latency 0\n";
+    llvm::errs() << name << "\n";
+    auto groupName = getState<ComponentLoweringState>().getUniqueName(name);
+    group = calyx::createGroup<calyx::CombGroupOp>(rewriter, getComponent(),
+                                                   op->getLoc(), groupName);
+  } else {
+    group = createStaticGroupForOp(rewriter, op, isPipeline ? 1 : latency);
+  }
 
   // Assign CE if it exists
   auto constOne = calyx::createConstant(op->getLoc(), rewriter, compOp, 1, 1);
-  rewriter.setInsertionPointToEnd(group.getBodyBlock());
+  rewriter.setInsertionPointToEnd(group.getBody());
   auto ceResNum = operatorLibraryAnalysis.getCEResultNum(operatorName);
   if (ceResNum.has_value()) {
     auto ce = clonedOp->getResult(ceResNum.value());
@@ -687,6 +697,8 @@ LogicalResult BuildOpGroups::buildOpFromOperator(
         operatorLibraryAnalysis.getCellResultForResultNum(operatorName, i);
     auto cellResult = clonedOp->getOpResult(resultNum);
     targetResult.replaceAllUsesWith(cellResult);
+
+    // Combinational operations should not have their result registered
     getState<ComponentLoweringState>().registerEvaluatingGroup(cellResult,
                                                                group);
   }
@@ -1667,7 +1679,8 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
 
     /// Create a calyx::ComponentOp corresponding to the to-be-lowered function.
     auto compOp = rewriter.create<calyx::ComponentOp>(
-        funcOp.getLoc(), rewriter.getStringAttr(funcOp.getSymName()), ports);
+        funcOp.getLoc(), rewriter.getStringAttr(funcOp.getSymName() + "_comp"),
+        ports);
 
     /// Mark this component as the toplevel.
     compOp->setAttr("toplevel", rewriter.getUnitAttr());
@@ -1684,7 +1697,7 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
 
     rewriter.setInsertionPointToStart(compOp.getBodyBlock());
     for (auto arg : enumerate(funcOp.getArguments())) {
-      if (auto memtype = arg.value().getType().dyn_cast<MemRefType>()) {
+      if (auto memtype = dyn_cast<MemRefType>(arg.value().getType())) {
         SmallVector<int64_t> addrSizes;
         SmallVector<int64_t> sizes;
         for (int64_t dim : memtype.getShape()) {
@@ -1715,6 +1728,7 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
     DenseMap<Value, calyx::RegisterOp> regMap;
+    // funcOp->getParentOfType<ModuleOp>().dump();
     auto res = funcOp.walk([&](LoopScheduleRegisterOp op) {
       // Condition registers are handled in BuildWhileGroups.
       auto *parent = op->getParentOp();
@@ -1754,7 +1768,12 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
         if (isIterArg)
           continue;
 
+        // value.dump();
+        // if (isa<BlockArgument>(value)) {
+        //   cast<BlockArgument>(value).getOwner()->dump();
+        // }
         if (!isa<LoopSchedulePipelineOp>(phase->getParentOp()) &&
+            !isa<BlockArgument>(value) &&
             isa<PhaseInterface>(value.getDefiningOp())) {
           // It won't be in the regMap if the value was loaded from memory and
           // not re-registered yet
@@ -1812,16 +1831,18 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
           continue;
         }
 
-        if (isa<LoopScheduleLoadOp>(value.getDefiningOp())) {
-          getState<ComponentLoweringState>().addPhaseReg(phase, value, i);
-          continue;
-        }
-
-        if (auto load =
-                dyn_cast<calyx::LoadLoweringInterface>(value.getDefiningOp())) {
-          if (load.getLatency().value_or(1) > 0) {
+        if (!isa<BlockArgument>(value)) {
+          if (isa<LoopScheduleLoadOp>(value.getDefiningOp())) {
             getState<ComponentLoweringState>().addPhaseReg(phase, value, i);
             continue;
+          }
+
+          if (auto load = dyn_cast<calyx::LoadLoweringInterface>(
+                  value.getDefiningOp())) {
+            if (load.getLatency().value_or(1) > 0) {
+              getState<ComponentLoweringState>().addPhaseReg(phase, value, i);
+              continue;
+            }
           }
         }
 
@@ -2034,7 +2055,8 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       assert(pipelineRegisterPtr);
       auto pipelineRegister = *pipelineRegisterPtr;
 
-      if (!isa<LoopSchedulePipelineOp>(phase->getParentOp()) &&
+      if (!isa<BlockArgument>(value) &&
+          !isa<LoopSchedulePipelineOp>(phase->getParentOp()) &&
           isa<calyx::RegisterOp>(value.getDefiningOp())) {
         phase->getResult(i).replaceAllUsesWith(pipelineRegister.getOut());
         continue;
@@ -2910,6 +2932,8 @@ class CleanupFuncOps : public calyx::FuncOpPartialLoweringPattern {
 
   LogicalResult matchAndRewrite(FuncOp funcOp,
                                 PatternRewriter &rewriter) const override {
+    auto compOp = functionMapping[funcOp];
+    compOp.setName(funcOp.getName());
     rewriter.eraseOp(funcOp);
     return success();
   }

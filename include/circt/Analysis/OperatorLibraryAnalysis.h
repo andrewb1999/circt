@@ -16,6 +16,7 @@
 
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Support/LLVM.h"
+#include "mlir/IR/Attributes.h"
 #include "mlir/Pass/AnalysisManager.h"
 #include <utility>
 
@@ -43,6 +44,8 @@ struct Operator {
   std::optional<unsigned> ce;
 
   std::optional<unsigned> reset;
+
+  SmallVector<mlir::NamedAttribute> attrs;
 };
 
 using PotentialOperatorsMap = std::map<StringRef, SmallVector<StringRef>>;
@@ -53,7 +56,7 @@ struct OperatorLibraryAnalysis {
   // Construct the analysis from an oplib::Library.
   OperatorLibraryAnalysis(Operation *op);
 
-  ArrayRef<StringRef> getPotentialOperators(Operation *);
+  SmallVector<StringRef> getPotentialOperators(Operation *);
 
   SmallVector<StringRef> getAllSupportedTargets();
 

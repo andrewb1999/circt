@@ -332,9 +332,8 @@ getSharedOperatorsProblem(scf::ForOp forOp,
   return problem;
 }
 
-ChainingSharedOperatorsProblem
-getChainingSharedOperatorsProblem(scf::ForOp forOp,
-                          LoopScheduleDependenceAnalysis &dependenceAnalysis) {
+ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
+    scf::ForOp forOp, LoopScheduleDependenceAnalysis &dependenceAnalysis) {
   ChainingSharedOperatorsProblem problem(forOp);
 
   // Insert memory dependences into the problem.
@@ -455,9 +454,8 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
   return problem;
 }
 
-ChainingSharedOperatorsProblem
-getChainingSharedOperatorsProblem(func::FuncOp funcOp,
-                          LoopScheduleDependenceAnalysis &dependenceAnalysis) {
+ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
+    func::FuncOp funcOp, LoopScheduleDependenceAnalysis &dependenceAnalysis) {
   ChainingSharedOperatorsProblem problem(funcOp);
 
   // Insert memory dependences into the problem.
@@ -750,6 +748,36 @@ struct IfToSelectPattern : OpConversionPattern<scf::IfOp> {
   }
 };
 
+struct EmptyIfRemovalPattern : OpConversionPattern<scf::IfOp> {
+  using OpConversionPattern<scf::IfOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!op.thenBlock()->without_terminator().empty()) {
+      return failure();
+    }
+
+    if (!op.thenYield().getResults().empty()) {
+      return failure();
+    }
+
+    if (op.elseBlock()) {
+      if (!op.elseBlock()->empty()) {
+        return failure();
+      }
+
+      if (!op.elseYield().getResults().empty()) {
+        return failure();
+      }
+    }
+
+    rewriter.eraseOp(op);
+
+    return success();
+  }
+};
+
 LogicalResult ifOpConversion(Operation *op, Region &body,
                              PredicateMap &predicateMap) {
   predicateMap.clear();
@@ -763,6 +791,7 @@ LogicalResult ifOpConversion(Operation *op, Region &body,
   RewritePatternSet patterns(ctx);
   patterns.add<IfOpConversionPattern>(ctx, predicateMap);
   patterns.add<IfToSelectPattern>(ctx);
+  patterns.add<EmptyIfRemovalPattern>(ctx);
 
   if (failed(applyPartialConversion(op, target, std::move(patterns))))
     return failure();

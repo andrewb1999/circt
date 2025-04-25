@@ -98,8 +98,7 @@ private:
                                            CyclicProblem &problem);
   LogicalResult createLoopScheduleSequential(scf::ForOp &loop,
                                              Problem &problem);
-  LogicalResult createFuncLoopSchedule(FuncOp &funcOp,
-                                       Problem &problem);
+  LogicalResult createFuncLoopSchedule(FuncOp &funcOp, Problem &problem);
 
   std::optional<LoopScheduleDependenceAnalysis> dependenceAnalysis;
   std::optional<OperatorLibraryAnalysis> operatorLibraryAnalysis;
@@ -286,6 +285,17 @@ void SCFToLoopSchedulePass::runOnOperation() {
   });
 }
 
+static bool onlyUserIsYield(Operation *op) {
+  auto users = op->getUsers();
+  if (std::distance(users.begin(), users.end()) != 1)
+    return false;
+
+  Operation *user = users.begin().getCurrent()->getOwner();
+
+  if (isa<scf::YieldOp>(user))
+    return true;
+}
+
 /// Populate the schedling problem operator types for the dialect we are
 /// targetting. Right now, we assume Calyx, which has a standard library with
 /// well-defined operator latencies. Ultimately, we should move this to a
@@ -305,6 +315,10 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
   problem.setLatency(combOpr, 0);
   problem.setIncomingDelay(combOpr, 0.2);
   problem.setOutgoingDelay(combOpr, 0.2);
+  OperatorType combEndOpr = problem.getOrInsertOperatorType("combEnd");
+  problem.setLatency(combEndOpr, 0);
+  problem.setIncomingDelay(combEndOpr, 0.2);
+  problem.setOutgoingDelay(combEndOpr, 0.2);
   OperatorType seqOpr = problem.getOrInsertOperatorType("seq");
   problem.setLatency(seqOpr, 1);
   problem.setIncomingDelay(seqOpr, 0.5);
@@ -352,17 +366,21 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
 
     return TypeSwitch<Operation *, WalkResult>(op)
         .Case<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
-              arith::TruncIOp, IndexCastOp, memref::AllocaOp,
-              memref::AllocOp, loopschedule::AllocInterface, YieldOp,
-              func::ReturnOp>([&](Operation *freeOp) {
-          // Some known free ops.
-          problem.setLinkedOperatorType(freeOp, freeOpr);
-          return WalkResult::advance();
-        })
-        .Case<CmpIOp, arith::SelectOp, AddIOp, SubIOp, ShLIOp, 
-              AndIOp, ShRSIOp, ShRUIOp, XOrIOp>([&](Operation *combOp) {
+              arith::TruncIOp, IndexCastOp, memref::AllocaOp, memref::AllocOp,
+              loopschedule::AllocInterface, YieldOp, func::ReturnOp>(
+            [&](Operation *freeOp) {
+              // Some known free ops.
+              problem.setLinkedOperatorType(freeOp, freeOpr);
+              return WalkResult::advance();
+            })
+        .Case<CmpIOp, arith::SelectOp, AddIOp, SubIOp, ShLIOp, AndIOp, ShRSIOp,
+              ShRUIOp, XOrIOp>([&](Operation *combOp) {
           // Some known combinational ops.
-          problem.setLinkedOperatorType(combOp, combOpr);
+          if (onlyUserIsYield(combOp)) {
+            problem.setLinkedOperatorType(combOp, combEndOpr);
+          } else {
+            problem.setLinkedOperatorType(combOp, combOpr);
+          }
           return WalkResult::advance();
         })
         .Case<MulIOp>([&](Operation *mcOp) {
@@ -681,11 +699,13 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
       }
       for (auto *user : users) {
         unsigned userStartTime = *problem.getStartTime(user);
+        // if (isLoopTerminator(user)) {
+        //   op->dump();
+        //   // Manually forward the value into the terminator's valueMap
+        //   pipeEndTime = std::max(
+        // } else if (*problem.getStartTime(user) > startTime)
         if (*problem.getStartTime(user) > startTime)
           pipeEndTime = std::max(pipeEndTime, userStartTime);
-        else if (isLoopTerminator(user))
-          // Manually forward the value into the terminator's valueMap
-          pipeEndTime = std::max(pipeEndTime, userStartTime + 1);
       }
 
       // Insert the range of pipeline stages the value needs to be valid for

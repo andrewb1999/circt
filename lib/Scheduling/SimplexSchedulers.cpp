@@ -302,9 +302,8 @@ protected:
                                    Dependence dep) override;
 
 public:
-  ChainingSharedOperatorsSimplexScheduler(ChainingSharedOperatorsProblem &prob, 
-                                          Operation *lastOp,
-                                          float cycleTime)
+  ChainingSharedOperatorsSimplexScheduler(ChainingSharedOperatorsProblem &prob,
+                                          Operation *lastOp, float cycleTime)
       : SimplexSchedulerBase(lastOp), prob(prob), cycleTime(cycleTime) {}
   LogicalResult schedule() override;
 };

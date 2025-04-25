@@ -1845,7 +1845,9 @@ SmallVector<Direction> PrimitiveOp::portDirections() {
   return portDirections;
 }
 
-bool PrimitiveOp::isCombinational() { return false; }
+bool PrimitiveOp::isCombinational() {
+  return getReferencedPrimitive()->hasAttr("combinational");
+}
 
 /// Returns a new DictionaryAttr containing only the calyx dialect attrs
 /// in the input DictionaryAttr. Also strips the 'calyx.' prefix from these

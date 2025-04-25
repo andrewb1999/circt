@@ -28,6 +28,7 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/FormatVariadic.h"
 #include <bitset>
 #include <string>
@@ -680,11 +681,28 @@ LogicalResult Emitter::finalize() { return failure(encounteredError); }
 
 /// Emit an entire program.
 void Emitter::emitModule(ModuleOp op) {
+  DenseMap<StringRef, SmallVector<hw::HWModuleExternOp>> collectedExterns;
+
+  op.walk([&](hw::HWModuleExternOp op) {
+    auto filename = op->getAttrOfType<StringAttr>("filename");
+    collectedExterns[filename.getValue()].push_back(op);
+  });
+
+  for (auto [filename, vec] : collectedExterns) {
+    indent() << "extern \"" << filename << "\"" << space() << LBraceEndL();
+    addIndent();
+    for (auto hwModuleExternOp : vec) {
+      emitPrimitiveExtern(hwModuleExternOp);
+    }
+    reduceIndent();
+    os << RBraceEndL();
+  }
+
   for (auto &bodyOp : *op.getBody()) {
     if (auto componentOp = dyn_cast<ComponentInterface>(bodyOp))
       emitComponent(componentOp);
     else if (auto hwModuleExternOp = dyn_cast<hw::HWModuleExternOp>(bodyOp))
-      emitPrimitiveExtern(hwModuleExternOp);
+      continue;
     else if (auto hwModuleOp = dyn_cast<hw::HWModuleOp>(bodyOp))
       emitPrimitiveModule(hwModuleOp);
     else
@@ -779,9 +797,6 @@ void Emitter::emitComponentPorts(ComponentInterface op) {
 
 /// Emit a primitive extern
 void Emitter::emitPrimitiveExtern(hw::HWModuleExternOp op) {
-  Attribute filename = op->getAttrDictionary().get("filename");
-  indent() << "extern " << filename << space() << LBraceEndL();
-  addIndent();
   indent() << "primitive " << op.getName();
 
   if (!op.getParameters().empty()) {
@@ -796,8 +811,6 @@ void Emitter::emitPrimitiveExtern(hw::HWModuleExternOp op) {
   // Emit the ports.
   emitPrimitivePorts(op);
   os << semicolonEndL();
-  reduceIndent();
-  os << RBraceEndL();
 }
 
 static void createInputLogicMap(hw::HWModuleOp op,
@@ -810,7 +823,6 @@ static void createInputLogicMap(hw::HWModuleOp op,
 }
 
 void Emitter::emitPrimitiveModule(hw::HWModuleOp op) {
-  op.dump();
   indent() << "primitive " << op.getName();
 
   if (!op.getParameters().empty()) {
@@ -1193,15 +1205,22 @@ void Emitter::emitConstant(ConstantOp constantOp) {
   auto fltAttr = cast<FloatAttr>(attr);
   APFloat value = fltAttr.getValue();
   auto type = cast<FloatType>(fltAttr.getType());
-  double doubleValue = value.convertToDouble();
   auto floatBits = value.getSizeInBits(type.getFloatSemantics());
   indent() << constantOp.getName().str() << space() << equals() << space()
            << "std_float_const";
   // Currently defaults to IEEE-754 representation [1].
   // [1]: https://github.com/calyxir/calyx/blob/main/primitives/float.futil
-  static constexpr int32_t IEEE754 = 0;
-  os << LParen() << std::to_string(IEEE754) << comma() << floatBits << comma()
-     << std::to_string(doubleValue) << RParen() << semicolonEndL();
+  static constexpr int32_t ieee754 = 0;
+  os << LParen() << std::to_string(ieee754) << comma() << floatBits << comma();
+  if (type.isF32()) {
+    float floatValue = value.convertToFloat();
+    os << llvm::format("%.9f", floatValue);
+  } else if (type.isF64()) {
+    double doubleValue = value.convertToDouble();
+    os << llvm::format("%.17f", doubleValue);
+  }
+
+  os << RParen() << semicolonEndL();
 }
 
 /// Calling getName() on a calyx operation will return "calyx.${opname}". This

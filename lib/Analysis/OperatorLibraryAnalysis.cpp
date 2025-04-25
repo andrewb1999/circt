@@ -63,19 +63,34 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
     operatorStruct.outDelay = operatorOp.getOutDelay();
     operatorStruct.templateOp = &matchOp.getBodyBlock()->front();
 
+    if (operationOp.getOpDict().has_value()) {
+      auto dict = operationOp.getOpDict().value();
+
+      for (auto attr : dict) {
+        operatorStruct.attrs.push_back(attr);
+      }
+    }
+
     auto yieldOp =
         cast<oplib::YieldOp>(matchOp.getBodyBlock()->getTerminator());
 
-    auto clockResultNum = cast<OpResult>(yieldOp.getClock()).getResultNumber();
-    operatorStruct.clock = clockResultNum;
+    if (yieldOp.getClock() != nullptr) {
+      auto clockResultNum =
+          cast<OpResult>(yieldOp.getClock()).getResultNumber();
+      operatorStruct.clock = clockResultNum;
+    }
 
-    auto resetResultNum =
-        cast<OpResult>(yieldOp.getReset()).getResultNumber();
-    operatorStruct.reset = resetResultNum;
+    if (yieldOp.getReset() != nullptr) {
+      auto resetResultNum =
+          cast<OpResult>(yieldOp.getReset()).getResultNumber();
+      operatorStruct.reset = resetResultNum;
+    }
 
-    auto ceResultNum =
-        cast<OpResult>(yieldOp.getClockEnable()).getResultNumber();
-    operatorStruct.ce = ceResultNum;
+    if (yieldOp.getClockEnable() != nullptr) {
+      auto ceResultNum =
+          cast<OpResult>(yieldOp.getClockEnable()).getResultNumber();
+      operatorStruct.ce = ceResultNum;
+    }
 
     for (auto iv : llvm::enumerate(yieldOp.getInputs())) {
       auto i = iv.index();
@@ -107,9 +122,31 @@ OperatorLibraryAnalysis::getOperatorTemplateOp(StringRef operatorName) {
   return operatorMap.at(operatorName).templateOp;
 }
 
-ArrayRef<StringRef>
+static bool allAttributesMatch(Operation *op, Operator &operatorStruct) {
+  // All attributes match
+  for (auto namedAttr : operatorStruct.attrs) {
+    auto otherAttr = op->getAttr(namedAttr.getName());
+    if (namedAttr.getValue() != otherAttr) {
+      return false;
+    }
+  }
+  return true;
+}
+
+SmallVector<StringRef>
 OperatorLibraryAnalysis::getPotentialOperators(Operation *op) {
-  return potentialOperatorsMap[op->getName().getStringRef()];
+  ArrayRef<StringRef> vec = potentialOperatorsMap[op->getName().getStringRef()];
+  SmallVector<StringRef> potentialOperators;
+
+  for (auto po : vec) {
+    auto operatorStruct = operatorMap.at(po);
+
+    if (allAttributesMatch(op, operatorStruct)) {
+      potentialOperators.push_back(po);
+    }
+  }
+
+  return potentialOperators;
 }
 
 SmallVector<StringRef> OperatorLibraryAnalysis::getAllSupportedTargets() {
