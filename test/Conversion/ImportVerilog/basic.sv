@@ -11,9 +11,29 @@ timeprecision 10fs;
 timeunit 100ps/10fs;
 `timescale 100ps/10fs;
 
-// Ignore type aliases and enum variant names imported into the parent scope.
+// Ignore type aliases, forward declarations of type aliases, and enum variant
+// names imported into the parent scope. These are resolved by Slang.
+typedef MyInt;
 typedef int MyInt;
+typedef MyInt;
+typedef MyInt;
 typedef enum { VariantA, VariantB } MyEnum;
+
+module Typedefs1;
+  typedef MyInt2;
+  typedef int MyInt2;
+  typedef MyInt2;
+  typedef MyInt2;
+  typedef enum { VariantC, VariantD } MyEnum2;
+endmodule
+
+function void Typedefs2();
+  typedef MyInt2;
+  typedef int MyInt2;
+  typedef MyInt2;
+  typedef MyInt2;
+  typedef enum { VariantC, VariantD } MyEnum2;
+endfunction
 
 // Ignore imports.
 import Package::*;
@@ -131,37 +151,6 @@ module Basic;
   // CHECK: %b2 = moore.variable [[TMP1]] : <i1>
   bit [0:0] b1;
   bit b2 = b1;
-
-  // CHECK: moore.procedure initial {
-  // CHECK: }
-  initial;
-
-  // CHECK: moore.procedure final {
-  // CHECK: }
-  final begin end
-
-  // CHECK: moore.procedure always {
-  // CHECK:   %x = moore.variable
-  // CHECK:   %y = moore.variable
-  // CHECK: }
-  always begin
-    int x;
-    begin
-      int y;
-    end
-  end
-
-  // CHECK: moore.procedure always_comb {
-  // CHECK: }
-  always_comb begin end
-
-  // CHECK: moore.procedure always_latch {
-  // CHECK: }
-  always_latch begin end
-
-  // CHECK: moore.procedure always_ff {
-  // CHECK: }
-  always_ff @* begin end
 
   // CHECK: [[TMP1:%.+]] = moore.read %v2
   // CHECK: moore.assign %v1, [[TMP1]] : i32
@@ -740,6 +729,10 @@ module Expressions;
   bit [1:0][31:0] arrayInt;
   // CHECK: %uarrayInt = moore.variable : <uarray<2 x i32>>
   bit [31:0] uarrayInt [2];
+  // CHECK: %arr1 = moore.variable : <uarray<2 x i32>
+  bit [31:0] arr1 [2];
+  // CHECK: %arr2 = moore.variable : <uarray<2 x i32>
+  bit [31:0] arr2 [2];
   // CHECK: %m = moore.variable : <l4>
   logic [3:0] m;
 
@@ -890,6 +883,14 @@ module Expressions;
     // CHECK: [[TMP2:%.+]] = moore.concat [[TMP1]] : (!moore.i1) -> i1
     // CHECK: moore.replicate [[TMP2]] : i1 -> i32
     a = {32{1'b0}};
+    // CHECK: [[TMP1:%.+]] = moore.read %a : <i32>
+    // CHECK: [[TMP2:%.+]] = moore.read %c : <i32>
+    // CHECK: moore.concat [[TMP1]], [[TMP2]] : (!moore.i32, !moore.i32) -> i64
+    a = {a, {0{b}}, c};
+    // CHECK: [[TMP1:%.+]] = moore.read %a : <i32>
+    // CHECK: [[TMP2:%.+]] = moore.read %c : <i32>
+    // CHECK: moore.concat [[TMP1]], [[TMP2]] : (!moore.i32, !moore.i32) -> i64
+    a = {a, {0{b}}, {0{a, {0{b}}, c}}, c};
     // CHECK: [[TMP1:%.+]] = moore.read %vec_1 : <l32>
     // CHECK: moore.extract [[TMP1]] from 1 : l32 -> l3
     y = vec_1[3:1];
@@ -1150,6 +1151,24 @@ module Expressions;
     // CHECK: [[TMP2:%.+]] = moore.read %e
     // CHECK: moore.eq [[TMP1]], [[TMP2]] : l32 -> l1
     y = d == e;
+
+    // CHECK: [[TMP0:%.+]] = moore.constant 43
+    // CHECK: [[TMP1:%.+]] = moore.constant 9002
+    // CHECK: moore.array_create [[TMP0]], [[TMP1]] : !moore.i32, !moore.i32 -> uarray<2 x i32>
+    arr1 = '{43, 9002};
+    // CHECK: [[TMP0:%.+]] = moore.constant 43
+    // CHECK: [[TMP1:%.+]] = moore.constant 9002
+    // CHECK: moore.array_create [[TMP0]], [[TMP1]] : !moore.i32, !moore.i32 -> uarray<2 x i32>
+    arr2 = '{43, 9002};
+    // CHECK: [[TMP1:%.+]] = moore.read %arr1
+    // CHECK: [[TMP2:%.+]] = moore.read %arr2
+    // CHECK: moore.uarray_cmp eq [[TMP1]], [[TMP2]] : <2 x i32> -> i1
+    x = arr1 == arr2;
+    // CHECK: [[TMP3:%.+]] = moore.read %arr1
+    // CHECK: [[TMP4:%.+]] = moore.read %arr2
+    // CHECK: moore.uarray_cmp ne [[TMP3]], [[TMP4]] : <2 x i32> -> i1
+    x = arr1 != arr2;
+
     // CHECK: [[TMP1:%.+]] = moore.read %a
     // CHECK: [[TMP2:%.+]] = moore.read %b
     // CHECK: moore.ne [[TMP1]], [[TMP2]] : i32 -> i1

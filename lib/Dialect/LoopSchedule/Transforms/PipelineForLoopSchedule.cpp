@@ -106,17 +106,17 @@ PipelineForLoopSchedule::consumePragma(AffineForOp affineFor) {
   std::optional<uint64_t> maxUnrollFactor;
   if (unrollAttr == nullptr)
     return maxUnrollFactor;
-  if (unrollAttr.isa<StringAttr>()) {
-    auto val = unrollAttr.cast<StringAttr>().getValue();
+  if (isa<StringAttr>(unrollAttr)) {
+    auto val = cast<StringAttr>(unrollAttr).getValue();
     if (val == "full")
       maxUnrollFactor = std::numeric_limits<uint64_t>::max();
     else if (val == "none")
       maxUnrollFactor = std::numeric_limits<uint64_t>::min();
-  } else if (unrollAttr.isa<IntegerAttr>()) {
-    maxUnrollFactor = unrollAttr.cast<IntegerAttr>().getInt() < 1
+  } else if (isa<IntegerAttr>(unrollAttr)) {
+    maxUnrollFactor = cast<IntegerAttr>(unrollAttr).getInt() < 1
                           ? std::numeric_limits<uint64_t>::max()
-                          : unrollAttr.cast<IntegerAttr>().getInt();
-  } else if (unrollAttr.isa<UnitAttr>()) {
+                          : cast<IntegerAttr>(unrollAttr).getInt();
+  } else if (isa<UnitAttr>(unrollAttr)) {
     maxUnrollFactor = std::numeric_limits<uint64_t>::max();
   }
   affineFor->removeAttr("hls.unroll");

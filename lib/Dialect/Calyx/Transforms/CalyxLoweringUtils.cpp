@@ -564,6 +564,14 @@ void ComponentLoweringStateInterface::addInstance(StringRef calleeName,
   instanceMap[calleeName] = instanceOp;
 }
 
+bool ComponentLoweringStateInterface::isSeqGuardCmpLibOp(Operation *op) {
+  return seqGuardCmpLibOps.contains(op);
+}
+
+void ComponentLoweringStateInterface::addSeqGuardCmpLibOp(Operation *op) {
+  seqGuardCmpLibOps.insert(op);
+}
+
 //===----------------------------------------------------------------------===//
 // CalyxLoweringState
 //===----------------------------------------------------------------------===//
@@ -833,8 +841,14 @@ void InlineCombGroups::recurseInlineCombGroups(
             calyx::SeqDivULibOp, calyx::SeqDivSLibOp, calyx::SeqRemSLibOp,
             calyx::SeqRemULibOp, mlir::scf::WhileOp, calyx::InstanceOp,
             calyx::ConstantOp, calyx::AddFOpIEEE754, calyx::MulFOpIEEE754,
-            calyx::CompareFOpIEEE754>(src.getDefiningOp()))
+            calyx::CompareFOpIEEE754, calyx::FpToIntOpIEEE754,
+            calyx::IntToFpOpIEEE754, calyx::DivSqrtOpIEEE754>(
+            src.getDefiningOp()))
       continue;
+
+    if (state.isSeqGuardCmpLibOp(src.getDefiningOp())) {
+      continue;
+    }
 
     auto evalGroupOpt = state.findEvaluatingGroup(src);
     if (!evalGroupOpt.has_value()) {
@@ -1084,6 +1098,14 @@ PredicateInfo getPredicateInfo(CmpFPredicate pred) {
   }
 
   return info;
+}
+
+bool parentIsSeqCell(const Value value) {
+  if (Operation *defOp = value.getDefiningOp()) {
+    auto cellOp = dyn_cast_or_null<calyx::CellInterface>(defOp);
+    return cellOp && !cellOp.isCombinational();
+  }
+  return false;
 }
 
 } // namespace calyx

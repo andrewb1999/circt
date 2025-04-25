@@ -297,7 +297,7 @@ def FormalOp : VerifOp<"formal", [
     into the hardware to be tested. Testing tools will then try to find concrete
     values for them that violate any asserts or make any covers true.
 
-    ### Example
+    #### Example
     ```
     verif.formal @AdderTest {myParam = 42, myTag = "hello"} {
       %0 = verif.symbolic_value : i42
@@ -309,7 +309,7 @@ def FormalOp : VerifOp<"formal", [
     }
     ```
 
-    ### Parameters
+    #### Parameters
     The following parameters have a predefined meaning and are interpreted by
     tools such as `circt-test` to guide execution of tests:
 
@@ -362,7 +362,7 @@ def SimulationOp : VerifOp<"simulation", [
     by various tools. To describe a test, the body of this op should contain the
     hardware to be tested, alongside any necessary forms of stimulus generation.
 
-    ### Inputs
+    #### Inputs
 
     The body has two block arguments as input values: a "clock" signal of type
     `!seq.clock` and an "init" signal of type `i1`. The clock signal starts at 0
@@ -370,7 +370,7 @@ def SimulationOp : VerifOp<"simulation", [
     signal starts at 1, remains 1 during a single 0-to-1 transition of the
     clock, and then drops to 0 for the remainder of the simulation.
 
-    ### Outputs
+    #### Outputs
 
     The body must have a `verif.yield` terminator op with exactly two operands:
 
@@ -379,16 +379,12 @@ def SimulationOp : VerifOp<"simulation", [
     0-to-1 transition of the clock after the init signal has dropped to 0. No
     additional clock toggles occur once done has been sampled as 1.
 
-    The second operand is an "exit code" signal which may be of any integer
-    type. It indicates success of a test as 0, or failure as any non-zero
-    integer. The exit code is sampled at the same time as the done signal. Only
-    the zero versus non-zero value distinction is relevant to indicate
-    simulation success and must be preserved. The exact non-zero value is for
-    informational purposes only and may not be reproduced accurately by
-    simulators. Simulators may in the worst case map all non-zero values to 1,
-    reducing the exit code to a single bit indicating failure or success.
+    The second operand is a "success" signal of type `i1` which indicates the
+    success of a test as 1, or failure as 0. The signal is sampled at the same
+    time as the done signal. Simulators must signal failure to the operating
+    system through a non-zero exit code.
 
-    ### Schedule
+    #### Schedule
 
     The clock and init values adhere to the following schedule during
     simulation:
@@ -406,7 +402,7 @@ def SimulationOp : VerifOp<"simulation", [
     Simulation termination occurs when the done signal is 1 during a 0-to-1
     transition of the clock.
 
-    ### Example
+    #### Example
     ```
     verif.simulation @AdderTest {myParam = 42, myTag = "hello"} {
     ^bb0(%clock: !seq.clock, %init: i1):
@@ -424,12 +420,12 @@ def SimulationOp : VerifOp<"simulation", [
 
       // Check results and track failures.
       %4 = comb.add %1, %2 : i42
-      %5 = comb.icmp ne %3, %4 : i42
-      %false = hw.constant false
-      %failure = seq.compreg %6, %clock reset %init, %false : i1
-      %6 = comb.or %failure, %5 : i1
+      %5 = comb.icmp eq %3, %4 : i42
+      %true = hw.constant true
+      %success = seq.compreg %6, %clock reset %init, %true : i1
+      %6 = comb.and %success, %5 : i1
 
-      verif.yield %done, %failure : i1, i1
+      verif.yield %done, %success : i1, i1
     }
     ```
   }];

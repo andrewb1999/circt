@@ -64,61 +64,57 @@ def InstanceOp : HardwareDeclOp<"instance", [
     ```
   }];
 
-  let arguments = (ins FlatSymbolRefAttr:$moduleName, StrAttr:$name, NameKindAttr:$nameKind,
-                       DenseBoolArrayAttr:$portDirections, StrArrayAttr:$portNames,
-                       AnnotationArrayAttr:$annotations,
-                       PortAnnotationsAttr:$portAnnotations,
-                       LayerArrayAttr:$layers,
-                       UnitAttr:$lowerToBind,
-                       OptionalAttr<InnerSymAttr>:$inner_sym);
+  let arguments = (ins FlatSymbolRefAttr:$moduleName, StrAttr:$name,
+      NameKindAttr:$nameKind, DenseBoolArrayAttr:$portDirections,
+      StrArrayAttr:$portNames, AnnotationArrayAttr:$annotations,
+      PortAnnotationsAttr:$portAnnotations, LayerArrayAttr:$layers,
+      UnitAttr:$lowerToBind, UnitAttr:$doNotPrint,
+      OptionalAttr<InnerSymAttr>:$inner_sym);
 
   let results = (outs Variadic<AnyType>:$results);
 
   let hasCustomAssemblyFormat = 1;
 
-  let builders = [
-    OpBuilder<(ins "::mlir::TypeRange":$resultTypes,
-                   "::mlir::StringRef":$moduleName,
-                   "::mlir::StringRef":$name,
-                   "::circt::firrtl::NameKindEnum":$nameKind,
-                   "::mlir::ArrayRef<Direction>":$portDirections,
-                   "::mlir::ArrayRef<Attribute>":$portNames,
-                   CArg<"ArrayRef<Attribute>", "{}">:$annotations,
-                   CArg<"ArrayRef<Attribute>", "{}">:$portAnnotations,
-                   CArg<"::mlir::ArrayRef<Attribute>", "{}">:$layers,
-                   CArg<"bool","false">:$lowerToBind,
-                   CArg<"StringAttr", "StringAttr()">:$innerSym)>,
-    OpBuilder<(ins "::mlir::TypeRange":$resultTypes,
-                   "::mlir::StringRef":$moduleName,
-                   "::mlir::StringRef":$name,
-                   "::circt::firrtl::NameKindEnum":$nameKind,
-                   "::mlir::ArrayRef<Direction>":$portDirections,
-                   "::mlir::ArrayRef<Attribute>":$portNames,
-                   "ArrayRef<Attribute>":$annotations,
-                   "ArrayRef<Attribute>":$portAnnotations,
-                   "::mlir::ArrayRef<Attribute>":$layers,
-                   "bool":$lowerToBind,
-                   "hw::InnerSymAttr":$innerSym)>,
+  let builders =
+      [OpBuilder<(ins "::mlir::TypeRange":$resultTypes,
+           "::mlir::StringRef":$moduleName, "::mlir::StringRef":$name,
+           "::circt::firrtl::NameKindEnum":$nameKind,
+           "::mlir::ArrayRef<Direction>":$portDirections,
+           "::mlir::ArrayRef<Attribute>":$portNames,
+           CArg<"ArrayRef<Attribute>", "{}">:$annotations,
+           CArg<"ArrayRef<Attribute>", "{}">:$portAnnotations,
+           CArg<"::mlir::ArrayRef<Attribute>", "{}">:$layers,
+           CArg<"bool", "false">:$lowerToBind,
+           CArg<"bool", "false">:$doNotPrint,
+           CArg<"StringAttr", "StringAttr()">:$innerSym)>,
+       OpBuilder<(ins "::mlir::TypeRange":$resultTypes,
+           "::mlir::StringRef":$moduleName, "::mlir::StringRef":$name,
+           "::circt::firrtl::NameKindEnum":$nameKind,
+           "::mlir::ArrayRef<Direction>":$portDirections,
+           "::mlir::ArrayRef<Attribute>":$portNames,
+           "ArrayRef<Attribute>":$annotations,
+           "ArrayRef<Attribute>":$portAnnotations,
+           "::mlir::ArrayRef<Attribute>":$layers, "bool":$lowerToBind,
+           "bool":$doNotPrint, "hw::InnerSymAttr":$innerSym)>,
 
-    /// Constructor when you have the target module in hand.
-    OpBuilder<(ins "FModuleLike":$module,
-                   "mlir::StringRef":$name,
-                   CArg<"NameKindEnum", "NameKindEnum::DroppableName">:$nameKind,
-                   CArg<"ArrayRef<Attribute>", "{}">:$annotations,
-                   CArg<"ArrayRef<Attribute>", "{}">:$portAnnotations,
-                   CArg<"bool","false">:$lowerToBind,
-                   CArg<"hw::InnerSymAttr", "hw::InnerSymAttr()">:$innerSym)>,
+       /// Constructor when you have the target module in hand.
+       OpBuilder<(ins "FModuleLike":$module, "mlir::StringRef":$name,
+           CArg<"NameKindEnum", "NameKindEnum::DroppableName">:$nameKind,
+           CArg<"ArrayRef<Attribute>", "{}">:$annotations,
+           CArg<"ArrayRef<Attribute>", "{}">:$portAnnotations,
+           CArg<"bool", "false">:$lowerToBind,
+           CArg<"bool", "false">:$doNotPrint,
+           CArg<"hw::InnerSymAttr", "hw::InnerSymAttr()">:$innerSym)>,
 
-    /// Constructor when you have a port info list in hand.
-    OpBuilder<(ins "ArrayRef<PortInfo>":$ports,
-                   "::mlir::StringRef":$moduleName,
-                   "mlir::StringRef":$name,
-                   CArg<"NameKindEnum", "NameKindEnum::DroppableName">:$nameKind,
-                   CArg<"ArrayRef<Attribute>", "{}">:$annotations,
-                   CArg<"ArrayRef<Attribute>", "{}">:$layers,
-                   CArg<"bool","false">:$lowerToBind,
-                   CArg<"hw::InnerSymAttr", "hw::InnerSymAttr()">:$innerSym)>
-  ];
+       /// Constructor when you have a port info list in hand.
+       OpBuilder<(ins "ArrayRef<PortInfo>":$ports,
+           "::mlir::StringRef":$moduleName, "mlir::StringRef":$name,
+           CArg<"NameKindEnum", "NameKindEnum::DroppableName">:$nameKind,
+           CArg<"ArrayRef<Attribute>", "{}">:$annotations,
+           CArg<"ArrayRef<Attribute>", "{}">:$layers,
+           CArg<"bool", "false">:$lowerToBind,
+           CArg<"bool", "false">:$doNotPrint,
+           CArg<"hw::InnerSymAttr", "hw::InnerSymAttr()">:$innerSym)>];
 
   let extraClassDeclaration = [{
     /// Return the port direction for the specified result number.
@@ -404,6 +400,14 @@ def RegOp : HardwareDeclOp<"reg", [Forceable, DeclareOpInterfaceMethods<CombData
       assert(operands.size() == 1u && "mismatched number of parameters");
       odsState.addOperands(operands);
       odsState.addAttributes(attributes);
+      assert(resultTypes.size() >= 1u && "mismatched number of return types");
+      odsState.addTypes(resultTypes);
+    }]>,
+    OpBuilder<(ins "::mlir::TypeRange":$resultTypes, "::mlir::ValueRange":$operands,
+                   CArg<"const Properties &","{}">:$properties), [{
+      assert(operands.size() == 1u && "mismatched number of parameters");
+      odsState.addOperands(operands);
+      odsState.useProperties(const_cast<Properties &>(properties));
       assert(resultTypes.size() >= 1u && "mismatched number of return types");
       odsState.addTypes(resultTypes);
     }]>,

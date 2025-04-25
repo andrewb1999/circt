@@ -290,9 +290,17 @@ struct RvalueExprVisitor {
     }
 
     case BinaryOperator::Equality:
-      return createBinary<moore::EqOp>(lhs, rhs);
+      if (isa<moore::UnpackedArrayType>(lhs.getType()))
+        return builder.create<moore::UArrayCmpOp>(
+            loc, moore::UArrayCmpPredicate::eq, lhs, rhs);
+      else
+        return createBinary<moore::EqOp>(lhs, rhs);
     case BinaryOperator::Inequality:
-      return createBinary<moore::NeOp>(lhs, rhs);
+      if (isa<moore::UnpackedArrayType>(lhs.getType()))
+        return builder.create<moore::UArrayCmpOp>(
+            loc, moore::UArrayCmpPredicate::ne, lhs, rhs);
+      else
+        return createBinary<moore::NeOp>(lhs, rhs);
     case BinaryOperator::CaseEquality:
       return createBinary<moore::CaseEqOp>(lhs, rhs);
     case BinaryOperator::CaseInequality:
@@ -409,10 +417,15 @@ struct RvalueExprVisitor {
   Value visit(const slang::ast::ConcatenationExpression &expr) {
     SmallVector<Value> operands;
     for (auto *operand : expr.operands()) {
-      auto value = context.convertRvalueExpression(*operand);
-      if (!value)
+      // Handle empty replications like `{0{...}}` which may occur within
+      // concatenations. Slang assigns them a `void` type which we can check for
+      // here.
+      if (operand->type->isVoid())
         continue;
+      auto value = context.convertRvalueExpression(*operand);
       value = context.convertToSimpleBitVector(value);
+      if (!value)
+        return {};
       operands.push_back(value);
     }
     return builder.create<moore::ConcatOp>(loc, operands);
@@ -421,9 +434,6 @@ struct RvalueExprVisitor {
   // Handle replications.
   Value visit(const slang::ast::ReplicationExpression &expr) {
     auto type = context.convertType(*expr.type);
-    if (isa<moore::VoidType>(type))
-      return {};
-
     auto value = context.convertRvalueExpression(expr.concat());
     if (!value)
       return {};
@@ -872,12 +882,9 @@ struct RvalueExprVisitor {
         value = context.convertRvalueExpression(*stream.operand);
       }
 
+      value = context.convertToSimpleBitVector(value);
       if (!value)
         return {};
-      value = context.convertToSimpleBitVector(value);
-      if (!value) {
-        return {};
-      }
       operands.push_back(value);
     }
     Value value;
@@ -974,7 +981,7 @@ struct LvalueExprVisitor {
     for (auto *operand : expr.operands()) {
       auto value = context.convertLvalueExpression(*operand);
       if (!value)
-        continue;
+        return {};
       operands.push_back(value);
     }
     return builder.create<moore::ConcatRefOp>(loc, operands);

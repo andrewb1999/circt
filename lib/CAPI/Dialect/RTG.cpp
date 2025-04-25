@@ -79,6 +79,10 @@ MlirType rtgSetTypeGet(MlirType elementType) {
   return wrap(SetType::get(ty.getContext(), ty));
 }
 
+MlirType rtgSetTypeGetElementType(MlirType type) {
+  return wrap(cast<SetType>(unwrap(type)).getElementType());
+}
+
 // BagType
 //===----------------------------------------------------------------------===//
 
@@ -87,6 +91,10 @@ bool rtgTypeIsABag(MlirType type) { return isa<BagType>(unwrap(type)); }
 MlirType rtgBagTypeGet(MlirType elementType) {
   auto ty = unwrap(elementType);
   return wrap(BagType::get(ty.getContext(), ty));
+}
+
+MlirType rtgBagTypeGetElementType(MlirType type) {
+  return wrap(cast<BagType>(unwrap(type)).getElementType());
 }
 
 // DictType
@@ -107,8 +115,51 @@ MlirType rtgDictTypeGet(MlirContext ctxt, intptr_t numEntries,
   return wrap(DictType::get(unwrap(ctxt), entries));
 }
 
+// ArrayType
+//===----------------------------------------------------------------------===//
+
+MlirType rtgArrayTypeGet(MlirType elementType) {
+  return wrap(
+      ArrayType::get(unwrap(elementType).getContext(), unwrap(elementType)));
+}
+
+bool rtgTypeIsAArray(MlirType type) { return isa<ArrayType>(unwrap(type)); }
+
+MlirType rtgArrayTypeGetElementType(MlirType type) {
+  return wrap(cast<ArrayType>(unwrap(type)).getElementType());
+}
+
+// ImmediateType
+//===----------------------------------------------------------------------===//
+
+bool rtgTypeIsAImmediate(MlirType type) {
+  return isa<ImmediateType>(unwrap(type));
+}
+
+MlirType rtgImmediateTypeGet(MlirContext ctx, uint32_t width) {
+  return wrap(ImmediateType::get(unwrap(ctx), width));
+}
+
+uint32_t rtgImmediateTypeGetWidth(MlirType type) {
+  return cast<ImmediateType>(unwrap(type)).getWidth();
+}
+
 //===----------------------------------------------------------------------===//
 // Attribute API.
+//===----------------------------------------------------------------------===//
+
+// DefaultContext
+//===----------------------------------------------------------------------===//
+
+bool rtgAttrIsADefaultContextAttr(MlirAttribute attr) {
+  return isa<DefaultContextAttr>(unwrap(attr));
+}
+
+MlirAttribute rtgDefaultContextAttrGet(MlirContext ctxt, MlirType type) {
+  return wrap(DefaultContextAttr::get(unwrap(ctxt), unwrap(type)));
+}
+
+// Label Visibility
 //===----------------------------------------------------------------------===//
 
 bool rtgAttrIsALabelVisibilityAttr(MlirAttribute attr) {
@@ -144,10 +195,22 @@ MlirAttribute rtgLabelVisibilityAttrGet(MlirContext ctxt,
   return wrap(LabelVisibilityAttr::get(unwrap(ctxt), convert(visibility)));
 }
 
-bool rtgAttrIsADefaultContextAttr(MlirAttribute attr) {
-  return isa<DefaultContextAttr>(unwrap(attr));
+// ImmediateAttr
+//===----------------------------------------------------------------------===//
+
+bool rtgAttrIsAImmediate(MlirAttribute attr) {
+  return isa<ImmediateAttr>(unwrap(attr));
 }
 
-MlirAttribute rtgDefaultContextAttrGet(MlirContext ctxt, MlirType type) {
-  return wrap(DefaultContextAttr::get(unwrap(ctxt), unwrap(type)));
+MlirAttribute rtgImmediateAttrGet(MlirContext ctx, uint32_t width,
+                                  uint64_t value) {
+  return wrap(rtg::ImmediateAttr::get(unwrap(ctx), APInt(width, value)));
+}
+
+uint32_t rtgImmediateAttrGetWidth(MlirAttribute attr) {
+  return cast<ImmediateAttr>(unwrap(attr)).getValue().getBitWidth();
+}
+
+uint64_t rtgImmediateAttrGetValue(MlirAttribute attr) {
+  return cast<ImmediateAttr>(unwrap(attr)).getValue().getZExtValue();
 }

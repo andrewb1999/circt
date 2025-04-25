@@ -32,6 +32,8 @@ public:
     auto *thisCast = static_cast<ConcreteType *>(this);
     return TypeSwitch<Operation *, ResultType>(op)
         .template Case<
+            // Constants
+            ConstantOp,
             // Bags
             BagCreateOp, BagSelectRandomOp, BagDifferenceOp, BagUnionOp,
             BagUniqueSizeOp,
@@ -47,10 +49,14 @@ public:
             RandomNumberInRangeOp,
             // Sequences
             SequenceOp, GetSequenceOp, SubstituteSequenceOp,
-            RandomizeSequenceOp, EmbedSequenceOp,
+            RandomizeSequenceOp, EmbedSequenceOp, InterleaveSequencesOp,
             // Sets
             SetCreateOp, SetSelectRandomOp, SetDifferenceOp, SetUnionOp,
-            SetSizeOp>([&](auto expr) -> ResultType {
+            SetSizeOp,
+            // Arrays
+            ArrayCreateOp, ArrayExtractOp,
+            // Immediates
+            IntToImmediateOp>([&](auto expr) -> ResultType {
           return thisCast->visitOp(expr, args...);
         })
         .Default([&](auto expr) -> ResultType {
@@ -82,10 +88,12 @@ public:
     return static_cast<ConcreteType *>(this)->visit##OPKIND##Op(op, args...);  \
   }
 
+  HANDLE(ConstantOp, Unhandled);
   HANDLE(SequenceOp, Unhandled);
   HANDLE(GetSequenceOp, Unhandled);
   HANDLE(SubstituteSequenceOp, Unhandled);
   HANDLE(RandomizeSequenceOp, Unhandled);
+  HANDLE(InterleaveSequencesOp, Unhandled);
   HANDLE(EmbedSequenceOp, Unhandled);
   HANDLE(RandomNumberInRangeOp, Unhandled);
   HANDLE(OnContextOp, Unhandled);
@@ -100,6 +108,8 @@ public:
   HANDLE(BagDifferenceOp, Unhandled);
   HANDLE(BagUnionOp, Unhandled);
   HANDLE(BagUniqueSizeOp, Unhandled);
+  HANDLE(ArrayCreateOp, Unhandled);
+  HANDLE(ArrayExtractOp, Unhandled);
   HANDLE(LabelDeclOp, Unhandled);
   HANDLE(LabelUniqueDeclOp, Unhandled);
   HANDLE(LabelOp, Unhandled);
@@ -108,6 +118,7 @@ public:
   HANDLE(YieldOp, Unhandled);
   HANDLE(FixedRegisterOp, Unhandled);
   HANDLE(VirtualRegisterOp, Unhandled);
+  HANDLE(IntToImmediateOp, Unhandled);
 #undef HANDLE
 };
 
@@ -119,10 +130,11 @@ public:
   ResultType dispatchTypeVisitor(Type type, ExtraArgs... args) {
     auto *thisCast = static_cast<ConcreteType *>(this);
     return TypeSwitch<Type, ResultType>(type)
-        .template Case<SequenceType, SetType, BagType, DictType, LabelType,
-                       IndexType, IntegerType>([&](auto expr) -> ResultType {
-          return thisCast->visitType(expr, args...);
-        })
+        .template Case<ImmediateType, SequenceType, SetType, BagType, DictType,
+                       LabelType, IndexType, IntegerType>(
+            [&](auto expr) -> ResultType {
+              return thisCast->visitType(expr, args...);
+            })
         .template Case<ContextResourceTypeInterface>(
             [&](auto expr) -> ResultType {
               return thisCast->visitContextResourceType(expr, args...);
@@ -162,6 +174,7 @@ public:
                                                                     args...);  \
   }
 
+  HANDLE(ImmediateType, Unhandled);
   HANDLE(SequenceType, Unhandled);
   HANDLE(SetType, Unhandled);
   HANDLE(BagType, Unhandled);

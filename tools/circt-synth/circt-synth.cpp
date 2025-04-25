@@ -16,11 +16,21 @@
 #include "circt/Dialect/AIG/AIGDialect.h"
 #include "circt/Dialect/AIG/AIGPasses.h"
 #include "circt/Dialect/Comb/CombDialect.h"
+#include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/Debug/DebugDialect.h"
+#include "circt/Dialect/Emit/EmitDialect.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWPasses.h"
+#include "circt/Dialect/LTL/LTLDialect.h"
+#include "circt/Dialect/OM/OMDialect.h"
+#include "circt/Dialect/SV/SVDialect.h"
+#include "circt/Dialect/Seq/SeqDialect.h"
+#include "circt/Dialect/Sim/SimDialect.h"
+#include "circt/Dialect/Verif/VerifDialect.h"
 #include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
+#include "circt/Transforms/Passes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
@@ -66,6 +76,11 @@ static cl::opt<bool>
                           cl::desc("Log executions of toplevel module passes"),
                           cl::init(false), cl::cat(mainCategory));
 
+static cl::opt<bool>
+    allowUnregisteredDialects("allow-unregistered-dialect",
+                              cl::desc("Allow unknown dialects in the input"),
+                              cl::init(false), cl::cat(mainCategory));
+
 // Options to control early-out from pipeline.
 enum Until { UntilAIGLowering, UntilEnd };
 
@@ -85,6 +100,10 @@ static cl::opt<bool>
                   cl::desc("Convert AIG to Comb at the end of the pipeline"),
                   cl::init(false), cl::cat(mainCategory));
 
+static cl::opt<std::string> topName("top", cl::desc("Top module name"),
+                                    cl::value_desc("name"), cl::init(""),
+                                    cl::cat(mainCategory));
+
 //===----------------------------------------------------------------------===//
 // Main Tool Logic
 //===----------------------------------------------------------------------===//
@@ -97,35 +116,57 @@ static bool untilReached(Until until) {
 // Tool implementation
 //===----------------------------------------------------------------------===//
 
+template <typename... AllowedOpTy>
+static void partiallyLegalizeCombToAIG(SmallVectorImpl<std::string> &ops) {
+  (ops.push_back(AllowedOpTy::getOperationName().str()), ...);
+}
+
 static void populateSynthesisPipeline(PassManager &pm) {
-  // Add the AIG to Comb at the scope exit if requested.
-  auto addAIGToComb = llvm::make_scope_exit([&]() {
-    if (convertToComb) {
-      auto &mpm = pm.nest<hw::HWModuleOp>();
-      mpm.addPass(circt::createConvertAIGToComb());
-      mpm.addPass(createCSEPass());
+  auto pipeline = [](OpPassManager &mpm) {
+    // Add the AIG to Comb at the scope exit if requested.
+    auto addAIGToComb = llvm::make_scope_exit([&]() {
+      if (convertToComb) {
+        mpm.addPass(circt::createConvertAIGToComb());
+        mpm.addPass(createCSEPass());
+      }
+    });
+    {
+      // Partially legalize Comb to AIG, run CSE and canonicalization.
+      circt::ConvertCombToAIGOptions options;
+      partiallyLegalizeCombToAIG<comb::AndOp, comb::OrOp, comb::XorOp,
+                                 comb::MuxOp, comb::ICmpOp, hw::ArrayGetOp,
+                                 hw::ArraySliceOp, hw::ArrayCreateOp,
+                                 hw::ArrayConcatOp, hw::AggregateConstantOp>(
+          options.additionalLegalOps);
+      mpm.addPass(circt::createConvertCombToAIG(options));
     }
-  });
+    mpm.addPass(createCSEPass());
+    mpm.addPass(createSimpleCanonicalizerPass());
 
-  auto &mpm = pm.nest<hw::HWModuleOp>();
-  mpm.addPass(circt::hw::createHWAggregateToCombPass());
-  mpm.addPass(circt::createConvertCombToAIG());
-  mpm.addPass(createCSEPass());
-  if (untilReached(UntilAIGLowering))
-    return;
-  mpm.addPass(createSimpleCanonicalizerPass());
-  mpm.addPass(createCSEPass());
-  mpm.addPass(aig::createLowerVariadic());
-  // TODO: LowerWordToBits is not scalable for large designs. Change to
-  // conditionally enable the pass once the rest of the pipeline was able to
-  // handle multibit operands properly.
-  mpm.addPass(aig::createLowerWordToBits());
-  mpm.addPass(createCSEPass());
-  mpm.addPass(createSimpleCanonicalizerPass());
-  // TODO: Add balancing, rewriting, FRAIG conversion, etc.
-  if (untilReached(UntilEnd))
-    return;
+    mpm.addPass(circt::hw::createHWAggregateToCombPass());
+    mpm.addPass(circt::createConvertCombToAIG());
+    mpm.addPass(createCSEPass());
+    if (untilReached(UntilAIGLowering))
+      return;
+    mpm.addPass(createSimpleCanonicalizerPass());
+    mpm.addPass(createCSEPass());
+    mpm.addPass(aig::createLowerVariadic());
+    // TODO: LowerWordToBits is not scalable for large designs. Change to
+    // conditionally enable the pass once the rest of the pipeline was able
+    // to handle multibit operands properly.
+    mpm.addPass(aig::createLowerWordToBits());
+    mpm.addPass(createCSEPass());
+    mpm.addPass(createSimpleCanonicalizerPass());
+    // TODO: Add balancing, rewriting, FRAIG conversion, etc.
+    if (untilReached(UntilEnd))
+      return;
+  };
 
+  if (topName.empty()) {
+    pipeline(pm.nest<hw::HWModuleOp>());
+  } else {
+    pm.addPass(circt::createHierarchicalRunner(topName, pipeline));
+  }
   // TODO: Add LUT mapping, etc.
 }
 
@@ -204,9 +245,13 @@ int main(int argc, char **argv) {
 
   // Register the supported CIRCT dialects and create a context to work with.
   DialectRegistry registry;
-  registry.insert<circt::aig::AIGDialect, circt::comb::CombDialect,
-                  circt::hw::HWDialect>();
+  registry.insert<aig::AIGDialect, comb::CombDialect, debug::DebugDialect,
+                  emit::EmitDialect, hw::HWDialect, ltl::LTLDialect,
+                  om::OMDialect, seq::SeqDialect, sim::SimDialect,
+                  sv::SVDialect, verif::VerifDialect>();
   MLIRContext context(registry);
+  if (allowUnregisteredDialects)
+    context.allowUnregisteredDialects();
 
   // Setup of diagnostic handling.
   llvm::SourceMgr sourceMgr;

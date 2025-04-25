@@ -39,15 +39,15 @@ void UnrollMarkedLoopsPass::runOnOperation() {
 
     auto attr = loop->getAttr("hls.unroll");
     loop->removeAttr("hls.unroll");
-    if (attr.isa<StringAttr>()) {
-      auto val = attr.cast<StringAttr>().getValue();
+    if (isa<StringAttr>(attr)) {
+      auto val = cast<StringAttr>(attr).getValue();
       if (val != "full")
         return WalkResult::interrupt();
 
       if (loopUnrollFull(loop).failed())
         return WalkResult::interrupt();
-    } else if (attr.isa<IntegerAttr>()) {
-      auto val = attr.cast<IntegerAttr>().getInt();
+    } else if (isa<IntegerAttr>(attr)) {
+      auto val = cast<IntegerAttr>(attr).getInt();
 
       if (loopUnrollByFactor(loop, val).failed())
         return WalkResult::interrupt();

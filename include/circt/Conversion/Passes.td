@@ -252,7 +252,7 @@ def LoopScheduleToCalyx : Pass<"lower-loopschedule-to-calyx", "mlir::ModuleOp"> 
 
 
 //===----------------------------------------------------------------------===//
-// PipelineTHW
+// PipelineToHW
 //===----------------------------------------------------------------------===//
 
 // TODO: @mortbopet: There is a possible non-neglible speedup that can be achieved
@@ -738,7 +738,7 @@ def ConvertCombToSMT : Pass<"convert-comb-to-smt"> {
   // Need to depend on HWDialect because some 'comb' canonicalization patterns
   // build 'hw.constant' operations.
   let dependentDialects = [
-    "smt::SMTDialect", "hw::HWDialect", "mlir::func::FuncDialect"
+    "mlir::smt::SMTDialect", "hw::HWDialect", "mlir::func::FuncDialect"
   ];
 }
 
@@ -748,7 +748,7 @@ def ConvertCombToSMT : Pass<"convert-comb-to-smt"> {
 
 def ConvertHWToSMT : Pass<"convert-hw-to-smt", "mlir::ModuleOp"> {
   let summary = "Convert HW ops and constants to SMT ops";
-  let dependentDialects = ["smt::SMTDialect", "mlir::func::FuncDialect"];
+  let dependentDialects = ["mlir::smt::SMTDialect", "mlir::func::FuncDialect"];
 }
 
 //===----------------------------------------------------------------------===//
@@ -758,10 +758,16 @@ def ConvertHWToSMT : Pass<"convert-hw-to-smt", "mlir::ModuleOp"> {
 def ConvertVerifToSMT : Pass<"convert-verif-to-smt", "mlir::ModuleOp"> {
   let summary = "Convert Verif ops to SMT ops";
   let dependentDialects = [
-    "smt::SMTDialect",
+    "mlir::smt::SMTDialect",
     "mlir::arith::ArithDialect",
     "mlir::scf::SCFDialect",
     "mlir::func::FuncDialect"
+  ];
+  let options = [
+    Option<"risingClocksOnly", "rising-clocks-only", "bool",
+           /*default=*/"false",
+           "When lowering verif.bmc ops, only consider the circuit and property"
+           "on rising clock edges.">,
   ];
 }
 
@@ -788,7 +794,7 @@ def LowerArcToLLVM : Pass<"lower-arc-to-llvm", "mlir::ModuleOp"> {
 def LowerSMTToZ3LLVM : Pass<"lower-smt-to-z3-llvm", "mlir::ModuleOp"> {
   let summary = "Lower the SMT dialect to LLVM IR calling the Z3 API";
   let dependentDialects = [
-    "smt::SMTDialect", "mlir::LLVM::LLVMDialect", "mlir::scf::SCFDialect",
+    "mlir::smt::SMTDialect", "mlir::LLVM::LLVMDialect", "mlir::scf::SCFDialect",
     "mlir::cf::ControlFlowDialect", "mlir::func::FuncDialect"
   ];
   let options = [
@@ -861,7 +867,7 @@ def ConvertCombToAIG: Pass<"convert-comb-to-aig",  "hw::HWModuleOp"> {
 
   let options = [
     ListOption<"additionalLegalOps", "additional-legal-ops", "std::string",
-               "Specify additional legal ops for testing">,
+               "Specify additional legal ops to partially legalize Comb to AIG">,
     Option<"maxEmulationUnknownBits", "max-emulation-unknown-bits", "uint32_t", "10",
            "Maximum number of unknown bits to emulate in a table lookup">
   ];

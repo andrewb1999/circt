@@ -34,17 +34,19 @@
 #include <future>
 
 namespace esi {
+class Accelerator;
 
 /// Engines implement the actual channel communication between the host and the
 /// accelerator. Engines can support multiple channels. They are low level of
 /// the ESI runtime API and are not intended to be used directly by users.
 class Engine {
 public:
+  Engine(AcceleratorConnection &conn) : connected(false), conn(conn) {}
   virtual ~Engine() = default;
   /// Start the engine, if applicable.
-  virtual void connect(){};
+  virtual void connect() { connected = true; };
   /// Stop the engine, if applicable.
-  virtual void disconnect(){};
+  virtual void disconnect() { connected = false; };
   /// Get a port for a channel, from the cache if it exists or create it. An
   /// engine may override this method if different behavior is desired.
   virtual ChannelPort &requestPort(AppIDPath idPath,
@@ -57,6 +59,9 @@ protected:
   virtual std::unique_ptr<ChannelPort>
   createPort(AppIDPath idPath, const std::string &channelName,
              BundleType::Direction dir, const Type *type) = 0;
+
+  bool connected;
+  AcceleratorConnection &conn;
 
 private:
   std::map<std::pair<AppIDPath, std::string>, std::unique_ptr<ChannelPort>>
@@ -105,9 +110,11 @@ struct RegisterEngine {
   RegisterEngine(const char *name) { registerEngine(name, &TEngine::create); }
 };
 
+#define CONCAT_(prefix, suffix) prefix##suffix
+#define CONCAT(prefix, suffix) CONCAT_(prefix, suffix)
 #define REGISTER_ENGINE(Name, TEngine)                                         \
-  static ::esi::registry::internal::RegisterEngine<TEngine>                    \
-  __register_engine____LINE__(Name)
+  static ::esi::registry::internal::RegisterEngine<TEngine> CONCAT(            \
+      __register_engine__, __LINE__)(Name)
 
 } // namespace internal
 } // namespace registry

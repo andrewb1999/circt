@@ -248,7 +248,7 @@ struct ProcedureOpConversion : public OpConversionPattern<ProcedureOp> {
         op.getKind() == ProcedureKind::Final) {
       Operation *newOp;
       if (op.getKind() == ProcedureKind::Initial)
-        newOp = rewriter.create<llhd::ProcessOp>(loc);
+        newOp = rewriter.create<llhd::ProcessOp>(loc, TypeRange{});
       else
         newOp = rewriter.create<llhd::FinalOp>(loc);
       auto &body = newOp->getRegion(0);
@@ -256,14 +256,14 @@ struct ProcedureOpConversion : public OpConversionPattern<ProcedureOp> {
       for (auto returnOp :
            llvm::make_early_inc_range(body.getOps<ReturnOp>())) {
         rewriter.setInsertionPoint(returnOp);
-        rewriter.replaceOpWithNewOp<llhd::HaltOp>(returnOp);
+        rewriter.replaceOpWithNewOp<llhd::HaltOp>(returnOp, ValueRange{});
       }
       rewriter.eraseOp(op);
       return success();
     }
 
     // All other procedures lower to a an `llhd.process`.
-    auto newOp = rewriter.create<llhd::ProcessOp>(loc);
+    auto newOp = rewriter.create<llhd::ProcessOp>(loc, TypeRange{});
 
     // We need to add an empty entry block because it is not allowed in MLIR to
     // branch back to the entry block. Instead we put the logic in the second
@@ -283,8 +283,8 @@ struct ProcedureOpConversion : public OpConversionPattern<ProcedureOp> {
     if (op.getKind() == ProcedureKind::AlwaysComb ||
         op.getKind() == ProcedureKind::AlwaysLatch) {
       Block *waitBlock = rewriter.createBlock(&newOp.getBody());
-      rewriter.create<llhd::WaitOp>(loc, observedValues, Value(), ValueRange{},
-                                    block);
+      rewriter.create<llhd::WaitOp>(loc, ValueRange{}, Value(), observedValues,
+                                    ValueRange{}, block);
       block = waitBlock;
     }
 
@@ -350,7 +350,7 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
     if (op.getBody().front().empty()) {
       // Let the cleanup iteration after the dialect conversion clean up all
       // remaining unreachable blocks.
-      rewriter.replaceOpWithNewOp<llhd::HaltOp>(op);
+      rewriter.replaceOpWithNewOp<llhd::HaltOp>(op, ValueRange{});
       return success();
     }
 
@@ -398,8 +398,8 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
     // Create the `llhd.wait` op that suspends the current process and waits for
     // a change in the interesting values listed in `observeValues`. When a
     // change is detected, execution resumes in the "check" block.
-    auto waitOp = rewriter.create<llhd::WaitOp>(loc, observeValues, Value(),
-                                                ValueRange{}, checkBlock);
+    auto waitOp = rewriter.create<llhd::WaitOp>(
+        loc, ValueRange{}, Value(), observeValues, ValueRange{}, checkBlock);
     rewriter.inlineBlockBefore(&clonedOp.getBody().front(), waitOp);
     rewriter.eraseOp(clonedOp);
 
@@ -895,6 +895,19 @@ struct DynExtractRefOpConversion : public OpConversionPattern<DynExtractRefOp> {
     }
 
     return failure();
+  }
+};
+
+struct ArrayCreateOpConversion : public OpConversionPattern<ArrayCreateOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ArrayCreateOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    rewriter.replaceOpWithNewOp<hw::ArrayCreateOp>(op, resultType,
+                                                   adaptor.getElements());
+    return success();
   }
 };
 
@@ -1780,7 +1793,7 @@ static void populateOpConversion(RewritePatternSet &patterns,
     ExtractOpConversion, DynExtractOpConversion, DynExtractRefOpConversion,
     ReadOpConversion,
     StructExtractOpConversion, StructExtractRefOpConversion,
-    ExtractRefOpConversion, StructCreateOpConversion, ConditionalOpConversion,
+    ExtractRefOpConversion, StructCreateOpConversion, ConditionalOpConversion, ArrayCreateOpConversion,
     YieldOpConversion, OutputOpConversion, StringConstantOpConv,
 
     // Patterns of unary operations.

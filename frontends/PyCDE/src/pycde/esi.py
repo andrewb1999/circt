@@ -219,6 +219,7 @@ class EngineServiceRecord:
                engine: EngineModule,
                details: Optional[Dict[str, object]] = None):
     rec_appid = AppID(f"{engine.appid.name}_record", engine.appid.index)
+    details = optional_dict_to_dict_attr(details)
     self._rec = raw_esi.ServiceImplRecordOp(appID=rec_appid._appid,
                                             serviceImplName=engine.TypeName,
                                             implDetails=details,
@@ -274,7 +275,6 @@ class _ServiceGeneratorBundles:
                   engine: EngineModule,
                   details: Dict[str, object] = None):
     """Emit and return an engine record."""
-    details = optional_dict_to_dict_attr(details)
     with get_user_loc(), ir.InsertionPoint(self._rec):
       return EngineServiceRecord(engine, details)
 
@@ -642,10 +642,16 @@ class _HostMem(ServiceDecl):
     """Create a write request to the host memory out of a request channel."""
     # Extract the data type from the request channel and call the helper to get
     # the write bundle type for the req channel.
-    req_data_type = req.type.inner_type.data
-    write_bundle_type = self.write_req_bundle_type(req_data_type)
+    write_bundle_type = self.write_req_bundle_type(req.type.inner_type.data)
+    bundle = self.write_from_bundle(appid, write_bundle_type)
+    resp = bundle.unpack(req=req)['ackTag']
+    return resp
 
-    bundle = cast(
+  def write_from_bundle(self, appid: AppID,
+                        write_bundle_type: Bundle) -> BundleSignal:
+    self._materialize_service_decl()
+
+    return cast(
         BundleSignal,
         _FromCirctValue(
             raw_esi.RequestConnectionOp(
@@ -653,29 +659,39 @@ class _HostMem(ServiceDecl):
                 hw.InnerRefAttr.get(self.symbol, ir.StringAttr.get("write")),
                 appid._appid).toClient))
 
-  # Create a read request to the host memory out of a request channel and return
-  # the response channel with the specified data type.
-  def read(self, appid: AppID, req: ChannelSignal,
-           data_type: Type) -> ChannelSignal:
-    self._materialize_service_decl()
-
+  def read_bundle_type(self, resp_type: Type) -> Bundle:
+    """Build a read bundle type for the given data type."""
     resp_type = StructType([
         ("tag", UInt(8)),
-        ("data", data_type),
+        ("data", resp_type),
     ])
     read_bundle_type = Bundle([
         BundledChannel("req", ChannelDirection.FROM, _HostMem.ReadReqType),
         BundledChannel("resp", ChannelDirection.TO, resp_type)
     ])
+    return read_bundle_type
 
-    bundle = cast(
+  def read_from_bundle(self, appid: AppID,
+                       read_bundle_type: Bundle) -> BundleSignal:
+    """Request a connection based for a given read bundle type."""
+    return cast(
         BundleSignal,
         _FromCirctValue(
             raw_esi.RequestConnectionOp(
                 read_bundle_type._type,
                 hw.InnerRefAttr.get(self.symbol, ir.StringAttr.get("read")),
                 appid._appid).toClient))
-    resp = bundle.unpack(req=req)['resp']
+
+  def read(self, appid: AppID, req: ChannelSignal,
+           data_type: Type) -> ChannelSignal:
+    """Create a read request to the host memory out of a request channel and
+    return the response channel with the specified data type."""
+
+    self._materialize_service_decl()
+
+    read_bundle_type = self.read_bundle_type(data_type)
+    bundle_sig = self.read_from_bundle(appid, read_bundle_type)
+    resp = bundle_sig.unpack(req=req)['resp']
     return resp
 
   @staticmethod

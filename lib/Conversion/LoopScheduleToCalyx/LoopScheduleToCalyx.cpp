@@ -1470,7 +1470,7 @@ class BuildConditionChecks : public calyx::FuncOpPartialLoweringPattern {
 
       auto termArg = term.getIterArgs()[0];
       auto phase = termArg.getDefiningOp<PhaseInterface>();
-      auto result = termArg.cast<OpResult>();
+      auto result = cast<OpResult>(termArg);
       auto *phaseReg = phase.getBodyBlock().getTerminator();
       auto newIterArg = phaseReg->getOpOperand(result.getResultNumber()).get();
       Value newCondValue;

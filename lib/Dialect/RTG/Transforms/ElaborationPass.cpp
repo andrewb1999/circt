@@ -85,60 +85,37 @@ static uint32_t getUniformlyInRange(std::mt19937 &rng, uint32_t a, uint32_t b) {
 //===----------------------------------------------------------------------===//
 
 namespace {
+struct ArrayStorage;
 struct BagStorage;
 struct SequenceStorage;
 struct RandomizedSequenceStorage;
+struct InterleavedSequenceStorage;
 struct SetStorage;
+struct VirtualRegisterStorage;
+struct UniqueLabelStorage;
 
-/// Represents a unique virtual register.
-struct VirtualRegister {
-  VirtualRegister(uint64_t id, ArrayAttr allowedRegs)
-      : id(id), allowedRegs(allowedRegs) {}
-
-  bool operator==(const VirtualRegister &other) const {
-    assert(
-        id != other.id ||
-        allowedRegs == other.allowedRegs &&
-            "instances with the same ID must have the same allowed registers");
-    return id == other.id;
-  }
-
-  // The ID of this virtual register.
-  uint64_t id;
-
-  // The list of fixed registers allowed to be selected for this virtual
-  // register.
-  ArrayAttr allowedRegs;
-};
-
+/// Simple wrapper around a 'StringAttr' such that we know to materialize it as
+/// a label declaration instead of calling the builtin dialect constant
+/// materializer.
 struct LabelValue {
-  LabelValue(StringAttr name, uint64_t id = 0) : name(name), id(id) {}
+  LabelValue(StringAttr name) : name(name) {}
 
-  bool operator==(const LabelValue &other) const {
-    return name == other.name && id == other.id;
-  }
+  bool operator==(const LabelValue &other) const { return name == other.name; }
 
-  /// The label name. For unique labels, this is just the prefix.
+  /// The label name.
   StringAttr name;
-
-  /// Standard label declarations always have id=0
-  uint64_t id;
 };
 
 /// The abstract base class for elaborated values.
 using ElaboratorValue =
     std::variant<TypedAttr, BagStorage *, bool, size_t, SequenceStorage *,
-                 RandomizedSequenceStorage *, SetStorage *, VirtualRegister,
-                 LabelValue>;
-
-// NOLINTNEXTLINE(readability-identifier-naming)
-llvm::hash_code hash_value(const VirtualRegister &val) {
-  return llvm::hash_value(val.id);
-}
+                 RandomizedSequenceStorage *, InterleavedSequenceStorage *,
+                 SetStorage *, VirtualRegisterStorage *, UniqueLabelStorage *,
+                 LabelValue, ArrayStorage *>;
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 llvm::hash_code hash_value(const LabelValue &val) {
-  return llvm::hash_combine(val.id, val.name);
+  return llvm::hash_value(val.name);
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -164,32 +141,16 @@ struct DenseMapInfo<bool> {
 
   static bool isEqual(const bool &lhs, const bool &rhs) { return lhs == rhs; }
 };
-
-template <>
-struct DenseMapInfo<VirtualRegister> {
-  static inline VirtualRegister getEmptyKey() {
-    return VirtualRegister(0, ArrayAttr());
-  }
-  static inline VirtualRegister getTombstoneKey() {
-    return VirtualRegister(~0, ArrayAttr());
-  }
-  static unsigned getHashValue(const VirtualRegister &val) {
-    return llvm::hash_combine(val.id, val.allowedRegs);
-  }
-
-  static bool isEqual(const VirtualRegister &lhs, const VirtualRegister &rhs) {
-    return lhs == rhs;
-  }
-};
-
 template <>
 struct DenseMapInfo<LabelValue> {
-  static inline LabelValue getEmptyKey() { return LabelValue(StringAttr(), 0); }
+  static inline LabelValue getEmptyKey() {
+    return DenseMapInfo<StringAttr>::getEmptyKey();
+  }
   static inline LabelValue getTombstoneKey() {
-    return LabelValue(StringAttr(), ~0);
+    return DenseMapInfo<StringAttr>::getTombstoneKey();
   }
   static unsigned getHashValue(const LabelValue &val) {
-    return llvm::hash_combine(val.name, val.id);
+    return hash_value(val);
   }
 
   static bool isEqual(const LabelValue &lhs, const LabelValue &rhs) {
@@ -351,6 +312,79 @@ struct RandomizedSequenceStorage {
   const SequenceStorage *sequence;
 };
 
+/// Storage object for interleaved '!rtg.randomized_sequence'es.
+struct InterleavedSequenceStorage {
+  InterleavedSequenceStorage(SmallVector<ElaboratorValue> &&sequences,
+                             uint32_t batchSize)
+      : sequences(std::move(sequences)), batchSize(batchSize),
+        hashcode(llvm::hash_combine(
+            llvm::hash_combine_range(sequences.begin(), sequences.end()),
+            batchSize)) {}
+
+  explicit InterleavedSequenceStorage(RandomizedSequenceStorage *sequence)
+      : sequences(SmallVector<ElaboratorValue>(1, sequence)), batchSize(1),
+        hashcode(llvm::hash_combine(
+            llvm::hash_combine_range(sequences.begin(), sequences.end()),
+            batchSize)) {}
+
+  bool isEqual(const InterleavedSequenceStorage *other) const {
+    return hashcode == other->hashcode && sequences == other->sequences &&
+           batchSize == other->batchSize;
+  }
+
+  const SmallVector<ElaboratorValue> sequences;
+
+  const uint32_t batchSize;
+
+  // The cached hashcode to avoid repeated computations.
+  const unsigned hashcode;
+};
+
+/// Represents a unique virtual register.
+struct VirtualRegisterStorage {
+  VirtualRegisterStorage(ArrayAttr allowedRegs) : allowedRegs(allowedRegs) {}
+
+  // NOTE: we don't need an 'isEqual' function and 'hashcode' here because
+  // VirtualRegisters are never internalized.
+
+  // The list of fixed registers allowed to be selected for this virtual
+  // register.
+  const ArrayAttr allowedRegs;
+};
+
+struct UniqueLabelStorage {
+  UniqueLabelStorage(StringAttr name) : name(name) {}
+
+  // NOTE: we don't need an 'isEqual' function and 'hashcode' here because
+  // VirtualRegisters are never internalized.
+
+  /// The label name. For unique labels, this is just the prefix.
+  const StringAttr name;
+};
+
+/// Storage object for '!rtg.array`-typed values.
+struct ArrayStorage {
+  ArrayStorage(Type type, SmallVector<ElaboratorValue> &&array)
+      : hashcode(llvm::hash_combine(
+            type, llvm::hash_combine_range(array.begin(), array.end()))),
+        type(type), array(array) {}
+
+  bool isEqual(const ArrayStorage *other) const {
+    return hashcode == other->hashcode && type == other->type &&
+           array == other->array;
+  }
+
+  // The cached hashcode to avoid repeated computations.
+  const unsigned hashcode;
+
+  /// The type of the array. This is necessary because an array of size 0
+  /// cannot be reconstructed without knowing the original element type.
+  const Type type;
+
+  /// The label name. For unique labels, this is just the prefix.
+  const SmallVector<ElaboratorValue> array;
+};
+
 /// An 'Internalizer' object internalizes storages and takes ownership of them.
 /// When the initializer object is destroyed, all owned storages are also
 /// deallocated and thus must not be accessed anymore.
@@ -375,11 +409,19 @@ public:
     return storagePtr;
   }
 
+  template <typename StorageTy, typename... Args>
+  StorageTy *create(Args &&...args) {
+    return new (allocator.Allocate<StorageTy>())
+        StorageTy(std::forward<Args>(args)...);
+  }
+
 private:
   template <typename StorageTy>
   DenseSet<HashedStorage<StorageTy>, StorageKeyInfo<StorageTy>> &
   getInternSet() {
-    if constexpr (std::is_same_v<StorageTy, SetStorage>)
+    if constexpr (std::is_same_v<StorageTy, ArrayStorage>)
+      return internedArrays;
+    else if constexpr (std::is_same_v<StorageTy, SetStorage>)
       return internedSets;
     else if constexpr (std::is_same_v<StorageTy, BagStorage>)
       return internedBags;
@@ -387,6 +429,8 @@ private:
       return internedSequences;
     else if constexpr (std::is_same_v<StorageTy, RandomizedSequenceStorage>)
       return internedRandomizedSequences;
+    else if constexpr (std::is_same_v<StorageTy, InterleavedSequenceStorage>)
+      return internedInterleavedSequences;
     else
       static_assert(!sizeof(StorageTy),
                     "no intern set available for this storage type.");
@@ -399,6 +443,8 @@ private:
   // The sets holding the internalized objects. We use one set per storage type
   // such that we can have a simpler equality checking function (no need to
   // compare some sort of TypeIDs).
+  DenseSet<HashedStorage<ArrayStorage>, StorageKeyInfo<ArrayStorage>>
+      internedArrays;
   DenseSet<HashedStorage<SetStorage>, StorageKeyInfo<SetStorage>> internedSets;
   DenseSet<HashedStorage<BagStorage>, StorageKeyInfo<BagStorage>> internedBags;
   DenseSet<HashedStorage<SequenceStorage>, StorageKeyInfo<SequenceStorage>>
@@ -406,6 +452,9 @@ private:
   DenseSet<HashedStorage<RandomizedSequenceStorage>,
            StorageKeyInfo<RandomizedSequenceStorage>>
       internedRandomizedSequences;
+  DenseSet<HashedStorage<InterleavedSequenceStorage>,
+           StorageKeyInfo<InterleavedSequenceStorage>>
+      internedInterleavedSequences;
 };
 
 } // namespace
@@ -452,6 +501,20 @@ static void print(RandomizedSequenceStorage *val, llvm::raw_ostream &os) {
   os << ") at " << val << ">";
 }
 
+static void print(InterleavedSequenceStorage *val, llvm::raw_ostream &os) {
+  os << "<interleaved-sequence [";
+  llvm::interleaveComma(val->sequences, os,
+                        [&](const ElaboratorValue &val) { os << val; });
+  os << "] batch-size " << val->batchSize << " at " << val << ">";
+}
+
+static void print(ArrayStorage *val, llvm::raw_ostream &os) {
+  os << "<array [";
+  llvm::interleaveComma(val->array, os,
+                        [&](const ElaboratorValue &val) { os << val; });
+  os << "] at " << val << ">";
+}
+
 static void print(SetStorage *val, llvm::raw_ostream &os) {
   os << "<set {";
   llvm::interleaveComma(val->set, os,
@@ -459,12 +522,16 @@ static void print(SetStorage *val, llvm::raw_ostream &os) {
   os << "} at " << val << ">";
 }
 
-static void print(const VirtualRegister &val, llvm::raw_ostream &os) {
-  os << "<virtual-register " << val.id << " " << val.allowedRegs << ">";
+static void print(const VirtualRegisterStorage *val, llvm::raw_ostream &os) {
+  os << "<virtual-register " << val << " " << val->allowedRegs << ">";
+}
+
+static void print(const UniqueLabelStorage *val, llvm::raw_ostream &os) {
+  os << "<unique-label " << val << " " << val->name << ">";
 }
 
 static void print(const LabelValue &val, llvm::raw_ostream &os) {
-  os << "<label " << val.id << " " << val.name << ">";
+  os << "<label " << val.name << ">";
 }
 
 static llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
@@ -634,6 +701,24 @@ private:
     return res;
   }
 
+  Value visit(ArrayStorage *val, Location loc,
+              std::queue<RandomizedSequenceStorage *> &elabRequests,
+              function_ref<InFlightDiagnostic()> emitError) {
+    SmallVector<Value> elements;
+    elements.reserve(val->array.size());
+    for (auto el : val->array) {
+      auto materialized = materialize(el, loc, elabRequests, emitError);
+      if (!materialized)
+        return Value();
+
+      elements.push_back(materialized);
+    }
+
+    auto res = builder.create<ArrayCreateOp>(loc, val->type, elements);
+    materializedValues[val] = res;
+    return res;
+  }
+
   Value visit(SetStorage *val, Location loc,
               std::queue<RandomizedSequenceStorage *> &elabRequests,
               function_ref<InFlightDiagnostic()> emitError) {
@@ -687,13 +772,39 @@ private:
     elabRequests.push(val);
     Value seq = builder.create<GetSequenceOp>(
         loc, SequenceType::get(builder.getContext(), {}), val->name);
-    return builder.create<RandomizeSequenceOp>(loc, seq);
+    Value res = builder.create<RandomizeSequenceOp>(loc, seq);
+    materializedValues[val] = res;
+    return res;
   }
 
-  Value visit(const VirtualRegister &val, Location loc,
+  Value visit(InterleavedSequenceStorage *val, Location loc,
               std::queue<RandomizedSequenceStorage *> &elabRequests,
               function_ref<InFlightDiagnostic()> emitError) {
-    auto res = builder.create<VirtualRegisterOp>(loc, val.allowedRegs);
+    SmallVector<Value> sequences;
+    for (auto seqVal : val->sequences)
+      sequences.push_back(materialize(seqVal, loc, elabRequests, emitError));
+
+    if (sequences.size() == 1)
+      return sequences[0];
+
+    Value res =
+        builder.create<InterleaveSequencesOp>(loc, sequences, val->batchSize);
+    materializedValues[val] = res;
+    return res;
+  }
+
+  Value visit(VirtualRegisterStorage *val, Location loc,
+              std::queue<RandomizedSequenceStorage *> &elabRequests,
+              function_ref<InFlightDiagnostic()> emitError) {
+    Value res = builder.create<VirtualRegisterOp>(loc, val->allowedRegs);
+    materializedValues[val] = res;
+    return res;
+  }
+
+  Value visit(UniqueLabelStorage *val, Location loc,
+              std::queue<RandomizedSequenceStorage *> &elabRequests,
+              function_ref<InFlightDiagnostic()> emitError) {
+    Value res = builder.create<LabelUniqueDeclOp>(loc, val->name, ValueRange());
     materializedValues[val] = res;
     return res;
   }
@@ -701,13 +812,7 @@ private:
   Value visit(const LabelValue &val, Location loc,
               std::queue<RandomizedSequenceStorage *> &elabRequests,
               function_ref<InFlightDiagnostic()> emitError) {
-    if (val.id == 0) {
-      auto res = builder.create<LabelDeclOp>(loc, val.name, ValueRange());
-      materializedValues[val] = res;
-      return res;
-    }
-
-    auto res = builder.create<LabelUniqueDeclOp>(loc, val.name, ValueRange());
+    Value res = builder.create<LabelDeclOp>(loc, val.name, ValueRange());
     materializedValues[val] = res;
     return res;
   }
@@ -743,15 +848,11 @@ struct ElaboratorSharedState {
   SymbolTable &table;
   std::mt19937 rng;
   Namespace names;
-  Namespace labelNames;
   Internalizer internalizer;
 
   /// The worklist used to keep track of the test and sequence operations to
   /// make sure they are processed top-down (BFS traversal).
   std::queue<RandomizedSequenceStorage *> worklist;
-
-  uint64_t virtualRegisterID = 0;
-  uint64_t uniqueLabelID = 1;
 };
 
 /// A collection of state per RTG test.
@@ -826,6 +927,10 @@ public:
     return visitUnhandledOp(op);
   }
 
+  FailureOr<DeletionKind> visitOp(ConstantOp op) {
+    return visitConstantLike(op);
+  }
+
   FailureOr<DeletionKind> visitOp(GetSequenceOp op) {
     SmallVector<ElaboratorValue> replacements;
     state[op.getResult()] =
@@ -852,26 +957,56 @@ public:
     auto *seq = get<SequenceStorage *>(op.getSequence());
 
     auto name = sharedState.names.newName(seq->familyName.getValue());
-    state[op.getResult()] =
+    auto *randomizedSeq =
         sharedState.internalizer.internalize<RandomizedSequenceStorage>(
             name, currentContext, testState.name, seq);
+    state[op.getResult()] =
+        sharedState.internalizer.internalize<InterleavedSequenceStorage>(
+            randomizedSeq);
     return DeletionKind::Delete;
   }
 
-  FailureOr<DeletionKind> visitOp(EmbedSequenceOp op) {
-    auto *seq = get<RandomizedSequenceStorage *>(op.getSequence());
-    if (seq->context != currentContext) {
-      auto err = op->emitError("attempting to place sequence ")
-                 << seq->name << " derived from "
-                 << seq->sequence->familyName.getValue() << " under context "
-                 << currentContext
-                 << ", but it was previously randomized for context ";
-      if (seq->context)
-        err << seq->context;
-      else
-        err << "'default'";
-      return err;
+  FailureOr<DeletionKind> visitOp(InterleaveSequencesOp op) {
+    SmallVector<ElaboratorValue> sequences;
+    for (auto seq : op.getSequences())
+      sequences.push_back(get<InterleavedSequenceStorage *>(seq));
+
+    state[op.getResult()] =
+        sharedState.internalizer.internalize<InterleavedSequenceStorage>(
+            std::move(sequences), op.getBatchSize());
+    return DeletionKind::Delete;
+  }
+
+  // NOLINTNEXTLINE(misc-no-recursion)
+  LogicalResult isValidContext(ElaboratorValue value, Operation *op) const {
+    if (std::holds_alternative<RandomizedSequenceStorage *>(value)) {
+      auto *seq = std::get<RandomizedSequenceStorage *>(value);
+      if (seq->context != currentContext) {
+        auto err = op->emitError("attempting to place sequence ")
+                   << seq->name << " derived from "
+                   << seq->sequence->familyName.getValue() << " under context "
+                   << currentContext
+                   << ", but it was previously randomized for context ";
+        if (seq->context)
+          err << seq->context;
+        else
+          err << "'default'";
+        return err;
+      }
+      return success();
     }
+
+    auto *interVal = std::get<InterleavedSequenceStorage *>(value);
+    for (auto val : interVal->sequences)
+      if (failed(isValidContext(val, op)))
+        return failure();
+    return success();
+  }
+
+  FailureOr<DeletionKind> visitOp(EmbedSequenceOp op) {
+    auto *seqVal = get<InterleavedSequenceStorage *>(op.getSequence());
+    if (failed(isValidContext(seqVal, op)))
+      return failure();
 
     return DeletionKind::Keep;
   }
@@ -888,6 +1023,9 @@ public:
 
   FailureOr<DeletionKind> visitOp(SetSelectRandomOp op) {
     auto set = get<SetStorage *>(op.getSet())->set;
+
+    if (set.empty())
+      return op->emitError("cannot select from an empty set");
 
     size_t selected;
     if (auto intAttr =
@@ -947,6 +1085,9 @@ public:
 
   FailureOr<DeletionKind> visitOp(BagSelectRandomOp op) {
     auto bag = get<BagStorage *>(op.getBag())->bag;
+
+    if (bag.empty())
+      return op->emitError("cannot select from an empty bag");
 
     SmallVector<std::pair<ElaboratorValue, uint32_t>> prefixSum;
     prefixSum.reserve(bag.size());
@@ -1023,8 +1164,9 @@ public:
   }
 
   FailureOr<DeletionKind> visitOp(VirtualRegisterOp op) {
-    state[op.getResult()] = VirtualRegister(sharedState.virtualRegisterID++,
-                                            op.getAllowedRegsAttr());
+    state[op.getResult()] =
+        sharedState.internalizer.create<VirtualRegisterStorage>(
+            op.getAllowedRegsAttr());
     return DeletionKind::Delete;
   }
 
@@ -1046,18 +1188,39 @@ public:
     return StringAttr::get(formatString.getContext(), original);
   }
 
+  FailureOr<DeletionKind> visitOp(ArrayCreateOp op) {
+    SmallVector<ElaboratorValue> array;
+    array.reserve(op.getElements().size());
+    for (auto val : op.getElements())
+      array.emplace_back(state.at(val));
+
+    state[op.getResult()] = sharedState.internalizer.internalize<ArrayStorage>(
+        op.getResult().getType(), std::move(array));
+    return DeletionKind::Delete;
+  }
+
+  FailureOr<DeletionKind> visitOp(ArrayExtractOp op) {
+    auto array = get<ArrayStorage *>(op.getArray())->array;
+    size_t idx = get<size_t>(op.getIndex());
+
+    if (array.size() <= idx)
+      return op->emitError("invalid to access index ")
+             << idx << " of an array with " << array.size() << " elements";
+
+    state[op.getResult()] = array[idx];
+    return DeletionKind::Delete;
+  }
+
   FailureOr<DeletionKind> visitOp(LabelDeclOp op) {
     auto substituted =
         substituteFormatString(op.getFormatStringAttr(), op.getArgs());
-    sharedState.labelNames.add(substituted.getValue());
     state[op.getLabel()] = LabelValue(substituted);
     return DeletionKind::Delete;
   }
 
   FailureOr<DeletionKind> visitOp(LabelUniqueDeclOp op) {
-    state[op.getLabel()] = LabelValue(
-        substituteFormatString(op.getFormatStringAttr(), op.getArgs()),
-        sharedState.uniqueLabelID++);
+    state[op.getLabel()] = sharedState.internalizer.create<UniqueLabelStorage>(
+        substituteFormatString(op.getFormatStringAttr(), op.getArgs()));
     return DeletionKind::Delete;
   }
 
@@ -1079,6 +1242,19 @@ public:
           size_t(getUniformlyInRange(sharedState.rng, lower, upper));
     }
 
+    return DeletionKind::Delete;
+  }
+
+  FailureOr<DeletionKind> visitOp(IntToImmediateOp op) {
+    size_t input = get<size_t>(op.getInput());
+    auto width = op.getType().getWidth();
+    auto emitError = [&]() { return op->emitError(); };
+    if (input > APInt::getAllOnes(width).getZExtValue())
+      return emitError() << "cannot represent " << input << " with " << width
+                         << " bits";
+
+    state[op.getResult()] =
+        ImmediateAttr::get(op.getContext(), APInt(width, input));
     return DeletionKind::Delete;
   }
 
@@ -1320,7 +1496,6 @@ struct ElaborationPass
   void runOnOperation() override;
   void cloneTargetsIntoTests(SymbolTable &table);
   LogicalResult elaborateModule(ModuleOp moduleOp, SymbolTable &table);
-  LogicalResult inlineSequences(TestOp testOp, SymbolTable &table);
 };
 } // namespace
 
@@ -1418,6 +1593,8 @@ LogicalResult ElaborationPass::elaborateModule(ModuleOp moduleOp,
     auto seqOp = builder.cloneWithoutRegions(familyOp);
     seqOp.getBodyRegion().emplaceBlock();
     seqOp.setSymName(curr->name);
+    seqOp.setSequenceType(
+        SequenceType::get(builder.getContext(), ArrayRef<Type>{}));
     table.insert(seqOp);
     assert(seqOp.getSymName() == curr->name && "should not have been renamed");
 
@@ -1434,65 +1611,6 @@ LogicalResult ElaborationPass::elaborateModule(ModuleOp moduleOp,
       return failure();
 
     materializer.finalize();
-  }
-
-  for (auto testOp : moduleOp.getOps<TestOp>()) {
-    // Inline all sequences and remove the operations that place the sequences.
-    if (failed(inlineSequences(testOp, table)))
-      return failure();
-
-    // Convert 'rtg.label_unique_decl' to 'rtg.label_decl' by choosing a unique
-    // name based on the set of names we collected during elaboration.
-    for (auto labelOp :
-         llvm::make_early_inc_range(testOp.getOps<LabelUniqueDeclOp>())) {
-      IRRewriter rewriter(labelOp);
-      auto newName = state.labelNames.newName(labelOp.getFormatString());
-      rewriter.replaceOpWithNewOp<LabelDeclOp>(labelOp, newName, ValueRange());
-    }
-  }
-
-  // Remove all sequences since they are not accessible from the outside and
-  // are not needed anymore since we fully inlined them.
-  for (auto seqOp : llvm::make_early_inc_range(moduleOp.getOps<SequenceOp>()))
-    seqOp->erase();
-
-  return success();
-}
-
-LogicalResult ElaborationPass::inlineSequences(TestOp testOp,
-                                               SymbolTable &table) {
-  OpBuilder builder(testOp);
-  for (auto iter = testOp.getBody()->begin();
-       iter != testOp.getBody()->end();) {
-    auto embedOp = dyn_cast<EmbedSequenceOp>(&*iter);
-    if (!embedOp) {
-      ++iter;
-      continue;
-    }
-
-    auto randSeqOp = embedOp.getSequence().getDefiningOp<RandomizeSequenceOp>();
-    if (!randSeqOp)
-      return embedOp->emitError("sequence operand not directly defined by "
-                                "'rtg.randomize_sequence' op");
-    auto getSeqOp = randSeqOp.getSequence().getDefiningOp<GetSequenceOp>();
-    if (!getSeqOp)
-      return randSeqOp->emitError(
-          "sequence operand not directly defined by 'rtg.get_sequence' op");
-
-    auto seqOp = table.lookup<SequenceOp>(getSeqOp.getSequenceAttr());
-
-    builder.setInsertionPointAfter(embedOp);
-    IRMapping mapping;
-    for (auto &op : *seqOp.getBody())
-      builder.clone(op, mapping);
-
-    (iter++)->erase();
-
-    if (randSeqOp->use_empty())
-      randSeqOp->erase();
-
-    if (getSeqOp->use_empty())
-      getSeqOp->erase();
   }
 
   return success();

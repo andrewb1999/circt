@@ -16,23 +16,27 @@
 # REQUIRES: esi-runtime, esi-cosim, rtl-sim, esitester
 # RUN: rm -rf %t
 # RUN: mkdir %t && cd %t
+# Run pure cosim since we don't yet have a FromHost DMA engine.
 # RUN: %PYTHON% %s %t cosim 2>&1
-# RUN: esi-cosim.py --source %t -- esitester cosim env wait | FileCheck %s
+# RUN: esi-cosim.py --source %t -- esitester -v cosim env wait | FileCheck %s
 # RUN: ESI_COSIM_MANIFEST_MMIO=1 esi-cosim.py --source %t -- esiquery cosim env info
-# RUN: esi-cosim.py --source %t -- esitester cosim env dmatest
+# Now test the ToHost DMA engine.
+# RUN: %PYTHON% %s %t cosim_dma 2>&1
+# RUN: esi-cosim.py --source %t -- esitester cosim env hostmem
+# RUN: esi-cosim.py --source %t -- esitester cosim env dma -w -r
 
 import pycde
 from pycde import AppID, Clock, Module, Reset, generator, modparams
 from pycde.bsp import get_bsp
-from pycde.constructs import Counter, Reg, Wire
-from pycde.esi import CallService
+from pycde.constructs import ControlReg, Counter, NamedWire, Reg, Wire
+from pycde.esi import CallService, ChannelService
 import pycde.esi as esi
 from pycde.types import Bits, Channel, UInt
 
 import typing
 import sys
 
-# CHECK: [INFO] [CONNECT] connecting to backend
+# CHECK: [CONNECT] connecting to backend
 
 
 class PrintfExample(Module):
@@ -43,8 +47,6 @@ class PrintfExample(Module):
 
   @generator
   def construct(ports):
-    # CHECK: [DEBUG] [ESITESTER] Received PrintfExample message
-    # CHECK:                     data: 7000
     # CHECK: PrintfExample: 7
     arg_data = UInt(32)(7)
 
@@ -181,6 +183,121 @@ def WriteMem(width: int) -> typing.Type['WriteMem']:
   return WriteMem
 
 
+@modparams
+def ToHostDMATest(width: int):
+  """Construct a module that sends the write count over a channel to the host
+  the specified number of times. Exercises any DMA engine."""
+
+  class ToHostDMATest(Module):
+    clk = Clock()
+    rst = Reset()
+
+    @generator
+    def construct(ports):
+      count_reached = Wire(Bits(1))
+      count_valid = Wire(Bits(1))
+      out_xact = Wire(Bits(1))
+      cycle_counter = Counter(width)(clk=ports.clk,
+                                     rst=ports.rst,
+                                     clear=Bits(1)(0),
+                                     increment=out_xact)
+
+      write_cntr_incr = ~count_reached & count_valid & out_xact
+      write_counter = Counter(32)(clk=ports.clk,
+                                  rst=ports.rst,
+                                  clear=count_reached,
+                                  increment=write_cntr_incr)
+      num_writes = write_counter.out
+
+      # Get the MMIO space for commands.
+      cmd_chan_wire = Wire(Channel(esi.MMIOReadWriteCmdType))
+      resp_ready_wire = Wire(Bits(1))
+      cmd, cmd_valid = cmd_chan_wire.unwrap(resp_ready_wire)
+      mmio_xact = cmd_valid & resp_ready_wire
+      response_data = Bits(64)(0)
+      response_chan, response_ready = Channel(response_data.type).wrap(
+          response_data, cmd_valid)
+      resp_ready_wire.assign(response_ready)
+
+      # write_count is the specified number of times to send the cycle count.
+      write_count_ce = mmio_xact & cmd.write & (cmd.offset == UInt(32)(0))
+      write_count = cmd.data.as_uint().reg(clk=ports.clk,
+                                           rst=ports.rst,
+                                           rst_value=0,
+                                           ce=write_count_ce)
+      count_reached.assign(num_writes == write_count)
+      count_valid.assign(
+          ControlReg(clk=ports.clk,
+                     rst=ports.rst,
+                     asserts=[write_count_ce],
+                     resets=[count_reached]))
+
+      mmio_rw = esi.MMIO.read_write(appid=AppID("ToHostDMATest"))
+      mmio_rw_cmd_chan = mmio_rw.unpack(data=response_chan)['cmd']
+      cmd_chan_wire.assign(mmio_rw_cmd_chan)
+
+      # Output channel.
+      out_channel, out_channel_ready = Channel(UInt(width)).wrap(
+          cycle_counter.out, count_valid)
+      out_xact.assign(out_channel_ready & count_valid)
+      ChannelService.to_host(name=AppID("out"), chan=out_channel)
+
+  return ToHostDMATest
+
+
+def FromHostDMATest(width: int):
+  """Construct a module that receives the write count over a channel from the
+  host the specified number of times. Exercises any DMA engine."""
+
+  class FromHostDMATest(Module):
+    clk = Clock()
+    rst = Reset()
+
+    @generator
+    def build(ports):
+      last_read = Wire(UInt(width))
+
+      # Get the MMIO space for commands.
+      cmd_chan_wire = Wire(Channel(esi.MMIOReadWriteCmdType))
+      resp_ready_wire = Wire(Bits(1))
+      cmd, cmd_valid = cmd_chan_wire.unwrap(resp_ready_wire)
+      mmio_xact = cmd_valid & resp_ready_wire
+      response_data = last_read.as_bits(64)
+      response_chan, response_ready = Channel(response_data.type).wrap(
+          response_data, cmd_valid)
+      resp_ready_wire.assign(response_ready)
+
+      # read_count is the specified number of times to recieve data.
+      read_count_ce = mmio_xact & cmd.write & (cmd.offset == UInt(32)(0))
+      read_count = cmd.data.as_uint().reg(clk=ports.clk,
+                                          rst=ports.rst,
+                                          rst_value=0,
+                                          ce=read_count_ce)
+      in_data_xact = NamedWire(Bits(1), "in_data_xact")
+      read_counter = Counter(32)(clk=ports.clk,
+                                 rst=ports.rst,
+                                 clear=read_count_ce,
+                                 increment=in_data_xact)
+
+      mmio_rw = esi.MMIO.read_write(appid=AppID("FromHostDMATest"))
+      mmio_rw_cmd_chan = mmio_rw.unpack(data=response_chan)['cmd']
+      cmd_chan_wire.assign(mmio_rw_cmd_chan)
+
+      in_chan = ChannelService.from_host(name=AppID("in"), type=UInt(width))
+      in_ready = NamedWire(read_counter.out < read_count, "in_ready")
+      in_data, in_valid = in_chan.unwrap(in_ready)
+      NamedWire(in_data, "in_data")
+      in_data_xact.assign(in_valid & in_ready)
+
+      last_read.assign(
+          in_data.reg(clk=ports.clk,
+                      rst=ports.rst,
+                      ce=in_data_xact,
+                      name="last_read"))
+
+  return FromHostDMATest
+
+
 class EsiTesterTop(Module):
   clk = Clock()
   rst = Reset()
@@ -188,12 +305,19 @@ class EsiTesterTop(Module):
   @generator
   def construct(ports):
     PrintfExample(clk=ports.clk, rst=ports.rst)
-    ReadMem(32)(appid=esi.AppID("readmem", 32), clk=ports.clk, rst=ports.rst)
-    ReadMem(64)(appid=esi.AppID("readmem", 64), clk=ports.clk, rst=ports.rst)
-    ReadMem(96)(appid=esi.AppID("readmem", 96), clk=ports.clk, rst=ports.rst)
-    WriteMem(32)(appid=esi.AppID("writemem", 32), clk=ports.clk, rst=ports.rst)
-    WriteMem(64)(appid=esi.AppID("writemem", 64), clk=ports.clk, rst=ports.rst)
-    WriteMem(96)(appid=esi.AppID("writemem", 96), clk=ports.clk, rst=ports.rst)
+    for width in [32, 64, 96, 128, 256, 384, 504, 512]:
+      ReadMem(width)(appid=esi.AppID("readmem", width),
+                     clk=ports.clk,
+                     rst=ports.rst)
+      WriteMem(width)(appid=esi.AppID("writemem", width),
+                      clk=ports.clk,
+                      rst=ports.rst)
+      ToHostDMATest(width)(appid=esi.AppID("tohostdmatest", width),
+                           clk=ports.clk,
+                           rst=ports.rst)
+      FromHostDMATest(width)(appid=esi.AppID("fromhostdmatest", width),
+                             clk=ports.clk,
+                             rst=ports.rst)
 
 
 if __name__ == "__main__":

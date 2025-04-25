@@ -105,6 +105,12 @@ def EarlyCodeMotion : Pass<"llhd-early-code-motion", "hw::HWModuleOp"> {
 
 def Sig2Reg : Pass<"llhd-sig2reg", "hw::HWModuleOp"> {
   let summary = "promote LLHD signals to SSA values";
+
+  let dependentDialects = ["circt::hw::HWDialect", "circt::comb::CombDialect"];
+}
+
+def Mem2RegPass : Pass<"llhd-mem2reg"> {
+  let summary = "Promotes memory and signal slots into values.";
 }
 
 def TemporalCodeMotion : Pass<"llhd-temporal-code-motion", "hw::HWModuleOp"> {
@@ -142,6 +148,27 @@ def Desequentialization : Pass<"llhd-desequentialize", "hw::HWModuleOp"> {
 
   let dependentDialects = [
     "comb::CombDialect", "hw::HWDialect", "seq::SeqDialect"
+  ];
+}
+
+def HoistSignalsPass : Pass<"llhd-hoist-signals"> {
+  let summary = "Hoist probes and promote drives to process results";
+}
+
+def LowerProcessesPass : Pass<"llhd-lower-processes", "hw::HWModuleOp"> {
+  let summary = "Convert combinational LLHD processes to SCF execute regions";
+  let dependentDialects = [
+    "mlir::scf::SCFDialect",
+  ];
+}
+
+def DeseqPass : Pass<"llhd-deseq", "hw::HWModuleOp"> {
+  let summary = "Convert sequential processes to registers";
+  let dependentDialects = [
+    "comb::CombDialect",
+    "hw::HWDialect",
+    "mlir::scf::SCFDialect",
+    "seq::SeqDialect",
   ];
 }
 

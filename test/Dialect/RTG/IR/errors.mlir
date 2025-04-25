@@ -1,5 +1,18 @@
 // RUN: circt-opt %s --split-input-file --verify-diagnostics
 
+rtg.test @constantTooBig() {
+  // expected-error @below {{integer value out-of-range for bit-width 2}}
+  rtg.constant #rtg.isa.immediate<2, 4>
+}
+
+// -----
+
+rtg.test @immediateWidthMismatch() {
+  // expected-error @below {{explicit immediate type bit-width does not match attribute bit-width, 1 vs 2}}
+  rtg.constant #rtg.isa.immediate<2, 1> : !rtg.isa.immediate<1>
+}
+
+// -----
 
 func.func @seq0() {
   return
@@ -83,29 +96,24 @@ rtg.target @target : !rtg.dict<a: i32> {
 // -----
 
 // expected-error @below {{argument types must match dict entry types}}
-rtg.test @test : !rtg.dict<a: i32> {
+"rtg.test"() <{sym_name="test", target=!rtg.dict<a: i32>}> ({^bb0(%b: i8):}) : () -> ()
+
+// -----
+
+// expected-error @below {{dictionary must be sorted by names and contain no duplicates, first violation at entry 'a'}}
+rtg.test @test(a = %a: i32, a = %a: i32) {
 }
 
 // -----
 
 // expected-error @below {{dictionary must be sorted by names and contain no duplicates, first violation at entry 'a'}}
-rtg.test @test : !rtg.dict<a: i32, a: i32> {
-^bb0(%arg0: i32, %arg1: i32):
-}
-
-// -----
-
-// expected-error @below {{dictionary must be sorted by names and contain no duplicates, first violation at entry 'a'}}
-rtg.test @test : !rtg.dict<b: i32, a: i32> {
-^bb0(%arg0: i32, %arg1: i32):
+rtg.test @test(b = %b: i32, a = %a: i32) {
 }
 
 // -----
 
 // expected-error @below {{empty strings not allowed as entry names}}
-rtg.test @test : !rtg.dict<"": i32> {
-^bb0(%arg0: i32):
-}
+rtg.test @test(dict = %dict: !rtg.dict<"": i32>) { }
 
 // -----
 
@@ -173,4 +181,26 @@ rtg.target @target : !rtg.dict<> {
   %0 = rtg.get_sequence @seq : !rtg.sequence<!rtgtest.cpu, !rtgtest.cpu, !rtgtest.cpu>
   // expected-error @below {{third sequence element type must be a fully substituted sequence}}
   rtg.context_switch #rtgtest.cpu<0> -> #rtgtest.cpu<1>, %0 : !rtg.sequence<!rtgtest.cpu, !rtgtest.cpu, !rtgtest.cpu>
+}
+
+// -----
+
+rtg.test @test() {
+  // expected-error @below {{must have at least one sequence in the list}}
+  %0 = rtg.interleave_sequences
+}
+
+// -----
+
+// expected-note @below {{prior use here}}
+rtg.test @test(a = %a: i32, b = %b: index) {
+  // expected-error @below {{use of value '%a' expects different type than prior uses: 'index' vs 'i32'}}
+  rtg.array_create %a, %b : index
+}
+
+// -----
+
+rtg.test @test(a = %a: i32, b = %b: index) {
+  // expected-error @below {{requires all operands to have the same type}}
+  "rtg.array_create"(%a, %b) : (i32, index) -> (!rtg.array<index>)
 }

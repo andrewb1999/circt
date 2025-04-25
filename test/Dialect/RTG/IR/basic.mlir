@@ -1,5 +1,16 @@
 // RUN: circt-opt %s --verify-roundtrip | FileCheck %s
 
+// CHECK-LABEL: @constants
+rtg.test @constants() {
+  // CHECK-NEXT: rtg.constant #rtg.isa.immediate<2, -1> : !rtg.isa.immediate<2>
+  %0 = rtg.constant #rtg.isa.immediate<2, -1>
+
+  // CHECK-NEXT: [[V0:%.+]] = index.constant 5
+  // CHECK-NEXT: rtg.isa.int_to_immediate [[V0]] : !rtg.isa.immediate<32>
+  %1 = index.constant 5
+  %2 = rtg.isa.int_to_immediate %1 : !rtg.isa.immediate<32>
+}
+
 // CHECK-LABEL: rtg.sequence @ranomizedSequenceType
 // CHECK-SAME: (%{{.*}}: !rtg.randomized_sequence)
 rtg.sequence @ranomizedSequenceType(%seq: !rtg.randomized_sequence) {}
@@ -20,8 +31,8 @@ rtg.sequence @seq0() {
 }
 
 // CHECK-LABEL: rtg.sequence @seqAttrsAndTypeElements
-// CHECK-SAME: (%arg0: !rtg.sequence<!rtg.sequence<!rtg.label, !rtg.set<index>>>) attributes {rtg.some_attr} {
-rtg.sequence @seqAttrsAndTypeElements(%arg0: !rtg.sequence<!rtg.sequence<!rtg.label, !rtg.set<index>>>) attributes {rtg.some_attr} {}
+// CHECK-SAME: (%arg0: !rtg.sequence<!rtg.sequence<!rtg.isa.label, !rtg.set<index>>>) attributes {rtg.some_attr} {
+rtg.sequence @seqAttrsAndTypeElements(%arg0: !rtg.sequence<!rtg.sequence<!rtg.isa.label, !rtg.set<index>>>) attributes {rtg.some_attr} {}
 
 // CHECK-LABEL: rtg.sequence @seq1
 // CHECK-SAME: (%arg0: i32, %arg1: !rtg.sequence)
@@ -89,8 +100,8 @@ rtg.target @empty_target : !rtg.dict<> {
   rtg.yield
 }
 
-// CHECK-LABEL: rtg.test @empty_test : !rtg.dict<> {
-rtg.test @empty_test : !rtg.dict<> { }
+// CHECK-LABEL: rtg.test @empty_test() {
+rtg.test @empty_test() { }
 
 // CHECK-LABEL: rtg.target @target : !rtg.dict<num_cpus: i32, num_modes: i32> {
 // CHECK:   rtg.yield %{{.*}}, %{{.*}} : i32, i32
@@ -115,22 +126,43 @@ rtg.target @context_switch : !rtg.dict<> {
 }
 
 // CHECK-LABEL: @contexts
-rtg.test @contexts : !rtg.dict<ctxt0: !rtgtest.cpu> {
-^bb0(%arg0: !rtgtest.cpu):
+rtg.test @contexts(ctxt0 = %ctxt0: !rtgtest.cpu) {
   // CHECK: rtg.on_context {{%.+}}, {{%.+}} : !rtgtest.cpu
   %seq = rtg.get_sequence @seq0 : !rtg.sequence
-  rtg.on_context %arg0, %seq : !rtgtest.cpu
+  rtg.on_context %ctxt0, %seq : !rtgtest.cpu
 }
 
-// CHECK-LABEL: rtg.test @test : !rtg.dict<num_cpus: i32, num_modes: i32> {
-// CHECK: ^bb0(%arg0: i32, %arg1: i32):
-// CHECK: }
-rtg.test @test : !rtg.dict<num_cpus: i32, num_modes: i32> {
-^bb0(%arg0: i32, %arg1: i32):
-}
+// CHECK-LABEL: rtg.test @test0
+// CHECK-SAME: (num_cpus = %num_cpus: i32, num_modes = %num_modes: i32) {
+rtg.test @test0(num_cpus = %num_cpus: i32, num_modes = %num_modes: i32) { }
+
+// CHECK-LABEL: rtg.test @test1
+// CHECK-SAME: (num_cpus = %num_cpus: i32, num_modes = %num_modes: i32) {
+rtg.test @test1(num_cpus = %a: i32, num_modes = %b: i32) { }
 
 // CHECK-LABEL: rtg.sequence @integerHandlingOps
 rtg.sequence @integerHandlingOps(%arg0: index, %arg1: index) {
   // CHECK: rtg.random_number_in_range [%arg0, %arg1)
   rtg.random_number_in_range [%arg0, %arg1)
+}
+
+// CHECK-LABEL: rtg.test @interleaveSequences
+rtg.test @interleaveSequences(seq0 = %seq0: !rtg.randomized_sequence, seq1 = %seq1: !rtg.randomized_sequence) {
+  // CHECK: rtg.interleave_sequences %seq0 {rtg.some_attr}
+  rtg.interleave_sequences %seq0 {rtg.some_attr}
+  // CHECK: rtg.interleave_sequences %seq0, %seq1 batch 4 {rtg.some_attr}
+  rtg.interleave_sequences %seq0, %seq1 batch 4 {rtg.some_attr}
+}
+
+// CHECK-LABEL: rtg.test @arrays
+// CHECK-SAME: (arr = [[ARR:%.+]]: !rtg.array<index>)
+rtg.test @arrays(arr = %arr: !rtg.array<index>) {
+  // CHECK-NEXT: [[IDX1:%.+]] = index.constant 1
+  // CHECK-NEXT: [[V0:%.+]] = rtg.array_create [[ARR]], [[ARR]] : !rtg.array<index>
+  // CHECK-NEXT: [[V1:%.+]] = rtg.array_create : index
+  // CHECK-NEXT: [[V2:%.+]] = rtg.array_extract [[V0]][[[IDX1]]] : !rtg.array<!rtg.array<index>>
+  %idx1 = index.constant 1
+  %0 = rtg.array_create %arr, %arr : !rtg.array<index>
+  %1 = rtg.array_create : index
+  %2 = rtg.array_extract %0[%idx1] : !rtg.array<!rtg.array<index>>
 }
