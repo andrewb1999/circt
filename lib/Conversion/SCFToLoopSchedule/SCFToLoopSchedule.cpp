@@ -315,8 +315,8 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
   problem.setOutgoingDelay(freeOpr, 0);
   OperatorType combOpr = problem.getOrInsertOperatorType("comb");
   problem.setLatency(combOpr, 0);
-  problem.setIncomingDelay(combOpr, 0.1);
-  problem.setOutgoingDelay(combOpr, 0.1);
+  problem.setIncomingDelay(combOpr, 0.2);
+  problem.setOutgoingDelay(combOpr, 0.2);
   OperatorType seqOpr = problem.getOrInsertOperatorType("seq");
   problem.setLatency(seqOpr, 1);
   problem.setIncomingDelay(seqOpr, 0.5);
