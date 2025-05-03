@@ -70,6 +70,34 @@ LogicalResult OperatorOp::verify() {
 // TargetOp
 //===----------------------------------------------------------------------===//
 
+LogicalResult TargetOp::verify() {
+  if (!getBodyBlock()->mightHaveTerminator()) {
+    return emitOpError("body block does not have terminator");
+  }
+
+  auto *term = getBodyRegion().front().getTerminator();
+  if (!isa<oplib::OutputOp>(term)) {
+    return emitOpError("region terminator must be OutputOp");
+  }
+
+  auto outputOp = cast<oplib::OutputOp>(term);
+
+  if (outputOp.getOutputs().size() != getNumResults()) {
+    return emitError("OutputOp must have the same number of arguments as "
+                     "results returned by TargetOp");
+  }
+
+  for (auto [t1, t2] :
+       llvm::zip(outputOp.getOperandTypes(), getResultTypes())) {
+    if (t1 != t2) {
+      return emitError(
+          "OutputOp return type does not match TargetOp result type");
+    }
+  }
+
+  return success();
+}
+
 ParseResult TargetOp::parse(OpAsmParser &parser, OperationState &result) {
   auto buildFuncType =
       [](Builder &builder, ArrayRef<Type> argTypes, ArrayRef<Type> results,

@@ -15,10 +15,12 @@
 #include "circt/Dialect/Calyx/CalyxHelpers.h"
 #include "circt/Dialect/Calyx/CalyxLoweringUtils.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
+#include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
+#include "circt/Dialect/SV/SVDialect.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -26,6 +28,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/AsmState.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
@@ -343,16 +346,18 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
     /// been visited before their uses.
     bool opBuiltSuccessfully = true;
     funcOp.walk([&](Operation *op) {
-      auto potentialOperators =
-          operatorLibraryAnalysis.getPotentialOperators(op);
+      // auto potentialOperators =
+      //     operatorLibraryAnalysis.getPotentialOperators(op);
 
-      if (!potentialOperators.empty()) {
+      if (op->hasAttrOfType<SymbolRefAttr>("loopschedule.operator")) {
+        auto chosenOperator =
+            op->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
         auto res = buildOpFromOperator(rewriter, op, operatorLibraryAnalysis);
         if (res.succeeded()) {
           return WalkResult::advance();
         }
         op->emitOpError("Operation matched operator ")
-            << potentialOperators.front() << " but failed to build.";
+            << chosenOperator.getLeafReference() << " but failed to build.";
         return WalkResult::interrupt();
       }
 
@@ -629,14 +634,11 @@ private:
 LogicalResult BuildOpGroups::buildOpFromOperator(
     PatternRewriter &rewriter, Operation *op,
     analysis::OperatorLibraryAnalysis &operatorLibraryAnalysis) const {
-  auto potentialOperators = operatorLibraryAnalysis.getPotentialOperators(op);
-  // TODO: Actually implement allocation to choose best potential operator
-  assert(potentialOperators.size() == 1 &&
-         "multiple potential operators not yet supported");
+  auto operatorName = operatorLibraryAnalysis.getOperatorBySymbol(
+      op->getAttrOfType<SymbolRefAttr>("loopschedule.operator"));
 
   auto phase = op->getParentOfType<PhaseInterface>();
   auto isPipeline = isa<LoopSchedulePipelineStageOp>(phase);
-  auto operatorName = potentialOperators.front();
   auto latency = operatorLibraryAnalysis.getOperatorLatency(operatorName);
   auto *templateOp =
       operatorLibraryAnalysis.getOperatorTemplateOp(operatorName);
@@ -657,8 +659,6 @@ LogicalResult BuildOpGroups::buildOpFromOperator(
   calyx::GroupInterface group;
   if (latency == 0) {
     auto name = op->getName().getStringRef().split(".").second;
-    llvm::errs() << "latency 0\n";
-    llvm::errs() << name << "\n";
     auto groupName = getState<ComponentLoweringState>().getUniqueName(name);
     group = calyx::createGroup<calyx::CombGroupOp>(rewriter, getComponent(),
                                                    op->getLoc(), groupName);
@@ -1728,7 +1728,6 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
     DenseMap<Value, calyx::RegisterOp> regMap;
-    // funcOp->getParentOfType<ModuleOp>().dump();
     auto res = funcOp.walk([&](LoopScheduleRegisterOp op) {
       // Condition registers are handled in BuildWhileGroups.
       auto *parent = op->getParentOp();
@@ -1768,10 +1767,6 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
         if (isIterArg)
           continue;
 
-        // value.dump();
-        // if (isa<BlockArgument>(value)) {
-        //   cast<BlockArgument>(value).getOwner()->dump();
-        // }
         if (!isa<LoopSchedulePipelineOp>(phase->getParentOp()) &&
             !isa<BlockArgument>(value) &&
             isa<PhaseInterface>(value.getDefiningOp())) {
@@ -3044,7 +3039,7 @@ public:
                       ReturnOp, arith::ConstantOp, IndexCastOp, FuncOp, ExtSIOp,
                       SelectOp>();
 
-    getOperation().walk([&](func::FuncOp funcOp) {
+    auto res = getOperation().walk([&](func::FuncOp funcOp) {
       auto operatorLibraryAnalysis =
           getAnalysisManager()
               .nest(funcOp)
@@ -3055,14 +3050,17 @@ public:
         auto operationName = OperationName(operationTarget, &getContext());
         target.addLegalOp(operationName);
       }
+
+      RewritePatternSet legalizePatterns(&getContext());
+      legalizePatterns.add<DummyPattern>(&getContext());
+      DenseSet<Operation *> legalizedOps;
+      if (applyPartialConversion(funcOp, target, std::move(legalizePatterns))
+              .failed())
+        return WalkResult::interrupt();
+      return WalkResult::advance();
     });
 
-    RewritePatternSet legalizePatterns(&getContext());
-    legalizePatterns.add<DummyPattern>(&getContext());
-    DenseSet<Operation *> legalizedOps;
-    if (applyPartialConversion(getOperation(), target,
-                               std::move(legalizePatterns))
-            .failed())
+    if (res.wasInterrupted())
       return failure();
 
     // Program conversion

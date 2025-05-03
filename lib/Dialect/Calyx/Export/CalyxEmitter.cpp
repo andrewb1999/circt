@@ -275,9 +275,13 @@ struct Emitter {
   void emitHWConstant(hw::ConstantOp op);
   void emitConstantZ(sv::ConstantZOp op);
   void emitAlwaysFF(sv::AlwaysFFOp op);
+  void emitAlwaysComb(sv::AlwaysCombOp op);
+  void emitCombExtract(comb::ExtractOp op);
+  void emitCombSub(comb::SubOp op);
   void emitCase(sv::CaseOp op);
   void emitIf(sv::IfOp op);
   void emitPAssign(sv::PAssignOp op);
+  void emitBPAssign(sv::BPAssignOp op);
   void emitReadInOut(sv::ReadInOutOp op);
 
   // Instance emission
@@ -861,6 +865,8 @@ void Emitter::emitPrimitiveModule(hw::HWModuleOp op) {
 
   for (auto [src, dst] :
        llvm::zip(outputOp.getOutputs(), op.getOutputNames())) {
+    Value srcVal = src;
+    assert(logicNameMap.contains(srcVal));
     auto srcName = logicNameMap[src];
     auto dstName = cast<StringAttr>(dst).str();
     indent() << "assign" << space() << dstName << space() << equals() << space()
@@ -912,9 +918,13 @@ void Emitter::emitSVStmt(Operation *op) {
       .Case<hw::ConstantOp>([&](auto op) { emitHWConstant(op); })
       .Case<sv::ConstantZOp>([&](auto op) { emitConstantZ(op); })
       .Case<sv::AlwaysFFOp>([&](auto op) { emitAlwaysFF(op); })
+      .Case<sv::AlwaysCombOp>([&](auto op) { emitAlwaysComb(op); })
+      .Case<comb::ExtractOp>([&](auto op) { emitCombExtract(op); })
+      .Case<comb::SubOp>([&](auto op) { emitCombSub(op); })
       .Case<sv::CaseOp>([&](auto op) { emitCase(op); })
       .Case<sv::IfOp>([&](auto op) { emitIf(op); })
       .Case<sv::PAssignOp>([&](auto op) { emitPAssign(op); })
+      .Case<sv::BPAssignOp>([&](auto op) { emitBPAssign(op); })
       .Case<sv::ReadInOutOp>([&](auto op) { emitReadInOut(op); })
       .Case<hw::OutputOp>([&](auto op) { /* Do nothing */ })
       .Default([&](auto op) {
@@ -935,8 +945,9 @@ void Emitter::emitConstantZ(sv::ConstantZOp op) {
 void Emitter::emitHWConstant(hw::ConstantOp op) {
   indent() << "localparam ";
   std::string name = getUniqueConstantName(op);
-  os << name << space() << equals() << space() << op.getValue().getZExtValue()
-     << semicolonEndL();
+  auto bitwidth = op.getType().getIntOrFloatBitWidth();
+  os << name << space() << equals() << space() << std::to_string(bitwidth)
+     << "'d" << op.getValue().getZExtValue() << semicolonEndL();
   logicNameMap[op.getResult()] = name;
 }
 
@@ -961,8 +972,14 @@ void Emitter::emitPAssign(sv::PAssignOp op) {
            << logicNameMap[op.getSrc()] << semicolonEndL();
 }
 
+void Emitter::emitBPAssign(sv::BPAssignOp op) {
+  indent() << logicNameMap[op.getDest()] << space() << "=" << space()
+           << logicNameMap[op.getSrc()] << semicolonEndL();
+}
+
 void Emitter::emitReadInOut(sv::ReadInOutOp op) {
-  logicNameMap[op.getResult()] = logicNameMap[op.getInput()];
+  auto name = logicNameMap[op.getInput()];
+  logicNameMap[op] = name;
 }
 
 void Emitter::emitIf(sv::IfOp op) {
@@ -1036,6 +1053,44 @@ void Emitter::emitAlwaysFF(sv::AlwaysFFOp op) {
 
   reduceIndent();
   indent() << EndEndL();
+}
+
+void Emitter::emitAlwaysComb(sv::AlwaysCombOp op) {
+  indent() << "always_comb" << space() << BeginEndL();
+  addIndent();
+
+  for (auto &&bodyOp : *op.getBodyBlock()) {
+    emitSVStmt(&bodyOp);
+  }
+
+  reduceIndent();
+  indent() << EndEndL();
+}
+
+void Emitter::emitCombExtract(comb::ExtractOp op) {
+  auto input = logicNameMap[op.getInput()];
+  auto lowBit = op.getLowBit();
+  auto hiBit = lowBit + op.getResult().getType().getIntOrFloatBitWidth() - 1;
+  if (hiBit == lowBit) {
+    logicNameMap[op.getResult()] = input + "[" + std::to_string(lowBit) + "]";
+  } else {
+    logicNameMap[op.getResult()] = input + "[" + std::to_string(hiBit) + ":" +
+                                   std::to_string(lowBit) + "]";
+  }
+}
+
+void Emitter::emitCombSub(comb::SubOp op) {
+  auto lhs = logicNameMap[op.getLhs()];
+  auto rhs = logicNameMap[op.getRhs()];
+
+  if (isa<hw::ConstantOp>(op.getLhs().getDefiningOp())) {
+    auto constOp = op.getLhs().getDefiningOp<hw::ConstantOp>();
+    if (constOp.getValue() == 0) {
+      logicNameMap[op.getResult()] = "(-" + rhs + ")";
+      return;
+    }
+  }
+  logicNameMap[op.getResult()] = "(" + lhs + " - " + rhs + ")";
 }
 
 void Emitter::emitInstance(InstanceOp op) {

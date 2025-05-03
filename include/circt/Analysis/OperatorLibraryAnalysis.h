@@ -17,6 +17,7 @@
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/Attributes.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/AnalysisManager.h"
 #include <utility>
 
@@ -34,6 +35,8 @@ struct Operator {
 
   // Must be calyx::CellInterface
   Operation *templateOp;
+
+  Operation *opToMatch;
 
   std::map<unsigned, unsigned> operandToCellResultMapping;
 
@@ -57,6 +60,8 @@ struct OperatorLibraryAnalysis {
   OperatorLibraryAnalysis(Operation *op);
 
   SmallVector<StringRef> getPotentialOperators(Operation *);
+
+  StringRef getOperatorBySymbol(mlir::SymbolRefAttr);
 
   SmallVector<StringRef> getAllSupportedTargets();
 

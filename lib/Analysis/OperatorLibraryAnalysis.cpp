@@ -19,6 +19,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/Value.h"
+#include "llvm/ADT/STLExtras.h"
 #include <cassert>
 
 using namespace mlir;
@@ -62,6 +63,7 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
     operatorStruct.incDelay = operatorOp.getIncDelay();
     operatorStruct.outDelay = operatorOp.getOutDelay();
     operatorStruct.templateOp = &matchOp.getBodyBlock()->front();
+    operatorStruct.opToMatch = operationOp;
 
     if (operationOp.getOpDict().has_value()) {
       auto dict = operationOp.getOpDict().value();
@@ -133,6 +135,28 @@ static bool allAttributesMatch(Operation *op, Operator &operatorStruct) {
   return true;
 }
 
+static bool allOperandTypesMatch(Operation *op, Operator &operatorStruct) {
+  auto *opToMatch = operatorStruct.opToMatch;
+  if (op->getOperands().size() != opToMatch->getOperands().size()) {
+    return false;
+  }
+
+  return llvm::all_of(
+      llvm::zip(op->getOperandTypes(), opToMatch->getOperandTypes()),
+      [](const auto &p) { return std::get<0>(p) == std::get<1>(p); });
+}
+
+static bool allResultTypesMatch(Operation *op, Operator &operatorStruct) {
+  auto *opToMatch = operatorStruct.opToMatch;
+  if (op->getResults().size() != opToMatch->getResults().size()) {
+    return false;
+  }
+
+  return llvm::all_of(
+      llvm::zip(op->getResultTypes(), opToMatch->getResultTypes()),
+      [](const auto &p) { return std::get<0>(p) == std::get<1>(p); });
+}
+
 SmallVector<StringRef>
 OperatorLibraryAnalysis::getPotentialOperators(Operation *op) {
   ArrayRef<StringRef> vec = potentialOperatorsMap[op->getName().getStringRef()];
@@ -141,12 +165,28 @@ OperatorLibraryAnalysis::getPotentialOperators(Operation *op) {
   for (auto po : vec) {
     auto operatorStruct = operatorMap.at(po);
 
-    if (allAttributesMatch(op, operatorStruct)) {
-      potentialOperators.push_back(po);
+    if (!allAttributesMatch(op, operatorStruct)) {
+      continue;
     }
+
+    if (!allOperandTypesMatch(op, operatorStruct)) {
+      continue;
+    }
+
+    if (!allResultTypesMatch(op, operatorStruct)) {
+      continue;
+    }
+    potentialOperators.push_back(po);
   }
 
   return potentialOperators;
+}
+
+StringRef
+OperatorLibraryAnalysis::getOperatorBySymbol(mlir::SymbolRefAttr symbol) {
+  auto name = symbol.getLeafReference();
+
+  return name.getValue();
 }
 
 SmallVector<StringRef> OperatorLibraryAnalysis::getAllSupportedTargets() {

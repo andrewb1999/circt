@@ -177,7 +177,7 @@ def TargetOp : OpLibOp<"target", [Symbol,
   // let assemblyFormat = [{
   //   $sym_name custom<FunctionType>($function_type) attr-dict-with-keyword $body
   // }];
-  // let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 def OperationOp : OpLibOp<"operation", [HasParent<"TargetOp">]> {

@@ -14,10 +14,12 @@
 #include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -417,6 +419,44 @@ struct StoreInterfaceAddressNarrowingPattern
   }
 };
 
+template <typename T>
+struct ImplicitTruncPattern : OpRewritePattern<TruncIOp> {
+  using OpRewritePattern<TruncIOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(TruncIOp op,
+                                PatternRewriter &rewriter) const override {
+    if (isa<BlockArgument>(op.getIn())) {
+      return failure();
+    }
+
+    auto *inputOp = op.getIn().getDefiningOp();
+    if (!isa<T>(inputOp)) {
+      return failure();
+    }
+
+    auto users = inputOp->getUsers();
+
+    // if (std::distance(users.begin(), users.end()) > 1) {
+    //   return failure();
+    // }
+
+    auto newType = op.getOut().getType();
+
+    SmallVector<Value> newOperands;
+
+    rewriter.setInsertionPoint(inputOp);
+    for (auto &operand : inputOp->getOpOperands()) {
+      auto val = operand.get();
+      auto newOperand = rewriter.create<TruncIOp>(op.getLoc(), newType, val);
+      newOperands.push_back(newOperand);
+    }
+
+    rewriter.replaceOpWithNewOp<T>(op, newOperands);
+
+    return success();
+  }
+};
+
 namespace {
 class DataFlowListener : public RewriterBase::Listener {
 public:
@@ -451,7 +491,7 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   // Apply the core integer narrowing pass
   patterns.clear();
   SmallVector<unsigned> bitwidthsSupported;
-  for (unsigned i = 1; i <= 128; ++i) {
+  for (unsigned i = 1; i <= 1024; ++i) {
     bitwidthsSupported.push_back(i);
   }
 
@@ -460,7 +500,7 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   solver.load<dataflow::IntegerRangeAnalysis>();
   if (failed(solver.initializeAndRun(op)))
     return signalPassFailure();
-  
+
   DataFlowListener listener(solver);
 
   populateIntRangeNarrowingPatterns(patterns, solver, bitwidthsSupported);
@@ -487,6 +527,11 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   patterns.add<StoreInterfaceCleanupPattern>(&context);
   patterns.add<LoadInterfaceAddressNarrowingPattern>(&context);
   patterns.add<StoreInterfaceAddressNarrowingPattern>(&context);
+  // patterns.add<ImplicitTruncPattern<MulIOp>>(&context);
+  // patterns.add<ImplicitTruncPattern<DivSIOp>>(&context);
+  // patterns.add<ImplicitTruncPattern<DivUIOp>>(&context);
+  // patterns.add<ImplicitTruncPattern<AddIOp>>(&context);
+  // patterns.add<ImplicitTruncPattern<SubIOp>>(&context);
 
   if (failed(applyPatternsGreedily(op, std::move(patterns), config))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");

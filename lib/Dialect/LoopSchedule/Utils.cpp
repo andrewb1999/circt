@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
@@ -417,6 +418,23 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
     // Insert every operation into the problem.
     problem.insertOperation(op);
 
+    // Add dependencies for ops contained within loops
+    if (isa<LoopSchedulePipelineOp>(op) || isa<LoopScheduleSequentialOp>(op)) {
+      op->walk([&](Operation *innerOp) {
+        for (auto operand : innerOp->getOperands()) {
+          if (isa<BlockArgument>(operand)) {
+            continue;
+          }
+
+          if (problem.hasOperation(operand.getDefiningOp())) {
+            Dependence dep(operand.getDefiningOp(), op);
+            auto depInserted = problem.insertDependence(dep);
+            assert(succeeded(depInserted));
+          }
+        }
+      });
+    }
+
     ArrayRef<LoopScheduleDependence> dependences =
         dependenceAnalysis.getDependencies(op);
     if (dependences.empty())
@@ -467,12 +485,29 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
     // Insert every operation into the problem.
     problem.insertOperation(op);
 
-    ArrayRef<LoopScheduleDependence> dependences =
+    // Add dependencies for ops contained within loops
+    if (isa<LoopSchedulePipelineOp>(op) || isa<LoopScheduleSequentialOp>(op)) {
+      op->walk([&](Operation *innerOp) {
+        for (auto operand : innerOp->getOperands()) {
+          if (isa<BlockArgument>(operand)) {
+            continue;
+          }
+
+          if (problem.hasOperation(operand.getDefiningOp())) {
+            Dependence dep(operand.getDefiningOp(), op);
+            auto depInserted = problem.insertDependence(dep);
+            assert(succeeded(depInserted));
+          }
+        }
+      });
+    }
+
+    ArrayRef<LoopScheduleDependence> dependencies =
         dependenceAnalysis.getDependencies(op);
-    if (dependences.empty())
+    if (dependencies.empty())
       return;
 
-    for (const LoopScheduleDependence &memoryDep : dependences) {
+    for (const LoopScheduleDependence &memoryDep : dependencies) {
       // Don't insert a dependence into the problem if there is no dependence.
       if (!funcOp->isAncestor(memoryDep.source))
         continue;

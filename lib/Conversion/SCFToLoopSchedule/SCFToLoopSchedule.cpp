@@ -17,6 +17,7 @@
 #include "circt/Dialect/SSP/SSPInterfaces.h"
 #include "circt/Scheduling/Algorithms.h"
 #include "circt/Scheduling/Problems.h"
+#include "circt/Support/LLVM.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
@@ -110,6 +111,7 @@ private:
 
 void SCFToLoopSchedulePass::runOnOperation() {
   float cycleTime = prioritizeII ? 2.0 : 1.0;
+  getOperation()->getParentOfType<ModuleOp>().dump();
 
   // Collect loops to pipeline and work on them.
   SmallVector<scf::ForOp> loops;
@@ -313,12 +315,8 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
   problem.setOutgoingDelay(freeOpr, 0);
   OperatorType combOpr = problem.getOrInsertOperatorType("comb");
   problem.setLatency(combOpr, 0);
-  problem.setIncomingDelay(combOpr, 0.2);
-  problem.setOutgoingDelay(combOpr, 0.2);
-  OperatorType combEndOpr = problem.getOrInsertOperatorType("combEnd");
-  problem.setLatency(combEndOpr, 0);
-  problem.setIncomingDelay(combEndOpr, 0.2);
-  problem.setOutgoingDelay(combEndOpr, 0.2);
+  problem.setIncomingDelay(combOpr, 0.1);
+  problem.setOutgoingDelay(combOpr, 0.1);
   OperatorType seqOpr = problem.getOrInsertOperatorType("seq");
   problem.setLatency(seqOpr, 1);
   problem.setIncomingDelay(seqOpr, 0.5);
@@ -361,6 +359,8 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
           operatorLibraryAnalysis->getOperatorOutgoingDelay(selectedOperator)
               .value_or(0.0));
       problem.setLinkedOperatorType(op, libOpr);
+      op->setAttr("loopschedule.operator",
+                  SymbolRefAttr::get(libOpr.getName()));
       return WalkResult::advance();
     }
 
@@ -373,16 +373,28 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
               problem.setLinkedOperatorType(freeOp, freeOpr);
               return WalkResult::advance();
             })
-        .Case<CmpIOp, arith::SelectOp, AddIOp, SubIOp, ShLIOp, AndIOp, ShRSIOp,
-              ShRUIOp, XOrIOp>([&](Operation *combOp) {
-          // Some known combinational ops.
-          if (onlyUserIsYield(combOp)) {
-            problem.setLinkedOperatorType(combOp, combEndOpr);
+        .Case<ShLIOp, ShRSIOp, ShRUIOp>([&](Operation *shOp) {
+          bool constant =
+              llvm::any_of(shOp->getOpOperands(), [](auto &operand) {
+                if (isa<BlockArgument>(operand.get())) {
+                  return false;
+                }
+                return isa<arith::ConstantOp>(operand.get().getDefiningOp());
+              });
+          // Constant shifts are free
+          if (constant) {
+            problem.setLinkedOperatorType(shOp, freeOpr);
           } else {
-            problem.setLinkedOperatorType(combOp, combOpr);
+            problem.setLinkedOperatorType(shOp, combOpr);
           }
           return WalkResult::advance();
         })
+        .Case<CmpIOp, arith::SelectOp, AddIOp, SubIOp, AndIOp, XOrIOp>(
+            [&](Operation *combOp) {
+              // Some known combinational ops.
+              problem.setLinkedOperatorType(combOp, combOpr);
+              return WalkResult::advance();
+            })
         .Case<MulIOp>([&](Operation *mcOp) {
           // Multiplier
           problem.setLinkedOperatorType(mcOp, mcOpr);
