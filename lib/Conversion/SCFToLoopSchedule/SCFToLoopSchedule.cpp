@@ -111,7 +111,6 @@ private:
 
 void SCFToLoopSchedulePass::runOnOperation() {
   float cycleTime = prioritizeII ? 2.0 : 1.0;
-  getOperation()->getParentOfType<ModuleOp>().dump();
 
   // Collect loops to pipeline and work on them.
   SmallVector<scf::ForOp> loops;
