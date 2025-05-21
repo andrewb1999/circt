@@ -21,6 +21,7 @@
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Support/LLVM.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Support/LLVM.h"
@@ -717,12 +718,13 @@ void Emitter::emitModule(ModuleOp op) {
   for (auto &bodyOp : *op.getBody()) {
     if (auto componentOp = dyn_cast<ComponentInterface>(bodyOp))
       emitComponent(componentOp);
-    else if (auto hwModuleExternOp = dyn_cast<hw::HWModuleExternOp>(bodyOp))
+    else if (auto hwModuleExternOp = dyn_cast<hw::HWModuleExternOp>(bodyOp) ||
+                                     isa<memref::GlobalOp>(bodyOp))
       continue;
     else if (auto hwModuleOp = dyn_cast<hw::HWModuleOp>(bodyOp))
       emitPrimitiveModule(hwModuleOp);
     else
-      emitOpError(&bodyOp, "Unexpected op");
+      emitOpError(&bodyOp, "Unexpected op in calyx emission");
   }
 }
 
