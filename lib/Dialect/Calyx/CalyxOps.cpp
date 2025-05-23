@@ -3065,6 +3065,16 @@ LogicalResult SliceLibOp::verify() {
   return success();
 }
 
+LogicalResult BitSliceLibOp::verify() {
+  unsigned inBits = getResult(0).getType().getIntOrFloatBitWidth();
+  unsigned outBits = getResult(1).getType().getIntOrFloatBitWidth();
+  if (inBits <= outBits)
+    return emitOpError("expected input bits (")
+           << inBits << ')' << " to be greater than output bits (" << outBits
+           << ')';
+  return success();
+}
+
 #define ImplBinSeqOpCellInterface(OpType, outName)                             \
   SmallVector<StringRef> OpType::portNames() {                                 \
     return {clkPort, resetPort, goPort, "left", "right", outName, donePort};   \
@@ -3203,6 +3213,7 @@ ImplBinStallOpCellInterface(StallableMultLibOp, "out")
 
 ImplUnaryOpCellInterface(PadLibOp)
 ImplUnaryOpCellInterface(SliceLibOp)
+ImplUnaryOpCellInterface(BitSliceLibOp)
 ImplUnaryOpCellInterface(NotLibOp)
 ImplUnaryOpCellInterface(WireLibOp)
 ImplUnaryOpCellInterface(ExtSILibOp)

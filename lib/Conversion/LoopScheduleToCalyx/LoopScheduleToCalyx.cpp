@@ -363,21 +363,22 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
 
       opBuiltSuccessfully &=
           TypeSwitch<mlir::Operation *, bool>(op)
-              .template Case<
-                  arith::ConstantOp, BranchOpInterface,
-                  /// memory ops
-                  memref::AllocOp, memref::AllocaOp, LoopScheduleLoadOp,
-                  LoopScheduleStoreOp,
-                  /// memory interface
-                  calyx::StoreLoweringInterface, calyx::LoadLoweringInterface,
-                  calyx::AllocLoweringInterface,
-                  /// standard arithmetic
-                  AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp, AndIOp,
-                  XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp, MulIOp, DivUIOp,
-                  DivSIOp, RemUIOp, RemSIOp, IndexCastOp, SelectOp,
-                  /// loop schedule
-                  LoopInterface, LoopScheduleTerminatorOp, LoopScheduleYieldOp,
-                  LoopScheduleIfOp>(
+              .template Case<arith::ConstantOp, BranchOpInterface,
+                             /// memory ops
+                             memref::AllocOp, memref::AllocaOp,
+                             LoopScheduleLoadOp, LoopScheduleStoreOp,
+                             /// memory interface
+                             calyx::StoreLoweringInterface,
+                             calyx::LoadLoweringInterface,
+                             calyx::AllocLoweringInterface,
+                             /// standard arithmetic
+                             AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp,
+                             AndIOp, XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp,
+                             MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp,
+                             IndexCastOp, SelectOp, comb::ExtractOp,
+                             /// loop schedule
+                             LoopInterface, LoopScheduleTerminatorOp,
+                             LoopScheduleYieldOp, LoopScheduleIfOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<FuncOp, LoopScheduleRegisterOp, PhaseInterface,
                              ReturnOp>([&](auto) {
@@ -429,6 +430,7 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, ReturnOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, IndexCastOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, SelectOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, comb::ExtractOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::AllocOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::AllocaOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, LoopScheduleLoadOp op) const;
@@ -1413,6 +1415,64 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      SelectOp op) const {
   return buildLibraryOp<calyx::CombGroupOp, calyx::MuxLibOp>(rewriter, op);
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     comb::ExtractOp op) const {
+  SmallVector<Type> types;
+  types.push_back(op.getInput().getType());
+  types.push_back(op.getResult().getType());
+
+  // Cast floats to integer types
+  SmallVector<Type> newTypes;
+  for (auto type : types) {
+    auto newType = type;
+    if (isa<FloatType>(type)) {
+      auto bitwidth = type.getIntOrFloatBitWidth();
+      newType = rewriter.getIntegerType(bitwidth);
+    }
+    newTypes.push_back(newType);
+  }
+
+  rewriter.setInsertionPoint(
+      getState<ComponentLoweringState>().getComponentOp().getWiresOp());
+
+  auto calyxOp = rewriter.create<calyx::BitSliceLibOp>(
+      op.getLoc(),
+      getState<ComponentLoweringState>().getUniqueName("std_bit_slice"),
+      op.getLowBit(), newTypes);
+
+  auto directions = calyxOp.portDirections();
+  SmallVector<Value, 4> opInputPorts;
+  SmallVector<Value, 4> opOutputPorts;
+  for (auto dir : enumerate(directions)) {
+    if (dir.value() == calyx::Direction::Input)
+      opInputPorts.push_back(calyxOp.getResult(dir.index()));
+    else
+      opOutputPorts.push_back(calyxOp.getResult(dir.index()));
+  }
+  assert(
+      opInputPorts.size() == op->getNumOperands() &&
+      opOutputPorts.size() == op->getNumResults() &&
+      "Expected an equal number of in/out ports in the Calyx library op with "
+      "respect to the number of operands/results of the source operation.");
+
+  /// Create assignments to the inputs of the library op.
+  auto group = createGroupForOp<calyx::CombGroupOp>(rewriter, op);
+  rewriter.setInsertionPointToEnd(group.getBodyBlock());
+  for (auto dstOp : enumerate(opInputPorts)) {
+    rewriter.create<calyx::AssignOp>(op.getLoc(), dstOp.value(),
+                                     op->getOperand(dstOp.index()));
+  }
+
+  /// Replace the result values of the source operator with the new operator.
+  for (auto res : enumerate(opOutputPorts)) {
+    getState<ComponentLoweringState>().registerEvaluatingGroup(res.value(),
+                                                               group);
+    op->getResult(res.index()).replaceAllUsesWith(res.value());
+  }
+
+  return success();
 }
 
 /// Builds condition checks for each loop.
@@ -3037,7 +3097,7 @@ public:
                       XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp, CondBranchOp,
                       BranchOp, MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp,
                       ReturnOp, arith::ConstantOp, IndexCastOp, FuncOp, ExtSIOp,
-                      SelectOp>();
+                      SelectOp, comb::ExtractOp>();
 
     auto res = getOperation().walk([&](func::FuncOp funcOp) {
       auto operatorLibraryAnalysis =

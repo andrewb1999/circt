@@ -135,7 +135,7 @@ private:
             })
         .Case<NotLibOp, AndLibOp, OrLibOp, XorLibOp, SubLibOp, GtLibOp, LtLibOp,
               EqLibOp, NeqLibOp, GeLibOp, LeLibOp, LshLibOp, RshLibOp,
-              SliceLibOp, PadLibOp, MuxLibOp>(
+              SliceLibOp, PadLibOp, MuxLibOp, BitSliceLibOp>(
             [&](auto op) -> FailureOr<StringRef> {
               static constexpr std::string_view sCore = "core";
               return {sCore};
@@ -329,6 +329,9 @@ struct Emitter {
 
   // Floating point Constant emission
   void emitConstant(ConstantOp constant);
+
+  // Bit Slice Emission
+  void emitBitSlice(BitSliceLibOp op);
 
   // Emits a library primitive with template parameters based on all in- and
   // output ports.
@@ -759,6 +762,7 @@ void Emitter::emitComponent(ComponentInterface op) {
           .Case<calyx::ConstantOp>([&](auto op) { emitConstant(op); })
           .Case<SliceLibOp, PadLibOp, ExtSILibOp>(
               [&](auto op) { emitLibraryPrimTypedByAllPorts(op); })
+          .Case<BitSliceLibOp>([&](auto op) { emitBitSlice(op); })
           .Case<LtLibOp, GtLibOp, EqLibOp, NeqLibOp, GeLibOp, LeLibOp, SltLibOp,
                 SgtLibOp, SeqLibOp, SneqLibOp, SgeLibOp, SleLibOp, AddLibOp,
                 SubLibOp, ShruLibOp, RshLibOp, SrshLibOp, LshLibOp, AndLibOp,
@@ -1291,6 +1295,17 @@ void Emitter::emitConstant(ConstantOp constantOp) {
   }
 
   os << RParen() << semicolonEndL();
+}
+
+void Emitter::emitBitSlice(BitSliceLibOp op) {
+  auto cell = cast<CellInterface>(op.getOperation());
+  indent() << getAttributes(op, /*atFormat=*/true) << cell.instanceName()
+           << space() << equals() << space() << "std_bit_slice" << LParen();
+  os << op.getIn().getType().getIntOrFloatBitWidth() << comma();
+  auto outWidth = op.getOut().getType().getIntOrFloatBitWidth();
+  os << op.getStartIdx() << comma() << op.getStartIdx() + outWidth - 1
+     << comma();
+  os << outWidth << RParen() << semicolonEndL();
 }
 
 /// Calling getName() on a calyx operation will return "calyx.${opname}". This

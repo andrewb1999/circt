@@ -629,6 +629,25 @@ def SliceLibOp : UnaryLibraryOp<"slice", "std_"> {
   let hasVerifier = 1;
 }
 
+def BitSliceLibOp : CalyxPrimitive<"std_bit_slice",
+    [DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>
+    ]> {
+  let arguments = (ins SymbolNameAttr:$sym_name, I32Attr:$startIdx);
+
+  let results = (outs AnyInteger:$in, AnyInteger:$out);
+
+  let builders = [
+    OpBuilder <(ins "StringRef":$sym_name, "uint32_t":$startIdx, "::mlir::TypeRange":$resultTypes), [{
+      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
+      $_state.addAttribute(getStartIdxAttrName($_state.name), $_builder.getI32IntegerAttr(startIdx));
+      $_state.addTypes(resultTypes);
+    }]>
+  ];
+
+  let assemblyFormat = "$sym_name ` ` `<` $startIdx `>` attr-dict `:` qualified(type(results))";
+  let hasVerifier = 1;
+}
+
 def NotLibOp  : UnaryLibraryOp<"not", "std_"> {}
 
 def WireLibOp : UnaryLibraryOp<"wire", "std_", [SameTypeConstraint<"in", "out">]> {

@@ -12,6 +12,7 @@
 #include "circt/Analysis/NameAnalysis.h"
 #include "circt/Analysis/OperatorLibraryAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
+#include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/LoopSchedule/Utils.h"
 #include "circt/Dialect/SSP/SSPInterfaces.h"
@@ -366,12 +367,12 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
     return TypeSwitch<Operation *, WalkResult>(op)
         .Case<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
               arith::TruncIOp, IndexCastOp, memref::AllocaOp, memref::AllocOp,
-              loopschedule::AllocInterface, YieldOp, func::ReturnOp>(
-            [&](Operation *freeOp) {
-              // Some known free ops.
-              problem.setLinkedOperatorType(freeOp, freeOpr);
-              return WalkResult::advance();
-            })
+              loopschedule::AllocInterface, YieldOp, func::ReturnOp,
+              comb::ExtractOp>([&](Operation *freeOp) {
+          // Some known free ops.
+          problem.setLinkedOperatorType(freeOp, freeOpr);
+          return WalkResult::advance();
+        })
         .Case<ShLIOp, ShRSIOp, ShRUIOp>([&](Operation *shOp) {
           bool constant =
               llvm::any_of(shOp->getOpOperands(), [](auto &operand) {
