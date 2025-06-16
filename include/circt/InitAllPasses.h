@@ -25,7 +25,6 @@
 #include "circt/Dialect/Emit/EmitPasses.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/FSM/FSMPasses.h"
-#include "circt/Dialect/HLS/HLSPasses.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/Handshake/HandshakePasses.h"
 #include "circt/Dialect/Kanagawa/KanagawaPasses.h"
@@ -81,7 +80,6 @@ inline void registerAllPasses() {
   seq::registerPasses();
   sv::registerPasses();
   handshake::registerPasses();
-  hls::registerPasses();
   kanagawa::registerPasses();
   rtg::registerPasses();
   hw::registerPasses();

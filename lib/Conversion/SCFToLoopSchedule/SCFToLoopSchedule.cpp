@@ -178,8 +178,10 @@ void SCFToLoopSchedulePass::runOnOperation() {
                              moduloProblem, predicateMap, predicateUse);
 
     // Solve the scheduling problem computed by the analysis.
-    if (failed(solveChainingModuloProblem(loop, moduloProblem, cycleTime)))
+    if (failed(solveChainingModuloProblem(loop, moduloProblem, cycleTime))) {
+      llvm::errs() << "Failed to solve ChainingModuloProblem\n";
       return signalPassFailure();
+    }
 
     // Convert the IR.
     if (failed(createLoopSchedulePipeline(loop, moduloProblem)))
@@ -534,7 +536,7 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
     return failure();
 
   // Verify II
-  if (problem.getInitiationInterval() != ii)
+  if (ii.has_value() && problem.getInitiationInterval() != ii)
     return failure();
 
   // Optionally debug problem outputs.

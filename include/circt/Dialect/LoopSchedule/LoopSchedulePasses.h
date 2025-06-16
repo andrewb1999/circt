@@ -27,6 +27,7 @@ std::unique_ptr<mlir::Pass> createUnrollSubLoopsPass();
 std::unique_ptr<mlir::Pass> createBitwidthReductionForLoopSchedulePass();
 std::unique_ptr<mlir::Pass> createUnrollForLoopSchedulePass();
 std::unique_ptr<mlir::Pass> createPipelineForLoopSchedulePass();
+std::unique_ptr<mlir::Pass> createUnrollMarkedLoopsPass();
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION

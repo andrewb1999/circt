@@ -34,6 +34,14 @@ def UnrollSubLoops : Pass<"unroll-sub-loops", "::mlir::func::FuncOp"> {
   let dependentDialects = ["mlir::scf::SCFDialect", "mlir::func::FuncDialect"];
 }
 
+def UnrollMarkedLoops : Pass<"unroll-marked-loops", "mlir::func::FuncOp"> {
+  let summary = "Unrolls loops with an `hls.unroll` attribute by a given factor.";
+  let description = [{
+  }];
+  let dependentDialects = ["mlir::scf::SCFDialect,mlir::affine::AffineDialect"];
+  let constructor = "circt::loopschedule::createUnrollMarkedLoopsPass()";
+}
+
 def BitwidthReductionForLoopSchedule : Pass<"bitwidth-reduction-for-loopschedule", "::mlir::func::FuncOp"> {
   let summary = "Reduce bitwidth of ops before lowering to loopschedule";
   let description = [{Reduce bitwidth of ops before lowering to loopschedule}];

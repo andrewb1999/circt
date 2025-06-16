@@ -1,4 +1,5 @@
-//===- RemoveGroups.cpp - Remove Groups Pass --------------------*- C++ -*-===//
+//===- UnrollMarkedLoops.cpp - Unroll Marked Loops Pass ----------*- C++
+//-*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -11,7 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "PassDetails.h"
-#include "circt/Dialect/HLS/HLSPasses.h"
+#include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
@@ -20,7 +21,7 @@
 #include "mlir/Interfaces/LoopLikeInterface.h"
 
 using namespace circt;
-using namespace hls;
+using namespace loopschedule;
 using namespace mlir::affine;
 
 namespace {
@@ -60,6 +61,6 @@ void UnrollMarkedLoopsPass::runOnOperation() {
   }
 }
 
-std::unique_ptr<mlir::Pass> circt::hls::createUnrollMarkedLoopsPass() {
+std::unique_ptr<mlir::Pass> circt::loopschedule::createUnrollMarkedLoopsPass() {
   return std::make_unique<UnrollMarkedLoopsPass>();
 }
