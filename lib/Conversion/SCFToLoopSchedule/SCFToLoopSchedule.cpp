@@ -496,6 +496,10 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
   // Scheduling analyis only considers the innermost loop nest for now.
   auto forOp = loop;
 
+  std::optional<int32_t> ii;
+  if (auto iiAttr = loop->getAttrOfType<IntegerAttr>("hls.pipeline"))
+    ii = iiAttr.getInt();
+
   LLVM_DEBUG(forOp.dump());
 
   // Optionally debug problem inputs.
@@ -522,11 +526,15 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
     return failure();
 
   auto *anchor = forOp.getBody()->getTerminator();
-  if (failed(scheduleSimplex(problem, anchor, cycleTime)))
+  if (failed(scheduleSimplex(problem, anchor, cycleTime, ii)))
     return failure();
 
   // Verify the solution.
   if (failed(problem.verify()))
+    return failure();
+
+  // Verify II
+  if (problem.getInitiationInterval() != ii)
     return failure();
 
   // Optionally debug problem outputs.

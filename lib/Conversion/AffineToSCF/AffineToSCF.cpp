@@ -132,14 +132,14 @@ public:
                         rewriter.getI64IntegerAttr(tripCount.value()));
     }
 
-    auto hasPipeline = op->hasAttrOfType<UnitAttr>("hls.pipeline");
+    auto hasPipeline = op->hasAttr("hls.pipeline");
     auto unrollAttr = op->getAttrOfType<IntegerAttr>("hls.unroll");
     rewriter.eraseBlock(scfForOp.getBody());
     rewriter.inlineRegionBefore(op.getRegion(), scfForOp.getRegion(),
                                 scfForOp.getRegion().end());
 
     if (hasPipeline)
-      scfForOp->setAttr("hls.pipeline", rewriter.getUnitAttr());
+      scfForOp->setAttr("hls.pipeline", op->getAttr("hls.pipeline"));
 
     if (op->hasAttrOfType<IntegerAttr>("hls.unroll"))
       scfForOp->setAttr("hls.unroll", unrollAttr);

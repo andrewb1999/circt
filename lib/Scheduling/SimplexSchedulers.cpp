@@ -317,6 +317,7 @@ class ChainingCyclicSimplexScheduler : public SimplexSchedulerBase {
 private:
   ChainingCyclicProblem &prob;
   float cycleTime;
+  std::optional<int32_t> ii;
 
 protected:
   Problem &getProblem() override { return prob; }
@@ -326,8 +327,10 @@ protected:
 
 public:
   ChainingCyclicSimplexScheduler(ChainingCyclicProblem &prob, Operation *lastOp,
-                                 float cycleTime)
-      : SimplexSchedulerBase(lastOp), prob(prob), cycleTime(cycleTime) {}
+                                 float cycleTime,
+                                 std::optional<int32_t> ii = std::nullopt)
+      : SimplexSchedulerBase(lastOp), prob(prob), cycleTime(cycleTime), ii(ii) {
+  }
   LogicalResult schedule() override;
 };
 
@@ -351,6 +354,7 @@ private:
   SmallVector<Operation *> unscheduled, scheduled;
   MRT mrt;
   float cycleTime;
+  std::optional<int32_t> ii;
 
 protected:
   Problem &getProblem() override { return prob; }
@@ -363,9 +367,10 @@ protected:
 
 public:
   ChainingModuloSimplexScheduler(ChainingModuloProblem &prob, Operation *lastOp,
-                                 float cycleTime)
-      : ChainingCyclicSimplexScheduler(prob, lastOp, cycleTime), prob(prob),
-        mrt(*this), cycleTime(cycleTime) {}
+                                 float cycleTime,
+                                 std::optional<int32_t> ii = std::nullopt)
+      : ChainingCyclicSimplexScheduler(prob, lastOp, cycleTime, ii), prob(prob),
+        mrt(*this), cycleTime(cycleTime), ii(ii) {}
   LogicalResult schedule() override;
 };
 
@@ -1892,6 +1897,11 @@ LogicalResult ChainingModuloSimplexScheduler::schedule() {
 
   parameterS = 0;
   parameterT = computeResMinII();
+
+  if (ii.has_value() && ii > parameterT) {
+    parameterT = ii.value();
+  }
+
   LLVM_DEBUG(dbgs() << "ResMinII = " << parameterT << "\n");
   buildTableau();
   asapTimes.resize(startTimeLocations.size());
@@ -1993,7 +2003,8 @@ LogicalResult scheduling::scheduleSimplex(ChainingCyclicProblem &prob,
 }
 
 LogicalResult scheduling::scheduleSimplex(ChainingModuloProblem &prob,
-                                          Operation *lastOp, float cycleTime) {
-  ChainingModuloSimplexScheduler simplex(prob, lastOp, cycleTime);
+                                          Operation *lastOp, float cycleTime,
+                                          std::optional<int32_t> ii) {
+  ChainingModuloSimplexScheduler simplex(prob, lastOp, cycleTime, ii);
   return simplex.schedule();
 }
