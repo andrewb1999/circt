@@ -145,6 +145,39 @@ def BypassRegisterOp : CalyxPrimitive<"bypass_register", [
   ];
 }
 
+def ShiftRegisterOp : CalyxPrimitive<"shift_register", [
+    SameTypeConstraint<"in", "out">
+  ]> {
+  let summary = "Defines a shift register";
+  let description = [{
+    The "calyx.shift_register" op defines a shift register.
+    ```mlir
+      // A 32-bit shift register.
+      %r.in, %r.write_en, %r.clk, %r.out, %r.done = calyx.shift_register @r : i32, i1, i1, i32, i1
+    ```
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    I64Attr:$depth
+  );
+  let results = (outs AnyType:$in, I1:$write_en, I1:$clk, AnyType:$out, I1:$done);
+  let builders = [
+    OpBuilder<(ins "StringRef":$sym_name, "size_t":$width, "size_t":$depth), [{
+      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
+      $_state.addAttribute(getDepthAttrName($_state.name), $_builder.getI64IntegerAttr(depth));
+      Type i1Type = $_builder.getI1Type();
+      Type widthType = $_builder.getIntegerType(width);
+      $_state.addTypes({widthType, i1Type, i1Type, widthType, i1Type});
+    }]>,
+    OpBuilder<(ins "StringRef":$sym_name, "Type":$type, "size_t":$depth), [{
+      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
+      $_state.addAttribute(getDepthAttrName($_state.name), $_builder.getI64IntegerAttr(depth));
+      Type i1Type = $_builder.getI1Type();
+      $_state.addTypes({type, i1Type, i1Type, type, i1Type});
+    }]>
+  ];
+}
+
 def MemoryOp : CalyxPrimitive<"memory", []> {
   let summary = "Defines a memory";
   let description = [{

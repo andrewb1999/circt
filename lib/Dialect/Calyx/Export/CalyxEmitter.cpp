@@ -128,18 +128,18 @@ private:
   /// Returns the library name for a given Operation Type.
   FailureOr<StringRef> getLibraryFor(Operation *op) {
     return TypeSwitch<Operation *, FailureOr<StringRef>>(op)
-        .Case<AddLibOp, RegisterOp, BypassRegisterOp, UndefLibOp, WireLibOp>(
+        .Case<AddLibOp, RegisterOp, UndefLibOp, WireLibOp>(
             [&](auto op) -> FailureOr<StringRef> {
               static constexpr std::string_view sCompile = "compile";
               return {sCompile};
             })
         .Case<NotLibOp, AndLibOp, OrLibOp, XorLibOp, SubLibOp, GtLibOp, LtLibOp,
               EqLibOp, NeqLibOp, GeLibOp, LeLibOp, LshLibOp, RshLibOp,
-              SliceLibOp, PadLibOp, MuxLibOp, BitSliceLibOp>(
-            [&](auto op) -> FailureOr<StringRef> {
-              static constexpr std::string_view sCore = "core";
-              return {sCore};
-            })
+              SliceLibOp, PadLibOp, MuxLibOp, BitSliceLibOp, BypassRegisterOp,
+              ShiftRegisterOp>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sCore = "core";
+          return {sCore};
+        })
         .Case<SgtLibOp, SltLibOp, SeqLibOp, SneqLibOp, SgeLibOp, SleLibOp,
               SrshLibOp, SeqMultLibOp, SeqRemULibOp, SeqRemSLibOp, SeqDivULibOp,
               SeqDivSLibOp, ExtSILibOp, ConstMultLibOp>(
@@ -311,6 +311,9 @@ struct Emitter {
 
   // BypassRegister emission
   void emitBypassRegister(BypassRegisterOp reg);
+
+  // ShiftRegister emission
+  void emitShiftRegister(ShiftRegisterOp reg);
 
   // Emit undefined op
   void emitUndef(UndefLibOp op);
@@ -755,6 +758,7 @@ void Emitter::emitComponent(ComponentInterface op) {
           .Case<PrimitiveOp>([&](auto op) { emitPrimitive(op); })
           .Case<RegisterOp>([&](auto op) { emitRegister(op); })
           .Case<BypassRegisterOp>([&](auto op) { emitBypassRegister(op); })
+          .Case<ShiftRegisterOp>([&](auto op) { emitShiftRegister(op); })
           .Case<MemoryOp>([&](auto op) { emitMemory(op); })
           .Case<SeqMemoryOp>([&](auto op) { emitSeqMemory(op); })
           .Case<ConstMultLibOp>([&](auto op) { emitConstMult(op); })
@@ -1139,6 +1143,15 @@ void Emitter::emitBypassRegister(BypassRegisterOp reg) {
   indent() << getAttributes(reg, /*atFormat=*/true) << reg.instanceName()
            << space() << equals() << space() << "std_bypass_reg" << LParen()
            << std::to_string(bitWidth) << RParen() << semicolonEndL();
+}
+
+void Emitter::emitShiftRegister(ShiftRegisterOp reg) {
+  size_t bitWidth = reg.getIn().getType().getIntOrFloatBitWidth();
+  size_t depth = reg.getDepth();
+  indent() << getAttributes(reg, /*atFormat=*/true) << reg.instanceName()
+           << space() << equals() << space() << "std_shift_reg" << LParen()
+           << std::to_string(bitWidth) << comma() << space()
+           << std::to_string(depth) << RParen() << semicolonEndL();
 }
 
 void Emitter::emitUndef(UndefLibOp op) {

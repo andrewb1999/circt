@@ -1597,11 +1597,13 @@ void AssignOp::print(OpAsmPrinter &p) {
 /// Lookup the component for the symbol. This returns null on
 /// invalid IR.
 ComponentInterface InstanceOp::getReferencedComponent() {
-  auto module = (*this)->getParentOfType<ModuleOp>();
-  if (!module)
-    return nullptr;
+  auto moduleOp = (*this)->getParentOfType<ModuleOp>();
+  assert(moduleOp && "InstanceOp no parent of type moduleOp");
 
-  return module.lookupSymbol<ComponentInterface>(getComponentName());
+  auto comp = moduleOp.lookupSymbol<ComponentInterface>(getComponentName());
+  assert(comp && "InstanceOp referenced component does not exist");
+
+  return comp;
 }
 
 /// Verifies the port information in comparison with the referenced component
@@ -2159,6 +2161,41 @@ SmallVector<DictionaryAttr> BypassRegisterOp::portAttributes() {
 }
 
 bool BypassRegisterOp::isCombinational() { return false; }
+
+//===----------------------------------------------------------------------===//
+// ShiftRegisterOp
+//===----------------------------------------------------------------------===//
+
+/// Provide meaningful names to the result values of a ShiftRegisterOp.
+void ShiftRegisterOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  getCellAsmResultNames(setNameFn, *this, this->portNames());
+}
+
+SmallVector<StringRef> ShiftRegisterOp::portNames() {
+  return {"in", "write_en", clkPort, "out", donePort};
+}
+
+SmallVector<Direction> ShiftRegisterOp::portDirections() {
+  return {Input, Input, Input, Output, Output};
+}
+
+SmallVector<DictionaryAttr> ShiftRegisterOp::portAttributes() {
+  MLIRContext *context = getContext();
+  IntegerAttr isSet = IntegerAttr::get(IntegerType::get(context, 1), 1);
+  NamedAttrList writeEn, clk, done;
+  writeEn.append(goPort, isSet);
+  clk.append(clkPort, isSet);
+  done.append(donePort, isSet);
+  return {
+      DictionaryAttr::get(context),   // In
+      writeEn.getDictionary(context), // Write enable
+      clk.getDictionary(context),     // Clk
+      DictionaryAttr::get(context),   // Out
+      done.getDictionary(context)     // Done
+  };
+}
+
+bool ShiftRegisterOp::isCombinational() { return false; }
 
 //===----------------------------------------------------------------------===//
 // MemoryOp

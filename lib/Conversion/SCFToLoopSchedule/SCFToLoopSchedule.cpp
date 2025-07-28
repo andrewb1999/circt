@@ -53,6 +53,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
+#include <algorithm>
 #include <cassert>
 #include <limits>
 #include <math.h>
@@ -1388,22 +1389,46 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
       endTime = *startTime;
   }
 
+  auto usedByOperation = [&](Operation *op, Operation *maybeUser) {
+    if (isa<MulIOp>(op)) {
+      op->dump();
+    }
+    return llvm::any_of(maybeUser->getOperands(), [&](Value operand) {
+      if (operand.getDefiningOp() == op)
+        return true;
+
+      // Forward values used for predicates as well
+      if (predicateUse.contains(operand))
+        return true;
+
+      return false;
+    });
+  };
+
   auto hasLaterUse = [&](Operation *op, uint32_t resTime) {
-    for (uint32_t i = resTime + 1; i < endTime; ++i) {
+    llvm::errs() << "op: \n";
+    op->dump();
+    llvm::errs() << "==============\n";
+    llvm::errs() << "endTime: " << std::to_string(endTime) << "\n";
+    for (uint32_t i = resTime + 1; i <= endTime; ++i) {
+      llvm::errs() << "i: " << std::to_string(i) << "\n";
       if (startGroups.contains(i)) {
         auto startGroup = startGroups[i];
         for (auto *operation : startGroup) {
-          for (auto &operand : operation->getOpOperands()) {
-            if (operand.get().getDefiningOp() == op)
-              return true;
-
-            // Forward values used for predicates as well
-            if (predicateUse.contains(operand.get()))
-              return true;
-          }
+          // operation->dump();
+          if (usedByOperation(op, operation))
+            return true;
+          auto wasInterrupted = operation->walk([&](Operation *inner) {
+            if (usedByOperation(op, inner))
+              return WalkResult::interrupt();
+            return WalkResult::advance();
+          });
+          if (wasInterrupted.wasInterrupted())
+            return true;
         }
       }
     }
+    llvm::errs() << "no later use\n";
     return false;
   };
 
