@@ -205,6 +205,30 @@ static void checkNonAffineAccessPair(Operation *source, Operation *destination,
   if (sourceIsSchedInterface != destIsSchedInterface)
     return;
 
+  if (auto srcInterface = dyn_cast<StoreInterface>(source)) {
+    if (auto dstInterface = dyn_cast<StoreInterface>(destination)) {
+      if (isIntraIteration) {
+        if (auto *commonBlock =
+                getCommonBlockInAffineScope(source, destination)) {
+
+          Operation *srcOrAncestor =
+              commonBlock->findAncestorOpInBlock(*source);
+          Operation *dstOrAncestor =
+              commonBlock->findAncestorOpInBlock(*destination);
+          if (srcOrAncestor == nullptr || dstOrAncestor == nullptr)
+            return;
+
+          // Check if the src or its ancestor is before the dst or its ancestor.
+          if (srcOrAncestor->isBeforeInBlock(dstOrAncestor) &&
+              dstInterface.hasControlDependence(srcInterface)) {
+            results[nameAnalysis.getOperationName(destination)].emplace(
+                nameAnalysis.getOperationName(source), 0);
+          }
+        }
+      }
+    }
+  }
+
   if (isa<SchedulableAffineInterface>(source) &&
       isa<SchedulableAffineInterface>(destination))
     return;

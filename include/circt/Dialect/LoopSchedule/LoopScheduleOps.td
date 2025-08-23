@@ -18,6 +18,7 @@ include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/IR/RegionKindInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "circt/Dialect/LoopSchedule/LoopSchedule.td"
 include "circt/Dialect/LoopSchedule/LoopScheduleInterfaces.td"
@@ -585,6 +586,16 @@ def LoopScheduleIfOp : LoopScheduleOp<"if",
   ];
 
   let hasCustomAssemblyFormat = 1;
+}
+
+def LoopScheduleBufferOp : LoopScheduleOp<"buffer", [Pure, SameOperandsAndResultType]> {
+  let summary = "Explicitly ensures the schedule delays a value by 1 clock cycle";
+
+  let arguments = (ins AnyType:$input);
+  let results = (outs AnyType:$output);
+
+  let assemblyFormat =
+      [{  $input attr-dict `:` type($output) }];
 }
 
 #endif // CIRCIT_LOOP_SCHEDULE_OPS_TD

@@ -124,11 +124,18 @@ public:
       }
     }
     phaseRegs[phase][idx] = reg;
+    if (auto *calyxReg = std::get_if<calyx::RegisterOp>(&reg)) {
+      phaseRegSet.insert(*calyxReg);
+    }
   }
 
   /// Return a mapping of step/stage result indices to sink registers.
   const DenseMap<unsigned, PhaseRegister> &getPhaseRegs(Operation *phase) {
     return phaseRegs[phase];
+  }
+
+  bool isPhaseReg(calyx::RegisterOp regOp) {
+    return phaseRegSet.count(regOp) > 0;
   }
 
   void setLoopIterValue(LoopSchedulePipelineOp loop, Value v) {
@@ -272,9 +279,19 @@ public:
     return interfaces;
   }
 
+  void addBufferReg(calyx::RegisterOp regOp) { bufferRegSet.insert(regOp); }
+
+  bool isBufferReg(calyx::RegisterOp regOp) {
+    return bufferRegSet.count(regOp) > 0;
+  }
+
 private:
   /// A mapping from steps/stages to their registers.
   DenseMap<Operation *, DenseMap<unsigned, PhaseRegister>> phaseRegs;
+
+  std::set<calyx::RegisterOp> phaseRegSet;
+
+  std::set<calyx::RegisterOp> bufferRegSet;
 
   DenseMap<LoopInterface, Value> loopIterValues;
 
@@ -363,22 +380,22 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
 
       opBuiltSuccessfully &=
           TypeSwitch<mlir::Operation *, bool>(op)
-              .template Case<arith::ConstantOp, BranchOpInterface,
-                             /// memory ops
-                             memref::AllocOp, memref::AllocaOp,
-                             LoopScheduleLoadOp, LoopScheduleStoreOp,
-                             /// memory interface
-                             calyx::StoreLoweringInterface,
-                             calyx::LoadLoweringInterface,
-                             calyx::AllocLoweringInterface,
-                             /// standard arithmetic
-                             AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp,
-                             AndIOp, XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp,
-                             MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp,
-                             IndexCastOp, SelectOp, comb::ExtractOp,
-                             /// loop schedule
-                             LoopInterface, LoopScheduleTerminatorOp,
-                             LoopScheduleYieldOp, LoopScheduleIfOp>(
+              .template Case<
+                  arith::ConstantOp, BranchOpInterface,
+                  /// memory ops
+                  memref::AllocOp, memref::AllocaOp, LoopScheduleLoadOp,
+                  LoopScheduleStoreOp,
+                  /// memory interface
+                  calyx::StoreLoweringInterface, calyx::LoadLoweringInterface,
+                  calyx::AllocLoweringInterface,
+                  /// standard arithmetic
+                  AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp, AndIOp,
+                  XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp, MulIOp, DivUIOp,
+                  DivSIOp, RemUIOp, RemSIOp, IndexCastOp, SelectOp,
+                  comb::ExtractOp,
+                  /// loop schedule
+                  LoopInterface, LoopScheduleTerminatorOp, LoopScheduleYieldOp,
+                  LoopScheduleIfOp, LoopScheduleBufferOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<FuncOp, LoopScheduleRegisterOp, PhaseInterface,
                              ReturnOp>([&](auto) {
@@ -448,6 +465,8 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter,
                         LoopScheduleYieldOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, LoopScheduleIfOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        LoopScheduleBufferOp op) const;
 
   /// buildLibraryOp will build a TCalyxLibOp inside a TGroupOp based on the
   /// source operation TSrcOp.
@@ -1226,6 +1245,31 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 }
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     LoopScheduleBufferOp op) const {
+  auto type = op.getOutput().getType();
+  auto regOp = getState<ComponentLoweringState>()
+                   .getNewLibraryOpInstance<calyx::RegisterOp>(
+                       rewriter, op.getLoc(), type);
+  getState<ComponentLoweringState>().addBufferReg(regOp);
+  std::string groupName =
+      getState<ComponentLoweringState>().getUniqueName("buffer");
+  auto groupOp = calyx::createStaticGroup(rewriter, getComponent(), op.getLoc(),
+                                          groupName, 1);
+  auto compOp = getState<ComponentLoweringState>().getComponentOp();
+  auto constOne = calyx::createConstant(op->getLoc(), rewriter, compOp, 1, 1);
+
+  rewriter.setInsertionPointToStart(groupOp.getBodyBlock());
+  rewriter.create<calyx::AssignOp>(op.getLoc(), regOp.getIn(), op.getInput());
+  rewriter.create<calyx::AssignOp>(op.getLoc(), regOp.getWriteEn(), constOne);
+  op.replaceAllUsesWith(regOp.getOut());
+  getState<ComponentLoweringState>().registerEvaluatingGroup(regOp.getOut(),
+                                                             groupOp);
+  getState<ComponentLoweringState>().addBlockSchedulable(op->getBlock(),
+                                                         groupOp);
+  return success();
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      BranchOpInterface brOp) const {
   /// Branch argument passing group creation
   /// Branch operands are passed through registers. In BuildBasicBlockRegs we
@@ -1843,47 +1887,57 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
         // If value is produced by a sequential op just pass it
         // on to next phase.
         if (auto cell = value.getDefiningOp<calyx::CellInterface>();
-            cell && !cell.isCombinational() && !isa<calyx::RegisterOp>(cell)) {
-          auto *op = cell.getOperation();
-          Value v;
-          if (auto prim = dyn_cast<calyx::PrimitiveOp>(op)) {
-            assert(
-                prim.getOutputPorts().size() == 1 &&
-                "only pipelined primitives with a single output are supported");
-            v = prim.getOutputPorts().front();
-          } else if (auto mul = dyn_cast<calyx::PipelinedMultLibOp>(op); mul) {
-            v = mul.getOut();
-          } else if (auto divs = dyn_cast<calyx::PipelinedDivSLibOp>(op);
-                     divs) {
-            v = divs.getOut();
-          } else if (auto divu = dyn_cast<calyx::SeqDivULibOp>(op); divu) {
-            v = divu.getOut();
-          } else if (auto seqMem = dyn_cast<calyx::SeqMemoryOp>(op); seqMem) {
-            v = seqMem.readData();
-          } else if (auto seqMul = dyn_cast<calyx::SeqMultLibOp>(op); seqMul) {
-            v = seqMul.getOut();
-          } else if (auto seqRemU = dyn_cast<calyx::SeqRemULibOp>(op);
-                     seqRemU) {
-            v = seqRemU.getOut();
-          } else if (auto seqRemS = dyn_cast<calyx::SeqRemSLibOp>(op);
-                     seqRemS) {
-            v = seqRemS.getOut();
-          } else if (auto seqDivS = dyn_cast<calyx::SeqDivSLibOp>(op);
-                     seqDivS) {
-            v = seqDivS.getOut();
-          } else if (auto stallMul = dyn_cast<calyx::StallableMultLibOp>(op);
-                     stallMul) {
-            v = stallMul.getOut();
-          } else {
-            funcOp->getParentOfType<ModuleOp>().dump();
-            phase.dump();
-            op->dump();
-            // assert(false && "Unsupported pipelined cell op");
-            funcOp.emitOpError("Unsupported pipelined cell op ") << op;
-            return WalkResult::interrupt();
+            cell && !cell.isCombinational()) {
+          // Don't pass registers that were produced by prior phases or are part
+          // of the loop control.
+          if (!isa<calyx::RegisterOp>(cell) ||
+              getState<ComponentLoweringState>().isBufferReg(
+                  cast<calyx::RegisterOp>(cell))) {
+            auto *op = cell.getOperation();
+            Value v;
+            if (auto prim = dyn_cast<calyx::PrimitiveOp>(op)) {
+              assert(prim.getOutputPorts().size() == 1 &&
+                     "only pipelined primitives with a single output are "
+                     "supported");
+              v = prim.getOutputPorts().front();
+            } else if (auto mul = dyn_cast<calyx::PipelinedMultLibOp>(op);
+                       mul) {
+              v = mul.getOut();
+            } else if (auto divs = dyn_cast<calyx::PipelinedDivSLibOp>(op);
+                       divs) {
+              v = divs.getOut();
+            } else if (auto divu = dyn_cast<calyx::SeqDivULibOp>(op); divu) {
+              v = divu.getOut();
+            } else if (auto seqMem = dyn_cast<calyx::SeqMemoryOp>(op); seqMem) {
+              v = seqMem.readData();
+            } else if (auto seqMul = dyn_cast<calyx::SeqMultLibOp>(op);
+                       seqMul) {
+              v = seqMul.getOut();
+            } else if (auto seqRemU = dyn_cast<calyx::SeqRemULibOp>(op);
+                       seqRemU) {
+              v = seqRemU.getOut();
+            } else if (auto seqRemS = dyn_cast<calyx::SeqRemSLibOp>(op);
+                       seqRemS) {
+              v = seqRemS.getOut();
+            } else if (auto seqDivS = dyn_cast<calyx::SeqDivSLibOp>(op);
+                       seqDivS) {
+              v = seqDivS.getOut();
+            } else if (auto stallMul = dyn_cast<calyx::StallableMultLibOp>(op);
+                       stallMul) {
+              v = stallMul.getOut();
+            } else if (auto reg = dyn_cast<calyx::RegisterOp>(op); reg) {
+              v = reg.getOut();
+            } else {
+              funcOp->getParentOfType<ModuleOp>().dump();
+              phase.dump();
+              op->dump();
+              // assert(false && "Unsupported pipelined cell op");
+              funcOp.emitOpError("Unsupported pipelined cell op ") << op;
+              return WalkResult::interrupt();
+            }
+            getState<ComponentLoweringState>().addPhaseReg(phase, v, i);
+            continue;
           }
-          getState<ComponentLoweringState>().addPhaseReg(phase, v, i);
-          continue;
         }
 
         if (!isa<BlockArgument>(value)) {
@@ -2090,6 +2144,7 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       if (auto *valuePtr = std::get_if<Value>(&reg); valuePtr) {
         auto evaluatingGroup =
             getState<ComponentLoweringState>().findEvaluatingGroup(value);
+        assert(evaluatingGroup.has_value());
         assert(isa<calyx::StaticGroupOp>(evaluatingGroup.value()));
         addBodyGroup(outerVal, dyn_cast<calyx::StaticGroupOp>(
                                    evaluatingGroup.value().getOperation()));

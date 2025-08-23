@@ -112,6 +112,7 @@ private:
 } // namespace
 
 void SCFToLoopSchedulePass::runOnOperation() {
+  getOperation()->getParentOfType<ModuleOp>().dump();
   float cycleTime = prioritizeII ? 2.0 : 1.0;
 
   // Collect loops to pipeline and work on them.
@@ -401,6 +402,10 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
         .Case<MulIOp>([&](Operation *mcOp) {
           // Multiplier
           problem.setLinkedOperatorType(mcOp, mcOpr);
+          return WalkResult::advance();
+        })
+        .Case<LoopScheduleBufferOp>([&](Operation *op) {
+          problem.setLinkedOperatorType(op, seqOpr);
           return WalkResult::advance();
         })
         .Case<RemUIOp, RemSIOp, DivSIOp>([&](Operation *op) {

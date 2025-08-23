@@ -162,7 +162,7 @@ def LoadOpInterface : OpInterface<"LoadInterface"> {
       "getResult",
       (ins)>,
     InterfaceMethod<
-      "This returns the result.",
+      "This returns true if a dependence could exist with otherOp.",
       "bool",
       "hasDependence",
       (ins "Operation *":$otherOp)>,
@@ -225,9 +225,14 @@ def StoreOpInterface : OpInterface<"StoreInterface"> {
       "getDimBitwidth",
       (ins "int64_t":$idx)>,
     InterfaceMethod<
-      "This returns the result.",
+      "This returns true if a dependence could exist with otherOp.",
       "bool",
       "hasDependence",
+      (ins "Operation *":$otherOp)>,
+    InterfaceMethod<
+      "This returns true if a control dependence exists with otherOp.",
+      "bool",
+      "hasControlDependence",
       (ins "Operation *":$otherOp)>,
     InterfaceMethod<
       "This returns the unique identifier of the associated memory",
