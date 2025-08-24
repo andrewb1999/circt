@@ -845,6 +845,13 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
   auto res = loadOp.connectToMemInterface(rewriter, group, getComponent(),
                                           state, blockOpt);
 
+  if (res.failed())
+    return failure();
+
+  auto phase = loadOp->getParentOfType<PhaseInterface>();
+  if (isa<LoopScheduleStepOp>(phase))
+    return success();
+
   if (latency > 1) {
     Value ce;
     auto ceOpt = memoryInterface.contentEnOpt();
@@ -853,15 +860,11 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
     } else {
       ce = memoryInterface.readEn();
     }
-    auto phase = loadOp->getParentOfType<PhaseInterface>();
     for (unsigned i = 0; i < latency - 1; ++i) {
       phase = cast<PhaseInterface>(phase->getNextNode());
       getState<ComponentLoweringState>().setHoldCEInPhase(ce, phase);
     }
   }
-
-  if (res.failed())
-    return failure();
 
   return success();
 }

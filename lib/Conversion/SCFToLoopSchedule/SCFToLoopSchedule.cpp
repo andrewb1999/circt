@@ -542,8 +542,12 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
     return failure();
 
   // Verify II
-  if (ii.has_value() && problem.getInitiationInterval() != ii)
-    return failure();
+  if (ii.has_value() && problem.getInitiationInterval() != ii) {
+    return loop.emitError(
+        "Failed to schedule for desired II of " + std::to_string(ii.value()) +
+        ", minimum II is " +
+        std::to_string(problem.getInitiationInterval().value()));
+  }
 
   // Optionally debug problem outputs.
   LLVM_DEBUG({

@@ -1898,10 +1898,6 @@ LogicalResult ChainingModuloSimplexScheduler::schedule() {
   parameterS = 0;
   parameterT = computeResMinII();
 
-  if (ii.has_value() && ii > parameterT) {
-    parameterT = ii.value();
-  }
-
   LLVM_DEBUG(dbgs() << "ResMinII = " << parameterT << "\n");
   buildTableau();
   asapTimes.resize(startTimeLocations.size());

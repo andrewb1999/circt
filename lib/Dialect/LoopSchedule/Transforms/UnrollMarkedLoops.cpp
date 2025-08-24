@@ -50,6 +50,12 @@ void UnrollMarkedLoopsPass::runOnOperation() {
     } else if (isa<IntegerAttr>(attr)) {
       auto val = cast<IntegerAttr>(attr).getInt();
 
+      if (val == 1)
+        return WalkResult::advance();
+
+      if (val < 1)
+        return WalkResult::interrupt();
+
       if (loopUnrollByFactor(loop, val).failed())
         return WalkResult::interrupt();
     }
