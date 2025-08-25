@@ -68,14 +68,14 @@ struct ModuleExternalizer : public OpReduction<HWModuleOp> {
 
   LogicalResult rewrite(HWModuleOp op) override {
     OpBuilder builder(op);
-    builder.create<HWModuleExternOp>(op->getLoc(), op.getModuleNameAttr(),
-                                     op.getPortList(), StringRef(),
-                                     op.getParameters());
+    HWModuleExternOp::create(builder, op->getLoc(), op.getModuleNameAttr(),
+                             op.getPortList(), StringRef(), op.getParameters());
     op->erase();
     return success();
   }
 
   std::string getName() const override { return "hw-module-externalizer"; }
+  bool acceptSizeIncrease() const override { return true; }
 
   std::unique_ptr<InstanceGraph> instanceGraph;
   ModuleSizeCache moduleSizes;
@@ -114,102 +114,183 @@ struct HWOperandForwarder : public Reduction {
 /// A sample reduction pattern that replaces integer operations with a constant
 /// zero of their type.
 struct HWConstantifier : public Reduction {
-  uint64_t match(Operation *op) override {
-    if (op->getNumResults() == 0 || op->getNumOperands() == 0)
-      return 0;
-    return llvm::all_of(op->getResults(), [](Value result) {
-      return isa<IntegerType>(result.getType());
-    });
+  void matches(Operation *op,
+               llvm::function_ref<void(uint64_t, uint64_t)> addMatch) override {
+    if (op->hasTrait<OpTrait::ConstantLike>())
+      return;
+    for (auto result : op->getResults())
+      if (!result.use_empty())
+        if (isa<IntegerType>(result.getType()))
+          addMatch(1, result.getResultNumber());
   }
-  LogicalResult rewrite(Operation *op) override {
-    assert(match(op));
+  LogicalResult rewriteMatches(Operation *op,
+                               ArrayRef<uint64_t> indices) override {
     OpBuilder builder(op);
-    for (auto result : op->getResults()) {
+    for (auto idx : indices) {
+      auto result = op->getResult(idx);
       auto type = cast<IntegerType>(result.getType());
-      auto newOp = builder.create<hw::ConstantOp>(op->getLoc(), type, 0);
+      auto newOp = hw::ConstantOp::create(builder, result.getLoc(), type, 0);
       result.replaceAllUsesWith(newOp);
     }
     reduce::pruneUnusedOps(op, *this);
     return success();
   }
   std::string getName() const override { return "hw-constantifier"; }
+  bool acceptSizeIncrease() const override { return true; }
 };
 
-/// Remove the first or last output of the top-level module depending on the
-/// 'Front' template parameter.
-template <bool Front>
-struct ModuleOutputPruner : public OpReduction<HWModuleOp> {
+/// Remove unused module input ports.
+struct ModuleInputPruner : public Reduction {
   void beforeReduction(mlir::ModuleOp op) override {
-    useEmpty.clear();
-
-    SymbolTableCollection table;
-    SymbolUserMap users(table, op);
-    for (auto module : op.getOps<HWModuleOp>())
-      if (users.useEmpty(module))
-        useEmpty.insert(module);
+    symbolTables = std::make_unique<SymbolTableCollection>();
+    symbolUsers = std::make_unique<SymbolUserMap>(*symbolTables, op);
   }
 
-  uint64_t match(HWModuleOp op) override {
-    return op.getNumOutputPorts() != 0 && useEmpty.contains(op);
+  void matches(Operation *op,
+               llvm::function_ref<void(uint64_t, uint64_t)> addMatch) override {
+    auto mod = dyn_cast<HWModuleLike>(op);
+    if (!mod)
+      return;
+    auto modType = mod.getHWModuleType();
+    if (modType.getNumInputs() == 0)
+      return;
+    auto users = symbolUsers->getUsers(op);
+    if (!llvm::all_of(users, [](auto *user) { return isa<InstanceOp>(user); }))
+      return;
+    auto *block = mod.getBodyBlock();
+    for (unsigned idx = 0; idx < modType.getNumInputs(); ++idx)
+      if (!block || block->getArgument(idx).use_empty())
+        addMatch(1, idx);
   }
 
-  LogicalResult rewrite(HWModuleOp op) override {
-    Operation *terminator = op.getBody().front().getTerminator();
-    auto operands = terminator->getOperands();
-    ValueRange newOutputs = operands.drop_back();
-    unsigned portToErase = op.getNumOutputPorts() - 1;
-    if (Front) {
-      newOutputs = operands.drop_front();
-      portToErase = 0;
+  LogicalResult rewriteMatches(Operation *op,
+                               ArrayRef<uint64_t> matches) override {
+    auto mod = cast<HWMutableModuleLike>(op);
+
+    // Remove the ports from the module.
+    SmallVector<unsigned> indexList;
+    BitVector indexSet(mod.getNumInputPorts());
+    for (auto idx : matches) {
+      indexList.push_back(idx);
+      indexSet.set(idx);
     }
+    llvm::sort(indexList);
+    mod.erasePorts(indexList, {});
+    if (auto *block = mod.getBodyBlock())
+      block->eraseArguments(indexSet);
 
-    terminator->setOperands(newOutputs);
-    op.erasePorts({}, {portToErase});
-
-    return success();
-  }
-
-  std::string getName() const override {
-    return Front ? "hw-module-output-pruner-front"
-                 : "hw-module-output-pruner-back";
-  }
-
-  DenseSet<HWModuleOp> useEmpty;
-};
-
-/// Remove all input ports of the top-level module that have no users
-struct ModuleInputPruner : public OpReduction<HWModuleOp> {
-  void beforeReduction(mlir::ModuleOp op) override {
-    useEmpty.clear();
-
-    SymbolTableCollection table;
-    SymbolUserMap users(table, op);
-    for (auto module : op.getOps<HWModuleOp>())
-      if (users.useEmpty(module))
-        useEmpty.insert(module);
-  }
-
-  uint64_t match(HWModuleOp op) override { return useEmpty.contains(op); }
-
-  LogicalResult rewrite(HWModuleOp op) override {
-    SmallVector<unsigned> inputsToErase;
-    BitVector toErase(op.getNumPorts());
-    for (auto [i, arg] : llvm::enumerate(op.getBody().getArguments())) {
-      if (arg.use_empty()) {
-        toErase.set(i);
-        inputsToErase.push_back(i);
+    // Remove the ports from the instances.
+    for (auto *user : symbolUsers->getUsers(op)) {
+      auto instOp = cast<InstanceOp>(user);
+      SmallVector<Value> newOperands;
+      SmallVector<Attribute> newArgNames;
+      for (auto [idx, data] : llvm::enumerate(
+               llvm::zip(instOp.getInputs(), instOp.getArgNames()))) {
+        if (indexSet.test(idx))
+          continue;
+        auto [operand, argName] = data;
+        newOperands.push_back(operand);
+        newArgNames.push_back(argName);
       }
+      instOp.getInputsMutable().assign(newOperands);
+      instOp.setArgNamesAttr(ArrayAttr::get(op->getContext(), newArgNames));
     }
-
-    op.erasePorts(inputsToErase, {});
-    op.getBodyBlock()->eraseArguments(toErase);
 
     return success();
   }
 
   std::string getName() const override { return "hw-module-input-pruner"; }
+  bool acceptSizeIncrease() const override { return true; }
 
-  DenseSet<HWModuleOp> useEmpty;
+  std::unique_ptr<SymbolTableCollection> symbolTables;
+  std::unique_ptr<SymbolUserMap> symbolUsers;
+};
+
+/// Remove unused module output ports.
+struct ModuleOutputPruner : public Reduction {
+  void beforeReduction(mlir::ModuleOp op) override {
+    symbolTables = std::make_unique<SymbolTableCollection>();
+    symbolUsers = std::make_unique<SymbolUserMap>(*symbolTables, op);
+  }
+
+  void matches(Operation *op,
+               llvm::function_ref<void(uint64_t, uint64_t)> addMatch) override {
+    auto mod = dyn_cast<HWModuleLike>(op);
+    if (!mod)
+      return;
+    auto modType = mod.getHWModuleType();
+    if (modType.getNumOutputs() == 0)
+      return;
+    auto users = symbolUsers->getUsers(op);
+    if (!llvm::all_of(users, [](auto *user) { return isa<InstanceOp>(user); }))
+      return;
+    for (unsigned idx = 0; idx < modType.getNumOutputs(); ++idx)
+      if (llvm::all_of(users, [&](auto *user) {
+            return user->getResult(idx).use_empty();
+          }))
+        addMatch(1, idx);
+  }
+
+  LogicalResult rewriteMatches(Operation *op,
+                               ArrayRef<uint64_t> matches) override {
+    auto mod = cast<HWMutableModuleLike>(op);
+
+    // Remove the ports from the module.
+    SmallVector<unsigned> indexList;
+    BitVector indexSet(mod.getNumOutputPorts());
+    for (auto idx : matches) {
+      indexList.push_back(idx);
+      indexSet.set(idx);
+    }
+    llvm::sort(indexList);
+    mod.erasePorts({}, indexList);
+
+    // Update the `hw.output` op.
+    if (auto *block = mod.getBodyBlock()) {
+      auto outputOp = cast<OutputOp>(block->getTerminator());
+      SmallVector<Value> newOutputs;
+      for (auto [idx, output] : llvm::enumerate(outputOp.getOutputs()))
+        if (!indexSet.test(idx))
+          newOutputs.push_back(output);
+      outputOp.getOutputsMutable().assign(newOutputs);
+    }
+
+    // Remove the ports from the instances.
+    for (auto *user : symbolUsers->getUsers(op)) {
+      OpBuilder builder(user);
+      auto instOp = cast<InstanceOp>(user);
+      SmallVector<Value> oldResults;
+      SmallVector<Type> newResultTypes;
+      SmallVector<Attribute> newResultNames;
+      for (auto [idx, data] : llvm::enumerate(
+               llvm::zip(instOp.getResults(), instOp.getResultNames()))) {
+        if (indexSet.test(idx))
+          continue;
+        auto [result, resultName] = data;
+        oldResults.push_back(result);
+        newResultTypes.push_back(result.getType());
+        newResultNames.push_back(resultName);
+      }
+      auto newOp = InstanceOp::create(
+          builder, instOp.getLoc(), newResultTypes,
+          instOp.getInstanceNameAttr(), instOp.getModuleNameAttr(),
+          instOp.getInputs(), instOp.getArgNamesAttr(),
+          builder.getArrayAttr(newResultNames), instOp.getParametersAttr(),
+          instOp.getInnerSymAttr(), instOp.getDoNotPrintAttr());
+      for (auto [oldResult, newResult] :
+           llvm::zip(oldResults, newOp.getResults()))
+        oldResult.replaceAllUsesWith(newResult);
+      instOp.erase();
+    }
+
+    return success();
+  }
+
+  std::string getName() const override { return "hw-module-output-pruner"; }
+  bool acceptSizeIncrease() const override { return true; }
+
+  std::unique_ptr<SymbolTableCollection> symbolTables;
+  std::unique_ptr<SymbolUserMap> symbolUsers;
 };
 
 //===----------------------------------------------------------------------===//
@@ -228,8 +309,7 @@ void HWReducePatternDialectInterface::populateReducePatterns(
   patterns.add<HWOperandForwarder<0>, 4>();
   patterns.add<HWOperandForwarder<1>, 3>();
   patterns.add<HWOperandForwarder<2>, 2>();
-  patterns.add<ModuleOutputPruner<true>, 2>();
-  patterns.add<ModuleOutputPruner<false>, 2>();
+  patterns.add<ModuleOutputPruner, 2>();
   patterns.add<ModuleInputPruner, 2>();
 }
 

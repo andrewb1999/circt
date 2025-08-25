@@ -54,6 +54,32 @@ def EventType : MooreTypeDef<"Event", [], "moore::UnpackedType"> {
 
 
 //===----------------------------------------------------------------------===//
+// TimeType
+//===----------------------------------------------------------------------===//
+
+def TimeType : MooreTypeDef<"Time", [], "moore::PackedType"> {
+  let mnemonic = "time";
+  let summary = "the SystemVerilog `time` and `realtime` type";
+  let description = [{
+    The `!moore.time` type represents a time value. Internally, the value is
+    represented as femtoseconds in `i64`.
+
+    Time values are a problematic part of the SystemVerilog language, since they
+    are multiplied by a scaling factor given by the current scope's `timeunit`
+    and then mapped to an 64 bit four-valued integer for `time`, or a real for
+    `realtime`. This means that a time value flowing from one module with one
+    timeunit to another module with a different timeunit will read as two
+    distinct delay values in the two modules.
+
+    To work around these issues, the Moore dialect maps all time values to
+    femtoseconds and represents them as an integer value. This allows us to have
+    time values exchanged between modules correctly, while locally casting from
+    and to `integer` and `real` with the correct local scaling factor.
+  }];
+}
+
+
+//===----------------------------------------------------------------------===//
 // IntType
 //===----------------------------------------------------------------------===//
 
@@ -75,7 +101,7 @@ def IntType : MooreTypeDef<"Int", [], "moore::PackedType"> {
     | `int`      | `!moore.i32`  |
     | `integer`  | `!moore.l32`  |
     | `longint`  | `!moore.i64`  |
-    | `time`     | `!moore.l64`  |
+    | `time`     | `!moore.time` |
   }];
   let parameters = (ins "unsigned":$width, "Domain":$domain);
 
@@ -88,6 +114,20 @@ def IntType : MooreTypeDef<"Int", [], "moore::PackedType"> {
     /// Create a signless `logic [width-1:0]` type.
     static IntType getLogic(MLIRContext *context, unsigned width) {
       return get(context, width, Domain::FourValued);
+    }
+
+    /// Get a two-valued version of this integer.
+    IntType getTwoValued() {
+      if (getDomain() == Domain::TwoValued)
+        return *this;
+      return getInt(getContext(), getWidth());
+    }
+
+    /// Get a four-valued version of this integer.
+    IntType getFourValued() {
+      if (getDomain() == Domain::FourValued)
+        return *this;
+      return getLogic(getContext(), getWidth());
     }
   }];
 }
@@ -112,7 +152,7 @@ def RealType : MooreTypeDef<"Real", [], "moore::UnpackedType"> {
     |-------------|---------------|
     | `shortreal` | `!moore.real` |
     | `real`      | `!moore.real` |
-    | `realtime`  | `!moore.real` |
+    | `realtime`  | `!moore.time` |
   }];
 }
 
@@ -395,8 +435,17 @@ def FormatStringType : MooreTypeDef<"FormatString"> {
 def ModuleType : MooreType<CPred<"llvm::isa<hw::ModuleType>($_self)">,
   "module type", "hw::ModuleType">;
 
+def PackedType : MooreType<CPred<"llvm::isa<moore::PackedType>($_self)">,
+  "packed type", "moore::PackedType">;
+
 def UnpackedType : MooreType<CPred<"llvm::isa<moore::UnpackedType>($_self)">,
   "unpacked type", "moore::UnpackedType">;
+
+/// A packed type with a known bit size.
+def PackedTypeWithKnownSize : MooreType<CPred<[{
+    llvm::isa<moore::PackedType>($_self) &&
+    llvm::cast<moore::PackedType>($_self).getBitSize().has_value()
+  }]>, "packed type with known size", "moore::PackedType">;
 
 /// A simple bit vector type.
 def SimpleBitVectorType : MooreType<CPred<[{
@@ -419,6 +468,18 @@ def BitType : MooreType<CPred<[{
     IntType::getInt($_builder.getContext(), 1)
   }];
 }
+
+/// A two-valued integer.
+def TwoValuedIntType : MooreType<CPred<[{
+    llvm::isa<moore::IntType>($_self) &&
+    llvm::cast<moore::IntType>($_self).getDomain() == moore::Domain::TwoValued
+  }]>, "two-valued integer type", "moore::IntType">;
+
+/// A four-valued integer.
+def FourValuedIntType : MooreType<CPred<[{
+    llvm::isa<moore::IntType>($_self) &&
+    llvm::cast<moore::IntType>($_self).getDomain() == moore::Domain::FourValued
+  }]>, "four-valued integer type", "moore::IntType">;
 
 /// A packed or unpacked array type with a fixed size.
 def AnyStaticArrayType : MooreType<

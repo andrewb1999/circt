@@ -65,8 +65,9 @@ static LogicalResult replaceReadsOfWrites(ContainerOp containerOp) {
                              [getPortOp.getPortSymbolAttr().getAttr()];
     if (getPortOp.getDirection() == Direction::Input) {
       if (portAccesses.getAsInput)
-        return containerOp.emitError(
-            "multiple input get_ports - please CSE the input IR");
+        return portAccesses.getAsInput.emitError("multiple input get_ports")
+                   .attachNote(getPortOp.getLoc())
+               << "redundant get_port here";
       portAccesses.getAsInput = getPortOp;
       for (auto *user : getPortOp->getUsers()) {
         if (auto writer = dyn_cast<PortWriteOp>(user)) {
@@ -78,8 +79,9 @@ static LogicalResult replaceReadsOfWrites(ContainerOp containerOp) {
       }
     } else {
       if (portAccesses.getAsOutput)
-        return containerOp.emitError(
-            "multiple get_port as output - please CSE the input IR");
+        return portAccesses.getAsOutput.emitError("multiple get_port as output")
+                   .attachNote(getPortOp.getLoc())
+               << "redundant get_port here";
       portAccesses.getAsOutput = getPortOp;
 
       for (auto *user : getPortOp->getUsers()) {
@@ -149,8 +151,8 @@ struct InputPortOpConversionPattern : public OpConversionPattern<InputPortOp> {
     }
 
     // Create a `hw.wire` to ensure that the input port name is maintained.
-    auto wire = rewriter.create<hw::WireOp>(op.getLoc(), writer.getValue(),
-                                            op.getInnerSymAttrName());
+    auto wire = hw::WireOp::create(rewriter, op.getLoc(), writer.getValue(),
+                                   op.getInnerSymAttrName());
 
     // Replace all reads of the input port with the wire.
     for (auto reader : readers)
@@ -174,9 +176,10 @@ struct InputPortOpConversionPattern : public OpConversionPattern<InputPortOp> {
       });
 
       if (anyOutsideReads) {
-        auto outputPort = rewriter.create<OutputPortOp>(
-            op.getLoc(), op.getInnerSym(), op.getType(), op.getNameAttr());
-        rewriter.create<PortWriteOp>(op.getLoc(), outputPort, wire);
+        auto outputPort =
+            OutputPortOp::create(rewriter, op.getLoc(), op.getInnerSym(),
+                                 op.getType(), op.getNameAttr());
+        PortWriteOp::create(rewriter, op.getLoc(), outputPort, wire);
       }
     }
 

@@ -10,6 +10,7 @@
 #include "circt/Dialect/LLHD/Transforms/LLHDPasses.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/Support/Debug.h"
 
@@ -488,25 +489,25 @@ void DriveHoister::hoistDrives() {
         .Case<IntegerAttr>([&](auto attr) {
           auto &slot = materializedConstants[attr];
           if (!slot)
-            slot = builder.create<hw::ConstantOp>(processOp.getLoc(), attr);
+            slot = hw::ConstantOp::create(builder, processOp.getLoc(), attr);
           return slot;
         })
         .Case<TimeAttr>([&](auto attr) {
           auto &slot = materializedConstants[attr];
           if (!slot)
             slot =
-                builder.create<llhd::ConstantTimeOp>(processOp.getLoc(), attr);
+                llhd::ConstantTimeOp::create(builder, processOp.getLoc(), attr);
           return slot;
         })
         .Case<Type>([&](auto type) {
           // TODO: This should probably create something like a `llhd.dontcare`.
           unsigned numBits = hw::getBitWidth(type);
           assert(numBits >= 0);
-          Value value = builder.create<hw::ConstantOp>(
-              processOp.getLoc(), builder.getIntegerType(numBits), 0);
+          Value value = hw::ConstantOp::create(
+              builder, processOp.getLoc(), builder.getIntegerType(numBits), 0);
           if (value.getType() != type)
             value =
-                builder.create<hw::BitcastOp>(processOp.getLoc(), type, value);
+                hw::BitcastOp::create(builder, processOp.getLoc(), type, value);
           return value;
         });
   };
@@ -549,9 +550,9 @@ void DriveHoister::hoistDrives() {
     addResultType(driveSet.uniform.delay, operands.delay);
     addResultType(driveSet.uniform.enable, operands.enable);
   }
-  auto newProcessOp = builder.create<ProcessOp>(processOp.getLoc(), resultTypes,
-                                                processOp->getOperands(),
-                                                processOp->getAttrs());
+  auto newProcessOp =
+      ProcessOp::create(builder, processOp.getLoc(), resultTypes,
+                        processOp->getOperands(), processOp->getAttrs());
   newProcessOp.getBody().takeBody(processOp.getBody());
   processOp.replaceAllUsesWith(
       newProcessOp->getResults().slice(0, oldNumResults));
@@ -587,8 +588,8 @@ void DriveHoister::hoistDrives() {
     auto enable = driveSet.uniform.enable != DriveValue(trueAttr)
                       ? useResultValue(driveSet.uniform.enable)
                       : Value{};
-    auto newDrive =
-        builder.create<DrvOp>(slot.getLoc(), slot, value, delay, enable);
+    [[maybe_unused]] auto newDrive =
+        DrvOp::create(builder, slot.getLoc(), slot, value, delay, enable);
     LLVM_DEBUG(llvm::dbgs() << "- Add " << newDrive << "\n");
 
     // Remove the old drives inside of the process.
@@ -619,14 +620,11 @@ struct HoistSignalsPass
 
 void HoistSignalsPass::runOnOperation() {
   SmallVector<Region *> regions;
-  getOperation()->walk<WalkOrder::PreOrder>([&](Operation *op) {
-    if (isa<ProcessOp, FinalOp>(op)) {
-      auto &region = op->getRegion(0);
-      if (!region.empty())
-        regions.push_back(&region);
-      return WalkResult::skip();
-    }
-    return WalkResult::advance();
+  getOperation()->walk([&](Operation *op) {
+    if (isa<ProcessOp, FinalOp, CombinationalOp, scf::IfOp>(op))
+      for (auto &region : op->getRegions())
+        if (!region.empty())
+          regions.push_back(&region);
   });
   for (auto *region : regions) {
     ProbeHoister(*region).hoist();

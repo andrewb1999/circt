@@ -26,8 +26,7 @@ using namespace firrtl;
 namespace {
 struct SpecializeOptionPass
     : public circt::firrtl::impl::SpecializeOptionBase<SpecializeOptionPass> {
-  using SpecializeOptionBase::numInstances;
-  using SpecializeOptionBase::selectDefaultInstanceChoice;
+  using Base::Base;
 
   void runOnOperation() override {
     auto circuit = getOperation();
@@ -80,8 +79,8 @@ struct SpecializeOptionPass
               target = inst.getTargetOrDefaultAttr(it->second);
 
             ImplicitLocOpBuilder builder(inst.getLoc(), inst);
-            auto newInst = builder.create<InstanceOp>(
-                inst->getResultTypes(), target, inst.getNameAttr(),
+            auto newInst = InstanceOp::create(
+                builder, inst->getResultTypes(), target, inst.getNameAttr(),
                 inst.getNameKindAttr(), inst.getPortDirectionsAttr(),
                 inst.getPortNamesAttr(), inst.getAnnotationsAttr(),
                 inst.getPortAnnotationsAttr(), builder.getArrayAttr({}),
@@ -106,10 +105,3 @@ struct SpecializeOptionPass
   }
 };
 } // namespace
-
-std::unique_ptr<Pass>
-firrtl::createSpecializeOptionPass(bool selectDefaultInstanceChoice) {
-  auto pass = std::make_unique<SpecializeOptionPass>();
-  pass->selectDefaultInstanceChoice = selectDefaultInstanceChoice;
-  return pass;
-}

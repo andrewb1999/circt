@@ -70,13 +70,33 @@ class OperatorTypeProperty<Dialect dialect, string name, string type, string pro
     : PropertyBase<dialect, name, type, problem, traits> {
   let extraClassDeclaration = [{
     void setInProblem(}] # problemClassName # [{ &prob,
-                      ::circt::scheduling::OperatorType opr) {
+                      ::circt::scheduling::Problem::OperatorType opr) {
       prob.set}] # propertyName # [{(opr, }] # unwrapValue # [{);
     }
     static ::mlir::Attribute getFromProblem(}] # problemClassName # [{ &prob,
-                                            ::circt::scheduling::OperatorType opr,
+                                            ::circt::scheduling::Problem::OperatorType opr,
                                             ::mlir::MLIRContext *ctx) {
       if (auto optValue = prob.get}] # propertyName # [{(opr)) {
+        auto value = *optValue;
+        return }] # cppClassName # [{::get(ctx, }] # wrapValue # [{);
+      }
+      return {};
+    }
+  }];
+}
+
+class ResourceTypeProperty<Dialect dialect, string name, string type, string problem,
+                           list<Trait> traits = []>
+    : PropertyBase<dialect, name, type, problem, traits> {
+  let extraClassDeclaration = [{
+    void setInProblem(}] # problemClassName # [{ &prob,
+                      ::circt::scheduling::Problem::ResourceType rsrc) {
+      prob.set}] # propertyName # [{(rsrc, }] # unwrapValue # [{);
+    }
+    static ::mlir::Attribute getFromProblem(}] # problemClassName # [{ &prob,
+                                            ::circt::scheduling::Problem::ResourceType rsrc,
+                                            ::mlir::MLIRContext *ctx) {
+      if (auto optValue = prob.get}] # propertyName # [{(rsrc)) {
         auto value = *optValue;
         return }] # cppClassName # [{::get(ctx, }] # wrapValue # [{);
       }
@@ -90,11 +110,11 @@ class DependenceProperty<Dialect dialect, string name, string type, string probl
     : PropertyBase<dialect, name, type, problem, traits> {
   let extraClassDeclaration = [{
     void setInProblem(}] # problemClassName # [{ &prob,
-                      ::circt::scheduling::Dependence dep) {
+                      ::circt::scheduling::Problem::Dependence dep) {
       prob.set}] # propertyName # [{(dep, }] # unwrapValue # [{);
     }
     static ::mlir::Attribute getFromProblem(}] # problemClassName # [{ &prob,
-                                            ::circt::scheduling::Dependence dep,
+                                            ::circt::scheduling::Problem::Dependence dep,
                                             ::mlir::MLIRContext *ctx) {
       if (auto optValue = prob.get}] # propertyName # [{(dep)) {
         auto value = *optValue;

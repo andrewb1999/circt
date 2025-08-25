@@ -1371,9 +1371,11 @@ bool TypeLoweringVisitor::visitExpr(BitCastOp op) {
         srcLoweredVal = src;
       else {
         if (type_isa<BundleType>(op.getInput().getType())) {
-          srcLoweredVal = builder->create<CatPrimOp>(srcLoweredVal, src);
+          srcLoweredVal =
+              builder->create<CatPrimOp>(ValueRange{srcLoweredVal, src});
         } else {
-          srcLoweredVal = builder->create<CatPrimOp>(src, srcLoweredVal);
+          srcLoweredVal =
+              builder->create<CatPrimOp>(ValueRange{src, srcLoweredVal});
         }
       }
       // Record the total bits already accumulated.
@@ -1640,12 +1642,8 @@ bool TypeLoweringVisitor::visitExpr(MultibitMuxOp op) {
 namespace {
 struct LowerTypesPass
     : public circt::firrtl::impl::LowerFIRRTLTypesBase<LowerTypesPass> {
-  LowerTypesPass(
-      circt::firrtl::PreserveAggregate::PreserveMode preserveAggregateFlag,
-      circt::firrtl::PreserveAggregate::PreserveMode preserveMemoriesFlag) {
-    preserveAggregate = preserveAggregateFlag;
-    preserveMemories = preserveMemoriesFlag;
-  }
+  using Base::Base;
+
   void runOnOperation() override;
 };
 } // end anonymous namespace
@@ -1686,11 +1684,4 @@ void LowerTypesPass::runOnOperation() {
 
   if (failed(result))
     signalPassFailure();
-}
-
-/// This is the pass constructor.
-std::unique_ptr<mlir::Pass> circt::firrtl::createLowerFIRRTLTypesPass(
-    PreserveAggregate::PreserveMode mode,
-    PreserveAggregate::PreserveMode memoryMode) {
-  return std::make_unique<LowerTypesPass>(mode, memoryMode);
 }

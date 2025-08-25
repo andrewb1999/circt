@@ -64,10 +64,10 @@ struct WordRewritePattern : public OpRewritePattern<AndInverterOp> {
         }
         // Otherwise, we need to extract the bit.
         operands.push_back(
-            rewriter.create<comb::ExtractOp>(op.getLoc(), operand, i, 1));
+            comb::ExtractOp::create(rewriter, op.getLoc(), operand, i, 1));
       }
-      results.push_back(rewriter.create<AndInverterOp>(op.getLoc(), operands,
-                                                       op.getInvertedAttr()));
+      results.push_back(AndInverterOp::create(rewriter, op.getLoc(), operands,
+                                              op.getInvertedAttr()));
     }
 
     rewriter.replaceOpWithNewOp<comb::ConcatOp>(op, results);
@@ -95,7 +95,7 @@ void LowerWordToBitsPass::runOnOperation() {
   mlir::FrozenRewritePatternSet frozenPatterns(std::move(patterns));
   mlir::GreedyRewriteConfig config;
   // Use top-down traversal to reuse bits from `comb.concat`.
-  config.useTopDownTraversal = true;
+  config.setUseTopDownTraversal(true);
 
   if (failed(
           mlir::applyPatternsGreedily(getOperation(), frozenPatterns, config)))

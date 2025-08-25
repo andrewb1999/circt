@@ -36,10 +36,14 @@ struct TypeVisitor {
   }
 
   Type visit(const slang::ast::FloatingType &type) {
+    if (type.floatKind == slang::ast::FloatingType::Kind::RealTime)
+      return moore::TimeType::get(context.getContext());
     return moore::RealType::get(context.getContext());
   }
 
   Type visit(const slang::ast::PredefinedIntegerType &type) {
+    if (type.integerKind == slang::ast::PredefinedIntegerType::Kind::Time)
+      return moore::TimeType::get(context.getContext());
     return getSimpleBitVectorType(type);
   }
 
@@ -69,6 +73,11 @@ struct TypeVisitor {
     auto innerType = type.elementType.visit(*this);
     if (!innerType)
       return {};
+    if (!type.indexType) {
+      mlir::emitError(
+          loc, "unsupported type: associative arrays with wildcard index");
+      return {};
+    }
     auto indexType = type.indexType->visit(*this);
     if (!indexType)
       return {};

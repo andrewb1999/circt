@@ -9,8 +9,9 @@ set(libs
   CIRCTMooreToCore
   CIRCTMooreTransforms
   CIRCTSeq
-  CIRCTSim
+  CIRCTSeqTransforms
   CIRCTSupport
+  CIRCTTransforms
   CIRCTVerif
   MLIRBytecodeReader
   MLIRControlFlowDialect

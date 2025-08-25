@@ -118,7 +118,7 @@ getModuloProblem(scf::ForOp forOp,
       // if (distance > 0)
       //   continue;
       // Insert a dependence into the problem.
-      Dependence dep(memoryDep.source, op);
+      Problem::Dependence dep(memoryDep.source, op);
       if (isa<loopschedule::LoopScheduleStoreOp, StoreInterface,
               memref::StoreOp>(memoryDep.source)) {
         problem.setSrcAsStore(dep, true);
@@ -145,7 +145,7 @@ getModuloProblem(scf::ForOp forOp,
   forOp.getBody()->walk([&](Operation *op) {
     if (op == anchor || !problem.hasOperation(op))
       return;
-    Dependence dep(op, anchor);
+    Problem::Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -163,7 +163,7 @@ getModuloProblem(scf::ForOp forOp,
         continue;
 
       for (Operation *iterArgUser : iterArgs[i].getUsers()) {
-        Dependence dep(iterArgDefiner, iterArgUser);
+        Problem::Dependence dep(iterArgDefiner, iterArgUser);
         auto depInserted = problem.insertDependence(dep);
         assert(succeeded(depInserted));
         (void)depInserted;
@@ -202,7 +202,7 @@ getChainingModuloProblem(scf::ForOp forOp,
       // if (distance > 0)
       //   continue;
       // Insert a dependence into the problem.
-      Dependence dep(memoryDep.source, op);
+      Problem::Dependence dep(memoryDep.source, op);
       if (isa<loopschedule::LoopScheduleStoreOp, StoreInterface,
               memref::StoreOp>(memoryDep.source)) {
         problem.setSrcAsStore(dep, true);
@@ -229,7 +229,7 @@ getChainingModuloProblem(scf::ForOp forOp,
   forOp.getBody()->walk([&](Operation *op) {
     if (op == anchor || !problem.hasOperation(op))
       return;
-    Dependence dep(op, anchor);
+    Problem::Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -247,7 +247,7 @@ getChainingModuloProblem(scf::ForOp forOp,
         continue;
 
       for (Operation *iterArgUser : iterArgs[i].getUsers()) {
-        Dependence dep(iterArgDefiner, iterArgUser);
+        Problem::Dependence dep(iterArgDefiner, iterArgUser);
         auto depInserted = problem.insertDependence(dep);
         assert(succeeded(depInserted));
         (void)depInserted;
@@ -280,7 +280,7 @@ getSharedOperatorsProblem(scf::ForOp forOp,
         for (auto &operand : innerOp->getOpOperands()) {
           auto *definingOp = operand.get().getDefiningOp();
           if (definingOp && definingOp->getParentOp() == forOp) {
-            Dependence dep(definingOp, op);
+            Problem::Dependence dep(definingOp, op);
             auto depInserted = problem.insertDependence(dep);
             assert(succeeded(depInserted));
             (void)depInserted;
@@ -305,7 +305,7 @@ getSharedOperatorsProblem(scf::ForOp forOp,
         continue;
 
       // Insert a dependence into the problem.
-      Dependence dep(memoryDep.source, op);
+      Problem::Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -324,7 +324,7 @@ getSharedOperatorsProblem(scf::ForOp forOp,
       return;
     if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface>(op))
       return;
-    Dependence dep(op, anchor);
+    Problem::Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -351,7 +351,7 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
         for (auto &operand : innerOp->getOpOperands()) {
           auto *definingOp = operand.get().getDefiningOp();
           if (definingOp && definingOp->getParentOp() == forOp) {
-            Dependence dep(definingOp, op);
+            Problem::Dependence dep(definingOp, op);
             auto depInserted = problem.insertDependence(dep);
             assert(succeeded(depInserted));
             (void)depInserted;
@@ -376,7 +376,7 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
         continue;
 
       // Insert a dependence into the problem.
-      Dependence dep(memoryDep.source, op);
+      Problem::Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -395,7 +395,7 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
       return;
     if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface>(op))
       return;
-    Dependence dep(op, anchor);
+    Problem::Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -427,7 +427,7 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
           }
 
           if (problem.hasOperation(operand.getDefiningOp())) {
-            Dependence dep(operand.getDefiningOp(), op);
+            Problem::Dependence dep(operand.getDefiningOp(), op);
             auto depInserted = problem.insertDependence(dep);
             assert(succeeded(depInserted));
           }
@@ -447,7 +447,7 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
       if (memoryDep.distance > 0)
         continue;
       // Insert a dependence into the problem.
-      Dependence dep(memoryDep.source, op);
+      Problem::Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -463,7 +463,7 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
         op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
         !problem.hasOperation(op))
       return;
-    Dependence dep(op, anchor);
+    Problem::Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -494,7 +494,7 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
           }
 
           if (problem.hasOperation(operand.getDefiningOp())) {
-            Dependence dep(operand.getDefiningOp(), op);
+            Problem::Dependence dep(operand.getDefiningOp(), op);
             auto depInserted = problem.insertDependence(dep);
             assert(succeeded(depInserted));
           }
@@ -514,7 +514,7 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
       if (memoryDep.distance > 0)
         continue;
       // Insert a dependence into the problem.
-      Dependence dep(memoryDep.source, op);
+      Problem::Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
       assert(succeeded(depInserted));
       (void)depInserted;
@@ -530,7 +530,7 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
         op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
         !problem.hasOperation(op))
       return;
-    Dependence dep(op, anchor);
+    Problem::Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
     (void)depInserted;
@@ -673,7 +673,7 @@ LogicalResult addMemoryResources(Operation *op, Region &body,
 
   for (const auto &it : resourceLimits) {
     auto memRsrc = problem.getOrInsertResourceType(it.getKey());
-    problem.setResourceLimit(memRsrc, it.getValue());
+    problem.setLimit(memRsrc, it.getValue());
   }
 
   for (const auto &it : resourceMap) {
@@ -685,7 +685,7 @@ LogicalResult addMemoryResources(Operation *op, Region &body,
       if (latency != 0) {
         for (const auto &name : rsrcs) {
           auto memRsrc = problem.getOrInsertResourceType(name);
-          problem.addResourceType(op, memRsrc);
+          problem.addLinkedResourceType(op, memRsrc);
         }
       }
     }
@@ -846,7 +846,7 @@ void addPredicateDependencies(Operation *op, Region &body,
     auto *definingOp = pred.getDefiningOp();
     assert(problem.hasOperation(definingOp));
     assert(problem.hasOperation(op));
-    Dependence dep(definingOp, op);
+    Problem::Dependence dep(definingOp, op);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));
   }

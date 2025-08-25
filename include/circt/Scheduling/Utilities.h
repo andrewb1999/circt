@@ -41,7 +41,7 @@ LogicalResult handleOperationsInTopologicalOrder(Problem &prob, HandleOpFn fun);
 /// greater than \p cycleTime, or if the dependence graph contains cycles.
 LogicalResult
 computeChainBreakingDependences(ChainingProblem &prob, float cycleTime,
-                                SmallVectorImpl<Dependence> &result);
+                                SmallVectorImpl<Problem::Dependence> &result);
 
 /// Assuming \p prob is scheduled and contains (integer) start times, this
 /// method fills in the start times in cycle in an ASAP fashion.

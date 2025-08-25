@@ -18,15 +18,6 @@ hw.module @two_clks(in %clk_i1: i1, in %in: i32, out out: i32) {
 
 // -----
 
-hw.module @reg_with_reset(in %clk: !seq.clock, in %rst: i1, in %in: i32, out out: i32) {
-  %c0_i32 = hw.constant 0 : i32
-  // expected-error @below {{registers with reset signals not yet supported}}
-  %1 = seq.compreg %in, %clk reset %rst, %c0_i32 : i32
-  hw.output %1 : i32
-}
-
-// -----
-
 hw.module @reg_with_indirect_initial(in %clk: !seq.clock, in %in: i32, out out: i32) {
   %init = seq.initial () {
     %c0_i32 = hw.constant 0 : i32
@@ -61,5 +52,13 @@ hw.module @reg_with_instance_initial(in %clk: !seq.clock, in %in: i32, out out: 
   %init = hw.instance "foo" @init_emitter () -> (out: !seq.immutable<i32>)
   // expected-error @below {{registers with initial values not directly defined by a seq.initial op not yet supported}}
   %1 = seq.compreg %in, %clk initial %init : i32
+  hw.output %1 : i32
+}
+
+// -----
+hw.module @firreg_with_async_reset(in %clk: !seq.clock, in %rst: i1, in %in: i32, out out: i32) {
+  %c0_i32 = hw.constant 0 : i32
+  // expected-error @below {{registers with an async reset are not yet supported}}
+  %1 = seq.firreg %in clock %clk reset async %rst, %c0_i32 : i32
   hw.output %1 : i32
 }

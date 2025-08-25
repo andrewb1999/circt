@@ -47,7 +47,7 @@ using ObjectFields = SmallDenseMap<StringAttr, EvaluatorValuePtr>;
 /// the appropriate reference count.
 struct EvaluatorValue : std::enable_shared_from_this<EvaluatorValue> {
   // Implement LLVM RTTI.
-  enum class Kind { Attr, Object, List, Tuple, Map, Reference, BasePath, Path };
+  enum class Kind { Attr, Object, List, Reference, BasePath, Path };
   EvaluatorValue(MLIRContext *ctx, Kind kind, Location loc)
       : kind(kind), ctx(ctx), loc(loc) {}
   Kind getKind() const { return kind; }
@@ -130,20 +130,6 @@ private:
 
 /// Values which can be directly representable by MLIR attributes.
 struct AttributeValue : EvaluatorValue {
-  AttributeValue(Attribute attr)
-      : AttributeValue(attr, mlir::UnknownLoc::get(attr.getContext())) {}
-  AttributeValue(Attribute attr, Location loc)
-      : EvaluatorValue(attr.getContext(), Kind::Attr, loc), attr(attr),
-        type(cast<TypedAttr>(attr).getType()) {
-    markFullyEvaluated();
-  }
-
-  // Constructors for partially evaluated AttributeValue.
-  AttributeValue(Type type)
-      : AttributeValue(mlir::UnknownLoc::get(type.getContext())) {}
-  AttributeValue(Type type, Location loc)
-      : EvaluatorValue(type.getContext(), Kind::Attr, loc), type(type) {}
-
   Attribute getAttr() const { return attr; }
   template <typename AttrTy>
   AttrTy getAs() const {
@@ -161,9 +147,32 @@ struct AttributeValue : EvaluatorValue {
 
   Type getType() const { return type; }
 
+  // Factory methods that create AttributeValue objects
+  static std::shared_ptr<EvaluatorValue> get(Attribute attr,
+                                             LocationAttr loc = {});
+  static std::shared_ptr<EvaluatorValue> get(Type type, LocationAttr loc = {});
+
 private:
+  // Make AttributeValue constructible only by the factory methods
+  struct PrivateTag {};
+
+  // Constructor that requires a PrivateTag
+  AttributeValue(PrivateTag, Attribute attr, Location loc)
+      : EvaluatorValue(attr.getContext(), Kind::Attr, loc), attr(attr),
+        type(cast<TypedAttr>(attr).getType()) {
+    markFullyEvaluated();
+  }
+
+  // Constructor for partially evaluated AttributeValue
+  AttributeValue(PrivateTag, Type type, Location loc)
+      : EvaluatorValue(type.getContext(), Kind::Attr, loc), type(type) {}
+
   Attribute attr = {};
   Type type;
+
+  // Friend declaration for the factory methods
+  friend std::shared_ptr<EvaluatorValue> get(Attribute attr, LocationAttr loc);
+  friend std::shared_ptr<EvaluatorValue> get(Type type, LocationAttr loc);
 };
 
 // This perform finalization to `value`.
@@ -215,44 +224,6 @@ private:
   SmallVector<EvaluatorValuePtr> elements;
 };
 
-/// A Map value.
-struct MapValue : EvaluatorValue {
-  MapValue(om::MapType type, DenseMap<Attribute, EvaluatorValuePtr> elements,
-           Location loc)
-      : EvaluatorValue(type.getContext(), Kind::Map, loc), type(type),
-        elements(std::move(elements)) {
-    markFullyEvaluated();
-  }
-
-  // Partially evaluated value.
-  MapValue(om::MapType type, Location loc)
-      : EvaluatorValue(type.getContext(), Kind::Map, loc), type(type) {}
-
-  const auto &getElements() const { return elements; }
-  void setElements(DenseMap<Attribute, EvaluatorValuePtr> newElements) {
-    elements = std::move(newElements);
-    markFullyEvaluated();
-  }
-
-  // Finalize the evaluator value.
-  LogicalResult finalizeImpl();
-
-  /// Return the type of the value, which is a MapType.
-  om::MapType getMapType() const { return type; }
-
-  /// Return an array of keys in the ascending order.
-  ArrayAttr getKeys();
-
-  /// Implement LLVM RTTI.
-  static bool classof(const EvaluatorValue *e) {
-    return e->getKind() == Kind::Map;
-  }
-
-private:
-  om::MapType type;
-  DenseMap<Attribute, EvaluatorValuePtr> elements;
-};
-
 /// A composite Object, which has a type and fields.
 struct ObjectValue : EvaluatorValue {
   ObjectValue(om::ClassOp cls, ObjectFields fields, Location loc)
@@ -302,46 +273,6 @@ struct ObjectValue : EvaluatorValue {
 private:
   om::ClassOp cls;
   llvm::SmallDenseMap<StringAttr, EvaluatorValuePtr> fields;
-};
-
-/// Tuple values.
-struct TupleValue : EvaluatorValue {
-  using TupleElements = llvm::SmallVector<EvaluatorValuePtr>;
-  TupleValue(TupleType type, TupleElements tupleElements, Location loc)
-      : EvaluatorValue(type.getContext(), Kind::Tuple, loc), type(type),
-        elements(std::move(tupleElements)) {
-    markFullyEvaluated();
-  }
-
-  // Partially evaluated value.
-  TupleValue(TupleType type, Location loc)
-      : EvaluatorValue(type.getContext(), Kind::Tuple, loc), type(type) {}
-
-  void setElements(TupleElements newElements) {
-    elements = std::move(newElements);
-    markFullyEvaluated();
-  }
-
-  LogicalResult finalizeImpl() {
-    for (auto &&value : elements)
-      if (failed(finalizeEvaluatorValue(value)))
-        return failure();
-
-    return success();
-  }
-  /// Implement LLVM RTTI.
-  static bool classof(const EvaluatorValue *e) {
-    return e->getKind() == Kind::Tuple;
-  }
-
-  /// Return the type of the value, which is a TupleType.
-  TupleType getTupleType() const { return type; }
-
-  const TupleElements &getElements() const { return elements; }
-
-private:
-  TupleType type;
-  TupleElements elements;
 };
 
 /// A Basepath value.
@@ -484,14 +415,6 @@ private:
   FailureOr<EvaluatorValuePtr> evaluateListConcat(ListConcatOp op,
                                                   ActualParameters actualParams,
                                                   Location loc);
-  FailureOr<EvaluatorValuePtr>
-  evaluateTupleCreate(TupleCreateOp op, ActualParameters actualParams,
-                      Location loc);
-  FailureOr<EvaluatorValuePtr>
-  evaluateTupleGet(TupleGetOp op, ActualParameters actualParams, Location loc);
-  FailureOr<evaluator::EvaluatorValuePtr>
-  evaluateMapCreate(MapCreateOp op, ActualParameters actualParams,
-                    Location loc);
   FailureOr<evaluator::EvaluatorValuePtr>
   evaluateBasePathCreate(FrozenBasePathCreateOp op,
                          ActualParameters actualParams, Location loc);
@@ -534,8 +457,6 @@ operator<<(mlir::Diagnostic &diag,
     diag << "Object(" << object->getType() << ")";
   else if (auto *list = llvm::dyn_cast<evaluator::ListValue>(&evaluatorValue))
     diag << "List(" << list->getType() << ")";
-  else if (auto *map = llvm::dyn_cast<evaluator::MapValue>(&evaluatorValue))
-    diag << "Map(" << map->getType() << ")";
   else if (llvm::isa<evaluator::BasePathValue>(&evaluatorValue))
     diag << "BasePath()";
   else if (llvm::isa<evaluator::PathValue>(&evaluatorValue))

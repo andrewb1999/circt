@@ -11,7 +11,6 @@
 #include "circt/Dialect/LLHD/Transforms/LLHDPasses.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/Support/Debug.h"
 
@@ -56,16 +55,16 @@ void Lowering::lower() {
 
   // Replace the process.
   OpBuilder builder(processOp);
-  auto executeOp = builder.create<scf::ExecuteRegionOp>(
-      processOp.getLoc(), processOp.getResultTypes());
+  auto executeOp = CombinationalOp::create(builder, processOp.getLoc(),
+                                           processOp.getResultTypes());
   executeOp.getRegion().takeBody(processOp.getBody());
   processOp.replaceAllUsesWith(executeOp);
   processOp.erase();
   processOp = {};
 
-  // Replace the `llhd.wait` with an `scf.yield`.
+  // Replace the `llhd.wait` with an `llhd.yield`.
   builder.setInsertionPoint(waitOp);
-  builder.create<scf::YieldOp>(waitOp.getLoc(), waitOp.getYieldOperands());
+  YieldOp::create(builder, waitOp.getLoc(), waitOp.getYieldOperands());
   waitOp.erase();
 
   // Simplify the execute op body region since disconnecting the control flow
@@ -104,7 +103,8 @@ bool Lowering::matchControlFlow() {
   auto skipToMergePoint = [&](Block *block) -> std::pair<Block *, ValueRange> {
     ValueRange operands;
     while (auto branchOp = dyn_cast<cf::BranchOp>(block->getTerminator())) {
-      if (!block->without_terminator().empty())
+      if (llvm::any_of(block->without_terminator(),
+                       [](auto &op) { return !isMemoryEffectFree(&op); }))
         break;
       block = branchOp.getDest();
       operands = branchOp.getDestOperands();
@@ -116,8 +116,7 @@ bool Lowering::matchControlFlow() {
     return {block, operands};
   };
 
-  // Ensure that the entry block and wait op converge on the same block and with
-  // the same block arguments.
+  // Ensure that the entry block and wait op converge on the same block.
   auto &entry = processOp.getBody().front();
   auto [entryMergeBlock, entryMergeArgs] = skipToMergePoint(&entry);
   auto [waitMergeBlock, waitMergeArgs] = skipToMergePoint(waitOp.getDest());
@@ -127,7 +126,24 @@ bool Lowering::matchControlFlow() {
                << ": control from entry and wait does not converge\n");
     return false;
   }
-  if (entryMergeArgs != waitMergeArgs) {
+
+  // Helper function to check if two values are equivalent.
+  auto areValuesEquivalent = [](std::tuple<Value, Value> values) {
+    auto [a, b] = values;
+    if (a == b)
+      return true;
+    auto *opA = a.getDefiningOp();
+    auto *opB = b.getDefiningOp();
+    if (!opA || !opB)
+      return false;
+    return OperationEquivalence::isEquivalentTo(
+        opA, opB, OperationEquivalence::IgnoreLocations);
+  };
+
+  // Ensure that the entry block and wait op converge with equivalent block
+  // arguments.
+  if (!llvm::all_of(llvm::zip(entryMergeArgs, waitMergeArgs),
+                    areValuesEquivalent)) {
     LLVM_DEBUG(llvm::dbgs() << "Skipping process " << processOp.getLoc()
                             << ": control from entry and wait converges with "
                                "different block arguments\n");

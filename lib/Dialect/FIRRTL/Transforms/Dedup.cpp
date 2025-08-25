@@ -813,13 +813,10 @@ struct Equivalence {
     }
     auto aSymbol = cast<mlir::SymbolOpInterface>(a);
     auto bSymbol = cast<mlir::SymbolOpInterface>(b);
-    if (!canRemoveModule(aSymbol)) {
+    if (!canRemoveModule(aSymbol) && !canRemoveModule(bSymbol)) {
       diag.attachNote(a->getLoc())
           << "module is "
           << (aSymbol.isPrivate() ? "private but not discardable" : "public");
-      return;
-    }
-    if (!canRemoveModule(bSymbol)) {
       diag.attachNote(b->getLoc())
           << "module is "
           << (bSymbol.isPrivate() ? "private but not discardable" : "public");
@@ -1064,8 +1061,8 @@ private:
       // Check the NLA cache to see if we already have this NLA.
       auto &cacheEntry = nlaCache[arrayAttr];
       if (!cacheEntry) {
-        auto nla = OpBuilder::atBlockBegin(nlaBlock).create<hw::HierPathOp>(
-            loc, "nla", arrayAttr);
+        auto builder = OpBuilder::atBlockBegin(nlaBlock);
+        auto nla = hw::HierPathOp::create(builder, loc, "nla", arrayAttr);
         // Insert it into the symbol table to get a unique name.
         symbolTable.insert(nla);
         // Store it in the cache.
@@ -1563,8 +1560,8 @@ void fixupConnect(ImplicitLocOpBuilder &builder, Value dst, Value src) {
   auto dstBundle = type_cast<BundleType>(dstType);
   auto srcBundle = type_cast<BundleType>(srcType);
   for (unsigned i = 0; i < dstBundle.getNumElements(); ++i) {
-    auto dstField = builder.create<SubfieldOp>(dst, i);
-    auto srcField = builder.create<SubfieldOp>(src, i);
+    auto dstField = SubfieldOp::create(builder, dst, i);
+    auto srcField = SubfieldOp::create(builder, src, i);
     if (dstBundle.getElement(i).isFlip) {
       std::swap(srcBundle, dstBundle);
       std::swap(srcField, dstField);
@@ -1612,7 +1609,7 @@ void fixupAllModules(InstanceGraph &instanceGraph) {
         // If the type changed we transform it back to the old type with an
         // intermediate wire.
         auto wire =
-            builder.create<WireOp>(oldType, inst.getPortName(i)).getResult();
+            WireOp::create(builder, oldType, inst.getPortName(i)).getResult();
         result.replaceAllUsesWith(wire);
         result.setType(newType);
         if (inst.getPortDirection(i) == Direction::Out)
@@ -1890,7 +1887,3 @@ class DedupPass : public circt::firrtl::impl::DedupBase<DedupPass> {
   }
 };
 } // end anonymous namespace
-
-std::unique_ptr<mlir::Pass> circt::firrtl::createDedupPass() {
-  return std::make_unique<DedupPass>();
-}

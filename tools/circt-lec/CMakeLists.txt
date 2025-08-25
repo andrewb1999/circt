@@ -14,6 +14,8 @@ target_link_libraries(circt-lec
   PRIVATE
   CIRCTComb
   CIRCTCombToSMT
+  CIRCTDatapath
+  CIRCTDatapathToSMT
   CIRCTEmitTransforms
   CIRCTHW
   CIRCTHWToSMT
@@ -34,6 +36,7 @@ target_link_libraries(circt-lec
   MLIRLLVMToLLVMIRTranslation
   MLIRSMT
   MLIRTargetLLVMIRExport
+  MLIRExportSMTLIB
 
   ${CIRCT_LEC_JIT_DEPS}
 )

@@ -12,6 +12,7 @@
 
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/OpAsmInterface.td"
+include "mlir/IR/RegionKindInterface.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "circt/Dialect/Emit/EmitOpInterfaces.td"
@@ -43,10 +44,9 @@ def OrderedOutputOp : SVOp<"ordered", [SingleBlock, NoTerminator, NoRegionArgume
 }
 
 def IfDefOp : SVOp<"ifdef", [
-    SingleBlock,
-    NoTerminator,
     NoRegionArguments,
     NonProceduralOp,
+    GraphRegionNoTerminator,
     DeclareOpInterfaceMethods<SymbolUserOpInterface>
 ]> {
   let summary = "'ifdef MACRO' block";
@@ -854,6 +854,23 @@ def ForOp : SVOp<"for", [SingleBlock, NoTerminator, ProceduralOp,
 // Macros
 //===----------------------------------------------------------------------===//
 
+def MacroErrorOp : SVOp<"macro.error"> {
+  let summary = "Produce a compilation error using the preprocessor";
+  let description = [{
+    The `sv.macro.error` op represents a static error in System Verilog. Since
+    System Verilog lacks an error preprocessor directive, this is emitted as a
+    reference to an undefined macro definition.
+
+    We reserve the macro prefix _ERROR for emitting static assertions.
+  }];
+  let arguments = (ins OptionalAttr<StrAttr>:$message);
+  let assemblyFormat = "($message^)? attr-dict";
+  let extraClassDeclaration = [{
+    /// Build the bogus macro identifier for this error op. Do not define this
+    /// macro identifier. The identifier will be prefixed by `_ERROR`.
+    std::string getMacroIdentifier();
+  }];
+}
 
 def MacroDeclOp : SVOp<"macro.decl", [Symbol]> {
   let summary = "System verilog macro declaration";
@@ -917,9 +934,15 @@ def MacroDefOp : SVOp<"macro.def",
   let results = (outs);
 
   let builders = [
-    OpBuilder<(ins "StringRef":$macroName, "StringRef":$format_string),
-                "build($_builder, $_state, macroName, format_string,"
-                "odsBuilder.getArrayAttr({}));">
+    OpBuilder<(ins "FlatSymbolRefAttr":$macroName), [{
+      auto formatString = StringAttr::get($_builder.getContext());
+      auto symbols = $_builder.getArrayAttr({});
+      build($_builder, $_state, macroName, formatString, symbols);
+    }]>,
+    OpBuilder<(ins "StringRef":$macroName, "StringRef":$formatString), [{
+      auto symbols = $_builder.getArrayAttr({});
+      build($_builder, $_state, macroName, formatString, symbols);
+    }]>
   ];
 
   let assemblyFormat = [{

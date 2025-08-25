@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-from .circt import ir
-from .core import Value
+from .base import ir
+from .core import Value, Type
 from .rtg import rtg
 from .integers import Integer
 
@@ -56,16 +56,20 @@ class Label(Value):
 
     return rtg.LabelOp(rtg.LabelVisibilityAttr.get(visibility), self._value)
 
-  def get_type(self) -> ir.Type:
-    return rtg.LabelType.get()
+  def get_type(self) -> Type:
+    return LabelType()
 
   def _get_ssa_value(self) -> ir.Value:
     return self._value
 
-  def type(*args: ir.Type) -> ir.Type:
-    """
-    Returns the label type.
-    """
 
-    assert len(args) == 0, "Label type does not take type arguments"
+class LabelType(Type):
+  """
+  Represents the type of label values.
+  """
+
+  def __eq__(self, other) -> bool:
+    return isinstance(other, LabelType)
+
+  def _codegen(self) -> ir.Type:
     return rtg.LabelType.get()

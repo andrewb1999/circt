@@ -312,6 +312,7 @@ struct IMConstPropPass
   void markBlockExecutable(Block *block);
   void markWireOp(WireOp wireOrReg);
   void markMemOp(MemOp mem);
+  void markDPICallIntrinsicOp(DPICallIntrinsicOp dpi);
 
   void markInvalidValueOp(InvalidValueOp invalid);
   void markAggregateConstantOp(AggregateConstantOp constant);
@@ -516,6 +517,8 @@ void IMConstPropPass::markBlockExecutable(Block *block) {
         .Case<MemOp>([&](auto mem) { markMemOp(mem); })
         .Case<LayerBlockOp>(
             [&](auto layer) { markBlockExecutable(layer.getBody(0)); })
+        .Case<DPICallIntrinsicOp>(
+            [&](auto dpi) { markDPICallIntrinsicOp(dpi); })
         .Default([&](auto _) {
           if (isa<mlir::UnrealizedConversionCastOp, VerbatimExprOp,
                   VerbatimWireOp, SubaccessOp>(op) ||
@@ -583,6 +586,11 @@ void IMConstPropPass::markWireOp(WireOp wire) {
 
 void IMConstPropPass::markMemOp(MemOp mem) {
   for (auto result : mem.getResults())
+    markOverdefined(result);
+}
+
+void IMConstPropPass::markDPICallIntrinsicOp(DPICallIntrinsicOp dpi) {
+  if (auto result = dpi.getResult())
     markOverdefined(result);
 }
 
@@ -968,7 +976,7 @@ void IMConstPropPass::rewriteModuleBody(FModuleOp module) {
 
   // Separate the constants we insert from the instructions we are folding and
   // processing. Leave these as-is until we're done.
-  auto cursor = builder.create<firrtl::ConstantOp>(module.getLoc(), APSInt(1));
+  auto cursor = firrtl::ConstantOp::create(builder, module.getLoc(), APSInt(1));
   builder.setInsertionPoint(cursor);
 
   // Unique constants per <Const,Type> pair, inserted at entry
@@ -994,7 +1002,7 @@ void IMConstPropPass::rewriteModuleBody(FModuleOp module) {
              "Attempting to materialize rwprobe of constant, shouldn't happen");
       auto inner = getConst(constantValue, refType.getType(), loc);
       assert(inner);
-      cst = builder.create<RefSendOp>(loc, inner);
+      cst = RefSendOp::create(builder, loc, inner);
     } else
       cst = module->getDialect()->materializeConstant(builder, constantValue,
                                                       type, loc);
@@ -1126,8 +1134,4 @@ void IMConstPropPass::rewriteModuleBody(FModuleOp module) {
 
         return WalkResult::advance();
       });
-}
-
-std::unique_ptr<mlir::Pass> circt::firrtl::createIMConstPropPass() {
-  return std::make_unique<IMConstPropPass>();
 }

@@ -206,6 +206,44 @@ void LoopSchedulePipelineOp::print(OpAsmPrinter &p) {
 }
 
 LogicalResult LoopSchedulePipelineOp::verify() {
+  // Verify the condition block is "combinational" based on an allowlist of
+  // Arithmetic ops.
+  Block &conditionBlock = getCondition().front();
+  Operation *nonCombinational;
+  WalkResult conditionWalk = conditionBlock.walk([&](Operation *op) {
+    if (isa_and_nonnull<LoopScheduleDialect>(op->getDialect()))
+      return WalkResult::advance();
+
+    if (!isa<arith::AddIOp, arith::AndIOp, arith::BitcastOp, arith::CmpIOp,
+             arith::ConstantOp, arith::IndexCastOp, arith::MulIOp, arith::OrIOp,
+             arith::SelectOp, arith::ShLIOp, arith::ExtSIOp, arith::CeilDivSIOp,
+             arith::DivSIOp, arith::FloorDivSIOp, arith::RemSIOp,
+             arith::ShRSIOp, arith::SubIOp, arith::TruncIOp, arith::DivUIOp,
+             arith::RemUIOp, arith::ShRUIOp, arith::XOrIOp, arith::ExtUIOp>(
+            op)) {
+      nonCombinational = op;
+      return WalkResult::interrupt();
+    }
+
+    return WalkResult::advance();
+  });
+
+  if (conditionWalk.wasInterrupted())
+    return emitOpError("condition must have a combinational body, found ")
+           << *nonCombinational;
+
+  // Verify the condition block terminates with a value of type i1.
+  TypeRange conditionResults =
+      conditionBlock.getTerminator()->getOperandTypes();
+  if (conditionResults.size() != 1)
+    return emitOpError("condition must terminate with a single result, found ")
+           << conditionResults;
+
+  if (conditionResults.front() != IntegerType::get(getContext(), 1))
+    return emitOpError("condition must terminate with an i1 result, found ")
+           << conditionResults.front();
+
+  // Verify the stages block contains at least one stage and a terminator.
   Block &stagesBlock = getStages().front();
 
   std::optional<uint64_t> lastStartTime;
@@ -271,14 +309,15 @@ void LoopSchedulePipelineOp::build(OpBuilder &builder, OperationState &state,
     argLocs.push_back(arg.getLoc());
   condBlock.addArguments(iterArgs.getTypes(), argLocs);
   builder.setInsertionPointToEnd(&condBlock);
-  builder.create<LoopScheduleRegisterOp>(builder.getUnknownLoc(), ValueRange());
+  LoopScheduleRegisterOp::create(builder, builder.getUnknownLoc(),
+                                 ValueRange());
 
   Region *stagesRegion = state.addRegion();
   Block &stagesBlock = stagesRegion->emplaceBlock();
   stagesBlock.addArguments(iterArgs.getTypes(), argLocs);
   builder.setInsertionPointToEnd(&stagesBlock);
-  builder.create<LoopScheduleTerminatorOp>(builder.getUnknownLoc(),
-                                           ValueRange(), ValueRange());
+  LoopScheduleTerminatorOp::create(builder, builder.getUnknownLoc(),
+                                   ValueRange(), ValueRange());
 }
 
 uint64_t LoopSchedulePipelineOp::getBodyLatency() {
@@ -375,7 +414,8 @@ void LoopSchedulePipelineStageOp::build(OpBuilder &builder,
   Region *region = state.addRegion();
   Block &block = region->emplaceBlock();
   builder.setInsertionPointToEnd(&block);
-  builder.create<LoopScheduleRegisterOp>(builder.getUnknownLoc(), ValueRange());
+  LoopScheduleRegisterOp::create(builder, builder.getUnknownLoc(),
+                                 ValueRange());
 }
 
 unsigned LoopSchedulePipelineStageOp::getStageNumber() {

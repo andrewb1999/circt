@@ -63,7 +63,6 @@
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
-#include "llvm/ADT/ScopeExit.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
@@ -73,10 +72,6 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
-
-#ifdef ARCILATOR_ENABLE_JIT
-#include "arcilator-jit-env.h"
-#endif
 
 #include <optional>
 
@@ -286,7 +281,7 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   }
   if (shouldDedup)
     pm.addPass(arc::createDedupPass());
-  pm.addPass(hw::createFlattenModulesPass());
+  pm.addPass(hw::createFlattenModules());
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizerPass());
 
@@ -425,6 +420,11 @@ static LogicalResult processBuffer(
 #ifdef ARCILATOR_ENABLE_JIT
   // Handle JIT execution.
   if (outputFormat == OutputRunJIT) {
+    if (runUntilBefore != UntilEnd || runUntilAfter != UntilEnd) {
+      llvm::errs() << "full pipeline must be run for JIT execution\n";
+      return failure();
+    }
+
     Operation *toCall = module->lookupSymbol(jitEntryPoint);
     if (!toCall) {
       llvm::errs() << "entry point not found: '" << jitEntryPoint << "'\n";
@@ -445,16 +445,6 @@ static LogicalResult processBuffer(
                    << "' must have no arguments\n";
       return failure();
     }
-
-    auto envInitResult = arc_jit_runtime_env_init();
-    if (envInitResult != 0) {
-      llvm::errs() << "Initialization of arcilator runtime library failed ("
-                   << envInitResult << ").\n";
-      return failure();
-    }
-
-    auto envDeinit =
-        llvm::make_scope_exit([] { arc_jit_runtime_env_deinit(); });
 
     SmallVector<StringRef, 4> sharedLibraries(sharedLibs.begin(),
                                               sharedLibs.end());

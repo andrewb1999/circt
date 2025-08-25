@@ -14,6 +14,7 @@
 #define CIRCT_DIALECT_LLHD_IR_LLHDTYPES_TD
 
 include "circt/Dialect/LLHD/IR/LLHDDialect.td"
+include "circt/Dialect/HW/HWTypes.td"
 include "mlir/IR/AttrTypeBase.td"
 
 // Base class for other typedefs. Provides dialact-specific defaults.
@@ -82,13 +83,13 @@ def LLHDTimeAttr : AttrDef<LLHDDialect, "Time", []> {
   let hasCustomAssemblyFormat = 1;
 
   let parameters = (ins AttributeSelfTypeParameter<"", "llhd::TimeType">:$type,
-                        "unsigned":$time,
+                        "uint64_t":$time,
                         StringRefParameter<"SI time unit">:$timeUnit,
                         "unsigned":$delta,
                         "unsigned":$epsilon);
 
   let skipDefaultBuilders = 1;
-  let builders = [ AttrBuilder<(ins "unsigned":$time,
+  let builders = [ AttrBuilder<(ins "uint64_t":$time,
                                     "llvm::StringRef":$timeUnit,
                                     "unsigned":$delta,
                                     "unsigned":$epsilon), [{

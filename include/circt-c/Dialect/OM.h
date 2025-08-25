@@ -61,14 +61,14 @@ MLIR_CAPI_EXPORTED MlirTypeID omListTypeGetTypeID(void);
 // Return a element type of a ListType.
 MLIR_CAPI_EXPORTED MlirType omListTypeGetElementType(MlirType type);
 
-/// Is the Type a MapType.
-MLIR_CAPI_EXPORTED bool omTypeIsAMapType(MlirType type);
-
-// Return a key type of a MapType.
-MLIR_CAPI_EXPORTED MlirType omMapTypeGetKeyType(MlirType type);
-
 /// Is the Type a StringType.
 MLIR_CAPI_EXPORTED bool omTypeIsAStringType(MlirType type);
+
+/// Get the TypeID for a StringType.
+MLIR_CAPI_EXPORTED MlirTypeID omStringTypeGetTypeID(void);
+
+/// Get a StringType.
+MLIR_CAPI_EXPORTED MlirType omStringTypeGet(MlirContext ctx);
 
 //===----------------------------------------------------------------------===//
 // Evaluator data structures.
@@ -181,31 +181,6 @@ omEvaluatorListGetNumElements(OMEvaluatorValue evaluatorValue);
 MLIR_CAPI_EXPORTED OMEvaluatorValue
 omEvaluatorListGetElement(OMEvaluatorValue evaluatorValue, intptr_t pos);
 
-/// Query if the EvaluatorValue is a Tuple.
-MLIR_CAPI_EXPORTED bool
-omEvaluatorValueIsATuple(OMEvaluatorValue evaluatorValue);
-
-/// Get the size of the tuple.
-MLIR_CAPI_EXPORTED intptr_t
-omEvaluatorTupleGetNumElements(OMEvaluatorValue evaluatorValue);
-
-/// Get an element of the tuple.
-MLIR_CAPI_EXPORTED OMEvaluatorValue
-omEvaluatorTupleGetElement(OMEvaluatorValue evaluatorValue, intptr_t pos);
-
-/// Get an element of the map.
-MLIR_CAPI_EXPORTED OMEvaluatorValue
-omEvaluatorMapGetElement(OMEvaluatorValue evaluatorValue, MlirAttribute attr);
-
-MLIR_CAPI_EXPORTED MlirAttribute omEvaluatorMapGetKeys(OMEvaluatorValue object);
-
-/// Query if the EvaluatorValue is a Map.
-MLIR_CAPI_EXPORTED bool omEvaluatorValueIsAMap(OMEvaluatorValue evaluatorValue);
-
-/// Get the Type from a Map, which will be a MapType.
-MLIR_CAPI_EXPORTED MlirType
-omEvaluatorMapGetType(OMEvaluatorValue evaluatorValue);
-
 /// Query if the EvaluatorValue is a BasePath.
 MLIR_CAPI_EXPORTED bool
 omEvaluatorValueIsABasePath(OMEvaluatorValue evaluatorValue);
@@ -265,19 +240,9 @@ MLIR_CAPI_EXPORTED intptr_t omListAttrGetNumElements(MlirAttribute attr);
 MLIR_CAPI_EXPORTED MlirAttribute omListAttrGetElement(MlirAttribute attr,
                                                       intptr_t pos);
 
-//===----------------------------------------------------------------------===//
-// MapAttr API
-//===----------------------------------------------------------------------===//
-
-MLIR_CAPI_EXPORTED bool omAttrIsAMapAttr(MlirAttribute attr);
-
-MLIR_CAPI_EXPORTED intptr_t omMapAttrGetNumElements(MlirAttribute attr);
-
-MLIR_CAPI_EXPORTED MlirIdentifier omMapAttrGetElementKey(MlirAttribute attr,
-                                                         intptr_t pos);
-
-MLIR_CAPI_EXPORTED MlirAttribute omMapAttrGetElementValue(MlirAttribute attr,
-                                                          intptr_t pos);
+MLIR_CAPI_EXPORTED MlirAttribute omListAttrGet(MlirType elementType,
+                                               intptr_t numElements,
+                                               const MlirAttribute *elements);
 
 #ifdef __cplusplus
 }

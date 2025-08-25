@@ -99,7 +99,8 @@ def ChannelTypeImpl : ESI_Type<"Channel"> {
 }
 
 //===----------------------------------------------------------------------===//
-// Snoop operations reveal the internal signals of a channel.
+// Operations which reveal the internal signals of a channel. They hang off
+// channels but don't count towards its user count.
 //===----------------------------------------------------------------------===//
 
 def SnoopValidReadyOp : ESI_Physical_Op<"snoop.vr", [InferTypeOpInterface]> {
@@ -113,6 +114,36 @@ def SnoopValidReadyOp : ESI_Physical_Op<"snoop.vr", [InferTypeOpInterface]> {
 
   let arguments = (ins ChannelType:$input);
   let results = (outs I1:$valid, I1:$ready, AnyType:$data);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    $input attr-dict `:` qualified(type($input))
+  }];
+
+  let extraClassDeclaration = [{
+    /// Infer the return types of this operation.
+    static LogicalResult inferReturnTypes(MLIRContext *context,
+                                          std::optional<Location> loc,
+                                          ValueRange operands,
+                                          DictionaryAttr attrs,
+                                          mlir::OpaqueProperties properties,
+                                          mlir::RegionRange regions,
+                                          SmallVectorImpl<Type> &results);
+  }];
+}
+
+def SnoopTransactionOp : ESI_Physical_Op<"snoop.xact", [InferTypeOpInterface]> {
+  let summary = "Get the data and transaction signal from a channel";
+  let description = [{
+    A snoop that observes when a transaction occurs on a channel and provides
+    the data being transmitted. The transaction signal indicates when data is
+    actually being transferred on the channel, regardless of the underlying
+    signaling protocol (ValidReady or FIFO). Like other snoop operations, this
+    does not count as another user of the channel. Useful for monitoring data
+    flow and debugging.
+  }];
+
+  let arguments = (ins ChannelType:$input);
+  let results = (outs I1:$transaction, AnyType:$data);
   let hasVerifier = 1;
   let assemblyFormat = [{
     $input attr-dict `:` qualified(type($input))
@@ -497,13 +528,17 @@ def ChannelBufferOp : ESI_Abstract_Op<"buffer", [
     OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<1>]>>:$stages,
     OptionalAttr<StrAttr>:$name);
   let results = (outs ChannelType:$output);
-  let hasCustomAssemblyFormat = 1;
+  let assemblyFormat = [{
+    $clk `,` $rst `,` $input attr-dict
+      `:` qualified(type($input)) `->` qualified(type($output))
+  }];
   let hasVerifier = 1;
 }
 
 def PipelineStageOp : ESI_Physical_Op<"stage", [
     Pure,
-    DeclareOpInterfaceMethods<ChannelOpInterface>
+    DeclareOpInterfaceMethods<ChannelOpInterface>,
+    AllTypesMatch<["input", "output"]>,
   ]> {
   let summary = "An elastic buffer stage.";
   let description = [{
@@ -515,7 +550,10 @@ def PipelineStageOp : ESI_Physical_Op<"stage", [
 
   let arguments = (ins ClockType:$clk, I1:$rst, ChannelType:$input);
   let results = (outs ChannelType:$output);
-  let hasCustomAssemblyFormat = 1;
+  let assemblyFormat = [{
+    $clk `,` $rst `,` $input attr-dict
+      `:` qualified(type($input))
+  }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -562,6 +600,7 @@ def CosimToHostEndpointOp : ESI_Physical_Op<"cosim.to_host", []> {
   let assemblyFormat = [{
     $clk `,` $rst `,` $toHost`,` $id attr-dict `:` qualified(type($toHost))
   }];
+  let hasVerifier = 1;
 }
 
 def CosimFromHostEndpointOp : ESI_Physical_Op<"cosim.from_host", []> {
@@ -583,6 +622,7 @@ def CosimFromHostEndpointOp : ESI_Physical_Op<"cosim.from_host", []> {
   let assemblyFormat = [{
     $clk `,` $rst `,` $id attr-dict `:` qualified(type($fromHost))
   }];
+  let hasVerifier = 1;
 }
 
 def NullSourceOp : ESI_Physical_Op<"null", [Pure]> {

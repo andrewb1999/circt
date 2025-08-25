@@ -32,6 +32,8 @@ using namespace firrtl;
 namespace {
 struct RemoveUnusedPortsPass
     : public circt::firrtl::impl::RemoveUnusedPortsBase<RemoveUnusedPortsPass> {
+  using Base::Base;
+
   void runOnOperation() override;
   void removeUnusedModulePorts(FModuleOp module,
                                InstanceGraphNode *instanceGraphNode);
@@ -101,7 +103,7 @@ void RemoveUnusedPortsPass::removeUnusedModulePorts(
         // Replace the port with a wire if it is unused.
         auto builder = ImplicitLocOpBuilder::atBlockBegin(
             arg.getLoc(), module.getBodyBlock());
-        auto wire = builder.create<WireOp>(arg.getType());
+        auto wire = WireOp::create(builder, arg.getType());
         arg.replaceAllUsesWith(wire.getResult());
         outputPortConstants.push_back(std::nullopt);
       } else if (arg.hasOneUse()) {
@@ -158,7 +160,7 @@ void RemoveUnusedPortsPass::removeUnusedModulePorts(
       // If the port is input, replace the port with an unwritten wire
       // so that we can remove use-chains in SV dialect canonicalization.
       if (ports[index].isInput()) {
-        WireOp wire = builder.create<WireOp>(result.getType());
+        WireOp wire = WireOp::create(builder, result.getType());
 
         // Check that the input port is only written. Sometimes input ports are
         // used as temporary wires. In that case, we cannot erase connections.
@@ -189,9 +191,9 @@ void RemoveUnusedPortsPass::removeUnusedModulePorts(
       auto portConstant = outputPortConstants[outputPortIndex++];
       Value value;
       if (portConstant)
-        value = builder.create<ConstantOp>(*portConstant);
+        value = ConstantOp::create(builder, *portConstant);
       else
-        value = builder.create<InvalidValueOp>(result.getType());
+        value = InvalidValueOp::create(builder, result.getType());
 
       result.replaceAllUsesWith(value);
     }
@@ -203,11 +205,4 @@ void RemoveUnusedPortsPass::removeUnusedModulePorts(
   }
 
   numRemovedPorts += removalPortIndexes.count();
-}
-
-std::unique_ptr<mlir::Pass>
-circt::firrtl::createRemoveUnusedPortsPass(bool ignoreDontTouch) {
-  auto pass = std::make_unique<RemoveUnusedPortsPass>();
-  pass->ignoreDontTouch = ignoreDontTouch;
-  return pass;
 }

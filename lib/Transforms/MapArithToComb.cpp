@@ -34,7 +34,7 @@ class MapArithTypeConverter : public mlir::TypeConverter {
 public:
   MapArithTypeConverter() {
     addConversion([](Type type) {
-      if (isa<mlir::IntegerType>(type))
+      if (hw::isHWValueType(type))
         return type;
 
       return Type();
@@ -86,10 +86,10 @@ public:
     size_t outWidth = op.getOut().getType().getIntOrFloatBitWidth();
     size_t inWidth = adaptor.getIn().getType().getIntOrFloatBitWidth();
 
-    rewriter.replaceOp(op, rewriter.create<comb::ConcatOp>(
-                               loc,
-                               rewriter.create<hw::ConstantOp>(
-                                   loc, APInt(outWidth - inWidth, 0)),
+    rewriter.replaceOp(op, comb::ConcatOp::create(
+                               rewriter, loc,
+                               hw::ConstantOp::create(
+                                   rewriter, loc, APInt(outWidth - inWidth, 0)),
                                adaptor.getIn()));
     return success();
   }

@@ -21,100 +21,10 @@
 #include "circt/Support/LLVM.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/Operation.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 
 #include <optional>
-
-namespace circt {
-namespace scheduling {
-class OperatorType {
-public:
-  OperatorType() = default;
-  OperatorType(mlir::StringAttr name) : name(name) {}
-
-  mlir::StringAttr getName() const { return name; }
-
-  bool operator==(const OperatorType &other) {
-    return getName() == other.getName();
-  }
-
-  bool operator!=(const OperatorType &other) {
-    return getName() != other.getName();
-  }
-
-private:
-  mlir::StringAttr name;
-};
-
-class ResourceType {
-public:
-  ResourceType() = default;
-  ResourceType(mlir::StringAttr name) : name(name) {}
-
-  mlir::StringAttr getName() const { return name; }
-
-  bool operator==(const ResourceType &other) {
-    return getName() == other.getName();
-  }
-
-  bool operator!=(const ResourceType &other) {
-    return getName() != other.getName();
-  }
-
-private:
-  mlir::StringAttr name;
-};
-/// A thin wrapper to allow a uniform handling of def-use and auxiliary
-/// dependences.
-using Dependence = detail::Dependence;
-} // namespace scheduling
-} // namespace circt
-
-namespace llvm {
-template <>
-struct DenseMapInfo<circt::scheduling::OperatorType> {
-  static inline circt::scheduling::OperatorType getEmptyKey() {
-    return DenseMapInfo<mlir::StringAttr>::getEmptyKey();
-  }
-
-  static inline circt::scheduling::OperatorType getTombstoneKey() {
-    return DenseMapInfo<mlir::StringAttr>::getTombstoneKey();
-  }
-
-  static unsigned getHashValue(circt::scheduling::OperatorType val) {
-    return DenseMapInfo<mlir::StringAttr>::getHashValue(val.getName());
-  }
-
-  static bool isEqual(circt::scheduling::OperatorType lhs,
-                      circt::scheduling::OperatorType rhs) {
-    return DenseMapInfo<mlir::StringAttr>::isEqual(lhs.getName(),
-                                                   rhs.getName());
-  }
-};
-
-template <>
-struct DenseMapInfo<circt::scheduling::ResourceType> {
-  static inline circt::scheduling::ResourceType getEmptyKey() {
-    return DenseMapInfo<mlir::StringAttr>::getEmptyKey();
-  }
-
-  static inline circt::scheduling::ResourceType getTombstoneKey() {
-    return DenseMapInfo<mlir::StringAttr>::getTombstoneKey();
-  }
-
-  static unsigned getHashValue(circt::scheduling::ResourceType val) {
-    return DenseMapInfo<mlir::StringAttr>::getHashValue(val.getName());
-  }
-
-  static bool isEqual(circt::scheduling::ResourceType lhs,
-                      circt::scheduling::ResourceType rhs) {
-    return DenseMapInfo<mlir::StringAttr>::isEqual(lhs.getName(),
-                                                   rhs.getName());
-  }
-};
-} // namespace llvm
 
 namespace circt {
 namespace scheduling {
@@ -180,6 +90,55 @@ protected:
   // Aliases for the problem components
   //===--------------------------------------------------------------------===//
 public:
+  /// A thin wrapper to allow a uniform handling of def-use and auxiliary
+  /// dependences.
+  using Dependence = detail::Dependence;
+
+  /// Operator types are distinguished by name (chosen by the client).
+  struct OperatorType {
+    mlir::StringAttr attr;
+
+    OperatorType() = default;
+    OperatorType(mlir::StringAttr attr) : attr(attr) {}
+
+    static OperatorType get(mlir::MLIRContext *ctx, llvm::StringRef name) {
+      return OperatorType{mlir::StringAttr::get(ctx, name)};
+    }
+
+    mlir::StringAttr getAttr() const { return attr; }
+
+    mlir::StringRef getValue() const { return attr.getValue(); }
+
+    std::string str() const { return attr.str(); }
+
+    friend bool operator==(const OperatorType &lhs, const OperatorType &rhs) {
+      return lhs.attr == rhs.attr;
+    }
+  };
+
+  /// Resource types are distinguished by name (chosen by the client).
+  struct ResourceType {
+    mlir::StringAttr attr;
+
+    ResourceType() = default;
+    ResourceType(mlir::StringAttr attr) : attr(attr) {}
+
+    static ResourceType get(mlir::MLIRContext *ctx, llvm::StringRef name) {
+      return ResourceType{mlir::StringAttr::get(ctx, name)};
+    }
+
+    mlir::StringAttr getAttr() const { return attr; }
+
+    mlir::StringRef getValue() const { return attr.getValue(); }
+
+    std::string str() const { return attr.str(); }
+
+    friend bool operator==(const ResourceType &lhs, const ResourceType &rhs) {
+      return lhs.attr == rhs.attr;
+    }
+    bool operator!=(const ResourceType &rhs) const { return !(*this == rhs); }
+  };
+
   //===--------------------------------------------------------------------===//
   // Aliases for containers storing the problem components and properties
   //===--------------------------------------------------------------------===//
@@ -187,6 +146,7 @@ public:
   using OperationSet = llvm::SetVector<Operation *>;
   using DependenceRange = llvm::iterator_range<detail::DependenceIterator>;
   using OperatorTypeSet = llvm::SetVector<OperatorType>;
+  using ResourceTypeSet = llvm::SetVector<ResourceType>;
 
 protected:
   using AuxDependenceMap =
@@ -198,6 +158,8 @@ protected:
   using DependenceProperty = llvm::DenseMap<Dependence, std::optional<T>>;
   template <typename T>
   using OperatorTypeProperty = llvm::DenseMap<OperatorType, std::optional<T>>;
+  template <typename T>
+  using ResourceTypeProperty = llvm::DenseMap<ResourceType, std::optional<T>>;
   template <typename T>
   using InstanceProperty = std::optional<T>;
 
@@ -213,9 +175,11 @@ private:
   OperationSet operations;
   AuxDependenceMap auxDependences;
   OperatorTypeSet operatorTypes;
+  ResourceTypeSet resourceTypes;
 
   // Operation properties
   OperationProperty<OperatorType> linkedOperatorType;
+  OperationProperty<SmallVector<ResourceType>> linkedResourceTypes;
   OperationProperty<unsigned> startTime;
 
   // Operator type properties
@@ -236,9 +200,16 @@ public:
   /// Include \p opr in this scheduling problem.
   void insertOperatorType(OperatorType opr) { operatorTypes.insert(opr); }
 
+  /// Include \p rsrc in this scheduling problem.
+  void insertResourceType(ResourceType rsrc) { resourceTypes.insert(rsrc); }
+
   /// Retrieves the operator type identified by the client-specific \p name. The
   /// operator type is automatically registered in the scheduling problem.
   OperatorType getOrInsertOperatorType(StringRef name);
+
+  /// Retrieves the resource type identified by the client-specific \p name. The
+  /// resource type is automatically registered in the scheduling problem.
+  ResourceType getOrInsertResourceType(StringRef name);
 
   //===--------------------------------------------------------------------===//
   // Access to problem components
@@ -271,6 +242,12 @@ public:
   /// Return the set of operator types.
   const OperatorTypeSet &getOperatorTypes() { return operatorTypes; }
 
+  /// Return true if \p rsrc is part of this problem.
+  bool hasResourceType(ResourceType rsrc) {
+    return resourceTypes.contains(rsrc);
+  }
+  /// Return the set of resource types.
+  const ResourceTypeSet &getResourceTypes() { return resourceTypes; }
   //===--------------------------------------------------------------------===//
   // Access to properties
   //===--------------------------------------------------------------------===//
@@ -281,6 +258,18 @@ public:
   }
   void setLinkedOperatorType(Operation *op, OperatorType opr) {
     linkedOperatorType[op] = opr;
+  }
+
+  /// The linked resource type provides the available resources for \p op.
+  std::optional<SmallVector<ResourceType>>
+  getLinkedResourceTypes(Operation *op) {
+    return linkedResourceTypes.lookup(op);
+  }
+  void setLinkedResourceTypes(Operation *op, SmallVector<ResourceType> rsrcs) {
+    linkedResourceTypes[op] = rsrcs;
+  }
+  void addLinkedResourceType(Operation *op, ResourceType rsrc) {
+    linkedResourceTypes[op]->push_back(rsrc);
   }
 
   /// The latency is the number of cycles \p opr needs to compute its result.
@@ -310,7 +299,7 @@ public:
   // Optional names (for exporting and debugging instances)
   //===--------------------------------------------------------------------===//
 private:
-  StringAttr instanceName, libraryName;
+  StringAttr instanceName, libraryName, rsrcLibraryName;
   SmallDenseMap<Operation *, StringAttr> operationNames;
 
 public:
@@ -319,6 +308,9 @@ public:
 
   StringAttr getLibraryName() { return libraryName; }
   void setLibraryName(StringAttr name) { libraryName = name; }
+
+  StringAttr getRsrcLibraryName() { return rsrcLibraryName; }
+  void setRsrcLibraryName(StringAttr name) { rsrcLibraryName = name; }
 
   StringAttr getOperationName(Operation *op) {
     return operationNames.lookup(op);
@@ -339,13 +331,14 @@ public:
   virtual PropertyStringVector getProperties(OperatorType opr);
   virtual PropertyStringVector getProperties();
 
+  virtual PropertyStringVector getProperties(ResourceType rsrc);
   //===--------------------------------------------------------------------===//
   // Property-specific validators
   //===--------------------------------------------------------------------===//
 protected:
   /// \p op is linked to a registered operator type.
   virtual LogicalResult checkLinkedOperatorType(Operation *op);
-  /// \p opr has a latency.
+  /// \p op has a latency.
   virtual LogicalResult checkLatency(Operation *op);
   /// \p op has a start time.
   virtual LogicalResult verifyStartTime(Operation *op);
@@ -402,18 +395,18 @@ public:
   std::optional<unsigned> getInitiationInterval() { return initiationInterval; }
   void setInitiationInterval(unsigned val) { initiationInterval = val; }
 
-  PropertyStringVector getProperties(Dependence dep) override;
-  PropertyStringVector getProperties() override;
+  virtual PropertyStringVector getProperties(Dependence dep) override;
+  virtual PropertyStringVector getProperties() override;
 
 protected:
   /// \p dep's source operation is available before \p dep's destination
   /// operation starts (\p dep's distance iterations later).
-  LogicalResult verifyPrecedence(Dependence dep) override;
+  virtual LogicalResult verifyPrecedence(Dependence dep) override;
   /// This problem has a non-zero II.
-  LogicalResult verifyInitiationInterval();
+  virtual LogicalResult verifyInitiationInterval();
 
 public:
-  LogicalResult verify() override;
+  virtual LogicalResult verify() override;
 };
 
 /// This class models the accumulation of physical propagation delays on
@@ -470,8 +463,8 @@ public:
   }
   void clearStartTimeInCycle() { startTimeInCycle.clear(); }
 
-  PropertyStringVector getProperties(Operation *op) override;
-  PropertyStringVector getProperties(OperatorType opr) override;
+  virtual PropertyStringVector getProperties(Operation *op) override;
+  virtual PropertyStringVector getProperties(OperatorType opr) override;
 
 protected:
   /// Incoming/outgoing delays are set for \p opr and non-negative. The delays
@@ -486,12 +479,12 @@ protected:
   virtual LogicalResult verifyPrecedenceInCycle(Dependence dep);
 
 public:
-  LogicalResult check() override;
-  LogicalResult verify() override;
+  virtual LogicalResult check() override;
+  virtual LogicalResult verify() override;
 };
 
 /// This class models a resource-constrained scheduling problem. An optional,
-/// non-zero *limit* marks operator types to be *shared* by the operations using
+/// non-zero *limit* marks resource types to be *shared* by the operations using
 /// them. In an HLS setting, this corresponds to multiplexing multiple
 /// operations onto a pre-allocated number of operator instances. These
 /// instances are assumed to be *fully pipelined*, meaning each instance can
@@ -509,63 +502,31 @@ public:
 protected:
   SharedOperatorsProblem() = default;
 
-public:
-  /// Resource types are distinguished by name (chosen by the client).
-  // using ResourceType = mlir::StringAttr;
-
-  template <typename T>
-  using ResourceTypeProperty = llvm::DenseMap<ResourceType, std::optional<T>>;
-
-  using ResourceTypeSet = llvm::SetVector<ResourceType>;
-
 private:
-  ResourceTypeSet resourceTypes;
-
-  ResourceTypeProperty<unsigned> resourceLimits;
-
-  DenseMap<Operation *, DenseSet<ResourceType>> resourceMap;
+  ResourceTypeProperty<unsigned> limit;
 
 public:
-  void setResourceLimit(ResourceType rsrc, unsigned limit) {
-    resourceLimits.insert(std::pair(rsrc, limit));
+  /// The limit is the maximum number of operations using \p rsrc that are
+  /// available in the target hardware.
+  std::optional<unsigned> getLimit(ResourceType rsrc) {
+    return limit.lookup(rsrc);
   }
+  void setLimit(ResourceType rsrc, unsigned val) { limit[rsrc] = val; }
 
-  std::optional<unsigned> getResourceLimit(ResourceType rsrc) {
-    return resourceLimits.lookup(rsrc);
-  }
-
-  void addResourceType(Operation *op, ResourceType rsrc) {
-    resourceMap[op].insert(rsrc);
-  }
-
-  DenseSet<ResourceType> getLinkedResourceTypes(Operation *op) {
-    return resourceMap[op];
-  }
-
-  ResourceType getOrInsertResourceType(llvm::StringRef name) {
-    auto rsrc =
-        ResourceType(StringAttr::get(getContainingOp()->getContext(), name));
-    resourceTypes.insert(rsrc);
-    return rsrc;
-  }
-
-  /// Return the set of resource types.
-  const ResourceTypeSet &getResourceTypes() { return resourceTypes; }
-
-  PropertyStringVector getProperties(OperatorType opr) override;
+  virtual PropertyStringVector getProperties(ResourceType rsrc) override;
 
 protected:
-  /// If \p opr is limited, it has a non-zero latency.
-  LogicalResult checkLatency(Operation *op) override;
-  /// \p opr is not oversubscribed in any time step.
+  /// If \p op is limited, it has a non-zero latency.
+  virtual LogicalResult checkLatency(Operation *op) override;
+  /// \p rsrc is not oversubscribed in any time step.
   virtual LogicalResult verifyUtilization(ResourceType rsrc);
 
 public:
-  LogicalResult verify() override;
+  virtual LogicalResult verify() override;
 };
 
 class ChainingSharedOperatorsProblem : public virtual ChainingProblem,
-                      public virtual SharedOperatorsProblem {
+                                       public virtual SharedOperatorsProblem {
 public:
   static constexpr auto name = "ChainingSharedOperatorsProblem";
   using ChainingProblem::ChainingProblem;
@@ -600,10 +561,10 @@ protected:
   ModuloProblem() = default;
 
   /// \p opr is not oversubscribed in any congruence class modulo II.
-  LogicalResult verifyUtilization(ResourceType rsrc) override;
+  virtual LogicalResult verifyUtilization(ResourceType rsrc) override;
 
 public:
-  LogicalResult verify() override;
+  virtual LogicalResult verify() override;
 };
 
 /// This class models the accumulation of physical propagation delays on
@@ -653,5 +614,55 @@ public:
 
 } // namespace scheduling
 } // namespace circt
+
+namespace llvm {
+
+template <>
+struct DenseMapInfo<circt::scheduling::Problem::OperatorType> {
+  static inline circt::scheduling::Problem::OperatorType getEmptyKey() {
+    return circt::scheduling::Problem::OperatorType(
+        DenseMapInfo<mlir::StringAttr>::getEmptyKey());
+  }
+
+  static inline circt::scheduling::Problem::OperatorType getTombstoneKey() {
+    return circt::scheduling::Problem::OperatorType{
+        DenseMapInfo<mlir::StringAttr>::getTombstoneKey()};
+  }
+
+  static unsigned
+  getHashValue(const circt::scheduling::Problem::OperatorType &val) {
+    return DenseMapInfo<mlir::StringAttr>::getHashValue(val.attr);
+  }
+
+  static bool isEqual(const circt::scheduling::Problem::OperatorType &lhs,
+                      const circt::scheduling::Problem::OperatorType &rhs) {
+    return DenseMapInfo<mlir::StringAttr>::isEqual(lhs.attr, rhs.attr);
+  }
+};
+
+template <>
+struct DenseMapInfo<circt::scheduling::Problem::ResourceType> {
+  static inline circt::scheduling::Problem::ResourceType getEmptyKey() {
+    return circt::scheduling::Problem::ResourceType(
+        DenseMapInfo<mlir::StringAttr>::getEmptyKey());
+  }
+
+  static inline circt::scheduling::Problem::ResourceType getTombstoneKey() {
+    return circt::scheduling::Problem::ResourceType(
+        DenseMapInfo<mlir::StringAttr>::getTombstoneKey());
+  }
+
+  static unsigned
+  getHashValue(const circt::scheduling::Problem::ResourceType &val) {
+    return DenseMapInfo<mlir::StringAttr>::getHashValue(val.attr);
+  }
+
+  static bool isEqual(const circt::scheduling::Problem::ResourceType &lhs,
+                      const circt::scheduling::Problem::ResourceType &rhs) {
+    return DenseMapInfo<mlir::StringAttr>::isEqual(lhs.attr, rhs.attr);
+  }
+};
+
+} // namespace llvm
 
 #endif // CIRCT_SCHEDULING_PROBLEMS_H

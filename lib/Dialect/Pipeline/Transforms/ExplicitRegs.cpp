@@ -199,6 +199,16 @@ void ExplicitRegsPass::runOnPipeline(ScheduledPipelineOp pipeline) {
           // resides within the current pipeline stage. No routing needed.
           continue;
         }
+
+        // At this point, only `pipeline.src` operations are legally allowed to
+        // reference operands from other stages.
+        [[maybe_unused]] SourceOp srcOp =
+            llvm::dyn_cast_or_null<pipeline::SourceOp>(operand.getOwner());
+        assert(
+            srcOp &&
+            "Only pipeline.srcOp's should be allowed to reference "
+            "values outside of this block. Verifiers should have caught this");
+
         Value reroutedValue = routeThroughStage(operand.get(), stage);
         if (reroutedValue != operand.get())
           op->setOperand(operand.getOperandNumber(), reroutedValue);
@@ -261,9 +271,9 @@ void ExplicitRegsPass::runOnPipeline(ScheduledPipelineOp pipeline) {
     StageOp terminator = cast<StageOp>(predecessorStage->getTerminator());
     b.setInsertionPoint(terminator);
     llvm::SmallVector<llvm::SmallVector<Value>> clockGates;
-    b.create<StageOp>(terminator.getLoc(), terminator.getNextStage(), regIns,
-                      passIns, clockGates, b.getArrayAttr(regNames),
-                      b.getArrayAttr(passNames));
+    StageOp::create(b, terminator.getLoc(), terminator.getNextStage(), regIns,
+                    passIns, clockGates, b.getArrayAttr(regNames),
+                    b.getArrayAttr(passNames));
     terminator.erase();
 
     // ... and add arguments to the next stage. Registers first, then
@@ -290,6 +300,12 @@ void ExplicitRegsPass::runOnPipeline(ScheduledPipelineOp pipeline) {
 
   // Clear internal state. See https://github.com/llvm/circt/issues/3235
   stageRegOrPassMap.clear();
+
+  // Finally, erase all of the pipeline.src ops now that they've become no-ops.
+  for (auto srcOp : llvm::make_early_inc_range(pipeline.getOps<SourceOp>())) {
+    srcOp.getResult().replaceAllUsesWith(srcOp.getInput());
+    srcOp.erase();
+  }
 }
 
 void ExplicitRegsPass::runOnOperation() {

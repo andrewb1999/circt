@@ -313,27 +313,27 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
   // Load the Calyx operator library into the problem. This is a very minimal
   // set of arithmetic and memory operators for now. This should ultimately be
   // pulled out into some sort of dialect interface.
-  OperatorType freeOpr = problem.getOrInsertOperatorType("free");
+  Problem::OperatorType freeOpr = problem.getOrInsertOperatorType("free");
   problem.setLatency(freeOpr, 0);
   problem.setIncomingDelay(freeOpr, 0);
   problem.setOutgoingDelay(freeOpr, 0);
-  OperatorType combOpr = problem.getOrInsertOperatorType("comb");
+  Problem::OperatorType combOpr = problem.getOrInsertOperatorType("comb");
   problem.setLatency(combOpr, 0);
   problem.setIncomingDelay(combOpr, 0.2);
   problem.setOutgoingDelay(combOpr, 0.2);
-  OperatorType seqOpr = problem.getOrInsertOperatorType("seq");
+  Problem::OperatorType seqOpr = problem.getOrInsertOperatorType("seq");
   problem.setLatency(seqOpr, 1);
   problem.setIncomingDelay(seqOpr, 0.5);
   problem.setOutgoingDelay(seqOpr, 0.5);
-  OperatorType loopOpr = problem.getOrInsertOperatorType("loop");
+  Problem::OperatorType loopOpr = problem.getOrInsertOperatorType("loop");
   problem.setLatency(loopOpr, 1);
   problem.setIncomingDelay(loopOpr, 0.0);
   problem.setOutgoingDelay(loopOpr, 0.0);
-  OperatorType mcOpr = problem.getOrInsertOperatorType("multicycle");
+  Problem::OperatorType mcOpr = problem.getOrInsertOperatorType("multicycle");
   problem.setLatency(mcOpr, 4);
   problem.setIncomingDelay(mcOpr, 0.5);
   problem.setOutgoingDelay(mcOpr, 0.5);
-  OperatorType divOpr = problem.getOrInsertOperatorType("divider");
+  Problem::OperatorType divOpr = problem.getOrInsertOperatorType("divider");
   problem.setLatency(divOpr, 36);
   problem.setIncomingDelay(divOpr, 0.5);
   problem.setOutgoingDelay(divOpr, 0.5);
@@ -351,7 +351,8 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
       // Just pick the first potential operator for now
       // TODO: Perform better allocation
       auto selectedOperator = potentialOperators.front();
-      OperatorType libOpr = problem.getOrInsertOperatorType(selectedOperator);
+      Problem::OperatorType libOpr =
+          problem.getOrInsertOperatorType(selectedOperator);
       problem.setLatency(libOpr, operatorLibraryAnalysis->getOperatorLatency(
                                      selectedOperator));
       problem.setIncomingDelay(
@@ -364,7 +365,7 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
               .value_or(0.0));
       problem.setLinkedOperatorType(op, libOpr);
       op->setAttr("loopschedule.operator",
-                  SymbolRefAttr::get(libOpr.getName()));
+                  SymbolRefAttr::get(libOpr.getAttr()));
       return WalkResult::advance();
     }
 
@@ -422,7 +423,7 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
           Value memRef = isa<AffineStoreOp>(*memOp)
                              ? cast<AffineStoreOp>(*memOp).getMemRef()
                              : cast<LoopScheduleStoreOp>(*memOp).getMemRef();
-          OperatorType memOpr = problem.getOrInsertOperatorType(
+          Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
               "mem_" + std::to_string(hash_value(memRef)));
           problem.setLatency(memOpr, 1);
           problem.setLinkedOperatorType(memOp, memOpr);
@@ -432,7 +433,7 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
         })
         .Case<LoopScheduleLoadOp, AffineLoadOp>([&](Operation *memOp) {
           Value memRef = getMemref(memOp);
-          OperatorType memOpr = problem.getOrInsertOperatorType(
+          Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
               "mem_" + std::to_string(hash_value(memRef)));
           problem.setLatency(memOpr, 1);
           problem.setLinkedOperatorType(memOp, memOpr);
@@ -456,7 +457,8 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
             uniqueId = storeOp.getUniqueId();
             incomingDelay = storeOp.getIncomingDelay();
           }
-          OperatorType portOpr = problem.getOrInsertOperatorType(uniqueId);
+          Problem::OperatorType portOpr =
+              problem.getOrInsertOperatorType(uniqueId);
           problem.setLatency(portOpr, latency);
           problem.setLinkedOperatorType(op, portOpr);
           problem.setIncomingDelay(portOpr, incomingDelay);
@@ -468,13 +470,13 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
           auto schedOp = cast<SchedulableInterface>(op);
           auto latency = schedOp.getOpLatency();
           auto limitOpt = schedOp.getOpLimit();
-          OperatorType opr =
+          Problem::OperatorType opr =
               problem.getOrInsertOperatorType(schedOp.getUniqueId());
           problem.setLatency(opr, latency);
           if (limitOpt.has_value()) {
             auto rsrc = problem.getOrInsertResourceType(schedOp.getUniqueId());
-            problem.setResourceLimit(rsrc, limitOpt.value());
-            problem.addResourceType(op, rsrc);
+            problem.setLimit(rsrc, limitOpt.value());
+            problem.addLinkedResourceType(op, rsrc);
           }
           problem.setLinkedOperatorType(op, opr);
           problem.setIncomingDelay(opr, schedOp.getIncomingDelay());
@@ -517,11 +519,14 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
     //   continue;
     llvm::dbgs() << "Chaining Modulo scheduling inputs for " << *op;
     auto opr = problem.getLinkedOperatorType(op);
-    llvm::dbgs() << "\n  opr = " << opr->getName();
+    llvm::dbgs() << "\n  opr = " << opr->getAttr();
     llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
-    for (auto rsrc : problem.getLinkedResourceTypes(op))
-      llvm::dbgs() << "\n  resource = " << rsrc.getName()
-                   << " limit = " << problem.getResourceLimit(rsrc);
+    auto maybeRsrcs = problem.getLinkedResourceTypes(op);
+    if (maybeRsrcs.has_value()) {
+      for (auto rsrc : *maybeRsrcs)
+        llvm::dbgs() << "\n  resource = " << rsrc.getAttr()
+                     << " limit = " << problem.getLimit(rsrc);
+    }
     for (auto dep : problem.getDependences(op))
       if (dep.isAuxiliary())
         llvm::dbgs() << "\n  dep = { distance = " << problem.getDistance(dep)
@@ -575,11 +580,14 @@ LogicalResult SCFToLoopSchedulePass::solveChainingSharedOperatorsProblem(
                   : problem.getOperations()) {
     llvm::dbgs() << "Chaining Shared Operator scheduling inputs for " << *op;
     auto opr = problem.getLinkedOperatorType(op);
-    llvm::dbgs() << "\n  opr = " << opr->getName();
+    llvm::dbgs() << "\n  opr = " << opr->getAttr();
     llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
-    for (auto rsrc : problem.getLinkedResourceTypes(op))
-      llvm::dbgs() << "\n  resource = " << rsrc.getName()
-                   << " limit = " << problem.getResourceLimit(rsrc);
+    auto maybeRsrcs = problem.getLinkedResourceTypes(op);
+    if (maybeRsrcs.has_value()) {
+      for (auto rsrc : *maybeRsrcs)
+        llvm::dbgs() << "\n  resource = " << rsrc.getAttr()
+                     << " limit = " << problem.getLimit(rsrc);
+    }
     for (auto dep : problem.getDependences(op))
       if (dep.isAuxiliary())
         llvm::dbgs() << "\n  dep = { "

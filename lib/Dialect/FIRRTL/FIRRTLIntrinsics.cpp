@@ -181,7 +181,7 @@ FailureOr<size_t> IntrinsicLowerings::lower(FModuleOp mod,
         !isTypeLarger(resultType, inputType))
       return {};
 
-    auto w = builder.create<WireOp>(loc, resultType).getResult();
+    auto w = WireOp::create(builder, loc, resultType).getResult();
     emitConnect(builder, loc, w, inputs.front());
     return w;
   };
@@ -265,8 +265,8 @@ public:
   void convert(GenericIntrinsic gi, GenericIntrinsicOpAdaptor adaptor,
                PatternRewriter &rewriter) override {
     auto bty = gi.getOutputBundle().getType();
-    auto newop = rewriter.create<PlusArgsValueIntrinsicOp>(
-        gi.op.getLoc(), bty.getElementTypePreservingConst(0),
+    auto newop = PlusArgsValueIntrinsicOp::create(
+        rewriter, gi.op.getLoc(), bty.getElementTypePreservingConst(0),
         bty.getElementTypePreservingConst(1),
         gi.getParamValue<StringAttr>("FORMAT"));
     rewriter.replaceOpWithNewOp<BundleCreateOp>(
@@ -922,9 +922,9 @@ public:
     size_t numLeaves = 0;
     auto augGroundAttr =
         StringAttr::get(gi.op.getContext(), augmentedGroundTypeClass);
-    auto augBundleAttr =
+    [[maybe_unused]] auto augBundleAttr =
         StringAttr::get(gi.op.getContext(), augmentedBundleTypeClass);
-    auto augVectorAttr =
+    [[maybe_unused]] auto augVectorAttr =
         StringAttr::get(gi.op.getContext(), augmentedVectorTypeClass);
     while (!worklist.empty()) {
       auto dict = worklist.pop_back_val();

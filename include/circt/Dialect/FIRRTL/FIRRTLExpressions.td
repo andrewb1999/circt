@@ -465,12 +465,6 @@ def IsTagOp : FIRRTLExprOp<"istag"> {
   ];
 
   let firrtlExtraClassDeclaration = [{
-    /// Return a `FieldRef` to the accessed field.
-    FieldRef getAccessedField() {
-      return FieldRef(getInput(), firrtl::type_cast<FEnumType>(getInput().getType())
-                                            .getFieldID(getFieldIndex()));
-    }
-
     /// Return the name of the accessed field.
     StringAttr getFieldNameAttr() {
       return firrtl::type_cast<FEnumType>(getInput().getType())
@@ -509,12 +503,6 @@ def SubtagOp : FIRRTLExprOp<"subtag"> {
   ];
 
   let firrtlExtraClassDeclaration = [{
-    /// Return a `FieldRef` to the accessed field.
-    FieldRef getAccessedField() {
-      return FieldRef(getInput(), getInput().getType().base()
-                                            .getFieldID(getFieldIndex()));
-    }
-
     /// Return the name of the accessed field.
     StringAttr getFieldNameAttr() {
       return getInput().getType().base().getElementNameAttr(getFieldIndex());
@@ -540,6 +528,21 @@ def TagExtractOp : FIRRTLExprOp<"tagextract", [InferTypeOpInterface]> {
   let arguments = (ins FEnumType:$input);
   let results = (outs UIntType:$result);
   let assemblyFormat = "$input attr-dict `:` qualified(type($input))";
+
+  let inferTypeDecl = [{
+    static FIRRTLType inferReturnType(FIRRTLType input,
+                                      std::optional<Location> loc);
+
+    static FIRRTLType inferReturnType(ValueRange operands,
+                                      DictionaryAttr attrs,
+                                      OpaqueProperties properties,
+                                      mlir::RegionRange regions,
+                                      std::optional<Location> loc) {
+      Adaptor adaptor(operands, attrs, properties, regions);
+      auto input = firrtl::type_cast<FIRRTLType>(adaptor.getInput().getType());
+      return inferReturnType(input, loc);
+    }
+  }];
 }
 
 def MultibitMuxOp : FIRRTLExprOp<"multibit_mux"> {
@@ -679,9 +682,16 @@ let inferType = "impl::inferComparisonResult" in {
   }
 }
 
-def CatPrimOp : IntBinaryPrimOp<"cat", UIntType> {
-  let hasCanonicalizer = true;
+def CatPrimOp : FIRRTLExprOp<"cat"> {
+  let arguments = (ins Variadic<IntType>:$inputs);
+  let results = (outs UIntType:$result);
+
+  let assemblyFormat = "$inputs attr-dict `:` functional-type($inputs, $result)";
+
+  let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
+
 def DShlPrimOp  : BinaryPrimOp<"dshl", IntType, UIntType, IntType>  {
   let description = [{
     A dynamic shift left operation. The width of `$result` is expanded to
@@ -1582,15 +1592,28 @@ def RWProbeOp : FIRRTLOp<"ref.rwprobe",
   let assemblyFormat = "$target attr-dict `:` type($result)";
 }
 
-def XMRRefOp : FIRRTLOp<"xmr.ref"> {
+def XMRRefOp : FIRRTLOp<"xmr.ref", [
+    Pure,
+    DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "FIRRTL XMR operation, targetable by ref ops.";
+  let description = [{
+    Takes a (symbol-ref to a) hierarchical path and returns a reference to
+    the target. Through this reference, the target can be read or written
+    "at a distance".
+  }];
   let arguments = (ins FlatSymbolRefAttr:$ref, DefaultValuedAttr<StrAttr, "{}">:$verbatimSuffix);
   let results = (outs RefType:$dest);
   let assemblyFormat = "$ref (`,` $verbatimSuffix^)? attr-dict `:` qualified(type($dest))";
 }
 
-def XMRDerefOp : FIRRTLOp<"xmr.deref"> {
+def XMRDerefOp : FIRRTLOp<"xmr.deref", [
+    Pure,
+    DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "FIRRTL XMR operation, reading an XMR target.";
+  let description = [{
+    A "read at a distance", taking a (symbol-ref to a) hierarchical path,
+    returning the value of the target.
+  }];
   let arguments = (ins FlatSymbolRefAttr:$ref, DefaultValuedAttr<StrAttr, "{}">:$verbatimSuffix);
   let results = (outs PassiveType:$dest);
   let assemblyFormat = "$ref (`,` $verbatimSuffix^)? attr-dict `:` qualified(type($dest))";
@@ -1607,17 +1630,17 @@ class LTLIntrinsicOp<string mnemonic, list<Trait> traits = []> :
   let assemblyFormat = [{
     operands attr-dict `:` functional-type(operands, results)
   }];
-  let results = (outs UInt1Type:$result);
+  let results = (outs NonConstUInt1Type:$result);
 }
 
 class UnaryLTLIntrinsicOp<string mnemonic, list<Trait> traits = []> :
     LTLIntrinsicOp<mnemonic, traits> {
-  let arguments = (ins UInt1Type:$input);
+  let arguments = (ins NonConstUInt1Type:$input);
 }
 
 class BinaryLTLIntrinsicOp<string mnemonic, list<Trait> traits = []> :
     LTLIntrinsicOp<mnemonic, traits> {
-  let arguments = (ins UInt1Type:$lhs, UInt1Type:$rhs);
+  let arguments = (ins NonConstUInt1Type:$lhs, NonConstUInt1Type:$rhs);
 }
 
 
@@ -1628,7 +1651,7 @@ def LTLIntersectIntrinsicOp : BinaryLTLIntrinsicOp<"intersect", [Commutative]>;
 
 // Sequences
 def LTLDelayIntrinsicOp : LTLIntrinsicOp<"delay"> {
-  let arguments = (ins UInt1Type:$input,
+  let arguments = (ins NonConstUInt1Type:$input,
                        I64Attr:$delay,
                        OptionalAttr<I64Attr>:$length);
   let assemblyFormat = [{
@@ -1638,7 +1661,7 @@ def LTLDelayIntrinsicOp : LTLIntrinsicOp<"delay"> {
 }
 def LTLConcatIntrinsicOp : BinaryLTLIntrinsicOp<"concat">;
 def LTLRepeatIntrinsicOp : LTLIntrinsicOp<"repeat"> {
-  let arguments = (ins UInt1Type:$input,
+  let arguments = (ins NonConstUInt1Type:$input,
                        I64Attr:$base,
                        OptionalAttr<I64Attr>:$more);
   let assemblyFormat = [{
@@ -1648,7 +1671,7 @@ def LTLRepeatIntrinsicOp : LTLIntrinsicOp<"repeat"> {
 }
 
 def LTLGoToRepeatIntrinsicOp : LTLIntrinsicOp<"goto_repeat"> {
-  let arguments = (ins UInt1Type:$input,
+  let arguments = (ins NonConstUInt1Type:$input,
                        I64Attr:$base,
                        I64Attr:$more);
   let assemblyFormat = [{
@@ -1658,7 +1681,7 @@ def LTLGoToRepeatIntrinsicOp : LTLIntrinsicOp<"goto_repeat"> {
 }
 
 def LTLNonConsecutiveRepeatIntrinsicOp : LTLIntrinsicOp<"non_consecutive_repeat"> {
-  let arguments = (ins UInt1Type:$input,
+  let arguments = (ins NonConstUInt1Type:$input,
                        I64Attr:$base,
                        I64Attr:$more);
   let assemblyFormat = [{
@@ -1675,7 +1698,7 @@ def LTLEventuallyIntrinsicOp : UnaryLTLIntrinsicOp<"eventually">;
 
 // Clocking
 def LTLClockIntrinsicOp : LTLIntrinsicOp<"clock"> {
-  let arguments = (ins UInt1Type:$input, ClockType:$clock);
+  let arguments = (ins NonConstUInt1Type:$input, ClockType:$clock);
   let assemblyFormat = [{
     $input `,` $clock attr-dict `:` functional-type(operands, results)
   }];

@@ -554,6 +554,8 @@ module {
 // CHECK-DAG:        calyx.assign %std_fpToIntFN_0.in = %in0 : i32
 // CHECK-DAG:        calyx.assign %std_fpToIntFN_0.signedOut = %true : i1
 // CHECK-DAG:        %0 = comb.xor %std_fpToIntFN_0.done, %true : i1
+// CHECK-DAG:        calyx.assign %fptosi_0_reg.in = %std_fpToIntFN_0.out : i64
+// CHECK-DAG:        calyx.assign %fptosi_0_reg.write_en = %true : i1
 // CHECK-DAG:        calyx.assign %std_fpToIntFN_0.go = %0 ? %true : i1
 // CHECK-DAG:        calyx.group_done %fptosi_0_reg.done : i1
 // CHECK-DAG:      }
@@ -573,6 +575,8 @@ module {
 // CHECK:      calyx.group @bb0_0 {
 // CHECK-DAG:        calyx.assign %std_intToFpFN_0.in = %in0 : i64
 // CHECK-DAG:        calyx.assign %std_intToFpFN_0.signedIn = %true : i1
+// CHECK-DAG:        calyx.assign %sitofp_0_reg.in = %std_intToFpFN_0.out : i32
+// CHECK-DAG:        calyx.assign %sitofp_0_reg.write_en = %true : i1
 // CHECK-DAG:        %0 = comb.xor %std_intToFpFN_0.done, %true : i1
 // CHECK-DAG:        calyx.assign %std_intToFpFN_0.go = %0 ? %true : i1
 // CHECK-DAG:        calyx.group_done %sitofp_0_reg.done : i1
@@ -631,5 +635,54 @@ module {
     %1 = arith.divf %arg0, %0 : f32
 
     return %1 : f32
+  }
+}
+
+// -----
+
+// Test floating point square root
+
+// CHECK:    %sqrt_0_reg.in, %sqrt_0_reg.write_en, %sqrt_0_reg.clk, %sqrt_0_reg.reset, %sqrt_0_reg.out, %sqrt_0_reg.done = calyx.register @sqrt_0_reg : i32, i1, i1, i1, i32, i1
+// CHECK-DAG:    %std_divSqrtFN_0.clk, %std_divSqrtFN_0.reset, %std_divSqrtFN_0.go, %std_divSqrtFN_0.control, %std_divSqrtFN_0.sqrtOp, %std_divSqrtFN_0.left, %std_divSqrtFN_0.right, %std_divSqrtFN_0.roundingMode, %std_divSqrtFN_0.out, %std_divSqrtFN_0.exceptionalFlags, %std_divSqrtFN_0.done = calyx.ieee754.divSqrt @std_divSqrtFN_0 : i1, i1, i1, i1, i1, i32, i32, i3, i32, i5, i1
+// CHECK:      calyx.group @bb0_0 {
+// CHECK-DAG:        calyx.assign %std_divSqrtFN_0.left = %in0 : i32
+// CHECK-DAG:        calyx.assign %sqrt_0_reg.in = %std_divSqrtFN_0.out : i32
+// CHECK-DAG:        calyx.assign %sqrt_0_reg.write_en = %std_divSqrtFN_0.done : i1
+// CHECK-DAG:        %0 = comb.xor %std_divSqrtFN_0.done, %true : i1
+// CHECK-DAG:        calyx.assign %std_divSqrtFN_0.go = %0 ? %true : i1
+// CHECK-DAG:        calyx.assign %std_divSqrtFN_0.sqrtOp = %true : i1
+// CHECK-DAG:        calyx.group_done %sqrt_0_reg.done : i1
+// CHECK-DAG:      }
+
+module {
+  func.func @main(%arg0: f32) -> f32 {
+    %result = math.sqrt %arg0 : f32
+    return %result : f32
+  }
+}
+
+// -----
+
+// Test floating point absolute lowering
+
+// CHECK:      calyx.group @bb0_2 {
+// CHECK-DAG:        calyx.assign %std_slice_0.in = %c0_i32 : i32
+// CHECK-DAG:        calyx.assign %arg_mem_0.addr0 = %std_slice_0.out : i1
+// CHECK-DAG:        calyx.assign %arg_mem_0.write_data = %std_and_0.out : i32
+// CHECK-DAG:        calyx.assign %arg_mem_0.write_en = %true : i1
+// CHECK-DAG:        calyx.assign %arg_mem_0.content_en = %true : i1
+// CHECK-DAG:        calyx.assign %std_and_0.left = %c2147483647_i32 : i32
+// CHECK-DAG:        calyx.assign %std_and_0.right = %addf_0_reg.out : i32
+// CHECK-DAG:        calyx.group_done %arg_mem_0.done : i1
+// CHECK-DAG:      }
+
+module {
+  func.func @main(%arg0: memref<1xf32>, %arg1: f32) {
+    %zero_idx = arith.constant 0 : index
+    %cst = arith.constant -1.1 : f32
+    %sum = arith.addf %cst, %arg1 : f32
+    %abs = math.absf %sum : f32
+    memref.store %abs, %arg0[%zero_idx] : memref<1xf32>
+    return
   }
 }

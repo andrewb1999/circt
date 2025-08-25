@@ -629,9 +629,9 @@ static llvm::StringMap<AnnoRecord> annotationRecords{{
     {extractSeqMemsAnnoClass, NoTargetAnnotation},
     {injectDUTHierarchyAnnoClass, NoTargetAnnotation},
     {convertMemToRegOfVecAnnoClass, NoTargetAnnotation},
-    {excludeMemToRegAnnoClass,
-     {stdResolve, applyWithoutTarget<true, MemOp, CombMemOp>}},
     {sitestBlackBoxAnnoClass, NoTargetAnnotation},
+    {sitestBlackBoxLibrariesAnnoClass,
+     {stdResolve, applyWithoutTarget<false, FExtModuleOp>}},
     {enumComponentAnnoClass, {noResolve, drop}},
     {enumDefAnnoClass, {noResolve, drop}},
     {enumVecAnnoClass, {noResolve, drop}},
@@ -721,15 +721,13 @@ namespace {
 struct LowerAnnotationsPass
     : public circt::firrtl::impl::LowerFIRRTLAnnotationsBase<
           LowerAnnotationsPass> {
+  using Base::Base;
+
   void runOnOperation() override;
   LogicalResult applyAnnotation(DictionaryAttr anno, ApplyState &state);
   LogicalResult legacyToWiringProblems(ApplyState &state);
   LogicalResult solveWiringProblems(ApplyState &state);
 
-  using LowerFIRRTLAnnotationsBase::allowAddingPortsOnPublic;
-  using LowerFIRRTLAnnotationsBase::ignoreAnnotationClassless;
-  using LowerFIRRTLAnnotationsBase::ignoreAnnotationUnknown;
-  using LowerFIRRTLAnnotationsBase::noRefTypePorts;
   SmallVector<DictionaryAttr> worklistAttrs;
 };
 } // end anonymous namespace
@@ -879,9 +877,9 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
     // Create RefSend/RefResolve if necessary.
     if (type_isa<RefType>(dest.getType()) != type_isa<RefType>(src.getType())) {
       if (type_isa<RefType>(dest.getType()))
-        src = builder.create<RefSendOp>(src);
+        src = RefSendOp::create(builder, src);
       else
-        src = builder.create<RefResolveOp>(src);
+        src = RefResolveOp::create(builder, src);
     }
 
     // If the sink is a wire with no users, then convert this to a node.
@@ -894,7 +892,7 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
           baseType && baseType.isPassive()) {
         // Note that the wire is replaced with the source type
         // regardless, continue this behavior.
-        builder.create<NodeOp>(src, destOp.getName())
+        NodeOp::create(builder, src, destOp.getName())
             .setAnnotationsAttr(destOp.getAnnotations());
         opsToErase.push_back(destOp);
         return success();
@@ -1264,16 +1262,4 @@ void LowerAnnotationsPass::runOnOperation() {
 
   if (numFailures)
     signalPassFailure();
-}
-
-/// This is the pass constructor.
-std::unique_ptr<mlir::Pass> circt::firrtl::createLowerFIRRTLAnnotationsPass(
-    bool ignoreAnnotationUnknown, bool ignoreAnnotationClassless,
-    bool noRefTypePorts, bool allowAddingPortsOnPublic) {
-  auto pass = std::make_unique<LowerAnnotationsPass>();
-  pass->ignoreAnnotationUnknown = ignoreAnnotationUnknown;
-  pass->ignoreAnnotationClassless = ignoreAnnotationClassless;
-  pass->noRefTypePorts = noRefTypePorts;
-  pass->allowAddingPortsOnPublic = allowAddingPortsOnPublic;
-  return pass;
 }

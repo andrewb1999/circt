@@ -40,11 +40,9 @@ firrtl.circuit "Foo" {
     // CHECK: firrtl.invalidvalue : !firrtl.uint<0>
     // CHECK: firrtl.invalidvalue : !firrtl.bundle<x: uint<0>>
     // CHECK: firrtl.invalidvalue : !firrtl.vector<uint<0>, 2>
-    // CHECK: firrtl.invalidvalue : !firrtl.enum<a: uint<0>>
     %invalid_0 = firrtl.invalidvalue : !firrtl.uint
     %invalid_1 = firrtl.invalidvalue : !firrtl.bundle<x: uint>
     %invalid_2 = firrtl.invalidvalue : !firrtl.vector<uint, 2>
-    %invalid_3 = firrtl.invalidvalue : !firrtl.enum<a: uint>
   }
 
   // CHECK-LABEL: @InferOutput
@@ -174,8 +172,8 @@ firrtl.circuit "Foo" {
     // CHECK: %1 = firrtl.wire : !firrtl.uint<3>
     // CHECK: %2 = firrtl.wire : !firrtl.sint<2>
     // CHECK: %3 = firrtl.wire : !firrtl.sint<3>
-    // CHECK: %4 = firrtl.cat {{.*}} -> !firrtl.uint<5>
-    // CHECK: %5 = firrtl.cat {{.*}} -> !firrtl.uint<5>
+    // CHECK: %4 = firrtl.cat {{.*}} -> !firrtl.uint<8>
+    // CHECK: %5 = firrtl.cat {{.*}} -> !firrtl.uint<8>
     // CHECK: %6 = firrtl.dshl {{.*}} -> !firrtl.uint<10>
     // CHECK: %7 = firrtl.dshl {{.*}} -> !firrtl.sint<10>
     // CHECK: %8 = firrtl.dshlw {{.*}} -> !firrtl.uint<3>
@@ -186,8 +184,8 @@ firrtl.circuit "Foo" {
     %1 = firrtl.wire : !firrtl.uint
     %2 = firrtl.wire : !firrtl.sint
     %3 = firrtl.wire : !firrtl.sint
-    %4 = firrtl.cat %0, %1 : (!firrtl.uint, !firrtl.uint) -> !firrtl.uint
-    %5 = firrtl.cat %2, %3 : (!firrtl.sint, !firrtl.sint) -> !firrtl.uint
+    %4 = firrtl.cat %0, %1, %1 : (!firrtl.uint, !firrtl.uint, !firrtl.uint) -> !firrtl.uint
+    %5 = firrtl.cat %2, %3, %3 : (!firrtl.sint, !firrtl.sint, !firrtl.sint) -> !firrtl.uint
     %6 = firrtl.dshl %1, %1 : (!firrtl.uint, !firrtl.uint) -> !firrtl.uint
     %7 = firrtl.dshl %3, %1 : (!firrtl.sint, !firrtl.uint) -> !firrtl.sint
     %8 = firrtl.dshlw %1, %1 : (!firrtl.uint, !firrtl.uint) -> !firrtl.uint
@@ -695,15 +693,6 @@ firrtl.circuit "Foo" {
     firrtl.connect %w_a, %c2_ui3 : !firrtl.uint, !firrtl.uint<3>
   }
 
-  // CHECK-LABEL: @InferEnum
-  firrtl.module @InferEnum(in %in : !firrtl.enum<a: uint<3>>) {
-    // CHECK: %w = firrtl.wire : !firrtl.enum<a: uint<3>>
-    %w = firrtl.wire : !firrtl.enum<a: uint>
-    firrtl.connect %w, %in : !firrtl.enum<a: uint>, !firrtl.enum<a: uint<3>>
-    // CHECK: %0 = firrtl.subtag %w[a] : !firrtl.enum<a: uint<3>>
-    %0 = firrtl.subtag %w[a] : !firrtl.enum<a: uint>
-  }
-
   // CHECK-LABEL: InferComplexBundles
   firrtl.module @InferComplexBundles() {
     // CHECK: %w = firrtl.wire : !firrtl.bundle<a: bundle<v: vector<uint<3>, 10>>, b: bundle<v: vector<uint<3>, 10>>>
@@ -1008,5 +997,10 @@ firrtl.circuit "Foo" {
     firrtl.connect %y, %x : !firrtl.uint, !firrtl.uint<5>
     %0 = firrtl.string "test"
     firrtl.propassign %s, %0 : !firrtl.string
+  }
+
+  // Make sure it doesn't crash.
+  firrtl.module private @NullaryCat() {
+    %0 = firrtl.cat : () -> !firrtl.uint<0>
   }
 }

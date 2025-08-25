@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/RTG/IR/RTGOps.h"
+#include "circt/Dialect/RTG/IR/RTGAttributes.h"
 #include "circt/Support/ParsingUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
@@ -105,6 +106,15 @@ void SequenceOp::print(OpAsmPrinter &p) {
       (*this)->getAttrs(), {getSymNameAttrName(), getSequenceTypeAttrName()});
   p << ' ';
   p.printRegion(getBodyRegion(), /*printEntryBlockArgs=*/false);
+}
+
+mlir::SymbolTable::Visibility SequenceOp::getVisibility() {
+  return mlir::SymbolTable::Visibility::Private;
+}
+
+void SequenceOp::setVisibility(mlir::SymbolTable::Visibility visibility) {
+  // Do nothing, always private.
+  assert(false && "cannot change visibility of sequence");
 }
 
 //===----------------------------------------------------------------------===//
@@ -268,6 +278,28 @@ LogicalResult SetCreateOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// SetCartesianProductOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult SetCartesianProductOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
+  if (operands.empty()) {
+    if (loc)
+      return mlir::emitError(*loc) << "at least one set must be provided";
+    return failure();
+  }
+
+  SmallVector<Type> elementTypes;
+  for (auto operand : operands)
+    elementTypes.push_back(cast<SetType>(operand.getType()).getElementType());
+  inferredReturnTypes.push_back(
+      SetType::get(rtg::TupleType::get(context, elementTypes)));
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // BagCreateOp
 //===----------------------------------------------------------------------===//
 
@@ -336,6 +368,52 @@ LogicalResult BagCreateOp::verify() {
     if (getElements()[0].getType() != getBag().getType().getElementType())
       return emitOpError() << "operand types must match bag element type";
 
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// TupleCreateOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult TupleCreateOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
+  SmallVector<Type> elementTypes;
+  for (auto operand : operands)
+    elementTypes.push_back(operand.getType());
+  inferredReturnTypes.push_back(rtg::TupleType::get(context, elementTypes));
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// TupleExtractOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult TupleExtractOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
+  assert(operands.size() == 1 && "must have exactly one operand");
+
+  auto tupleTy = dyn_cast<rtg::TupleType>(operands[0].getType());
+  size_t idx = properties.as<Properties *>()->getIndex().getInt();
+  if (!tupleTy) {
+    if (loc)
+      return mlir::emitError(*loc) << "only RTG tuples are supported";
+    return failure();
+  }
+
+  if (tupleTy.getFieldTypes().size() <= idx) {
+    if (loc)
+      return mlir::emitError(*loc)
+             << "index (" << idx
+             << ") must be smaller than number of elements in tuple ("
+             << tupleTy.getFieldTypes().size() << ")";
+    return failure();
+  }
+
+  inferredReturnTypes.push_back(tupleTy.getFieldTypes()[idx]);
   return success();
 }
 
@@ -429,17 +507,60 @@ LogicalResult ContextSwitchOp::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult TestOp::verifyRegions() {
-  if (!getTarget().entryTypesMatch(getBody()->getArgumentTypes()))
+  if (!getTargetType().entryTypesMatch(getBody()->getArgumentTypes()))
     return emitOpError("argument types must match dict entry types");
+
+  return success();
+}
+
+LogicalResult TestOp::verify() {
+  if (getTemplateName().empty())
+    return emitOpError("template name must not be empty");
+
+  return success();
+}
+
+LogicalResult TestOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  if (!getTargetAttr())
+    return success();
+
+  auto target =
+      symbolTable.lookupNearestSymbolFrom<TargetOp>(*this, getTargetAttr());
+  if (!target)
+    return emitOpError()
+           << "'" << *getTarget()
+           << "' does not reference a valid 'rtg.target' operation";
+
+  // Check if target is a subtype of test requirements
+  // Since entries are sorted by name, we can do this in a single pass
+  size_t targetIdx = 0;
+  auto targetEntries = target.getTarget().getEntries();
+  for (auto testEntry : getTargetType().getEntries()) {
+    // Find the matching entry in target entries.
+    while (targetIdx < targetEntries.size() &&
+           targetEntries[targetIdx].name.getValue() < testEntry.name.getValue())
+      targetIdx++;
+
+    // Check if we found a matching entry with the same name and type
+    if (targetIdx >= targetEntries.size() ||
+        targetEntries[targetIdx].name != testEntry.name ||
+        targetEntries[targetIdx].type != testEntry.type) {
+      return emitOpError("referenced 'rtg.target' op's type is invalid: "
+                         "missing entry called '")
+             << testEntry.name.getValue() << "' of type " << testEntry.type;
+    }
+  }
 
   return success();
 }
 
 ParseResult TestOp::parse(OpAsmParser &parser, OperationState &result) {
   // Parse the name as a symbol.
-  if (parser.parseSymbolName(
-          result.getOrAddProperties<TestOp::Properties>().sym_name))
+  StringAttr symNameAttr;
+  if (parser.parseSymbolName(symNameAttr))
     return failure();
+
+  result.getOrAddProperties<TestOp::Properties>().sym_name = symNameAttr;
 
   // Parse the function signature.
   SmallVector<OpAsmParser::Argument> arguments;
@@ -476,7 +597,31 @@ ParseResult TestOp::parse(OpAsmParser &parser, OperationState &result) {
                                    ArrayRef<DictEntry>(entries));
   if (!type)
     return failure();
-  result.getOrAddProperties<TestOp::Properties>().target = TypeAttr::get(type);
+  result.getOrAddProperties<TestOp::Properties>().targetType =
+      TypeAttr::get(type);
+
+  std::string templateName;
+  if (!parser.parseOptionalKeyword("template")) {
+    auto loc = parser.getCurrentLocation();
+    if (parser.parseString(&templateName))
+      return failure();
+
+    if (templateName.empty())
+      return parser.emitError(loc, "template name must not be empty");
+  }
+
+  StringAttr templateNameAttr = symNameAttr;
+  if (!templateName.empty())
+    templateNameAttr = StringAttr::get(result.getContext(), templateName);
+
+  StringAttr targetName;
+  if (!parser.parseOptionalKeyword("target"))
+    if (parser.parseSymbolName(targetName))
+      return failure();
+
+  result.getOrAddProperties<TestOp::Properties>().templateName =
+      templateNameAttr;
+  result.getOrAddProperties<TestOp::Properties>().target = targetName;
 
   auto loc = parser.getCurrentLocation();
   if (parser.parseOptionalAttrDictWithKeyword(result.attributes))
@@ -506,15 +651,25 @@ void TestOp::print(OpAsmPrinter &p) {
   p << "(";
   SmallString<32> resultNameStr;
   llvm::interleaveComma(
-      llvm::zip(getTarget().getEntries(), getBody()->getArguments()), p,
+      llvm::zip(getTargetType().getEntries(), getBody()->getArguments()), p,
       [&](auto entryAndArg) {
         auto [entry, arg] = entryAndArg;
         p << entry.name.getValue() << " = ";
         p.printRegionArgument(arg);
       });
   p << ")";
+
+  if (getSymNameAttr() != getTemplateNameAttr())
+    p << " template " << getTemplateNameAttr();
+
+  if (getTargetAttr()) {
+    p << " target ";
+    p.printSymbolName(getTargetAttr().getValue());
+  }
+
   p.printOptionalAttrDictWithKeyword(
-      (*this)->getAttrs(), {getSymNameAttrName(), getTargetAttrName()});
+      (*this)->getAttrs(), {getSymNameAttrName(), getTargetTypeAttrName(),
+                            getTargetAttrName(), getTemplateNameAttrName()});
   p << ' ';
   p.printRegion(getBodyRegion(), /*printEntryBlockArgs=*/false);
 }
@@ -522,7 +677,7 @@ void TestOp::print(OpAsmPrinter &p) {
 void TestOp::getAsmBlockArgumentNames(Region &region,
                                       OpAsmSetValueNameFn setNameFn) {
   for (auto [entry, arg] :
-       llvm::zip(getTarget().getEntries(), region.getArguments()))
+       llvm::zip(getTargetType().getEntries(), region.getArguments()))
     setNameFn(arg, entry.name.getValue());
 }
 
@@ -534,6 +689,18 @@ LogicalResult TargetOp::verifyRegions() {
   if (!getTarget().entryTypesMatch(
           getBody()->getTerminator()->getOperandTypes()))
     return emitOpError("terminator operand types must match dict entry types");
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ValidateOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult ValidateOp::verify() {
+  if (!getRef().getType().isValidContentType(getValue().getType()))
+    return emitOpError(
+        "result type must be a valid content type for the ref value");
 
   return success();
 }
@@ -574,6 +741,191 @@ void ArrayCreateOp::print(OpAsmPrinter &p) {
   p.printOperands(getElements());
   p << " : " << getType().getElementType();
   p.printOptionalAttrDict((*this)->getAttrs(), {});
+}
+
+//===----------------------------------------------------------------------===//
+// MemoryBlockDeclareOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult MemoryBlockDeclareOp::verify() {
+  if (getBaseAddress().getBitWidth() != getType().getAddressWidth())
+    return emitOpError(
+        "base address width must match memory block address width");
+
+  if (getEndAddress().getBitWidth() != getType().getAddressWidth())
+    return emitOpError(
+        "end address width must match memory block address width");
+
+  if (getBaseAddress().ugt(getEndAddress()))
+    return emitOpError(
+        "base address must be smaller than or equal to the end address");
+
+  return success();
+}
+
+ParseResult MemoryBlockDeclareOp::parse(OpAsmParser &parser,
+                                        OperationState &result) {
+  SmallVector<OpAsmParser::UnresolvedOperand> operands;
+  MemoryBlockType memoryBlockType;
+  APInt start, end;
+
+  if (parser.parseLSquare())
+    return failure();
+
+  auto startLoc = parser.getCurrentLocation();
+  if (parser.parseInteger(start))
+    return failure();
+
+  if (parser.parseMinus())
+    return failure();
+
+  auto endLoc = parser.getCurrentLocation();
+  if (parser.parseInteger(end) || parser.parseRSquare() ||
+      parser.parseColonType(memoryBlockType) ||
+      parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  auto width = memoryBlockType.getAddressWidth();
+  auto adjustAPInt = [&](APInt value, llvm::SMLoc loc) -> FailureOr<APInt> {
+    if (value.getBitWidth() > width) {
+      if (!value.isIntN(width))
+        return parser.emitError(
+                   loc,
+                   "address out of range for memory block with address width ")
+               << width;
+
+      return value.trunc(width);
+    }
+
+    if (value.getBitWidth() < width)
+      return value.zext(width);
+
+    return value;
+  };
+
+  auto startRes = adjustAPInt(start, startLoc);
+  auto endRes = adjustAPInt(end, endLoc);
+  if (failed(startRes) || failed(endRes))
+    return failure();
+
+  auto intType = IntegerType::get(result.getContext(), width);
+  result.addAttribute(getBaseAddressAttrName(result.name),
+                      IntegerAttr::get(intType, *startRes));
+  result.addAttribute(getEndAddressAttrName(result.name),
+                      IntegerAttr::get(intType, *endRes));
+
+  result.addTypes(memoryBlockType);
+  return success();
+}
+
+void MemoryBlockDeclareOp::print(OpAsmPrinter &p) {
+  SmallVector<char> str;
+  getBaseAddress().toString(str, 16, false, false, false);
+  p << " [0x" << str;
+  p << " - 0x";
+  str.clear();
+  getEndAddress().toString(str, 16, false, false, false);
+  p << str << "] : " << getType();
+  p.printOptionalAttrDict((*this)->getAttrs(),
+                          {getBaseAddressAttrName(), getEndAddressAttrName()});
+}
+
+//===----------------------------------------------------------------------===//
+// MemoryBaseAddressOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult MemoryBaseAddressOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
+  if (operands.empty())
+    return failure();
+  auto memTy = dyn_cast<MemoryType>(operands[0].getType());
+  if (!memTy)
+    return failure();
+  inferredReturnTypes.push_back(
+      ImmediateType::get(context, memTy.getAddressWidth()));
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ConcatImmediateOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult ConcatImmediateOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
+  if (operands.empty()) {
+    if (loc)
+      return mlir::emitError(*loc) << "at least one operand must be provided";
+    return failure();
+  }
+
+  unsigned totalWidth = 0;
+  for (auto operand : operands) {
+    auto immType = dyn_cast<ImmediateType>(operand.getType());
+    if (!immType) {
+      if (loc)
+        return mlir::emitError(*loc)
+               << "all operands must be of immediate type";
+      return failure();
+    }
+    totalWidth += immType.getWidth();
+  }
+
+  inferredReturnTypes.push_back(ImmediateType::get(context, totalWidth));
+  return success();
+}
+
+OpFoldResult ConcatImmediateOp::fold(FoldAdaptor adaptor) {
+  // concat(x) -> x
+  if (getOperands().size() == 1)
+    return getOperands()[0];
+
+  // If all operands are constants, fold into a single constant
+  if (llvm::all_of(adaptor.getOperands(), [](Attribute attr) {
+        return isa_and_nonnull<ImmediateAttr>(attr);
+      })) {
+    auto result = APInt::getZeroWidth();
+    for (auto attr : adaptor.getOperands())
+      result = result.concat(cast<ImmediateAttr>(attr).getValue());
+
+    return ImmediateAttr::get(getContext(), result);
+  }
+
+  return {};
+}
+
+//===----------------------------------------------------------------------===//
+// SliceImmediateOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult SliceImmediateOp::verify() {
+  auto srcWidth = getInput().getType().getWidth();
+  auto dstWidth = getResult().getType().getWidth();
+
+  if (getLowBit() >= srcWidth)
+    return emitOpError("from bit too large for input (got ")
+           << getLowBit() << ", but input width is " << srcWidth << ")";
+
+  if (srcWidth - getLowBit() < dstWidth)
+    return emitOpError("slice does not fit in input (trying to extract ")
+           << dstWidth << " bits starting at index " << getLowBit()
+           << ", but only " << (srcWidth - getLowBit())
+           << " bits are available)";
+
+  return success();
+}
+
+OpFoldResult SliceImmediateOp::fold(FoldAdaptor adaptor) {
+  if (auto inputAttr = dyn_cast_or_null<ImmediateAttr>(adaptor.getInput())) {
+    auto resultWidth = getType().getWidth();
+    APInt sliced = inputAttr.getValue().extractBits(resultWidth, getLowBit());
+    return ImmediateAttr::get(getContext(), sliced);
+  }
+
+  return {};
 }
 
 //===----------------------------------------------------------------------===//

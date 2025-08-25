@@ -49,7 +49,7 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
 
   DenseMap<Operation *, IntVar> taskStarts;
   DenseMap<Operation *, IntVar> taskEnds;
-  DenseMap<ResourceType, SmallVector<IntervalVar, 4>>
+  DenseMap<Problem::ResourceType, SmallVector<IntervalVar, 4>>
       resourcesToTaskIntervals;
 
   // First get horizon, i.e., the time taken if all operations were executed
@@ -81,10 +81,12 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
         cpModel.NewIntervalVar(startVar, duration, endVar)
             .WithName((Twine("task_interval_") + Twine(i)).str());
 
-    for (auto resource : prob.getLinkedResourceTypes(task)) {
-      auto limit = prob.getResourceLimit(resource);
-      if (limit.has_value())
-        resourcesToTaskIntervals[resource].emplace_back(taskInterval);
+    auto resourceListOpt = prob.getLinkedResourceTypes(task);
+    if (resourceListOpt) {
+      for (const auto &resource : *resourceListOpt) {
+        if (auto limitOpt = prob.getLimit(resource))
+          resourcesToTaskIntervals[resource].push_back(taskInterval);
+      }
     }
   }
 
@@ -103,8 +105,8 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
   // Establish "cumulative" constraints in order to constrain maximum
   // concurrent usage of operators.
   for (auto resourceToTaskIntervals : resourcesToTaskIntervals) {
-    ResourceType &resource = resourceToTaskIntervals.getFirst();
-    auto capacity = prob.getResourceLimit(resource);
+    Problem::ResourceType &resource = resourceToTaskIntervals.getFirst();
+    auto capacity = prob.getLimit(resource);
     SmallVector<IntervalVar, 4> &taskIntervals =
         resourceToTaskIntervals.getSecond();
     // The semantics of cumulative constraints in or-tools are such that
@@ -118,7 +120,8 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
       auto i = item.index();
       auto taskInterval = item.value();
       IntVar demandVar = cpModel.NewIntVar(Domain(1)).WithName(
-          (Twine("demand_") + Twine(i) + Twine("_") + Twine(resource.getName().strref()))
+          (Twine("demand_") + Twine(i) + Twine("_") +
+           Twine(resource.getAttr().strref()))
               .str());
       // Conventional formulation for SharedOperatorsProblem;
       // interval during which the resource is occupied has size 1.

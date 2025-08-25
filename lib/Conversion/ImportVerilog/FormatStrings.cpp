@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ImportVerilogInternals.h"
-#include "slang/text/SFormat.h"
+#include "slang/ast/SFormat.h"
 
 using namespace mlir;
 using namespace circt;
@@ -15,7 +15,8 @@ using namespace ImportVerilog;
 using moore::IntAlign;
 using moore::IntFormat;
 using moore::IntPadding;
-using slang::SFormat::FormatOptions;
+using moore::RealFormat;
+using slang::ast::SFormat::FormatOptions;
 
 namespace {
 struct FormatStringParser {
@@ -65,7 +66,7 @@ struct FormatStringParser {
       return Value{};
     if (fragments.size() == 1)
       return fragments[0];
-    return builder.create<moore::FormatConcatOp>(loc, fragments).getResult();
+    return moore::FormatConcatOp::create(builder, loc, fragments).getResult();
   }
 
   /// Parse a format string literal and consume and format the arguments
@@ -87,13 +88,13 @@ struct FormatStringParser {
     auto onError = [&](auto, auto, auto, auto) {
       assert(false && "Slang should have already reported all errors");
     };
-    slang::SFormat::parse(format, onText, onArg, onError);
+    slang::ast::SFormat::parse(format, onText, onArg, onError);
     return failure(anyFailure);
   }
 
   /// Emit a string literal that requires no additional formatting.
   void emitLiteral(StringRef literal) {
-    fragments.push_back(builder.create<moore::FormatLiteralOp>(loc, literal));
+    fragments.push_back(moore::FormatLiteralOp::create(builder, loc, literal));
   }
 
   /// Consume the next argument from the list and emit it according to the given
@@ -128,6 +129,11 @@ struct FormatStringParser {
       return emitInteger(arg, options,
                          std::isupper(specifier) ? IntFormat::HexUpper
                                                  : IntFormat::HexLower);
+
+    case 'e':
+    case 'g':
+    case 'f':
+      return emitReal(arg, options, RealFormat::Float);
 
     case 's':
       // Simplified handling for literals.
@@ -177,8 +183,27 @@ struct FormatStringParser {
     auto padding =
         format == IntFormat::Decimal ? IntPadding::Space : IntPadding::Zero;
 
-    fragments.push_back(builder.create<moore::FormatIntOp>(
-        loc, value, format, width, alignment, padding));
+    fragments.push_back(moore::FormatIntOp::create(builder, loc, value, format,
+                                                   width, alignment, padding));
+    return success();
+  }
+
+  LogicalResult emitReal(const slang::ast::Expression &arg,
+                         const FormatOptions &options, RealFormat format) {
+
+    // Ensures that the given value is moore.real
+    // i.e. $display("%f", 4) -> 4.000000, but 4 is not necessarily of real type
+    auto value = context.convertRvalueExpression(
+        arg, moore::RealType::get(context.getContext()));
+
+    if (!value)
+      return failure();
+
+    // TODO add support for specifics such as width etc
+
+    fragments.push_back(
+        moore::FormatRealOp::create(builder, loc, value, format));
+
     return success();
   }
 
@@ -191,7 +216,7 @@ struct FormatStringParser {
 } // namespace
 
 FailureOr<Value> Context::convertFormatString(
-    slang::span<const slang::ast::Expression *const> arguments, Location loc,
+    std::span<const slang::ast::Expression *const> arguments, Location loc,
     IntFormat defaultFormat, bool appendNewline) {
   FormatStringParser parser(*this, ArrayRef(arguments.data(), arguments.size()),
                             loc, defaultFormat);

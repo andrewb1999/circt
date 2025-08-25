@@ -15,12 +15,14 @@
 
 #include "esi/backends/Cosim.h"
 
+#include <ranges>
 #include <sstream>
 
 // pybind11 includes
 #include <pybind11/pybind11.h>
 namespace py = pybind11;
 
+#include <pybind11/functional.h>
 #include <pybind11/stl.h>
 
 using namespace esi;
@@ -55,6 +57,10 @@ struct polymorphic_type_hook<Service> {
     }
     if (auto p = dynamic_cast<const HostMem *>(svc)) {
       type = &typeid(HostMem);
+      return p;
+    }
+    if (auto p = dynamic_cast<const TelemetryService *>(svc)) {
+      type = &typeid(TelemetryService);
       return p;
     }
     return svc;
@@ -102,9 +108,12 @@ py::object getPyType(std::optional<const Type *> t) {
 // NOLINTNEXTLINE(readability-identifier-naming)
 PYBIND11_MODULE(esiCppAccel, m) {
   py::class_<Type>(m, "Type")
+      .def(py::init<const Type::ID &>(), py::arg("id"))
       .def_property_readonly("id", &Type::getID)
       .def("__repr__", [](Type &t) { return "<" + t.getID() + ">"; });
   py::class_<ChannelType, Type>(m, "ChannelType")
+      .def(py::init<const Type::ID &, const Type *>(), py::arg("id"),
+           py::arg("inner"))
       .def_property_readonly("inner", &ChannelType::getInner,
                              py::return_value_policy::reference);
   py::enum_<BundleType::Direction>(m, "Direction")
@@ -112,20 +121,38 @@ PYBIND11_MODULE(esiCppAccel, m) {
       .value("From", BundleType::Direction::From)
       .export_values();
   py::class_<BundleType, Type>(m, "BundleType")
+      .def(py::init<const Type::ID &, const BundleType::ChannelVector &>(),
+           py::arg("id"), py::arg("channels"))
       .def_property_readonly("channels", &BundleType::getChannels,
                              py::return_value_policy::reference);
-  py::class_<VoidType, Type>(m, "VoidType");
-  py::class_<AnyType, Type>(m, "AnyType");
+  py::class_<VoidType, Type>(m, "VoidType")
+      .def(py::init<const Type::ID &>(), py::arg("id"));
+  py::class_<AnyType, Type>(m, "AnyType")
+      .def(py::init<const Type::ID &>(), py::arg("id"));
   py::class_<BitVectorType, Type>(m, "BitVectorType")
+      .def(py::init<const Type::ID &, uint64_t>(), py::arg("id"),
+           py::arg("width"))
       .def_property_readonly("width", &BitVectorType::getWidth);
-  py::class_<BitsType, BitVectorType>(m, "BitsType");
-  py::class_<IntegerType, BitVectorType>(m, "IntegerType");
-  py::class_<SIntType, IntegerType>(m, "SIntType");
-  py::class_<UIntType, IntegerType>(m, "UIntType");
+  py::class_<BitsType, BitVectorType>(m, "BitsType")
+      .def(py::init<const Type::ID &, uint64_t>(), py::arg("id"),
+           py::arg("width"));
+  py::class_<IntegerType, BitVectorType>(m, "IntegerType")
+      .def(py::init<const Type::ID &, uint64_t>(), py::arg("id"),
+           py::arg("width"));
+  py::class_<SIntType, IntegerType>(m, "SIntType")
+      .def(py::init<const Type::ID &, uint64_t>(), py::arg("id"),
+           py::arg("width"));
+  py::class_<UIntType, IntegerType>(m, "UIntType")
+      .def(py::init<const Type::ID &, uint64_t>(), py::arg("id"),
+           py::arg("width"));
   py::class_<StructType, Type>(m, "StructType")
+      .def(py::init<const Type::ID &, const StructType::FieldVector &>(),
+           py::arg("id"), py::arg("fields"))
       .def_property_readonly("fields", &StructType::getFields,
                              py::return_value_policy::reference);
   py::class_<ArrayType, Type>(m, "ArrayType")
+      .def(py::init<const Type::ID &, const Type *, uint64_t>(), py::arg("id"),
+           py::arg("element_type"), py::arg("size"))
       .def_property_readonly("element", &ArrayType::getElementType,
                              py::return_value_policy::reference)
       .def_property_readonly("size", &ArrayType::getSize);
@@ -255,10 +282,22 @@ PYBIND11_MODULE(esiCppAccel, m) {
              // emits an error.
              return f.valid();
            })
-      .def("wait", &std::future<MessageData>::wait)
+      .def("wait",
+           [](std::future<MessageData> &f) {
+             // Yield the GIL while waiting for the future to complete, in case
+             // of python callbacks occuring from other threads while waiting.
+             py::gil_scoped_release release{};
+             f.wait();
+           })
       .def("get", [](std::future<MessageData> &f) {
-        MessageData data = f.get();
-        return py::bytearray((const char *)data.getBytes(), data.getSize());
+        std::optional<MessageData> data;
+        {
+          // Yield the GIL while waiting for the future to complete, in case of
+          // python callbacks occuring from other threads while waiting.
+          py::gil_scoped_release release{};
+          data.emplace(f.get());
+        }
+        return py::bytearray((const char *)data->getBytes(), data->getSize());
       });
 
   py::class_<ChannelPort>(m, "ChannelPort")
@@ -323,6 +362,31 @@ PYBIND11_MODULE(esiCppAccel, m) {
           py::return_value_policy::take_ownership)
       .def("connect", &FuncService::Function::connect);
 
+  py::class_<CallService::Callback, ServicePort>(m, "Callback")
+      .def("connect", [](CallService::Callback &self,
+                         std::function<py::object(py::object)> pyCallback) {
+        // TODO: Under certain conditions this will cause python to crash. I
+        // don't remember how to replicate these crashes, but IIRC they are
+        // deterministic.
+        self.connect([pyCallback](const MessageData &req) -> MessageData {
+          py::gil_scoped_acquire acquire{};
+          std::vector<uint8_t> arg(req.getBytes(),
+                                   req.getBytes() + req.getSize());
+          py::bytearray argObj((const char *)arg.data(), arg.size());
+          auto ret = pyCallback(argObj);
+          if (ret.is_none())
+            return MessageData();
+          py::buffer_info info(py::buffer(ret).request());
+          std::vector<uint8_t> dataVec((uint8_t *)info.ptr,
+                                       (uint8_t *)info.ptr + info.size);
+          return MessageData(dataVec);
+        });
+      });
+
+  py::class_<TelemetryService::Telemetry, ServicePort>(m, "Telemetry")
+      .def("connect", &TelemetryService::Telemetry::connect)
+      .def("read", &TelemetryService::Telemetry::read);
+
   // Store this variable (not commonly done) as the "children" method needs for
   // "Instance" to be defined first.
   auto hwmodule =
@@ -371,7 +435,9 @@ PYBIND11_MODULE(esiCppAccel, m) {
           [](AcceleratorConnection &acc) {
             return acc.getService<services::HostMem>({});
           },
-          py::return_value_policy::reference);
+          py::return_value_policy::reference)
+      .def("get_accelerator", &AcceleratorConnection::getAccelerator,
+           py::return_value_policy::reference);
 
   py::class_<Manifest>(m, "Manifest")
       .def(py::init<Context &, std::string>())

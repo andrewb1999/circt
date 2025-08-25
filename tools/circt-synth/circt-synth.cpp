@@ -12,29 +12,34 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/AIGToComb.h"
-#include "circt/Conversion/CombToAIG.h"
 #include "circt/Dialect/AIG/AIGDialect.h"
 #include "circt/Dialect/AIG/AIGPasses.h"
+#include "circt/Dialect/AIG/Analysis/LongestPathAnalysis.h"
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/Comb/CombPasses.h"
 #include "circt/Dialect/Debug/DebugDialect.h"
 #include "circt/Dialect/Emit/EmitDialect.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/HW/HWOps.h"
-#include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/LTL/LTLDialect.h"
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/SV/SVDialect.h"
+#include "circt/Dialect/SV/SVPasses.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Sim/SimDialect.h"
+#include "circt/Dialect/Synth/Transforms/SynthPasses.h"
+#include "circt/Dialect/Synth/Transforms/SynthesisPipeline.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
 #include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
 #include "circt/Transforms/Passes.h"
+#include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/Passes.h"
@@ -49,6 +54,7 @@ namespace cl = llvm::cl;
 
 using namespace mlir;
 using namespace circt;
+using namespace synth;
 
 //===----------------------------------------------------------------------===//
 // Command-line options declaration
@@ -65,6 +71,13 @@ static cl::opt<std::string> outputFilename("o", cl::desc("Output filename"),
                                            cl::value_desc("filename"),
                                            cl::init("-"),
                                            cl::cat(mainCategory));
+static cl::opt<bool>
+    emitBytecode("emit-bytecode",
+                 cl::desc("Emit bytecode when generating MLIR output"),
+                 cl::init(false), cl::cat(mainCategory));
+
+static cl::opt<bool> force("f", cl::desc("Enable binary output on terminals"),
+                           cl::init(false), cl::cat(mainCategory));
 
 static cl::opt<bool>
     verifyPasses("verify-each",
@@ -81,11 +94,11 @@ static cl::opt<bool>
                               cl::desc("Allow unknown dialects in the input"),
                               cl::init(false), cl::cat(mainCategory));
 
-// Options to control early-out from pipeline.
-enum Until { UntilAIGLowering, UntilEnd };
+enum Until { UntilAIGLowering, UntilMapping, UntilEnd };
 
 static auto runUntilValues = llvm::cl::values(
     clEnumValN(UntilAIGLowering, "aig-lowering", "Lowering of AIG"),
+    clEnumValN(UntilMapping, "mapping", "Run technology/lut mapping"),
     clEnumValN(UntilEnd, "all", "Run entire pipeline (default)"));
 
 static llvm::cl::opt<Until> runUntilBefore(
@@ -100,9 +113,65 @@ static cl::opt<bool>
                   cl::desc("Convert AIG to Comb at the end of the pipeline"),
                   cl::init(false), cl::cat(mainCategory));
 
+static cl::opt<std::string>
+    outputLongestPath("output-longest-path",
+                      cl::desc("Output file for longest path analysis "
+                               "results. The analysis is only run "
+                               "if file name is specified"),
+                      cl::init(""), cl::cat(mainCategory));
+
+static cl::opt<bool>
+    outputLongestPathJSON("output-longest-path-json",
+                          cl::desc("Output longest path analysis results in "
+                                   "JSON format"),
+                          cl::init(false), cl::cat(mainCategory));
+static cl::opt<int>
+    outputLongestPathTopKPercent("output-longest-path-top-k-percent",
+                                 cl::desc("Output top K percent of longest "
+                                          "paths in the analysis results"),
+                                 cl::init(5), cl::cat(mainCategory));
+
 static cl::opt<std::string> topName("top", cl::desc("Top module name"),
                                     cl::value_desc("name"), cl::init(""),
                                     cl::cat(mainCategory));
+
+static cl::list<std::string> abcCommands("abc-commands",
+                                         cl::desc("ABC passes to run"),
+                                         cl::CommaSeparated,
+                                         cl::cat(mainCategory));
+static cl::opt<std::string> abcPath("abc-path", cl::desc("Path to ABC"),
+                                    cl::value_desc("path"), cl::init("abc"),
+                                    cl::cat(mainCategory));
+
+static cl::opt<bool>
+    ignoreAbcFailures("ignore-abc-failures",
+                      cl::desc("Continue on ABC failure instead of aborting"),
+                      cl::init(false), cl::cat(mainCategory));
+
+static cl::opt<bool> disableWordToBits("disable-word-to-bits",
+                                       cl::desc("Disable LowerWordToBits pass"),
+                                       cl::init(false), cl::cat(mainCategory));
+static cl::opt<bool>
+    disableDatapath("disable-datapath",
+                    cl::desc("Disable datapath optimization passes"),
+                    cl::init(false), cl::cat(mainCategory));
+
+static cl::opt<int> maxCutSizePerRoot("max-cut-size-per-root",
+                                      cl::desc("Maximum cut size per root"),
+                                      cl::init(6), cl::cat(mainCategory));
+
+static cl::opt<synth::OptimizationStrategy> synthesisStrategy(
+    "synthesis-strategy", cl::desc("Synthesis strategy to use"),
+    cl::values(clEnumValN(synth::OptimizationStrategyArea, "area",
+                          "Optimize for area"),
+               clEnumValN(synth::OptimizationStrategyTiming, "timing",
+                          "Optimize for timing")),
+    cl::init(synth::OptimizationStrategyTiming), cl::cat(mainCategory));
+
+static cl::opt<int>
+    lowerToKLUTs("lower-to-k-lut",
+                 cl::desc("Lower to generic a truth table op with K inputs"),
+                 cl::init(0), cl::cat(mainCategory));
 
 //===----------------------------------------------------------------------===//
 // Main Tool Logic
@@ -110,6 +179,17 @@ static cl::opt<std::string> topName("top", cl::desc("Top module name"),
 
 static bool untilReached(Until until) {
   return until >= runUntilBefore || until > runUntilAfter;
+}
+
+static void
+nestOrAddToHierarchicalRunner(OpPassManager &pm,
+                              std::function<void(OpPassManager &pm)> pipeline,
+                              const std::string &topName) {
+  if (topName.empty()) {
+    pipeline(pm.nest<hw::HWModuleOp>());
+  } else {
+    pm.addPass(circt::createHierarchicalRunner(topName, pipeline));
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -121,53 +201,88 @@ static void partiallyLegalizeCombToAIG(SmallVectorImpl<std::string> &ops) {
   (ops.push_back(AllowedOpTy::getOperationName().str()), ...);
 }
 
-static void populateSynthesisPipeline(PassManager &pm) {
-  auto pipeline = [](OpPassManager &mpm) {
-    // Add the AIG to Comb at the scope exit if requested.
-    auto addAIGToComb = llvm::make_scope_exit([&]() {
-      if (convertToComb) {
-        mpm.addPass(circt::createConvertAIGToComb());
-        mpm.addPass(createCSEPass());
-      }
-    });
-    {
-      // Partially legalize Comb to AIG, run CSE and canonicalization.
-      circt::ConvertCombToAIGOptions options;
-      partiallyLegalizeCombToAIG<comb::AndOp, comb::OrOp, comb::XorOp,
-                                 comb::MuxOp, comb::ICmpOp, hw::ArrayGetOp,
-                                 hw::ArraySliceOp, hw::ArrayCreateOp,
-                                 hw::ArrayConcatOp, hw::AggregateConstantOp>(
-          options.additionalLegalOps);
-      mpm.addPass(circt::createConvertCombToAIG(options));
-    }
-    mpm.addPass(createCSEPass());
-    mpm.addPass(createSimpleCanonicalizerPass());
-
-    mpm.addPass(circt::hw::createHWAggregateToCombPass());
-    mpm.addPass(circt::createConvertCombToAIG());
-    mpm.addPass(createCSEPass());
+// Add a default synthesis pipeline and analysis.
+static void populateCIRCTSynthPipeline(PassManager &pm) {
+  // ExtractTestCode is used to move verification code from design to
+  // remove registers/logic used only for verification.
+  pm.addPass(sv::createSVExtractTestCodePass(
+      /*disableInstanceExtraction=*/false, /*disableRegisterExtraction=*/false,
+      /*disableModuleInlining=*/false));
+  auto pipeline = [](OpPassManager &pm) {
+    circt::synth::AIGLoweringPipelineOptions loweringOptions;
+    loweringOptions.disableDatapath = disableDatapath;
+    circt::synth::buildAIGLoweringPipeline(pm, loweringOptions);
     if (untilReached(UntilAIGLowering))
       return;
-    mpm.addPass(createSimpleCanonicalizerPass());
-    mpm.addPass(createCSEPass());
-    mpm.addPass(aig::createLowerVariadic());
-    // TODO: LowerWordToBits is not scalable for large designs. Change to
-    // conditionally enable the pass once the rest of the pipeline was able
-    // to handle multibit operands properly.
-    mpm.addPass(aig::createLowerWordToBits());
-    mpm.addPass(createCSEPass());
-    mpm.addPass(createSimpleCanonicalizerPass());
-    // TODO: Add balancing, rewriting, FRAIG conversion, etc.
-    if (untilReached(UntilEnd))
+
+    circt::synth::AIGOptimizationPipelineOptions optimizationOptions;
+    optimizationOptions.abcCommands = abcCommands;
+    optimizationOptions.abcPath.setValue(abcPath);
+    optimizationOptions.ignoreAbcFailures.setValue(ignoreAbcFailures);
+    optimizationOptions.disableWordToBits.setValue(disableWordToBits);
+
+    circt::synth::buildAIGOptimizationPipeline(pm, optimizationOptions);
+    if (untilReached(UntilMapping))
       return;
+    if (lowerToKLUTs) {
+      circt::synth::GenericLutMapperOptions lutOptions;
+      lutOptions.maxLutSize = lowerToKLUTs;
+      lutOptions.maxCutsPerRoot = maxCutSizePerRoot;
+      pm.addPass(circt::synth::createGenericLutMapper(lutOptions));
+    }
   };
 
-  if (topName.empty()) {
-    pipeline(pm.nest<hw::HWModuleOp>());
-  } else {
-    pm.addPass(circt::createHierarchicalRunner(topName, pipeline));
+  nestOrAddToHierarchicalRunner(pm, pipeline, topName);
+
+  if (!untilReached(UntilMapping)) {
+    synth::TechMapperOptions options;
+    options.maxCutsPerRoot = maxCutSizePerRoot;
+    options.strategy = synthesisStrategy;
+    pm.addPass(synth::createTechMapper(options));
   }
-  // TODO: Add LUT mapping, etc.
+
+  // Run analysis if requested.
+  if (!outputLongestPath.empty()) {
+    circt::aig::PrintLongestPathAnalysisOptions options;
+    options.outputFile = outputLongestPath;
+    options.showTopKPercent = outputLongestPathTopKPercent;
+    options.emitJSON = outputLongestPathJSON;
+    pm.addPass(circt::aig::createPrintLongestPathAnalysis(options));
+  }
+
+  if (convertToComb)
+    nestOrAddToHierarchicalRunner(
+        pm,
+        [&](OpPassManager &pm) {
+          pm.addPass(circt::createConvertAIGToComb());
+          if (lowerToKLUTs)
+            pm.addPass(circt::comb::createLowerComb());
+          pm.addPass(createCSEPass());
+        },
+        topName);
+}
+
+/// Check output stream before writing bytecode to it.
+/// Warn and return true if output is known to be displayed.
+static bool checkBytecodeOutputToConsole(raw_ostream &os) {
+  if (os.is_displayed()) {
+    llvm::errs() << "WARNING: You're attempting to print out a bytecode file.\n"
+                    "This is inadvisable as it may cause display problems. If\n"
+                    "you REALLY want to taste MLIR bytecode first-hand, you\n"
+                    "can force output with the `-f' option.\n\n";
+    return true;
+  }
+  return false;
+}
+
+/// Print the operation to the specified stream, emitting bytecode when
+/// requested and politely avoiding dumping to terminal unless forced.
+static LogicalResult printOp(Operation *op, raw_ostream &os) {
+  if (emitBytecode && (force || !checkBytecodeOutputToConsole(os)))
+    return writeBytecodeToFile(op, os,
+                               mlir::BytecodeWriterConfig(getCirctVersion()));
+  op->print(os);
+  return success();
 }
 
 /// This function initializes the various components of the tool and
@@ -206,13 +321,21 @@ static LogicalResult executeSynthesis(MLIRContext &context) {
     pm.addInstrumentation(
         std::make_unique<VerbosePassInstrumentation<mlir::ModuleOp>>(
             "circt-synth"));
-  populateSynthesisPipeline(pm);
+  populateCIRCTSynthPipeline(pm);
+
+  if (!topName.empty()) {
+    // Set a top module name for the longest path analysis.
+    module.get()->setAttr(
+        circt::aig::LongestPathAnalysis::getTopModuleNameAttrName(),
+        FlatSymbolRefAttr::get(&context, topName));
+  }
+
   if (failed(pm.run(module.get())))
     return failure();
 
   auto timer = ts.nest("Print MLIR output");
-  OpPrintingFlags printingFlags;
-  module->print(outputFile.value()->os(), printingFlags);
+  if (failed(printOp(module.get(), outputFile.value()->os())))
+    return failure();
   outputFile.value()->keep();
   return success();
 }
@@ -233,6 +356,7 @@ int main(int argc, char **argv) {
   registerPassManagerCLOptions();
   registerDefaultTimingManagerCLOptions();
   registerAsmPrinterCLOptions();
+
   cl::AddExtraVersionPrinter(
       [](llvm::raw_ostream &os) { os << circt::getCirctVersion() << '\n'; });
 

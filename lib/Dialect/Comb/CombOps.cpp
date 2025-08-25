@@ -14,11 +14,28 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/Support/FormatVariadic.h"
 
 using namespace circt;
 using namespace comb;
+
+Value comb::createZExt(OpBuilder &builder, Location loc, Value value,
+                       unsigned targetWidth) {
+  assert(value.getType().isSignlessInteger());
+  auto inputWidth = value.getType().getIntOrFloatBitWidth();
+  assert(inputWidth <= targetWidth);
+
+  // Nothing to do if the width already matches.
+  if (inputWidth == targetWidth)
+    return value;
+
+  // Create a zero constant for the upper bits.
+  auto zeros = hw::ConstantOp::create(
+      builder, loc, builder.getIntegerType(targetWidth - inputWidth), 0);
+  return builder.createOrFold<ConcatOp>(loc, zeros, value);
+}
 
 /// Create a sign extension operation from a value of integer type to an equal
 /// or larger integer type.
@@ -47,7 +64,7 @@ Value comb::createOrFoldSExt(Value value, Type destTy,
 
 Value comb::createOrFoldNot(Location loc, Value value, OpBuilder &builder,
                             bool twoState) {
-  auto allOnes = builder.create<hw::ConstantOp>(loc, value.getType(), -1);
+  auto allOnes = hw::ConstantOp::create(builder, loc, value.getType(), -1);
   return builder.createOrFold<XorOp>(loc, value, allOnes, twoState);
 }
 
@@ -109,6 +126,175 @@ Value comb::constructMuxTree(OpBuilder &builder, Location loc,
   };
 
   return constructTreeHelper(0, llvm::Log2_64_Ceil(leafNodes.size()));
+}
+
+Value comb::createDynamicExtract(OpBuilder &builder, Location loc, Value value,
+                                 Value offset, unsigned width) {
+  assert(value.getType().isSignlessInteger());
+  auto valueWidth = value.getType().getIntOrFloatBitWidth();
+  assert(width <= valueWidth);
+
+  // Handle the special case where the offset is constant.
+  APInt constOffset;
+  if (matchPattern(offset, mlir::m_ConstantInt(&constOffset)))
+    if (constOffset.getActiveBits() < 32)
+      return builder.createOrFold<comb::ExtractOp>(
+          loc, value, constOffset.getZExtValue(), width);
+
+  // Zero-extend the offset, shift the value down, and extract the requested
+  // number of bits.
+  offset = createZExt(builder, loc, offset, valueWidth);
+  value = builder.createOrFold<comb::ShrUOp>(loc, value, offset);
+  return builder.createOrFold<comb::ExtractOp>(loc, value, 0, width);
+}
+
+Value comb::createDynamicInject(OpBuilder &builder, Location loc, Value value,
+                                Value offset, Value replacement,
+                                bool twoState) {
+  assert(value.getType().isSignlessInteger());
+  assert(replacement.getType().isSignlessInteger());
+  auto largeWidth = value.getType().getIntOrFloatBitWidth();
+  auto smallWidth = replacement.getType().getIntOrFloatBitWidth();
+  assert(smallWidth <= largeWidth);
+
+  // If we're inserting a zero-width value there's nothing to do.
+  if (smallWidth == 0)
+    return value;
+
+  // Handle the special case where the offset is constant.
+  APInt constOffset;
+  if (matchPattern(offset, mlir::m_ConstantInt(&constOffset)))
+    if (constOffset.getActiveBits() < 32)
+      return createInject(builder, loc, value, constOffset.getZExtValue(),
+                          replacement);
+
+  // Zero-extend the offset and clear the value bits we are replacing.
+  offset = createZExt(builder, loc, offset, largeWidth);
+  Value mask = hw::ConstantOp::create(
+      builder, loc, APInt::getLowBitsSet(largeWidth, smallWidth));
+  mask = builder.createOrFold<comb::ShlOp>(loc, mask, offset);
+  mask = createOrFoldNot(loc, mask, builder, true);
+  value = builder.createOrFold<comb::AndOp>(loc, value, mask, twoState);
+
+  // Zero-extend the replacement value, shift it up to the offset, and merge it
+  // with the value that has the corresponding bits cleared.
+  replacement = createZExt(builder, loc, replacement, largeWidth);
+  replacement = builder.createOrFold<comb::ShlOp>(loc, replacement, offset);
+  return builder.createOrFold<comb::OrOp>(loc, value, replacement, twoState);
+}
+
+Value comb::createInject(OpBuilder &builder, Location loc, Value value,
+                         unsigned offset, Value replacement) {
+  assert(value.getType().isSignlessInteger());
+  assert(replacement.getType().isSignlessInteger());
+  auto largeWidth = value.getType().getIntOrFloatBitWidth();
+  auto smallWidth = replacement.getType().getIntOrFloatBitWidth();
+  assert(smallWidth <= largeWidth);
+
+  // If the offset is outside the value there's nothing to do.
+  if (offset >= largeWidth)
+    return value;
+
+  // If we're inserting a zero-width value there's nothing to do.
+  if (smallWidth == 0)
+    return value;
+
+  // Assemble the pieces of the injection as everything below the offset, the
+  // replacement value, and everything above the replacement value.
+  SmallVector<Value, 3> fragments;
+  auto end = offset + smallWidth;
+  if (end < largeWidth)
+    fragments.push_back(
+        comb::ExtractOp::create(builder, loc, value, end, largeWidth - end));
+  if (end <= largeWidth)
+    fragments.push_back(replacement);
+  else
+    fragments.push_back(comb::ExtractOp::create(builder, loc, replacement, 0,
+                                                largeWidth - offset));
+  if (offset > 0)
+    fragments.push_back(
+        comb::ExtractOp::create(builder, loc, value, 0, offset));
+  return builder.createOrFold<comb::ConcatOp>(loc, fragments);
+}
+
+// Construct a full adder for three 1-bit inputs.
+std::pair<Value, Value> comb::fullAdder(OpBuilder &builder, Location loc,
+                                        Value a, Value b, Value c) {
+  auto aXorB = builder.createOrFold<comb::XorOp>(loc, a, b, true);
+  Value sum = builder.createOrFold<comb::XorOp>(loc, aXorB, c, true);
+
+  auto carry = builder.createOrFold<comb::OrOp>(
+      loc,
+      ArrayRef<Value>{builder.createOrFold<comb::AndOp>(loc, a, b, true),
+                      builder.createOrFold<comb::AndOp>(loc, aXorB, c, true)},
+      true);
+
+  return {sum, carry};
+}
+
+// Perform Wallace tree reduction on partial products.
+// See https://en.wikipedia.org/wiki/Wallace_tree
+SmallVector<Value>
+comb::wallaceReduction(OpBuilder &builder, Location loc, size_t width,
+                       size_t targetAddends,
+                       SmallVector<SmallVector<Value>> &addends) {
+  auto falseValue = hw::ConstantOp::create(builder, loc, APInt(1, 0));
+  SmallVector<SmallVector<Value>> newAddends;
+  newAddends.reserve(addends.size());
+  // Continue reduction until we have only two rows. The length of
+  // `addends` is reduced by 1/3 in each iteration.
+  while (addends.size() > targetAddends) {
+    newAddends.clear();
+    // Take three rows at a time and reduce to two rows(sum and carry).
+    for (unsigned i = 0; i < addends.size(); i += 3) {
+      if (i + 2 < addends.size()) {
+        // We have three rows to reduce
+        auto &row1 = addends[i];
+        auto &row2 = addends[i + 1];
+        auto &row3 = addends[i + 2];
+
+        assert(row1.size() == width && row2.size() == width &&
+               row3.size() == width);
+
+        SmallVector<Value> sumRow, carryRow;
+        sumRow.reserve(width);
+        carryRow.reserve(width);
+        carryRow.push_back(falseValue);
+
+        // Process each bit position
+        for (unsigned j = 0; j < width; ++j) {
+          // Full adder logic
+          auto [sum, carry] =
+              comb::fullAdder(builder, loc, row1[j], row2[j], row3[j]);
+          sumRow.push_back(sum);
+          if (j + 1 < width)
+            carryRow.push_back(carry);
+        }
+
+        newAddends.push_back(std::move(sumRow));
+        newAddends.push_back(std::move(carryRow));
+      } else {
+        // Add remaining rows as is
+        newAddends.append(addends.begin() + i, addends.end());
+      }
+    }
+    std::swap(newAddends, addends);
+  }
+
+  assert(addends.size() <= targetAddends);
+  SmallVector<Value> carrySave;
+  for (auto &addend : addends) {
+    // Reverse the order of the bits
+    std::reverse(addend.begin(), addend.end());
+    carrySave.push_back(comb::ConcatOp::create(builder, loc, addend));
+  }
+
+  // Pad with zeros
+  auto zero = hw::ConstantOp::create(builder, loc, APInt(width, 0));
+  while (carrySave.size() < targetAddends)
+    carrySave.push_back(zero);
+
+  return carrySave;
 }
 
 //===----------------------------------------------------------------------===//
@@ -297,18 +483,6 @@ static unsigned getTotalWidth(ValueRange inputs) {
   return resultWidth;
 }
 
-LogicalResult ConcatOp::verify() {
-  unsigned tyWidth = cast<IntegerType>(getType()).getWidth();
-  unsigned operandsTotalWidth = getTotalWidth(getInputs());
-  if (tyWidth != operandsTotalWidth)
-    return emitOpError("ConcatOp requires operands total width to "
-                       "match type width. operands "
-                       "totalWidth is")
-           << operandsTotalWidth << ", but concatOp type width is " << tyWidth;
-
-  return success();
-}
-
 void ConcatOp::build(OpBuilder &builder, OperationState &result, Value hd,
                      ValueRange tl) {
   result.addOperands(ValueRange{hd});
@@ -324,6 +498,45 @@ LogicalResult ConcatOp::inferReturnTypes(
   unsigned resultWidth = getTotalWidth(operands);
   results.push_back(IntegerType::get(context, resultWidth));
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ReverseOp
+//===----------------------------------------------------------------------===//
+
+// Folding of ReverseOp: if the input is constant, compute the reverse at
+// compile time.
+OpFoldResult comb::ReverseOp::fold(FoldAdaptor adaptor) {
+  // Try to cast the input attribute to an IntegerAttr.
+  auto cstInput = llvm::dyn_cast_or_null<mlir::IntegerAttr>(adaptor.getInput());
+  if (!cstInput)
+    return {};
+
+  APInt val = cstInput.getValue();
+  APInt reversedVal = val.reverseBits();
+
+  return mlir::IntegerAttr::get(getType(), reversedVal);
+}
+
+namespace {
+struct ReverseOfReverse : public OpRewritePattern<comb::ReverseOp> {
+  using OpRewritePattern<comb::ReverseOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(comb::ReverseOp op,
+                                PatternRewriter &rewriter) const override {
+    auto inputOp = op.getInput().getDefiningOp<comb::ReverseOp>();
+    if (!inputOp)
+      return failure();
+
+    rewriter.replaceOp(op, inputOp.getInput());
+    return success();
+  }
+};
+} // namespace
+
+void comb::ReverseOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                                  MLIRContext *context) {
+  results.add<ReverseOfReverse>(context);
 }
 
 //===----------------------------------------------------------------------===//

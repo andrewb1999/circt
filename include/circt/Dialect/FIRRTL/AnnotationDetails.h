@@ -56,8 +56,6 @@ constexpr const char *blackBoxPathAnnoClass =
     "firrtl.transforms.BlackBoxPathAnno";
 constexpr const char *blackBoxTargetDirAnnoClass =
     "firrtl.transforms.BlackBoxTargetDirAnno";
-constexpr const char *blackBoxResourceFileNameAnnoClass =
-    "firrtl.transforms.BlackBoxResourceFileNameAnno";
 constexpr const char *blackBoxAnnoClass =
     "firrtl.transforms.BlackBox"; // Not in SFC
 constexpr const char *mustDedupAnnoClass =
@@ -145,6 +143,8 @@ constexpr const char *sitestBlackBoxAnnoClass =
     "sifive.enterprise.firrtl.SitestBlackBoxAnnotation";
 constexpr const char *sitestTestHarnessBlackBoxAnnoClass =
     "sifive.enterprise.firrtl.SitestTestHarnessBlackBoxAnnotation";
+constexpr const char *sitestBlackBoxLibrariesAnnoClass =
+    "sifive.enterprise.firrtl.SitestBlackBoxLibrariesAnnotation";
 constexpr const char *dontObfuscateModuleAnnoClass =
     "sifive.enterprise.firrtl.DontObfuscateModuleAnnotation";
 constexpr const char *elaborationArtefactsDirectoryAnnoClass =
@@ -166,8 +166,6 @@ constexpr const char *ignoreFullAsyncResetAnnoClass =
 // MemToRegOfVec Annotations
 constexpr const char *convertMemToRegOfVecAnnoClass =
     "sifive.enterprise.firrtl.ConvertMemToRegOfVecAnnotation$";
-constexpr const char *excludeMemToRegAnnoClass =
-    "sifive.enterprise.firrtl.ExcludeMemFromMemToRegOfVec";
 
 // Instance Extraction
 constexpr const char *extractBlackBoxAnnoClass =

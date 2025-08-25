@@ -9,6 +9,9 @@ rtg.test @constants() {
   // CHECK-NEXT: rtg.isa.int_to_immediate [[V0]] : !rtg.isa.immediate<32>
   %1 = index.constant 5
   %2 = rtg.isa.int_to_immediate %1 : !rtg.isa.immediate<32>
+
+  // CHECK-NEXT: rtg.comment "this is a comment"
+  rtg.comment "this is a comment"
 }
 
 // CHECK-LABEL: rtg.sequence @ranomizedSequenceType
@@ -59,21 +62,25 @@ rtg.sequence @seqRandomizationAndEmbedding() {
 }
 
 // CHECK-LABEL: @sets
-func.func @sets(%arg0: i32, %arg1: i32) {
+func.func @sets(%arg0: i32, %arg1: i32) -> !rtg.set<!rtg.tuple<i32, i32>> {
   // CHECK: [[SET:%.+]] = rtg.set_create %arg0, %arg1 : i32
   // CHECK: [[R:%.+]] = rtg.set_select_random [[SET]] : !rtg.set<i32>
   // CHECK: [[EMPTY:%.+]] = rtg.set_create : i32
   // CHECK: [[DIFF:%.+]] = rtg.set_difference [[SET]], [[EMPTY]] : !rtg.set<i32>
   // CHECK: rtg.set_union [[SET]], [[DIFF]] : !rtg.set<i32>
   // CHECK: rtg.set_size [[SET]] : !rtg.set<i32>
+  // CHECK: rtg.set_cartesian_product [[SET]], [[SET]] : !rtg.set<i32>, !rtg.set<i32>
+  // CHECK: rtg.set_convert_to_bag [[SET]] : !rtg.set<i32>
   %set = rtg.set_create %arg0, %arg1 : i32
   %r = rtg.set_select_random %set : !rtg.set<i32>
   %empty = rtg.set_create : i32
   %diff = rtg.set_difference %set, %empty : !rtg.set<i32>
   %union = rtg.set_union %set, %diff : !rtg.set<i32>
   %size = rtg.set_size %set : !rtg.set<i32>
+  %prod = rtg.set_cartesian_product %set, %set : !rtg.set<i32>, !rtg.set<i32>
+  %bag = rtg.set_convert_to_bag %set : !rtg.set<i32>
 
-  return
+  return %prod : !rtg.set<!rtg.tuple<i32, i32>>
 }
 
 // CHECK-LABEL: @bags
@@ -85,6 +92,7 @@ rtg.sequence @bags(%arg0: i32, %arg1: i32, %arg2: index) {
   // CHECK: rtg.bag_difference [[BAG]], [[EMPTY]] inf : !rtg.bag<i32>
   // CHECK: rtg.bag_union [[BAG]], [[EMPTY]], [[DIFF]] : !rtg.bag<i32>
   // CHECK: rtg.bag_unique_size [[BAG]] : !rtg.bag<i32>
+  // CHECK: rtg.bag_convert_to_set [[BAG]] : !rtg.bag<i32>
   %bag = rtg.bag_create (%arg2 x %arg0, %arg2 x %arg1) : i32 {rtg.some_attr}
   %r = rtg.bag_select_random %bag : !rtg.bag<i32> {rtg.some_attr}
   %empty = rtg.bag_create : i32
@@ -92,6 +100,7 @@ rtg.sequence @bags(%arg0: i32, %arg1: i32, %arg2: index) {
   %diff2 = rtg.bag_difference %bag, %empty inf : !rtg.bag<i32>
   %union = rtg.bag_union %bag, %empty, %diff : !rtg.bag<i32>
   %size = rtg.bag_unique_size %bag : !rtg.bag<i32>
+  %set = rtg.bag_convert_to_set %bag : !rtg.bag<i32>
 }
 
 // CHECK-LABEL: rtg.target @empty_target : !rtg.dict<> {
@@ -130,6 +139,9 @@ rtg.test @contexts(ctxt0 = %ctxt0: !rtgtest.cpu) {
   // CHECK: rtg.on_context {{%.+}}, {{%.+}} : !rtgtest.cpu
   %seq = rtg.get_sequence @seq0 : !rtg.sequence
   rtg.on_context %ctxt0, %seq : !rtgtest.cpu
+
+  // CHECK: rtg.constant #rtg.any_context : !rtgtest.cpu
+  rtg.constant #rtg.any_context : !rtgtest.cpu
 }
 
 // CHECK-LABEL: rtg.test @test0
@@ -142,8 +154,8 @@ rtg.test @test1(num_cpus = %a: i32, num_modes = %b: i32) { }
 
 // CHECK-LABEL: rtg.sequence @integerHandlingOps
 rtg.sequence @integerHandlingOps(%arg0: index, %arg1: index) {
-  // CHECK: rtg.random_number_in_range [%arg0, %arg1)
-  rtg.random_number_in_range [%arg0, %arg1)
+  // CHECK: rtg.random_number_in_range [%arg0, %arg1]
+  rtg.random_number_in_range [%arg0, %arg1]
 }
 
 // CHECK-LABEL: rtg.test @interleaveSequences
@@ -161,8 +173,85 @@ rtg.test @arrays(arr = %arr: !rtg.array<index>) {
   // CHECK-NEXT: [[V0:%.+]] = rtg.array_create [[ARR]], [[ARR]] : !rtg.array<index>
   // CHECK-NEXT: [[V1:%.+]] = rtg.array_create : index
   // CHECK-NEXT: [[V2:%.+]] = rtg.array_extract [[V0]][[[IDX1]]] : !rtg.array<!rtg.array<index>>
+  // CHECK-NEXT: [[V3:%.+]] = rtg.array_inject [[V2]][[[IDX1]]], [[IDX1]] : !rtg.array<index>
+  // CHECK-NEXT: rtg.array_size [[V3]] : !rtg.array<index>
   %idx1 = index.constant 1
   %0 = rtg.array_create %arr, %arr : !rtg.array<index>
   %1 = rtg.array_create : index
   %2 = rtg.array_extract %0[%idx1] : !rtg.array<!rtg.array<index>>
+  %3 = rtg.array_inject %2[%idx1], %idx1 : !rtg.array<index>
+  %4 = rtg.array_size %3 : !rtg.array<index>
+}
+
+// CHECK-LABEL: rtg.test @tuples
+// CHECK-SAME: (tup = %{{.*}}: !rtg.tuple)
+rtg.test @tuples(tup = %tup: !rtg.tuple) {
+  // CHECK-NEXT: [[IDX0:%.+]] = index.constant 0
+  // CHECK-NEXT: [[TRUE:%.+]] = index.bool.constant true
+  // CHECK-NEXT: [[TUPLE:%.+]] = rtg.tuple_create [[IDX0]], [[TRUE]] : index, i1
+  // CHECK-NEXT: rtg.tuple_extract [[TUPLE]] at 1 : !rtg.tuple<index, i1>
+  // CHECK-NEXT: rtg.tuple_create
+  %idx0 = index.constant 0
+  %true = index.bool.constant true
+  %0 = rtg.tuple_create %idx0, %true : index, i1
+  %1 = rtg.tuple_extract %0 at 1 : !rtg.tuple<index, i1>
+  rtg.tuple_create
+}
+
+// CHECK-LABEL: @memoryBlocks : !rtg.dict<mem_base_address: !rtg.isa.immediate<32>, mem_block: !rtg.isa.memory_block<32>, mem_size: index>
+rtg.target @memoryBlocks : !rtg.dict<mem_base_address: !rtg.isa.immediate<32>, mem_block: !rtg.isa.memory_block<32>, mem_size: index> {
+  // CHECK: rtg.isa.memory_block_declare [0x0 - 0x8] : !rtg.isa.memory_block<32>
+  %0 = rtg.isa.memory_block_declare [0x0 - 0x8] : !rtg.isa.memory_block<32>
+
+  // CHECK: [[IDX8:%.+]] = index.constant 8
+  // CHECK: [[V1:%.+]] = rtg.isa.memory_alloc %0, [[IDX8]], [[IDX8]] : !rtg.isa.memory_block<32>
+  // CHECK: [[V2:%.+]] = rtg.isa.memory_base_address [[V1]] : !rtg.isa.memory<32>
+  // CHECK: [[V3:%.+]] = rtg.isa.memory_size [[V1]] : !rtg.isa.memory<32>
+  %idx8 = index.constant 8
+  %1 = rtg.isa.memory_alloc %0, %idx8, %idx8 : !rtg.isa.memory_block<32>
+  %2 = rtg.isa.memory_base_address %1 : !rtg.isa.memory<32>
+  %3 = rtg.isa.memory_size %1 : !rtg.isa.memory<32>
+  
+  rtg.yield %2, %0, %3 : !rtg.isa.immediate<32>, !rtg.isa.memory_block<32>, index
+}
+
+// CHECK-LABEL: rtg.test @template() template "temp_name" target @target {
+rtg.test @template() template "temp_name" target @target { }
+
+// CHECK-LABEL: rtg.test @validation()
+rtg.test @validation() {
+  // CHECK: [[V0:%.+]] = rtg.fixed_reg #rtgtest.t0
+  // CHECK: [[V1:%.+]] = rtg.constant #rtg.isa.immediate<32, 0>
+  %0 = rtg.fixed_reg #rtgtest.t0
+  %1 = rtg.constant #rtg.isa.immediate<32, 0>
+  // CHECK: rtg.validate [[V0]], [[V1]], "some_id" : !rtgtest.ireg -> !rtg.isa.immediate<32>
+  %2 = rtg.validate %0, %1, "some_id" : !rtgtest.ireg -> !rtg.isa.immediate<32>
+
+  // CHECK: rtg.validate [[V0]], [[V1]] : !rtgtest.ireg -> !rtg.isa.immediate<32>
+  %3 = rtg.validate %0, %1 : !rtgtest.ireg -> !rtg.isa.immediate<32>
+
+  // CHECK: rtg.validate [[V0]], [[V1]] ([[V1]], [[V1]] else [[V1]], [[V1]] : !rtg.isa.immediate<32>, !rtg.isa.immediate<32>) : !rtgtest.ireg -> !rtg.isa.immediate<32>
+  %4:3 = rtg.validate %0, %1 (%1, %1 else %1, %1 : !rtg.isa.immediate<32>, !rtg.isa.immediate<32>) : !rtgtest.ireg -> !rtg.isa.immediate<32>
+  
+  // CHECK: rtg.validate [[V0]], [[V1]], "some_id" ([[V1]], [[V1]] else [[V1]], [[V1]] : !rtg.isa.immediate<32>, !rtg.isa.immediate<32>) : !rtgtest.ireg -> !rtg.isa.immediate<32>
+  %5:3 = rtg.validate %0, %1, "some_id" (%1, %1 else %1, %1 : !rtg.isa.immediate<32>, !rtg.isa.immediate<32>) : !rtgtest.ireg -> !rtg.isa.immediate<32>
+}
+// CHECK-LABEL: @immediateOps
+rtg.test @immediateOps() {
+  // CHECK: rtg.isa.concat_immediate {{.*}}, {{.*}} : !rtg.isa.immediate<4>, !rtg.isa.immediate<8>
+  %0 = rtg.constant #rtg.isa.immediate<4, 15>
+  %1 = rtg.constant #rtg.isa.immediate<8, 175>
+  %2 = rtg.isa.concat_immediate %0, %1 : !rtg.isa.immediate<4>, !rtg.isa.immediate<8>
+
+  // CHECK: rtg.isa.slice_immediate {{.*}} from 4 : !rtg.isa.immediate<8> -> !rtg.isa.immediate<2>
+  %3 = rtg.constant #rtg.isa.immediate<8, 175>
+  %4 = rtg.isa.slice_immediate %3 from 4 : !rtg.isa.immediate<8> -> !rtg.isa.immediate<2>
+}
+
+// CHECK-LABEL: rtg.test @testReportOps
+rtg.test @testReportOps() {
+  // CHECK-NEXT: rtg.test.success
+  rtg.test.success
+  // CHECK-NEXT: rtg.test.failure "error message"
+  rtg.test.failure "error message"
 }

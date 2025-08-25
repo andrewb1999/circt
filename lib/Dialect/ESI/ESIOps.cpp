@@ -29,44 +29,13 @@ using namespace circt::esi;
 // ChannelBufferOp functions.
 //===----------------------------------------------------------------------===//
 
-ParseResult ChannelBufferOp::parse(OpAsmParser &parser,
-                                   OperationState &result) {
-  llvm::SMLoc inputOperandsLoc = parser.getCurrentLocation();
-
-  llvm::SmallVector<OpAsmParser::UnresolvedOperand, 4> operands;
-  if (parser.parseOperandList(operands, /*requiredOperandCount=*/3,
-                              /*delimiter=*/OpAsmParser::Delimiter::None))
-    return failure();
-
-  Type innerOutputType;
-  if (parser.parseOptionalAttrDict(result.attributes) || parser.parseColon() ||
-      parser.parseType(innerOutputType))
-    return failure();
-  auto outputType =
-      ChannelType::get(parser.getBuilder().getContext(), innerOutputType);
-  result.addTypes({outputType});
-
-  auto clkTy = seq::ClockType::get(result.getContext());
-  auto i1 = IntegerType::get(result.getContext(), 1);
-  if (parser.resolveOperands(operands, {clkTy, i1, outputType},
-                             inputOperandsLoc, result.operands))
-    return failure();
-  return success();
-}
-
-void ChannelBufferOp::print(OpAsmPrinter &p) {
-  p << " " << getClk() << ", " << getRst() << ", " << getInput();
-  p.printOptionalAttrDict((*this)->getAttrs());
-  p << " : " << innerType();
-}
-
 circt::esi::ChannelType ChannelBufferOp::channelType() {
-  return cast<circt::esi::ChannelType>(getInput().getType());
+  return getOutput().getType();
 }
 
 LogicalResult ChannelBufferOp::verify() {
-  if (getInput().getType().getSignaling() != ChannelSignaling::ValidReady)
-    return emitOpError("currently only supports valid-ready signaling");
+  if (getInput().getType().getInner() != getOutput().getType().getInner())
+    return emitOpError("input and output data types must match");
   if (getOutput().getType().getDataDelay() != 0)
     return emitOpError("currently only supports channels with zero data delay");
   return success();
@@ -96,6 +65,23 @@ LogicalResult SnoopValidReadyOp::inferReturnTypes(
   return success();
 }
 
+LogicalResult SnoopTransactionOp::verify() {
+  ChannelType type = getInput().getType();
+  if (type.getInner() != getData().getType())
+    return emitOpError("input and output types must match");
+  return success();
+}
+
+LogicalResult SnoopTransactionOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attrs, mlir::OpaqueProperties properties,
+    mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
+  auto i1 = IntegerType::get(context, 1);
+  results.push_back(i1);
+  results.push_back(cast<ChannelType>(operands[0].getType()).getInner());
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // FIFO functions.
 //===----------------------------------------------------------------------===//
@@ -109,34 +95,6 @@ LogicalResult FIFOOp::verify() {
 //===----------------------------------------------------------------------===//
 // PipelineStageOp functions.
 //===----------------------------------------------------------------------===//
-
-ParseResult PipelineStageOp::parse(OpAsmParser &parser,
-                                   OperationState &result) {
-  llvm::SMLoc inputOperandsLoc = parser.getCurrentLocation();
-
-  SmallVector<OpAsmParser::UnresolvedOperand, 4> operands;
-  Type innerOutputType;
-  if (parser.parseOperandList(operands, /*requiredOperandCount=*/3) ||
-      parser.parseOptionalAttrDict(result.attributes) || parser.parseColon() ||
-      parser.parseType(innerOutputType))
-    return failure();
-  auto type =
-      ChannelType::get(parser.getBuilder().getContext(), innerOutputType);
-  result.addTypes({type});
-
-  auto clkTy = seq::ClockType::get(result.getContext());
-  auto i1 = IntegerType::get(result.getContext(), 1);
-  if (parser.resolveOperands(operands, {clkTy, i1, type}, inputOperandsLoc,
-                             result.operands))
-    return failure();
-  return success();
-}
-
-void PipelineStageOp::print(OpAsmPrinter &p) {
-  p << " " << getClk() << ", " << getRst() << ", " << getInput();
-  p.printOptionalAttrDict((*this)->getAttrs());
-  p << " : " << innerType();
-}
 
 circt::esi::ChannelType PipelineStageOp::channelType() {
   return cast<circt::esi::ChannelType>(getInput().getType());
@@ -377,6 +335,24 @@ static void printInferWindowRet(OpAsmPrinter &p, Operation *, Type,
 }
 
 //===----------------------------------------------------------------------===//
+// Cosim ops.
+//===----------------------------------------------------------------------===//
+
+LogicalResult CosimFromHostEndpointOp::verify() {
+  ChannelType chanType = getFromHost().getType();
+  if (chanType.getSignaling() != ChannelSignaling::ValidReady)
+    return emitOpError("only supports valid-ready signaling");
+  return success();
+}
+
+LogicalResult CosimToHostEndpointOp::verify() {
+  ChannelType chanType = getToHost().getType();
+  if (chanType.getSignaling() != ChannelSignaling::ValidReady)
+    return emitOpError("only supports valid-ready signaling");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Services ops.
 //===----------------------------------------------------------------------===//
 
@@ -609,8 +585,11 @@ void UnpackBundleOp::build(::mlir::OpBuilder &odsBuilder,
 }
 
 LogicalResult PackBundleOp::verify() {
-  if (!getBundle().hasOneUse())
-    return emitOpError("bundles must have exactly one user");
+  if (!getBundle().hasOneUse()) {
+    if (getBundle().getUsers().empty())
+      return emitOpError("bundle must be used");
+    return emitOpError("bundle must only be used once");
+  }
   return success();
 }
 void PackBundleOp::build(::mlir::OpBuilder &odsBuilder,
@@ -625,8 +604,11 @@ void PackBundleOp::build(::mlir::OpBuilder &odsBuilder,
 }
 
 LogicalResult UnpackBundleOp::verify() {
-  if (!getBundle().hasOneUse())
-    return emitOpError("bundles must have exactly one user");
+  if (!getBundle().hasOneUse()) {
+    if (getBundle().getUsers().empty())
+      return emitOpError("bundle must be used");
+    return emitOpError("bundle must only be used once");
+  }
   return success();
 }
 

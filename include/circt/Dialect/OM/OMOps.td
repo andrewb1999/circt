@@ -127,10 +127,9 @@ def ClassOp : OMClassLike<"class", [
     // the field location will break.
     // This is required because MLIR's FusedLoc uses a "set" semantics where a
     // single location is used to represent multiple fields with the same
-    // location.  The OM implementation uses the metadata attribute on FusedLoc
-    // to store the original array of locations, so that the specific location
-    // of a field may be easily retrieved by index using the
-    // `getFieldLocByIndex` API.
+    // location.  The OM implementation uses an attribute to store the original
+    // array of locations, so that the specific location of a field may be
+    // easily retrieved by index using the `getFieldLocByIndex` API.
     void addNewFieldsOp(mlir::OpBuilder &builder, mlir::ArrayRef<mlir::Location>
                    locs, mlir::ArrayRef<mlir::Value> values);
 
@@ -156,8 +155,14 @@ def ClassOp : OMClassLike<"class", [
 
 def ClassFieldsOp : OMOp<"class.fields", [Terminator, ReturnLike, Pure,
       HasParent<"ClassOp">]> {
-  let arguments = (ins Variadic<AnyType>:$fields);
-  let assemblyFormat = "attr-dict ($fields^ `:` qualified(type($fields)))?";
+  let arguments = (ins Variadic<AnyType>:$fields, 
+                       OptionalAttr<LocationArrayAttr>:$field_locs);
+  let assemblyFormat = [{
+    attr-dict ($fields^ `:` qualified(type($fields)))?
+    custom<FieldLocs>($field_locs)
+  }];
+
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -273,94 +278,6 @@ def ListConcatOp : OMOp<"list_concat", [Pure, SameOperandsAndResultType]> {
   let results = (outs ListType:$result);
 
   let assemblyFormat = "$subLists attr-dict `:` type($result)";
-}
-
-def TupleCreateOp : OMOp<"tuple_create", [Pure, InferTypeOpInterface]> {
-  let summary = "Create a tuple of values";
-  let description = [{
-    Create a tuple from a sequence of inputs.
-
-    ```
-    %tuple = om.tuple_create %a, %b, %c : !om.ref, !om.string, !om.list<i32>
-    ```
-  }];
-
-  let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs
-    TupleOf<[AnyType]>:$result
-  );
-
-  let assemblyFormat = [{
-    $inputs attr-dict `:` type($inputs)
-  }];
-
-  let extraClassDeclaration = [{
-    // Implement InferTypeOpInterface.
-    static ::mlir::LogicalResult inferReturnTypes(
-      ::mlir::MLIRContext *context, ::std::optional<::mlir::Location> location,
-      ::mlir::ValueRange operands, ::mlir::DictionaryAttr attributes,
-      ::mlir::OpaqueProperties,
-      ::mlir::RegionRange regions,
-      ::llvm::SmallVectorImpl<::mlir::Type> &inferredReturnTypes);
-   }];
-
-}
-
-def TupleGetOp : OMOp<"tuple_get", [Pure, InferTypeOpInterface]> {
-  let summary = "Extract a value from a tuple";
-  let description = [{
-    Extract a value from a tuple.
-
-    ```
-    %value = om.tuple_get %a[0] : tuple<!om.ref, !om.string, !om.list<i32>>
-    ```
-  }];
-
-  let arguments = (ins
-    TupleOf<[AnyType]>:$input,
-    I32Attr:$index
-  );
-
-  let results = (outs
-    AnyType:$result
-  );
-
-  let assemblyFormat = [{
-    $input `[` $index `]` attr-dict `:` type($input)
-  }];
-
-  let extraClassDeclaration = [{
-    // Implement InferTypeOpInterface.
-    static ::mlir::LogicalResult inferReturnTypes(
-      ::mlir::MLIRContext *context, ::std::optional<::mlir::Location> location,
-      ::mlir::ValueRange operands, ::mlir::DictionaryAttr attributes,
-      ::mlir::OpaqueProperties, ::mlir::RegionRange regions,
-      ::llvm::SmallVectorImpl<::mlir::Type> &inferredReturnTypes);
-   }];
-}
-
-def MapKeyValuePair: Type<CPred<"::circt::om::isMapKeyValuePairType($_self)">,
-                        "a pair whose first element is an attribute",
-                        "::mlir::TupleType">;
-
-def MapCreateOp : OMOp<"map_create", [Pure, SameTypeOperands]> {
-  let summary = "Create a map";
-  let description = [{
-    Creates a map from a sequence of inputs.
-
-    ```
-    %map = om.map_create %e1, %e2 : !om.string, i8
-    ```
-    where `%e1` and `e2` have !om.tuple<!om.string, i8> and
-    `%map` has `!om.map<!om.string, i8>` type.
-  }];
-
-  let arguments = (ins Variadic<MapKeyValuePair>:$inputs);
-  let results = (outs
-    MapType:$result
-  );
-
-  let hasCustomAssemblyFormat = true;
 }
 
 def BasePathCreateOp : OMOp<"basepath_create", [Pure,

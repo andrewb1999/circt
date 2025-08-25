@@ -239,6 +239,7 @@ firrtl.circuit "BasicBlackboxes" attributes {
     firrtl.instance test @DUTBlackbox_1()
     firrtl.instance test @DUTBlackbox_2()
     firrtl.instance layerBlackboxInDesign1 @LayerBlackboxInDesign()
+    firrtl.instance blacklistedWithLibsDut @InlineBlackboxWithLibs()
     firrtl.layerblock @A {
       firrtl.instance layerBlackboxInDesign2 @LayerBlackboxInDesign()
       firrtl.instance layerBlackbox @LayerBlackbox()
@@ -298,15 +299,52 @@ firrtl.circuit "BasicBlackboxes" attributes {
   firrtl.extmodule @DUTBlackbox_2() attributes {defname = "DUTBlackbox1"}
   firrtl.extmodule @LayerBlackboxInDesign() attributes {defname = "LayerBlackboxInDesign"}
   firrtl.extmodule @LayerBlackbox() attributes {defname = "LayerBlackbox"}
+
+  // Test blacklisted blackbox with additional libraries - should be included
+  firrtl.extmodule @InlineBlackboxWithLibs() attributes {
+    annotations = [
+      {
+        class = "firrtl.transforms.BlackBoxInlineAnno"
+      },
+      {
+        class = "sifive.enterprise.firrtl.SitestBlackBoxLibrariesAnnotation",
+        libraries = ["lib1", "lib2"]
+      }
+    ],
+    defname = "InlineBlackboxWithLibs"
+  }
+
+  // Test non-blacklisted blackbox with additional libraries - should be included
+  firrtl.extmodule @BlackboxWithLibs() attributes {
+    annotations = [
+      {
+        class = "sifive.enterprise.firrtl.SitestBlackBoxLibrariesAnnotation",
+        libraries = ["lib3", "lib4", "lib5"]
+      }
+    ],
+    defname = "BlackboxWithLibs"
+  }
+
+  firrtl.module @TestHarness() {
+    firrtl.instance inlineBlackboxWithLibs @InlineBlackboxWithLibs()
+    firrtl.instance blackboxWithLibs @BlackboxWithLibs()
+    firrtl.instance test @TestBlackbox()
+  }
 }
 
 // (1) Class-based metadata ----------------------------------------------------
 //
 // CHECK:               firrtl.class @SitestBlackBoxModulesSchema(
-// CHECK-SAME:            in %[[moduleName_in:.+]]: !firrtl.string,
-// CHECK-SAME:            out %moduleName: !firrtl.string
+// CHECK-SAME:            in %[[moduleName_in:[^:]+]]: !firrtl.string,
+// CHECK-SAME:            out %moduleName: !firrtl.string,
+// CHECK-SAME:            in %[[inDut_in:[^:]+]]: !firrtl.bool,
+// CHECK-SAME:            out %inDut: !firrtl.bool,
+// CHECK-SAME:            in %[[libraries_in:[^:]+]]: !firrtl.list<string>,
+// CHECK-SAME:            out %libraries: !firrtl.list<string>
 // CHECK-SAME:          ) {
 // CHECK-NEXT:            firrtl.propassign %moduleName, %[[moduleName_in]]
+// CHECK-NEXT:            firrtl.propassign %inDut, %[[inDut_in]]
+// CHECK-NEXT:            firrtl.propassign %libraries, %[[libraries_in]]
 // CHECK:               }
 //
 // CHECK:               firrtl.class @SitestBlackBoxMetadata(
@@ -315,37 +353,98 @@ firrtl.circuit "BasicBlackboxes" attributes {
 // CHECK-SAME:            out %DUTBlackbox_1_field: !firrtl.class<@SitestBlackBoxModulesSchema(
 // CHECK-SAME:            out %LayerBlackboxInDesign_field: !firrtl.class<@SitestBlackBoxModulesSchema(
 // CHECK-SAME:            out %LayerBlackbox_field: !firrtl.class<@SitestBlackBoxModulesSchema(
+// CHECK-SAME:            out %InlineBlackboxWithLibs_field: !firrtl.class<@SitestBlackBoxModulesSchema(
+// CHECK-SAME:            out %BlackboxWithLibs_field: !firrtl.class<@SitestBlackBoxModulesSchema(
 // CHECK-NOT:             !firrtl.class<@SitestBlackBoxModulesSchema(
 //
 // CHECK-NEXT:            %[[#defname:]] = firrtl.string "TestBlackbox"
+// CHECK-NEXT:            %[[#inDutVal:]] = firrtl.bool false
+// CHECK-NEXT:            %[[#libsList:]] = firrtl.list.create %[[#defname]] : !firrtl.list<string>
 // CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
 // CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
 // CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            %[[#inDut:]] = firrtl.object.subfield %[[object]][inDut_in]
+// CHECK-NEXT:            firrtl.propassign %[[#inDut]], %[[#inDutVal]] : !firrtl.bool
+// CHECK-NEXT:            %[[#libraries:]] = firrtl.object.subfield %[[object]][libraries_in]
+// CHECK-NEXT:            firrtl.propassign %[[#libraries]], %[[#libsList]] : !firrtl.list<string>
 // CHECK-NEXT:            firrtl.propassign %TestBlackbox_field, %[[object]]
 //
 // CHECK-NEXT:            %[[#defname:]] = firrtl.string "DUTBlackbox2"
+// CHECK-NEXT:            %[[#inDutVal:]] = firrtl.bool true
+// CHECK-NEXT:            %[[#libsList:]] = firrtl.list.create %[[#defname]] : !firrtl.list<string>
 // CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
 // CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
 // CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            %[[#inDut:]] = firrtl.object.subfield %[[object]][inDut_in]
+// CHECK-NEXT:            firrtl.propassign %[[#inDut]], %[[#inDutVal]] : !firrtl.bool
+// CHECK-NEXT:            %[[#libraries:]] = firrtl.object.subfield %[[object]][libraries_in]
+// CHECK-NEXT:            firrtl.propassign %[[#libraries]], %[[#libsList]] : !firrtl.list<string>
 // CHECK-NEXT:            firrtl.propassign %DUTBlackbox_0_field, %[[object]]
 //
 // CHECK-NEXT:            %[[#defname:]] = firrtl.string "DUTBlackbox1"
+// CHECK-NEXT:            %[[#inDutVal:]] = firrtl.bool true
+// CHECK-NEXT:            %[[#libsList:]] = firrtl.list.create %[[#defname]] : !firrtl.list<string>
 // CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
 // CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
 // CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            %[[#inDut:]] = firrtl.object.subfield %[[object]][inDut_in]
+// CHECK-NEXT:            firrtl.propassign %[[#inDut]], %[[#inDutVal]] : !firrtl.bool
+// CHECK-NEXT:            %[[#libraries:]] = firrtl.object.subfield %[[object]][libraries_in]
+// CHECK-NEXT:            firrtl.propassign %[[#libraries]], %[[#libsList]] : !firrtl.list<string>
 // CHECK-NEXT:            firrtl.propassign %DUTBlackbox_1_field, %[[object]]
 //
 // CHECK-NEXT:            %[[#defname:]] = firrtl.string "LayerBlackboxInDesign"
+// CHECK-NEXT:            %[[#inDutVal:]] = firrtl.bool true
+// CHECK-NEXT:            %[[#libsList:]] = firrtl.list.create %[[#defname]] : !firrtl.list<string>
 // CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
 // CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
 // CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            %[[#inDut:]] = firrtl.object.subfield %[[object]][inDut_in]
+// CHECK-NEXT:            firrtl.propassign %[[#inDut]], %[[#inDutVal]] : !firrtl.bool
+// CHECK-NEXT:            %[[#libraries:]] = firrtl.object.subfield %[[object]][libraries_in]
+// CHECK-NEXT:            firrtl.propassign %[[#libraries]], %[[#libsList]] : !firrtl.list<string>
 // CHECK-NEXT:            firrtl.propassign %LayerBlackboxInDesign_field, %[[object]]
 //
 // CHECK-NEXT:            %[[#defname:]] = firrtl.string "LayerBlackbox"
+// CHECK-NEXT:            %[[#inDutVal:]] = firrtl.bool false
+// CHECK-NEXT:            %[[#libsList:]] = firrtl.list.create %[[#defname]] : !firrtl.list<string>
 // CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
 // CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
 // CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            %[[#inDut:]] = firrtl.object.subfield %[[object]][inDut_in]
+// CHECK-NEXT:            firrtl.propassign %[[#inDut]], %[[#inDutVal]] : !firrtl.bool
+// CHECK-NEXT:            %[[#libraries:]] = firrtl.object.subfield %[[object]][libraries_in]
+// CHECK-NEXT:            firrtl.propassign %[[#libraries]], %[[#libsList]] : !firrtl.list<string>
 // CHECK-NEXT:            firrtl.propassign %LayerBlackbox_field, %[[object]]
+//
+// CHECK-NEXT:            %[[#defname:]] = firrtl.string "InlineBlackboxWithLibs"
+// CHECK-NEXT:            %[[#inDutVal:]] = firrtl.bool true
+// CHECK-NEXT:            %[[#lib1:]] = firrtl.string "lib1"
+// CHECK-NEXT:            %[[#lib2:]] = firrtl.string "lib2"
+// CHECK-NEXT:            %[[#libsList:]] = firrtl.list.create %[[#lib1]], %[[#lib2]] : !firrtl.list<string>
+// CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
+// CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
+// CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            %[[#inDut:]] = firrtl.object.subfield %[[object]][inDut_in]
+// CHECK-NEXT:            firrtl.propassign %[[#inDut]], %[[#inDutVal]] : !firrtl.bool
+// CHECK-NEXT:            %[[#libraries:]] = firrtl.object.subfield %[[object]][libraries_in]
+// CHECK-NEXT:            firrtl.propassign %[[#libraries]], %[[#libsList]] : !firrtl.list<string>
+// CHECK-NEXT:            firrtl.propassign %InlineBlackboxWithLibs_field, %[[object]]
+//
+// CHECK-NEXT:            %[[#defname:]] = firrtl.string "BlackboxWithLibs"
+// CHECK-NEXT:            %[[#inDutVal:]] = firrtl.bool false
+// CHECK-NEXT:            %[[#lib3:]] = firrtl.string "lib3"
+// CHECK-NEXT:            %[[#lib4:]] = firrtl.string "lib4"
+// CHECK-NEXT:            %[[#lib5:]] = firrtl.string "lib5"
+// CHECK-NEXT:            %[[#libsList:]] = firrtl.list.create %[[#defname]], %[[#lib3]], %[[#lib4]], %[[#lib5]] : !firrtl.list<string>
+// CHECK-NEXT:            %[[object:.+]] = firrtl.object @SitestBlackBoxModulesSchema
+// CHECK-NEXT:            %[[#moduleName:]] = firrtl.object.subfield %[[object]][moduleName_in]
+// CHECK-NEXT:            firrtl.propassign %[[#moduleName]], %[[#defname:]] : !firrtl.string
+// CHECK-NEXT:            %[[#inDut:]] = firrtl.object.subfield %[[object]][inDut_in]
+// CHECK-NEXT:            firrtl.propassign %[[#inDut]], %[[#inDutVal]] : !firrtl.bool
+// CHECK-NEXT:            %[[#libraries:]] = firrtl.object.subfield %[[object]][libraries_in]
+// CHECK-NEXT:            firrtl.propassign %[[#libraries]], %[[#libsList]] : !firrtl.list<string>
+// CHECK-NEXT:            firrtl.propassign %BlackboxWithLibs_field, %[[object]]
 //
 // CHECK-NOT:             firrtl.object
 
@@ -353,8 +452,12 @@ firrtl.circuit "BasicBlackboxes" attributes {
 //
 // CHECK:               emit.file "test_blackboxes.json" {
 // CHECK-NEXT{LITERAL}:   emit.verbatim "[\0A
+// CHECK-SAME:              \22BlackboxWithLibs\22,\0A
 // CHECK-SAME:              \22LayerBlackbox\22,\0A
-// CHECK-SAME:              \22TestBlackbox\22\0A
+// CHECK-SAME:              \22TestBlackbox\22,\0A
+// CHECK-SAME:              \22lib3\22,\0A
+// CHECK-SAME:              \22lib4\22,\0A
+// CHECK-SAME:              \22lib5\22\0A
 // CHECK-SAME:            ]"
 // CHECK-NEXT:          }
 //
@@ -362,7 +465,9 @@ firrtl.circuit "BasicBlackboxes" attributes {
 // CHECK-NEXT{LITERAL}:   emit.verbatim "[\0A
 // CHECK-SAME:              \22DUTBlackbox1\22,\0A
 // CHECK-SAME:              \22DUTBlackbox2\22,\0A
-// CHECK-SAME:              \22LayerBlackboxInDesign\22\0A
+// CHECK-SAME:              \22LayerBlackboxInDesign\22,\0A
+// CHECK-SAME:              \22lib1\22,\0A
+// CHECK-SAME:              \22lib2\22\0A
 // CHECK-SAME:            ]"
 // CHECK-NEXT:          }
 
@@ -499,6 +604,7 @@ firrtl.circuit "Foo" {
 // CHECK-NEXT:            firrtl.propassign %readwritePorts, %readwritePorts_in
 // CHECK-NEXT:            firrtl.propassign %writeLatency, %writeLatency_in
 // CHECK-NEXT:            firrtl.propassign %readLatency, %readLatency_in
+// CHECK-NEXT:            firrtl.propassign %ruwBehavior, %ruwBehavior_in
 // CHECK-NEXT:            firrtl.propassign %hierarchy, %hierarchy_in
 // CHECK-NEXT:            firrtl.propassign %inDut, %inDut_in
 // CHECK-NEXT:            firrtl.propassign %extraPorts, %extraPorts_in
@@ -548,15 +654,18 @@ firrtl.circuit "Foo" {
 // CHECK-NEXT:            %27 = firrtl.integer 1
 // CHECK-NEXT:            %28 = firrtl.object.subfield %[[memoryObject]][readLatency_in]
 // CHECK-NEXT:            firrtl.propassign %28, %27
-// CHECK-NEXT:            %29 = firrtl.object.subfield %[[memoryObject]][hierarchy_in]
-// CHECK-NEXT:            firrtl.propassign %29, %3
-// CHECK-NEXT:            %30 = firrtl.bool true
-// CHECK-NEXT:            %31 = firrtl.object.subfield %[[memoryObject]][inDut_in]
-// CHECK-NEXT:            firrtl.propassign %31, %30
-// CHECK-NEXT:            %32 = firrtl.object.subfield %[[memoryObject]][extraPorts_in]
-// CHECK-NEXT:            firrtl.propassign %32, %10
-// CHECK-NEXT:            %33 = firrtl.object.subfield %[[memoryObject]][preExtInstName_in]
-// CHECK-NEXT:            firrtl.propassign %33, %2
+// CHECK-NEXT:            %29 = firrtl.string "Undefined"
+// CHECK-NEXT:            %30 = firrtl.object.subfield %[[memoryObject]][ruwBehavior_in]
+// CHECK-NEXT:            firrtl.propassign %30, %29
+// CHECK-NEXT:            %31 = firrtl.object.subfield %[[memoryObject]][hierarchy_in]
+// CHECK-NEXT:            firrtl.propassign %31, %3
+// CHECK-NEXT:            %32 = firrtl.bool true
+// CHECK-NEXT:            %33 = firrtl.object.subfield %[[memoryObject]][inDut_in]
+// CHECK-NEXT:            firrtl.propassign %33, %32
+// CHECK-NEXT:            %34 = firrtl.object.subfield %[[memoryObject]][extraPorts_in]
+// CHECK-NEXT:            firrtl.propassign %34, %10
+// CHECK-NEXT:            %35 = firrtl.object.subfield %[[memoryObject]][preExtInstName_in]
+// CHECK-NEXT:            firrtl.propassign %35, %2
 // CHECK-NEXT:            firrtl.propassign %[[memoryObject]]_field, %[[memoryObject]]
 
 // (2) Memory JSON -------------------------------------------------------------
@@ -570,6 +679,7 @@ firrtl.circuit "Foo" {
 // CHECK-SAME:              \22read\22: 2
 // CHECK-SAME:              \22write\22: 3
 // CHECK-SAME:              \22readwrite\22: 4
+// CHECK-SAME:              \22ruw_behavior\22: \22Undefined\22
 // CHECK-SAME:              \22extra_ports\22: [
 // CHECK-SAME:                {
 // CHECK-SAME:                  \22name\22: \22user_input\22
@@ -1068,3 +1178,92 @@ firrtl.circuit "Foo" {
 // CHECK-SAME{LITERAL}:     name {{0}} depth 32 width 8 ports read\0A
 // CHECK-SAME{LITERAL}:     name {{1}} depth 16 width 8 ports write\0A
 // CHECK-SAME:              symbols = [@m2, @m1]
+
+
+// -----
+
+// Test defined read-under-write behavior.
+
+firrtl.circuit "RUWOld" {
+  firrtl.memmodule private @mOld() attributes {
+    dataWidth = 8 : ui32,
+    depth = 32 : ui64,
+    extraPorts = [],
+    maskBits = 1 : ui32,
+    numReadPorts = 1 : ui32,
+    numWritePorts = 1 : ui32,
+    numReadWritePorts = 0 : ui32,
+    readLatency = 1 : ui32,
+    writeLatency = 1 : ui32,
+    ruw = #firrtl<ruwbehavior Old>
+  }
+  firrtl.module @RUWOld() attributes {
+    annotations = [
+      {
+        class = "sifive.enterprise.firrtl.MarkDUTAnnotation"
+      }
+    ]
+  } {
+    firrtl.instance m sym @mOld @mOld()
+  }
+}
+
+//------------------------------------------------------------------ (1) OM Info
+// CHECK-LABEL:         firrtl.class @MemoryMetadata({{.*$}}
+// CHECK:                 %[[memoryObject:.+]] = firrtl.object @MemorySchema
+// CHECK:                 %[[#a:]] = firrtl.string "Old"
+// CHECK-NEXT:            %[[#ruw:]] = firrtl.object.subfield %[[memoryObject]][ruwBehavior_in]
+// CHECK-NEXT:            firrtl.propassign %[[#ruw]], %[[#a]]
+
+//-------------------------------------------------------------- (2) Memory JSON
+// CHECK-LABEL:         emit.file "metadata{{/|\\\\}}seq_mems.json"
+// CHECK-NEXT:            sv.verbatim "[
+// CHECK:                  \22ruw_behavior\22: \22Old\22
+
+//------------------------------------------------------- (3) Configuration File
+// CHECK-LABEL:         emit.file "mems.conf"
+// CHECK-NEXT:            sv.verbatim
+// CHECK-SAME:            ruw Old
+
+// -----
+
+firrtl.circuit "RUWNew" {
+  firrtl.memmodule private @mNew() attributes {
+    dataWidth = 8 : ui32,
+    depth = 32 : ui64,
+    extraPorts = [],
+    maskBits = 1 : ui32,
+    numReadPorts = 1 : ui32,
+    numWritePorts = 1 : ui32,
+    numReadWritePorts = 0 : ui32,
+    readLatency = 1 : ui32,
+    writeLatency = 1 : ui32,
+    ruw = #firrtl<ruwbehavior New>
+  }
+  firrtl.module @RUWNew() attributes {
+    annotations = [
+      {
+        class = "sifive.enterprise.firrtl.MarkDUTAnnotation"
+      }
+    ]
+  } {
+    firrtl.instance m sym @mNew @mNew()
+  }
+}
+
+//------------------------------------------------------------------ (1) OM Info
+// CHECK-LABEL:         firrtl.class @MemoryMetadata({{.*$}}
+// CHECK:                 %[[memoryObject:.+]] = firrtl.object @MemorySchema
+// CHECK:                 %[[#a:]] = firrtl.string "New"
+// CHECK-NEXT:            %[[#ruw:]] = firrtl.object.subfield %[[memoryObject]][ruwBehavior_in]
+// CHECK-NEXT:            firrtl.propassign %[[#ruw]], %[[#a]]
+
+//-------------------------------------------------------------- (2) Memory JSON
+// CHECK-LABEL:         emit.file "metadata{{/|\\\\}}seq_mems.json"
+// CHECK-NEXT:            sv.verbatim "[
+// CHECK:                  \22ruw_behavior\22: \22New\22
+
+//------------------------------------------------------- (3) Configuration File
+// CHECK-LABEL:         emit.file "mems.conf"
+// CHECK-NEXT:            sv.verbatim
+// CHECK-SAME:            ruw New

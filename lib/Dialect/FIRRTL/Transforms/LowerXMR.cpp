@@ -103,7 +103,7 @@ public:
     else
       builder.setInsertionPointToStart(body);
 
-    Value xmr = builder.create<XMRRefOp>(type, symbol, suffix);
+    Value xmr = XMRRefOp::create(builder, type, symbol, suffix);
     xmrRefCache.insert({{type, symbol, suffix}, xmr});
 
     xmrRefPoint = builder.saveInsertionPoint();
@@ -192,7 +192,7 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
                 nameKind = NameKindEnum::InterestingName;
               }
             }
-            xmrDef = b.create<NodeOp>(xmrDef, opName, nameKind).getResult();
+            xmrDef = NodeOp::create(b, xmrDef, opName, nameKind).getResult();
 
             // Create a new entry for this RefSendOp. The path is currently
             // local.
@@ -329,9 +329,6 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
 
         if (result.wasInterrupted())
           return signalPassFailure();
-
-        // Clear any enabled layers.
-        module.setLayersAttr(ArrayAttr::get(module.getContext(), {}));
 
         // Since we walk operations pre-order and not along dataflow edges,
         // ref.sub may not be resolvable when we encounter them (they're not
@@ -563,8 +560,8 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
       ImplicitLocOpBuilder builder(resolve.getLoc(), resolve);
       auto zeroUintType = UIntType::get(builder.getContext(), 0);
       auto zeroC = builder.createOrFold<BitCastOp>(
-          resolve.getType(), builder.create<ConstantOp>(
-                                 zeroUintType, getIntZerosAttr(zeroUintType)));
+          resolve.getType(), ConstantOp::create(builder, zeroUintType,
+                                                getIntZerosAttr(zeroUintType)));
       resolve.getResult().replaceAllUsesWith(zeroC);
       return success();
     }
@@ -575,7 +572,7 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
     if (failed(resolveReference(resolve.getRef(), builder, ref, str)))
       return failure();
 
-    Value result = builder.create<XMRDerefOp>(resolve.getType(), ref, str);
+    Value result = XMRDerefOp::create(builder, resolve.getType(), ref, str);
     resolve.getResult().replaceAllUsesWith(result);
     return success();
   }
@@ -705,7 +702,8 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
         getRefABIPrefix(module, circuitRefPrefix);
       auto macroName =
           getRefABIMacroForPort(module, portIndex, circuitRefPrefix);
-      declBuilder.create<sv::MacroDeclOp>(macroName, ArrayAttr(), StringAttr());
+      sv::MacroDeclOp::create(declBuilder, macroName, ArrayAttr(),
+                              StringAttr());
       ports.emplace_back(macroName, declBuilder.getStringAttr(formatString),
                          ref ? declBuilder.getArrayAttr({ref}) : ArrayAttr{});
     }
@@ -717,10 +715,10 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
     // The macros will be exported to a `ref_<module-name>.sv` file.
     // In the IR, the file is inserted before the module.
     auto fileBuilder = ImplicitLocOpBuilder(module.getLoc(), module);
-    fileBuilder.create<emit::FileOp>(circuitRefPrefix + ".sv", [&] {
+    emit::FileOp::create(fileBuilder, circuitRefPrefix + ".sv", [&] {
       for (auto [macroName, formatString, symbols] : ports) {
-        fileBuilder.create<sv::MacroDefOp>(FlatSymbolRefAttr::get(macroName),
-                                           formatString, symbols);
+        sv::MacroDefOp::create(fileBuilder, FlatSymbolRefAttr::get(macroName),
+                               formatString, symbols);
       }
     });
 
@@ -815,9 +813,9 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
           portAnnotations.push_back(mem.getPortAnnotation(res.index()));
           oldResults.push_back(res.value());
         }
-        auto newMem = builder.create<MemOp>(
-            resultTypes, mem.getReadLatency(), mem.getWriteLatency(),
-            mem.getDepth(), RUWAttr::Undefined,
+        auto newMem = MemOp::create(
+            builder, resultTypes, mem.getReadLatency(), mem.getWriteLatency(),
+            mem.getDepth(), RUWBehavior::Undefined,
             builder.getArrayAttr(resultNames), mem.getNameAttr(),
             mem.getNameKind(), mem.getAnnotations(),
             builder.getArrayAttr(portAnnotations), mem.getInnerSymAttr(),
@@ -874,7 +872,3 @@ private:
   /// Per-module helpers for creating operations within modules.
   DenseMap<FModuleOp, ModuleState> moduleStates;
 };
-
-std::unique_ptr<mlir::Pass> circt::firrtl::createLowerXMRPass() {
-  return std::make_unique<LowerXMRPass>();
-}

@@ -1,5 +1,6 @@
 # TODO: Make the check source feature optional as an argument on *_add_library.
 set(LLVM_OPTIONAL_SOURCES
+  AIG.cpp
   Arc.cpp
   CHIRRTL.cpp
   Comb.cpp
@@ -12,16 +13,30 @@ set(LLVM_OPTIONAL_SOURCES
   HW.cpp
   HWArith.cpp
   Handshake.cpp
+  Kanagawa.cpp
   LLHD.cpp
   LTL.cpp
   MSFT.cpp
   Moore.cpp
   OM.cpp
+  Pipeline.cpp
   RTG.cpp
   RTGTest.cpp
   SV.cpp
   Seq.cpp
+  Synth.cpp
   Verif.cpp
+)
+
+add_circt_public_c_api_library(CIRCTCAPIAIG
+  AIG.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRCAPIIR
+  CIRCTAIG
+  CIRCTAIGAnalysis
+  CIRCTAIGTransforms
+  CIRCTCAPISupport
 )
 
 add_circt_public_c_api_library(CIRCTCAPIArc
@@ -131,12 +146,31 @@ add_circt_public_c_api_library(CIRCTCAPIOM
   CIRCTOMEvaluator
 )
 
+add_circt_public_c_api_library(CIRCTCAPIKanagawa
+  Kanagawa.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRCAPIIR
+  CIRCTKanagawa
+  CIRCTKanagawaTransforms
+)
+
+add_circt_public_c_api_library(CIRCTCAPIPipeline
+  Pipeline.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRCAPIIR
+  CIRCTPipelineOps
+  CIRCTPipelineTransforms
+)
+
 add_circt_public_c_api_library(CIRCTCAPIRTG
   RTG.cpp
 
   LINK_LIBS PUBLIC
   MLIRCAPIIR
   CIRCTRTGDialect
+  CIRCTRTGTransforms
 )
 
 if(CIRCT_INCLUDE_TESTS)
@@ -223,4 +257,13 @@ add_circt_public_c_api_library(CIRCTCAPIEmit
   LINK_LIBS PUBLIC
   MLIRCAPIIR
   CIRCTEmit
+)
+
+add_circt_public_c_api_library(CIRCTCAPISynth
+  Synth.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRCAPIIR
+  CIRCTSynth
+  CIRCTSynthTransforms
 )

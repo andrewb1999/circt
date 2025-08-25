@@ -321,6 +321,7 @@ public:
   InstanceOpInterface operator[](size_t idx) const { return path[idx]; }
   ArrayRef<InstanceOpInterface>::iterator begin() const { return path.begin(); }
   ArrayRef<InstanceOpInterface>::iterator end() const { return path.end(); }
+  ArrayRef<InstanceOpInterface> getPath() const { return path; }
   size_t size() const { return path.size(); }
   bool empty() const { return path.empty(); }
 
@@ -330,8 +331,9 @@ public:
   void print(llvm::raw_ostream &into) const;
 
 private:
-  // Only the path cache is allowed to create paths.
+  // Either path cache or DenseMapInfo is allowed to create paths.
   friend struct InstancePathCache;
+  friend struct llvm::DenseMapInfo<InstancePath>;
   InstancePath(ArrayRef<InstanceOpInterface> path) : path(path) {}
 
   ArrayRef<InstanceOpInterface> path;
@@ -343,7 +345,7 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
   return os;
 }
 
-/// A data structure that caches and provides absolute paths to module
+/// A data structure that caches and provides paths to module
 /// instances in the IR.
 struct InstancePathCache {
   /// The instance graph of the IR.
@@ -351,9 +353,13 @@ struct InstancePathCache {
 
   explicit InstancePathCache(InstanceGraph &instanceGraph)
       : instanceGraph(instanceGraph) {}
+
+  // Return all absolute paths from the top-level node to the given module.
   ArrayRef<InstancePath> getAbsolutePaths(ModuleOpInterface op);
-  ArrayRef<InstancePath> getAbsolutePaths(ModuleOpInterface op,
-                                          InstanceGraphNode *top);
+
+  // Return all relative paths from the given node to the given module.
+  ArrayRef<InstancePath> getRelativePaths(ModuleOpInterface op,
+                                          InstanceGraphNode *node);
 
   /// Replace an InstanceOp. This is required to keep the cache updated.
   void replaceInstance(InstanceOpInterface oldOp, InstanceOpInterface newOp);
@@ -364,12 +370,22 @@ struct InstancePathCache {
   /// Prepend an instance to a path.
   InstancePath prependInstance(InstanceOpInterface inst, InstancePath path);
 
+  /// Concatenate two paths.
+  InstancePath concatPath(InstancePath path1, InstancePath path2);
+
 private:
+  using PathsCache = DenseMap<Operation *, ArrayRef<InstancePath>>;
+  ArrayRef<InstancePath> getPaths(ModuleOpInterface op, InstanceGraphNode *top,
+                                  PathsCache &cache);
+
   /// An allocator for individual instance paths and entire path lists.
   llvm::BumpPtrAllocator allocator;
 
   /// Cached absolute instance paths.
-  DenseMap<Operation *, ArrayRef<InstancePath>> absolutePathsCache;
+  PathsCache absolutePathsCache;
+
+  /// Cached relative instance paths.
+  DenseMap<InstanceGraphNode *, PathsCache> relativePathsCache;
 };
 
 } // namespace igraph
@@ -462,6 +478,31 @@ struct llvm::DOTGraphTraits<circt::igraph::InstanceGraph *>
     auto *instanceRecord = *it.getCurrent();
     auto instanceOp = instanceRecord->getInstance();
     return ("label=" + instanceOp.getInstanceName()).str();
+  }
+};
+
+// DenseMap traits for InstancePath.
+template <>
+struct llvm::DenseMapInfo<circt::igraph::InstancePath> {
+  using ArrayRefInfo =
+      llvm::DenseMapInfo<ArrayRef<circt::igraph::InstanceOpInterface>>;
+  static circt::igraph::InstancePath getEmptyKey() {
+    return circt::igraph::InstancePath(ArrayRefInfo::getEmptyKey());
+  }
+
+  static circt::igraph::InstancePath getTombstoneKey() {
+    return circt::igraph::InstancePath(ArrayRefInfo::getTombstoneKey());
+  }
+
+  static llvm::hash_code getHashValue(circt::igraph::InstancePath path) {
+    auto range =
+        llvm::map_range(path, [](auto op) { return op.getAsOpaquePointer(); });
+    return llvm::hash_combine_range(range.begin(), range.end());
+  }
+
+  static bool isEqual(circt::igraph::InstancePath lhs,
+                      circt::igraph::InstancePath rhs) {
+    return ArrayRefInfo::isEqual(lhs.getPath(), rhs.getPath());
   }
 };
 

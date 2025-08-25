@@ -72,6 +72,11 @@ def SetType : RTGTypeDef<"Set"> {
 
   let mnemonic = "set";
   let assemblyFormat = "`<` $elementType `>`";
+
+  let builders = [
+    TypeBuilderWithInferredContext<(ins "::mlir::Type":$elementType),
+      "return $_get(elementType.getContext(), elementType);">,
+  ];
 }
 
 def BagType : RTGTypeDef<"Bag"> {
@@ -85,6 +90,11 @@ def BagType : RTGTypeDef<"Bag"> {
 
   let mnemonic = "bag";
   let assemblyFormat = "`<` $elementType `>`";
+
+  let builders = [
+    TypeBuilderWithInferredContext<(ins "::mlir::Type":$elementType),
+      "return $_get(elementType.getContext(), elementType);">,
+  ];
 }
 
 class SetTypeOf<Type elementType> : ContainerType<
@@ -138,15 +148,30 @@ def ArrayType : RTGTypeDef<"Array"> {
   ];
 }
 
+def TupleType : RTGTypeDef<"Tuple"> {
+  let summary = "a tuple of zero or more fields";
+  let description = [{
+    This type represents a tuple of zero or more fields. The fields can be
+    of any type. The builtin tuple type is not used because it does not allow
+    zero fields.
+  }];
+
+  let parameters = (ins
+    OptionalArrayRefParameter<"::mlir::Type", "tuple field types">:$fieldTypes);
+
+  let mnemonic = "tuple";
+  let assemblyFormat = "(`<` $fieldTypes^ `>`)?";
+}
+
 //===----------------------------------------------------------------------===//
 // Types for ISA targets
 //===----------------------------------------------------------------------===//
 
-class RTGISATypeDef<string name, list<Trait> traits = []>
-  : RTGTypeDef<name, traits> { let mnemonic = "isa." # !tolower(name); }
+class RTGISATypeDef<string name, string mnemo, list<Trait> traits = []>
+  : RTGTypeDef<name, traits> { let mnemonic = "isa." # mnemo; }
 
 
-def LabelType : RTGISATypeDef<"Label"> {
+def LabelType : RTGISATypeDef<"Label", "label"> {
   let summary = "a reference to a label";
   let description = [{
     This type represents a label. Payload dialects can add operations to cast
@@ -157,7 +182,7 @@ def LabelType : RTGISATypeDef<"Label"> {
   let assemblyFormat = "";
 }
 
-def ImmediateType : RTGISATypeDef<"Immediate"> {
+def ImmediateType : RTGISATypeDef<"Immediate", "immediate"> {
   let summary = "an ISA immediate";
   let description = [{
     This type represents immediates of arbitrary but fixed bit-width.
@@ -171,8 +196,38 @@ def ImmediateType : RTGISATypeDef<"Immediate"> {
 
 class ImmediateOfWidth<int width> : Type<
   And<[CPred<"llvm::isa<::circt::rtg::ImmediateType>($_self)">,
-       CPred<"llvm::cast<::circt::rtg::ImmediateType>($_self).getWidth() == " # width>]>,
+       CPred<"llvm::cast<::circt::rtg::ImmediateType>($_self).getWidth() == " #
+             width>]>,
   "a " # width # "-bit immediate">,
-  BuildableType<"::circt::rtg::ImmediateType::get($_builder.getContext(), " # width # ")">;
+  BuildableType<"::circt::rtg::ImmediateType::get($_builder.getContext(), " #
+                width # ")">;
+
+def MemoryType : RTGISATypeDef<"Memory", "memory"> {
+  let summary = "handle to a memory";
+  let description = [{
+    This type is used to represent memory resources that are allocated from
+    memory blocks and can be accessed and manipulated by payload dialect
+    operations.
+  }];
+
+  let parameters = (ins "uint32_t":$addressWidth);
+  let assemblyFormat = "`<` $addressWidth `>`";
+}
+
+def MemoryBlockType : RTGISATypeDef<"MemoryBlock", "memory_block"> {
+  let summary = "handle to a memory block";
+  let description = [{
+    A memory block is representing a continuous region in a memory map with a
+    fixed size and base address. It can refer to actual memory or a memory
+    mapped device.
+
+    It is assumed that there is only a single address space.
+  }];
+
+  let parameters = (ins "uint32_t":$addressWidth);
+  let assemblyFormat = "`<` $addressWidth `>`";
+}
+
+def ISAMemory : AnyTypeOf<[MemoryType, ImmediateType, LabelType]>;
 
 #endif // CIRCT_DIALECT_RTG_IR_RTGTYPES_TD

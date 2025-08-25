@@ -12,6 +12,7 @@
 
 #include "circt/Dialect/AIG/AIGOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Support/Naming.h"
 #include "mlir/IR/PatternMatch.h"
 
 using namespace mlir;
@@ -37,8 +38,10 @@ LogicalResult AndInverterOp::canonicalize(AndInverterOp op,
       APInt::getAllOnes(op.getResult().getType().getIntOrFloatBitWidth());
 
   bool invertedConstFound = false;
+  bool flippedFound = false;
 
   for (auto [value, inverted] : llvm::zip(op.getInputs(), op.getInverted())) {
+    bool newInverted = inverted;
     if (auto constOp = value.getDefiningOp<hw::ConstantOp>()) {
       if (inverted) {
         constValue &= ~constOp.getValue();
@@ -49,12 +52,21 @@ LogicalResult AndInverterOp::canonicalize(AndInverterOp op,
       continue;
     }
 
+    if (auto andInverterOp = value.getDefiningOp<aig::AndInverterOp>()) {
+      if (andInverterOp.getInputs().size() == 1 &&
+          andInverterOp.isInverted(0)) {
+        value = andInverterOp.getOperand(0);
+        newInverted = andInverterOp.isInverted(0) ^ inverted;
+        flippedFound = true;
+      }
+    }
+
     auto it = seen.find(value);
     if (it == seen.end()) {
-      seen.insert({value, inverted});
+      seen.insert({value, newInverted});
       uniqueValues.push_back(value);
-      uniqueInverts.push_back(inverted);
-    } else if (it->second != inverted) {
+      uniqueInverts.push_back(newInverted);
+    } else if (it->second != newInverted) {
       // replace with const 0
       rewriter.replaceOpWithNewOp<hw::ConstantOp>(
           op, APInt::getZero(value.getType().getIntOrFloatBitWidth()));
@@ -69,13 +81,13 @@ LogicalResult AndInverterOp::canonicalize(AndInverterOp op,
   }
 
   // No change.
-  if (uniqueValues.size() == op.getInputs().size() ||
+  if ((uniqueValues.size() == op.getInputs().size() && !flippedFound) ||
       (!constValue.isAllOnes() && !invertedConstFound &&
        uniqueValues.size() + 1 == op.getInputs().size()))
     return failure();
 
   if (!constValue.isAllOnes()) {
-    auto constOp = rewriter.create<hw::ConstantOp>(op.getLoc(), constValue);
+    auto constOp = hw::ConstantOp::create(rewriter, op.getLoc(), constValue);
     uniqueInverts.push_back(false);
     uniqueValues.push_back(constOp);
   }
@@ -87,8 +99,8 @@ LogicalResult AndInverterOp::canonicalize(AndInverterOp op,
   }
 
   // build new op with reduced input values
-  rewriter.replaceOpWithNewOp<aig::AndInverterOp>(op, uniqueValues,
-                                                  uniqueInverts);
+  replaceOpWithNewOpAndCopyNamehint<aig::AndInverterOp>(
+      rewriter, op, uniqueValues, uniqueInverts);
   return success();
 }
 
@@ -146,45 +158,4 @@ APInt AndInverterOp::evaluate(ArrayRef<APInt> inputs) {
       result &= input;
   }
   return result;
-}
-
-LogicalResult CutOp::verify() {
-  auto *block = getBody();
-  // NOTE: Currently input and output types of the block must be exactly the
-  // same. We might want to relax this in the future as a way to represent
-  // "vectorized" cuts. For example in the following cut, the block arguments
-  // types are i1, but the cut is batch-applied over 8-bit lanes.
-  // %0 = aig.cut %a, %b : (i8, i8) -> (i8) {
-  //   ^bb0(%arg0: i1, %arg1: i1):
-  //     %c = aig.and_inv %arg0, not %arg1 : i1
-  //     aig.output %c : i1
-  // }
-
-  if (getInputs().size() != block->getNumArguments())
-    return emitOpError("the number of inputs and the number of block arguments "
-                       "do not match. Expected ")
-           << getInputs().size() << " but got " << block->getNumArguments();
-
-  // Check input types.
-  for (auto [input, arg] : llvm::zip(getInputs(), block->getArguments()))
-    if (input.getType() != arg.getType())
-      return emitOpError("input type ")
-             << input.getType() << " does not match "
-             << "block argument type " << arg.getType();
-
-  if (getNumResults() != block->getTerminator()->getNumOperands())
-    return emitOpError("the number of results and the number of terminator "
-                       "operands do not match. Expected ")
-           << getNumResults() << " but got "
-           << block->getTerminator()->getNumOperands();
-
-  // Check output types.
-  for (auto [result, arg] :
-       llvm::zip(getResults(), block->getTerminator()->getOperands()))
-    if (result.getType() != arg.getType())
-      return emitOpError("result type ")
-             << result.getType() << " does not match "
-             << "terminator operand type " << arg.getType();
-
-  return success();
 }

@@ -19,6 +19,7 @@
 #include "circt/Dialect/Calyx/CalyxDialect.h"
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/DC/DCDialect.h"
+#include "circt/Dialect/Datapath/DatapathDialect.h"
 #include "circt/Dialect/Debug/DebugDialect.h"
 #include "circt/Dialect/ESI/ESIDialect.h"
 #include "circt/Dialect/Emit/EmitDialect.h"
@@ -46,6 +47,7 @@
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Sim/SimDialect.h"
+#include "circt/Dialect/Synth/SynthDialect.h"
 #include "circt/Dialect/SystemC/SystemCDialect.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
 #include "mlir/Dialect/SMT/IR/SMTDialect.h"
@@ -63,6 +65,7 @@ inline void registerAllDialects(mlir::DialectRegistry &registry) {
     oplib::OpLibDialect,
     chirrtl::CHIRRTLDialect,
     comb::CombDialect,
+    datapath::DatapathDialect,
     dc::DCDialect,
     debug::DebugDialect,
     emit::EmitDialect,
@@ -91,6 +94,7 @@ inline void registerAllDialects(mlir::DialectRegistry &registry) {
     mlir::smt::SMTDialect,
     ssp::SSPDialect,
     sv::SVDialect,
+    synth::SynthDialect,
     systemc::SystemCDialect,
     verif::VerifDialect
   >();

@@ -20,8 +20,9 @@ using namespace kanagawa;
 /// Create a simple canonicalizer pass.
 static std::unique_ptr<Pass> createSimpleCanonicalizerPass() {
   mlir::GreedyRewriteConfig config;
-  config.useTopDownTraversal = true;
-  config.enableRegionSimplification = mlir::GreedySimplifyRegionLevel::Disabled;
+  config.setUseTopDownTraversal(true);
+  config.setRegionSimplificationLevel(
+      mlir::GreedySimplifyRegionLevel::Disabled);
   return mlir::createCanonicalizerPass(config);
 }
 
@@ -29,22 +30,26 @@ void circt::kanagawa::loadKanagawaLowLevelPassPipeline(mlir::PassManager &pm) {
   // Inner ref: We create an inner ref verification pass to initially validate
   // the IR, as well as after all structure-changing passes.
   // In the future, could consider hiding this behind a flag to reduce overhead.
-  pm.addPass(hw::createVerifyInnerRefNamespacePass());
+  pm.addPass(hw::createVerifyInnerRefNamespace());
   pm.nest<kanagawa::DesignOp>().addPass(createContainerizePass());
-  pm.addPass(hw::createVerifyInnerRefNamespacePass());
+  pm.addPass(hw::createVerifyInnerRefNamespace());
 
-  // Pre-tunneling CSE pass. This ensures that duplicate get_port calls are
-  // removed before we start tunneling - no reason to tunnel the same thing
-  // twice.
-  pm.addPass(mlir::createCSEPass());
+  // This pass ensures that duplicate get_port calls are removed before we
+  // start tunneling - no reason to tunnel the same thing twice.
+  pm.nest<DesignOp>().nest<ContainerOp>().addPass(
+      createEliminateRedundantOpsPass());
+
   pm.nest<DesignOp>().addPass(
       createTunnelingPass(KanagawaTunnelingOptions{"", ""}));
-  pm.addPass(hw::createVerifyInnerRefNamespacePass());
+  pm.addPass(hw::createVerifyInnerRefNamespace());
   pm.addPass(createPortrefLoweringPass());
   pm.addPass(createSimpleCanonicalizerPass());
+  // Run this again as some of the above passes may create redundant ops.
+  pm.nest<DesignOp>().nest<ContainerOp>().addPass(
+      createEliminateRedundantOpsPass());
   pm.nest<DesignOp>().addPass(createCleanSelfdriversPass());
   pm.addPass(createContainersToHWPass());
-  pm.addPass(hw::createVerifyInnerRefNamespacePass());
+  pm.addPass(hw::createVerifyInnerRefNamespace());
 }
 
 void circt::kanagawa::loadKanagawaHighLevelPassPipeline(mlir::PassManager &pm) {

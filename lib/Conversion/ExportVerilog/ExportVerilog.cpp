@@ -743,7 +743,8 @@ static bool isExpressionUnableToInline(Operation *op,
 
   // StructCreateOp needs to be assigning to a named temporary so that types
   // are inferred properly by verilog
-  if (isa<StructCreateOp, UnionCreateOp, UnpackedArrayCreateOp>(op))
+  if (isa<StructCreateOp, UnionCreateOp, UnpackedArrayCreateOp, ArrayInjectOp>(
+          op))
     return true;
 
   // Aggregate literal syntax only works in an assignment expression, where
@@ -768,7 +769,7 @@ static bool isExpressionUnableToInline(Operation *op,
     //     assign bar = {{a}, {b}, {c}, {d}}[idx];
     //
     // To handle these, we push the subexpression into a temporary.
-    if (isa<ExtractOp, ArraySliceOp, ArrayGetOp, StructExtractOp,
+    if (isa<ExtractOp, ArraySliceOp, ArrayGetOp, ArrayInjectOp, StructExtractOp,
             UnionExtractOp, IndexedPartSelectOp>(user))
       if (use.getOperandNumber() == 0 && // ignore index operands.
           !isOkToBitSelectFrom(use.get()))
@@ -822,7 +823,8 @@ enum class BlockStatementCount { Zero, One, TwoOrMore };
 static BlockStatementCount countStatements(Block &block) {
   unsigned numStatements = 0;
   block.walk([&](Operation *op) {
-    if (isVerilogExpression(op) || isa<ltl::LTLDialect>(op->getDialect()))
+    if (isVerilogExpression(op) ||
+        isa_and_nonnull<ltl::LTLDialect>(op->getDialect()))
       return WalkResult::advance();
     numStatements +=
         TypeSwitch<Operation *, unsigned>(op)
@@ -2378,6 +2380,7 @@ private:
   // Comb Dialect Operations
   using CombinationalVisitor::visitComb;
   SubExprInfo visitComb(MuxOp op);
+  SubExprInfo visitComb(ReverseOp op);
   SubExprInfo visitComb(AddOp op) {
     assert(op.getNumOperands() == 2 && "prelowering should handle variadics");
     return emitBinary(op, Addition, "+");
@@ -3303,6 +3306,17 @@ SubExprInfo ExprEmitter::visitComb(MuxOp op) {
   });
 }
 
+SubExprInfo ExprEmitter::visitComb(ReverseOp op) {
+  if (hasSVAttributes(op))
+    emitError(op, "SV attributes emission is unimplemented for the op");
+
+  ps << "{<<{";
+  emitSubExpr(op.getInput(), LowestPrecedence);
+  ps << "}}";
+
+  return {Symbol, IsUnsigned};
+}
+
 SubExprInfo ExprEmitter::printStructCreate(
     ArrayRef<hw::detail::FieldInfo> fieldInfos,
     llvm::function_ref<void(const hw::detail::FieldInfo &, unsigned)> fieldFn,
@@ -4095,6 +4109,7 @@ private:
   LogicalResult visitSV(InterfaceSignalOp op);
   LogicalResult visitSV(InterfaceModportOp op);
   LogicalResult visitSV(AssignInterfaceSignalOp op);
+  LogicalResult visitSV(MacroErrorOp op);
   LogicalResult visitSV(MacroDefOp op);
 
   void emitBlockAsStatement(Block *block,
@@ -5726,6 +5741,13 @@ LogicalResult StmtEmitter::visitSV(AssignInterfaceSignalOp op) {
   return success();
 }
 
+LogicalResult StmtEmitter::visitSV(MacroErrorOp op) {
+  startStatement();
+  ps << "`" << op.getMacroIdentifier();
+  setPendingNewline();
+  return success();
+}
+
 LogicalResult StmtEmitter::visitSV(MacroDefOp op) {
   auto decl = op.getReferencedMacro(&state.symbolCache);
   // TODO: source info!
@@ -5756,7 +5778,7 @@ void StmtEmitter::emitStatement(Operation *op) {
 
   // Ignore LTL expressions as they are emitted as part of verification
   // statements. Ignore debug ops as they are emitted as part of debug info.
-  if (isa<ltl::LTLDialect, debug::DebugDialect>(op->getDialect()))
+  if (isa_and_nonnull<ltl::LTLDialect, debug::DebugDialect>(op->getDialect()))
     return;
 
   // Handle HW statements, SV statements.
@@ -5906,6 +5928,11 @@ LogicalResult StmtEmitter::emitDeclaration(Operation *op) {
   auto type = value.getType();
   auto word = getVerilogDeclWord(op, emitter);
   auto isZeroBit = isZeroBitType(type);
+
+  // LocalParams always need the bitwidth, otherwise they are considered to have
+  // an unknown size.
+  bool singleBitDefaultType = !isa<LocalParamOp>(op);
+
   ps.scopedBox(isZeroBit ? PP::neverbox : PP::ibox2, [&]() {
     unsigned targetColumn = 0;
     unsigned column = 0;
@@ -5929,7 +5956,8 @@ LogicalResult StmtEmitter::emitDeclaration(Operation *op) {
     {
       llvm::raw_svector_ostream stringStream(typeString);
       emitter.printPackedType(stripUnpackedTypes(type), stringStream,
-                              op->getLoc());
+                              op->getLoc(), /*optionalAliasType=*/{},
+                              /*implicitIntType=*/true, singleBitDefaultType);
     }
     // Emit the type.
     if (maxTypeWidth > 0)
@@ -6845,6 +6873,7 @@ void SharedEmitterState::gatherFiles(bool separateModules) {
             separateFile(op);
           }
         })
+        .Case<MacroErrorOp>([&](auto op) { replicatedOps.push_back(op); })
         .Case<MacroDeclOp>([&](auto op) {
           symbolCache.addDefinition(op.getSymNameAttr(), op);
         })
@@ -6946,7 +6975,7 @@ static void emitOperation(VerilogEmitterState &state, Operation *op) {
       })
       .Case<emit::FileOp, emit::FileListOp, emit::FragmentOp>(
           [&](auto op) { FileEmitter(state).emit(op); })
-      .Case<MacroDefOp, FuncDPIImportOp>(
+      .Case<MacroErrorOp, MacroDefOp, FuncDPIImportOp>(
           [&](auto op) { ModuleEmitter(state).emitStatement(op); })
       .Case<FuncOp>([&](auto op) { ModuleEmitter(state).emitFunc(op); })
       .Case<IncludeOp>([&](auto op) { ModuleEmitter(state).emitStatement(op); })
@@ -7115,10 +7144,10 @@ struct ExportVerilogPass
   void runOnOperation() override {
     // Prepare the ops in the module for emission.
     mlir::OpPassManager preparePM("builtin.module");
-    preparePM.addPass(createLegalizeAnonEnumsPass());
-    preparePM.addPass(createHWLowerInstanceChoicesPass());
+    preparePM.addPass(createLegalizeAnonEnums());
+    preparePM.addPass(createHWLowerInstanceChoices());
     auto &modulePM = preparePM.nestAny();
-    modulePM.addPass(createPrepareForEmissionPass());
+    modulePM.addPass(createPrepareForEmission());
     if (failed(runPipeline(preparePM, getOperation())))
       return signalPassFailure();
 
@@ -7297,10 +7326,10 @@ struct ExportSplitVerilogPass
   void runOnOperation() override {
     // Prepare the ops in the module for emission.
     mlir::OpPassManager preparePM("builtin.module");
-    preparePM.addPass(createHWLowerInstanceChoicesPass());
+    preparePM.addPass(createHWLowerInstanceChoices());
 
     auto &modulePM = preparePM.nest<hw::HWModuleOp>();
-    modulePM.addPass(createPrepareForEmissionPass());
+    modulePM.addPass(createPrepareForEmission());
     if (failed(runPipeline(preparePM, getOperation())))
       return signalPassFailure();
 

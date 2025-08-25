@@ -137,15 +137,39 @@ module Foo;
 endmodule
 
 // -----
-module Top; endmodule
 function Foo;
   // expected-error @below {{unsupported format specifier `%l`}}
   $write("%l");
 endfunction
 
 // -----
-module Top; endmodule
 function Foo;
   // expected-error @below {{string format specifier with width not supported}}
   $write("%42s", "foo");
+endfunction
+
+// -----
+function time Foo;
+  // expected-error @below {{time value is larger than 18446744073709549568 fs}}
+  return 100000s;
+endfunction
+
+// -----
+module Foo;
+  // expected-error @below {{unsupported type: associative arrays with wildcard index}}
+  int x[*];
+endmodule
+
+// -----
+function void foo();
+  int q[$];
+  // expected-error @below {{unsupported expression: range select with non-constant bounds}}
+  q = q[2:$];
+endfunction
+
+// -----
+function void foo;
+  int a[string];
+  // expected-error @below {{unsupported expression: element select into}}
+  a["foo"] = 1;
 endfunction

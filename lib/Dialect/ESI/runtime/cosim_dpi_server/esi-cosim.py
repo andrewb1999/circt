@@ -115,6 +115,7 @@ class Simulator:
     with (self.run_dir / "compile_stdout.log").open("w") as stdout, (
         self.run_dir / "compile_stderr.log").open("w") as stderr:
       for cmd in cmds:
+        stderr.write(" ".join(cmd) + "\n")
         cp = subprocess.run(cmd,
                             env=Simulator.get_env(),
                             capture_output=True,
@@ -134,7 +135,10 @@ class Simulator:
     """Return the command to run the simulation."""
     assert False, "Must be implemented by subclass"
 
-  def run(self, inner_command: str, gui: bool = False) -> int:
+  def run(self,
+          inner_command: str,
+          gui: bool = False,
+          server_only: bool = False) -> int:
     """Start the simulation then run the command specified. Kill the simulation
     when the command exits."""
 
@@ -157,8 +161,9 @@ class Simulator:
       simEnv = Simulator.get_env()
       if self.debug:
         simEnv["COSIM_DEBUG_FILE"] = "cosim_debug.log"
-        # Slow the simulation down to one tick per millisecond.
-        simEnv["DEBUG_PERIOD"] = "1"
+        if "DEBUG_PERIOD" not in simEnv:
+          # Slow the simulation down to one tick per millisecond.
+          simEnv["DEBUG_PERIOD"] = "1"
       simProc = subprocess.Popen(self.run_command(gui),
                                  stdout=simStdout,
                                  stderr=simStderr,
@@ -195,12 +200,19 @@ class Simulator:
           raise Exception("Simulation exited early")
         time.sleep(0.05)
 
-      # Run the inner command, passing the connection info via environment vars.
-      testEnv = os.environ.copy()
-      testEnv["ESI_COSIM_PORT"] = str(port)
-      testEnv["ESI_COSIM_HOST"] = "localhost"
-      return subprocess.run(inner_command, cwd=os.getcwd(),
-                            env=testEnv).returncode
+      if server_only:
+        # wait for user input to kill the server
+        input(
+            f"Running in server-only mode on port {port} - Press anything to kill the server..."
+        )
+        return 0
+      else:
+        # Run the inner command, passing the connection info via environment vars.
+        testEnv = os.environ.copy()
+        testEnv["ESI_COSIM_PORT"] = str(port)
+        testEnv["ESI_COSIM_HOST"] = "localhost"
+        return subprocess.run(inner_command, cwd=os.getcwd(),
+                              env=testEnv).returncode
     finally:
       # Make sure to stop the simulation no matter what.
       if simProc:
@@ -232,6 +244,8 @@ class Verilator(Simulator):
         "--top-module",
         self.sources.top,
         "-DSIMULATION",
+        "-Wno-TIMESCALEMOD",
+        "-Wno-fatal",
         "-sv",
         "--build",
         "--exe",
@@ -313,7 +327,10 @@ class Questa(Simulator):
       cmd.append(svLib)
     return cmd
 
-  def run(self, inner_command: str, gui: bool = False) -> int:
+  def run(self,
+          inner_command: str,
+          gui: bool = False,
+          server_only: bool = False) -> int:
     """Override the Simulator.run() to add a soft link in the run directory (to
     the work directory) before running vsim the usual way."""
 
@@ -323,7 +340,7 @@ class Questa(Simulator):
       os.symlink(Path(os.getcwd()) / "work", workDir)
 
     # Run the simulation.
-    return super().run(inner_command, gui)
+    return super().run(inner_command, gui, server_only=server_only)
 
 
 def __main__(args):
@@ -371,6 +388,11 @@ def __main__(args):
                          nargs=argparse.REMAINDER,
                          help="Command to run in the simulation environment.")
 
+  argparser.add_argument(
+      "--server-only",
+      action="store_true",
+      help="Only run the cosim server, and do not run any inner command.")
+
   if len(args) <= 1:
     argparser.print_help()
     return
@@ -394,7 +416,7 @@ def __main__(args):
     rc = sim.compile()
     if rc != 0:
       return rc
-  return sim.run(args.inner_cmd[1:], gui=args.gui)
+  return sim.run(args.inner_cmd[1:], gui=args.gui, server_only=args.server_only)
 
 
 if __name__ == '__main__':

@@ -2,10 +2,13 @@
 #  See https://llvm.org/LICENSE.txt for license information.
 #  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-from .circt import ir
-from .core import CodeGenRoot
+from .base import ir
+from .core import CodeGenRoot, CodeGenObject
 from .rtg import rtg
 from .support import _FromCirctValue
+from .configs import PythonParam
+
+from types import SimpleNamespace
 
 
 class Test(CodeGenRoot):
@@ -13,34 +16,71 @@ class Test(CodeGenRoot):
   Represents an RTG Test. Stores the test function and location.
   """
 
-  def __init__(self, test_func, args: list[tuple[str, ir.Type]]):
+  def __init__(self, test_func, config):
     self.test_func = test_func
-    self.arg_names = [name for name, _ in args]
-    self.arg_types = [ty for _, ty in args]
+    self.config = config
+
+  def codegen_depends_on(self) -> list[CodeGenObject]:
+    return [self.config]
 
   @property
   def name(self) -> str:
     return self.test_func.__name__
 
   def _codegen(self):
+    # Sort arguments by name
+    params_sorted = self.config.get_params()
+    params_sorted.sort(key=lambda param: param.get_name())
+
     test = rtg.TestOp(
-        self.name,
+        self.name, self.name,
         ir.TypeAttr.get(
-            rtg.DictType.get([
-                (ir.StringAttr.get(name), ty)
-                for (name, ty) in zip(self.arg_names, self.arg_types)
-            ])))
-    block = ir.Block.create_at_start(test.bodyRegion, self.arg_types)
+            rtg.DictType.get([(ir.StringAttr.get(param.get_name()),
+                               param.get_type()._codegen())
+                              for param in params_sorted])))
+    block = ir.Block.create_at_start(
+        test.bodyRegion,
+        [param.get_type()._codegen() for param in params_sorted])
+    new_config = []
+    for param, arg in zip(params_sorted, block.arguments):
+      new_config.append(
+          (param.get_original_name(), param.get_value() if isinstance(
+              param, PythonParam) else _FromCirctValue(arg)))
+
     with ir.InsertionPoint(block):
-      self.test_func(*[_FromCirctValue(arg) for arg in block.arguments])
+      self.test_func(SimpleNamespace(new_config))
 
 
-def test(*args, **kwargs):
+def test(config):
   """
   Decorator for RTG test functions.
   """
 
   def wrapper(func):
-    return Test(func, list(args))
+    return Test(func, config)
 
   return wrapper
+
+
+def embed_comment(comment: str) -> None:
+  """
+  Embeds a comment in the instruction stream.
+  """
+
+  rtg.CommentOp(comment)
+
+
+def report_success() -> None:
+  """
+  Exit this test and report a success.
+  """
+
+  rtg.TestSuccessOp()
+
+
+def report_failure(message: str) -> None:
+  """
+  Exit this test and report a failure with the provided error message.
+  """
+
+  rtg.TestFailureOp(message)

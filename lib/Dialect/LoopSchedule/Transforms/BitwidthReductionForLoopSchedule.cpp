@@ -508,8 +508,8 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   GreedyRewriteConfig narrowingConfig;
   // We specifically need bottom-up traversal as cmpi pattern needs range
   // data, attached to its original argument values.
-  narrowingConfig.useTopDownTraversal = false;
-  narrowingConfig.listener = &listener;
+  narrowingConfig.setUseTopDownTraversal(false);
+  narrowingConfig.setListener(&listener);
 
   if (failed(applyPatternsGreedily(op, std::move(patterns), narrowingConfig))) {
     op->emitOpError("Failed to perform bitwidth minimization conversions");

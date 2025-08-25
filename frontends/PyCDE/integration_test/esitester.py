@@ -16,14 +16,20 @@
 # REQUIRES: esi-runtime, esi-cosim, rtl-sim, esitester
 # RUN: rm -rf %t
 # RUN: mkdir %t && cd %t
-# Run pure cosim since we don't yet have a FromHost DMA engine.
+
+# Test cosim without DMA.
 # RUN: %PYTHON% %s %t cosim 2>&1
 # RUN: esi-cosim.py --source %t -- esitester -v cosim env wait | FileCheck %s
 # RUN: ESI_COSIM_MANIFEST_MMIO=1 esi-cosim.py --source %t -- esiquery cosim env info
-# Now test the ToHost DMA engine.
+# RUN: esi-cosim.py --source %t -- esiquery cosim env telemetry | FileCheck %s --check-prefix=TELEMETRY
+# RUN: esi-cosim.py --source %t -- %PYTHON% %S/test_software/esitester.py cosim env | FileCheck %s
+
+# Now test the DMA engines.
 # RUN: %PYTHON% %s %t cosim_dma 2>&1
 # RUN: esi-cosim.py --source %t -- esitester cosim env hostmem
 # RUN: esi-cosim.py --source %t -- esitester cosim env dma -w -r
+# RUN: esi-cosim.py --source %t -- esiquery cosim env telemetry | FileCheck %s --check-prefix=TELEMETRY
+# RUN: esi-cosim.py --source %t -- %PYTHON% %S/test_software/esitester.py cosim env | FileCheck %s
 
 import pycde
 from pycde import AppID, Clock, Module, Reset, generator, modparams
@@ -37,6 +43,29 @@ import typing
 import sys
 
 # CHECK: [CONNECT] connecting to backend
+
+# TELEMETRY: ********************************
+# TELEMETRY: * Telemetry
+# TELEMETRY: ********************************
+
+# TELEMETRY: tohostdmatest[32].totalWrites: 0
+# TELEMETRY: tohostdmatest[64].totalWrites: 0
+# TELEMETRY: tohostdmatest[96].totalWrites: 0
+# TELEMETRY: tohostdmatest[128].totalWrites: 0
+# TELEMETRY: tohostdmatest[256].totalWrites: 0
+# TELEMETRY: tohostdmatest[384].totalWrites: 0
+# TELEMETRY: tohostdmatest[504].totalWrites: 0
+# TELEMETRY: tohostdmatest[512].totalWrites: 0
+# TELEMETRY: tohostdmatest[513].totalWrites: 0
+# TELEMETRY: writemem[32].timesWritten: 0
+# TELEMETRY: writemem[64].timesWritten: 0
+# TELEMETRY: writemem[96].timesWritten: 0
+# TELEMETRY: writemem[128].timesWritten: 0
+# TELEMETRY: writemem[256].timesWritten: 0
+# TELEMETRY: writemem[384].timesWritten: 0
+# TELEMETRY: writemem[504].timesWritten: 0
+# TELEMETRY: writemem[512].timesWritten: 0
+# TELEMETRY: writemem[513].timesWritten: 0
 
 
 class PrintfExample(Module):
@@ -65,9 +94,9 @@ class PrintfExample(Module):
 def ReadMem(width: int):
 
   class ReadMem(Module):
-    """Module which reads host memory at a certain address as given by writes to
-    MMIO register 0x8. Stores the read value and responds to all MMIO reads with
-    the stored value."""
+    f"""Module which reads {width} bits of host memory at a certain address as
+    given by writes to MMIO register 0x8. Stores the read value and responds to
+    all MMIO reads with the stored value."""
 
     clk = Clock()
     rst = Reset()
@@ -132,8 +161,8 @@ def ReadMem(width: int):
 def WriteMem(width: int) -> typing.Type['WriteMem']:
 
   class WriteMem(Module):
-    """Writes a cycle count to host memory at address 0 in MMIO upon each MMIO
-    transaction."""
+    f"""Writes a cycle count of {width} bits to host memory at address 0 in MMIO
+    upon each MMIO transaction."""
     clk = Clock()
     rst = Reset()
 
@@ -171,14 +200,22 @@ def WriteMem(width: int) -> typing.Type['WriteMem']:
                                      clear=Bits(1)(0),
                                      increment=Bits(1)(1))
 
-      hostmem_write_req, _ = esi.HostMem.wrap_write_req(
+      hostmem_write_valid = mmio_xact.reg(ports.clk, ports.rst)
+      hostmem_write_req, hostmem_write_ready = esi.HostMem.wrap_write_req(
           write_loc,
           cycle_counter.out.as_bits(),
           tag.out,
-          valid=mmio_xact.reg(ports.clk, ports.rst))
+          valid=hostmem_write_valid)
 
       hostmem_write_resp = esi.HostMem.write(appid=AppID("WriteMem_hostwrite"),
                                              req=hostmem_write_req)
+
+      written = Counter(64)(clk=ports.clk,
+                            rst=ports.rst,
+                            clear=Bits(1)(0),
+                            increment=hostmem_write_valid & hostmem_write_ready)
+      esi.Telemetry.report_signal(ports.clk, ports.rst,
+                                  esi.AppID("timesWritten"), written.out)
 
   return WriteMem
 
@@ -241,6 +278,14 @@ def ToHostDMATest(width: int):
           cycle_counter.out, count_valid)
       out_xact.assign(out_channel_ready & count_valid)
       ChannelService.to_host(name=AppID("out"), chan=out_channel)
+
+      total_write_counter = Counter(64)(clk=ports.clk,
+                                        rst=ports.rst,
+                                        clear=Bits(1)(0),
+                                        increment=write_cntr_incr)
+      esi.Telemetry.report_signal(ports.clk, ports.rst,
+                                  esi.AppID("totalWrites"),
+                                  total_write_counter.out)
 
   return ToHostDMATest
 
@@ -305,7 +350,7 @@ class EsiTesterTop(Module):
   @generator
   def construct(ports):
     PrintfExample(clk=ports.clk, rst=ports.rst)
-    for width in [32, 64, 96, 128, 256, 384, 504, 512]:
+    for width in [32, 64, 96, 128, 256, 384, 504, 512, 513]:
       ReadMem(width)(appid=esi.AppID("readmem", width),
                      clk=ports.clk,
                      rst=ports.rst)

@@ -133,8 +133,8 @@ static Value castToFIRRTLType(Value val, Type type,
     val = builder.createOrFold<HWStructCastOp>(bundle.getPassiveType(), val);
 
   if (type != val.getType())
-    val = builder.create<mlir::UnrealizedConversionCastOp>(type, val).getResult(
-        0);
+    val = mlir::UnrealizedConversionCastOp::create(builder, type, val)
+              .getResult(0);
 
   return val;
 }
@@ -145,17 +145,16 @@ static Value castFromFIRRTLType(Value val, Type type,
 
   if (hw::StructType structTy = dyn_cast<hw::StructType>(type)) {
     // Strip off Flip type if needed.
-    val =
-        builder
-            .create<mlir::UnrealizedConversionCastOp>(
-                type_cast<FIRRTLBaseType>(val.getType()).getPassiveType(), val)
-            .getResult(0);
+    val = mlir::UnrealizedConversionCastOp::create(
+              builder,
+              type_cast<FIRRTLBaseType>(val.getType()).getPassiveType(), val)
+              .getResult(0);
     val = builder.createOrFold<HWStructCastOp>(type, val);
     return val;
   }
 
   val =
-      builder.create<mlir::UnrealizedConversionCastOp>(type, val).getResult(0);
+      mlir::UnrealizedConversionCastOp::create(builder, type, val).getResult(0);
 
   return val;
 }
@@ -480,8 +479,8 @@ private:
         auto b = ImplicitLocOpBuilder::atBlockBegin(
             circuitOp.getLoc(),
             &circuitOp->getParentRegion()->getBlocks().back());
-        typeScope = b.create<hw::TypeScopeOp>(
-            b.getStringAttr(circuitOp.getName() + "__TYPESCOPE_"));
+        typeScope = hw::TypeScopeOp::create(
+            b, b.getStringAttr(circuitOp.getName() + "__TYPESCOPE_"));
         typeScope.getBodyRegion().push_back(new Block());
       }
       auto typeName = firAlias.getName();
@@ -494,8 +493,8 @@ private:
 
       auto typeScopeBuilder =
           ImplicitLocOpBuilder::atBlockEnd(typeLoc, typeScope.getBodyBlock());
-      auto typeDecl = typeScopeBuilder.create<hw::TypedeclOp>(typeLoc, typeName,
-                                                              rawType, nullptr);
+      auto typeDecl = hw::TypedeclOp::create(typeScopeBuilder, typeLoc,
+                                             typeName, rawType, nullptr);
       auto hwAlias = hw::TypeAliasType::get(
           SymbolRefAttr::get(typeScope.getSymNameAttr(),
                              {FlatSymbolRefAttr::get(typeDecl)}),
@@ -706,9 +705,9 @@ void FIRRTLModuleLowering::runOnOperation() {
             })
             .Case<FormalOp>([&](auto oldOp) {
               auto builder = OpBuilder::atBlockEnd(topLevelModule);
-              auto newOp = builder.create<verif::FormalOp>(
-                  oldOp.getLoc(), oldOp.getNameAttr(),
-                  oldOp.getParametersAttr());
+              auto newOp = verif::FormalOp::create(builder, oldOp.getLoc(),
+                                                   oldOp.getNameAttr(),
+                                                   oldOp.getParametersAttr());
               newOp.getBody().emplaceBlock();
               state.recordModuleMapping(oldOp, newOp);
               opsToProcess.push_back(newOp);
@@ -717,8 +716,8 @@ void FIRRTLModuleLowering::runOnOperation() {
             .Case<SimulationOp>([&](auto oldOp) {
               auto loc = oldOp.getLoc();
               auto builder = OpBuilder::atBlockEnd(topLevelModule);
-              auto newOp = builder.create<verif::SimulationOp>(
-                  loc, oldOp.getNameAttr(), oldOp.getParametersAttr());
+              auto newOp = verif::SimulationOp::create(
+                  builder, loc, oldOp.getNameAttr(), oldOp.getParametersAttr());
               auto &body = newOp.getRegion().emplaceBlock();
               body.addArgument(seq::ClockType::get(builder.getContext()), loc);
               body.addArgument(builder.getI1Type(), loc);
@@ -811,7 +810,7 @@ void FIRRTLModuleLowering::runOnOperation() {
   if (!state.macroDeclNames.empty()) {
     ImplicitLocOpBuilder b(UnknownLoc::get(&getContext()), circuit);
     for (auto name : state.macroDeclNames) {
-      b.create<sv::MacroDeclOp>(name);
+      sv::MacroDeclOp::create(b, name);
     }
   }
 
@@ -836,23 +835,23 @@ void FIRRTLModuleLowering::lowerFileHeader(CircuitOp op,
                                StringRef defineFalse = StringRef()) {
     if (!defineFalse.data()) {
       assert(defineTrue.data() && "didn't define anything");
-      b.create<sv::IfDefOp>(
-          guard, [&]() { b.create<sv::MacroDefOp>(defName, defineTrue); });
+      sv::IfDefOp::create(
+          b, guard, [&]() { sv::MacroDefOp::create(b, defName, defineTrue); });
     } else {
-      b.create<sv::IfDefOp>(
-          guard,
+      sv::IfDefOp::create(
+          b, guard,
           [&]() {
             if (defineTrue.data())
-              b.create<sv::MacroDefOp>(defName, defineTrue);
+              sv::MacroDefOp::create(b, defName, defineTrue);
           },
-          [&]() { b.create<sv::MacroDefOp>(defName, defineFalse); });
+          [&]() { sv::MacroDefOp::create(b, defName, defineFalse); });
     }
   };
 
   // Helper function to emit #ifndef guard.
   auto emitGuard = [&](const char *guard, llvm::function_ref<void(void)> body) {
-    b.create<sv::IfDefOp>(
-        guard, []() {}, body);
+    sv::IfDefOp::create(
+        b, guard, []() {}, body);
   };
 
   if (state.usedFileDescriptorLib) {
@@ -885,8 +884,8 @@ void FIRRTLModuleLowering::lowerFileHeader(CircuitOp op,
         DictionaryAttr::get(b.getContext(), perArgumentsAttr)};
 
     // Create the function declaration
-    auto func = b.create<sv::FuncOp>(
-        /*sym_name=*/
+    auto func = sv::FuncOp::create(
+        b, /*sym_name=*/
         "__circt_lib_logging::FileDescriptor::get", moduleType,
         /*perArgumentAttrs=*/
         b.getArrayAttr(
@@ -899,47 +898,40 @@ void FIRRTLModuleLowering::lowerFileHeader(CircuitOp op,
         b.getStringAttr("__circt_lib_logging::FileDescriptor::get"));
     func.setPrivate();
 
-    b.create<sv::MacroDeclOp>("__CIRCT_LIB_LOGGING");
+    sv::MacroDeclOp::create(b, "__CIRCT_LIB_LOGGING");
     // Create the fragment containing the FileDescriptor class.
-    b.create<emit::FragmentOp>("CIRCT_LIB_LOGGING_FRAGMENT", [&] {
-      emitGuard("__CIRCT_LIB_LOGGING", [&]() {
-        b.create<sv::VerbatimOp>(R"(// CIRCT Logging Library
+    emit::FragmentOp::create(b, "CIRCT_LIB_LOGGING_FRAGMENT", [&] {
+      emitGuard("SYNTHESIS", [&]() {
+        emitGuard("__CIRCT_LIB_LOGGING", [&]() {
+          sv::VerbatimOp::create(b, R"(// CIRCT Logging Library
 package __circt_lib_logging;
   class FileDescriptor;
     static int global_id [string];
     static function int get(string name);
-      if (global_id.exists(name) == 32'h0)
+      if (global_id.exists(name) == 32'h0) begin
         global_id[name] = $fopen(name);
+        if (global_id[name] == 32'h0)
+          $error("Failed to open file %s", name);
+      end
       return global_id[name];
     endfunction
   endclass
 endpackage
 )");
 
-        b.create<sv::MacroDefOp>("__CIRCT_LIB_LOGGING", "");
+          sv::MacroDefOp::create(b, "__CIRCT_LIB_LOGGING", "");
+        });
       });
     });
   }
 
   if (state.usedPrintf) {
-    b.create<sv::MacroDeclOp>("PRINTF_FD");
-    b.create<sv::MacroDeclOp>("PRINTF_FD_");
-    b.create<emit::FragmentOp>("PRINTF_FD_FRAGMENT", [&] {
-      b.create<sv::VerbatimOp>(
-          "\n// Users can define 'PRINTF_FD' to add a specified fd to "
-          "prints.");
-      emitGuard("PRINTF_FD_", [&]() {
-        emitGuardedDefine("PRINTF_FD", "PRINTF_FD_", "(`PRINTF_FD)",
-                          "32'h80000002");
-      });
-    });
-
-    b.create<sv::MacroDeclOp>("PRINTF_COND");
-    b.create<sv::MacroDeclOp>("PRINTF_COND_");
-    b.create<emit::FragmentOp>("PRINTF_COND_FRAGMENT", [&] {
-      b.create<sv::VerbatimOp>(
-          "\n// Users can define 'PRINTF_COND' to add an extra gate to "
-          "prints.");
+    sv::MacroDeclOp::create(b, "PRINTF_COND");
+    sv::MacroDeclOp::create(b, "PRINTF_COND_");
+    emit::FragmentOp::create(b, "PRINTF_COND_FRAGMENT", [&] {
+      sv::VerbatimOp::create(
+          b, "\n// Users can define 'PRINTF_COND' to add an extra gate to "
+             "prints.");
       emitGuard("PRINTF_COND_", [&]() {
         emitGuardedDefine("PRINTF_COND", "PRINTF_COND_", "(`PRINTF_COND)", "1");
       });
@@ -947,12 +939,12 @@ endpackage
   }
 
   if (state.usedAssertVerboseCond) {
-    b.create<sv::MacroDeclOp>("ASSERT_VERBOSE_COND");
-    b.create<sv::MacroDeclOp>("ASSERT_VERBOSE_COND_");
-    b.create<emit::FragmentOp>("ASSERT_VERBOSE_COND_FRAGMENT", [&] {
-      b.create<sv::VerbatimOp>(
-          "\n// Users can define 'ASSERT_VERBOSE_COND' to add an extra "
-          "gate to assert error printing.");
+    sv::MacroDeclOp::create(b, "ASSERT_VERBOSE_COND");
+    sv::MacroDeclOp::create(b, "ASSERT_VERBOSE_COND_");
+    emit::FragmentOp::create(b, "ASSERT_VERBOSE_COND_FRAGMENT", [&] {
+      sv::VerbatimOp::create(
+          b, "\n// Users can define 'ASSERT_VERBOSE_COND' to add an extra "
+             "gate to assert error printing.");
       emitGuard("ASSERT_VERBOSE_COND_", [&]() {
         emitGuardedDefine("ASSERT_VERBOSE_COND", "ASSERT_VERBOSE_COND_",
                           "(`ASSERT_VERBOSE_COND)", "1");
@@ -961,12 +953,12 @@ endpackage
   }
 
   if (state.usedStopCond) {
-    b.create<sv::MacroDeclOp>("STOP_COND");
-    b.create<sv::MacroDeclOp>("STOP_COND_");
-    b.create<emit::FragmentOp>("STOP_COND_FRAGMENT", [&] {
-      b.create<sv::VerbatimOp>(
-          "\n// Users can define 'STOP_COND' to add an extra gate "
-          "to stop conditions.");
+    sv::MacroDeclOp::create(b, "STOP_COND");
+    sv::MacroDeclOp::create(b, "STOP_COND_");
+    emit::FragmentOp::create(b, "STOP_COND_FRAGMENT", [&] {
+      sv::VerbatimOp::create(
+          b, "\n// Users can define 'STOP_COND' to add an extra gate "
+             "to stop conditions.");
       emitGuard("STOP_COND_", [&]() {
         emitGuardedDefine("STOP_COND", "STOP_COND_", "(`STOP_COND)", "1");
       });
@@ -1170,8 +1162,8 @@ FIRRTLModuleLowering::lowerExtModule(FExtModuleOp oldModule,
   // no known default values in the extmodule.  This ensures that the
   // hw.instance will print all the parameters when generating verilog.
   auto parameters = getHWParameters(oldModule, /*ignoreValues=*/true);
-  auto newModule = builder.create<hw::HWModuleExternOp>(
-      oldModule.getLoc(), nameAttr, ports, verilogName, parameters);
+  auto newModule = hw::HWModuleExternOp::create(
+      builder, oldModule.getLoc(), nameAttr, ports, verilogName, parameters);
   SymbolTable::setSymbolVisibility(newModule,
                                    SymbolTable::getSymbolVisibility(oldModule));
 
@@ -1203,8 +1195,8 @@ FIRRTLModuleLowering::lowerMemModule(FMemModuleOp oldModule,
 
   // Build the new hw.module op.
   auto builder = OpBuilder::atBlockEnd(topLevelModule);
-  auto newModule = builder.create<hw::HWModuleExternOp>(
-      oldModule.getLoc(), oldModule.getModuleNameAttr(), ports,
+  auto newModule = hw::HWModuleExternOp::create(
+      builder, oldModule.getLoc(), oldModule.getModuleNameAttr(), ports,
       oldModule.getModuleNameAttr());
   loweringState.processRemainingAnnotations(oldModule,
                                             AnnotationSet(oldModule));
@@ -1226,7 +1218,7 @@ FIRRTLModuleLowering::lowerModule(FModuleOp oldModule, Block *topLevelModule,
   auto builder = OpBuilder::atBlockEnd(topLevelModule);
   auto nameAttr = builder.getStringAttr(oldModule.getName());
   auto newModule =
-      builder.create<hw::HWModuleOp>(oldModule.getLoc(), nameAttr, ports);
+      hw::HWModuleOp::create(builder, oldModule.getLoc(), nameAttr, ports);
 
   if (auto comment = oldModule->getAttrOfType<StringAttr>("comment"))
     newModule.setCommentAttr(comment);
@@ -1366,12 +1358,12 @@ tryEliminatingConnectsToValue(Value flipValue, Operation *insertPoint,
 
   // Convert fliped sources to passive sources.
   if (!type_cast<FIRRTLBaseType>(connectSrc.getType()).isPassive())
-    connectSrc = builder
-                     .create<mlir::UnrealizedConversionCastOp>(
-                         type_cast<FIRRTLBaseType>(connectSrc.getType())
-                             .getPassiveType(),
-                         connectSrc)
-                     .getResult(0);
+    connectSrc =
+        mlir::UnrealizedConversionCastOp::create(
+            builder,
+            type_cast<FIRRTLBaseType>(connectSrc.getType()).getPassiveType(),
+            connectSrc)
+            .getResult(0);
 
   // We know it must be the destination operand due to the types, but the
   // source may not match the destination width.
@@ -1430,7 +1422,7 @@ LogicalResult FIRRTLModuleLowering::lowerModulePortsAndMoveBody(
   // move the new function body to.  This is important because we insert some
   // ops at the start of the function and some at the end, and the body is
   // currently empty to avoid iterator invalidation.
-  auto cursor = bodyBuilder.create<hw::ConstantOp>(APInt(1, 1));
+  auto cursor = hw::ConstantOp::create(bodyBuilder, APInt(1, 1));
   bodyBuilder.setInsertionPoint(cursor);
 
   // Insert argument casts, and re-vector users in the old body to use them.
@@ -1472,10 +1464,10 @@ LogicalResult FIRRTLModuleLowering::lowerModulePortsAndMoveBody(
     // We lower zero width inout and outputs to a wire that isn't connected to
     // anything outside the module.  Inputs are lowered to zero.
     if (isZeroWidth && port.isInput()) {
-      Value newArg = bodyBuilder
-                         .create<WireOp>(port.type, "." + port.getName().str() +
-                                                        ".0width_input")
-                         .getResult();
+      Value newArg =
+          WireOp::create(bodyBuilder, port.type,
+                         "." + port.getName().str() + ".0width_input")
+              .getResult();
       oldArg.replaceAllUsesWith(newArg);
       continue;
     }
@@ -1491,8 +1483,8 @@ LogicalResult FIRRTLModuleLowering::lowerModulePortsAndMoveBody(
 
     // Outputs need a temporary wire so they can be connect'd to, which we
     // then return.
-    auto newArg = bodyBuilder.create<WireOp>(
-        port.type, "." + port.getName().str() + ".output");
+    auto newArg = WireOp::create(bodyBuilder, port.type,
+                                 "." + port.getName().str() + ".output");
 
     // Switch all uses of the old operands to the new ones.
     oldArg.replaceAllUsesWith(newArg.getResult());
@@ -1547,11 +1539,11 @@ FIRRTLModuleLowering::lowerFormalBody(verif::FormalOp newOp,
   SmallVector<Value> symbolicInputs;
   for (auto arg : newModule.getBody().getArguments())
     symbolicInputs.push_back(
-        builder.create<verif::SymbolicValueOp>(arg.getLoc(), arg.getType()));
+        verif::SymbolicValueOp::create(builder, arg.getLoc(), arg.getType()));
 
   // Instantiate the module with the given symbolic inputs.
-  builder.create<hw::InstanceOp>(newOp.getLoc(), newModule,
-                                 newModule.getNameAttr(), symbolicInputs);
+  hw::InstanceOp::create(builder, newOp.getLoc(), newModule,
+                         newModule.getNameAttr(), symbolicInputs);
   return success();
 }
 
@@ -1574,9 +1566,9 @@ FIRRTLModuleLowering::lowerSimulationBody(verif::SimulationOp newOp,
   // and yield the module's outputs.
   SmallVector<Value> inputs(newOp.getBody()->args_begin(),
                             newOp.getBody()->args_end());
-  auto instOp = builder.create<hw::InstanceOp>(newOp.getLoc(), newModule,
-                                               newModule.getNameAttr(), inputs);
-  builder.create<verif::YieldOp>(newOp.getLoc(), instOp.getResults());
+  auto instOp = hw::InstanceOp::create(builder, newOp.getLoc(), newModule,
+                                       newModule.getNameAttr(), inputs);
+  verif::YieldOp::create(builder, newOp.getLoc(), instOp.getResults());
   return success();
 }
 
@@ -1697,6 +1689,7 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
   LogicalResult visitExpr(AggregateConstantOp op);
   LogicalResult visitExpr(IsTagOp op);
   LogicalResult visitExpr(SubtagOp op);
+  LogicalResult visitExpr(TagExtractOp op);
   LogicalResult visitUnhandledOp(Operation *op) { return failure(); }
   LogicalResult visitInvalidOp(Operation *op) {
     if (auto castOp = dyn_cast<mlir::UnrealizedConversionCastOp>(op))
@@ -2024,7 +2017,7 @@ LogicalResult FIRRTLModuleLowering::lowerFileBody(emit::FileOp fileOp) {
   fileOp->walk([&](Operation *op) {
     if (auto bindOp = dyn_cast<BindOp>(op)) {
       b.setInsertionPointAfter(bindOp);
-      b.create<sv::BindOp>(bindOp.getLoc(), bindOp.getInstanceAttr());
+      sv::BindOp::create(b, bindOp.getLoc(), bindOp.getInstanceAttr());
       bindOp->erase();
     }
   });
@@ -2141,8 +2134,8 @@ LogicalResult FIRRTLLowering::run() {
         continue;
       if (!zeroI0) {
         auto builder = OpBuilder::atBlockBegin(theModule.getBodyBlock());
-        zeroI0 = builder.create<hw::ConstantOp>(op->getLoc(),
-                                                builder.getIntegerType(0), 0);
+        zeroI0 = hw::ConstantOp::create(builder, op->getLoc(),
+                                        builder.getIntegerType(0), 0);
         maybeUnusedValues.insert(zeroI0);
       }
       result.replaceAllUsesWith(zeroI0);
@@ -2196,7 +2189,7 @@ Value FIRRTLLowering::getOrCreateClockConstant(seq::ClockConst clock) {
     return entry;
 
   OpBuilder entryBuilder(&theModule.getBodyBlock()->front());
-  entry = entryBuilder.create<seq::ConstClockOp>(builder.getLoc(), attr);
+  entry = seq::ConstClockOp::create(entryBuilder, builder.getLoc(), attr);
   return entry;
 }
 
@@ -2211,7 +2204,7 @@ Value FIRRTLLowering::getOrCreateIntConstant(const APInt &value) {
     return entry;
 
   OpBuilder entryBuilder(&theModule.getBodyBlock()->front());
-  entry = entryBuilder.create<hw::ConstantOp>(builder.getLoc(), attr);
+  entry = hw::ConstantOp::create(entryBuilder, builder.getLoc(), attr);
   return entry;
 }
 
@@ -2270,8 +2263,8 @@ Value FIRRTLLowering::getOrCreateXConstant(unsigned numBits) {
     return entry;
 
   OpBuilder entryBuilder(&theModule.getBodyBlock()->front());
-  entry = entryBuilder.create<sv::ConstantXOp>(
-      builder.getLoc(), entryBuilder.getIntegerType(numBits));
+  entry = sv::ConstantXOp::create(entryBuilder, builder.getLoc(),
+                                  entryBuilder.getIntegerType(numBits));
   return entry;
 }
 
@@ -2279,7 +2272,7 @@ Value FIRRTLLowering::getOrCreateZConstant(Type type) {
   auto &entry = hwConstantZMap[type];
   if (!entry) {
     OpBuilder entryBuilder(&theModule.getBodyBlock()->front());
-    entry = entryBuilder.create<sv::ConstantZOp>(builder.getLoc(), type);
+    entry = sv::ConstantZOp::create(entryBuilder, builder.getLoc(), type);
   }
   return entry;
 }
@@ -2373,7 +2366,7 @@ Value FIRRTLLowering::getExtOrTruncAggregateValue(Value array,
                                           destVectorType.getNumElements());
                i != e; ++i) {
             auto iIdx = getOrCreateIntConstant(indexWidth, i);
-            auto arrayIndex = builder.create<hw::ArrayGetOp>(src, iIdx);
+            auto arrayIndex = hw::ArrayGetOp::create(builder, src, iIdx);
             if (failed(recurse(arrayIndex, srcVectorType.getElementType(),
                                destVectorType.getElementType())))
               return failure();
@@ -2395,7 +2388,7 @@ Value FIRRTLLowering::getExtOrTruncAggregateValue(Value array,
 
           for (auto elem : llvm::enumerate(destStructType)) {
             auto structExtract =
-                builder.create<hw::StructExtractOp>(src, elem.value().name);
+                hw::StructExtractOp::create(builder, src, elem.value().name);
             if (failed(recurse(structExtract,
                                srcStructType.getElementType(elem.index()),
                                destStructType.getElementType(elem.index()))))
@@ -2432,87 +2425,81 @@ Value FIRRTLLowering::getExtOrTruncAggregateValue(Value array,
 ///
 /// This returns a null value for FIRRTL values that cannot be lowered, e.g.
 /// unknown width integers.
-Value FIRRTLLowering::getLoweredAndExtendedValue(Value value, Type destType) {
-  assert(type_isa<FIRRTLBaseType>(value.getType()) &&
-         type_isa<FIRRTLBaseType>(destType) &&
-         "input/output value should be FIRRTL");
+Value FIRRTLLowering::getLoweredAndExtendedValue(Value src, Type target) {
+  auto srcType = cast<FIRRTLBaseType>(src.getType());
+  auto dstType = cast<FIRRTLBaseType>(target);
+  auto loweredSrc = getLoweredValue(src);
 
   // We only know how to extend integer types with known width.
-  auto destWidth = type_cast<FIRRTLBaseType>(destType).getBitWidthOrSentinel();
-  if (destWidth == -1)
+  auto dstWidth = dstType.getBitWidthOrSentinel();
+  if (dstWidth == -1)
     return {};
 
-  auto result = getLoweredValue(value);
-  if (!result) {
+  // Handle zero width FIRRTL values which have been removed.
+  if (!loweredSrc) {
     // If this was a zero bit operand being extended, then produce a zero of
     // the right result type.  If it is just a failure, fail.
-    if (!isZeroBitFIRRTLType(value.getType()))
+    if (!isZeroBitFIRRTLType(src.getType()))
       return {};
     // Zero bit results have to be returned as null.  The caller can handle
     // this if they want to.
-    if (destWidth == 0)
+    if (dstWidth == 0)
       return {};
     // Otherwise, FIRRTL semantics is that an extension from a zero bit value
     // always produces a zero value in the destination width.
-    return getOrCreateIntConstant(destWidth, 0);
+    return getOrCreateIntConstant(dstWidth, 0);
   }
 
-  if (destWidth ==
-      cast<FIRRTLBaseType>(value.getType()).getBitWidthOrSentinel()) {
+  auto loweredSrcType = loweredSrc.getType();
+  auto loweredDstType = lowerType(dstType);
+
+  // If the two types are the same we do not have to extend.
+  if (loweredSrcType == loweredDstType)
+    return loweredSrc;
+
+  // Handle type aliases.
+  if (dstWidth == srcType.getBitWidthOrSentinel()) {
     // Lookup the lowered type of dest.
-    auto loweredDstType = lowerType(destType);
-    if (result.getType() != loweredDstType &&
-        (isa<hw::TypeAliasType>(result.getType()) ||
+    if (loweredSrcType != loweredDstType &&
+        (isa<hw::TypeAliasType>(loweredSrcType) ||
          isa<hw::TypeAliasType>(loweredDstType))) {
-      return builder.createOrFold<hw::BitcastOp>(loweredDstType, result);
+      return builder.createOrFold<hw::BitcastOp>(loweredDstType, loweredSrc);
     }
   }
-  // Aggregates values
-  if (isa<hw::ArrayType, hw::StructType>(result.getType())) {
-    // Types already match.
-    if (destType == value.getType())
-      return result;
 
-    return getExtOrTruncAggregateValue(
-        result, type_cast<FIRRTLBaseType>(value.getType()),
-        type_cast<FIRRTLBaseType>(destType),
-        /* allowTruncate */ false);
-  }
+  // Aggregates values.
+  if (isa<hw::ArrayType, hw::StructType>(loweredSrcType))
+    return getExtOrTruncAggregateValue(loweredSrc, srcType, dstType,
+                                       /* allowTruncate */ false);
 
-  if (isa<seq::ClockType>(result.getType())) {
-    // Types already match.
-    if (destType == value.getType())
-      return result;
+  if (isa<seq::ClockType>(loweredSrcType)) {
     builder.emitError("cannot use clock type as an integer");
     return {};
   }
 
-  auto intResultType = dyn_cast<IntegerType>(result.getType());
-  if (!intResultType) {
+  auto intSourceType = dyn_cast<IntegerType>(loweredSrcType);
+  if (!intSourceType) {
     builder.emitError("operand of type ")
-        << result.getType() << " cannot be used as an integer";
+        << loweredSrcType << " cannot be used as an integer";
     return {};
   }
 
-  auto srcWidth = intResultType.getWidth();
-  if (srcWidth == unsigned(destWidth))
-    return result;
+  auto loweredSrcWidth = intSourceType.getWidth();
+  if (loweredSrcWidth == unsigned(dstWidth))
+    return loweredSrc;
 
-  if (srcWidth > unsigned(destWidth)) {
+  if (loweredSrcWidth > unsigned(dstWidth)) {
     builder.emitError("operand should not be a truncation");
     return {};
   }
 
-  auto resultType = builder.getIntegerType(destWidth);
-
-  // Extension follows the sign of the source value, not the destination.
-  auto valueFIRType =
-      type_cast<FIRRTLBaseType>(value.getType()).getPassiveType();
+  // Extension follows the sign of the src value, not the destination.
+  auto valueFIRType = type_cast<FIRRTLBaseType>(src.getType()).getPassiveType();
   if (type_cast<IntType>(valueFIRType).isSigned())
-    return comb::createOrFoldSExt(result, resultType, builder);
+    return comb::createOrFoldSExt(loweredSrc, loweredDstType, builder);
 
-  auto zero = getOrCreateIntConstant(destWidth - srcWidth, 0);
-  return builder.createOrFold<comb::ConcatOp>(zero, result);
+  auto zero = getOrCreateIntConstant(dstWidth - loweredSrcWidth, 0);
+  return builder.createOrFold<comb::ConcatOp>(zero, loweredSrc);
 }
 
 /// Return the lowered value corresponding to the specified original value and
@@ -2595,7 +2582,7 @@ std::optional<Value> FIRRTLLowering::getLoweredFmtOperand(Value operand) {
   // Handle special substitutions.
   if (type_isa<FStringType>(operand.getType())) {
     if (isa<TimeOp>(operand.getDefiningOp()))
-      return builder.create<sv::TimeOp>();
+      return sv::TimeOp::create(builder);
     if (isa<HierarchicalModuleNameOp>(operand.getDefiningOp()))
       return {nullptr};
   }
@@ -2612,8 +2599,8 @@ std::optional<Value> FIRRTLLowering::getLoweredFmtOperand(Value operand) {
   // it as signed decimal and have to wrap it in $signed().
   if (auto intTy = firrtl::type_cast<IntType>(operand.getType()))
     if (intTy.isSigned())
-      loweredValue = builder.create<sv::SystemFunctionOp>(
-          loweredValue.getType(), "signed", loweredValue);
+      loweredValue = sv::SystemFunctionOp::create(
+          builder, loweredValue.getType(), "signed", loweredValue);
 
   return loweredValue;
 }
@@ -2650,18 +2637,17 @@ LogicalResult FIRRTLLowering::lowerStatementWithFd(
       Value ifCond = cond;
       if (usePrintfCond) {
         ifCond =
-            builder.create<sv::MacroRefExprOp>(cond.getType(), "PRINTF_COND_");
+            sv::MacroRefExprOp::create(builder, cond.getType(), "PRINTF_COND_");
         ifCond = builder.createOrFold<comb::AndOp>(ifCond, cond, true);
       }
 
       addIfProceduralBlock(ifCond, [&]() {
-        // Create a value specified by `PRINTF_FD` for printf, or the file
-        // descriptor opened using $fopen for fprintf.
+        // `fd`represents a file decriptor. Use the stdout or the one opened
+        // using $fopen.
         Value fd;
         if (fileDescriptor.isDefaultFd()) {
-          fd = builder.create<sv::MacroRefExprOp>(builder.getIntegerType(32),
-                                                  "PRINTF_FD_");
-          circuitState.addFragment(theModule, "PRINTF_FD_FRAGMENT");
+          // Emit the sv.fwrite, writing to stderr by default.
+          fd = hw::ConstantOp::create(builder, APInt(32, 0x80000002));
         } else {
           // Call the library function to get the FD.
           auto fdOrError = callFileDescriptorLib(fileDescriptor);
@@ -2689,21 +2675,19 @@ FIRRTLLowering::callFileDescriptorLib(const FileDescriptorInfo &info) {
     if (failed(loweredFmtOperands(info.getSubstitutions(), fileNameOperands)))
       return failure();
 
-    fileName = builder
-                   .create<sv::SFormatFOp>(info.getOutputFileFormat(),
-                                           fileNameOperands)
+    fileName = sv::SFormatFOp::create(builder, info.getOutputFileFormat(),
+                                      fileNameOperands)
                    .getResult();
   } else {
     // If substitution is not required, just use the output file name.
-    fileName = builder.create<sv::ConstantStrOp>(info.getOutputFileFormat())
+    fileName = sv::ConstantStrOp::create(builder, info.getOutputFileFormat())
                    .getResult();
   }
 
-  return builder
-      .create<sv::FuncCallProceduralOp>(
-          mlir::TypeRange{builder.getIntegerType(32)},
-          builder.getStringAttr("__circt_lib_logging::FileDescriptor::get"),
-          ValueRange{fileName})
+  return sv::FuncCallProceduralOp::create(
+             builder, mlir::TypeRange{builder.getIntegerType(32)},
+             builder.getStringAttr("__circt_lib_logging::FileDescriptor::get"),
+             ValueRange{fileName})
       ->getResult(0);
 }
 
@@ -2876,7 +2860,7 @@ Value FIRRTLLowering::getNonClockValue(Value v) {
   if (it.second) {
     ImplicitLocOpBuilder builder(v.getLoc(), v.getContext());
     builder.setInsertionPointAfterValue(v);
-    it.first->second = builder.create<seq::FromClockOp>(v);
+    it.first->second = seq::FromClockOp::create(builder, v);
   }
   return it.first->second;
 }
@@ -2910,24 +2894,24 @@ void FIRRTLLowering::addToAlwaysBlock(
       auto createIfOp = [&]() {
         // It is weird but intended. Here we want to create an empty sv.if
         // with an else block.
-        insideIfOp = builder.create<sv::IfOp>(
-            reset, []() {}, []() {});
+        insideIfOp = sv::IfOp::create(
+            builder, reset, []() {}, []() {});
       };
       if (resetStyle == sv::ResetType::AsyncReset) {
         sv::EventControl events[] = {clockEdge, resetEdge};
         Value clocks[] = {clock, reset};
 
-        alwaysOp = builder.create<sv::AlwaysOp>(events, clocks, [&]() {
+        alwaysOp = sv::AlwaysOp::create(builder, events, clocks, [&]() {
           if (resetEdge == sv::EventControl::AtNegEdge)
             llvm_unreachable("negative edge for reset is not expected");
           createIfOp();
         });
       } else {
-        alwaysOp = builder.create<sv::AlwaysOp>(clockEdge, clock, createIfOp);
+        alwaysOp = sv::AlwaysOp::create(builder, clockEdge, clock, createIfOp);
       }
     } else {
       assert(!resetBody);
-      alwaysOp = builder.create<sv::AlwaysOp>(clockEdge, clock);
+      alwaysOp = sv::AlwaysOp::create(builder, clockEdge, clock);
       insideIfOp = nullptr;
     }
     alwaysBlocks[key] = {alwaysOp, insideIfOp};
@@ -2984,7 +2968,7 @@ void FIRRTLLowering::addToIfDefBlock(StringRef cond,
     op->moveBefore(builder.getInsertionBlock(), builder.getInsertionPoint());
   } else {
     ifdefBlocks[{builder.getBlock(), condAttr}] =
-        builder.create<sv::IfDefOp>(condAttr, thenCtor, elseCtor);
+        sv::IfDefOp::create(builder, condAttr, thenCtor, elseCtor);
   }
 }
 
@@ -2998,7 +2982,7 @@ void FIRRTLLowering::addToInitialBlock(std::function<void(void)> body) {
     // are defined ahead of the uses, which leads to better generated Verilog.
     op->moveBefore(builder.getInsertionBlock(), builder.getInsertionPoint());
   } else {
-    initialBlocks[builder.getBlock()] = builder.create<sv::InitialOp>(body);
+    initialBlocks[builder.getBlock()] = sv::InitialOp::create(builder, body);
   }
 }
 
@@ -3017,7 +3001,7 @@ void FIRRTLLowering::addIfProceduralBlock(Value cond,
       }
     }
 
-  builder.create<sv::IfOp>(cond, thenCtor, elseCtor);
+  sv::IfOp::create(builder, cond, thenCtor, elseCtor);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3032,7 +3016,8 @@ void FIRRTLLowering::addIfProceduralBlock(Value cond,
 FIRRTLLowering::UnloweredOpResult
 FIRRTLLowering::handleUnloweredOp(Operation *op) {
   // FIRRTL operations must explicitly handle their regions.
-  if (!op->getRegions().empty() && isa<FIRRTLDialect>(op->getDialect())) {
+  if (!op->getRegions().empty() &&
+      isa_and_nonnull<FIRRTLDialect>(op->getDialect())) {
     op->emitOpError("must explicitly handle its regions");
     return LoweringFailure;
   }
@@ -3041,7 +3026,7 @@ FIRRTLLowering::handleUnloweredOp(Operation *op) {
   // lowered. This allows us to handled partially lowered inputs, and also allow
   // other FIRRTL operations to spawn additional already-lowered operations,
   // like `hw.output`.
-  if (!isa<FIRRTLDialect>(op->getDialect())) {
+  if (!isa_and_nonnull<FIRRTLDialect>(op->getDialect())) {
     // Push nested operations onto the worklist such that they are lowered.
     for (auto &region : op->getRegions())
       addToWorklist(region);
@@ -3238,20 +3223,22 @@ LogicalResult FIRRTLLowering::visitExpr(FEnumCreateOp op) {
 
   auto input = getLoweredValue(op.getInput());
   auto tagName = op.getFieldNameAttr();
-  auto type = lowerType(op.getType());
+  auto oldType = op.getType().base();
+  auto newType = lowerType(oldType);
+  auto element = *oldType.getElement(op.getFieldNameAttr());
 
-  if (auto structType = dyn_cast<hw::StructType>(type)) {
-    auto enumType = structType.getFieldType("tag");
-    auto enumAttr = hw::EnumFieldAttr::get(op.getLoc(), tagName, enumType);
-    auto enumOp = builder.create<hw::EnumConstantOp>(enumAttr);
-    auto unionType = structType.getFieldType("body");
-    auto unionOp = builder.create<hw::UnionCreateOp>(unionType, tagName, input);
-    SmallVector<Value> operands = {enumOp.getResult(), unionOp.getResult()};
+  if (auto structType = dyn_cast<hw::StructType>(newType)) {
+    auto tagType = structType.getFieldType("tag");
+    auto tagValue = IntegerAttr::get(tagType, element.value.getValue());
+    auto tag = sv::LocalParamOp::create(builder, op.getLoc(), tagType, tagValue,
+                                        tagName);
+    auto bodyType = structType.getFieldType("body");
+    auto body = hw::UnionCreateOp::create(builder, bodyType, tagName, input);
+    SmallVector<Value> operands = {tag.getResult(), body.getResult()};
     return setLoweringTo<hw::StructCreateOp>(op, structType, operands);
   }
-
-  return setLoweringTo<hw::EnumConstantOp>(
-      op, hw::EnumFieldAttr::get(op.getLoc(), tagName, type));
+  auto tagValue = IntegerAttr::get(newType, element.value.getValue());
+  return setLoweringTo<sv::LocalParamOp>(op, newType, tagValue, tagName);
 }
 
 LogicalResult FIRRTLLowering::visitExpr(AggregateConstantOp op) {
@@ -3264,13 +3251,23 @@ LogicalResult FIRRTLLowering::visitExpr(AggregateConstantOp op) {
 }
 
 LogicalResult FIRRTLLowering::visitExpr(IsTagOp op) {
+
   auto tagName = op.getFieldNameAttr();
   auto lhs = getLoweredValue(op.getInput());
   if (isa<hw::StructType>(lhs.getType()))
-    lhs = builder.create<hw::StructExtractOp>(lhs, "tag");
-  auto enumField = hw::EnumFieldAttr::get(op.getLoc(), tagName, lhs.getType());
-  auto rhs = builder.create<hw::EnumConstantOp>(enumField);
-  return setLoweringTo<hw::EnumCmpOp>(op, lhs, rhs);
+    lhs = hw::StructExtractOp::create(builder, lhs, "tag");
+
+  auto index = op.getFieldIndex();
+  auto enumType = op.getInput().getType().base();
+  auto tagValue = enumType.getElementValueAttr(index);
+  auto tagValueType = IntegerType::get(op.getContext(), enumType.getTagWidth());
+  auto loweredTagValue = IntegerAttr::get(tagValueType, tagValue.getValue());
+  auto rhs = sv::LocalParamOp::create(builder, op.getLoc(), tagValueType,
+                                      loweredTagValue, tagName);
+
+  Type resultType = builder.getIntegerType(1);
+  return setLoweringTo<comb::ICmpOp>(op, resultType, ICmpPredicate::eq, lhs,
+                                     rhs, true);
 }
 
 LogicalResult FIRRTLLowering::visitExpr(SubtagOp op) {
@@ -3280,8 +3277,28 @@ LogicalResult FIRRTLLowering::visitExpr(SubtagOp op) {
 
   auto tagName = op.getFieldNameAttr();
   auto input = getLoweredValue(op.getInput());
-  auto field = builder.create<hw::StructExtractOp>(input, "body");
+  auto field = hw::StructExtractOp::create(builder, input, "body");
   return setLoweringTo<hw::UnionExtractOp>(op, field, tagName);
+}
+
+LogicalResult FIRRTLLowering::visitExpr(TagExtractOp op) {
+  // Zero width values must be lowered to nothing.
+  if (isZeroBitFIRRTLType(op.getType()))
+    return setLowering(op, Value());
+
+  auto input = getLoweredValue(op.getInput());
+  if (!input)
+    return failure();
+
+  // If the lowered enum is a struct (has both tag and body), extract the tag
+  // field.
+  if (isa<hw::StructType>(input.getType())) {
+    return setLoweringTo<hw::StructExtractOp>(op, input, "tag");
+  }
+
+  // If the lowered enum is just the tag (simple enum with no data), return it
+  // directly.
+  return setLowering(op, input);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3314,8 +3331,8 @@ LogicalResult FIRRTLLowering::visitDecl(WireOp op) {
   auto name = op.getNameAttr();
   // This is not a temporary wire created by the compiler, so attach a symbol
   // name.
-  auto wire = builder.create<hw::WireOp>(
-      op.getLoc(), getOrCreateZConstant(resultType), name, innerSym);
+  auto wire = hw::WireOp::create(
+      builder, op.getLoc(), getOrCreateZConstant(resultType), name, innerSym);
 
   if (auto svAttrs = sv::getSVAttributes(op))
     sv::setSVAttributes(wire, svAttrs);
@@ -3365,12 +3382,12 @@ LogicalResult FIRRTLLowering::visitDecl(NodeOp op) {
   auto innerSym = lowerInnerSymbol(op);
 
   if (innerSym)
-    operand = builder.create<hw::WireOp>(operand, name, innerSym);
+    operand = hw::WireOp::create(builder, operand, name, innerSym);
 
   // Move SV attributes.
   if (auto svAttrs = sv::getSVAttributes(op)) {
     if (!innerSym)
-      operand = builder.create<hw::WireOp>(operand, name);
+      operand = hw::WireOp::create(builder, operand, name);
     sv::setSVAttributes(operand.getDefiningOp(), svAttrs);
   }
 
@@ -3391,8 +3408,8 @@ LogicalResult FIRRTLLowering::visitDecl(RegOp op) {
   // Create a reg op, wiring itself to its input.
   auto innerSym = lowerInnerSymbol(op);
   Backedge inputEdge = backedgeBuilder.get(resultType);
-  auto reg = builder.create<seq::FirRegOp>(inputEdge, clockVal,
-                                           op.getNameAttr(), innerSym);
+  auto reg = seq::FirRegOp::create(builder, inputEdge, clockVal,
+                                   op.getNameAttr(), innerSym);
 
   // Pass along the start and end random initialization bits for this register.
   if (auto randomRegister = op->getAttr("firrtl.random_init_register"))
@@ -3432,8 +3449,8 @@ LogicalResult FIRRTLLowering::visitDecl(RegResetOp op) {
   bool isAsync = type_isa<AsyncResetType>(op.getResetSignal().getType());
   Backedge inputEdge = backedgeBuilder.get(resultType);
   auto reg =
-      builder.create<seq::FirRegOp>(inputEdge, clockVal, op.getNameAttr(),
-                                    resetSignal, resetValue, innerSym, isAsync);
+      seq::FirRegOp::create(builder, inputEdge, clockVal, op.getNameAttr(),
+                            resetSignal, resetValue, innerSym, isAsync);
 
   // Pass along the start and end random initialization bits for this register.
   if (auto randomRegister = op->getAttr("firrtl.random_init_register"))
@@ -3477,16 +3494,20 @@ LogicalResult FIRRTLLowering::visitDecl(MemOp op) {
     memInit = seq::FirMemInitAttr::get(init.getContext(), init.getFilename(),
                                        init.getIsBinary(), init.getIsInline());
 
-  auto memDecl = builder.create<seq::FirMemOp>(
-      memType, memSummary.readLatency, memSummary.writeLatency,
+  auto memDecl = seq::FirMemOp::create(
+      builder, memType, memSummary.readLatency, memSummary.writeLatency,
       memSummary.readUnderWrite, memSummary.writeUnderWrite, op.getNameAttr(),
       op.getInnerSymAttr(), memInit, op.getPrefixAttr(), Attribute{});
 
-  // If the module is outside the DUT, set the appropriate output directory for
-  // the memory.
-  if (!circuitState.isInDUT(theModule))
-    if (auto testBenchDir = circuitState.getTestBenchDirectory())
-      memDecl.setOutputFileAttr(testBenchDir);
+  if (auto parent = op->getParentOfType<hw::HWModuleOp>()) {
+    if (auto file = parent->getAttrOfType<hw::OutputFileAttr>("output_file")) {
+      auto dir = file;
+      if (!file.isDirectory())
+        dir = hw::OutputFileAttr::getAsDirectory(builder.getContext(),
+                                                 file.getDirectory());
+      memDecl.setOutputFileAttr(dir);
+    }
+  }
 
   // Memories return multiple structs, one for each port, which means we
   // have two layers of type to split apart.
@@ -3539,7 +3560,7 @@ LogicalResult FIRRTLLowering::visitDecl(MemOp op) {
       auto addr = addInputPort("addr", op.getAddrBits());
       auto en = addInputPort("en", 1);
       auto clk = addClock("clk");
-      auto data = builder.create<seq::FirMemReadOp>(memDecl, addr, clk, en);
+      auto data = seq::FirMemReadOp::create(builder, memDecl, addr, clk, en);
       addOutput("data", memSummary.dataWidth, data);
     } else if (memportKind == MemOp::PortKind::ReadWrite) {
       auto addr = addInputPort("addr", op.getAddrBits());
@@ -3556,8 +3577,8 @@ LogicalResult FIRRTLLowering::visitDecl(MemOp op) {
       Value mask;
       if (memSummary.isMasked)
         mask = addInputPort("wmask", memSummary.maskBits);
-      auto rdata = builder.create<seq::FirMemReadWriteOp>(
-          memDecl, addr, clk, en, wdata, mode, mask);
+      auto rdata = seq::FirMemReadWriteOp::create(builder, memDecl, addr, clk,
+                                                  en, wdata, mode, mask);
       addOutput("rdata", memSummary.dataWidth, rdata);
     } else {
       auto addr = addInputPort("addr", op.getAddrBits());
@@ -3573,7 +3594,7 @@ LogicalResult FIRRTLLowering::visitDecl(MemOp op) {
       Value mask;
       if (memSummary.isMasked)
         mask = addInputPort("mask", memSummary.maskBits);
-      builder.create<seq::FirMemWriteOp>(memDecl, addr, clk, en, data, mask);
+      seq::FirMemWriteOp::create(builder, memDecl, addr, clk, en, data, mask);
     }
   }
 
@@ -3651,8 +3672,8 @@ LogicalResult FIRRTLLowering::visitDecl(InstanceOp oldInstance) {
 
     // Create a wire for each inout operand, so there is something to connect
     // to. The instance becomes the sole driver of this wire.
-    auto wire = builder.create<sv::WireOp>(
-        portType, "." + port.getName().str() + ".wire");
+    auto wire = sv::WireOp::create(builder, portType,
+                                   "." + port.getName().str() + ".wire");
 
     // Know that the argument FIRRTL value is equal to this wire, allowing
     // connects to it to be lowered.
@@ -3672,8 +3693,8 @@ LogicalResult FIRRTLLowering::visitDecl(InstanceOp oldInstance) {
           oldInstance.getContext(), oldInstance.getInnerSymAttr(), 0,
           [&]() -> hw::InnerSymbolNamespace & { return moduleNamespace; });
 
-    auto bindOp = builder.create<sv::BindOp>(theModule.getNameAttr(),
-                                             innerSym.getSymName());
+    auto bindOp = sv::BindOp::create(builder, theModule.getNameAttr(),
+                                     innerSym.getSymName());
     // If the lowered op already had output file information, then use that.
     // Otherwise, generate some default bind information.
     if (auto outputFile = oldInstance->getAttr("output_file"))
@@ -3684,15 +3705,16 @@ LogicalResult FIRRTLLowering::visitDecl(InstanceOp oldInstance) {
   }
 
   // Create the new hw.instance operation.
-  auto newInstance = builder.create<hw::InstanceOp>(
-      newModule, oldInstance.getNameAttr(), operands, parameters, innerSym);
+  auto newInstance =
+      hw::InstanceOp::create(builder, newModule, oldInstance.getNameAttr(),
+                             operands, parameters, innerSym);
 
   if (oldInstance.getLowerToBind() || oldInstance.getDoNotPrint())
     newInstance.setDoNotPrintAttr(builder.getUnitAttr());
 
   if (newInstance.getInnerSymAttr())
     if (auto forceName = circuitState.instanceForceNames.lookup(
-            {cast<hw::HWModuleOp>(newInstance->getParentOp()).getNameAttr(),
+            {newInstance->getParentOfType<hw::HWModuleOp>().getNameAttr(),
              newInstance.getInnerNameAttr()}))
       newInstance->setAttr("hw.verilogName", forceName);
 
@@ -3724,7 +3746,7 @@ LogicalResult FIRRTLLowering::visitDecl(ContractOp oldOp) {
     types.push_back(lowered.getType());
   }
 
-  auto newOp = builder.create<verif::ContractOp>(types, inputs);
+  auto newOp = verif::ContractOp::create(builder, types, inputs);
   newOp->setDiscardableAttrs(oldOp->getDiscardableAttrDictionary());
   auto &body = newOp.getBody().emplaceBlock();
 
@@ -4058,22 +4080,32 @@ LogicalResult FIRRTLLowering::lowerDivLikeOp(Operation *op) {
 }
 
 LogicalResult FIRRTLLowering::visitExpr(CatPrimOp op) {
-  auto lhs = getLoweredValue(op.getLhs());
-  auto rhs = getLoweredValue(op.getRhs());
-  if (!lhs) {
-    return handleZeroBit(op.getLhs(), [&]() {
-      if (rhs) // cat(0bit, x) --> x
-        return setLowering(op, rhs);
-      // cat(0bit, 0bit) --> 0bit
-      return handleZeroBit(op.getRhs(),
-                           [&]() { return setLowering(op, Value()); });
-    });
+  // Handle the case of no operands - should result in a 0-bit value
+  if (op.getInputs().empty())
+    return setLowering(op, Value());
+
+  SmallVector<Value> loweredOperands;
+
+  // Lower all operands, filtering out zero-bit values
+  for (auto operand : op.getInputs()) {
+    auto loweredOperand = getLoweredValue(operand);
+    if (loweredOperand) {
+      loweredOperands.push_back(loweredOperand);
+    } else {
+      // Check if this is a zero-bit operand, which we can skip
+      auto result = handleZeroBit(operand, [&]() { return success(); });
+      if (failed(result))
+        return failure();
+      // Zero-bit operands are skipped (not added to loweredOperands)
+    }
   }
 
-  if (!rhs) // cat(x, 0bit) --> x
-    return handleZeroBit(op.getRhs(), [&]() { return setLowering(op, lhs); });
+  // If no non-zero operands, return 0-bit value
+  if (loweredOperands.empty())
+    return setLowering(op, Value());
 
-  return setLoweringTo<comb::ConcatOp>(op, lhs, rhs);
+  // Use comb.concat
+  return setLoweringTo<comb::ConcatOp>(op, loweredOperands);
 }
 
 //===----------------------------------------------------------------------===//
@@ -4100,7 +4132,7 @@ LogicalResult FIRRTLLowering::visitExpr(IsXIntrinsicOp op) {
 
 LogicalResult FIRRTLLowering::visitStmt(FPGAProbeIntrinsicOp op) {
   auto operand = getLoweredValue(op.getInput());
-  builder.create<hw::WireOp>(operand);
+  hw::WireOp::create(builder, operand);
   return success();
 }
 
@@ -4114,8 +4146,8 @@ LogicalResult FIRRTLLowering::visitExpr(PlusArgsValueIntrinsicOp op) {
   if (!type)
     return failure();
 
-  auto valueOp = builder.create<sim::PlusArgsValueOp>(
-      builder.getIntegerType(1), type, op.getFormatStringAttr());
+  auto valueOp = sim::PlusArgsValueOp::create(
+      builder, builder.getIntegerType(1), type, op.getFormatStringAttr());
   if (failed(setLowering(op.getResult(), valueOp.getResult())))
     return failure();
   if (failed(setLowering(op.getFound(), valueOp.getFound())))
@@ -4222,7 +4254,7 @@ template <typename TargetOp, typename IntrinsicOp>
 LogicalResult FIRRTLLowering::lowerVerifIntrinsicOp(IntrinsicOp op) {
   auto property = getLoweredValue(op.getProperty());
   auto enable = op.getEnable() ? getLoweredValue(op.getEnable()) : Value();
-  builder.create<TargetOp>(property, enable, op.getLabelAttr());
+  TargetOp::create(builder, property, enable, op.getLabelAttr());
   return success();
 }
 
@@ -4310,7 +4342,7 @@ LogicalResult FIRRTLLowering::visitExpr(InvalidValueOp op) {
     auto constant = getOrCreateIntConstant(*bitwidth, 0);
     // If the result is an aggregate value, we have to bitcast the constant.
     if (!type_isa<IntegerType>(resultTy))
-      constant = builder.create<hw::BitcastOp>(resultTy, constant);
+      constant = hw::BitcastOp::create(builder, resultTy, constant);
     return setLowering(op, constant);
   }
 
@@ -4402,8 +4434,8 @@ LogicalResult FIRRTLLowering::visitExpr(Mux2CellIntrinsicOp op) {
   if (!cond || !ifTrue || !ifFalse)
     return failure();
 
-  auto val = builder.create<comb::MuxOp>(ifTrue.getType(), cond, ifTrue,
-                                         ifFalse, true);
+  auto val = comb::MuxOp::create(builder, ifTrue.getType(), cond, ifTrue,
+                                 ifFalse, true);
   return setLowering(op, createValueWithMuxAnnotation(val, true));
 }
 
@@ -4416,8 +4448,8 @@ LogicalResult FIRRTLLowering::visitExpr(Mux4CellIntrinsicOp op) {
   if (!sel || !v3 || !v2 || !v1 || !v0)
     return failure();
   Value array[] = {v3, v2, v1, v0};
-  auto create = builder.create<hw::ArrayCreateOp>(array);
-  auto val = builder.create<hw::ArrayGetOp>(create, sel);
+  auto create = hw::ArrayCreateOp::create(builder, array);
+  auto val = hw::ArrayGetOp::create(builder, create, sel);
   return setLowering(op, createValueWithMuxAnnotation(val, false));
 }
 
@@ -4440,7 +4472,7 @@ LogicalResult FIRRTLLowering::visitExpr(Mux4CellIntrinsicOp op) {
 Value FIRRTLLowering::createValueWithMuxAnnotation(Operation *op, bool isMux2) {
   assert(op->getNumResults() == 1 && "only expect a single result");
   auto val = op->getResult(0);
-  auto valWire = builder.create<sv::WireOp>(val.getType());
+  auto valWire = sv::WireOp::create(builder, val.getType());
   // Use SV attributes to annotate pragmas.
   circt::sv::setSVAttributes(
       op, sv::SVAttributeAttr::get(builder.getContext(), "cadence map_to_mux",
@@ -4458,17 +4490,17 @@ Value FIRRTLLowering::createValueWithMuxAnnotation(Operation *op, bool isMux2) {
           op->getContext(), /*attr=*/nullptr, 0,
           [&]() -> hw::InnerSymbolNamespace & { return moduleNamespace; });
       auto wire =
-          builder.create<hw::WireOp>(operand, namehint + Twine(idx), innerSym);
+          hw::WireOp::create(builder, operand, namehint + Twine(idx), innerSym);
       op->setOperand(idx, wire);
     }
   }
 
-  auto assignOp = builder.create<sv::AssignOp>(valWire, val);
+  auto assignOp = sv::AssignOp::create(builder, valWire, val);
   sv::setSVAttributes(assignOp,
                       sv::SVAttributeAttr::get(builder.getContext(),
                                                "synopsys infer_mux_override",
                                                /*emitAsComment=*/true));
-  return builder.create<sv::ReadInOutOp>(valWire);
+  return sv::ReadInOutOp::create(builder, valWire);
 }
 
 Value FIRRTLLowering::createArrayIndexing(Value array, Value index) {
@@ -4480,14 +4512,14 @@ Value FIRRTLLowering::createArrayIndexing(Value array, Value index) {
   // optimization.
   if (!llvm::isPowerOf2_64(size)) {
     auto extElem = getOrCreateIntConstant(APInt(llvm::Log2_64_Ceil(size), 0));
-    auto extValue = builder.create<hw::ArrayGetOp>(array, extElem);
+    auto extValue = hw::ArrayGetOp::create(builder, array, extElem);
     SmallVector<Value> temp(llvm::NextPowerOf2(size) - size, extValue);
-    auto ext = builder.create<hw::ArrayCreateOp>(temp);
+    auto ext = hw::ArrayCreateOp::create(builder, temp);
     Value temp2[] = {ext.getResult(), array};
-    array = builder.create<hw::ArrayConcatOp>(temp2);
+    array = hw::ArrayConcatOp::create(builder, temp2);
   }
 
-  Value inBoundsRead = builder.create<hw::ArrayGetOp>(array, index);
+  Value inBoundsRead = hw::ArrayGetOp::create(builder, array, index);
 
   return inBoundsRead;
 }
@@ -4510,7 +4542,7 @@ LogicalResult FIRRTLLowering::visitExpr(MultibitMuxOp op) {
     loweredInputs.push_back(lowered);
   }
 
-  Value array = builder.create<hw::ArrayCreateOp>(loweredInputs);
+  Value array = hw::ArrayCreateOp::create(builder, loweredInputs);
   return setLowering(op, createArrayIndexing(array, index));
 }
 
@@ -4561,8 +4593,8 @@ LogicalResult FIRRTLLowering::visitExpr(XMRDerefOp op) {
   else
     xmrType = lowerType(op.getType());
 
-  auto xmr = builder.create<sv::XMRRefOp>(
-      sv::InOutType::get(xmrType), op.getRef(), op.getVerbatimSuffixAttr());
+  auto xmr = sv::XMRRefOp::create(builder, sv::InOutType::get(xmrType),
+                                  op.getRef(), op.getVerbatimSuffixAttr());
   auto readXmr = getReadValue(xmr);
   if (!isa<ClockType>(op.getType()))
     return setLowering(op, readXmr);
@@ -4597,7 +4629,7 @@ FailureOr<bool> FIRRTLLowering::lowerConnect(Value destVal, Value srcVal) {
   auto dstType = destVal.getType();
   if (srcType != dstType &&
       (isa<hw::TypeAliasType>(srcType) || isa<hw::TypeAliasType>(dstType))) {
-    srcVal = builder.create<hw::BitcastOp>(destVal.getType(), srcVal);
+    srcVal = hw::BitcastOp::create(builder, destVal.getType(), srcVal);
   }
   return TypeSwitch<Operation *, FailureOr<bool>>(destVal.getDefiningOp())
       .Case<hw::WireOp>([&](auto op) {
@@ -4645,7 +4677,7 @@ LogicalResult FIRRTLLowering::visitStmt(ConnectOp op) {
   if (!isa<hw::InOutType>(destVal.getType()))
     return op.emitError("destination isn't an inout type");
 
-  builder.create<sv::AssignOp>(destVal, srcVal);
+  sv::AssignOp::create(builder, destVal, srcVal);
   return success();
 }
 
@@ -4673,7 +4705,7 @@ LogicalResult FIRRTLLowering::visitStmt(MatchingConnectOp op) {
   if (!isa<hw::InOutType>(destVal.getType()))
     return op.emitError("destination isn't an inout type");
 
-  builder.create<sv::AssignOp>(destVal, srcVal);
+  sv::AssignOp::create(builder, destVal, srcVal);
   return success();
 }
 
@@ -4692,7 +4724,7 @@ LogicalResult FIRRTLLowering::visitStmt(ForceOp op) {
   // #ifndef SYNTHESIS
   circuitState.addMacroDecl(builder.getStringAttr("SYNTHESIS"));
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
-    addToInitialBlock([&]() { builder.create<sv::ForceOp>(destVal, srcVal); });
+    addToInitialBlock([&]() { sv::ForceOp::create(builder, destVal, srcVal); });
   });
   return success();
 }
@@ -4713,7 +4745,7 @@ LogicalResult FIRRTLLowering::visitStmt(RefForceOp op) {
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
     addToAlwaysBlock(clock, [&]() {
       addIfProceduralBlock(
-          pred, [&]() { builder.create<sv::ForceOp>(destVal, src); });
+          pred, [&]() { sv::ForceOp::create(builder, destVal, src); });
     });
   });
   return success();
@@ -4733,7 +4765,7 @@ LogicalResult FIRRTLLowering::visitStmt(RefForceInitialOp op) {
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
     addToInitialBlock([&]() {
       addIfProceduralBlock(
-          pred, [&]() { builder.create<sv::ForceOp>(destVal, src); });
+          pred, [&]() { sv::ForceOp::create(builder, destVal, src); });
     });
   });
   return success();
@@ -4753,7 +4785,7 @@ LogicalResult FIRRTLLowering::visitStmt(RefReleaseOp op) {
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
     addToAlwaysBlock(clock, [&]() {
       addIfProceduralBlock(pred,
-                           [&]() { builder.create<sv::ReleaseOp>(destVal); });
+                           [&]() { sv::ReleaseOp::create(builder, destVal); });
     });
   });
   return success();
@@ -4769,7 +4801,7 @@ LogicalResult FIRRTLLowering::visitStmt(RefReleaseInitialOp op) {
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
     addToInitialBlock([&]() {
       addIfProceduralBlock(pred,
-                           [&]() { builder.create<sv::ReleaseOp>(destVal); });
+                           [&]() { sv::ReleaseOp::create(builder, destVal); });
     });
   });
   return success();
@@ -4878,7 +4910,7 @@ LogicalResult FIRRTLLowering::visitPrintfLike(
     SmallVector<Value> operands;
     if (failed(loweredFmtOperands(op.getSubstitutions(), operands)))
       return failure();
-    builder.create<sv::FWriteOp>(op.getLoc(), fd, formatString, operands);
+    sv::FWriteOp::create(builder, op.getLoc(), fd, formatString, operands);
     return success();
   };
 
@@ -4906,7 +4938,7 @@ LogicalResult FIRRTLLowering::visitStmt(FFlushOp op) {
     return failure();
 
   auto fn = [&](Value fd) {
-    builder.create<sv::FFlushOp>(op.getLoc(), fd);
+    sv::FFlushOp::create(builder, op.getLoc(), fd);
     return success();
   };
 
@@ -4938,13 +4970,13 @@ LogicalResult FIRRTLLowering::visitStmt(StopOp op) {
   circuitState.addFragment(theModule, "STOP_COND_FRAGMENT");
 
   Value stopCond =
-      builder.create<sv::MacroRefExprOp>(cond.getType(), "STOP_COND_");
+      sv::MacroRefExprOp::create(builder, cond.getType(), "STOP_COND_");
   Value exitCond = builder.createOrFold<comb::AndOp>(stopCond, cond, true);
 
   if (op.getExitCode())
-    builder.create<sim::FatalOp>(clock, exitCond);
+    sim::FatalOp::create(builder, clock, exitCond);
   else
-    builder.create<sim::FinishOp>(clock, exitCond);
+    sim::FinishOp::create(builder, clock, exitCond);
 
   return success();
 }
@@ -4956,11 +4988,11 @@ template <typename... Args>
 static Operation *buildImmediateVerifOp(ImplicitLocOpBuilder &builder,
                                         StringRef opName, Args &&...args) {
   if (opName == "assert")
-    return builder.create<sv::AssertOp>(std::forward<Args>(args)...);
+    return sv::AssertOp::create(builder, std::forward<Args>(args)...);
   if (opName == "assume")
-    return builder.create<sv::AssumeOp>(std::forward<Args>(args)...);
+    return sv::AssumeOp::create(builder, std::forward<Args>(args)...);
   if (opName == "cover")
-    return builder.create<sv::CoverOp>(std::forward<Args>(args)...);
+    return sv::CoverOp::create(builder, std::forward<Args>(args)...);
   llvm_unreachable("unknown verification op");
 }
 
@@ -4971,11 +5003,11 @@ template <typename... Args>
 static Operation *buildConcurrentVerifOp(ImplicitLocOpBuilder &builder,
                                          StringRef opName, Args &&...args) {
   if (opName == "assert")
-    return builder.create<sv::AssertConcurrentOp>(std::forward<Args>(args)...);
+    return sv::AssertConcurrentOp::create(builder, std::forward<Args>(args)...);
   if (opName == "assume")
-    return builder.create<sv::AssumeConcurrentOp>(std::forward<Args>(args)...);
+    return sv::AssumeConcurrentOp::create(builder, std::forward<Args>(args)...);
   if (opName == "cover")
-    return builder.create<sv::CoverConcurrentOp>(std::forward<Args>(args)...);
+    return sv::CoverConcurrentOp::create(builder, std::forward<Args>(args)...);
   llvm_unreachable("unknown verification op");
 }
 
@@ -5059,7 +5091,7 @@ LogicalResult FIRRTLLowering::lowerVerificationStatement(
       // assertion triggers.  (See SystemVerilog 2017 spec section 16.9.3 for
       // more information.)
       for (auto &loweredValue : messageOps)
-        loweredValue = builder.create<sv::SampledOp>(loweredValue);
+        loweredValue = sv::SampledOp::create(builder, loweredValue);
     }
   }
 
@@ -5096,12 +5128,12 @@ LogicalResult FIRRTLLowering::lowerVerificationStatement(
             circuitState.addFragment(theModule, "ASSERT_VERBOSE_COND_FRAGMENT");
 
             addIfProceduralBlock(
-                builder.create<sv::MacroRefExprOp>(boolType,
-                                                   "ASSERT_VERBOSE_COND_"),
-                [&]() { builder.create<sv::ErrorOp>(message, messageOps); });
+                sv::MacroRefExprOp::create(builder, boolType,
+                                           "ASSERT_VERBOSE_COND_"),
+                [&]() { sv::ErrorOp::create(builder, message, messageOps); });
             addIfProceduralBlock(
-                builder.create<sv::MacroRefExprOp>(boolType, "STOP_COND_"),
-                [&]() { builder.create<sv::FatalOp>(); });
+                sv::MacroRefExprOp::create(builder, boolType, "STOP_COND_"),
+                [&]() { sv::FatalOp::create(builder); });
           });
         });
       });
@@ -5207,8 +5239,9 @@ LogicalResult FIRRTLLowering::visitStmt(UnclockedAssumeIntrinsicOp op) {
     messageOps.push_back(loweredValue);
   }
   return emitGuards(op.getLoc(), guards, [&]() {
-    builder.create<sv::AlwaysOp>(
-        ArrayRef(sv::EventControl::AtEdge), ArrayRef(predicate), [&]() {
+    sv::AlwaysOp::create(
+        builder, ArrayRef(sv::EventControl::AtEdge), ArrayRef(predicate),
+        [&]() {
           if (op.getMessageAttr().getValue().empty())
             buildImmediateVerifOp(
                 builder, "assume", predicate,
@@ -5284,28 +5317,29 @@ LogicalResult FIRRTLLowering::visitStmt(AttachOp op) {
         for (size_t i1 = 0, e = inoutValues.size(); i1 != e; ++i1) {
           for (size_t i2 = 0; i2 != e; ++i2)
             if (i1 != i2)
-              builder.create<sv::AssignOp>(inoutValues[i1], values[i2]);
+              sv::AssignOp::create(builder, inoutValues[i1], values[i2]);
         }
       },
       // In the non-synthesis case, we emit a SystemVerilog alias
       // statement.
       [&]() {
-        builder.create<sv::IfDefOp>(
-            "VERILATOR",
+        sv::IfDefOp::create(
+            builder, "VERILATOR",
             [&]() {
-              builder.create<sv::VerbatimOp>(
+              sv::VerbatimOp::create(
+                  builder,
                   "`error \"Verilator does not support alias and thus "
                   "cannot "
                   "arbitrarily connect bidirectional wires and ports\"");
             },
-            [&]() { builder.create<sv::AliasOp>(inoutValues); });
+            [&]() { sv::AliasOp::create(builder, inoutValues); });
       });
 
   return success();
 }
 
 LogicalResult FIRRTLLowering::visitStmt(BindOp op) {
-  builder.create<sv::BindOp>(op.getInstanceAttr());
+  sv::BindOp::create(builder, op.getInstanceAttr());
   return success();
 }
 
@@ -5368,7 +5402,8 @@ LogicalResult FIRRTLLowering::fixupLTLOps() {
     for (auto *user : op->getUsers()) {
       if (!usersReported.insert(user).second)
         continue;
-      if (isa<ltl::LTLDialect, verif::VerifDialect>(user->getDialect()))
+      if (isa_and_nonnull<ltl::LTLDialect, verif::VerifDialect>(
+              user->getDialect()))
         continue;
       if (isa<hw::WireOp>(user))
         continue;

@@ -117,6 +117,7 @@ def CompRegClockEnabledOp : SeqOp<"compreg.ce",
     custom<OptionalImmutableTypeMatch>(ref(type($data)), ref($initialValue), type($initialValue))
   }];
   let hasVerifier = 1;
+  let hasCanonicalizeMethod = 1;
 
   let builders = [
     OpBuilder<(ins "Value":$input, "Value":$clk, "Value":$ce,
@@ -238,7 +239,6 @@ def FirRegOp : SeqOp<"firreg",
   );
   let results = (outs AnyType:$data);
 
-  let skipDefaultBuilders = 1;
   let hasCanonicalizeMethod = true;
   let hasFolder = true;
   let builders = [
@@ -753,7 +753,7 @@ def YieldOp : SeqOp<"yield",
 
   let arguments = (ins Variadic<AnyType>:$operands);
   let builders = [
-    OpBuilder<(ins), "build($_builder, $_state, std::nullopt);">
+    OpBuilder<(ins), "build($_builder, $_state, mlir::ValueRange());">
   ];
 
   let assemblyFormat = "attr-dict ($operands^ `:` type($operands))?";

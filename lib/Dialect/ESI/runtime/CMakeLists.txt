@@ -32,6 +32,12 @@ if(ESI_STATIC_RUNTIME)
   message("-- Building ESI runtime as a static library.")
 endif()
 
+option(ESI_RUNTIME_TRACE "Enable ESI trace-level logging." OFF)
+if (ESI_RUNTIME_TRACE)
+  message("-- ESI runtime trace-level logging enabled.")
+  add_compile_definitions(ESI_RUNTIME_TRACE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
@@ -49,56 +55,53 @@ if (NOT TARGET nlohmann_json)
   FetchContent_MakeAvailable(json)
 endif()
 
-if(ESI_STATIC_RUNTIME)
-  set(ZLIB_USE_STATIC_LIBS ON)
-endif()
-
-# We need zlib to uncompress the manifest.
-find_package(ZLIB)
-if(ZLIB_FOUND)
-  set(ZLIB_LIBRARY ZLIB::ZLIB)
-else()
-  message("-- zlib not found, pulling down zlib from git")
-  set(ZLIB_BUILD_EXAMPLES OFF)
-  FetchContent_Declare(
-    ZLIB
-    GIT_REPOSITORY https://github.com/madler/zlib.git
-    GIT_TAG        v1.3.1
-  )
-  FetchContent_MakeAvailable(ZLIB)
-  set(ZLIB_INCLUDE_DIR ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
-  if(ESI_STATIC_RUNTIME)
-    set(ZLIB_LIBRARY zlibstatic)
-  else()
-    set(ZLIB_LIBRARY zlib)
-  endif()
-endif()
-
+# We need zlib to uncompress the manifest. We build it statically to avoid
+# conflicts with local zlib versions, and since we don't export anything zlib
+# related in our public headers.
+message("-- pulling down zlib from git")
+set(ZLIB_USE_STATIC_LIBS ON)
+set(ZLIB_BUILD_EXAMPLES OFF)
 FetchContent_Declare(
-  fmt
-  GIT_REPOSITORY https://github.com/fmtlib/fmt
-  GIT_TAG        11.1.4)
-FetchContent_MakeAvailable(fmt)
+  ZLIB
+  GIT_REPOSITORY https://github.com/madler/zlib.git
+  GIT_TAG        v1.3.1
+)
+FetchContent_MakeAvailable(ZLIB)
+set(ZLIB_INCLUDE_DIR ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
+set(ZLIB_LIBRARY zlibstatic)
+if(UNIX)
+  target_compile_options(zlibstatic
+    PRIVATE
+      -fPIC
+  )
+endif()
+
+# fmt is used for logging and formatting messages.
+if (NOT TARGET fmt::fmt-header-only)
+  message(STATUS "fmt not found, pulling down from git")
+  FetchContent_Declare(
+    fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt
+    GIT_TAG        11.1.4)
+  FetchContent_MakeAvailable(fmt)
+endif()
 
 # CLI11 is used for tools' command line options parsing.
-FetchContent_Declare(
-    cli11_proj
-    QUIET
-    GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
-    GIT_TAG v2.5.0
-)
-FetchContent_MakeAvailable(cli11_proj)
+if (NOT TARGET CLI11::CLI11)
+  message(STATUS "CLI11 not found, pulling down from git")
+  FetchContent_Declare(
+      cli11_proj
+      QUIET
+      GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
+      GIT_TAG v2.5.0
+  )
+  FetchContent_MakeAvailable(cli11_proj)
+endif()
 
 # In a Python wheel build, we need to install libraries to different places.
 option(WHEEL_BUILD "Set up the build for a Python wheel." OFF)
 if (WHEEL_BUILD)
   message(STATUS "Setting up for a Python wheel build.")
-endif()
-
-if(WIN32)
-  set(LIB_DIR "bin")
-else()
-  set(LIB_DIR "lib")
 endif()
 
 ##===----------------------------------------------------------------------===//
@@ -130,6 +133,7 @@ set(ESICppRuntimeHeaders
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Common.h
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Context.h
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Design.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Engines.h
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Logging.h
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Manifest.h
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Types.h
@@ -148,7 +152,11 @@ set(ESIPythonRuntimeSources
 )
 
 IF(MSVC)
-    set(CMAKE_CXX_FLAGS "/EHa")
+    # ESI runtime requires exceptions. Purge any exception-related flags from
+    # CXX_FLAGS, and add /EHa.
+    string(REGEX REPLACE "/EH[a-zA-Z-]*" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHa")
     set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS 1)
 ENDIF(MSVC)
 
@@ -170,43 +178,35 @@ if (DEFINED ZLIB_INCLUDE_DIR)
   target_include_directories(ESICppRuntime PRIVATE
     ${ZLIB_INCLUDE_DIR})
 endif()
-if(WIN32 AND TARGET zlib)
-  # On windows, DLLs must be in the same directory (or system directory) to be
-  # found. Windows doesn't have the equivalent of rpath.
-  add_custom_command(TARGET ESICppRuntime POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      $<TARGET_FILE:zlib>
-      ${CMAKE_CURRENT_BINARY_DIR}
-  )
-endif()
-target_link_libraries(ESICppRuntime PUBLIC
+
+target_link_libraries(ESICppRuntime PRIVATE
   ${ZLIB_LIBRARY}
   nlohmann_json::nlohmann_json
+)
+target_link_libraries(ESICppRuntime PRIVATE
   fmt::fmt-header-only
 )
 if(NOT MSVC)
   target_link_libraries(ESICppRuntime PRIVATE
     dl
   )
-  target_link_options(ESICppRuntime PRIVATE
+  target_link_options(ESICppRuntime PUBLIC
     -pthread
   )
 endif()
 add_dependencies(ESIRuntime ESICppRuntime)
-if (WHEEL_BUILD)
-  if (WIN32)
-    set(PYLIBDIR ".")
-  else()
-    set(PYLIBDIR "lib")
-  endif()
+if (WIN32)
+  set(ESIRT_INSTALL_BINDIR ".")
+  set(ESIRT_INSTALL_LIBDIR ".")
 else()
-  set(PYLIBDIR "python/esiaccel")
+  set(ESIRT_INSTALL_BINDIR "bin")
+  set(ESIRT_INSTALL_LIBDIR "lib")
 endif()
+
 install(TARGETS ESICppRuntime
-  DESTINATION ${PYLIBDIR}
+  DESTINATION ${ESIRT_INSTALL_LIBDIR}
   RUNTIME_DEPENDENCIES
     PRE_EXCLUDE_REGEXES .*
-    PRE_INCLUDE_REGEXES zlibd zlib libz
   COMPONENT ESIRuntime
 )
 
@@ -215,7 +215,12 @@ install(FILES ${ESICppRuntimeHeaders}
   COMPONENT ESIRuntime
 )
 
-install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/cpp/cmake/esiaccelConfig.cmake
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/cmake/esiaccelConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/cpp/cmake/esiaccelConfig.cmake
+  @ONLY
+)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cpp/cmake/esiaccelConfig.cmake
   DESTINATION cmake
   COMPONENT ESIRuntime
 )
@@ -242,7 +247,7 @@ target_link_libraries(esiquery PRIVATE
 )
 add_dependencies(ESIRuntime esiquery)
 install(TARGETS esiquery
-  DESTINATION bin
+  DESTINATION ${ESIRT_INSTALL_BINDIR}
   COMPONENT ESIRuntime
 )
 
@@ -265,9 +270,7 @@ add_dependencies(ESIRuntime esitester)
 ##===----------------------------------------------------------------------===//
 
 # Pybind11 is used to wrap the ESICppRuntime APIs.
-if(NOT DEFINED Python3_FOUND)
-  find_package(Python3 COMPONENTS Interpreter Development)
-endif()
+find_package(Python3 COMPONENTS Interpreter Development)
 if(Python3_FOUND)
   IF(MSVC)
     # Work around an issue with pybind11 and cmake incompatibility on Windows in debug mode.
@@ -358,9 +361,8 @@ if(Python3_FOUND)
       )
     endif()
     install(RUNTIME_DEPENDENCY_SET ESICppRuntime_RUNTIME_DEPS
-      DESTINATION ${PYLIBDIR}
+      DESTINATION ${ESIRT_INSTALL_LIBDIR}
       PRE_EXCLUDE_REGEXES .*
-      PRE_INCLUDE_REGEXES zlibd zlib
       COMPONENT ESIRuntime
     )
 
@@ -414,6 +416,8 @@ endif()
 
 option(ESI_COSIM "Enable ESI cosimulation." ON)
 if(ESI_COSIM)
+  message("-- ESI cosim enabled")
+
   # gRPC for cosimulation. Local install required.
   option(GRPC_PATH "Location of gRPC install.")
   if (${GRPC_PATH})
@@ -455,7 +459,7 @@ if(ESI_COSIM)
   add_dependencies(ESIRuntime CosimBackend)
 
   install(TARGETS CosimBackend
-    DESTINATION ${PYLIBDIR}
+    DESTINATION ${ESIRT_INSTALL_LIBDIR}
     COMPONENT ESIRuntime
   )
 
@@ -494,7 +498,7 @@ if (XRT_PATH)
   )
   add_dependencies(ESIRuntime XrtBackend)
   install(TARGETS XrtBackend
-    DESTINATION ${PYLIBDIR}
+    DESTINATION ${ESIRT_INSTALL_LIBDIR}
     COMPONENT ESIRuntime
   )
 endif()

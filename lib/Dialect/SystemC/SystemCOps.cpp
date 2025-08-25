@@ -332,7 +332,8 @@ CtorOp SCModuleOp::getOrCreateCtor() {
   if (ctor)
     return ctor;
 
-  return OpBuilder(getBody()).create<CtorOp>(getLoc());
+  auto builder = OpBuilder(getBody());
+  return CtorOp::create(builder, getLoc());
 }
 
 DestructorOp SCModuleOp::getOrCreateDestructor() {
@@ -347,7 +348,8 @@ DestructorOp SCModuleOp::getOrCreateDestructor() {
   if (destructor)
     return destructor;
 
-  return OpBuilder::atBlockEnd(getBodyBlock()).create<DestructorOp>(getLoc());
+  auto builder = OpBuilder::atBlockEnd(getBodyBlock());
+  return DestructorOp::create(builder, getLoc());
 }
 
 //===----------------------------------------------------------------------===//
@@ -857,7 +859,7 @@ void FuncOp::build(OpBuilder &odsBuilder, OperationState &odsState,
   assert(type.getNumInputs() == argAttrs.size());
   mlir::call_interface_impl::addArgAndResultAttrs(
       odsBuilder, odsState, argAttrs,
-      /*resultAttrs=*/std::nullopt, FuncOp::getArgAttrsAttrName(odsState.name),
+      /*resultAttrs=*/{}, FuncOp::getArgAttrsAttrName(odsState.name),
       FuncOp::getResAttrsAttrName(odsState.name));
 }
 

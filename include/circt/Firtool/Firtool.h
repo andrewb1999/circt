@@ -99,7 +99,6 @@ public:
   bool shouldReplaceSequentialMemories() const { return replSeqMem; }
   bool shouldDisableLayerSink() const { return disableLayerSink; }
   bool shouldDisableOptimization() const { return disableOptimization; }
-  bool shouldAdvancedLayerSink() const { return advancedLayerSink; }
   bool shouldLowerMemories() const { return lowerMemories; }
   bool shouldDedup() const { return !noDedup; }
   bool shouldEnableDebugInfo() const { return enableDebugInfo; }
@@ -132,7 +131,6 @@ public:
   }
   bool shouldExtractTestCode() const { return extractTestCode; }
   bool shouldFixupEICGWrapper() const { return fixupEICGWrapper; }
-  bool shouldAddCompanionAssume() const { return addCompanionAssume; }
   bool shouldDisableCSEinClasses() const { return disableCSEinClasses; }
   bool shouldSelectDefaultInstanceChoice() const {
     return selectDefaultInstanceChoice;
@@ -141,6 +139,13 @@ public:
   verif::SymbolicValueLowering getSymbolicValueLowering() const {
     return symbolicValueLowering;
   }
+  bool shouldDisableWireElimination() const { return disableWireElimination; }
+
+  bool getLintStaticAsserts() const { return lintStaticAsserts; }
+
+  bool getLintXmrsInDesign() const { return lintXmrsInDesign; }
+
+  bool getEmitAllBindFiles() const { return emitAllBindFiles; }
 
   // Setters, used by the CAPI
   FirtoolOptions &setOutputFilename(StringRef name) {
@@ -232,11 +237,6 @@ public:
 
   FirtoolOptions &setDisableAggressiveMergeConnections(bool value) {
     disableAggressiveMergeConnections = value;
-    return *this;
-  }
-
-  FirtoolOptions &setAdvancedLayerSink(bool value) {
-    advancedLayerSink = value;
     return *this;
   }
 
@@ -366,11 +366,6 @@ public:
     return *this;
   }
 
-  FirtoolOptions &setAddCompanionAssume(bool value) {
-    addCompanionAssume = value;
-    return *this;
-  }
-
   FirtoolOptions &setDisableCSEinClasses(bool value) {
     disableCSEinClasses = value;
     return *this;
@@ -386,12 +381,35 @@ public:
     return *this;
   }
 
+  FirtoolOptions &setDisableWireElimination(bool value) {
+    disableWireElimination = value;
+    return *this;
+  }
+
+  FirtoolOptions &setLintStaticAsserts(bool value) {
+    lintStaticAsserts = value;
+    return *this;
+  }
+
+  FirtoolOptions &setLintXmrsInDesign(bool value) {
+    lintXmrsInDesign = value;
+    return *this;
+  }
+
+  FirtoolOptions &setEmitAllBindFiles(bool value) {
+    emitAllBindFiles = value;
+    return *this;
+  }
+
 private:
   std::string outputFilename;
+
+  // LowerFIRRTLAnnotations
   bool disableAnnotationsUnknown;
   bool disableAnnotationsClassless;
   bool lowerAnnotationsNoRefTypePorts;
   bool allowAddingPortsOnPublic;
+
   bool probesToSignals;
   firrtl::PreserveAggregate::PreserveMode preserveAggregate;
   firrtl::PreserveValues::PreserveMode preserveMode;
@@ -405,7 +423,6 @@ private:
   bool noDedup;
   firrtl::CompanionMode companionMode;
   bool disableAggressiveMergeConnections;
-  bool advancedLayerSink;
   bool lowerMemories;
   std::string blackBoxRootPath;
   bool replSeqMem;
@@ -432,10 +449,13 @@ private:
   bool stripFirDebugInfo;
   bool stripDebugInfo;
   bool fixupEICGWrapper;
-  bool addCompanionAssume;
   bool disableCSEinClasses;
   bool selectDefaultInstanceChoice;
   verif::SymbolicValueLowering symbolicValueLowering;
+  bool disableWireElimination;
+  bool lintStaticAsserts;
+  bool lintXmrsInDesign;
+  bool emitAllBindFiles;
 };
 
 void registerFirtoolCLOptions();

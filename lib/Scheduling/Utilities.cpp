@@ -136,7 +136,7 @@ void scheduling::dumpAsDOT(Problem &prob, raw_ostream &stream) {
   for (auto opr : prob.getOperatorTypes()) {
     os << "opr" << oprId << " [label = ";
     startHTMLLabel();
-    emitTableHeader(opr.getName().str());
+    emitTableHeader(opr.getAttr().str());
     for (auto &kv : prob.getProperties(opr))
       emitTableRow(kv);
     endHTMLLabel();

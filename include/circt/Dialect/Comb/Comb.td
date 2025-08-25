@@ -15,6 +15,7 @@
 
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/Interfaces/InferIntRangeInterface.td"
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 
@@ -28,6 +29,7 @@ def CombDialect : Dialect {
   }];
   let hasConstantMaterializer = 1;
   let cppNamespace = "::circt::comb";
+  let dependentDialects = ["hw::HWDialect"];
 }
 
 // Base class for the operation in this dialect.

@@ -13,6 +13,23 @@
 using namespace circt;
 using namespace ImportVerilog;
 
+static ltl::ClockEdge convertEdgeKindLTL(const slang::ast::EdgeKind edge) {
+  using slang::ast::EdgeKind;
+  switch (edge) {
+  case EdgeKind::NegEdge:
+    return ltl::ClockEdge::Neg;
+  case EdgeKind::PosEdge:
+    return ltl::ClockEdge::Pos;
+  case EdgeKind::None:
+    // TODO: SV 16.16, what to do when no edge is specified?
+    // For now, assume all changes (two-valued should be the same as both
+    // edges)
+  case EdgeKind::BothEdges:
+    return ltl::ClockEdge::Both;
+  }
+  llvm_unreachable("all edge kinds handled");
+}
+
 static moore::Edge convertEdgeKind(const slang::ast::EdgeKind edge) {
   using slang::ast::EdgeKind;
   switch (edge) {
@@ -50,7 +67,7 @@ struct EventControlVisitor {
       if (!condition)
         return failure();
     }
-    builder.create<moore::DetectEventOp>(loc, edge, expr, condition);
+    moore::DetectEventOp::create(builder, loc, edge, expr, condition);
     return success();
   }
 
@@ -79,11 +96,53 @@ struct DelayControlVisitor {
   Location loc;
   OpBuilder &builder;
 
+  // Handle delays.
+  LogicalResult visit(const slang::ast::DelayControl &ctrl) {
+    auto delay = context.convertRvalueExpression(
+        ctrl.expr, moore::TimeType::get(builder.getContext()));
+    if (!delay)
+      return failure();
+    moore::WaitDelayOp::create(builder, loc, delay);
+    return success();
+  }
+
   // Emit an error for all other timing controls.
   template <typename T>
   LogicalResult visit(T &&ctrl) {
     return mlir::emitError(loc)
            << "unsupported delay control: " << slang::ast::toString(ctrl.kind);
+  }
+};
+
+struct LTLClockControlVisitor {
+  Context &context;
+  Location loc;
+  OpBuilder &builder;
+  Value seqOrPro;
+
+  Value visit(const slang::ast::SignalEventControl &ctrl) {
+    auto edge = convertEdgeKindLTL(ctrl.edge);
+    auto expr = context.convertRvalueExpression(ctrl.expr);
+    if (!expr)
+      return Value{};
+    Value condition;
+    if (ctrl.iffCondition) {
+      condition = context.convertRvalueExpression(*ctrl.iffCondition);
+      condition = context.convertToBool(condition, Domain::TwoValued);
+      if (!condition)
+        return Value{};
+    }
+    expr = context.convertToI1(expr);
+    if (!expr)
+      return Value{};
+    return ltl::ClockOp::create(builder, loc, seqOrPro, edge, expr);
+  }
+
+  template <typename T>
+  Value visit(T &&ctrl) {
+    mlir::emitError(loc, "unsupported LTL clock control: ")
+        << slang::ast::toString(ctrl.kind);
+    return Value{};
   }
 };
 
@@ -119,13 +178,13 @@ static LogicalResult handleRoot(Context &context,
     // empty wait op and let `Context::convertTimingControl` populate it once
     // the statement has been lowered.
   case TimingControlKind::ImplicitEvent:
-    implicitWaitOp = builder.create<moore::WaitEventOp>(loc);
+    implicitWaitOp = moore::WaitEventOp::create(builder, loc);
     return success();
 
     // Handle event control.
   case TimingControlKind::SignalEvent:
   case TimingControlKind::EventList: {
-    auto waitOp = builder.create<moore::WaitEventOp>(loc);
+    auto waitOp = moore::WaitEventOp::create(builder, loc);
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(&waitOp.getBody().emplaceBlock());
     EventControlVisitor visitor{context, loc, builder};
@@ -193,12 +252,20 @@ Context::convertTimingControl(const slang::ast::TimingControl &ctrl,
     builder.setInsertionPointToStart(&implicitWaitOp.getBody().emplaceBlock());
     for (auto readValue : readValues) {
       auto value =
-          builder.create<moore::ReadOp>(implicitWaitOp.getLoc(), readValue);
-      builder.create<moore::DetectEventOp>(
-          implicitWaitOp.getLoc(), moore::Edge::AnyChange, value, Value{});
+          moore::ReadOp::create(builder, implicitWaitOp.getLoc(), readValue);
+      moore::DetectEventOp::create(builder, implicitWaitOp.getLoc(),
+                                   moore::Edge::AnyChange, value, Value{});
     }
   }
 
   return success();
+}
+
+Value Context::convertLTLTimingControl(const slang::ast::TimingControl &ctrl,
+                                       const Value &seqOrPro) {
+  auto &builder = this->builder;
+  auto loc = this->convertLocation(ctrl.sourceRange);
+  LTLClockControlVisitor visitor{*this, loc, builder, seqOrPro};
+  return ctrl.visit(visitor);
 }
 // NOLINTEND(misc-no-recursion)

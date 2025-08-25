@@ -23,6 +23,7 @@
 #include "circt/Dialect/HW/InnerSymbolNamespace.h"
 #include "circt/Support/Debug.h"
 #include "circt/Support/LLVM.h"
+#include "circt/Support/Utils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
@@ -207,8 +208,8 @@ public:
       else
         namepath.push_back(FlatSymbolRefAttr::get(modPart));
 
-      auto hp = b.create<hw::HierPathOp>(b.getUnknownLoc(), sym,
-                                         b.getArrayAttr(namepath));
+      auto hp = hw::HierPathOp::create(b, b.getUnknownLoc(), sym,
+                                       b.getArrayAttr(namepath));
       hp.setVisibility(nla.getVisibility());
       return hp;
     };
@@ -864,13 +865,12 @@ void Inliner::mapPortsToWires(StringRef prefix, InliningLevel &il,
     }
 
     Value wire =
-        il.mic.b
-            .create<WireOp>(
-                target.getLoc(), type,
-                StringAttr::get(context, (prefix + portInfo[i].getName())),
-                NameKindEnumAttr::get(context, NameKindEnum::DroppableName),
-                ArrayAttr::get(context, newAnnotations), newSymAttr,
-                /*forceable=*/UnitAttr{})
+        WireOp::create(
+            il.mic.b, target.getLoc(), type,
+            StringAttr::get(context, (prefix + portInfo[i].getName())),
+            NameKindEnumAttr::get(context, NameKindEnum::DroppableName),
+            ArrayAttr::get(context, newAnnotations), newSymAttr,
+            /*forceable=*/UnitAttr{})
             .getResult();
     il.wires.push_back(wire);
     mapper.map(arg, wire);
@@ -1362,8 +1362,8 @@ LogicalResult Inliner::inlineInstances(FModuleOp module) {
 
 void Inliner::createDebugScope(InliningLevel &il, InstanceOp instance,
                                Value parentScope) {
-  auto op = il.mic.b.create<debug::ScopeOp>(
-      instance.getLoc(), instance.getInstanceNameAttr(),
+  auto op = debug::ScopeOp::create(
+      il.mic.b, instance.getLoc(), instance.getInstanceNameAttr(),
       instance.getModuleNameAttr().getAttr(), parentScope);
   debugScopes.push_back(op);
   il.debugScope = op;
@@ -1630,7 +1630,3 @@ class InlinerPass : public circt::firrtl::impl::InlinerBase<InlinerPass> {
   }
 };
 } // namespace
-
-std::unique_ptr<mlir::Pass> circt::firrtl::createInlinerPass() {
-  return std::make_unique<InlinerPass>();
-}

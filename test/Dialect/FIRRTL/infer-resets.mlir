@@ -414,7 +414,7 @@ firrtl.circuit "Top" {
     firrtl.matchingconnect %1, %in : !firrtl.uint<8>
 
     // Factoring of sync reset into mux works through subaccess op.
-    // CHECK: %reg6 = firrtl.regreset %clock, %extraReset, %14 
+    // CHECK: %reg6 = firrtl.regreset %clock, %extraReset, %14
     // CHECK: %16 = firrtl.mux(%init, %reset6, %reg6)
     // CHECK: firrtl.matchingconnect %reg6, %16
     // CHECK: %17 = firrtl.subaccess %reset6[%in]
@@ -495,6 +495,12 @@ firrtl.circuit "Top" {
     // CHECK: firrtl.matchingconnect %10, %c0_ui8_0
     // CHECK: %reg_vector = firrtl.regreset %clock, %reset, %6
     %reg_vector = firrtl.reg %clock : !firrtl.clock, !firrtl.vector<uint<8>, 4>
+    // CHECK: [[ENUMCREATE:%[0-9]+]] = firrtl.enumcreate a(%c0_ui0) : (!firrtl.const.uint<0>) -> !firrtl.const.enum<a>
+    // CHECK: %reg_enum_0 = firrtl.regreset %clock, %reset, [[ENUMCREATE]] : !firrtl.clock, !firrtl.asyncreset, !firrtl.const.enum<a>, !firrtl.enum<a>
+    %reg_enum_0 = firrtl.reg %clock : !firrtl.clock, !firrtl.enum<a>
+    // CHECK: [[BITCAST:%[0-9]+]] = firrtl.bitcast %c0_ui1 : (!firrtl.const.uint<1>) -> !firrtl.const.enum<a = 1>
+    // CHECK: %reg_enum_1 = firrtl.regreset %clock, %reset, [[BITCAST]] : !firrtl.clock, !firrtl.asyncreset, !firrtl.const.enum<a = 1>, !firrtl.enum<a = 1>
+    %reg_enum_1 = firrtl.reg %clock : !firrtl.clock, !firrtl.enum<a = 1>
   }
 }
 
@@ -577,8 +583,6 @@ firrtl.circuit "FullAsyncNested" {
     firrtl.matchingconnect %inst_io_in, %io_in : !firrtl.uint<8>
     // CHECK: %io_out_REG = firrtl.regreset %clock, %reset, %c0_ui8
     %io_out_REG = firrtl.reg %clock : !firrtl.clock, !firrtl.uint<8>
-    // CHECK: %io_out_REG_NO = firrtl.reg %clock : !firrtl.clock, !firrtl.uint<8>
-    %io_out_REG_NO = firrtl.reg %clock {annotations = [{class = "sifive.enterprise.firrtl.ExcludeMemFromMemToRegOfVec"}]}: !firrtl.clock, !firrtl.uint<8>
     firrtl.matchingconnect %io_out_REG, %io_in : !firrtl.uint<8>
     %0 = firrtl.add %io_out_REG, %inst_io_out : (!firrtl.uint<8>, !firrtl.uint<8>) -> !firrtl.uint<9>
     %1 = firrtl.bits %0 7 to 0 : (!firrtl.uint<9>) -> !firrtl.uint<8>
@@ -733,7 +737,7 @@ firrtl.circuit "MoveAcrossBlocks2" {
     // CHECK-NEXT: %localReset = firrtl.wire
     // CHECK-NEXT: firrtl.when %ui1 : !firrtl.uint<1> {
     // CHECK-NEXT:   [[TMP:%.+]] = firrtl.asAsyncReset %ui1
-    // CHECK-NEXT:   [[TMP2:%.+]] = firrtl.node [[TMP]] : !firrtl.asyncreset 
+    // CHECK-NEXT:   [[TMP2:%.+]] = firrtl.node [[TMP]] : !firrtl.asyncreset
     // CHECK-NEXT:   firrtl.matchingconnect %localReset, [[TMP2]]
     // CHECK-NEXT: }
     // CHECK-NEXT: firrtl.when %ui1 : !firrtl.uint<1> {
@@ -759,7 +763,7 @@ firrtl.circuit "MoveAcrossBlocks3" {
     // CHECK-NEXT: %reg = firrtl.regreset %clock, %localReset, [[RV]]
     // CHECK-NEXT: firrtl.when %ui1 : !firrtl.uint<1> {
     // CHECK-NEXT:   [[TMP:%.+]] = firrtl.asAsyncReset %ui1
-    // CHECK-NEXT:   [[TMP2:%.+]] = firrtl.node [[TMP]] : !firrtl.asyncreset 
+    // CHECK-NEXT:   [[TMP2:%.+]] = firrtl.node [[TMP]] : !firrtl.asyncreset
     // CHECK-NEXT:   firrtl.matchingconnect %localReset, [[TMP2]]
     // CHECK-NEXT: }
   }
@@ -1016,7 +1020,7 @@ firrtl.circuit "RefResetBundle" {
   // CHECK-LABEL: firrtl.module @RefResetBundle
   // CHECK-NOT: firrtl.reset
   firrtl.module @RefResetBundle(in %driver: !firrtl.asyncreset, out %out: !firrtl.bundle<a: reset, b: reset>) {
-  %r = firrtl.wire : !firrtl.bundle<a: reset, b flip: reset> 
+  %r = firrtl.wire : !firrtl.bundle<a: reset, b flip: reset>
   %ref_r = firrtl.ref.send %r : !firrtl.bundle<a: reset, b flip: reset>
   %reset = firrtl.ref.resolve %ref_r : !firrtl.probe<bundle<a: reset, b: reset>>
   firrtl.matchingconnect %out, %reset : !firrtl.bundle<a: reset, b: reset>
@@ -1037,7 +1041,7 @@ firrtl.circuit "RefResetSub" {
   // CHECK-LABEL: firrtl.module @RefResetSub
   // CHECK-NOT: firrtl.reset
   firrtl.module @RefResetSub(in %driver: !firrtl.asyncreset, out %out_a : !firrtl.reset, out %out_b: !firrtl.vector<reset,2>) {
-  %r = firrtl.wire : !firrtl.bundle<a: reset, b flip: vector<reset, 2>> 
+  %r = firrtl.wire : !firrtl.bundle<a: reset, b flip: vector<reset, 2>>
   %ref_r = firrtl.ref.send %r : !firrtl.bundle<a: reset, b flip: vector<reset, 2>>
   %ref_r_a = firrtl.ref.sub %ref_r[0] : !firrtl.probe<bundle<a: reset, b : vector<reset, 2>>>
   %reset_a = firrtl.ref.resolve %ref_r_a : !firrtl.probe<reset>

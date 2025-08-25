@@ -215,20 +215,21 @@ void IndexRemoval::runOnOperation() {
 
   auto *ctx = &context;
   mlir::GreedyRewriteConfig config;
-  config.useTopDownTraversal = true;
-  config.enableRegionSimplification = mlir::GreedySimplifyRegionLevel::Disabled;
+  config.setUseTopDownTraversal(true);
+  config.setRegionSimplificationLevel(
+      mlir::GreedySimplifyRegionLevel::Disabled);
   RewritePatternSet patterns{ctx};
   patterns.add<ReplaceConstantOpAttr>(ctx, 64);
   patterns.add<ReplaceIndexCast<arith::IndexCastOp, arith::ExtSIOp>,
                ReplaceIndexCast<arith::IndexCastUIOp, arith::ExtUIOp>>(ctx);
-  if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns),
-                                          config)))
+  if (failed(
+          applyPatternsGreedily(getOperation(), std::move(patterns), config)))
     return signalPassFailure();
 
   patterns.clear();
   patterns.add<ReplaceFuncSignature>(ctx, 64);
-  if (failed(applyOpPatternsAndFold(SmallVector<Operation *>{getOperation()},
-                                    std::move(patterns))))
+  if (failed(applyOpPatternsGreedily(SmallVector<Operation *>{getOperation()},
+                                     std::move(patterns))))
     return signalPassFailure();
 }
 

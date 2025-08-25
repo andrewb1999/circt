@@ -15,31 +15,45 @@ from __future__ import annotations
 from . import esiCppAccel as cpp
 
 from typing import TYPE_CHECKING
+
 if TYPE_CHECKING:
   from .accelerator import HWModule
 
 from concurrent.futures import Future
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+import sys
+import traceback
 
 
 def _get_esi_type(cpp_type: cpp.Type):
   """Get the wrapper class for a C++ type."""
-  for cpp_type_cls, fn in __esi_mapping.items():
+  if isinstance(cpp_type, cpp.ChannelType):
+    return _get_esi_type(cpp_type.inner)
+
+  for cpp_type_cls, wrapper_cls in __esi_mapping.items():
     if isinstance(cpp_type, cpp_type_cls):
-      return fn(cpp_type)
-  return ESIType(cpp_type)
+      return wrapper_cls.wrap_cpp(cpp_type)
+  return ESIType.wrap_cpp(cpp_type)
 
 
-# Mapping from C++ types to functions constructing the Python object
-# corresponding to that type.
-__esi_mapping: Dict[Type, Callable] = {
-    cpp.ChannelType: lambda cpp_type: _get_esi_type(cpp_type.inner)
-}
+# Mapping from C++ types to wrapper classes
+__esi_mapping: Dict[Type, Type] = {}
 
 
 class ESIType:
 
-  def __init__(self, cpp_type: cpp.Type):
+  def __init__(self, id: str):
+    self._init_from_cpp(cpp.Type(id))
+
+  @classmethod
+  def wrap_cpp(cls, cpp_type: cpp.Type):
+    """Wrap a C++ ESI type with its corresponding Python ESI Type."""
+    instance = cls.__new__(cls)
+    instance._init_from_cpp(cpp_type)
+    return instance
+
+  def _init_from_cpp(self, cpp_type: cpp.Type):
+    """Initialize instance attributes from a C++ type object."""
     self.cpp_type = cpp_type
 
   @property
@@ -84,6 +98,9 @@ class ESIType:
 
 class VoidType(ESIType):
 
+  def __init__(self, id: str):
+    self._init_from_cpp(cpp.VoidType(id))
+
   def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
     if obj is not None:
       return (False, f"void type cannot must represented by None, not {obj}")
@@ -108,8 +125,8 @@ __esi_mapping[cpp.VoidType] = VoidType
 
 class BitsType(ESIType):
 
-  def __init__(self, cpp_type: cpp.BitsType):
-    self.cpp_type: cpp.BitsType = cpp_type
+  def __init__(self, id: str, width: int):
+    self._init_from_cpp(cpp.BitsType(id, width))
 
   def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
     if not isinstance(obj, (bytearray, bytes, list)):
@@ -141,8 +158,8 @@ __esi_mapping[cpp.BitsType] = BitsType
 
 class IntType(ESIType):
 
-  def __init__(self, cpp_type: cpp.IntegerType):
-    self.cpp_type: cpp.IntegerType = cpp_type
+  def __init__(self, id: str, width: int):
+    self._init_from_cpp(cpp.IntegerType(id, width))
 
   @property
   def bit_width(self) -> int:
@@ -150,6 +167,9 @@ class IntType(ESIType):
 
 
 class UIntType(IntType):
+
+  def __init__(self, id: str, width: int):
+    self._init_from_cpp(cpp.UIntType(id, width))
 
   def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
     if not isinstance(obj, int):
@@ -173,6 +193,9 @@ __esi_mapping[cpp.UIntType] = UIntType
 
 
 class SIntType(IntType):
+
+  def __init__(self, id: str, width: int):
+    self._init_from_cpp(cpp.SIntType(id, width))
 
   def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
     if not isinstance(obj, int):
@@ -201,11 +224,16 @@ __esi_mapping[cpp.SIntType] = SIntType
 
 class StructType(ESIType):
 
-  def __init__(self, cpp_type: cpp.StructType):
-    self.cpp_type = cpp_type
-    self.fields: List[Tuple[str, ESIType]] = [
-        (name, _get_esi_type(ty)) for (name, ty) in cpp_type.fields
-    ]
+  def __init__(self, id: str, fields: List[Tuple[str, "ESIType"]]):
+    # Convert Python ESIType fields to cpp Type fields
+    cpp_fields = [(name, field_type.cpp_type) for name, field_type in fields]
+    self._init_from_cpp(cpp.StructType(id, cpp_fields))
+
+  def _init_from_cpp(self, cpp_type: cpp.StructType):
+    """Initialize instance attributes from a C++ type object."""
+    super()._init_from_cpp(cpp_type)
+    # For wrap_cpp path, we need to convert C++ fields back to Python
+    self.fields = [(name, _get_esi_type(ty)) for (name, ty) in cpp_type.fields]
 
   @property
   def bit_width(self) -> int:
@@ -250,8 +278,12 @@ __esi_mapping[cpp.StructType] = StructType
 
 class ArrayType(ESIType):
 
-  def __init__(self, cpp_type: cpp.ArrayType):
-    self.cpp_type = cpp_type
+  def __init__(self, id: str, element_type: "ESIType", size: int):
+    self._init_from_cpp(cpp.ArrayType(id, element_type.cpp_type, size))
+
+  def _init_from_cpp(self, cpp_type: cpp.ArrayType):
+    """Initialize instance attributes from a C++ type object."""
+    super()._init_from_cpp(cpp_type)
     self.element_type = _get_esi_type(cpp_type.element)
     self.size = cpp_type.size
 
@@ -364,8 +396,12 @@ class BundlePort:
     # TODO: add a proper registration mechanism for service ports.
     if isinstance(cpp_port, cpp.Function):
       return super().__new__(FunctionPort)
+    if isinstance(cpp_port, cpp.Callback):
+      return super().__new__(CallbackPort)
     if isinstance(cpp_port, cpp.MMIORegion):
       return super().__new__(MMIORegion)
+    if isinstance(cpp_port, cpp.Telemetry):
+      return super().__new__(TelemetryPort)
     return super().__new__(cls)
 
   def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
@@ -442,16 +478,78 @@ class FunctionPort(BundlePort):
     self.cpp_port.connect()
     self.connected = True
 
-  def call(self, **kwargs: Any) -> Future:
+  def call(self, *args: Any, **kwargs: Any) -> Future:
     """Call the function with the given argument and returns a future of the
     result."""
-    valid, reason = self.arg_type.is_valid(kwargs)
+
+    # Accept either positional or keyword arguments, but not both.
+    if len(args) > 0 and len(kwargs) > 0:
+      raise ValueError("cannot use both positional and keyword arguments")
+
+    # Handle arguments: for single positional arg, unwrap it from tuple
+    if len(args) == 1:
+      selected = args[0]
+    elif len(args) > 1:
+      selected = args
+    else:
+      selected = kwargs
+
+    valid, reason = self.arg_type.is_valid(selected)
     if not valid:
       raise ValueError(
-          f"'{kwargs}' cannot be converted to '{self.arg_type}': {reason}")
-    arg_bytes: bytearray = self.arg_type.serialize(kwargs)
+          f"'{selected}' cannot be converted to '{self.arg_type}': {reason}")
+    arg_bytes: bytearray = self.arg_type.serialize(selected)
     cpp_future = self.cpp_port.call(arg_bytes)
     return MessageFuture(self.result_type, cpp_future)
 
   def __call__(self, *args: Any, **kwds: Any) -> Future:
     return self.call(*args, **kwds)
+
+
+class CallbackPort(BundlePort):
+  """Callback ports are the inverse of function ports -- instead of calls to the
+  accelerator, they get called from the accelerator. Specify the function which
+  you'd like the accelerator to call when you call `connect`."""
+
+  def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
+    super().__init__(owner, cpp_port)
+    self.arg_type = self.read_port("arg").type
+    self.result_type = self.write_port("result").type
+    self.connected = False
+
+  def connect(self, cb: Callable[[Any], Any]):
+
+    def type_convert_wrapper(cb: Callable[[Any], Any],
+                             msg: bytearray) -> Optional[bytearray]:
+      try:
+        (obj, leftover) = self.arg_type.deserialize(msg)
+        if len(leftover) != 0:
+          raise ValueError(f"leftover bytes: {leftover}")
+        result = cb(obj)
+        if result is None:
+          return None
+        return self.result_type.serialize(result)
+      except Exception as e:
+        traceback.print_exception(e)
+        return None
+
+    self.cpp_port.connect(lambda x: type_convert_wrapper(cb=cb, msg=x))
+    self.connected = True
+
+
+class TelemetryPort(BundlePort):
+  """Telemetry ports report an individual piece of information from the
+  acceelerator. The method of accessing telemetry will likely change in the
+  future."""
+
+  def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
+    super().__init__(owner, cpp_port)
+    self.connected = False
+
+  def connect(self):
+    self.cpp_port.connect()
+    self.connected = True
+
+  def read(self) -> Future:
+    cpp_future = self.cpp_port.read()
+    return MessageFuture(self.cpp_port.type, cpp_future)

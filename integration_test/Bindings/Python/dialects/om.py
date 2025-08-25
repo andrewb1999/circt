@@ -33,7 +33,7 @@ with Context() as ctx, Location.unknown():
       om.class.fields %2, %0, %0 : !om.class.type<@comp>, !om.class.type<@node>, !om.class.type<@node>
     }
 
-    om.class @Test(%param: !om.integer) -> (field: !om.integer, child: !om.class.type<@Child>, reference: !om.ref, list: !om.list<!om.string>, tuple: tuple<!om.list<!om.string>, !om.integer>, nest: !om.class.type<@Nest>, map: !om.map<!om.string, !om.integer>, map_create: !om.map<!om.string, !om.integer>, true: i1, false: i1) {
+    om.class @Test(%param: !om.integer) -> (field: !om.integer, child: !om.class.type<@Child>, reference: !om.ref, list: !om.list<!om.string>, nest: !om.class.type<@Nest>, true: i1, false: i1) {
       %sym = om.constant #om.ref<<@Root::@x>> : !om.ref
 
       %c_14 = om.constant #om.integer<14> : !om.integer
@@ -42,26 +42,18 @@ with Context() as ctx, Location.unknown():
 
       %list = om.constant #om.list<!om.string, ["X" : !om.string, "Y" : !om.string]> : !om.list<!om.string>
 
-      %tuple = om.tuple_create %list, %c_14: !om.list<!om.string>, !om.integer
-
       %c_15 = om.constant #om.integer<15> : !om.integer
       %1 = om.object @Child(%c_15) : (!om.integer) -> !om.class.type<@Child>
       %list_child = om.list_create %0, %1: !om.class.type<@Child>
       %2 = om.object @Nest(%list_child) : (!om.list<!om.class.type<@Child>>) -> !om.class.type<@Nest>
 
-      %3 = om.constant #om.map<!om.integer, {a = #om.integer<42>, b = #om.integer<32>}> : !om.map<!om.string, !om.integer>
 
-      %x = om.constant "X" : !om.string
-      %y = om.constant "Y" : !om.string
-      %entry1 = om.tuple_create %x, %c_14: !om.string, !om.integer
-      %entry2 = om.tuple_create %y, %c_15: !om.string, !om.integer
 
-      %map = om.map_create %entry1, %entry2: !om.string, !om.integer
 
       %true = om.constant true
       %false = om.constant false
 
-      om.class.fields %param, %0, %sym, %list, %tuple, %2, %3, %map, %true, %false : !om.integer, !om.class.type<@Child>, !om.ref, !om.list<!om.string>, tuple<!om.list<!om.string>, !om.integer>, !om.class.type<@Nest>, !om.map<!om.string, !om.integer>, !om.map<!om.string, !om.integer>, i1, i1
+      om.class.fields %param, %0, %sym, %list, %2, %true, %false : !om.integer, !om.class.type<@Child>, !om.ref, !om.list<!om.string>, !om.class.type<@Nest>, i1, i1
     }
 
     om.class @Child(%0: !om.integer) -> (foo: !om.integer) {
@@ -104,6 +96,11 @@ with Context() as ctx, Location.unknown():
       %5 = om.integer.add %1, %3 : !om.integer
       om.class.fields %5 : !om.integer
     }
+    om.class @AppendList(%head: !om.string, %tail: !om.list<!om.string>) -> (result: !om.list<!om.string>) {
+      %0 = om.list_create %head : !om.string
+      %1 = om.list_concat %0, %tail : !om.list<!om.string>
+      om.class.fields %1 : !om.list<!om.string>
+    }
   }
   """)
 
@@ -144,82 +141,37 @@ print(obj.type.name)
 print(obj.field)
 
 # location of the om.class.field @field
-# CHECK: field: loc("-":50:7)
+# CHECK: field: loc("-":{{.*}}:{{.*}})
 print("field:", obj.get_field_loc("field"))
 
 # CHECK: child.foo: 14
 print("child.foo: ", obj.child.foo)
-# CHECK: child.foo.loc loc("-":54:7)
+# CHECK: child.foo.loc loc("-":{{.*}}:{{.*}})
 print("child.foo.loc", obj.child.get_field_loc("foo"))
 # CHECK: ('Root', 'x')
 print(obj.reference)
-(fst, snd) = obj.tuple
-# CHECK: 14
-print(snd)
-
-# CHECK: loc("-":50:7)
-print("tuple", obj.get_field_loc("tuple"))
-
-# CHECK: loc("-":22:5)
-print(obj.loc)
-
-try:
-  print(obj.tuple[3])
-except IndexError as e:
-  # CHECK: tuple index out of range
-  print(e)
 
 for (name, field) in obj:
   # location from om.class.field @child, %0 : !om.class.type<@Child>
   # CHECK: name: child, field: <circt.dialects.om.Object object
-  # CHECK-SAME: loc: loc("-":26:12)
+  # CHECK-SAME: loc: loc("-":{{.*}}:{{.*}})
   # location from om.class.field @field, %param : !om.integer
   # CHECK: name: field, field: 42
-  # CHECK-SAME: loc: loc("-":50:7)
+  # CHECK-SAME: loc: loc("-":{{.*}}:{{.*}})
   # location from om.class.field @reference, %sym : !om.ref
   # CHECK: name: reference, field: ('Root', 'x')
-  # CHECK-SAME: loc: loc("-":50:7)
+  # CHECK-SAME: loc: loc("-":{{.*}}:{{.*}})
   loc = obj.get_field_loc(name)
   print(f"name: {name}, field: {field}, loc: {loc}")
 
+print("Check list")
+# CHECK: Check list
 # CHECK: ['X', 'Y']
-print(obj.list)
+print(list(obj.list))
 for child in obj.nest.list_child:
   # CHECK: 14
   # CHECK-NEXT: 15
   print(child.foo)
-
-# CHECK: 2
-print(len(obj.map))
-# CHECK: {'a': 42, 'b': 32}
-print(obj.map)
-for k, v in obj.map.items():
-  # CHECK-NEXT: a 42
-  # CHECK-NEXT: b 32
-  print(k, v)
-
-try:
-  print(obj.map_create[1])
-except KeyError as e:
-  # CHECK-NEXT: 'key is not integer'
-  print(e)
-try:
-  print(obj.map_create["INVALID"])
-except KeyError as e:
-  # CHECK-NEXT: 'key not found'
-  print(e)
-# CHECK-NEXT: 14
-print(obj.map_create["X"])
-
-for k, v in obj.map_create.items():
-  # CHECK-NEXT: X 14
-  # CHECK-NEXT: Y 15
-  print(k, v)
-
-# CHECK: True
-print(obj.true)
-# CHECK: False
-print(obj.false)
 
 obj = evaluator.instantiate("Client")
 object_dict: Dict[om.Object, str] = {}
@@ -258,6 +210,24 @@ delayed = evaluator.instantiate("IntegerBinaryArithmeticObjectsDelayed")
 
 # CHECK: 3
 print(delayed.result)
+
+# Test string and list arguments
+obj = evaluator.instantiate("AppendList", "a", ["b", "c"])
+# CHECK: ['a', 'b', 'c']
+print(list(obj.result))
+
+# Test string and list arguments
+try:
+  obj = evaluator.instantiate("AppendList", "a", [1, "b"])
+except TypeError as e:
+  # CHECK: List elements must be of the same type
+  print(e)
+
+try:
+  obj = evaluator.instantiate("AppendList", "a", [])
+except TypeError as e:
+  # CHECK: Empty list is prohibited now
+  print(e)
 
 with Context() as ctx:
   circt.register_dialects(ctx)

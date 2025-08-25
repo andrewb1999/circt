@@ -62,14 +62,14 @@ struct SequenceInliner
   FailureOr<DeletionKind> visitOp(InterleaveSequencesOp op) {
     SmallVector<Block *> blocks;
     for (auto [i, seq] : llvm::enumerate(op.getSequences())) {
-      auto *block = materializedSequences.lookup(seq);
-      if (!block)
+      auto iter = materializedSequences.find(seq);
+      if (iter == materializedSequences.end())
         return op->emitError()
                << "sequence operand #" << i
                << " could not be resolved; it was likely produced by an op or "
                   "block argument not supported by this pass";
 
-      blocks.push_back(block);
+      blocks.push_back(iter->getSecond().first);
     }
 
     LLVM_DEBUG(llvm::dbgs()
@@ -81,44 +81,79 @@ struct SequenceInliner
   }
 
   FailureOr<DeletionKind> visitOp(GetSequenceOp op) {
-    auto seqOp = table.lookup<SequenceOp>(op.getSequenceAttr());
+    auto seqOp = table.lookup<SequenceOp>(op.getSequenceAttr().getAttr());
     if (!seqOp)
       return op->emitError() << "referenced sequence not found";
 
     LLVM_DEBUG(llvm::dbgs() << "  - Registering existing sequence: "
                             << op.getSequence() << "\n");
 
-    materializedSequences[op.getResult()] = seqOp.getBody();
+    materializedSequences[op.getResult()] =
+        std::make_pair(seqOp.getBody(), IRMapping());
+    return DeletionKind::Delete;
+  }
+
+  FailureOr<DeletionKind> visitOp(SubstituteSequenceOp op) {
+    LLVM_DEBUG(llvm::dbgs() << "  - Substitute sequence: " << op << "\n");
+
+    auto iter = materializedSequences.find(op.getSequence());
+    if (iter == materializedSequences.end())
+      return op->emitError() << "sequence operand could not be resolved; it "
+                                "was likely produced by an op or block "
+                                "argument not supported by this pass";
+
+    IRMapping mapping = iter->getSecond().second;
+    Block *block = iter->getSecond().first;
+    for (auto [arg, repl] :
+         llvm::zip(block->getArguments(), op.getReplacements())) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "    - Mapping " << arg << " to " << repl << "\n");
+      mapping.map(arg, repl);
+    }
+
+    materializedSequences[op.getResult()] = std::make_pair(block, mapping);
     return DeletionKind::Delete;
   }
 
   FailureOr<DeletionKind> visitOp(RandomizeSequenceOp op) {
     LLVM_DEBUG(llvm::dbgs() << "  - Randomize sequence: " << op << "\n");
 
-    auto *block = materializedSequences.lookup(op.getSequence());
-    if (!block)
+    auto iter = materializedSequences.find(op.getSequence());
+    if (iter == materializedSequences.end())
       return op->emitError() << "sequence operand could not be resolved; it "
                                 "was likely produced by an op or block "
                                 "argument not supported by this pass";
 
-    materializedSequences[op.getResult()] = block;
+    // It's important to force a copy here. Without the temporary variable, we'd
+    // assign an lvalue.
+    auto value = iter->getSecond();
+    materializedSequences[op.getResult()] = value;
     return DeletionKind::Delete;
   }
 
   FailureOr<DeletionKind> visitOp(EmbedSequenceOp op) {
     LLVM_DEBUG(llvm::dbgs() << "  - Inlining sequence: " << op << "\n");
 
-    auto *block = materializedSequences.lookup(op.getSequence());
-    if (!block)
+    auto iter = materializedSequences.find(op.getSequence());
+    if (iter == materializedSequences.end())
       return op->emitError() << "sequence operand could not be resolved; it "
                                 "was likely produced by an op or block "
                                 "argument not supported by this pass";
 
     OpBuilder builder(op);
     builder.setInsertionPointAfter(op);
-    IRMapping mapping;
-    for (auto &op : *block)
-      builder.clone(op, mapping);
+    IRMapping mapping = iter->getSecond().second;
+
+    LLVM_DEBUG({
+      for (auto [k, v] : mapping.getValueMap())
+        llvm::dbgs() << "    - Maps " << k << " to " << v << "\n";
+    });
+
+    for (auto &op : *iter->getSecond().first) {
+      Operation *o = builder.clone(op, mapping);
+      (void)o;
+      LLVM_DEBUG(llvm::dbgs() << "    - Inlined " << *o << "\n");
+    }
 
     ++numSequencesInlined;
 
@@ -134,7 +169,7 @@ struct SequenceInliner
   }
 
   SymbolTable table;
-  DenseMap<Value, Block *> materializedSequences;
+  DenseMap<Value, std::pair<Block *, IRMapping>> materializedSequences;
   SmallVector<std::unique_ptr<Block>> blockStorage;
   size_t numSequencesInlined = 0;
   size_t numSequencesInterleaved = 0;
@@ -171,7 +206,7 @@ void SequenceInliner::materializeInterleavedSequence(Value value,
     }
   }
 
-  materializedSequences[value] = interleavedBlock;
+  materializedSequences[value] = std::make_pair(interleavedBlock, IRMapping());
   numSequencesInterleaved += blocks.size();
 }
 
@@ -203,11 +238,6 @@ void InlineSequencesPass::runOnOperation() {
   for (auto testOp : moduleOp.getOps<TestOp>())
     if (failed(inliner.inlineSequences(testOp)))
       return signalPassFailure();
-
-  // Remove all sequences since they are not accessible from the outside and
-  // are not needed anymore since we fully inlined them.
-  for (auto seqOp : llvm::make_early_inc_range(moduleOp.getOps<SequenceOp>()))
-    seqOp->erase();
 
   numSequencesInlined = inliner.numSequencesInlined;
   numSequencesInterleaved = inliner.numSequencesInterleaved;

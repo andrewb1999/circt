@@ -285,23 +285,7 @@ Example:
 }
 ```
 
-### [BlackBoxResourceFileNameAnno](https://javadoc.io/doc/edu.berkeley.cs/firrtl_2.13/latest/firrtl/transforms/BlackBoxResourceFileNameAnno.html)
 
-| Property         | Type   | Description                                      |
-| ----------       | ------ | -------------                                    |
-| class            | string | `firrtl.transforms.BlackBoxResourceFileNameAnno` |
-| resourceFileName | string | Output filename                                  |
-
-Specifies the output file name for the list of black box source files that
-is generated as a collateral of the pass.
-
-Example:
-```json
-{
-  "class": "firrtl.transforms.BlackBoxResourceFileNameAnno",
-  "resourceFileName": "FileList.f"
-}
-```
 
 ### [BlackBoxTargetDirAnno](https://javadoc.io/doc/edu.berkeley.cs/firrtl_2.13/latest/firrtl/transforms/BlackBoxTargetDirAnno.html)
 
@@ -595,10 +579,11 @@ Example:
 
 ### InjectDUTHierarchyAnnotation
 
-| Property | Type   | Description                                             |
-|----------|--------|---------------------------------------------------------|
-| class    | string | `sifive.enterprise.firrtl.InjectDUTHierarchyAnnotation` |
-| name     | string | The name of the module containing original DUT logic    |
+| Property | Type    | Description                                                                                       |
+|----------|---------|---------------------------------------------------------------------------------------------------|
+| class    | string  | `sifive.enterprise.firrtl.InjectDUTHierarchyAnnotation`                                           |
+| name     | string  | The name of the module containing original DUT logic                                              |
+| moveDut  | boolean | Optional: if true, then treat the newly created module as the DUT. If unset, then treat as false. |
 
 This annotation can be used to add an extra level of hierarchy in the design
 under the DUT (indicated with a `MarkDUTAnnotation`).  All logic in the original
@@ -607,13 +592,19 @@ used in combination with `ExtractBlackBoxAnnotation` (or with passes that add
 these annotations to extract components like clock gates or memories) to not
 intermix the original DUT contents with extracted module instantiations.
 
+If the `moveDut` field is true, then the newly created module with the specified
+`name` will be treated as the design-under-test.  The `MarkDUTAnnotation` will
+be moved to this module.  If this field is false, then the design-under-test
+will not be changed.
+
 This annotation should only appear zero or once.
 
 Example:
 ``` json
 {
   "class": "sifive.enterprise.firrtl.InjectDUTHierarchyAnnotation",
-  "name": "Logic"
+  "name": "Logic",
+  "moveDut": false
 }
 ```
 
@@ -775,9 +766,13 @@ Example:
 | filename   | string | The file to write to                                |
 
 This annotation triggers the creation of a file containing a JSON array of the
-names of all external modules in the device under test which are not imported
+`defname`s of all external modules in the device under test which are not imported
 or inlined blackbox modules. This will only collect modules which are
 instantiated under a module annotated with `MarkDUTAnnotation`.
+
+If any external modules (including imported and inlined blackboxes) have a
+`SitestBlackBoxLibrariesAnnotation`, the libraries specified in that annotation
+will be included in the output.
 
 Example:
 ```json
@@ -795,15 +790,41 @@ Example:
 | filename   | string | The file to write to                                           |
 
 This annotation triggers the creation of a file containing a JSON array of the
-names of all external modules in the test harness which are not imported or
+`defname`s of all external modules in the test harness which are not imported or
 inlined blackbox modules. This will only collect modules which are not
 instantiated under a module annotated with `MarkDUTAnnotation`.
+
+If any external modules (including imported and inlined blackboxes) have a
+`SitestBlackBoxLibrariesAnnotation`, the libraries specified in that annotation
+will also be included in the output.
 
 Example:
 ```json
 {
   "class":"sifive.enterprise.firrtl.SitestTestHarnessBlackBoxAnnotation",
   "filename":"./testharness_blackboxes.json"
+}
+```
+
+### SitestBlackBoxLibrariesAnnotation
+
+| Property   | Type   | Description                                                      |
+| ---------- | ------ | -------------                                                    |
+| class      | string | `sifive.enterprise.firrtl.SitestBlackBoxLibrariesAnnotation`     |
+| libraries  | array  | Array of library names to include in blackbox metadata           |
+
+This annotation is used to specify additional library names that should be
+included in the blackbox metadata for an external module. When applied to an
+external module, the specified libraries will be added to the blackbox resource
+list in the generated metadata. Both the `defname` and any libraries specified by
+this annotation will be included in the metadata for non-imported and non-inlined
+blackboxes.
+
+Example:
+```json
+{
+  "class":"sifive.enterprise.firrtl.SitestBlackBoxLibrariesAnnotation",
+  "libraries":["libmath", "libcrypto", "custom_lib"]
 }
 ```
 

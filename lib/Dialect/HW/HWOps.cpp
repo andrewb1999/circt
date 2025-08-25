@@ -21,6 +21,7 @@
 #include "circt/Support/Namespace.h"
 #include "circt/Support/Naming.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
 #include "llvm/ADT/BitVector.h"
@@ -253,6 +254,14 @@ Value HWModulePortAccessor::getInput(StringRef name) {
 void HWModulePortAccessor::setOutput(StringRef name, Value v) {
   setOutput(outputIdx.find(name.str())->second, v);
 }
+
+//===----------------------------------------------------------------------===//
+// Declarative Canonicalization Patterns
+//===----------------------------------------------------------------------===//
+
+namespace {
+#include "circt/Dialect/HW/HWCanonicalization.cpp.inc"
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // ConstantOp
@@ -784,7 +793,7 @@ void HWModuleOp::build(OpBuilder &builder, OperationState &odsState,
   modBuilder(builder, accessor);
   // Create output operands.
   llvm::SmallVector<Value> outputOperands = accessor.getOutputOperands();
-  builder.create<hw::OutputOp>(odsState.location, outputOperands);
+  hw::OutputOp::create(builder, odsState.location, outputOperands);
 }
 
 void HWModuleOp::modifyPorts(
@@ -1962,8 +1971,8 @@ LogicalResult ArraySliceOp::canonicalize(ArraySliceOp op,
 
   if (sliceSize == 1) {
     // slice(a, n) -> create(a[n])
-    auto get = rewriter.create<ArrayGetOp>(op.getLoc(), op.getInput(),
-                                           op.getLowIndex());
+    auto get = ArrayGetOp::create(rewriter, op.getLoc(), op.getInput(),
+                                  op.getLowIndex());
     rewriter.replaceOpWithNewOp<ArrayCreateOp>(op, op.getType(),
                                                get.getResult());
     return success();
@@ -1973,7 +1982,7 @@ LogicalResult ArraySliceOp::canonicalize(ArraySliceOp op,
   if (!offsetOpt)
     return failure();
 
-  auto inputOp = op.getInput().getDefiningOp();
+  auto *inputOp = op.getInput().getDefiningOp();
   if (auto inputSlice = dyn_cast_or_null<ArraySliceOp>(inputOp)) {
     // slice(slice(a, n), m) -> slice(a, n + m)
     if (inputSlice == op)
@@ -1986,7 +1995,7 @@ LogicalResult ArraySliceOp::canonicalize(ArraySliceOp op,
 
     uint64_t offset = *offsetOpt + *inputOffsetOpt;
     auto lowIndex =
-        rewriter.create<ConstantOp>(op.getLoc(), inputIndex.getType(), offset);
+        ConstantOp::create(rewriter, op.getLoc(), inputIndex.getType(), offset);
     rewriter.replaceOpWithNewOp<ArraySliceOp>(op, op.getType(),
                                               inputSlice.getInput(), lowIndex);
     return success();
@@ -2027,10 +2036,11 @@ LogicalResult ArraySliceOp::canonicalize(ArraySliceOp op,
       } else {
         // Slice the required bits from the input.
         unsigned width = inputSize == 1 ? 1 : llvm::Log2_64_Ceil(inputSize);
-        auto lowIndex = rewriter.create<ConstantOp>(
-            op.getLoc(), rewriter.getIntegerType(width), sliceStart);
-        chunks.push_back(rewriter.create<ArraySliceOp>(
-            op.getLoc(), hw::ArrayType::get(elemTy, cutSize), input, lowIndex));
+        auto lowIndex = ConstantOp::create(
+            rewriter, op.getLoc(), rewriter.getIntegerType(width), sliceStart);
+        chunks.push_back(ArraySliceOp::create(
+            rewriter, op.getLoc(), hw::ArrayType::get(elemTy, cutSize), input,
+            lowIndex));
       }
 
       sliceStart = 0;
@@ -2567,7 +2577,7 @@ OpFoldResult StructExtractOp::fold(FoldAdaptor adaptor) {
 
 LogicalResult StructExtractOp::canonicalize(StructExtractOp op,
                                             PatternRewriter &rewriter) {
-  auto inputOp = op.getInput().getDefiningOp();
+  auto *inputOp = op.getInput().getDefiningOp();
 
   // b = extract(inject(x["a"], v0)["b"]) => extract(x, "b")
   if (auto structInject = dyn_cast_or_null<StructInjectOp>(inputOp)) {
@@ -2661,6 +2671,15 @@ OpFoldResult StructInjectOp::fold(FoldAdaptor adaptor) {
 
 LogicalResult StructInjectOp::canonicalize(StructInjectOp op,
                                            PatternRewriter &rewriter) {
+  // If this inject is only used as an input to another inject, don't try to
+  // canonicalize it. It will be included in that other op's canonicalization
+  // attempt. This avoids doing redundant work.
+  if (op->hasOneUse()) {
+    auto &use = *op->use_begin();
+    if (isa<StructInjectOp>(use.getOwner()) && use.getOperandNumber() == 0)
+      return failure();
+  }
+
   // Canonicalize multiple injects into a create op and eliminate overwrites.
   SmallPtrSet<Operation *, 4> injects;
   DenseMap<StringAttr, Value> fields;
@@ -2670,7 +2689,7 @@ LogicalResult StructInjectOp::canonicalize(StructInjectOp op,
   Value input;
   do {
     if (!injects.insert(inject).second)
-      return failure();
+      break;
 
     fields.try_emplace(inject.getFieldNameAttr(), inject.getNewValue());
     input = inject.getInput();
@@ -2702,8 +2721,8 @@ LogicalResult StructInjectOp::canonicalize(StructInjectOp op,
     auto it = fields.find(elements[fieldIndex].name);
     if (it == fields.end())
       continue;
-    input = rewriter.create<StructInjectOp>(op.getLoc(), ty, input, fieldIndex,
-                                            it->second);
+    input = StructInjectOp::create(rewriter, op.getLoc(), ty, input, fieldIndex,
+                                   it->second);
   }
 
   rewriter.replaceOp(op, input);
@@ -2855,6 +2874,11 @@ OpFoldResult ArrayGetOp::fold(FoldAdaptor adaptor) {
                                        intTy.getIntOrFloatBitWidth()));
   }
 
+  // array_get(array_inject(_, index, element), index) -> element
+  if (auto inject = getInput().getDefiningOp<ArrayInjectOp>())
+    if (getIndex() == inject.getIndex())
+      return inject.getElement();
+
   auto inputCreate = getInput().getDefiningOp<ArrayCreateOp>();
   if (!inputCreate)
     return {};
@@ -2888,7 +2912,7 @@ LogicalResult ArrayGetOp::canonicalize(ArrayGetOp op,
 
     uint64_t offset = *offsetOpt + *idxOpt;
     auto newOffset =
-        rewriter.create<ConstantOp>(op.getLoc(), offsetOp.getType(), offset);
+        ConstantOp::create(rewriter, op.getLoc(), offsetOp.getType(), offset);
     rewriter.replaceOpWithNewOp<ArrayGetOp>(op, inputSlice.getInput(),
                                             newOffset);
     return success();
@@ -2905,8 +2929,9 @@ LogicalResult ArrayGetOp::canonicalize(ArrayGetOp op,
       }
 
       unsigned indexWidth = size == 1 ? 1 : llvm::Log2_64_Ceil(size);
-      auto newIdxOp = rewriter.create<ConstantOp>(
-          op.getLoc(), rewriter.getIntegerType(indexWidth), elemIndex);
+      auto newIdxOp =
+          ConstantOp::create(rewriter, op.getLoc(),
+                             rewriter.getIntegerType(indexWidth), elemIndex);
 
       rewriter.replaceOpWithNewOp<ArrayGetOp>(op, input, newIdxOp);
       return success();
@@ -2937,6 +2962,105 @@ LogicalResult ArrayGetOp::canonicalize(ArrayGetOp op,
   }
 
   return failure();
+}
+
+//===----------------------------------------------------------------------===//
+// ArrayInjectOp
+//===----------------------------------------------------------------------===//
+
+OpFoldResult ArrayInjectOp::fold(FoldAdaptor adaptor) {
+  auto inputAttr = dyn_cast_or_null<ArrayAttr>(adaptor.getInput());
+  auto indexAttr = dyn_cast_or_null<IntegerAttr>(adaptor.getIndex());
+  auto elementAttr = adaptor.getElement();
+
+  // inject(constant[xs, y, zs], iy, a) -> constant[x, a, z]
+  if (inputAttr && indexAttr && elementAttr) {
+    if (auto index = indexAttr.getValue().tryZExtValue()) {
+      if (*index < inputAttr.size()) {
+        SmallVector<Attribute> elements(inputAttr.getValue());
+        elements[inputAttr.size() - 1 - *index] = elementAttr;
+        return ArrayAttr::get(getContext(), elements);
+      }
+    }
+  }
+
+  return {};
+}
+
+static LogicalResult canonicalizeArrayInjectChain(ArrayInjectOp op,
+                                                  PatternRewriter &rewriter) {
+  // If this inject is only used as an input to another inject, don't try to
+  // canonicalize it. It will be included in that other op's canonicalization
+  // attempt. This avoids doing redundant work.
+  if (op->hasOneUse()) {
+    auto &use = *op->use_begin();
+    if (isa<ArrayInjectOp>(use.getOwner()) && use.getOperandNumber() == 0)
+      return failure();
+  }
+
+  // Collect all injects to constant indices.
+  auto arrayLength = type_cast<ArrayType>(op.getType()).getNumElements();
+  Value input = op;
+  SmallDenseMap<uint32_t, Value> elements;
+  while (auto inject = input.getDefiningOp<ArrayInjectOp>()) {
+    // Determine the constant index.
+    APInt indexAPInt;
+    if (!matchPattern(inject.getIndex(), mlir::m_ConstantInt(&indexAPInt)))
+      break;
+    if (indexAPInt.getActiveBits() > 32)
+      break;
+    uint32_t index = indexAPInt.getZExtValue();
+
+    // Track the injected value. Make sure to only track indices that are in
+    // bounds. This will allow us to later check if `elements.size()` matches
+    // the array length.
+    if (index < arrayLength)
+      elements.insert({index, inject.getElement()});
+
+    // Step to the next inject op.
+    input = inject.getInput();
+    if (input == op)
+      break; // break cycles
+  }
+
+  // If we are assigning every single element, replace the op with an
+  // `hw.array_create`.
+  if (elements.size() == arrayLength) {
+    SmallVector<Value, 4> operands;
+    operands.reserve(arrayLength);
+    for (uint32_t idx = 0; idx < arrayLength; ++idx)
+      operands.push_back(elements.at(arrayLength - idx - 1));
+    rewriter.replaceOpWithNewOp<ArrayCreateOp>(op, op.getType(), operands);
+    return success();
+  }
+
+  return failure();
+}
+
+static LogicalResult
+canonicalizeArrayInjectIntoCreate(ArrayInjectOp op, PatternRewriter &rewriter) {
+  auto createOp = op.getInput().getDefiningOp<ArrayCreateOp>();
+  if (!createOp)
+    return failure();
+
+  // Make sure the access is in bounds.
+  APInt indexAPInt;
+  if (!matchPattern(op.getIndex(), mlir::m_ConstantInt(&indexAPInt)) ||
+      !indexAPInt.ult(createOp.getInputs().size()))
+    return failure();
+
+  // Substitute the injected value.
+  SmallVector<Value> elements = createOp.getInputs();
+  elements[elements.size() - indexAPInt.getZExtValue() - 1] = op.getElement();
+  rewriter.replaceOpWithNewOp<ArrayCreateOp>(op, elements);
+  return success();
+}
+
+void ArrayInjectOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
+                                                MLIRContext *context) {
+  patterns.add<ArrayInjectToSameIndex>(context);
+  patterns.add(canonicalizeArrayInjectChain);
+  patterns.add(canonicalizeArrayInjectIntoCreate);
 }
 
 //===----------------------------------------------------------------------===//

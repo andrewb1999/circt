@@ -76,14 +76,14 @@ struct AnnotationInfo {
 
 struct BlackBoxReaderPass
     : public circt::firrtl::impl::BlackBoxReaderBase<BlackBoxReaderPass> {
+  using Base::Base;
+
   void runOnOperation() override;
   bool runOnAnnotation(Operation *op, Annotation anno, OpBuilder &builder,
                        bool isCover, AnnotationInfo &annotationInfo);
   StringAttr loadFile(Operation *op, StringRef inputPath, OpBuilder &builder);
   hw::OutputFileAttr getOutputFile(Operation *origOp, StringAttr fileNameAttr,
                                    bool isCover = false);
-
-  using BlackBoxReaderBase::inputPrefix;
 
 private:
   /// A list of all files which will be included in the file list.  This is
@@ -99,11 +99,6 @@ private:
 
   /// The target directory for testbench files.
   StringRef testBenchDir;
-
-  /// The file list file name (sic) for black boxes. If set, generates a file
-  /// that lists all non-header source files for black boxes. Can be changed
-  /// through `firrtl.transforms.BlackBoxResourceFileNameAnno` annotations.
-  StringRef resourceFileName;
 
   /// Analyses used by this pass.
   InstanceGraph *instanceGraph;
@@ -143,24 +138,11 @@ void BlackBoxReaderPass::runOnOperation() {
   // Determine the target directory and resource file name from the
   // annotations present on the circuit operation.
   targetDir = ".";
-  resourceFileName = "firrtl_black_box_resource_files.f";
 
   // Process black box annotations on the circuit.  Some of these annotations
   // will affect how the rest of the annotations are resolved.
   SmallVector<Attribute, 4> filteredAnnos;
   for (auto annot : AnnotationSet(circuitOp)) {
-    // Handle resource file name annotation.
-    if (annot.isClass(blackBoxResourceFileNameAnnoClass)) {
-      if (auto resourceFN = annot.getMember<StringAttr>("resourceFileName")) {
-        resourceFileName = resourceFN.getValue();
-        continue;
-      }
-
-      circuitOp->emitError(blackBoxResourceFileNameAnnoClass)
-          << " annotation missing \"resourceFileName\" attribute";
-      signalPassFailure();
-      continue;
-    }
     filteredAnnos.push_back(annot.getDict());
 
     // Get the testbench and cover directories.
@@ -193,9 +175,8 @@ void BlackBoxReaderPass::runOnOperation() {
   anythingChanged |=
       AnnotationSet(filteredAnnos, context).applyToOperation(circuitOp);
 
-  LLVM_DEBUG(llvm::dbgs() << "Black box target directory: " << targetDir << "\n"
-                          << "Black box resource file name: "
-                          << resourceFileName << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "Black box target directory: " << targetDir
+                          << "\n");
 
   // Newly generated IR will be placed at the end of the circuit.
   auto builder = circuitOp.getBodyBuilder();
@@ -264,10 +245,10 @@ void BlackBoxReaderPass::runOnOperation() {
 
     auto fileName = ns.newName("blackbox_" + verilogName.getValue());
 
-    auto fileOp = builder.create<emit::FileOp>(
-        loc, annotationInfo.outputFileAttr.getFilename(), fileName,
+    auto fileOp = emit::FileOp::create(
+        builder, loc, annotationInfo.outputFileAttr.getFilename(), fileName,
         [&, text = annotationInfo.inlineText] {
-          builder.create<emit::VerbatimOp>(loc, text);
+          emit::VerbatimOp::create(builder, loc, text);
         });
 
     if (!annotationInfo.outputFileAttr.getExcludeFromFilelist().getValue())
@@ -288,11 +269,6 @@ void BlackBoxReaderPass::runOnOperation() {
     SmallVector<Attribute> symbols;
     for (emit::FileOp file : fileListFiles)
       symbols.push_back(FlatSymbolRefAttr::get(file.getSymNameAttr()));
-
-    builder.create<emit::FileListOp>(
-        loc, builder.getStringAttr(resourceFileName),
-        builder.getArrayAttr(symbols),
-        builder.getStringAttr(ns.newName("blackbox_filelist")));
   }
 
   // If nothing has changed we can preserve the analysis.
@@ -379,6 +355,8 @@ StringAttr BlackBoxReaderPass::loadFile(Operation *op, StringRef inputPath,
 hw::OutputFileAttr BlackBoxReaderPass::getOutputFile(Operation *origOp,
                                                      StringAttr fileNameAttr,
                                                      bool isCover) {
+  // If the original operation has a specified output file that is not a
+  // directory, then just use that.
   auto outputFile = origOp->getAttrOfType<hw::OutputFileAttr>("output_file");
   if (outputFile && !outputFile.isDirectory()) {
     return {outputFile};
@@ -392,16 +370,15 @@ hw::OutputFileAttr BlackBoxReaderPass::getOutputFile(Operation *origOp,
   bool exclude = (ext == ".h" || ext == ".vh" || ext == ".svh");
   auto outDir = targetDir;
 
-  // If the original operation has a specified output file that is not a
-  // directory, then just use that.
+  /// If the original operation has an output directory, use that.
   if (outputFile)
     outDir = outputFile.getFilename();
   // In order to output into the testbench directory, we need to have a
   // testbench dir annotation, not have a blackbox target directory annotation
   // (or one set to the current directory), have a DUT annotation, and the
-  // module needs to be in or under the effective design.
+  // module must not be instantiated under the DUT.
   else if (!testBenchDir.empty() && targetDir == "." &&
-           !instanceInfo->allInstancesInEffectiveDesign(
+           !instanceInfo->anyInstanceInEffectiveDesign(
                cast<igraph::ModuleOpInterface>(origOp)))
     outDir = testBenchDir;
   else if (isCover)
@@ -412,16 +389,4 @@ hw::OutputFileAttr BlackBoxReaderPass::getOutputFile(Operation *origOp,
   SmallString<128> outputFilePath(outDir);
   llvm::sys::path::append(outputFilePath, fileName);
   return hw::OutputFileAttr::getFromFilename(context, outputFilePath, exclude);
-}
-
-//===----------------------------------------------------------------------===//
-// Pass Creation
-//===----------------------------------------------------------------------===//
-
-std::unique_ptr<mlir::Pass>
-circt::firrtl::createBlackBoxReaderPass(std::optional<StringRef> inputPrefix) {
-  auto pass = std::make_unique<BlackBoxReaderPass>();
-  if (inputPrefix)
-    pass->inputPrefix = inputPrefix->str();
-  return pass;
 }

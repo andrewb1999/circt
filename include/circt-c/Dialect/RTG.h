@@ -20,6 +20,7 @@ extern "C" {
 //===----------------------------------------------------------------------===//
 
 MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(RTG, rtg);
+MLIR_CAPI_EXPORTED void registerRTGPipelines(void);
 
 //===----------------------------------------------------------------------===//
 // Type API.
@@ -98,6 +99,41 @@ MLIR_CAPI_EXPORTED bool rtgTypeIsAArray(MlirType type);
 /// Returns the element type of the RTG array.
 MLIR_CAPI_EXPORTED MlirType rtgArrayTypeGetElementType(MlirType type);
 
+/// Creates an RTG tuple type in the context.
+MLIR_CAPI_EXPORTED MlirType rtgTupleTypeGet(MlirContext ctxt,
+                                            intptr_t numFields,
+                                            MlirType const *fieldTypes);
+
+/// If the type is an RTG tuple.
+MLIR_CAPI_EXPORTED bool rtgTypeIsATuple(MlirType type);
+
+/// Returns the number of fields in the RTG tuple.
+MLIR_CAPI_EXPORTED intptr_t rtgTypeGetNumFields(MlirType type);
+
+/// Returns a field type of the RTG tuple.
+MLIR_CAPI_EXPORTED MlirType rtgTupleTypeGetFieldType(MlirType type,
+                                                     intptr_t idx);
+
+/// If the type is an RTG memory.
+MLIR_CAPI_EXPORTED bool rtgTypeIsAMemory(MlirType type);
+
+/// Creates an RTG memory type in the context.
+MLIR_CAPI_EXPORTED MlirType rtgMemoryTypeGet(MlirContext ctx,
+                                             uint32_t addressWidth);
+
+/// Returns the address with of an RTG memory type.
+MLIR_CAPI_EXPORTED uint32_t rtgMemoryTypeGetAddressWidth(MlirType type);
+
+/// If the type is an RTG memory block.
+MLIR_CAPI_EXPORTED bool rtgTypeIsAMemoryBlock(MlirType type);
+
+/// Creates an RTG memory block type in the context.
+MLIR_CAPI_EXPORTED MlirType rtgMemoryBlockTypeGet(MlirContext ctx,
+                                                  uint32_t addressWidth);
+
+/// Returns the address with of an RTG memory block type.
+MLIR_CAPI_EXPORTED uint32_t rtgMemoryBlockTypeGetAddressWidth(MlirType type);
+
 //===----------------------------------------------------------------------===//
 // Attribute API.
 //===----------------------------------------------------------------------===//
@@ -142,8 +178,17 @@ MLIR_CAPI_EXPORTED uint32_t rtgImmediateAttrGetWidth(MlirAttribute attr);
 /// Returns the value of the RTG immediate attribute.
 MLIR_CAPI_EXPORTED uint64_t rtgImmediateAttrGetValue(MlirAttribute attr);
 
+/// If the attribute is an RTG any context attribute.
+MLIR_CAPI_EXPORTED bool rtgAttrIsAAnyContextAttr(MlirAttribute attr);
+
+/// Creates an RTG any context attribute in the context.
+MLIR_CAPI_EXPORTED MlirAttribute rtgAnyContextAttrGet(MlirContext ctxt,
+                                                      MlirType type);
+
 #ifdef __cplusplus
 }
 #endif
+
+#include "circt/Dialect/RTG/Transforms/RTGPasses.capi.h.inc"
 
 #endif // CIRCT_C_DIALECT_RTG_H

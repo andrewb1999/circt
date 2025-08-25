@@ -20,7 +20,7 @@ using namespace mlir;
 using namespace circt::om;
 
 //===----------------------------------------------------------------------===//
-// Path Printers and Parsers
+// Custom Printers and Parsers
 //===----------------------------------------------------------------------===//
 
 static ParseResult parseBasePathString(OpAsmParser &parser, PathAttr &path) {
@@ -72,6 +72,26 @@ static void printPathString(OpAsmPrinter &p, Operation *op, PathAttr path,
   if (!field.getValue().empty())
     p << field.getValue();
   p << '\"';
+}
+
+static ParseResult parseFieldLocs(OpAsmParser &parser, ArrayAttr &fieldLocs) {
+  if (parser.parseOptionalKeyword("field_locs"))
+    return success();
+  if (parser.parseLParen() || parser.parseAttribute(fieldLocs) ||
+      parser.parseRParen()) {
+    return failure();
+  }
+  return success();
+}
+
+static void printFieldLocs(OpAsmPrinter &printer, Operation *op,
+                           ArrayAttr fieldLocs) {
+  mlir::OpPrintingFlags flags;
+  if (!flags.shouldPrintDebugInfo() || !fieldLocs)
+    return;
+  printer << "field_locs(";
+  printer.printAttribute(fieldLocs);
+  printer << ")";
 }
 
 //===----------------------------------------------------------------------===//
@@ -279,8 +299,8 @@ circt::om::ClassOp circt::om::ClassOp::buildSimpleClassOp(
     OpBuilder &odsBuilder, Location loc, Twine name,
     ArrayRef<StringRef> formalParamNames, ArrayRef<StringRef> fieldNames,
     ArrayRef<Type> fieldTypes) {
-  circt::om::ClassOp classOp = odsBuilder.create<circt::om::ClassOp>(
-      loc, odsBuilder.getStringAttr(name),
+  circt::om::ClassOp classOp = circt::om::ClassOp::create(
+      odsBuilder, loc, odsBuilder.getStringAttr(name),
       odsBuilder.getStrArrayAttr(formalParamNames),
       odsBuilder.getStrArrayAttr(fieldNames),
       odsBuilder.getDictionaryAttr(llvm::map_to_vector(
@@ -291,10 +311,17 @@ circt::om::ClassOp circt::om::ClassOp::buildSimpleClassOp(
   Block *body = &classOp.getRegion().emplaceBlock();
   auto prevLoc = odsBuilder.saveInsertionPoint();
   odsBuilder.setInsertionPointToEnd(body);
-  odsBuilder.create<ClassFieldsOp>(
-      loc, llvm::map_to_vector(fieldTypes, [&](Type type) -> Value {
-        return body->addArgument(type, loc);
-      }));
+
+  mlir::SmallVector<Attribute> locAttrs(fieldNames.size(), LocationAttr(loc));
+
+  ClassFieldsOp::create(odsBuilder, loc,
+                        llvm::map_to_vector(fieldTypes,
+                                            [&](Type type) -> Value {
+                                              return body->addArgument(type,
+                                                                       loc);
+                                            }),
+                        odsBuilder.getArrayAttr(locAttrs));
+
   odsBuilder.restoreInsertionPoint(prevLoc);
 
   return classOp;
@@ -409,31 +436,25 @@ void circt::om::ClassOp::addNewFieldsOp(mlir::OpBuilder &builder,
                                         mlir::ArrayRef<Value> values) {
   // Store the original locations as a metadata array so that unique locations
   // are preserved as a mapping from field index to location
+  assert(locs.size() == values.size() && "Expected a location per value");
   mlir::SmallVector<Attribute> locAttrs;
   for (auto loc : locs) {
     locAttrs.push_back(cast<Attribute>(LocationAttr(loc)));
   }
   // Also store the locations incase there's some other analysis that might
   // be able to use the default FusedLoc representation.
-  builder.create<ClassFieldsOp>(
-      builder.getFusedLoc(locs, builder.getArrayAttr(locAttrs)), values);
+  ClassFieldsOp::create(builder, builder.getFusedLoc(locs), values,
+                        builder.getArrayAttr(locAttrs));
 }
 
 mlir::Location circt::om::ClassOp::getFieldLocByIndex(size_t i) {
-  Location loc = this->getFieldsOp()->getLoc();
-  if (auto locs = dyn_cast<FusedLoc>(loc)) {
-    // Because it's possible for a user to construct a fields op directly and
-    // place a FusedLoc that doersn't follow the storage format of
-    // addNewFieldsOp, we assert the information has been stored appropriately
-    ArrayAttr metadataArr = dyn_cast<ArrayAttr>(locs.getMetadata());
-    assert(metadataArr && "Expected fused loc to store metadata array");
-    assert(i < metadataArr.size() &&
-           "expected index to be less than array size");
-    LocationAttr locAttr = dyn_cast<LocationAttr>(metadataArr[i]);
-    assert(locAttr && "expected metadataArr entry to be location attribute");
-    loc = Location(locAttr);
-  }
-  return loc;
+  auto fieldsOp = this->getFieldsOp();
+  auto fieldLocs = fieldsOp.getFieldLocs();
+  if (!fieldLocs.has_value())
+    return fieldsOp.getLoc();
+  assert(i < fieldLocs.value().size() &&
+         "field index too large for location array");
+  return cast<LocationAttr>(fieldLocs.value()[i]);
 }
 
 //===----------------------------------------------------------------------===//
@@ -473,6 +494,24 @@ circt::om::ClassExternOp::getFieldType(mlir::StringAttr field) {
 
 void circt::om::ClassExternOp::replaceFieldTypes(AttrTypeReplacer replacer) {
   replaceClassLikeFieldTypes(*this, replacer);
+}
+
+//===----------------------------------------------------------------------===//
+// ClassFieldsOp
+//===----------------------------------------------------------------------===//
+//
+LogicalResult circt::om::ClassFieldsOp::verify() {
+  auto fieldLocs = this->getFieldLocs();
+  if (fieldLocs.has_value()) {
+    auto fieldLocsVal = fieldLocs.value();
+    if (fieldLocsVal.size() != this->getFields().size()) {
+      auto error = this->emitOpError("size of field_locs (")
+                   << fieldLocsVal.size()
+                   << ") does not match number of fields ("
+                   << this->getFields().size() << ")";
+    }
+  }
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -569,80 +608,6 @@ ParseResult circt::om::ListCreateOp::parse(OpAsmParser &parser,
 
   for (auto operand : operands)
     if (parser.resolveOperand(operand, elemType, result.operands))
-      return failure();
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
-// TupleCreateOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult TupleCreateOp::inferReturnTypes(
-    MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties, RegionRange regions,
-    llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
-  ::llvm::SmallVector<Type> types;
-  for (auto op : operands)
-    types.push_back(op.getType());
-  inferredReturnTypes.push_back(TupleType::get(context, types));
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
-// TupleGetOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult TupleGetOp::inferReturnTypes(
-    MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
-    llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
-  Adaptor adaptor(operands, attributes, properties, regions);
-  auto idx = adaptor.getIndexAttr();
-  if (operands.empty() || !idx)
-    return failure();
-
-  auto tupleTypes = cast<TupleType>(adaptor.getInput().getType()).getTypes();
-  if (tupleTypes.size() <= idx.getValue().getLimitedValue()) {
-    if (location)
-      mlir::emitError(*location,
-                      "tuple index out-of-bounds, must be less than ")
-          << tupleTypes.size() << " but got "
-          << idx.getValue().getLimitedValue();
-    return failure();
-  }
-
-  inferredReturnTypes.push_back(tupleTypes[idx.getValue().getLimitedValue()]);
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
-// MapCreateOp
-//===----------------------------------------------------------------------===//
-
-void circt::om::MapCreateOp::print(OpAsmPrinter &p) {
-  p << " ";
-  p.printOperands(getInputs());
-  p.printOptionalAttrDict((*this)->getAttrs());
-  p << " : " << cast<circt::om::MapType>(getType()).getKeyType() << ", "
-    << cast<circt::om::MapType>(getType()).getValueType();
-}
-
-ParseResult circt::om::MapCreateOp::parse(OpAsmParser &parser,
-                                          OperationState &result) {
-  llvm::SmallVector<OpAsmParser::UnresolvedOperand, 16> operands;
-  Type elementType, valueType;
-
-  if (parser.parseOperandList(operands) ||
-      parser.parseOptionalAttrDict(result.attributes) || parser.parseColon() ||
-      parser.parseType(elementType) || parser.parseComma() ||
-      parser.parseType(valueType))
-    return failure();
-  result.addTypes({circt::om::MapType::get(elementType, valueType)});
-  auto operandType =
-      mlir::TupleType::get(valueType.getContext(), {elementType, valueType});
-
-  for (auto operand : operands)
-    if (parser.resolveOperand(operand, operandType, result.operands))
       return failure();
   return success();
 }

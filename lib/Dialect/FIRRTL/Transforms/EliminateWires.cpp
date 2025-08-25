@@ -83,17 +83,12 @@ void EliminateWiresPass::runOnOperation() {
 
   for (auto [wire, writer] : worklist) {
     mlir::ImplicitLocOpBuilder builder(wire->getLoc(), writer);
-    auto node = builder.create<NodeOp>(
-        writer.getSrc(), wire.getName(), wire.getNameKind(),
-        wire.getAnnotations(), wire.getInnerSymAttr(), wire.getForceable());
+    auto node = NodeOp::create(builder, writer.getSrc(), wire.getName(),
+                               wire.getNameKind(), wire.getAnnotations(),
+                               wire.getInnerSymAttr(), wire.getForceable());
     wire.replaceAllUsesWith(node);
     wire.erase();
     writer.erase();
     ++erasedWires;
   }
-}
-
-/// This is the pass constructor.
-std::unique_ptr<mlir::Pass> circt::firrtl::createEliminateWiresPass() {
-  return std::make_unique<EliminateWiresPass>();
 }

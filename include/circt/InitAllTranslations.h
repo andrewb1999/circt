@@ -11,6 +11,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Conversion/ExportAIGER.h"
+#include "circt/Conversion/ImportAIGER.h"
 #include "circt/Dialect/Arc/ModelInfoExport.h"
 #include "circt/Dialect/Calyx/CalyxEmitter.h"
 #include "circt/Dialect/ESI/ESIDialect.h"
@@ -38,6 +40,8 @@ inline void registerAllTranslations() {
     mlir::smt::registerExportSMTLIBTranslation();
     ExportSystemC::registerExportSystemCTranslation();
     debug::registerTranslations();
+    aiger::registerImportAIGERTranslation();
+    aiger::registerExportAIGERTranslation();
     return true;
   }();
   (void)initOnce;

@@ -1,4 +1,4 @@
-// RUN: circt-opt %s -verify-diagnostics | circt-opt -verify-diagnostics | FileCheck %s
+// RUN: circt-opt --verify-diagnostics --verify-roundtrip %s | FileCheck %s
 
 // CHECK-LABEL: moore.module @Empty()
 moore.module @Empty() {
@@ -122,6 +122,11 @@ moore.module @Expressions(
   // CHECK-SAME: in [[ARRAY2:%[^:]+]] : !moore.uarray<2 x uarray<4 x i8>>
   in %array2: !moore.uarray<2 x uarray<4 x i8>>,
 
+  // CHECK-SAME: in %s1 : !moore.string
+  in %s1 : !moore.string,
+  // CHECK-SAME: in %s2 : !moore.string
+  in %s2 : !moore.string,
+
   // CHECK-SAME: in [[REF_A:%[^:]+]] : !moore.ref<i32>
   in %refA: !moore.ref<i32>,
   // CHECK-SAME: in [[REF_B:%[^:]+]] : !moore.ref<i32>
@@ -163,6 +168,16 @@ moore.module @Expressions(
 
   // CHECK: moore.conversion [[A]] : !moore.i32 -> !moore.l32
   moore.conversion %a : !moore.i32 -> !moore.l32
+  // CHECK: moore.packed_to_sbv [[STRUCT1]] : struct<{a: i32, b: i32}>
+  moore.packed_to_sbv %struct1 : struct<{a: i32, b: i32}>
+  // CHECK: moore.sbv_to_packed [[C]] : struct<{u: l16, v: l16}>
+  moore.sbv_to_packed %c : struct<{u: l16, v: l16}>
+  // CHECK: moore.logic_to_int [[C]] : l32
+  moore.logic_to_int %c : l32
+  // CHECK: moore.int_to_logic [[A]] : i32
+  moore.int_to_logic %a : i32
+  // CHECK: moore.to_builtin_bool [[X]] : i1
+  moore.to_builtin_bool %x : i1
 
   // CHECK: moore.neg [[A]] : i32
   moore.neg %a : i32
@@ -310,6 +325,18 @@ moore.module @Expressions(
   moore.string_constant "Test" : i128
   // CHECK: moore.string_constant "" : i128
   moore.string_constant "" : i128
+  // CHECK: moore.string_cmp eq %s1, %s2 : string -> i1
+  moore.string_cmp eq %s1, %s2 : string -> i1
+  // CHECK: moore.string_cmp ne %s1, %s2 : string -> i1
+  moore.string_cmp ne %s1, %s2 : string -> i1
+  // CHECK: moore.string_cmp lt %s1, %s2 : string -> i1
+  moore.string_cmp lt %s1, %s2 : string -> i1
+  // CHECK: moore.string_cmp le %s1, %s2 : string -> i1
+  moore.string_cmp le %s1, %s2 : string -> i1
+  // CHECK: moore.string_cmp gt %s1, %s2 : string -> i1
+  moore.string_cmp gt %s1, %s2 : string -> i1
+  // CHECK: moore.string_cmp ge %s1, %s2 : string -> i1
+  moore.string_cmp ge %s1, %s2 : string -> i1
 
   moore.output
 }
@@ -339,6 +366,12 @@ func.func @WaitEvent(%arg0: !moore.i1, %arg1: !moore.i1) {
   return
 }
 
+// CHECK-LABEL: func.func @WaitDelay
+func.func @WaitDelay(%arg0: !moore.time) {
+  // CHECK: moore.wait_delay %arg0
+  moore.wait_delay %arg0
+  return
+}
 
 // CHECK-LABEL: func.func @FormatStrings
 // CHECK-SAME: %arg0: !moore.format_string
@@ -401,5 +434,14 @@ func.func @MathBuiltins(%arg0: !moore.i32, %arg1: !moore.l42) {
   moore.builtin.clog2 %arg0 : i32
   // CHECK: moore.builtin.clog2 %arg1 : l42
   moore.builtin.clog2 %arg1 : l42
+  return
+}
+
+// CHECK-LABEL: func.func @TimeConversion
+func.func @TimeConversion(%arg0: !moore.time, %arg1: !moore.l64) {
+  // CHECK: moore.packed_to_sbv %arg0 : time
+  moore.packed_to_sbv %arg0 : time
+  // CHECK: moore.sbv_to_packed %arg1 : time
+  moore.sbv_to_packed %arg1 : time
   return
 }

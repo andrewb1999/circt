@@ -20,8 +20,10 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/InferIntRangeInterface.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/DialectConversion.h"
 
 namespace llvm {
 struct KnownBits;
@@ -45,6 +47,10 @@ using llvm::KnownBits;
 /// in neither set is unknown.
 KnownBits computeKnownBits(Value value);
 
+/// Create the ops to zero-extend a value to an integer of equal or larger type.
+Value createZExt(OpBuilder &builder, Location loc, Value value,
+                 unsigned targetWidth);
+
 /// Create a sign extension operation from a value of integer type to an equal
 /// or larger integer type.
 Value createOrFoldSExt(Location loc, Value value, Type destTy,
@@ -65,6 +71,32 @@ void extractBits(OpBuilder &builder, Value val, SmallVectorImpl<Value> &bits);
 Value constructMuxTree(OpBuilder &builder, Location loc,
                        ArrayRef<Value> selectors, ArrayRef<Value> leafNodes,
                        Value outOfBoundsValue);
+
+/// Extract a range of bits from an integer at a dynamic offset.
+Value createDynamicExtract(OpBuilder &builder, Location loc, Value value,
+                           Value offset, unsigned width);
+
+/// Replace a range of bits in an integer at a dynamic offset, and return the
+/// updated integer value. Calls `createInject` if the offset is constant.
+Value createDynamicInject(OpBuilder &builder, Location loc, Value value,
+                          Value offset, Value replacement,
+                          bool twoState = false);
+
+/// Replace a range of bits in an integer and return the updated integer value.
+Value createInject(OpBuilder &builder, Location loc, Value value,
+                   unsigned offset, Value replacement);
+
+/// Construct a full adder for three 1-bit inputs.
+std::pair<Value, Value> fullAdder(OpBuilder &builder, Location loc, Value a,
+                                  Value b, Value c);
+
+/// Perform Wallace tree reduction on partial products.
+/// See https://en.wikipedia.org/wiki/Wallace_tree
+/// \param targetAddends The number of addends to reduce to (2 for carry-save).
+/// \param inputAddends The rows of bits to be summed.
+SmallVector<Value> wallaceReduction(OpBuilder &builder, Location loc,
+                                    size_t width, size_t targetAddends,
+                                    SmallVector<SmallVector<Value>> &addends);
 
 } // namespace comb
 } // namespace circt

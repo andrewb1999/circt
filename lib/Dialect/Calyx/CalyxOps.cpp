@@ -218,7 +218,7 @@ LogicalResult calyx::verifyControlLikeOp(Operation *op) {
   auto parent = op->getParentOp();
 
   if (isa<calyx::EnableOp>(op) &&
-      !isa<calyx::CalyxDialect>(parent->getDialect())) {
+      !isa_and_nonnull<calyx::CalyxDialect>(parent->getDialect())) {
     // Allow embedding calyx.enable ops within other dialects. This is motivated
     // by allowing experimentation with new styles of Calyx lowering. For more
     // info and the historical discussion, see:
@@ -599,9 +599,9 @@ static void buildComponentLike(OpBuilder &builder, OperationState &result,
   // Insert the WiresOp and ControlOp.
   IRRewriter::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(body);
-  builder.create<WiresOp>(result.location);
+  WiresOp::create(builder, result.location);
   if (!combinational)
-    builder.create<ControlOp>(result.location);
+    ControlOp::create(builder, result.location);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1063,7 +1063,8 @@ static LogicalResult isCombinational(Value value, GroupInterface group) {
     return success();
 
   // Constants and logical operations are OK.
-  if (isa<comb::CombDialect, hw::HWDialect>(definingOp->getDialect()))
+  if (isa_and_nonnull<comb::CombDialect, hw::HWDialect>(
+          definingOp->getDialect()))
     return success();
 
   // Reads to MemoryOp and RegisterOp are combinational. Writes are not.
@@ -2535,12 +2536,12 @@ static LogicalResult commonTailPatternWithSeq(IfOpTy ifOp,
   // this IfOp is nested in a ParOp. This avoids unintentionally
   // parallelizing the pulled out EnableOps.
   rewriter.setInsertionPointAfter(ifOp);
-  SeqOpTy seqOp = rewriter.create<SeqOpTy>(ifOp.getLoc());
+  SeqOpTy seqOp = SeqOpTy::create(rewriter, ifOp.getLoc());
   Block *body = seqOp.getBodyBlock();
   ifOp->remove();
   body->push_back(ifOp);
   rewriter.setInsertionPointToEnd(body);
-  rewriter.create<EnableOp>(seqOp.getLoc(), lastThenEnableOp->getGroupName());
+  EnableOp::create(rewriter, seqOp.getLoc(), lastThenEnableOp->getGroupName());
 
   // Erase the common EnableOp from the Then and Else regions.
   rewriter.eraseOp(*lastThenEnableOp);
@@ -2594,7 +2595,7 @@ static LogicalResult commonTailPatternWithPar(OpTy controlOp,
   // the pulled out EnableOps.
   rewriter.setInsertionPointAfter(controlOp);
 
-  ParOpTy parOp = rewriter.create<ParOpTy>(controlOp.getLoc());
+  ParOpTy parOp = ParOpTy::create(rewriter, controlOp.getLoc());
   Block *body = parOp.getBodyBlock();
   controlOp->remove();
   body->push_back(controlOp);
@@ -2602,7 +2603,7 @@ static LogicalResult commonTailPatternWithPar(OpTy controlOp,
   // counterparts in the Then and Else regions.
   rewriter.setInsertionPointToEnd(body);
   for (StringRef groupName : groupNames)
-    rewriter.create<EnableOp>(parOp.getLoc(), groupName);
+    EnableOp::create(rewriter, parOp.getLoc(), groupName);
 
   return success();
 }

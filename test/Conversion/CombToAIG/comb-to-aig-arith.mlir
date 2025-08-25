@@ -29,34 +29,89 @@ hw.module @add(in %lhs: i2, in %rhs: i2, out out: i2) {
   hw.output %0 : i2
 }
 
+// CHECK-LABEL: @add_17
+hw.module @add_17(in %lhs: i17, in %rhs: i17, out out: i17) {
+  %0 = comb.add %lhs, %rhs : i17
+  hw.output %0 : i17
+}
+
+// CHECK-LABEL: @add_35
+hw.module @add_35(in %lhs: i35, in %rhs: i35, out out: i35) {
+  %0 = comb.add %lhs, %rhs : i35
+  hw.output %0 : i35
+}
+
+// CHECK-LABEL: @add_64
+hw.module @add_64(in %lhs: i64, in %rhs: i64, out out: i64) {
+  %0 = comb.add %lhs, %rhs : i64
+  hw.output %0 : i64
+}
+
 // CHECK-LABEL: @sub
 // ALLOW_ADD-LABEL: @sub
 // ALLOW_ADD-NEXT: %[[NOT_RHS:.+]] = aig.and_inv not %rhs
 // ALLOW_ADD-NEXT: %[[CONST:.+]] = hw.constant 1 : i4
-// ALLOW_ADD-NEXT: %[[ADD:.+]] = comb.add bin %lhs, %[[NOT_RHS]], %[[CONST]]
+// ALLOW_ADD-NEXT: %[[ADD:.+]] = comb.add bin %lhs, %[[NOT_RHS]], %[[CONST]] {sv.namehint = "sub"}
 // ALLOW_ADD-NEXT: hw.output %[[ADD]]
 hw.module @sub(in %lhs: i4, in %rhs: i4, out out: i4) {
-  %0 = comb.sub %lhs, %rhs : i4
+  %0 = comb.sub %lhs, %rhs {sv.namehint = "sub"} : i4
   hw.output %0 : i4
 }
 
 
 // CHECK-LABEL: @mul
-// ALLOW_ADD-LABEL: @mul
-// ALLOW_ADD-NEXT:   %[[EXT_0:.+]] = comb.extract %lhs from 0 : (i2) -> i1
-// ALLOW_ADD-NEXT:   %[[EXT_1:.+]] = comb.extract %lhs from 1 : (i2) -> i1
-// ALLOW_ADD-NEXT:   %c0_i2 = hw.constant 0 : i2
-// ALLOW_ADD-NEXT:   %[[MUX_0:.+]] = comb.mux %[[EXT_0]], %rhs, %c0_i2 : i2
-// ALLOW_ADD-NEXT:   %[[MUX_1:.+]] = comb.mux %[[EXT_1]], %rhs, %c0_i2 : i2
-// ALLOW_ADD-NEXT:   %[[EXT_MUX_1:.+]] = comb.extract %[[MUX_1]] from 0 : (i2) -> i1
-// ALLOW_ADD-NEXT:   %false = hw.constant false
-// ALLOW_ADD-NEXT:   %[[SHIFT:.+]] = comb.concat %[[EXT_MUX_1]], %false : i1, i1
-// ALLOW_ADD-NEXT:   %[[ADD:.+]] = comb.add bin %[[MUX_0]], %[[SHIFT]] : i2
-// ALLOW_ADD-NEXT:   hw.output %[[ADD]] : i2
-// ALLOW_ADD-NEXT: }
-hw.module @mul(in %lhs: i2, in %rhs: i2, out out: i2) {
-  %0 = comb.mul %lhs, %rhs : i2
-  hw.output %0 : i2
+// ALLOW_ADD-LABEL:  hw.module @mul(in %lhs : i3, in %rhs : i3, out out : i3) {
+// ALLOW_ADD-NEXT:    %[[LHS0:.+]] = comb.extract %lhs from 0 : (i3) -> i1
+// ALLOW_ADD-NEXT:    %[[LHS1:.+]] = comb.extract %lhs from 1 : (i3) -> i1
+// ALLOW_ADD-NEXT:    %[[LHS2:.+]] = comb.extract %lhs from 2 : (i3) -> i1
+// ALLOW_ADD-NEXT:    %[[RHS0:.+]] = comb.extract %rhs from 0 : (i3) -> i1
+// ALLOW_ADD-NEXT:    %[[RHS1:.+]] = comb.extract %rhs from 1 : (i3) -> i1
+// ALLOW_ADD-NEXT:    %[[RHS2:.+]] = comb.extract %rhs from 2 : (i3) -> i1
+//                    Partial Products
+// ALLOW_ADD-NEXT:    %[[P_0_0:.+]] = comb.and %[[LHS0]], %[[RHS0]] : i1
+// ALLOW_ADD-NEXT:    %[[P_1_0:.+]] = comb.and %[[LHS1]], %[[RHS0]] : i1
+// ALLOW_ADD-NEXT:    %[[P_2_0:.+]] = comb.and %[[LHS2]], %[[RHS0]] : i1
+// ALLOW_ADD-NEXT:    %[[P_0_1:.+]] = comb.and %[[LHS0]], %[[RHS1]] : i1
+// ALLOW_ADD-NEXT:    %[[P_1_1:.+]] = comb.and %[[LHS1]], %[[RHS1]] : i1
+// ALLOW_ADD-NEXT:    %[[P_2_1:.+]] = comb.and %[[LHS0]], %[[RHS2]] : i1
+//                    Wallace Tree Reduction
+// ALLOW_ADD-NEXT:    %false = hw.constant false
+// ALLOW_ADD-NEXT:    %[[XOR0:.+]] = comb.xor bin %[[P_1_0]], %[[P_0_1]] : i1
+// ALLOW_ADD-NEXT:    %[[AND0:.+]] = comb.and bin %[[P_1_0]], %[[P_0_1]] : i1
+// ALLOW_ADD-NEXT:    %[[XOR1:.+]] = comb.xor bin %[[P_2_0]], %[[P_1_1]] : i1
+// ALLOW_ADD-NEXT:    %[[XOR2:.+]] = comb.xor bin %[[XOR1]], %[[P_2_1]] : i1
+// ALLOW_ADD-NEXT:    %[[AND1:.+]] = comb.and bin %[[P_2_0]], %[[P_1_1]] : i1
+// ALLOW_ADD-NEXT:    %[[AND2:.+]] = comb.and bin %[[XOR1]], %[[P_2_1]] : i1
+// ALLOW_ADD-NEXT:    %[[SUM_ROW:.+]] = comb.concat %[[XOR2]], %[[XOR0]], %[[P_0_0]] : i1, i1, i1
+// ALLOW_ADD-NEXT:    %[[CARRY_ROW:.+]] = comb.concat %[[AND0]], %false, %false : i1, i1, i1
+// ALLOW_ADD-NEXT:    %[[RESULT:.+]] = comb.add bin %[[SUM_ROW]], %[[CARRY_ROW]] : i3
+// ALLOW_ADD-NEXT:    hw.output %[[RESULT]] : i3
+// ALLOW_ADD-NEXT:  }
+hw.module @mul(in %lhs: i3, in %rhs: i3, out out: i3) {
+  %0 = comb.mul %lhs, %rhs : i3
+  hw.output %0 : i3
+}
+
+// CHECK-LABEL: @mul_0
+// CHECK-NEXT: %[[C0:.+]] = hw.constant 0 : i0
+// CHECK-NEXT: hw.output %[[C0]] : i0
+hw.module @mul_0(in %lhs: i0, in %rhs: i0, out out: i0) {
+  %0 = comb.mul %lhs, %rhs : i0
+  hw.output %0 : i0
+}
+
+// CHECK-LABEL: @mul_1
+// CHECK-NEXT: %[[AND:.+]] = comb.and %lhs, %rhs : i1
+// CHECK-NEXT: hw.output %[[AND]] : i1
+hw.module @mul_1(in %lhs: i1, in %rhs: i1, out out: i1) {
+  %0 = comb.mul %lhs, %rhs : i1
+  hw.output %0 : i1
+}
+
+// CHECK-LABEL: @mul_17
+hw.module @mul_17(in %lhs: i17, in %rhs: i17, out out: i17) {
+  %0 = comb.mul %lhs, %rhs : i17
+  hw.output %0 : i17
 }
 
 // CHECK-LABEL: @icmp_eq_ne

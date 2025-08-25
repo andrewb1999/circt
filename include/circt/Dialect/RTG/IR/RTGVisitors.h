@@ -36,7 +36,7 @@ public:
             ConstantOp,
             // Bags
             BagCreateOp, BagSelectRandomOp, BagDifferenceOp, BagUnionOp,
-            BagUniqueSizeOp,
+            BagUniqueSizeOp, BagConvertToSetOp,
             // Contexts
             OnContextOp, ContextSwitchOp,
             // Labels
@@ -44,7 +44,7 @@ public:
             // Registers
             FixedRegisterOp, VirtualRegisterOp,
             // RTG tests
-            TestOp, TargetOp, YieldOp,
+            TestOp, TargetOp, YieldOp, ValidateOp, TestSuccessOp, TestFailureOp,
             // Integers
             RandomNumberInRangeOp,
             // Sequences
@@ -52,11 +52,19 @@ public:
             RandomizeSequenceOp, EmbedSequenceOp, InterleaveSequencesOp,
             // Sets
             SetCreateOp, SetSelectRandomOp, SetDifferenceOp, SetUnionOp,
-            SetSizeOp,
+            SetSizeOp, SetCartesianProductOp, SetConvertToBagOp,
             // Arrays
-            ArrayCreateOp, ArrayExtractOp,
+            ArrayCreateOp, ArrayExtractOp, ArrayInjectOp, ArraySizeOp,
+            // Tuples
+            TupleCreateOp, TupleExtractOp,
             // Immediates
-            IntToImmediateOp>([&](auto expr) -> ResultType {
+            IntToImmediateOp, ConcatImmediateOp, SliceImmediateOp,
+            // Memories
+            MemoryAllocOp, MemoryBaseAddressOp, MemorySizeOp,
+            // Memory Blocks
+            MemoryBlockDeclareOp,
+            // Misc ops
+            CommentOp>([&](auto expr) -> ResultType {
           return thisCast->visitOp(expr, args...);
         })
         .Default([&](auto expr) -> ResultType {
@@ -103,22 +111,39 @@ public:
   HANDLE(SetDifferenceOp, Unhandled);
   HANDLE(SetUnionOp, Unhandled);
   HANDLE(SetSizeOp, Unhandled);
+  HANDLE(SetCartesianProductOp, Unhandled);
+  HANDLE(SetConvertToBagOp, Unhandled);
   HANDLE(BagCreateOp, Unhandled);
   HANDLE(BagSelectRandomOp, Unhandled);
   HANDLE(BagDifferenceOp, Unhandled);
   HANDLE(BagUnionOp, Unhandled);
   HANDLE(BagUniqueSizeOp, Unhandled);
+  HANDLE(BagConvertToSetOp, Unhandled);
   HANDLE(ArrayCreateOp, Unhandled);
   HANDLE(ArrayExtractOp, Unhandled);
+  HANDLE(ArrayInjectOp, Unhandled);
+  HANDLE(ArraySizeOp, Unhandled);
+  HANDLE(TupleCreateOp, Unhandled);
+  HANDLE(TupleExtractOp, Unhandled);
+  HANDLE(CommentOp, Unhandled);
   HANDLE(LabelDeclOp, Unhandled);
   HANDLE(LabelUniqueDeclOp, Unhandled);
   HANDLE(LabelOp, Unhandled);
   HANDLE(TestOp, Unhandled);
   HANDLE(TargetOp, Unhandled);
   HANDLE(YieldOp, Unhandled);
+  HANDLE(ValidateOp, Unhandled);
+  HANDLE(TestSuccessOp, Unhandled);
+  HANDLE(TestFailureOp, Unhandled);
   HANDLE(FixedRegisterOp, Unhandled);
   HANDLE(VirtualRegisterOp, Unhandled);
   HANDLE(IntToImmediateOp, Unhandled);
+  HANDLE(ConcatImmediateOp, Unhandled);
+  HANDLE(SliceImmediateOp, Unhandled);
+  HANDLE(MemoryBlockDeclareOp, Unhandled);
+  HANDLE(MemoryAllocOp, Unhandled);
+  HANDLE(MemoryBaseAddressOp, Unhandled);
+  HANDLE(MemorySizeOp, Unhandled);
 #undef HANDLE
 };
 

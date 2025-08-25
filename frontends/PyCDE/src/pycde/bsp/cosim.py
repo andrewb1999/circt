@@ -7,6 +7,7 @@ from typing import Dict, Tuple, Type
 from ..signals import BundleSignal
 from ..common import AppID, Clock, Input, Output
 from ..module import Module, generator
+from ..support import get_user_loc
 from ..system import System
 from ..types import (Bits, Bundle, BundledChannel, Channel, ChannelDirection,
                      StructType, UInt)
@@ -82,7 +83,7 @@ def CosimBSP(user_module: Type[Module], emulate_dma: bool = False) -> Module:
     def build(ports):
       System.current().platform = "cosim"
 
-      mmio_read_write = esi.FuncService.get_coerced(
+      mmio_read_write = esi.FuncService.get(
           esi.AppID("__cosim_mmio_read_write"), esi.MMIO.read_write.type)
       wrapper = ESI_Cosim_UserTopWrapper(clk=ports.clk,
                                          rst=ports.rst,
@@ -107,7 +108,8 @@ def CosimBSP(user_module: Type[Module], emulate_dma: bool = False) -> Module:
                                 appID=AppID("cosim")._appid,
                                 service_symbol=None,
                                 impl_type=ir.StringAttr.get("cosim"),
-                                inputs=[ports.clk.value, ports.rst.value])
+                                inputs=[ports.clk.value, ports.rst.value],
+                                loc=get_user_loc())
 
   return ESI_Cosim_Top
 

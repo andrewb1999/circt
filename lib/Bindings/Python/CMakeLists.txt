@@ -14,13 +14,13 @@ set(LLVM_OPTIONAL_SOURCES
 )
 
 set(PYTHON_BINDINGS_SOURCES
+  AIGModule.cpp
   CIRCTModule.cpp
   ESIModule.cpp
   HWModule.cpp
   MSFTModule.cpp
   OMModule.cpp
   RTGModule.cpp
-  RTGToolModule.cpp
   SeqModule.cpp
   SupportModule.cpp
   SVModule.cpp
@@ -30,6 +30,7 @@ set(PYTHON_BINDINGS_SOURCES
 )
 
 set(PYTHON_BINDINGS_LINK_LIBS
+  CIRCTCAPIAIG
   CIRCTCAPIArc
   CIRCTCAPIComb
   CIRCTCAPIConversion
@@ -42,18 +43,22 @@ set(PYTHON_BINDINGS_LINK_LIBS
   CIRCTCAPIHandshake
   CIRCTCAPIHW
   CIRCTCAPIHWArith
+  CIRCTCAPIKanagawa
   CIRCTCAPILTL
   CIRCTCAPIMSFT
   CIRCTCAPIOM
+  CIRCTCAPIPipeline
   CIRCTCAPIRTG
-  CIRCTCAPIRtgTool
   CIRCTCAPISeq
   CIRCTCAPISV
+  CIRCTCAPISupport
   CIRCTCAPIVerif
   CIRCTCAPITransforms
+  CIRCTCAPISynth
   MLIRCAPIIndex
   MLIRCAPISMT
   MLIRCAPIExportSMTLIB
+  MLIRCAPISCF
   # needed for mlirFrozenRewritePatternSetDestroy
   # but not the actual passes
   MLIRCAPITransforms
@@ -96,7 +101,6 @@ declare_mlir_python_sources(CIRCTBindingsPythonSources.Support
   ADD_TO_PARENT CIRCTBindingsPythonSources
   SOURCES
     support.py
-    rtgtool_support.py
 )
 
 ################################################################################
@@ -117,6 +121,14 @@ declare_mlir_dialect_python_bindings(
   SOURCES
     dialects/comb.py
   DIALECT_NAME comb)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+  TD_FILE dialects/AIGOps.td
+  SOURCES
+    dialects/aig.py
+  DIALECT_NAME aig)
 
 declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
@@ -149,6 +161,18 @@ declare_mlir_dialect_python_bindings(
   SOURCES
     dialects/hw.py
   DIALECT_NAME hw)
+
+# We need the 'arith.py' file because 'scf.py' imports from it. We are not
+# calling the function that constructs arith ops and thus don't need to
+# register and link against the dialect.
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${MLIR_MAIN_SRC_DIR}/python/mlir"
+  TD_FILE dialects/ArithOps.td
+  SOURCES
+    dialects/arith.py
+  DIALECT_NAME arith
+  GEN_ENUM_BINDINGS)
 
 declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
@@ -240,6 +264,14 @@ declare_mlir_dialect_python_bindings(
   SOURCES
     dialects/verif.py
   DIALECT_NAME verif)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${MLIR_MAIN_SRC_DIR}/python/mlir"
+  TD_FILE dialects/SCFOps.td
+  SOURCES
+    dialects/scf.py
+  DIALECT_NAME scf)
 
 declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects

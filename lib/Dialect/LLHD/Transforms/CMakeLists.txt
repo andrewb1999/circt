@@ -1,17 +1,21 @@
 add_circt_dialect_library(CIRCTLLHDTransforms
+  CombineDrives.cpp
   Deseq.cpp
   DesequentializationPass.cpp
-  DNF.cpp
+  DeseqUtils.cpp
   EarlyCodeMotionPass.cpp
-  FunctionEliminationPass.cpp
   HoistSignals.cpp
+  InlineCalls.cpp
   LowerProcesses.cpp
   Mem2Reg.cpp
   MemoryToBlockArgumentPass.cpp
   ProcessLoweringPass.cpp
+  RemoveControlFlow.cpp
   Sig2RegPass.cpp
   TemporalCodeMotionPass.cpp
   TemporalRegions.cpp
+  UnrollLoops.cpp
+  WrapProceduralOps.cpp
 
   DEPENDS
   CIRCTLLHDTransformsIncGen
@@ -21,6 +25,7 @@ add_circt_dialect_library(CIRCTLLHDTransforms
   CIRCTHW
   CIRCTLLHD
   CIRCTSeq
+  MLIRAnalysis
   MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRIR

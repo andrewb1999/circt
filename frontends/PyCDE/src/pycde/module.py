@@ -554,13 +554,19 @@ class ModuleBuilder(ModuleLikeBuilderBase):
       elif signal is None:
         if len(self.generators) > 0:
           raise PortError(
-              f"Port {name} cannot be None (disconnected ports only allowed "
+              f"Port '{name}' cannot be None (disconnected ports only allowed "
               "on extern mods.")
+        if port.type.bitwidth < 0:
+          raise PortError(f"Port '{name}' cannot be None.")
         circt_inputs[name] = create_const_zero(port.type).value
       else:
         # If it's not a signal, assume the user wants to specify a constant and
         # try to convert it to a hardware constant.
-        circt_inputs[name] = port.type(signal).value
+        try:
+          circt_inputs[name] = port.type(signal).value
+        except Exception as e:
+          raise PortError(f"Input port '{name}' could not be converted to type "
+                          f"{port.type}: {e}")
 
     missing = list(
         filter(lambda name: name not in circt_inputs, port_input_lookup.keys()))
@@ -655,11 +661,12 @@ class Module(_PyProxy, metaclass=ModuleLikeType):
     cls._builder.print(out)
 
   @classmethod
-  def inputs(cls) -> List[Tuple[str, Type]]:
-    """Get a dictionary of input port names to signals."""
-    if cls._builder.inputs is None:
-      return []
+  def inputs(cls) -> List[Input]:
     return cls._builder.inputs
+
+  @classmethod
+  def outputs(cls) -> List[Output]:
+    return cls._builder.outputs
 
 
 class modparams:
@@ -736,21 +743,16 @@ class ImportedModSpec(ModuleBuilder):
   # Creation callback that just moves the already build module into the System's
   # ModuleOp and returns it.
   def create_op(self, sys, symbol: str):
-    hw_module = self.modcls.hw_module
-
-    # TODO: deal with symbolrefs to this (potentially renamed) module symbol.
-    sys.mod.body.append(hw_module)
-
-    # Need to clear out the reference to ourselves so that we can release the
-    # raw reference to `hw_module`. It's safe to do so since unlike true PyCDE
-    # modules, this can only be run once during the import_mlir.
-    self.modcls.hw_module = None
-    return hw_module
+    assert False, "ImportedModSpec should not be used on imported modules."
 
 
-def import_hw_module(hw_module: hw.HWModuleOp):
+def import_hw_module(
+    sys,
+    hw_module: hw.HWModuleOp,
+    builder_type: type[ModuleBuilder] = ImportedModSpec) -> type[Module]:
   """Import a CIRCT module into PyCDE. Returns a standard Module subclass which
-  operates just like an external PyCDE module.
+  operates just like an external PyCDE module. If builder_type is specified, use
+  it as the module builder instead of the default `ImportedModSpec`.
 
   For now, the imported module name MUST NOT conflict with any other modules."""
 
@@ -765,11 +767,18 @@ def import_hw_module(hw_module: hw.HWModuleOp):
   for output_name, output_type in zip(mod_type.output_names,
                                       mod_type.output_types):
     modattrs[output_name] = Output(_FromCirctType(output_type), output_name)
-  modattrs["BuilderType"] = ImportedModSpec
-  modattrs["hw_module"] = hw_module
+  modattrs["BuilderType"] = builder_type
+
+  modattrs["add_metadata"] = staticmethod(
+      lambda meta, sys=sys: add_metadata(sys, name, meta))
 
   # Use the name and ports to construct a class object like what externmodule
   # would wrap.
   cls = type(name, (Module,), modattrs)
+  cls._builder = cls.BuilderType(cls, modattrs, hw_module.location)
+  cls._builder.go()
+
+  def add_metadata(sys, symbol: str, meta: Optional[Metadata]):
+    return cls._builder.add_metadata(sys, symbol, meta)
 
   return cls

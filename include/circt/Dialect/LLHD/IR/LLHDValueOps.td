@@ -10,6 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+include "circt/Dialect/LLHD/IR/LLHDDialect.td"
+include "circt/Dialect/LLHD/IR/LLHDTypes.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+
 def ConstantTimeOp : LLHDOp<"constant_time",
                                   [ConstantLike, Pure]> {
   let summary = "Introduce a new time constant.";
@@ -29,7 +33,7 @@ def ConstantTimeOp : LLHDOp<"constant_time",
   let builders = [
     /// Build a ConstantTimeOp from an ArrayRef with three values
     /// (real-time, delta, epsilon) and a string for the real-time unit.
-    OpBuilder<(ins "unsigned":$time,
+    OpBuilder<(ins "uint64_t":$time,
                    "const StringRef &":$timeUnit,
                    "unsigned":$delta,
                    "unsigned":$epsilon)>

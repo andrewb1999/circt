@@ -31,6 +31,14 @@ def ConstantTestOp : RTGTestOp<"constant_test", [
   let hasFolder = 1;
 }
 
+def GetHartIdOp : RTGTestOp<"get_hartid", [Pure]> {
+  let arguments = (ins CPUType:$cpu);
+  let results = (outs Index:$hartid);
+
+  let assemblyFormat = "$cpu attr-dict";
+  let hasFolder = 1;
+}
+
 //===- Instruction Formats -------------------------------------------------===//
 
 class InstFormatIOpBase<string mnemonic, int opcode7, int funct3>
@@ -426,6 +434,35 @@ class InstFormatShiftOpBase<string mnemonic, int opcode7,
 }
 
 //===- Instructions -------------------------------------------------------===//
+
+def RV32I_LA : RTGTestOp<"rv32i.la", [InstructionOpAdaptor]> {
+
+  let arguments = (ins IntegerRegisterType:$rd, ISAMemory:$mem);
+
+  let assemblyFormat = "$rd `,` $mem `:` type($mem) attr-dict";
+
+  let extraClassDefinition = [{
+    void $cppClass::printInstructionBinary(llvm::raw_ostream &os,
+                                           FoldAdaptor adaptor) {
+      assert(false && "binary not supported");
+    }
+
+    void $cppClass::printInstructionAssembly(llvm::raw_ostream &os,
+                                             FoldAdaptor adaptor) {
+      os << getOperationName().rsplit('.').second << " "
+         << cast<rtg::RegisterAttrInterface>(adaptor.getRd())
+              .getRegisterAssembly()
+         << ", ";
+
+      if (auto label = dyn_cast<StringAttr>(adaptor.getMem())) {
+        os << label.getValue();
+        return;
+      }
+      
+      os << cast<rtg::ImmediateAttr>(adaptor.getMem()).getValue();
+    }
+  }];
+}
 
 def RV32I_LUI       : InstFormatUOpBase<"lui",   0b0110111>;
 def RV32I_AUIPC     : InstFormatUOpBase<"auipc", 0b0010111>;

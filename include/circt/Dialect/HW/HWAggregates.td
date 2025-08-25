@@ -34,8 +34,8 @@ def AggregateConstantOp : HWOp<"aggregate_constant", [Pure, ConstantLike]> {
 
     Examples:
     ```mlir
-      %result = hw.aggregate.constant [1 : i1, 2 : i2, 3 : i2] : !hw.struct<a: i8, b: i8, c: i8>
-      %result = hw.aggregate.constant [1 : i1, [2 : i2, 3 : i2]] : !hw.struct<a: i8, b: vector<i8, 2>>
+      %result = hw.aggregate_constant [1 : i1, 2 : i2, 3 : i2] : !hw.struct<a: i8, b: i8, c: i8>
+      %result = hw.aggregate_constant [1 : i1, [2 : i2, 3 : i2]] : !hw.struct<a: i8, b: vector<i8, 2>>
     ```
   }];
 
@@ -149,29 +149,65 @@ def ArraySliceOp : HWOp<"array_slice", [Pure]> {
   }];
 }
 
-class IndexBitWidthConstraint<string index, string input>
-  : PredOpTrait<"Index width should be exactly clog2 (size of array), or either 0 or 1 if the array is a singleton.",
-                   CPred<"isValidIndexBitWidth($" # index # ", $" # input # ")">>;
+class IndexBitWidthConstraint<string index, string input> : PredOpTrait<
+  index # " bit width equals ceil(log2(length(" # input # ")))," #
+  " or 0 or 1 if " # input # " contains only one element",
+  CPred<"isValidIndexBitWidth($" # index # ", $" # input # ")">
+>;
 
-class ArrayElementTypeConstraint<string result, string input>
-  : TypesMatchWith<"Result must be arrays element type",
-                   input, result,
-                   "type_cast<ArrayType>($_self).getElementType()">;
+class ArrayElementTypeConstraint<string result, string input> : TypesMatchWith<
+  "must match array element type",
+  input, result,
+  "type_cast<ArrayType>($_self).getElementType()"
+>;
 
-// hw.array_get does not work with unpacked arrays.
-def ArrayGetOp : HWOp<"array_get",
-    [Pure, IndexBitWidthConstraint<"index", "input">,
-     ArrayElementTypeConstraint<"result", "input">]> {
-  let summary = "Get the value in an array at the specified index";
+def ArrayGetOp : HWOp<"array_get", [
+  ArrayElementTypeConstraint<"result", "input">,
+  IndexBitWidthConstraint<"index", "input">,
+  Pure,
+]> {
+  let summary = "Extract an element from an array";
+  let description = [{
+    Extracts the element at `index` from the given `input` array. The index must
+    be exactly `ceil(log2(length(input)))` bits wide.
+  }];
   let arguments = (ins ArrayType:$input, HWIntegerType:$index);
   let results = (outs HWNonInOutType:$result);
-
   let assemblyFormat = [{
-    $input`[`$index`]` attr-dict `:` qualified(type($input)) `,` qualified(type($index))
+    $input `[` $index `]`
+    attr-dict `:` type($input) `,` type($index)
   }];
-
   let hasFolder = 1;
   let hasCanonicalizeMethod = 1;
+}
+
+def ArrayInjectOp : HWOp<"array_inject", [
+  AllTypesMatch<["input", "result"]>,
+  ArrayElementTypeConstraint<"element", "input">,
+  IndexBitWidthConstraint<"index", "input">,
+  Pure,
+]> {
+  let summary = "Inject an element into an array";
+  let description = [{
+    Takes an `input` array, changes the element at `index` to the given
+    `element` value, and returns the updated array value as a result. The index
+    must be exactly `ceil(log2(length(input)))` bits wide. The element type
+    must match the input array's element type.
+
+    If the `index` is out of bounds, the result is undefined.
+  }];
+  let arguments = (ins
+    ArrayType:$input,
+    HWIntegerType:$index,
+    AnyType:$element
+  );
+  let results = (outs ArrayType:$result);
+  let assemblyFormat = [{
+    $input `[` $index `]` `,` $element
+    attr-dict `:` type($input) `,` type($index)
+  }];
+  let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
 
 //===----------------------------------------------------------------------===//

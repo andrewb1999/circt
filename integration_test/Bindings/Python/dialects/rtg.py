@@ -6,7 +6,6 @@ import circt
 from circt.dialects import rtg, rtgtest
 from circt.ir import Context, Location, Module, InsertionPoint, Block, StringAttr, TypeAttr, IndexType
 from circt.passmanager import PassManager
-from circt import rtgtool_support as rtgtool
 
 with Context() as ctx, Location.unknown():
   circt.register_dialects(ctx)
@@ -24,7 +23,7 @@ with Context() as ctx, Location.unknown():
       cpu1 = rtg.ConstantOp(rtgtest.CPUAttr.get(cpuAttr.id + 1))
       rtg.YieldOp([cpu0, cpu1])
 
-    test = rtg.TestOp('test_name', TypeAttr.get(dictTy))
+    test = rtg.TestOp('test_name', 'test_name', TypeAttr.get(dictTy))
     Block.create_at_start(test.bodyRegion, [cpuTy, cpuTy])
 
   # CHECK: rtg.target @target_name : !rtg.dict<cpu0: !rtgtest.cpu, cpu1: !rtgtest.cpu> {
@@ -58,11 +57,17 @@ with Context() as ctx, Location.unknown():
     seq = rtg.SequenceOp('sequence_name', TypeAttr.get(rtg.SequenceType.get()))
     Block.create_at_start(seq.bodyRegion, [])
 
-    test = rtg.TestOp('test_name', TypeAttr.get(rtg.DictType.get()))
+    test = rtg.TestOp('test_name', 'test_name',
+                      TypeAttr.get(rtg.DictType.get()))
     block = Block.create_at_start(test.bodyRegion, [])
     with InsertionPoint(block):
       seq_get = rtg.GetSequenceOp(rtg.SequenceType.get(), 'sequence_name')
       rtg.RandomizeSequenceOp(seq_get)
+
+    target = rtg.TargetOp('target', TypeAttr.get(rtg.DictType.get()))
+    block = Block.create_at_start(target.bodyRegion, [])
+    with InsertionPoint(block):
+      rtg.YieldOp([])
 
   # CHECK: rtg.test @test_name() {
   # CHECK-NEXT:   [[SEQ:%.+]] = rtg.get_sequence @sequence_name
@@ -71,14 +76,10 @@ with Context() as ctx, Location.unknown():
   print(m)
 
   pm = PassManager()
-  options = rtgtool.Options(
-      seed=0,
-      output_format=rtgtool.OutputFormat.ELABORATED_MLIR,
-  )
-  rtgtool.populate_randomizer_pipeline(pm, options)
+  pm.add('rtg-randomization-pipeline{seed=0}')
   pm.run(m.operation)
 
-  # CHECK: rtg.test @test_name() {
+  # CHECK: rtg.test @test_name_target() template "test_name" target @target {
   # CHECK-NEXT: }
   print(m)
 
@@ -205,6 +206,12 @@ with Context() as ctx, Location.unknown():
   # CHECK: #rtg.default : !rtgtest.cpu
   print(attr)
 
+  attr = rtg.AnyContextAttr.get(rtgtest.CPUType.get())
+  # CHECK: !rtgtest.cpu
+  print(attr.type)
+  # CHECK: #rtg.any_context : !rtgtest.cpu
+  print(attr)
+
   immediate_type = rtg.ImmediateType.get(32)
   # CHECK: width=32
   print(f"width={immediate_type.width}")
@@ -219,6 +226,18 @@ with Context() as ctx, Location.unknown():
   # CHECK: #rtg.isa.immediate<32, 42>
   print(immediate_attr)
 
+  memory_block_type = rtg.MemoryBlockType.get(32)
+  # CHECK: width=32
+  print(f"width={memory_block_type.address_width}")
+  # CHECK: !rtg.isa.memory_block<32>
+  print(memory_block_type)
+
+  memoryTy = rtg.MemoryType.get(32)
+  # CHECK: address_width=32
+  print(f'address_width={memoryTy.address_width}')
+  # CHECK: !rtg.isa.memory<32>
+  print(memoryTy)
+
 with Context() as ctx, Location.unknown():
   circt.register_dialects(ctx)
   indexTy = IndexType.get()
@@ -227,3 +246,16 @@ with Context() as ctx, Location.unknown():
   print(f"element_type={arr.element_type}")
   # CHECK: !rtg.array<index>
   print(arr)
+
+  tup = rtg.TupleType.get([indexTy, indexTy])
+  # CHECK: fields=[IndexType(index), IndexType(index)]
+  print(f"fields={tup.fields}")
+
+  # CHECK: !rtg.tuple<index, index>
+  print(tup)
+
+  tup = rtg.TupleType.get([])
+  # CHECK: fields=[]
+  print(f"fields={tup.fields}")
+  # CHECK: !rtg.tuple
+  print(tup)

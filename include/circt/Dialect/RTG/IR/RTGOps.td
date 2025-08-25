@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+include "mlir/IR/BuiltinTypes.td"
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/IR/CommonAttrConstraints.td"
@@ -20,6 +21,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "circt/Dialect/RTG/IR/RTGInterfaces.td"
 include "circt/Dialect/RTG/IR/RTGISAAssemblyInterfaces.td"
+include "circt/Dialect/Emit/EmitOpInterfaces.td"
 
 // Base class for the operation in this dialect.
 class RTGOp<string mnemonic, list<Trait> traits = []> :
@@ -44,7 +46,7 @@ def ConstantOp : RTGOp<"constant", [
 
 def SequenceOp : RTGOp<"sequence", [
   IsolatedFromAbove,
-  Symbol,
+  DeclareOpInterfaceMethods<Symbol, ["getVisibility", "setVisibility"]>,
   SingleBlock,
   NoTerminator,
   HasParent<"mlir::ModuleOp">,
@@ -86,7 +88,7 @@ def GetSequenceOp : RTGOp<"get_sequence", [
     of the main ways to do randomization.
   }];
 
-  let arguments = (ins SymbolNameAttr:$sequence);
+  let arguments = (ins FlatSymbolRefAttr:$sequence);
   let results = (outs SequenceType:$ref);
 
   let assemblyFormat = "$sequence `:` qualified(type($ref)) attr-dict";
@@ -358,6 +360,55 @@ def SetSizeOp : RTGOp<"set_size", [Pure]> {
   }];
 }
 
+def SetCartesianProductOp : RTGOp<"set_cartesian_product", [
+  Pure,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>,
+]> {
+  let summary = "computes the n-ary cartesian product of sets";
+  let description = [{
+    This operation computes a set of tuples from a list of input sets such that
+    each combination of elements from the input sets is present in the result
+    set. More formally, for n input sets it computes
+    `X_1 x ... x X_n = {(x_1, ..., x_n) | x_i \in X_i for i  \in {1, ..., n}}`.
+    At least one input set has to be provided (i.e., `n > 0`).
+
+    For example, given two sets A and B with elements
+    `A = {a0, a1}, B = {b0, b1}` the result set R will be
+    `R = {(a0, b0), (a0, b1), (a1, b0), (a1, b1)}`.
+
+    Note that an RTG set does not provide any guarantees about the order of
+    elements an can thus not be iterated over or indexed into, however, a
+    random element can be selected and subtracted from the set until it is
+    empty. This procedure is determinstic and will yield the same sequence of
+    elements for a fixed seed and RTG version. If more guarantees about the
+    order of elements is necessary, use arrays instead (and compute the
+    cartesian product manually using nested loops).
+  }];
+
+  let arguments = (ins Variadic<SetType>:$inputs);
+  let results = (outs SetType:$result);
+
+  let assemblyFormat = "$inputs `:` qualified(type($inputs)) attr-dict";
+}
+
+def SetConvertToBagOp : RTGOp<"set_convert_to_bag", [
+  Pure,
+  TypesMatchWith<"element type of set must match the bag's element type",
+                 "input", "result",
+                 "BagType::get(cast<SetType>($_self).getElementType())">,
+]> {
+  let summary = "convert a set to a bag";
+  let description = [{
+    This operation converts a set to a bag. Each element in the set occurs
+    exactly once in the resulting bag.
+  }];
+
+  let arguments = (ins SetType:$input);
+  let results = (outs BagType:$result);
+
+  let assemblyFormat = "$input `:` qualified(type($input)) attr-dict";
+}
+
 //===- Bag Operations ------------------------------------------------------===//
 
 def BagCreateOp : RTGOp<"bag_create", [Pure, SameVariadicOperandSize]> {
@@ -455,6 +506,24 @@ def BagUniqueSizeOp : RTGOp<"bag_unique_size", [Pure]> {
   }];
 }
 
+def BagConvertToSetOp : RTGOp<"bag_convert_to_set", [
+  Pure,
+  TypesMatchWith<"element type of set must match the bag's element type",
+                 "input", "result",
+                 "SetType::get(cast<BagType>($_self).getElementType())">,
+]> {
+  let summary = "convert a bag to a set";
+  let description = [{
+    This operation converts a bag to a set by dropping all duplicate elements.
+    For example, the bag `{a, a, b}` is converted to `{a, b}`.
+  }];
+
+  let arguments = (ins BagType:$input);
+  let results = (outs SetType:$result);
+
+  let assemblyFormat = "$input `:` qualified(type($input)) attr-dict";
+}
+
 //===- Array Operations -------------------------------------------------===//
 
 def ArrayCreateOp : RTGOp<"array_create", [
@@ -494,22 +563,93 @@ def ArrayExtractOp : RTGOp<"array_extract", [
   }];
 }
 
+def ArrayInjectOp : RTGOp<"array_inject", [
+  Pure,
+  AllTypesMatch<["array", "result"]>,
+  TypesMatchWith<"value type must match array element type",
+                 "array", "value",
+                 "cast<ArrayType>($_self).getElementType()">,
+]> {
+  let summary = "set an element in an array";
+  let description = [{
+    This operation produces a new array of the same type as the input array and
+    sets the element at the given index to the given value. All other values
+    remain the same. An OOB access is (immediate) undefined behavior.
+  }];
+
+  let arguments = (ins ArrayType:$array, Index:$index, AnyType:$value);
+  let results = (outs ArrayType:$result);
+
+  let assemblyFormat = [{
+    $array `[` $index `]` `,` $value `:` qualified(type($array)) attr-dict
+  }];
+}
+
+def ArraySizeOp : RTGOp<"array_size", [Pure]> {
+  let summary = "return the size of an array";
+
+  let arguments = (ins ArrayType:$array);
+  let results = (outs Index:$result);
+
+  let assemblyFormat = "$array `:` qualified(type($array)) attr-dict";
+}
+
+//===- Tuple Operations ---------------------------------------------------===//
+
+def TupleCreateOp : RTGOp<"tuple_create", [
+  Pure,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>,
+]> {
+  let summary = "create a tuple";
+
+  let arguments = (ins Variadic<AnyType>:$elements);
+  let results = (outs TupleType:$result);
+
+  let assemblyFormat = [{
+    ($elements^ `:` qualified(type($elements)))? attr-dict
+  }];
+}
+
+def TupleExtractOp : RTGOp<"tuple_extract", [
+  Pure,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>,
+]> {
+  let summary = "get an element from a tuple";
+
+  let arguments = (ins TupleType:$tuple, IndexAttr:$index);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = [{
+    $tuple `at` $index `:` qualified(type($tuple)) attr-dict
+  }];
+}
+
 //===- Integer Operations -------------------------------------------------===//
 
 def RandomNumberInRangeOp : RTGOp<"random_number_in_range", []> {
   let summary = "returns a number uniformly at random within the given range";
   let description = [{
     This operation computes a random number based on a uniform distribution
-    within the given range. The lower bound is inclusive while the upper bound
-    is exclusive. If the range is empty, compilation will fail.
-    This is (obviously) more performant than inserting all legal numbers into a
-    set and using 'set_select_random', but yields the same behavior.
+    within the given range. Both the lower and upper bounds are inclusive. If
+    the range is empty, compilation will fail. This is (obviously) more
+    performant than inserting all legal numbers into a set and using
+    'set_select_random', but yields the same behavior.
   }];
 
   let arguments = (ins Index:$lowerBound, Index:$upperBound);
   let results = (outs Index:$result);
 
-  let assemblyFormat = "` ` `[` $lowerBound `,` $upperBound `)` attr-dict";
+  let assemblyFormat = "` ` `[` $lowerBound `,` $upperBound `]` attr-dict";
+}
+
+//===- Misc Operations ----------------------------------------------------===//
+
+def CommentOp : RTGOp<"comment", []> {
+  let summary = "emit a comment in instruction stream";
+
+  let arguments = (ins StrAttr:$comment);
+
+  let assemblyFormat = "$comment attr-dict";
 }
 
 //===- ISA Register Handling Operations -----------------------------------===//
@@ -557,8 +697,10 @@ def TestOp : RTGOp<"test", [
   Symbol,
   SingleBlock,
   NoTerminator,
+  Emittable,
   DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmBlockArgumentNames"]>,
-  HasParent<"mlir::ModuleOp">
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+  HasParent<"mlir::ModuleOp">,
 ]> {
   let summary = "the root of a test";
   let description = [{
@@ -572,22 +714,47 @@ def TestOp : RTGOp<"test", [
     with that target.
 
     By default each test can be matched with all targets that fulfill its
-    requirements, but the user should be able to specify more constraints on the
-    matching procedure.
+    requirements, but the user can also directly provide a target via the
+    'target' attribute. In that case, the test will only be randomized against
+    that target.
+
+    The 'templateName' attribute specifies the name of the original test
+    template (mostly for result reporting purposes). This is because a test
+    (template) can be matched against many targets and during this process one
+    test per match is created, but all of them preserve the same test template
+    name.
 
     The body of this operation shall be processed the same way as an
     `rtg.sequence`'s body with the exception of the block arguments.
     The arguments must match the fields of the dict type in the target attribute
     exactly. The test must not have any additional arguments and cannot be
     referenced by an `rtg.get_sequence` operation.
+
+    If the end of the test is reached without executing an `rtg.test.success`
+    or `rtg.test.failure` it is as if an `rtg.test.success` is executed at the
+    very end.
   }];
 
-  let arguments = (ins SymbolNameAttr:$sym_name,
-                       TypeAttrOf<DictType>:$target);
+  let arguments = (ins SymbolNameAttr:$sym_name, StrAttr:$templateName,
+      TypeAttrOf<DictType>:$targetType, OptionalAttr<SymbolNameAttr>:$target);
   let regions = (region SizedRegion<1>:$bodyRegion);
 
   let hasCustomAssemblyFormat = 1;
   let hasRegionVerifier = 1;
+  let hasVerifier = 1;
+}
+
+def TestSuccessOp : RTGOp<"test.success", []> {
+  let summary = "exit the test and report success";
+
+  let assemblyFormat = "attr-dict";
+}
+
+def TestFailureOp : RTGOp<"test.failure", []> {
+  let summary = "exit the test and report failure";
+
+  let arguments = (ins StrAttr:$errorMessage);
+  let assemblyFormat = "$errorMessage attr-dict";
 }
 
 def TargetOp : RTGOp<"target", [
@@ -628,6 +795,73 @@ def YieldOp : RTGOp<"yield", [Pure, Terminator]> {
   let builders = [OpBuilder<(ins), [{ /* nothing to do */ }]>];
 }
 
+def ValidateOp : RTGOp<"validate", [
+  AllTypesMatch<["defaultValue", "value"]>,
+  AllTypesMatch<["defaultUsedValues", "elseValues", "values"]>,
+  AttrSizedOperandSegments,
+]> {
+  let summary = "validate the value in the given resource";
+  let description = [{
+    Validates the content of a reference-style value from the payload dialect
+    at the position of this operation. This validation may happen in a single
+    lowering step, e.g., a compiler pass that interprets the IR and inlines the
+    interpreted value directly, or a program that can be run to generate the
+    desired values may be generated first and in a second compilation run those
+    values (possibly stored in a file by the first run) may be inlined at the
+    position of these operations. For the latter, the ID attribute may be used
+    to match the values to the right operations and the 'defaultValue' is used
+    by the first run instead of the simulated value.
+
+    If the control-flow of the payload program visits this operation multiple
+    times, a possibly different value may be logged each time. In such
+    situations, the lowering should fail as no single value can be determined
+    that can be hardcoded/inlined in its place.
+
+    The value returned by this operation is not known during elaboration and
+    is thus treated like a value with identity (even though it might just be
+    a simple integer). Therefore, it is strongly recommended to not use the
+    result value of this operation in situations that expect structural
+    equivalence checks such as adding it to sets or bags.
+
+    The 'defaultUsedValues' are forwarded to the 'values' results without any
+    modification whenever the 'defaultValue' is used as replacement for 'value'.
+    Otherwise, the 'elseValues' are forwarded. This can be used to conditionally
+    execute code based on whether the default value was used or a proper value
+    was used as replacement. Note that this is not the most light-weight
+    implementation as, in principle, a single 'i1' result could achieve the same
+    in combination with an 'scf.if' or 'select' operation. However, these
+    operations are fully resolved during elaboration while the 'validate'
+    operation remains until later in the pipeline because the repeated
+    compilation runs to resolve the validate operations should use the same
+    elaboration result which is difficult to achieve with multiple elaboration
+    runs even with the same seed as a different elaboration of the validate op
+    for the different compilation runs can lead to subtle differences in the
+    RNG querrying behavior.
+
+    Another alternative could be a region that is conditionally inlined or
+    deleted. However, this is even more heavy-weight and implies a strategy that
+    involves some instructions to be present in one run but not the other which
+    can lead to different label addresses, etc. and thus more likely to problems
+    with AOT co-simulation.
+  }];
+
+  let arguments = (ins ValidationTypeInterface:$ref,
+                       AnyType:$defaultValue,
+                       OptionalAttr<StrAttr>:$id,
+                       Variadic<AnyType>:$defaultUsedValues,
+                       Variadic<AnyType>:$elseValues);
+  let results = (outs AnyType:$value, Variadic<AnyType>:$values);
+
+  let assemblyFormat = [{
+    $ref `,` $defaultValue (`,` $id^)?
+    (` ``(` $defaultUsedValues^ `else` $elseValues `:`
+    qualified(type($defaultUsedValues)) `)`)? `:`
+    qualified(type($ref)) `->` qualified(type($defaultValue)) attr-dict
+  }];
+
+  let hasVerifier = 1;
+}
+
 //===----------------------------------------------------------------------===//
 // ISA Target Operations
 //===----------------------------------------------------------------------===//
@@ -649,4 +883,124 @@ def IntToImmediateOp : RTGISAOp<"int_to_immediate", [Pure]> {
   let results = (outs ImmediateType:$result);
 
   let assemblyFormat = "$input `:` qualified(type($result)) attr-dict";
+}
+
+def ConcatImmediateOp : RTGISAOp<"concat_immediate", [
+  Pure,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>,
+]> {
+  let summary = "concatenate immediates";
+  let description = [{
+    This operation concatenates a variadic number of immediates into a single
+    immediate. The operands are concatenated in order, with the first operand
+    becoming the most significant bits of the result.
+  }];
+
+  let arguments = (ins Variadic<ImmediateType>:$operands);
+  let results = (outs ImmediateType:$result);
+
+  let assemblyFormat = "$operands `:` qualified(type($operands)) attr-dict";
+
+  let hasFolder = 1;
+}
+
+def SliceImmediateOp : RTGISAOp<"slice_immediate", [Pure]> {
+  let summary = "extract a slice from an immediate";
+  let description = [{
+    This operation extracts a contiguous slice of bits from an immediate value.
+    The slice is specified by a low bit index (inclusive) and the width of the
+    slice is determined by the result type. The slice must fit within the input
+    immediate's width.
+  }];
+
+  let arguments = (ins ImmediateType:$input, I32Attr:$lowBit);
+  let results = (outs ImmediateType:$result);
+
+  let assemblyFormat = [{
+    $input `from` $lowBit `:`
+    qualified(type($input)) `->` qualified(type($result)) attr-dict
+  }];
+  
+  let hasVerifier = 1;
+  let hasFolder = 1;
+}
+
+//===- ISA Memory Block Operations ----------------------------------------===//
+
+def MemoryBlockDeclareOp : RTGISAOp<"memory_block_declare", [
+  HasParent<"rtg::TargetOp">,
+]> {
+  let summary = "declare a memory block with the provided properties";
+  let description = [{
+    This operation declares a memory block to be allocated with the provided
+    properties. It is only allowed to declare new memory blocks in the
+    `rtg.target` operations and must be passed as argument to the `rtg.test`.
+    This is because the available memory blocks are specified by the hardware
+    design. This specification is fixed from the start and thus a test should
+    not be able to declare new memory blocks on-the-fly. However, tests are
+    allowed to allocate memory regions from these memory blocks.
+
+    The 'baseAddress' attribute specifies the first memory address (lowest
+    address representing a valid access to the memory) and the 'endAddress'
+    represents the last address (highest address that is valid to access the
+    memory).
+  }];
+
+  let arguments = (ins APIntAttr:$baseAddress, APIntAttr:$endAddress);
+  let results = (outs MemoryBlockType:$result);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+//===- ISA Memory Handling Operations -------------------------------------===//
+
+def MemoryAllocOp : RTGISAOp<"memory_alloc", [
+  TypesMatchWith<"memory must have the same address width as the memory block",
+                 "memoryBlock", "result",
+                 "MemoryType::get($_ctxt, " #
+                 "cast<MemoryBlockType>($_self).getAddressWidth())">,
+]> {
+  let summary = "allocate a memory with the provided properties";
+  let description = [{
+    This operation declares a memory to be allocated with the provided
+    properties. It is only allowed to declare new memories in the `rtg.target`
+    operations and must be passed as argument to the `rtg.test`.
+  }];
+
+  let arguments = (ins MemoryBlockType:$memoryBlock,
+                       Index:$size,
+                       Index:$alignment);
+
+  let results = (outs MemoryType:$result);
+
+  let assemblyFormat = [{
+    $memoryBlock `,` $size `,` $alignment
+    `:` qualified(type($memoryBlock)) attr-dict
+  }];
+}
+
+def MemoryBaseAddressOp : RTGISAOp<"memory_base_address", [
+  Pure,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>,
+]> {
+  let summary = "get the memory base address as an immediate";
+  let description = [{
+    This operation returns the base address of the given memory. The bit-width
+    of the returned immediate must match the address width of the given memory.
+  }];
+
+  let arguments = (ins MemoryType:$memory);
+  let results = (outs ImmediateType:$result);
+
+  let assemblyFormat = "$memory `:` qualified(type($memory)) attr-dict";
+}
+
+def MemorySizeOp : RTGISAOp<"memory_size", [Pure]> {
+  let summary = "get the size of the memory in bytes";
+
+  let arguments = (ins MemoryType:$memory);
+  let results = (outs Index:$result);
+
+  let assemblyFormat = "$memory `:` qualified(type($memory)) attr-dict";
 }

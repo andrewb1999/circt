@@ -15,7 +15,6 @@
 #include "circt/Dialect/ESI/ESIOps.h"
 #include "circt/Dialect/HW/HWInstanceGraph.h"
 #include "circt/Dialect/Handshake/HandshakeOps.h"
-#include "circt/Dialect/Handshake/HandshakePasses.h"
 #include "circt/Dialect/Seq/SeqTypes.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -256,9 +255,9 @@ void circt::handshake::insertFork(Value result, bool isLazy,
   auto forkSize = opsToProcess.size();
   Operation *newOp;
   if (isLazy)
-    newOp = rewriter.create<LazyForkOp>(result.getLoc(), result, forkSize);
+    newOp = LazyForkOp::create(rewriter, result.getLoc(), result, forkSize);
   else
-    newOp = rewriter.create<ForkOp>(result.getLoc(), result, forkSize);
+    newOp = ForkOp::create(rewriter, result.getLoc(), result, forkSize);
 
   // Modify operands of successor
   // opsToProcess may have multiple instances of same operand
