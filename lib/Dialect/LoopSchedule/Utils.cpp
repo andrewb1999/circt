@@ -709,7 +709,8 @@ public:
       Value newCond = cond;
       if (predicateMap.contains(op)) {
         auto currCond = predicateMap.lookup(op);
-        newCond = rewriter.create<arith::AndIOp>(ifOp.getLoc(), currCond, cond);
+        newCond =
+            arith::AndIOp::create(rewriter, ifOp.getLoc(), currCond, cond);
       }
       condMap.insert(std::pair(cond, newCond));
       return newCond;
@@ -728,10 +729,11 @@ public:
       }
       if (ifOp.elseBlock() && !ifOp.elseBlock()->without_terminator().empty()) {
         rewriter.setInsertionPoint(ifOp);
-        auto constOne = rewriter.create<arith::ConstantOp>(
-            ifOp.getLoc(), rewriter.getIntegerAttr(rewriter.getI1Type(), 1));
-        auto condNot = rewriter.create<arith::XOrIOp>(
-            ifOp.getLoc(), ifOp.getCondition(), constOne);
+        auto constOne = arith::ConstantOp::create(
+            rewriter, ifOp.getLoc(),
+            rewriter.getIntegerAttr(rewriter.getI1Type(), 1));
+        auto condNot = arith::XOrIOp::create(rewriter, ifOp.getLoc(),
+                                             ifOp.getCondition(), constOne);
         rewriter.splitBlock(ifOp.elseBlock(), --ifOp.elseBlock()->end());
         DenseMap<Value, Value> condMap;
         ifOp.getElseRegion().front().walk([&](Operation *op) {
@@ -774,7 +776,7 @@ struct IfToSelectPattern : OpConversionPattern<scf::IfOp> {
       operands.push_back(op.getCondition());
       operands.push_back(std::get<0>(v));
       operands.push_back(std::get<1>(v));
-      auto selectOp = rewriter.create<arith::SelectOp>(op.getLoc(), operands);
+      auto selectOp = arith::SelectOp::create(rewriter, op.getLoc(), operands);
       newValues.push_back(selectOp.getResult());
     }
     rewriter.replaceOp(op, newValues);

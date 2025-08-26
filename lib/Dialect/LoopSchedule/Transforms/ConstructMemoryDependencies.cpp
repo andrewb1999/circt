@@ -298,7 +298,7 @@ static void insertDependencies(const MemoryDependenceResult &results,
     auto destNameRef = val.first;
     auto destName = builder.getStringAttr(destNameRef);
     auto dependencies = val.second;
-    auto dependsOn = builder.create<LoopScheduleDependsOnOp>(destName);
+    auto dependsOn = LoopScheduleDependsOnOp::create(builder, destName);
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(dependsOn.getBodyBlock());
     for (auto dep : dependencies) {
@@ -306,7 +306,7 @@ static void insertDependencies(const MemoryDependenceResult &results,
       auto sourceName = builder.getStringAttr(sourceNameRef);
       auto dist =
           dep.distance > 0 ? builder.getI64IntegerAttr(dep.distance) : nullptr;
-      builder.create<LoopScheduleAccessOp>(sourceName, dist);
+      LoopScheduleAccessOp::create(builder, sourceName, dist);
     }
   }
 }
@@ -360,7 +360,8 @@ void ConstructMemoryDependenciesPass::runOnOperation() {
   ImplicitLocOpBuilder builder(funcOp.getLoc(), &getContext());
   builder.setInsertionPoint(funcOp);
   auto depOpNameAttr = builder.getStringAttr(funcOp.getName() + "_deps");
-  auto dependencies = builder.create<LoopScheduleDependenciesOp>(depOpNameAttr);
+  auto dependencies =
+      LoopScheduleDependenciesOp::create(builder, depOpNameAttr);
   builder.setInsertionPointToEnd(dependencies.getBodyBlock());
 
   insertDependencies(results, builder);

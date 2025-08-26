@@ -55,7 +55,7 @@ struct MulStrengthReduction : OpConversionPattern<MulIOp> {
       if (llvm::isPowerOf2_32(val.getInt())) {
         auto log = val.getValue().exactLogBase2();
         auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), log);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
+        auto shift = arith::ConstantOp::create(rewriter, op.getLoc(), attr);
         rewriter.replaceOpWithNewOp<arith::ShLIOp>(op, op.getLhs(),
                                                    shift.getResult());
         return success();
@@ -63,9 +63,9 @@ struct MulStrengthReduction : OpConversionPattern<MulIOp> {
 
       if (val.getInt() == -1) {
         auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), 1);
-        auto constOne = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
-        auto xorOp = rewriter.create<arith::XOrIOp>(op.getLoc(), op.getLhs(),
-                                                    op.getRhs());
+        auto constOne = arith::ConstantOp::create(rewriter, op.getLoc(), attr);
+        auto xorOp = arith::XOrIOp::create(rewriter, op.getLoc(), op.getLhs(),
+                                           op.getRhs());
         rewriter.replaceOpWithNewOp<arith::AddIOp>(op, xorOp.getResult(),
                                                    constOne);
         return success();
@@ -91,7 +91,7 @@ struct RemUIStrengthReduction : OpConversionPattern<RemUIOp> {
       if (llvm::isPowerOf2_32(val.getInt())) {
         auto shifted = val.getValue() - 1;
         auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), shifted);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
+        auto shift = arith::ConstantOp::create(rewriter, op.getLoc(), attr);
         rewriter.replaceOpWithNewOp<arith::AndIOp>(op, op.getLhs(),
                                                    shift.getResult());
         return success();
@@ -129,7 +129,7 @@ struct DivSIStrengthReduction : OpConversionPattern<DivSIOp> {
       if (llvm::isPowerOf2_32(val.getInt())) {
         auto log = val.getValue().exactLogBase2();
         auto attr = rewriter.getIntegerAttr(op.getRhs().getType(), log);
-        auto shift = rewriter.create<arith::ConstantOp>(op.getLoc(), attr);
+        auto shift = arith::ConstantOp::create(rewriter, op.getLoc(), attr);
         rewriter.replaceOpWithNewOp<arith::ShRUIOp>(op, op.getLhs(),
                                                     shift.getResult());
         return success();

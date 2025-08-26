@@ -63,8 +63,8 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
 
       op.getInductionVar().setType(newType);
       rewriter.setInsertionPointToStart(&op.getRegion().front());
-      auto newExt = rewriter.create<arith::ExtSIOp>(
-          op.getLoc(), rewriter.getI64Type(), op.getInductionVar());
+      auto newExt = arith::ExtSIOp::create(
+          rewriter, op.getLoc(), rewriter.getI64Type(), op.getInductionVar());
       rewriter.replaceAllUsesExcept(op.getInductionVar(), newExt.getOut(),
                                     newExt);
       return success();
@@ -83,23 +83,23 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
     // Replace lowerBound, upperBound and step
     auto lbValue = cast<IntegerAttr>(constantLB.getValue()).getInt();
     auto newLBAttr = rewriter.getIntegerAttr(newType, lbValue);
-    auto newLB = rewriter.create<ConstantOp>(op.getLoc(), newLBAttr);
+    auto newLB = ConstantOp::create(rewriter, op.getLoc(), newLBAttr);
     op.setLowerBound(newLB);
 
     auto ubValue = cast<IntegerAttr>(constantUB.getValue()).getInt();
     auto newUBAttr = rewriter.getIntegerAttr(newType, ubValue);
-    auto newUB = rewriter.create<ConstantOp>(op.getLoc(), newUBAttr);
+    auto newUB = ConstantOp::create(rewriter, op.getLoc(), newUBAttr);
     op.setUpperBound(newUB);
 
     auto stepValue = cast<IntegerAttr>(constantStep.getValue()).getInt();
     auto newStepAttr = rewriter.getIntegerAttr(newType, stepValue);
-    auto newStep = rewriter.create<ConstantOp>(op.getLoc(), newStepAttr);
+    auto newStep = ConstantOp::create(rewriter, op.getLoc(), newStepAttr);
     op.setStep(newStep);
 
     induction.setType(newType);
     rewriter.setInsertionPointToStart(&op.getRegion().front());
-    auto newExt = rewriter.create<arith::ExtSIOp>(
-        op.getLoc(), rewriter.getI64Type(), induction);
+    auto newExt = arith::ExtSIOp::create(rewriter, op.getLoc(),
+                                         rewriter.getI64Type(), induction);
     rewriter.replaceAllUsesExcept(induction, newExt.getOut(), newExt);
     return success();
   }
@@ -149,9 +149,9 @@ struct TruncCleanupPattern : OpRewritePattern<TruncIOp> {
     auto outputType = op.getOut().getType();
     Operation *newOp = nullptr;
     if (auto extUI = dyn_cast<ExtUIOp>(definingOp)) {
-      newOp = rewriter.create<ExtUIOp>(op.getLoc(), outputType, extUI.getIn());
+      newOp = ExtUIOp::create(rewriter, op.getLoc(), outputType, extUI.getIn());
     } else if (auto extSI = dyn_cast<ExtSIOp>(definingOp)) {
-      newOp = rewriter.create<ExtSIOp>(op.getLoc(), outputType, extSI.getIn());
+      newOp = ExtSIOp::create(rewriter, op.getLoc(), outputType, extSI.getIn());
     }
 
     if (!newOp)
@@ -244,8 +244,8 @@ struct LoadAddressNarrowingPattern : OpRewritePattern<LoopScheduleLoadOp> {
       auto oldType = dyn_cast_or_null<IntegerType>(idx.get().getType());
       if (oldType) {
         if (newType.getIntOrFloatBitWidth() < oldType.getIntOrFloatBitWidth()) {
-          auto newIdx =
-              rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
+          auto newIdx = arith::TruncIOp::create(rewriter, op.getLoc(), newType,
+                                                idx.get());
           idx.set(newIdx);
           updated = true;
         }
@@ -275,8 +275,8 @@ struct StoreAddressNarrowingPattern : OpRewritePattern<LoopScheduleStoreOp> {
       auto oldType = dyn_cast_or_null<IntegerType>(idx.get().getType());
       if (oldType) {
         if (newType.getIntOrFloatBitWidth() < oldType.getIntOrFloatBitWidth()) {
-          auto newIdx =
-              rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
+          auto newIdx = arith::TruncIOp::create(rewriter, op.getLoc(), newType,
+                                                idx.get());
           idx.set(newIdx);
           updated = true;
         }
@@ -373,8 +373,8 @@ struct LoadInterfaceAddressNarrowingPattern
       auto oldType = dyn_cast_or_null<IntegerType>(idx.get().getType());
       if (oldType) {
         if (newType.getIntOrFloatBitWidth() < oldType.getIntOrFloatBitWidth()) {
-          auto newIdx =
-              rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
+          auto newIdx = arith::TruncIOp::create(rewriter, op.getLoc(), newType,
+                                                idx.get());
           idx.set(newIdx);
           updated = true;
         }
@@ -404,8 +404,8 @@ struct StoreInterfaceAddressNarrowingPattern
       auto oldType = dyn_cast_or_null<IntegerType>(idx.get().getType());
       if (oldType) {
         if (newType.getIntOrFloatBitWidth() < oldType.getIntOrFloatBitWidth()) {
-          auto newIdx =
-              rewriter.create<arith::TruncIOp>(op.getLoc(), newType, idx.get());
+          auto newIdx = arith::TruncIOp::create(rewriter, op.getLoc(), newType,
+                                                idx.get());
           idx.set(newIdx);
           updated = true;
         }
@@ -447,7 +447,7 @@ struct ImplicitTruncPattern : OpRewritePattern<TruncIOp> {
     rewriter.setInsertionPoint(inputOp);
     for (auto &operand : inputOp->getOpOperands()) {
       auto val = operand.get();
-      auto newOperand = rewriter.create<TruncIOp>(op.getLoc(), newType, val);
+      auto newOperand = TruncIOp::create(rewriter, op.getLoc(), newType, val);
       newOperands.push_back(newOperand);
     }
 
