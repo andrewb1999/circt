@@ -1690,9 +1690,7 @@ LogicalResult ChainingModuloSimplexScheduler::MRT::enter(Operation *op,
   // llvm::errs() << "slot = " << slot << "\n";
   auto maybeRsrcs = sched.prob.getLinkedResourceTypes(op);
   if (maybeRsrcs.has_value()) {
-    llvm::errs() << "here\n";
-    for (auto rsrc : *maybeRsrcs) {
-      // llvm::errs() << "resource type\n";
+    for (auto rsrc : maybeRsrcs.value()) {
       auto lim = sched.prob.getLimit(rsrc);
       assert(lim.has_value() && "resource type does not have limit");
       assert(lim.value() > 0);
@@ -1701,7 +1699,7 @@ LogicalResult ChainingModuloSimplexScheduler::MRT::enter(Operation *op,
       assert(!revTab.count(op));
 
       auto &tempCell = tempTables[rsrc][slot];
-      if (tempCell.size() >= lim)
+      if (tempCell.size() >= *lim)
         return failure();
       tempCell.insert(op);
       usedRsrcs.insert(rsrc);
@@ -1709,7 +1707,6 @@ LogicalResult ChainingModuloSimplexScheduler::MRT::enter(Operation *op,
   }
 
   for (auto rsrc : usedRsrcs) {
-    // llvm::errs() << "usedRsrcs\n";
     auto &revTab = reverseTables[rsrc];
     assert(!revTab.count(op));
     auto &cell = tables[rsrc][slot];

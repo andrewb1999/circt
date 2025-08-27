@@ -22,6 +22,7 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -273,7 +274,11 @@ public:
     auto maybeRsrcs = linkedResourceTypes[op];
     auto rsrcs = maybeRsrcs.has_value() ? maybeRsrcs.value()
                                         : SmallVector<ResourceType>{};
-    rsrcs.push_back(rsrc);
+    auto alreadyHasRsrc =
+        llvm::any_of(rsrcs, [&](ResourceType r) { return r == rsrc; });
+    if (!alreadyHasRsrc) {
+      rsrcs.push_back(rsrc);
+    }
     linkedResourceTypes[op] = rsrcs;
   }
 

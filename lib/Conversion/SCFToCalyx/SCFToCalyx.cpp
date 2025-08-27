@@ -1409,10 +1409,10 @@ static LogicalResult buildAllocOp(ComponentLoweringState &componentState,
   // collapsed to `memref<1xi32>` with `totalSize == 1`. While the above case is
   // a trivial fix, Calyx expects 1-dimensional memories in general:
   // https://github.com/calyxir/calyx/issues/907
-  if (!(shape.size() <= 1 || totalSize <= 1)) {
-    allocOp.emitError("input memory dimension must be empty or one.");
-    return failure();
-  }
+  // if (!(shape.size() <= 1 || totalSize <= 1)) {
+  //   allocOp.emitError("input memory dimension must be empty or one.");
+  //   return failure();
+  // }
 
   std::vector<uint64_t> flattenedVals(totalSize, 0);
   if (isa<memref::GetGlobalOp>(allocOp)) {
