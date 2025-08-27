@@ -23,6 +23,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include <optional>
 
@@ -269,7 +270,11 @@ public:
     linkedResourceTypes[op] = rsrcs;
   }
   void addLinkedResourceType(Operation *op, ResourceType rsrc) {
-    linkedResourceTypes[op]->push_back(rsrc);
+    auto maybeRsrcs = linkedResourceTypes[op];
+    auto rsrcs = maybeRsrcs.has_value() ? maybeRsrcs.value()
+                                        : SmallVector<ResourceType>{};
+    rsrcs.push_back(rsrc);
+    linkedResourceTypes[op] = rsrcs;
   }
 
   /// The latency is the number of cycles \p opr needs to compute its result.

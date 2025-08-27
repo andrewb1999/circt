@@ -1690,6 +1690,7 @@ LogicalResult ChainingModuloSimplexScheduler::MRT::enter(Operation *op,
   // llvm::errs() << "slot = " << slot << "\n";
   auto maybeRsrcs = sched.prob.getLinkedResourceTypes(op);
   if (maybeRsrcs.has_value()) {
+    llvm::errs() << "here\n";
     for (auto rsrc : *maybeRsrcs) {
       // llvm::errs() << "resource type\n";
       auto lim = sched.prob.getLimit(rsrc);

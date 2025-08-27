@@ -141,7 +141,7 @@ struct ParSchedulable {
   scf::ParallelOp parOp;
 };
 
-/// A variant of types representing scheduleable operations.
+/// A variant of types representing schedulable operations.
 using Schedulable =
     std::variant<calyx::GroupOp, WhileSchedulable, ForSchedulable,
                  IfSchedulable, CallSchedulable, ParSchedulable>;
@@ -349,30 +349,34 @@ public:
     funcOp.walk([&](Operation *_op) {
       opBuiltSuccessfully &=
           TypeSwitch<mlir::Operation *, bool>(_op)
-              .template Case<arith::ConstantOp, ReturnOp, BranchOpInterface,
-                             /// SCF
-                             scf::YieldOp, scf::WhileOp, scf::ForOp, scf::IfOp,
-                             scf::ParallelOp, scf::ReduceOp,
-                             scf::ExecuteRegionOp,
-                             /// memref
-                             memref::AllocOp, memref::AllocaOp, memref::LoadOp,
-                             memref::StoreOp, memref::GetGlobalOp,
-                             /// standard arithmetic
-                             AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp,
-                             AndIOp, XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp,
-                             MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp,
-                             /// floating point
-                             AddFOp, SubFOp, MulFOp, CmpFOp, FPToSIOp, SIToFPOp,
-                             DivFOp, math::SqrtOp, math::AbsFOp,
-                             /// others
-                             SelectOp, IndexCastOp, BitcastOp, CallOp>(
+              .template Case<
+                  arith::ConstantOp, ReturnOp, BranchOpInterface,
+                  /// SCF
+                  scf::YieldOp, scf::WhileOp, scf::ForOp, scf::IfOp,
+                  scf::ParallelOp, scf::ReduceOp, scf::ExecuteRegionOp,
+                  /// memref
+                  memref::AllocOp, memref::AllocaOp, memref::LoadOp,
+                  memref::StoreOp, memref::GetGlobalOp,
+                  /// memory interface
+                  calyx::StoreLoweringInterface, calyx::LoadLoweringInterface,
+                  calyx::AllocLoweringInterface,
+                  /// standard arithmetic
+                  AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp, AndIOp,
+                  XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp, MulIOp, DivUIOp,
+                  DivSIOp, RemUIOp, RemSIOp,
+                  /// floating point
+                  AddFOp, SubFOp, MulFOp, CmpFOp, FPToSIOp, SIToFPOp, DivFOp,
+                  math::SqrtOp, math::AbsFOp,
+                  /// others
+                  SelectOp, IndexCastOp, BitcastOp, CallOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<FuncOp, scf::ConditionOp>([&](auto) {
                 /// Skip: these special cases will be handled separately.
                 return true;
               })
               .Default([&](auto op) {
-                op->emitError() << "Unhandled operation during BuildOpGroups()";
+                op->emitOpError()
+                    << "Unhandled operation during BuildOpGroups()";
                 return false;
               });
 
@@ -410,6 +414,10 @@ public:
 
 private:
   mlir::Pass::Option<std::string> &writeJson;
+  calyx::StaticGroupOp createStaticGroupForOp(PatternRewriter &rewriter,
+                                              Operation *op,
+                                              uint64_t latency) const;
+
   /// Op builder specializations.
   LogicalResult buildOp(PatternRewriter &rewriter, scf::YieldOp yieldOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter,
@@ -452,6 +460,12 @@ private:
                         memref::GetGlobalOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::LoadOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::StoreOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        calyx::LoadLoweringInterface op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        calyx::StoreLoweringInterface op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        calyx::AllocLoweringInterface op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::WhileOp whileOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::ForOp forOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::IfOp ifOp) const;
@@ -789,6 +803,71 @@ private:
   };
 };
 
+calyx::StaticGroupOp
+BuildOpGroups::createStaticGroupForOp(PatternRewriter &rewriter, Operation *op,
+                                      uint64_t latency) const {
+  auto name = op->getName().getStringRef().split(".").second;
+  auto groupName = getState<ComponentLoweringState>().getUniqueName(name);
+  return calyx::createStaticGroup(
+      rewriter, getState<ComponentLoweringState>().getComponentOp(),
+      op->getLoc(), groupName, latency);
+}
+
+LogicalResult
+BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                       calyx::LoadLoweringInterface loadOp) const {
+  Value memref = loadOp.getMemoryValue();
+
+  auto memoryInterface =
+      getState<ComponentLoweringState>().getMemoryInterface(memref);
+
+  auto group = createGroupForOp<calyx::GroupOp>(rewriter, loadOp);
+  rewriter.setInsertionPointToEnd(group.getBodyBlock());
+  auto &state = getState<ComponentLoweringState>();
+  std::optional<Block *> blockOpt;
+  auto res = loadOp.connectToMemInterface(rewriter, group, getComponent(),
+                                          state, blockOpt);
+  if (res.failed())
+    return failure();
+
+  if (blockOpt.has_value()) {
+    state.addBlockSchedulable(blockOpt.value(), group);
+  }
+
+  return success();
+}
+
+LogicalResult
+BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                       calyx::StoreLoweringInterface storeOp) const {
+  auto memoryInterface = getState<ComponentLoweringState>().getMemoryInterface(
+      storeOp.getMemoryValue());
+  auto group = createGroupForOp<calyx::GroupOp>(rewriter, storeOp);
+
+  rewriter.setInsertionPointToEnd(group.getBodyBlock());
+  auto &state = getState<ComponentLoweringState>();
+  std::optional<Block *> blockOpt;
+  auto res = storeOp.connectToMemInterface(rewriter, group, getComponent(),
+                                           state, blockOpt);
+  if (res.failed())
+    return failure();
+
+  if (blockOpt.has_value()) {
+    state.addBlockSchedulable(blockOpt.value(), group);
+  }
+
+  return success();
+}
+
+LogicalResult
+BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                       calyx::AllocLoweringInterface allocOp) const {
+  rewriter.setInsertionPointToStart(getComponent().getBodyBlock());
+  allocOp.insertMemory(rewriter, getState<ComponentLoweringState>());
+
+  return success();
+}
+
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      memref::LoadOp loadOp) const {
   Value memref = loadOp.getMemref();
@@ -894,7 +973,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
       storeOp.getMemref());
   auto group = createGroupForOp<calyx::GroupOp>(rewriter, storeOp);
 
-  // This is a sequential group, so register it as being scheduleable for the
+  // This is a sequential group, so register it as being schedulable for the
   // block.
   getState<ComponentLoweringState>().addBlockSchedulable(storeOp->getBlock(),
                                                          group);
@@ -2451,7 +2530,7 @@ private:
                                 ArrayAttr::get(rewriter.getContext(), {}),
                                 ArrayAttr::get(rewriter.getContext(), {}));
       } else
-        llvm_unreachable("Unknown scheduleable");
+        llvm_unreachable("Unknown schedulable");
     }
     return success();
   }
@@ -2533,11 +2612,10 @@ private:
         }
 
         return success(trueBrSchedSuccess && falseBrSchedSuccess);
-      } else {
-        /// Schedule sequentially within the current parent control block.
-        return schedulePath(rewriter, path, brOp.getLoc(), block,
-                            successors.front(), parentCtrlBlock);
       }
+      /// Schedule sequentially within the current parent control block.
+      return schedulePath(rewriter, path, brOp.getLoc(), block,
+                          successors.front(), parentCtrlBlock);
     }
     return success();
   }
@@ -2623,6 +2701,17 @@ class LateSSAReplacement : public calyx::FuncOpPartialLoweringPattern {
                 .getMemoryInterface(loadOp.getMemref())
                 .readData());
       }
+    });
+
+    funcOp.walk([&](calyx::LoadLoweringInterface loadOp) {
+      /// In buildOpGroups we did not replace loadOp's results, to ensure a
+      /// link between evaluating groups (which fix the input addresses of a
+      /// memory op) and a readData result. Now, we may replace these SSA
+      /// values with their memoryOp readData output.
+      loadOp.getResult().replaceAllUsesWith(
+          getState<ComponentLoweringState>()
+              .getMemoryInterface(loadOp.getMemoryValue())
+              .readData());
     });
 
     return success();
