@@ -32,19 +32,19 @@ using ResourceLimits = llvm::StringMap<unsigned>;
 Value getMemref(Operation *op);
 
 scheduling::ModuloProblem
-getModuloProblem(mlir::scf::ForOp forOp,
+getModuloProblem(mlir::scf::WhileOp whileOp,
                  analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
 scheduling::ChainingModuloProblem getChainingModuloProblem(
-    mlir::scf::ForOp forOp,
+    mlir::scf::WhileOp whileOp,
     analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
 scheduling::SharedOperatorsProblem getSharedOperatorsProblem(
-    mlir::scf::ForOp forOp,
+    mlir::scf::WhileOp whileOp,
     analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
 scheduling::ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
-    mlir::scf::ForOp forOp,
+    mlir::scf::WhileOp whileOp,
     analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
 scheduling::SharedOperatorsProblem getSharedOperatorsProblem(

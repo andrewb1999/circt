@@ -94,13 +94,13 @@ bool hasLoopScheduleDependence(Operation *op, Operation *otherOp) {
 }
 
 ModuloProblem
-getModuloProblem(scf::ForOp forOp,
+getModuloProblem(scf::WhileOp whileOp,
                  LoopScheduleDependenceAnalysis &dependenceAnalysis) {
   // Create a modulo scheduling problem.
-  ModuloProblem problem(forOp);
+  ModuloProblem problem(whileOp);
 
   // Insert memory dependences into the problem.
-  forOp.getBody()->walk([&](Operation *op) {
+  whileOp.getAfterBody()->walk([&](Operation *op) {
     // Insert every operation into the problem.
     problem.insertOperation(op);
 
@@ -111,7 +111,7 @@ getModuloProblem(scf::ForOp forOp,
 
     for (LoopScheduleDependence memoryDep : dependences) {
       // Don't insert a dependence into the problem if there is no dependence.
-      if (!forOp->isAncestor(memoryDep.source))
+      if (!whileOp->isAncestor(memoryDep.source))
         continue;
 
       unsigned distance = memoryDep.distance;
@@ -140,9 +140,9 @@ getModuloProblem(scf::ForOp forOp,
 
   // Set the anchor for scheduling. Insert dependences from all stores to the
   // terminator to ensure the problem schedules them before the terminator.
-  auto *anchor = forOp.getBody()->getTerminator();
+  auto *anchor = whileOp.getAfterBody()->getTerminator();
   problem.insertOperation(anchor);
-  forOp.getBody()->walk([&](Operation *op) {
+  whileOp.getAfterBody()->walk([&](Operation *op) {
     if (op == anchor || !problem.hasOperation(op))
       return;
     Problem::Dependence dep(op, anchor);
@@ -155,7 +155,7 @@ getModuloProblem(scf::ForOp forOp,
   // induction variable. Insert inter-iteration dependences from the definers of
   // "iter_args" to their users.
   if (unsigned nIterArgs = anchor->getNumOperands(); nIterArgs > 0) {
-    auto iterArgs = forOp.getRegionIterArgs();
+    auto iterArgs = whileOp.getRegionIterArgs();
     for (unsigned i = 0; i < nIterArgs; ++i) {
       Operation *iterArgDefiner = anchor->getOperand(i).getDefiningOp();
       // If it's not an operation, we don't need to model the dependence.
@@ -178,13 +178,13 @@ getModuloProblem(scf::ForOp forOp,
 }
 
 ChainingModuloProblem
-getChainingModuloProblem(scf::ForOp forOp,
+getChainingModuloProblem(scf::WhileOp whileOp,
                          LoopScheduleDependenceAnalysis &dependenceAnalysis) {
   // Create a modulo scheduling problem.
-  ChainingModuloProblem problem(forOp);
+  ChainingModuloProblem problem(whileOp);
 
   // Insert memory dependences into the problem.
-  forOp.getBody()->walk([&](Operation *op) {
+  whileOp.getAfterBody()->walk([&](Operation *op) {
     // Insert every operation into the problem.
     problem.insertOperation(op);
 
@@ -195,7 +195,7 @@ getChainingModuloProblem(scf::ForOp forOp,
 
     for (LoopScheduleDependence memoryDep : dependences) {
       // Don't insert a dependence into the problem if there is no dependence.
-      if (!forOp->isAncestor(memoryDep.source))
+      if (!whileOp->isAncestor(memoryDep.source))
         continue;
 
       unsigned distance = memoryDep.distance;
@@ -224,9 +224,9 @@ getChainingModuloProblem(scf::ForOp forOp,
 
   // Set the anchor for scheduling. Insert dependences from all stores to the
   // terminator to ensure the problem schedules them before the terminator.
-  auto *anchor = forOp.getBody()->getTerminator();
+  auto *anchor = whileOp.getAfterBody()->getTerminator();
   problem.insertOperation(anchor);
-  forOp.getBody()->walk([&](Operation *op) {
+  whileOp.getAfterBody()->walk([&](Operation *op) {
     if (op == anchor || !problem.hasOperation(op))
       return;
     Problem::Dependence dep(op, anchor);
@@ -239,7 +239,7 @@ getChainingModuloProblem(scf::ForOp forOp,
   // induction variable. Insert inter-iteration dependences from the definers of
   // "iter_args" to their users.
   if (unsigned nIterArgs = anchor->getNumOperands(); nIterArgs > 0) {
-    auto iterArgs = forOp.getRegionIterArgs();
+    auto iterArgs = whileOp.getAfterArguments();
     for (unsigned i = 0; i < nIterArgs; ++i) {
       Operation *iterArgDefiner = anchor->getOperand(i).getDefiningOp();
       // If it's not an operation, we don't need to model the dependence.
@@ -262,13 +262,13 @@ getChainingModuloProblem(scf::ForOp forOp,
 }
 
 SharedOperatorsProblem
-getSharedOperatorsProblem(scf::ForOp forOp,
+getSharedOperatorsProblem(scf::WhileOp whileOp,
                           LoopScheduleDependenceAnalysis &dependenceAnalysis) {
-  SharedOperatorsProblem problem(forOp);
+  SharedOperatorsProblem problem(whileOp);
 
   // Insert memory dependences into the problem.
-  assert(forOp.getLoopRegions().size() == 1);
-  forOp.getLoopRegions().front()->walk([&](Operation *op) {
+  assert(whileOp.getLoopRegions().size() == 1);
+  whileOp.getAfter().walk([&](Operation *op) {
     if (op->getParentOfType<LoopInterface>() != nullptr)
       return;
 
@@ -279,7 +279,7 @@ getSharedOperatorsProblem(scf::ForOp forOp,
       loop.getBodyBlock()->walk([&](Operation *innerOp) {
         for (auto &operand : innerOp->getOpOperands()) {
           auto *definingOp = operand.get().getDefiningOp();
-          if (definingOp && definingOp->getParentOp() == forOp) {
+          if (definingOp && definingOp->getParentOp() == whileOp) {
             Problem::Dependence dep(definingOp, op);
             auto depInserted = problem.insertDependence(dep);
             assert(succeeded(depInserted));
@@ -296,7 +296,7 @@ getSharedOperatorsProblem(scf::ForOp forOp,
 
     for (const LoopScheduleDependence &memoryDep : dependences) {
       assert(memoryDep.source != nullptr);
-      if (!forOp->isAncestor(memoryDep.source))
+      if (!whileOp->isAncestor(memoryDep.source))
         continue;
 
       // Do not consider inter-iteration deps for seq loops
@@ -314,10 +314,10 @@ getSharedOperatorsProblem(scf::ForOp forOp,
 
   // Set the anchor for scheduling. Insert dependences from all stores to the
   // terminator to ensure the problem schedules them before the terminator.
-  assert(forOp.getLoopRegions().size() == 1);
-  auto *anchor = forOp.getLoopRegions().front()->back().getTerminator();
+  assert(whileOp.getLoopRegions().size() == 1);
+  auto *anchor = whileOp.getAfter().back().getTerminator();
   problem.insertOperation(anchor);
-  forOp.getLoopRegions().front()->walk([&](Operation *op) {
+  whileOp.getAfter().walk([&](Operation *op) {
     if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
         op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
         !problem.hasOperation(op))
@@ -334,12 +334,11 @@ getSharedOperatorsProblem(scf::ForOp forOp,
 }
 
 ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
-    scf::ForOp forOp, LoopScheduleDependenceAnalysis &dependenceAnalysis) {
-  ChainingSharedOperatorsProblem problem(forOp);
+    scf::WhileOp whileOp, LoopScheduleDependenceAnalysis &dependenceAnalysis) {
+  ChainingSharedOperatorsProblem problem(whileOp);
 
   // Insert memory dependences into the problem.
-  assert(forOp.getLoopRegions().size() == 1);
-  forOp.getLoopRegions().front()->walk([&](Operation *op) {
+  whileOp.getAfterBody()->walk([&](Operation *op) {
     if (op->getParentOfType<LoopInterface>() != nullptr)
       return;
 
@@ -350,7 +349,7 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
       loop.getBodyBlock()->walk([&](Operation *innerOp) {
         for (auto &operand : innerOp->getOpOperands()) {
           auto *definingOp = operand.get().getDefiningOp();
-          if (definingOp && definingOp->getParentOp() == forOp) {
+          if (definingOp && definingOp->getParentOp() == whileOp) {
             Problem::Dependence dep(definingOp, op);
             auto depInserted = problem.insertDependence(dep);
             assert(succeeded(depInserted));
@@ -367,7 +366,7 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
 
     for (const LoopScheduleDependence &memoryDep : dependences) {
       assert(memoryDep.source != nullptr);
-      if (!forOp->isAncestor(memoryDep.source))
+      if (!whileOp->isAncestor(memoryDep.source))
         continue;
 
       // Do not consider inter-iteration deps for seq loops
@@ -385,10 +384,9 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
 
   // Set the anchor for scheduling. Insert dependences from all stores to the
   // terminator to ensure the problem schedules them before the terminator.
-  assert(forOp.getLoopRegions().size() == 1);
-  auto *anchor = forOp.getLoopRegions().front()->back().getTerminator();
+  auto *anchor = whileOp.getAfter().back().getTerminator();
   problem.insertOperation(anchor);
-  forOp.getLoopRegions().front()->walk([&](Operation *op) {
+  whileOp.getAfter().walk([&](Operation *op) {
     if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
         op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
         !problem.hasOperation(op))

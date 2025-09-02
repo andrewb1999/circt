@@ -92,14 +92,14 @@ struct SCFToLoopSchedulePass
 private:
   LogicalResult populateOperatorTypes(Operation *op, Region &body,
                                       ChainingSharedOperatorsProblem &problem);
-  LogicalResult solveChainingModuloProblem(scf::ForOp &loop,
+  LogicalResult solveChainingModuloProblem(scf::WhileOp &loop,
                                            ChainingModuloProblem &problem,
                                            float cycleTime);
   LogicalResult solveChainingSharedOperatorsProblem(
       Region &region, ChainingSharedOperatorsProblem &problem, float cycleTime);
-  LogicalResult createLoopSchedulePipeline(scf::ForOp &loop,
+  LogicalResult createLoopSchedulePipeline(scf::WhileOp &loop,
                                            CyclicProblem &problem);
-  LogicalResult createLoopScheduleSequential(scf::ForOp &loop,
+  LogicalResult createLoopScheduleSequential(scf::WhileOp &loop,
                                              Problem &problem);
   LogicalResult createFuncLoopSchedule(FuncOp &funcOp, Problem &problem);
 
@@ -112,11 +112,10 @@ private:
 } // namespace
 
 void SCFToLoopSchedulePass::runOnOperation() {
-  getOperation()->getParentOfType<ModuleOp>().dump();
   float cycleTime = prioritizeII ? 2.0 : 1.0;
 
   // Collect loops to pipeline and work on them.
-  SmallVector<scf::ForOp> loops;
+  SmallVector<scf::WhileOp> loops;
 
   auto hasPipelinedParent = [](Operation *op) {
     Operation *currentOp = op;
@@ -131,13 +130,13 @@ void SCFToLoopSchedulePass::runOnOperation() {
   };
 
   auto res = getOperation()->walk<WalkOrder::PreOrder>([&](Operation *op) {
-    if (!isa<scf::ForOp>(op) || !op->hasAttr("hls.pipeline"))
+    if (!isa<scf::WhileOp>(op) || !op->hasAttr("hls.pipeline"))
       return WalkResult::advance();
 
     if (hasPipelinedParent(op))
       return WalkResult::interrupt();
 
-    loops.push_back(cast<scf::ForOp>(op));
+    loops.push_back(cast<scf::WhileOp>(op));
     return WalkResult::advance();
   });
 
@@ -156,27 +155,27 @@ void SCFToLoopSchedulePass::runOnOperation() {
   for (auto loop : llvm::make_early_inc_range(loops)) {
     ResourceMap resourceMap;
     ResourceLimits resourceLimits;
-    if (failed(recordMemoryResources(loop.getOperation(), loop.getRegion(),
+    if (failed(recordMemoryResources(loop.getOperation(), loop.getAfter(),
                                      resourceMap, resourceLimits)))
       return signalPassFailure();
 
-    if (failed(ifOpConversion(loop.getOperation(), loop.getRegion(),
-                              predicateMap)))
+    if (failed(
+            ifOpConversion(loop.getOperation(), loop.getAfter(), predicateMap)))
       return signalPassFailure();
 
     // Populate the target operator types.
     ChainingModuloProblem moduloProblem =
         getChainingModuloProblem(loop, *dependenceAnalysis);
 
-    if (failed(populateOperatorTypes(loop.getOperation(), loop.getRegion(),
+    if (failed(populateOperatorTypes(loop.getOperation(), loop.getAfter(),
                                      moduloProblem)))
       return signalPassFailure();
 
-    if (failed(addMemoryResources(loop.getOperation(), loop.getRegion(),
+    if (failed(addMemoryResources(loop.getOperation(), loop.getAfter(),
                                   moduloProblem, resourceMap, resourceLimits)))
       return signalPassFailure();
 
-    addPredicateDependencies(loop.getOperation(), loop.getRegion(),
+    addPredicateDependencies(loop.getOperation(), loop.getAfter(),
                              moduloProblem, predicateMap, predicateUse);
 
     // Solve the scheduling problem computed by the analysis.
@@ -191,9 +190,9 @@ void SCFToLoopSchedulePass::runOnOperation() {
   }
 
   // Schedule all remaining loops
-  SmallVector<scf::ForOp> seqLoops;
+  SmallVector<scf::WhileOp> seqLoops;
 
-  getOperation().walk([&](scf::ForOp loop) {
+  getOperation().walk([&](scf::WhileOp loop) {
     seqLoops.push_back(loop);
     return WalkResult::advance();
   });
@@ -202,32 +201,31 @@ void SCFToLoopSchedulePass::runOnOperation() {
   for (auto loop : seqLoops) {
     ResourceMap resourceMap;
     ResourceLimits resourceLimits;
-    if (failed(recordMemoryResources(loop.getOperation(), loop.getRegion(),
+    if (failed(recordMemoryResources(loop.getOperation(), loop.getAfter(),
                                      resourceMap, resourceLimits)))
       return signalPassFailure();
 
-    if (failed(ifOpConversion(loop.getOperation(), loop.getRegion(),
-                              predicateMap)))
+    if (failed(
+            ifOpConversion(loop.getOperation(), loop.getAfter(), predicateMap)))
       return signalPassFailure();
 
-    assert(loop.getLoopRegions().size() == 1);
     auto problem = getChainingSharedOperatorsProblem(loop, *dependenceAnalysis);
 
     // Populate the target operator types.
-    if (failed(populateOperatorTypes(loop.getOperation(),
-                                     *loop.getLoopRegions().front(), problem)))
+    if (failed(populateOperatorTypes(loop.getOperation(), loop.getAfter(),
+                                     problem)))
       return signalPassFailure();
 
-    if (failed(addMemoryResources(loop.getOperation(), loop.getRegion(),
-                                  problem, resourceMap, resourceLimits)))
+    if (failed(addMemoryResources(loop.getOperation(), loop.getAfter(), problem,
+                                  resourceMap, resourceLimits)))
       return signalPassFailure();
 
-    addPredicateDependencies(loop.getOperation(), loop.getRegion(), problem,
+    addPredicateDependencies(loop.getOperation(), loop.getAfter(), problem,
                              predicateMap, predicateUse);
 
     // Solve the scheduling problem computed by the analysis.
-    if (failed(solveChainingSharedOperatorsProblem(
-            *loop.getLoopRegions().front(), problem, cycleTime)))
+    if (failed(solveChainingSharedOperatorsProblem(loop.getAfter(), problem,
+                                                   cycleTime)))
       return signalPassFailure();
 
     // Convert the IR.
@@ -298,8 +296,7 @@ static bool onlyUserIsYield(Operation *op) {
 
   Operation *user = users.begin().getCurrent()->getOwner();
 
-  if (isa<scf::YieldOp>(user))
-    return true;
+  return isa<scf::YieldOp>(user);
 }
 
 /// Populate the schedling problem operator types for the dialect we are
@@ -502,15 +499,14 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
 
 /// Solve the pre-computed scheduling problem.
 LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
-    scf::ForOp &loop, ChainingModuloProblem &problem, float cycleTime) {
+    scf::WhileOp &loop, ChainingModuloProblem &problem, float cycleTime) {
   // Scheduling analyis only considers the innermost loop nest for now.
-  auto forOp = loop;
 
   std::optional<int32_t> ii;
   if (auto iiAttr = loop->getAttrOfType<IntegerAttr>("hls.pipeline"))
     ii = iiAttr.getInt();
 
-  LLVM_DEBUG(forOp.dump());
+  LLVM_DEBUG(loop.dump());
 
   // Optionally debug problem inputs.
   LLVM_DEBUG(for (auto *op
@@ -538,7 +534,7 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
   if (failed(problem.check()))
     return failure();
 
-  auto *anchor = forOp.getBody()->getTerminator();
+  auto *anchor = loop.getAfterBody()->getTerminator();
   if (failed(scheduleSimplex(problem, anchor, cycleTime, ii)))
     return failure();
 
@@ -623,7 +619,7 @@ LogicalResult SCFToLoopSchedulePass::solveChainingSharedOperatorsProblem(
 
 /// Create the pipeline op for a loop nest.
 LogicalResult
-SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
+SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
                                                   CyclicProblem &problem) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
 
@@ -631,9 +627,9 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
       &loop->getParentOfType<FuncOp>().getBody().front());
 
   // Create Values for the loop's lower and upper bounds.
-  Value lowerBound = loop.getLowerBound();
-  Value upperBound = loop.getUpperBound();
-  Value step = loop.getStep();
+  // Value lowerBound = loop.getLowerBound();
+  // Value upperBound = loop.getUpperBound();
+  // Value step = loop.getStep();
 
   builder.setInsertionPoint(loop);
 
@@ -644,7 +640,7 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
   auto ii = builder.getI64IntegerAttr(problem.getInitiationInterval().value());
 
   SmallVector<Value> iterArgs;
-  iterArgs.push_back(lowerBound);
+  // iterArgs.push_back(lowerBound);
   iterArgs.append(loop.getInits().begin(), loop.getInits().end());
 
   // If possible, attach a constant trip count attribute. This could be
@@ -657,14 +653,26 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
   auto pipeline = builder.create<LoopSchedulePipelineOp>(
       resultTypes, ii, tripCountAttr, iterArgs);
 
-  // Create the condition, which currently just compares the induction variable
-  // to the upper bound.
+  // Create the condition
   Block &condBlock = pipeline.getCondBlock();
+  auto scfCond = cast<scf::ConditionOp>(loop.getBeforeBody()->getTerminator());
   builder.setInsertionPointToStart(&condBlock);
-  auto cmpResult = builder.create<arith::CmpIOp>(
-      builder.getI1Type(), arith::CmpIPredicate::slt, condBlock.getArgument(0),
-      upperBound);
-  condBlock.getTerminator()->insertOperands(0, {cmpResult});
+
+  IRMapping mapper;
+
+  for (size_t i = 0; i < iterArgs.size(); ++i) {
+    auto oldArg = loop.getBeforeArguments()[i];
+    auto newArg = condBlock.getArgument(i);
+    mapper.map(oldArg, newArg);
+  }
+
+  for (auto &op : loop.getBeforeBody()->getOperations()) {
+    if (!op.hasTrait<OpTrait::IsTerminator>()) {
+      builder.clone(op, mapper);
+    }
+  }
+  condBlock.getTerminator()->insertOperands(
+      0, mapper.lookup(scfCond.getCondition()));
 
   // Add the non-yield and non-if operations to their start time groups.
   DenseMap<unsigned, SmallVector<Operation *>> startGroups;
@@ -679,9 +687,9 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
   // initially populated with the iter args.
   IRMapping valueMap;
   // Nested loops are not supported yet.
-  assert(iterArgs.size() == loop.getBody()->getNumArguments());
+  assert(iterArgs.size() == loop.getAfterBody()->getNumArguments());
   for (size_t i = 0; i < iterArgs.size(); ++i)
-    valueMap.map(loop.getBody()->getArgument(i),
+    valueMap.map(loop.getAfterBody()->getArgument(i),
                  pipeline.getStagesBlock().getArgument(i));
 
   // Create the stages.
@@ -803,8 +811,7 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
     }
   }
 
-  assert(loop.getLoopRegions().size() == 1);
-  for (auto it : enumerate(loop.getLoopRegions().front()->getArguments())) {
+  for (auto it : enumerate(loop.getAfter().getArguments())) {
     auto iterArg = it.value();
     if (iterArg.getUsers().empty())
       continue;
@@ -812,7 +819,7 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
     unsigned startPipeTime = 0;
     if (it.index() > 0) {
       // Handle extra iter args
-      auto *term = loop.getLoopRegions().front()->back().getTerminator();
+      auto *term = loop.getAfterBody()->getTerminator();
       auto &termOperand = term->getOpOperand(it.index() - 1);
       auto *definingOp = termOperand.get().getDefiningOp();
       assert(definingOp != nullptr);
@@ -895,9 +902,9 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
     uint64_t endTime = startTime + largestLatency;
 
     // Add the induction variable increment in the first stage.
-    if (startTime == 0) {
-      stageTypes.push_back(lowerBound.getType());
-    }
+    // if (startTime == 0) {
+    //   stageTypes.push_back(lowerBound.getType());
+    // }
 
     // Create the stage itself.
     builder.setInsertionPoint(stagesBlock.getTerminator());
@@ -962,12 +969,12 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
                                     stageOperands);
 
     // Add the induction variable increment to the first stage.
-    if (startTime == 0) {
-      auto incResult =
-          builder.create<arith::AddIOp>(stagesBlock.getArgument(0), step);
-      stageTerminator->insertOperands(stageTerminator->getNumOperands(),
-                                      incResult->getResults());
-    }
+    // if (startTime == 0) {
+    //   auto incResult =
+    //       builder.create<arith::AddIOp>(stagesBlock.getArgument(0), step);
+    //   stageTerminator->insertOperands(stageTerminator->getNumOperands(),
+    //                                   incResult->getResults());
+    // }
   }
 
   // Add the iter args and results to the terminator.
@@ -978,10 +985,11 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::ForOp &loop,
   // mapped values that were originally yielded.
   SmallVector<Value> termIterArgs;
   SmallVector<Value> termResults;
-  termIterArgs.push_back(
-      stagesBlock.front().getResult(stagesBlock.front().getNumResults() - 1));
+  // termIterArgs.push_back(
+  //     stagesBlock.front().getResult(stagesBlock.front().getNumResults() -
+  //     1));
 
-  for (auto value : loop.getBody()->getTerminator()->getOperands()) {
+  for (auto value : loop.getAfterBody()->getTerminator()->getOperands()) {
     unsigned lookupTime =
         std::min((unsigned)(stageValueMaps.size() - 1),
                  (unsigned)(pipeTimes[value].first + ii.getInt()));
@@ -1034,28 +1042,23 @@ getOperationCycleMap(Problem &problem) {
 
 /// Create loopschedule seq op for a sequential loop
 LogicalResult
-SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
+SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
                                                     Problem &problem) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
 
   builder.setInsertionPointToStart(
       &loop->getParentOfType<FuncOp>().getBody().front());
 
-  // Create Values for the loop's lower and upper bounds.
-  Value lowerBound = loop.getLowerBound();
-  Value upperBound = loop.getUpperBound();
-  Value incr = loop.getStep();
-
   builder.setInsertionPoint(loop);
 
-  auto *anchor = loop.getBody()->getTerminator();
+  auto *anchor = loop.getAfterBody()->getTerminator();
 
   // Create the pipeline op, with the same result types as the inner loop. An
   // iter arg is created for the induction variable.
   TypeRange resultTypes = loop.getResultTypes();
 
   SmallVector<Value> iterArgs;
-  iterArgs.push_back(lowerBound);
+  // iterArgs.push_back(lowerBound);
   iterArgs.append(loop.getInits().begin(), loop.getInits().end());
 
   // If possible, attach a constant trip count attribute.
@@ -1069,14 +1072,26 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
   auto sequential = builder.create<LoopScheduleSequentialOp>(
       loop.getLoc(), resultTypes, tripCountAttr, iterArgs);
 
-  // Create the condition, which currently just compares the induction variable
-  // to the upper bound.
+  // Create the condition
   Block &condBlock = sequential.getCondBlock();
+  auto scfCond = cast<scf::ConditionOp>(loop.getBeforeBody()->getTerminator());
   builder.setInsertionPointToStart(&condBlock);
-  auto cmpResult = builder.create<arith::CmpIOp>(
-      builder.getI1Type(), arith::CmpIPredicate::slt, condBlock.getArgument(0),
-      upperBound);
-  condBlock.getTerminator()->insertOperands(0, {cmpResult});
+
+  IRMapping mapper;
+
+  for (size_t i = 0; i < iterArgs.size(); ++i) {
+    auto oldArg = loop.getBeforeArguments()[i];
+    auto newArg = condBlock.getArgument(i);
+    mapper.map(oldArg, newArg);
+  }
+
+  for (auto &op : loop.getBeforeBody()->getOperations()) {
+    if (!op.hasTrait<OpTrait::IsTerminator>()) {
+      builder.clone(op, mapper);
+    }
+  }
+  condBlock.getTerminator()->insertOperands(
+      0, mapper.lookup(scfCond.getCondition()));
 
   // Maintain mappings of values in the loop body and results of stages
   IRMapping valueMap;
@@ -1114,6 +1129,26 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
     return false;
   };
 
+  auto valueHasLaterUse = [&](Value v, uint32_t resTime) {
+    for (uint32_t i = resTime + 1; i < endTime; ++i) {
+      if (startGroups.contains(i)) {
+        auto startGroup = startGroups[i];
+        for (auto *operation : startGroup) {
+          for (auto &operand : operation->getOpOperands()) {
+            if (operand.get() == v) {
+              return true;
+            }
+
+            // Forward values used for predicates as well
+            if (predicateUse.contains(operand.get()))
+              return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+
   // Must re-register return values of memories if they are used later
   for (auto *op : problem.getOperations()) {
     if (isa<LoopScheduleLoadOp>(op)) {
@@ -1135,8 +1170,7 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
 
   Block &scheduleBlock = sequential.getScheduleBlock();
 
-  assert(loop.getLoopRegions().size() == 1);
-  if (!loop.getLoopRegions().front()->getArgument(0).getUsers().empty()) {
+  if (!loop.getAfter().getArgument(0).getUsers().empty()) {
     auto containsLoop = false;
     for (auto *op : startGroups[endTime]) {
       if (isa<LoopInterface>(op)) {
@@ -1155,7 +1189,7 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
   // initially populated with the iter args.
   valueMap.clear();
   for (size_t i = 0; i < iterArgs.size(); ++i)
-    valueMap.map(loop.getLoopRegions().front()->getArgument(i),
+    valueMap.map(loop.getAfter().getArgument(i),
                  sequential.getScheduleBlock().getArgument(i));
 
   // Create the stages.
@@ -1176,12 +1210,12 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
     auto group = startGroups[startTime];
     OpBuilder::InsertionGuard g(builder);
 
-    // Collect the return types for this stage. Operations whose results are not
-    // used within this stage are returned.
     auto isLoopTerminator = [loop](Operation *op) {
       return isa<YieldOp>(op) && op->getParentOp() == loop;
     };
 
+    // Collect the return types for this stage. Operations whose results are not
+    // exclusively used within this stage are returned.
     SmallVector<Type> stepTypes;
     DenseSet<Operation *> opsWithReturns;
     for (auto *op : group) {
@@ -1192,8 +1226,7 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
         users.append(predUsers.begin(), predUsers.end());
       }
       for (auto *user : users) {
-        auto *userOrAncestor =
-            loop.getLoopRegions().front()->findAncestorOpInRegion(*user);
+        auto *userOrAncestor = loop.getAfter().findAncestorOpInRegion(*user);
         auto startTimeOpt = problem.getStartTime(userOrAncestor);
         if ((startTimeOpt.has_value() && *startTimeOpt > startTime) ||
             isLoopTerminator(user)) {
@@ -1204,15 +1237,22 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
           }
         }
       }
+
+      // Add return types for iter_args that are updated in this step but have
+      // later uses.
+      for (auto &operand : anchor->getOpOperands()) {
+        auto iterArgNum = operand.getOperandNumber();
+        auto iterArg = loop.getAfterArguments()[iterArgNum];
+        if (operand.get().getDefiningOp() == op &&
+            valueHasLaterUse(iterArg, startTime)) {
+          stepTypes.push_back(iterArg.getType());
+        }
+      }
     }
 
+    // Add return types for values we already know need to be reregistered.
     for (auto val : reregisterValues[startTime]) {
       stepTypes.push_back(val.getType());
-    }
-
-    if (i.index() == startTimes.size() - 1) {
-      // Add index increment to first step
-      stepTypes.push_back(lowerBound.getType());
     }
 
     // Create the step itself.
@@ -1224,6 +1264,8 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
     // Sort the group according to original dominance.
     llvm::sort(group,
                [&](Operation *a, Operation *b) { return dom.dominates(a, b); });
+
+    SmallVector<std::pair<Value, Value>> newIterArgs;
 
     // Move over the operations and add their results to the terminator.
     SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
@@ -1260,6 +1302,22 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
         stepTerminator->insertOperands(resultIndex, newOp->getResults());
         movedOps.emplace_back(op, newOp, resultIndex);
       }
+
+      resultIndex = stepTerminator->getNumOperands();
+
+      // Handle iter_args with later uses
+      for (auto &operand : anchor->getOpOperands()) {
+        auto iterArgNum = operand.getOperandNumber();
+        auto iterArg = loop.getAfterArguments()[iterArgNum];
+        if (operand.get().getDefiningOp() == op &&
+            valueHasLaterUse(iterArg, startTime)) {
+          auto newIterArg = valueMap.lookup(iterArg);
+          stepTerminator->insertOperands(resultIndex,
+                                         SmallVector<Value>{newIterArg});
+          newIterArgs.emplace_back(iterArg, step->getResult(resultIndex));
+        }
+      }
+
       // All further uses in this stage should used the cloned-version of values
       // So we update the mapping in this stage
       for (auto result : op->getResults())
@@ -1275,15 +1333,20 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
     }
 
     // Add the step results to the value map for the original op.
-    for (auto tuple : movedOps) {
-      Operation *op = std::get<0>(tuple);
-      Operation *newOp = std::get<1>(tuple);
-      unsigned resultIndex = std::get<2>(tuple);
+    for (auto t : movedOps) {
+      Operation *op = std::get<0>(t);
+      Operation *newOp = std::get<1>(t);
+      unsigned resultIndex = std::get<2>(t);
       for (size_t i = 0; i < newOp->getNumResults(); ++i) {
         auto newValue = step->getResult(resultIndex + i);
         auto oldValue = op->getResult(i);
         valueMap.map(oldValue, newValue);
       }
+    }
+
+    // Handle iter_args with later uses
+    for (auto iterArgPair : newIterArgs) {
+      valueMap.map(std::get<0>(iterArgPair), std::get<1>(iterArgPair));
     }
 
     // Add values that need to be reregistered in the future
@@ -1300,14 +1363,6 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
         }
       }
     }
-
-    if (i.index() == startTimes.size() - 1) {
-      auto incResult =
-          builder.create<arith::AddIOp>(scheduleBlock.getArgument(0), incr);
-      stepTerminator->insertOperands(stepTerminator->getNumOperands(),
-                                     incResult->getResults());
-      lastStep = step;
-    }
   }
 
   // Add the iter args and results to the terminator.
@@ -1317,21 +1372,13 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::ForOp &loop,
   // Collect iter args and results from the induction variable increment and any
   // mapped values that were originally yielded.
   SmallVector<Value> termIterArgs;
-  SmallVector<Value> termResults;
-  termIterArgs.push_back(lastStep.getResult(lastStep.getNumResults() - 1));
   for (int i = 0, vals = anchor->getNumOperands(); i < vals; ++i) {
     auto value = anchor->getOperand(i);
-    auto result = loop.getResult(i);
     termIterArgs.push_back(valueMap.lookup(value));
-    auto numUses =
-        std::distance(result.getUses().begin(), result.getUses().end());
-    if (numUses > 0) {
-      termResults.push_back(valueMap.lookup(value));
-    }
   }
 
   scheduleTerminator.getIterArgsMutable().append(termIterArgs);
-  scheduleTerminator.getResultsMutable().append(termResults);
+  scheduleTerminator.getResultsMutable().append(termIterArgs);
 
   // Replace loop results with while results.
   auto resultNum = 0;

@@ -98,6 +98,9 @@ LogicalResult loopschedule::verifyLoop(Operation *op) {
                     return phase == definingPhase ||
                            phase->isBeforeInBlock(definingPhase);
                   });
+    if (i >= loop.getBodyArgs().size())
+      return loop.emitOpError(
+          "mismatched number of iter_args between block and terminator");
     auto bodyArg = loop.getBodyArgs()[i];
     for (auto &use : bodyArg.getUses()) {
       auto *user = use.getOwner();
@@ -111,6 +114,13 @@ LogicalResult loopschedule::verifyLoop(Operation *op) {
                                 "produced, found use in: ");
     }
   }
+
+  // Verify that the terminator produces the expected number of results
+  auto termOp =
+      cast<LoopScheduleTerminatorOp>(loop.getBodyBlock()->getTerminator());
+  if (termOp.getResults().size() != loop->getNumResults())
+    return loop.emitOpError(
+        "TerminatorOp does not produce the expected number of results");
 
   return success();
 }
@@ -591,7 +601,7 @@ LogicalResult LoopScheduleStepOp::verify() {
     for (auto res : step.getResults()) {
       auto num = res.getResultNumber();
       auto &termOperand = term->getOpOperand(num);
-      if (!isa<memref::LoadOp>(termOperand.get().getDefiningOp()))
+      if (!isa_and_nonnull<memref::LoadOp>(termOperand.get().getDefiningOp()))
         continue;
 
       for (auto *user : res.getUsers()) {
