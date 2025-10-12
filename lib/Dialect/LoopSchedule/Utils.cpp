@@ -31,6 +31,7 @@
 #include "mlir/Interfaces/CastInterfaces.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/WalkResult.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
@@ -391,6 +392,39 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
         op->getParentOfType<LoopSchedulePipelineOp>() != nullptr ||
         !problem.hasOperation(op))
       return;
+
+    for (OpOperand &operand : anchor->getOpOperands()) {
+      Value v = operand.get();
+      Operation *argProducer = v.getDefiningOp();
+      if (op != argProducer) {
+        Value arg = whileOp.getAfterArguments()[operand.getOperandNumber()];
+        if (auto loop = dyn_cast<LoopInterface>(op)) {
+          loop.getBodyBlock()->walk([&](Operation *innerOp) {
+            for (OpOperand &otherOperand : innerOp->getOpOperands()) {
+              if (otherOperand.get() == arg) {
+                Problem::Dependence dep(op, argProducer);
+                auto depInserted = problem.insertDependence(dep);
+                assert(succeeded(depInserted));
+                (void)depInserted;
+                return WalkResult::interrupt();
+              }
+            }
+            return WalkResult::advance();
+          });
+        } else {
+          for (OpOperand &otherOperand : op->getOpOperands()) {
+            if (otherOperand.get() == arg) {
+              Problem::Dependence dep(op, argProducer);
+              auto depInserted = problem.insertDependence(dep);
+              assert(succeeded(depInserted));
+              (void)depInserted;
+              break;
+            }
+          }
+        }
+      }
+    }
+
     if (!isa<AffineStoreOp, memref::StoreOp, StoreInterface>(op))
       return;
     Problem::Dependence dep(op, anchor);

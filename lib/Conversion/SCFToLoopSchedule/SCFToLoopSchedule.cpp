@@ -817,14 +817,12 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
       continue;
 
     unsigned startPipeTime = 0;
-    if (it.index() > 0) {
-      // Handle extra iter args
-      auto *term = loop.getAfterBody()->getTerminator();
-      auto &termOperand = term->getOpOperand(it.index() - 1);
-      auto *definingOp = termOperand.get().getDefiningOp();
-      assert(definingOp != nullptr);
-      startPipeTime = *problem.getStartTime(definingOp);
-    }
+
+    auto *term = loop.getAfterBody()->getTerminator();
+    auto &termOperand = term->getOpOperand(it.index());
+    auto *definingOp = termOperand.get().getDefiningOp();
+    assert(definingOp != nullptr);
+    startPipeTime = *problem.getStartTime(definingOp);
 
     unsigned pipeEndTime = 0;
     for (auto *user : iterArg.getUsers()) {
@@ -1380,15 +1378,9 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
   scheduleTerminator.getIterArgsMutable().append(termIterArgs);
   scheduleTerminator.getResultsMutable().append(termIterArgs);
 
-  // Replace loop results with while results.
-  auto resultNum = 0;
+  // Replace loop results with sequential results.
   for (size_t i = 0; i < loop.getNumResults(); ++i) {
-    auto result = loop.getResult(i);
-    auto numUses =
-        std::distance(result.getUses().begin(), result.getUses().end());
-    if (numUses > 0) {
-      loop.getResult(i).replaceAllUsesWith(sequential.getResult(resultNum++));
-    }
+    loop.getResult(i).replaceAllUsesWith(sequential.getResult(i));
   }
 
   dependenceAnalysis->replaceOp(loop, sequential);
