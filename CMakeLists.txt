@@ -35,6 +35,7 @@ if( CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR )
 # Options and settings
 #-------------------------------------------------------------------------------
 
+  # MSVC-specific compiler configuration
   if (MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHs-c- /GR-")
   else ()
@@ -564,8 +565,10 @@ if(CIRCT_SLANG_FRONTEND_ENABLED)
     FetchContent_Declare(
       slang
       GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
-      GIT_TAG v9.0
-      GIT_SHALLOW ON)
+      GIT_TAG dd16a7947e0586d0541477f1b4b60eda7c986e35
+      # Shallow check-out doesn't work if the tag is ref spec is far from HEAD.
+      # GIT_SHALLOW ON
+    )
     set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE "NEVER")
 
     # Force Slang to be built as a static library to avoid messing around with
@@ -597,12 +600,13 @@ if(CIRCT_SLANG_FRONTEND_ENABLED)
         get_target_property(dep_target ${dep_alias} ALIASED_TARGET)
         message(STATUS "Installing slang dependency ${dep_target}")
         set_property(GLOBAL APPEND PROPERTY CIRCT_EXPORTS ${dep_target})
-        install(TARGETS ${dep_target} EXPORT CIRCTTargets)
 
         # Disable the installation of headers coming from third-party libraries.
         # We won't use those APIs directly. Just make them static libraries for
         # the sake of running slang normally.
         set_target_properties(${dep_target} PROPERTIES PUBLIC_HEADER "")
+
+        install(TARGETS ${dep_target} EXPORT CIRCTTargets)
       endif()
     endforeach()
     set_property(GLOBAL APPEND PROPERTY CIRCT_EXPORTS slang_slang)

@@ -851,7 +851,7 @@ void FIRRTLModuleLowering::lowerFileHeader(CircuitOp op,
   // Helper function to emit #ifndef guard.
   auto emitGuard = [&](const char *guard, llvm::function_ref<void(void)> body) {
     sv::IfDefOp::create(
-        b, guard, []() {}, body);
+        b, guard, [] {}, body);
   };
 
   if (state.usedFileDescriptorLib) {
@@ -909,7 +909,7 @@ package __circt_lib_logging;
     static int global_id [string];
     static function int get(string name);
       if (global_id.exists(name) == 32'h0) begin
-        global_id[name] = $fopen(name);
+        global_id[name] = $fopen(name, "w");
         if (global_id[name] == 32'h0)
           $error("Failed to open file %s", name);
       end
@@ -1224,11 +1224,12 @@ FIRRTLModuleLowering::lowerModule(FModuleOp oldModule, Block *topLevelModule,
     newModule.setCommentAttr(comment);
 
   // Copy over any attributes which are not required for FModuleOp.
-  SmallVector<StringRef, 12> attrNames = {
+  SmallVector<StringRef, 13> attrNames = {
       "annotations",   "convention",      "layers",
       "portNames",     "sym_name",        "portDirections",
       "portTypes",     "portAnnotations", "portSymbols",
-      "portLocations", "parameters",      SymbolTable::getVisibilityAttrName()};
+      "portLocations", "parameters",      SymbolTable::getVisibilityAttrName(),
+      "domainInfo"};
 
   DenseSet<StringRef> attrSet(attrNames.begin(), attrNames.end());
   SmallVector<NamedAttribute> newAttrs(newModule->getAttrs());
@@ -2895,7 +2896,7 @@ void FIRRTLLowering::addToAlwaysBlock(
         // It is weird but intended. Here we want to create an empty sv.if
         // with an else block.
         insideIfOp = sv::IfOp::create(
-            builder, reset, []() {}, []() {});
+            builder, reset, [] {}, [] {});
       };
       if (resetStyle == sv::ResetType::AsyncReset) {
         sv::EventControl events[] = {clockEdge, resetEdge};
@@ -4973,10 +4974,9 @@ LogicalResult FIRRTLLowering::visitStmt(StopOp op) {
       sv::MacroRefExprOp::create(builder, cond.getType(), "STOP_COND_");
   Value exitCond = builder.createOrFold<comb::AndOp>(stopCond, cond, true);
 
-  if (op.getExitCode())
-    sim::FatalOp::create(builder, clock, exitCond);
-  else
-    sim::FinishOp::create(builder, clock, exitCond);
+  sim::ClockedTerminateOp::create(builder, clock, exitCond,
+                                  /*success=*/op.getExitCode() == 0,
+                                  /*verbose=*/true);
 
   return success();
 }

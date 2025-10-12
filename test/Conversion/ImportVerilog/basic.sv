@@ -742,8 +742,8 @@ module Expressions;
       int a, b;
     } c, d;
   } union1;
-  // CHECK: %r1 = moore.variable : <real>
-  // CHECK: %r2 = moore.variable : <real>
+  // CHECK: %r1 = moore.variable : <f64>
+  // CHECK: %r2 = moore.variable : <f64>
   real r1,r2;
   // CHECK: %arrayInt = moore.variable : <array<2 x i32>>
   bit [1:0][31:0] arrayInt;
@@ -833,9 +833,8 @@ module Expressions;
     // CHECK: [[TMP5:%.+]] = moore.zext [[TMP4]] : i6 -> i32
     // CHECK: moore.blocking_assign %a, [[TMP5]] : i32
     a = { << 4 { 6'b11_0101 }};
-    // CHECK: [[TMP1:%.+]] = moore.constant -11 : i6
-    // CHECK: [[TMP2:%.+]] = moore.zext [[TMP1]] : i6 -> i32
-    // CHECK: moore.blocking_assign %a, [[TMP2]] : i32
+    // CHECK: [[TMP1:%.+]] = moore.constant 53 : i32
+    // CHECK: moore.blocking_assign %a, [[TMP1]] : i32
     a = { >> 4 { 6'b11_0101 }};
     // CHECK: [[TMP1:%.+]] = moore.constant -3 : i4
     // CHECK: [[TMP2:%.+]] = moore.extract [[TMP1]] from 0 : i4 -> i1
@@ -867,9 +866,8 @@ module Expressions;
     // CHECK: moore.blocking_assign [[TMP1]], [[TMP2]] : i96
     {>>{ a, b, c }} = 96'b1;
     // CHECK: [[TMP1:%.+]] = moore.concat_ref %a, %b, %c : (!moore.ref<i32>, !moore.ref<i32>, !moore.ref<i32>) -> <i96>
-    // CHECK: [[TMP2:%.+]] = moore.constant 31 : i100
-    // CHECK: [[TMP3:%.+]] = moore.trunc [[TMP2]] : i100 -> i96
-    // CHECK: moore.blocking_assign [[TMP1]], [[TMP3]] : i96
+    // CHECK: [[TMP2:%.+]] = moore.constant 31 : i96
+    // CHECK: moore.blocking_assign [[TMP1]], [[TMP2]] : i96
     {>>{ a, b, c }} = 100'b11111;
     // CHECK: [[TMP1:%.+]] = moore.concat_ref %p1, %p2, %p3, %p4 : (!moore.ref<l11>, !moore.ref<l11>, !moore.ref<l11>, !moore.ref<l11>) -> <l44>
     // CHECK: [[TMP2:%.+]] = moore.read %up : <uarray<4 x l11>>
@@ -1365,12 +1363,12 @@ module Expressions;
     c = x ? a : b;
 
     // CHECK: [[X_COND:%.+]] = moore.read %x
-    // CHECK: moore.conditional [[X_COND]] : i1 -> real {
+    // CHECK: moore.conditional [[X_COND]] : i1 -> f64 {
     // CHECK:   [[R1_READ:%.+]] = moore.read %r1
-    // CHECK:   moore.yield [[R1_READ]] : real
+    // CHECK:   moore.yield [[R1_READ]] : f64
     // CHECK: } {
     // CHECK:   [[R2_READ:%.+]] = moore.read %r2
-    // CHECK:   moore.yield [[R2_READ]] : real
+    // CHECK:   moore.yield [[R2_READ]] : f64
     // CHECK: }
     r1 = x ? r1 : r2;
 
@@ -1525,15 +1523,12 @@ module Expressions;
     struct0 = '{43, 9002};
 
 
-    // CHECK: [[TMP0:%.+]] = moore.constant 43 : i32
-    // CHECK: [[TMP1:%.+]] = moore.sext [[TMP0]] : i32 -> i64
+    // CHECK: [[TMP1:%.+]] = moore.constant 43 : i64
     // CHECK: [[TMP2:%.+]] = moore.read %struct0 : <struct<{a: i32, b: i32}>>
     // CHECK: [[TMP3:%.+]] = moore.packed_to_sbv [[TMP2]] : struct<{a: i32, b: i32}>
     // CHECK: [[TMP4:%.+]] = moore.wildcard_eq [[TMP1]], [[TMP3]] : i64 -> i1
     // CHECK: [[TMP5:%.+]] = moore.zext [[TMP4]] : i1 -> i32
-    // CHECK: [[TMP6:%.+]] = moore.int_to_logic [[TMP5]] : i32
-    // CHECK: [[TMP7:%.+]] = moore.logic_to_int [[TMP6]] : l32
-    // CHECK: moore.blocking_assign %c, [[TMP7]] : i32
+    // CHECK: moore.blocking_assign %c, [[TMP5]] : i32
     c = 43 inside {struct0};
 
     // CHECK: [[TMP0:%.+]] = moore.constant 44
@@ -1625,6 +1620,28 @@ module Conversion;
   // CHECK: [[TMP2:%.+]] = moore.sbv_to_packed [[TMP1]] : struct<{a: i32, b: i32}>
   // CHECK: %f = moore.variable [[TMP2]]
   struct packed { int a; int b; } f = '0;
+endmodule
+
+// CHECK-LABEL: moore.module @TimeConversion1
+module TimeConversion1;
+  timeunit 10fs / 1fs;
+  // CHECK-DAG: [[TMP:%.+]] = moore.constant_time 12340 fs
+  // CHECK: moore.variable [[TMP]] : <time>
+  time t = 1234;
+  // CHECK-DAG: [[TMP:%.+]] = moore.constant 1234 : i32
+  // CHECK: moore.variable [[TMP]] : <i32>
+  int i = 12.34ps;
+endmodule
+
+// CHECK-LABEL: moore.module @TimeConversion2
+module TimeConversion2;
+  timeunit 100fs / 1fs;
+  // CHECK-DAG: [[TMP:%.+]] = moore.constant_time 123400 fs
+  // CHECK: moore.variable [[TMP]] : <time>
+  time t = 1234;
+  // CHECK-DAG: [[TMP:%.+]] = moore.constant 123 : i32
+  // CHECK: moore.variable [[TMP]] : <i32>
+  int i = 12.34ps;
 endmodule
 
 // CHECK-LABEL: moore.module @PortsTop
@@ -1862,17 +1879,17 @@ module GenerateConstructs;
     // CHECK: [[TMP:%.+]] = moore.constant 0
     // CHECK: dbg.variable "i", [[TMP]]
     // CHECK: [[TMP:%.+]] = moore.constant 0
-    // CHECK: %g1 = moore.variable [[TMP]]
+    // CHECK: g1 = moore.variable [[TMP]]
     // CHECK: [[TMP:%.+]] = moore.constant 1
     // CHECK: dbg.variable "i", [[TMP]]
     // CHECK: [[TMP:%.+]] = moore.constant 1
-    // CHECK: moore.variable name "g1" [[TMP]]
+    // CHECK: g1 = moore.variable [[TMP]]
     for (i = 0; i < 2; i = i + 1) begin
       integer g1 = i;
     end
 
     // CHECK: [[TMP:%.+]] = moore.constant 2 : i32
-    // CHECK: %g2 = moore.variable [[TMP]] : <i32>
+    // CHECK: g2 = moore.variable [[TMP]] : <i32>
     if (p == 2) begin
       int g2 = 2;
     end else begin
@@ -1880,7 +1897,7 @@ module GenerateConstructs;
     end
     
     // CHECK: [[TMP:%.+]] = moore.constant 2 : i32
-    // CHECK: %g3 = moore.variable [[TMP]] : <i32>
+    // CHECK: g3 = moore.variable [[TMP]] : <i32>
     case (p)
       2: begin
         int g3 = 2;
@@ -3126,3 +3143,105 @@ module PackedLvalue5(input logic [1023:0] x);
   logic [7:0][63:0] a, b;
   always_comb {a, b[0]} = x;
 endmodule
+
+// CHECK-LABEL: moore.module @UnarySingleBitIncrement(
+module UnarySingleBitIncrement (
+    input  logic  clk_i,
+    input  logic  rst_ni
+);
+  // CHECK: [[IQ:%.+]] = moore.variable : <l1>
+  logic i_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) begin
+      i_q <= '0;
+    end else begin
+      // CHECK: [[PRE:%.+]] = moore.read [[IQ]] : <l1>
+      // CHECK-NEXT: [[OUT:%.+]] = moore.not [[PRE]]
+      i_q <= ++i_q;
+    end
+  end
+
+endmodule // UnarySingleBitIncrement
+
+// CHECK-LABEL: func.func private @returnParameterArrayElement(
+function automatic int unsigned returnParameterArrayElement (int idx);
+  localparam int unsigned ParameterArray [2] = '{42, 9001};
+  // CHECK: [[CONST0:%.+]] = moore.constant 42 : i32
+  // CHECK-NEXT: [[CONST1:%.+]] = moore.constant 9001 : i32
+  // CHECK-NEXT: [[ARR:%.+]] = moore.array_create [[CONST0]], [[CONST1]] : !moore.i32, !moore.i32 -> uarray<2 x i32>
+  // CHECK: [[RETURN:%.+]] = moore.dyn_extract [[ARR]] from {{%.+}} : uarray<2 x i32>, i32 -> i32
+  return ParameterArray[idx];
+endfunction
+
+// CHECK-LABEL: func.func private @TimeFormat(
+function void TimeFormat();
+  // CHECK: [[TIME:%.+]] = moore.constant_time 100000000 fs
+  localparam time TestTime = 100ns;
+  // CHECK-NEXT: [[FMT:%.+]] = moore.fmt.time [[TIME]]
+  // CHECK-NEXT: [[LINEBREAK:%.+]] = moore.fmt.literal "\0A"
+  // CHECK-NEXT: [[CONCAT:%.+]] = moore.fmt.concat ([[FMT]], [[LINEBREAK]])
+  // CHECK-NEXT: moore.builtin.display [[CONCAT]]
+  $display("%t", TestTime);
+  // CHECK: [[SIMTIME:%.+]] = moore.builtin.time
+  // CHECK-NEXT: [[FMT2:%.+]] = moore.fmt.time [[SIMTIME]]
+  // CHECK-NEXT: [[LINEBREAK2:%.+]] = moore.fmt.literal "\0A"
+  // CHECK-NEXT: [[CONCAT2:%.+]] = moore.fmt.concat ([[FMT2]], [[LINEBREAK2]])
+  // CHECK-NEXT: moore.builtin.display [[CONCAT2]]
+  $display("%t", $time());
+  // CHECK: [[SIMTIME3:%.+]] = moore.builtin.time
+  // CHECK-NEXT: [[FMT3:%.+]] = moore.fmt.time [[SIMTIME3]], width 4
+  // CHECK-NEXT: [[LINEBREAK3:%.+]] = moore.fmt.literal "\0A"
+  // CHECK-NEXT: [[CONCAT3:%.+]] = moore.fmt.concat ([[FMT3]], [[LINEBREAK3]])
+  // CHECK-NEXT: moore.builtin.display [[CONCAT3]]
+  $display("%4t", $time());
+endfunction
+
+// CHECK-LABEL: func.func private @StructCreateConversion(
+// CHECK-SAME: [[ARRAY:%.+]]: !moore.array<8 x l8>
+// CHECK-SAME: [[IMM:%.+]]: !moore.l64
+function void StructCreateConversion (logic [7:0][7:0] array, logic [63:0] immediate);
+
+   typedef struct packed {
+      logic [63:0] structField;
+   } testStruct;
+
+    // CHECK: [[TS:%.+]] = moore.struct_create [[IMM]] : !moore.l64 -> struct<{structField: l64}>
+   testStruct ts = '{structField: immediate};
+    // CHECK: [[CAST:%.+]] = moore.packed_to_sbv [[ARRAY]] : array<8 x l8>
+    // CHECK-NEXT: [[TS2:%.+]] = moore.struct_create [[CAST]] : !moore.l64 -> struct<{structField: l64}>
+   testStruct ts2 = '{structField: array};
+
+endfunction
+
+// CHECK-LABEL: func.func private @ConcatSformatf(
+// CHECK-SAME: [[STR1:%[^,]+]]: !moore.string
+// CHECK-SAME: [[STR2:%[^,]+]]: !moore.string
+// CHECK-SAME: [[STR3:%[^,]+]]: !moore.ref<string>
+function automatic void ConcatSformatf(string testStr, string otherString, ref string outputString);
+   // CHECK: [[LV:%.+]] = moore.variable : <l64>
+   logic [63:0] logicVector;
+   // CHECK: [[FMTSTR1:%.+]] = moore.fmt.string [[STR1]]
+   // CHECK-NEXT: [[SPC:%.+]] = moore.fmt.literal " "
+   // CHECK-NEXT: [[FMTSTR2:%.+]] = moore.fmt.string [[STR2]]
+   // CHECK-NEXT: [[CONCAT:%.+]] = moore.fmt.concat ([[FMTSTR1]], [[SPC]], [[FMTSTR2]])
+   // CHECK-NEXT: [[STROUT:%.+]] = moore.fstring_to_string [[CONCAT]]
+    string test = $sformatf("%s %s", testStr, otherString);
+
+   // CHECK: [[FMTSTR3:%.+]] = moore.fmt.string [[STR1]]
+   // CHECK-NEXT: [[SPC2:%.+]] = moore.fmt.literal " "
+   // CHECK-NEXT: [[FMTSTR4:%.+]] = moore.fmt.string [[STR2]]
+   // CHECK-NEXT: [[CONCAT2:%.+]] = moore.fmt.concat ([[FMTSTR3]], [[SPC2]], [[FMTSTR4]])
+   // CHECK-NEXT: [[STROUT2:%.+]] = moore.fstring_to_string [[CONCAT2]]
+   // CHECK-NEXT: moore.blocking_assign [[STR3]], [[STROUT2]] : string
+   $sformat(outputString, "%s %s", testStr, otherString);
+
+   // CHECK: [[FMTSTR5:%.+]] = moore.fmt.string [[STR1]]
+   // CHECK-NEXT: [[SPC3:%.+]] = moore.fmt.literal " "
+   // CHECK-NEXT: [[FMTSTR6:%.+]] = moore.fmt.string [[STR2]]
+   // CHECK-NEXT: [[CONCAT3:%.+]] = moore.fmt.concat ([[FMTSTR5]], [[SPC3]], [[FMTSTR6]])
+   // CHECK-NEXT: [[STROUT3:%.+]] = moore.fstring_to_string [[CONCAT3]]
+   // CHECK-NEXT: [[CONV:%.+]] = moore.conversion [[STROUT3]] : !moore.string -> !moore.l64
+   // CHECK-NEXT: moore.blocking_assign [[LV]], [[CONV]] : l64
+   $sformat(logicVector, "%s %s", testStr, otherString);
+endfunction

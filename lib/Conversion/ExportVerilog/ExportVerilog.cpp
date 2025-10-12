@@ -2168,8 +2168,11 @@ public:
     assert(localTokens.empty());
     // Wrap to this column.
     ps.scopedBox(PP::ibox0, [&]() {
+      // Require unsigned in an assignment context since every wire is
+      // declared as unsigned.
       emitSubExpr(exp, parenthesizeIfLooserThan,
-                  /*signRequirement*/ NoRequirement,
+                  /*signRequirement*/
+                  isAssignmentLikeContext ? RequireUnsigned : NoRequirement,
                   /*isSelfDeterminedUnsignedValue*/ false,
                   isAssignmentLikeContext);
     });
@@ -5406,6 +5409,7 @@ LogicalResult StmtEmitter::visitSV(CaseOp op) {
   });
   emitLocationInfoAndNewLine(ops);
 
+  size_t caseValueIndex = 0;
   ps.scopedBox(PP::bbox2, [&]() {
     for (auto &caseInfo : op.getCases()) {
       startStatement();
@@ -5424,6 +5428,9 @@ LogicalResult StmtEmitter::visitSV(CaseOp op) {
           .Case<CaseEnumPattern>([&](auto enumPattern) {
             ps << PPExtString(emitter.fieldNameResolver.getEnumFieldName(
                 cast<hw::EnumFieldAttr>(enumPattern->attr())));
+          })
+          .Case<CaseExprPattern>([&](auto) {
+            emitExpression(op.getCaseValues()[caseValueIndex++], ops);
           })
           .Case<CaseDefaultPattern>([&](auto) { ps << "default"; })
           .Default([&](auto) { assert(false && "unhandled case pattern"); });

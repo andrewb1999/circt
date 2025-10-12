@@ -512,11 +512,12 @@ def ConstantOp : MooreOp<"constant", [Pure, ConstantLike]> {
   ];
 }
 
-def ConstantTimeOp : MooreOp<"constant_time", [Pure]> {
+def ConstantTimeOp : MooreOp<"constant_time", [Pure, ConstantLike]> {
   let summary = "A constant time value in femtoseconds";
   let arguments = (ins UI64Attr:$value);
   let results = (outs TimeType:$result);
   let assemblyFormat = "$value `fs` attr-dict";
+  let hasFolder = 1;
 }
 
 def StringConstantOp : MooreOp<"string_constant", [Pure]> {
@@ -547,12 +548,12 @@ def RealLiteralOp : MooreOp<"real_constant", [Pure]> {
     See IEEE 1800-2017 § 5.7.2 "Real literal constants".
   }];
   let arguments = (ins F64Attr:$value);
-  let results = (outs RealType:$result);
+  let results = (outs RealF64:$result);
   let assemblyFormat = "$value attr-dict `:` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
-// Casting and Resizing
+// Casting
 //===----------------------------------------------------------------------===//
 
 def ConversionOp : MooreOp<"conversion", [Pure]> {
@@ -650,6 +651,26 @@ def ToBuiltinBoolOp : MooreOp<"to_builtin_bool", [Pure]> {
   }];
 }
 
+def TimeToLogicOp : MooreOp<"time_to_logic", [Pure]> {
+  let summary = "Convert a time type to an integer number of femtoseconds";
+  let arguments = (ins TimeType:$input);
+  let results = (outs FourValuedI64:$result);
+  let assemblyFormat = "$input attr-dict";
+  let hasFolder = 1;
+}
+
+def LogicToTimeOp : MooreOp<"logic_to_time", [Pure]> {
+  let summary = "Convert an integer number of femtoseconds to a time type";
+  let arguments = (ins FourValuedI64:$input);
+  let results = (outs TimeType:$result);
+  let assemblyFormat = "$input attr-dict";
+  let hasFolder = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Resizing
+//===----------------------------------------------------------------------===//
+
 def TruncOp : MooreOp<"trunc", [
   Pure,
   TypeDomainsMatch<["input", "result"]>,
@@ -668,6 +689,7 @@ def TruncOp : MooreOp<"trunc", [
   let assemblyFormat = [{
     $input attr-dict `:` type($input) `->` type($result)
   }];
+  let hasFolder = 1;
 }
 
 class ExtOpBase<string mnemonic> : MooreOp<mnemonic, [
@@ -683,6 +705,7 @@ class ExtOpBase<string mnemonic> : MooreOp<mnemonic, [
   let assemblyFormat = [{
     $input attr-dict `:` type($input) `->` type($result)
   }];
+  let hasFolder = 1;
 }
 
 def ZExtOp : ExtOpBase<"zext"> {
@@ -837,7 +860,6 @@ def SubOp : BinaryOpBase<"sub"> {
 
     See IEEE 1800-2017 § 11.4.3 "Arithmetic operators".
   }];
-
   let hasFolder = 1;
 }
 
@@ -849,6 +871,7 @@ def MulOp : BinaryOpBase<"mul", [Commutative]> {
 
     See IEEE 1800-2017 § 11.4.3 "Arithmetic operators".
   }];
+  let hasFolder = 1;
 }
 
 class DivOpBase<string mnemonic> : BinaryOpBase<mnemonic> {
@@ -861,6 +884,7 @@ class DivOpBase<string mnemonic> : BinaryOpBase<mnemonic> {
 
     See IEEE 1800-2017 § 11.4.3 "Arithmetic operators".
   }];
+  let hasFolder = 1;
 }
 
 def DivUOp : DivOpBase<"divu">;
@@ -1621,6 +1645,17 @@ def FormatLiteralOp : MooreOp<"fmt.literal", [Pure]> {
   let assemblyFormat = "$literal attr-dict";
 }
 
+def FormatStringToStringOp : MooreOp<"fstring_to_string", [Pure]> {
+  let summary = "A dynamic string created through formatting";
+  let description = [{
+    Creates a dynamic string from a format string.
+    Translates into a no-op.
+  }];
+  let arguments = (ins FormatStringType:$fmtstring);
+  let results = (outs StringType:$result);
+  let assemblyFormat = "$fmtstring attr-dict";
+}
+
 def FormatConcatOp : MooreOp<"fmt.concat", [Pure]> {
   let summary = "Concatenate string fragments";
   let description = [{
@@ -1710,12 +1745,184 @@ def FormatRealOp : MooreOp<"fmt.real", [Pure]> {
   }];
 }
 
+def FormatTimeOp : MooreOp<"fmt.time", [Pure]> {
+  let summary = "Format a time value";
+  let description = [{
+  Format a time value as a string according to the format specified by the most recent
+  invocation of `$timeformat`.
+
+  See IEEE 1800-2023 § 21.2.1.1 "Format specifications" and
+  IEEE 1800-2023 § 20.4.3 "$timeformat".
+  }];
+  let arguments = (ins
+  TimeType:$value,
+  OptionalAttr<I32Attr>:$width
+  );
+  let results = (outs FormatStringType:$result);
+  let assemblyFormat = [{
+      $value
+      (`,` `width` $width^)?
+      attr-dict
+  }];
+}
+
+def FormatStringOp : MooreOp<"fmt.string", [Pure]> {
+  let summary = "A dynamic string fragment";
+  let description = [{
+    Creates a dynamic string fragment to be used as a format string. The
+    string is printed as is, without any further escaping or processing of its
+    characters.
+
+    Use fmt.literal over this operator for any constant strings / literals.
+  }];
+  let arguments = (ins
+    StringType:$string,
+    OptionalAttr<I32Attr>:$width,
+    OptionalAttr<IntAlignAttr>:$alignment,
+    OptionalAttr<IntPaddingAttr>:$padding);
+  let results = (outs FormatStringType:$result);
+  let assemblyFormat = [{
+    $string
+    (`,` `width` $width^)?
+    (`,` `alignment` $alignment^)?
+    (`,` `padding` $padding^)?
+    attr-dict
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // Builtin System Tasks and Functions
 //===----------------------------------------------------------------------===//
 
 class Builtin<string mnemonic, list<Trait> traits = []> :
     MooreOp<"builtin." # mnemonic, traits>;
+
+//===----------------------------------------------------------------------===//
+// Conversion Builtins
+//===----------------------------------------------------------------------===//
+
+def RealtobitsBIOp : Builtin<"realtobits"> {
+  let summary = "Convert a real-valued number to its logic vector representation";
+  let description = [{
+    Corresponds to the `$realtobits` system function. Returns a 64-bit
+    logic vector corresponding to the bit representation of the real number.
+    Note that this does not correspond to a cast to another type, but rather a no-op.
+
+    See IEEE 1800-2023 § 20.5 "Conversion functions".
+  }];
+
+  // Optional positional attribute for the seed
+  let arguments = (ins RealF64:$value);
+  let results = (outs TwoValuedI64:$result);
+  let assemblyFormat = "$value attr-dict";
+}
+
+def BitstorealBIOp : Builtin<"bitstoreal"> {
+  let summary = "Convert a logic vector representation to its real-valued number";
+  let description = [{
+    Corresponds to the `$bitstoreal` system function. Returns a real number
+    corresponding to the real number representation of the logic vector.
+    Note that this does not correspond to a cast to another type, but rather a no-op.
+
+    See IEEE 1800-2023 § 20.5 "Conversion functions".
+  }];
+
+  // Optional positional attribute for the seed
+  let arguments = (ins TwoValuedI64:$value);
+  let results = (outs RealF64:$result);
+  let assemblyFormat = "$value attr-dict`:` type($value)";
+}
+
+
+def ShortrealtobitsBIOp : Builtin<"shortrealtobits"> {
+  let summary = "Convert a real-valued number to its logic vector representation";
+  let description = [{
+    Corresponds to the `$shortrealtobits` system function. Returns a 64-bit
+    logic vector corresponding to the bit representation of the real number.
+    Note that this does not correspond to a cast to another type, but rather a no-op.
+
+    See IEEE 1800-2023 § 20.5 "Conversion functions".
+  }];
+
+  // Optional positional attribute for the seed
+  let arguments = (ins RealF32:$value);
+  let results = (outs TwoValuedI32:$result);
+  let assemblyFormat = "$value attr-dict";
+}
+
+def BitstoshortrealBIOp : Builtin<"bitstoshortreal"> {
+  let summary = "Convert a logic vector representation to its real-valued number";
+  let description = [{
+    Corresponds to the `$bitstoshortreal` system function. Returns a real number
+    corresponding to the real number representation of the logic vector.
+    Note that this does not correspond to a cast to another type, but rather a no-op.
+
+    See IEEE 1800-2023 § 20.5 "Conversion functions".
+  }];
+
+  // Optional positional attribute for the seed
+  let arguments = (ins TwoValuedI32:$value);
+  let results = (outs RealF32:$result);
+  let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
+//===----------------------------------------------------------------------===//
+// True-Random and Pseudo-Random Generators
+//===----------------------------------------------------------------------===//
+
+def RandomBIOp : Builtin<"random"> {
+  let summary = "Generate a true random signed integer (optionally seeded)";
+  let description = [{
+    Corresponds to the `$random` system function. Returns a 32-bit
+    true random integer. The seed is optional; when provided, it initializes
+    the generator. If not provided, treat it as 0 in semantics/lowering.
+
+    `$random` is largely considered to be deprecated since it leads to
+    non-reproducible simulation results. Consider using `$urandom` instead.
+
+    See IEEE 1800-2023 § 20.14 "Probablistic distribution functions".
+  }];
+
+  // Optional positional attribute for the seed
+  let arguments = (ins Optional<TwoValuedI32>:$seed);
+  let results = (outs TwoValuedI32:$result);
+  let assemblyFormat = "($seed^)? attr-dict";
+}
+
+def UrandomBIOp : Builtin<"urandom"> {
+  let summary = "Generate a pseudo-random unsigned integer (optionally seeded)";
+  let description = [{
+    Corresponds to the `$urandom` system function. Returns a 32-bit
+    pseudo-random integer. The seed is optional; when provided, it initializes
+    the generator. If not provided, treat it as 0 in semantics/lowering.
+
+    See IEEE 1800-2023 § 18.13 "Random number system functions and methods".
+  }];
+
+  // Optional positional attribute for the seed
+  let arguments = (ins Optional<TwoValuedI32>:$seed);
+  let results = (outs TwoValuedI32:$result);
+  let assemblyFormat = "($seed^)? attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// Simulation Time Measurement Builtins
+//===----------------------------------------------------------------------===//
+
+def TimeBIOp : Builtin<"time"> {
+  let summary = "Return the current simulation time";
+  let description = [{
+    Corresponds to the `$time` system function. Returns a int-rounded 64-bit
+    integer corresponding to the elapsed simulation time scaled by the
+    simulation's timescale.
+
+    See IEEE 1800-2023 § 20.3 "Simulation time system functions".
+  }];
+
+  // Optional positional attribute for the seed
+  let results = (outs TimeType:$result);
+  let assemblyFormat = "attr-dict";
+}
 
 //===----------------------------------------------------------------------===//
 // Simulation Control Builtins
@@ -1832,8 +2039,8 @@ class RealMathFunc<string mnemonic, list<Trait> traits = []> :
 
     See IEEE 1800-2017 § 20.8.2 "Real math functions".
    }];
-  let arguments = (ins RealType:$value);
-  let results = (outs RealType:$result);
+  let arguments = (ins RealF64:$value);
+  let results = (outs RealF64:$result);
   let assemblyFormat = "$value attr-dict `:` type($value)";
 }
 

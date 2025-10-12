@@ -16,9 +16,11 @@ include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/IR/CommonAttrConstraints.td"
 include "mlir/IR/Properties.td"
 include "mlir/IR/SymbolInterfaces.td"
+include "mlir/IR/OpAsmInterface.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "circt/Dialect/RTG/IR/RTGAttributes.td"
 include "circt/Dialect/RTG/IR/RTGInterfaces.td"
 include "circt/Dialect/RTG/IR/RTGISAAssemblyInterfaces.td"
 include "circt/Dialect/Emit/EmitOpInterfaces.td"
@@ -657,6 +659,7 @@ def CommentOp : RTGOp<"comment", []> {
 def FixedRegisterOp : RTGOp<"fixed_reg", [
   Pure, ConstantLike,
   DeclareOpInterfaceMethods<InferTypeOpInterface>,
+  DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>,
 ]> {
   let summary = "returns a value representing a fixed register";
   let description = [{
@@ -683,11 +686,10 @@ def VirtualRegisterOp : RTGOp<"virtual_reg", [
   }];
 
   // ArrayAttr of RegisterAttrInterfaces
-  let arguments = (ins ArrayAttr:$allowedRegs);
+  let arguments = (ins VirtualRegisterConfigAttr:$allowedRegs);
   let results = (outs RegisterTypeInterface:$result);
 
   let assemblyFormat = "$allowedRegs attr-dict";
-  let hasVerifier = 1;
 }
 
 //===- Test Specification Operations --------------------------------------===//
@@ -1003,4 +1005,12 @@ def MemorySizeOp : RTGISAOp<"memory_size", [Pure]> {
   let results = (outs Index:$result);
 
   let assemblyFormat = "$memory `:` qualified(type($memory)) attr-dict";
+}
+
+def SpaceOp : RTGISAOp<"space", []> {
+  let summary = "reserve the given number of bytes";
+
+  let arguments = (ins Index:$size);
+
+  let assemblyFormat = "$size attr-dict";
 }

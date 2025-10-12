@@ -52,6 +52,23 @@ enum class Domain {
   FourValued,
 };
 
+/// The type of floating point / real number behind a RealType
+enum class RealWidth {
+  /// A standard 32-Bit floating point number ("float")
+  f32 = 32,
+  /// A 64-bit double-precision floation point number ("double")
+  f64 = 64
+};
+
+/// Check if a type is an `IntType` type of the given width.
+bool isIntType(Type type, unsigned width);
+/// Check if a type is an `IntType` type of the given domain.
+bool isIntType(Type type, Domain domain);
+/// Check if a type is an `IntType` type of the given width and domain.
+bool isIntType(Type type, unsigned width, Domain domain);
+/// Check if a type is a `RealType` type of the given width.
+bool isRealType(Type type, unsigned width);
+
 //===----------------------------------------------------------------------===//
 // Unpacked Type
 //===----------------------------------------------------------------------===//
@@ -149,6 +166,10 @@ public:
   /// Get the simple bit vector type equivalent to this packed type. Returns
   /// null if the type does not have a known bit size.
   IntType getSimpleBitVector() const;
+
+  /// Check if this is a `TimeType`, or an aggregate that contains a nested
+  /// `TimeType`.
+  bool containsTimeType() const;
 
 protected:
   using UnpackedType::UnpackedType;

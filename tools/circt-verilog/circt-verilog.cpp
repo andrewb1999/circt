@@ -32,6 +32,8 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -267,6 +269,13 @@ struct CLOptions {
           "One or more library files, which are separate compilation units "
           "where modules are not automatically instantiated."),
       cl::value_desc("filename"), cl::Prefix, cl::cat(cat)};
+
+  cl::list<std::string> commandFiles{
+      "C",
+      cl::desc(
+          "One or more command files, which are independent compilation units "
+          "where modules are automatically instantiated."),
+      cl::value_desc("filename"), cl::Prefix, cl::cat(cat)};
 };
 } // namespace
 
@@ -430,6 +439,7 @@ static LogicalResult executeWithSources(MLIRContext *context,
 
   options.singleUnit = opts.singleUnit;
   options.libraryFiles = opts.libraryFiles;
+  options.commandFiles = opts.commandFiles;
 
   // Open the output file.
   std::string errorMessage;
@@ -497,9 +507,11 @@ static LogicalResult executeWithSources(MLIRContext *context,
 }
 
 static LogicalResult execute(MLIRContext *context) {
-  // Default to reading from stdin if no files were provided.
-  if (opts.inputFilenames.empty())
+  // Default to reading from stdin if no files were provided except if
+  // commandfiles were.
+  if (opts.inputFilenames.empty() && opts.commandFiles.empty()) {
     opts.inputFilenames.push_back("-");
+  }
 
   // Auto-detect the input format if it was not explicitly specified.
   if (opts.format.getNumOccurrences() == 0) {
@@ -521,8 +533,12 @@ static LogicalResult execute(MLIRContext *context) {
       detectedFormat = format;
     }
     if (!detectedFormat) {
-      WithColor::error() << "cannot auto-detect input format; use --format\n";
-      return failure();
+      if (!opts.commandFiles.empty()) {
+        detectedFormat = Format::SV;
+      } else {
+        WithColor::error() << "cannot auto-detect input format; use --format\n";
+        return failure();
+      }
     }
     opts.format = *detectedFormat;
   }
@@ -597,12 +613,15 @@ int main(int argc, char **argv) {
     moore::MooreDialect,
     scf::SCFDialect,
     seq::SeqDialect,
-    verif::VerifDialect
+    verif::VerifDialect,
+    mlir::LLVM::LLVMDialect
   >();
   // clang-format on
 
   // Perform the actual work and use "exit" to avoid slow context teardown.
   mlir::func::registerInlinerExtension(registry);
+  mlir::LLVM::registerInlinerInterface(registry);
+
   MLIRContext context(registry);
   exit(failed(execute(&context)));
 }

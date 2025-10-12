@@ -123,6 +123,11 @@ struct Context {
   Value convertAssertionExpression(const slang::ast::AssertionExpr &expr,
                                    Location loc);
 
+  // Convert an assertion expression AST node to MLIR ops.
+  Value convertAssertionCallExpression(
+      const slang::ast::CallExpression &expr,
+      const slang::ast::CallExpression::SystemCallInfo &info, Location loc);
+
   // Traverse the whole AST to collect hierarchical names.
   LogicalResult
   collectHierarchicalValues(const slang::ast::Expression &expr,
@@ -161,6 +166,12 @@ struct Context {
   Value materializeSVInt(const slang::SVInt &svint,
                          const slang::ast::Type &type, Location loc);
 
+  /// Helper function to materialize an unpacked array of `SVInt`s as an SSA
+  /// value.
+  Value materializeFixedSizeUnpackedArrayType(
+      const slang::ConstantValue &constant,
+      const slang::ast::FixedSizeUnpackedArrayType &astType, Location loc);
+
   /// Helper function to materialize a `ConstantValue` as an SSA value. Returns
   /// null if the constant cannot be materialized.
   Value materializeConstant(const slang::ConstantValue &constant,
@@ -175,10 +186,21 @@ struct Context {
       moore::IntFormat defaultFormat = moore::IntFormat::Decimal,
       bool appendNewline = false);
 
+  /// Convert system function calls only have arity-0.
+  FailureOr<Value>
+  convertSystemCallArity0(const slang::ast::SystemSubroutine &subroutine,
+                          Location loc);
+
   /// Convert system function calls only have arity-1.
   FailureOr<Value>
   convertSystemCallArity1(const slang::ast::SystemSubroutine &subroutine,
                           Location loc, Value value);
+
+  /// Convert system function calls within properties and assertion with a
+  /// single argument.
+  FailureOr<Value> convertAssertionSystemCallArity1(
+      const slang::ast::SystemSubroutine &subroutine, Location loc,
+      Value value);
 
   /// Evaluate the constant value of an expression.
   slang::ConstantValue evaluateConstant(const slang::ast::Expression &expr);

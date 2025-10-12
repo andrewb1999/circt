@@ -1,9 +1,9 @@
 add_circt_tool(circt-synth circt-synth.cpp)
 target_link_libraries(circt-synth
   PRIVATE
-  CIRCTAIG
-  CIRCTAIGToComb
-  CIRCTAIGAnalysis
+  CIRCTSynth
+  CIRCTSynthToComb
+  CIRCTSynthAnalysis
   CIRCTComb
   CIRCTCombToDatapath
   CIRCTCombTransforms
@@ -12,6 +12,7 @@ target_link_libraries(circt-synth
   CIRCTDebug
   CIRCTEmit
   CIRCTHW
+  CIRCTImportAIGER
   CIRCTLTL
   CIRCTOM
   CIRCTSeq
