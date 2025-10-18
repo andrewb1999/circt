@@ -633,6 +633,35 @@ struct ConstantOpConv : public OpConversionPattern<ConstantOp> {
   }
 };
 
+struct RealConstantOpConv : public OpConversionPattern<RealLiteralOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(RealLiteralOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    llvm::APFloat apf = op.getValue();
+    Type outTy = rewriter.getF64Type();
+    auto attr = FloatAttr::get(outTy, apf);
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, attr);
+    return success();
+  }
+};
+
+struct ShortrealConstantOpConv
+    : public OpConversionPattern<ShortrealLiteralOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ShortrealLiteralOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    llvm::APFloat apf = op.getValue();
+    Type outTy = rewriter.getF32Type();
+    auto attr = FloatAttr::get(outTy, apf);
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, attr);
+    return success();
+  }
+};
+
 struct ConstantTimeOpConv : public OpConversionPattern<ConstantTimeOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1470,7 +1499,7 @@ struct AssignedVariableOpConversion
   }
 };
 
-template <typename OpTy, unsigned DeltaTime, unsigned EpsilonTime>
+template <typename OpTy>
 struct AssignOpConversion : public OpConversionPattern<OpTy> {
   using OpConversionPattern<OpTy>::OpConversionPattern;
   using OpAdaptor = typename OpTy::Adaptor;
@@ -1478,13 +1507,26 @@ struct AssignOpConversion : public OpConversionPattern<OpTy> {
   LogicalResult
   matchAndRewrite(OpTy op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // TODO: When we support delay control in Moore dialect, we need to update
-    // this conversion.
-    auto timeAttr = llhd::TimeAttr::get(
-        op->getContext(), 0U, llvm::StringRef("ns"), DeltaTime, EpsilonTime);
-    auto time = llhd::ConstantTimeOp::create(rewriter, op->getLoc(), timeAttr);
-    rewriter.replaceOpWithNewOp<llhd::DriveOp>(op, adaptor.getDst(),
-                                               adaptor.getSrc(), time, Value{});
+    // Determine the delay for the assignment.
+    Value delay;
+    if constexpr (std::is_same_v<OpTy, ContinuousAssignOp> ||
+                  std::is_same_v<OpTy, BlockingAssignOp>) {
+      // Blocking and continuous assignments get a 0ns 0d 1e delay.
+      delay = llhd::ConstantTimeOp::create(
+          rewriter, op->getLoc(),
+          llhd::TimeAttr::get(op->getContext(), 0U, "ns", 0, 1));
+    } else if constexpr (std::is_same_v<OpTy, NonBlockingAssignOp>) {
+      // Non-blocking assignments get a 0ns 1d 0e delay.
+      delay = llhd::ConstantTimeOp::create(
+          rewriter, op->getLoc(),
+          llhd::TimeAttr::get(op->getContext(), 0U, "ns", 1, 0));
+    } else {
+      // Delayed assignments have a delay operand.
+      delay = adaptor.getDelay();
+    }
+
+    rewriter.replaceOpWithNewOp<llhd::DriveOp>(
+        op, adaptor.getDst(), adaptor.getSrc(), delay, Value{});
     return success();
   }
 };
@@ -1729,6 +1771,7 @@ static void populateLegality(ConversionTarget &target,
   target.addLegalDialect<sim::SimDialect>();
   target.addLegalDialect<mlir::LLVM::LLVMDialect>();
   target.addLegalDialect<verif::VerifDialect>();
+  target.addLegalDialect<arith::ArithDialect>();
 
   target.addLegalOp<debug::ScopeOp>();
 
@@ -1757,6 +1800,16 @@ static void populateLegality(ConversionTarget &target,
 static void populateTypeConversion(TypeConverter &typeConverter) {
   typeConverter.addConversion([&](IntType type) {
     return IntegerType::get(type.getContext(), type.getWidth());
+  });
+
+  typeConverter.addConversion([&](RealType type) -> mlir::Type {
+    MLIRContext *ctx = type.getContext();
+    switch (type.getWidth()) {
+    case moore::RealWidth::f32:
+      return mlir::Float32Type::get(ctx);
+    case moore::RealWidth::f64:
+      return mlir::Float64Type::get(ctx);
+    }
   });
 
   typeConverter.addConversion(
@@ -1903,6 +1956,8 @@ static void populateOpConversion(ConversionPatternSet &patterns,
 
     // Patterns of miscellaneous operations.
     ConstantOpConv,
+    RealConstantOpConv,
+    ShortrealConstantOpConv,
     ConcatOpConversion,
     ReplicateOpConversion,
     ConstantTimeOpConv,
@@ -1973,9 +2028,11 @@ static void populateOpConversion(ConversionPatternSet &patterns,
     AShrOpConversion,
 
     // Patterns of assignment operations.
-    AssignOpConversion<ContinuousAssignOp, 0, 1>,
-    AssignOpConversion<BlockingAssignOp, 0, 1>,
-    AssignOpConversion<NonBlockingAssignOp, 1, 0>,
+    AssignOpConversion<ContinuousAssignOp>,
+    AssignOpConversion<DelayedContinuousAssignOp>,
+    AssignOpConversion<BlockingAssignOp>,
+    AssignOpConversion<NonBlockingAssignOp>,
+    AssignOpConversion<DelayedNonBlockingAssignOp>,
     AssignedVariableOpConversion,
 
     // Patterns of branch operations.

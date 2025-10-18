@@ -1305,3 +1305,37 @@ moore.module @MultiDimensionalSlice(in %in : !moore.array<2 x array<2 x l2>>, ou
   %0 = moore.extract %in from 0 : array<2 x array<2 x l2>> -> array<2 x l2>
   moore.output %0 : !moore.array<2 x l2>
 }
+
+// CHECK-LABEL: hw.module @ContinuousAssignment
+// CHECK-SAME: in %a : !llhd.ref<i42>
+// CHECK-SAME: in %b : i42
+// CHECK-SAME: in %c : !llhd.time
+moore.module @ContinuousAssignment(in %a: !moore.ref<i42>, in %b: !moore.i42, in %c: !moore.time) {
+  // CHECK-NEXT: [[DELTA:%.+]] = llhd.constant_time <0ns, 0d, 1e>
+  // CHECK-NEXT: llhd.drv %a, %b after [[DELTA]]
+  moore.assign %a, %b : i42
+  // CHECK-NEXT: llhd.drv %a, %b after %c
+  moore.delayed_assign %a, %b, %c : i42
+}
+
+// CHECK-LABEL: func.func @NonBlockingAssignment
+// CHECK-SAME: %arg0: !llhd.ref<i42>
+// CHECK-SAME: %arg1: i42
+// CHECK-SAME: %arg2: !llhd.time
+func.func @NonBlockingAssignment(%arg0: !moore.ref<i42>, %arg1: !moore.i42, %arg2: !moore.time) {
+  // CHECK-NEXT: [[DELTA:%.+]] = llhd.constant_time <0ns, 1d, 0e>
+  // CHECK-NEXT: llhd.drv %arg0, %arg1 after [[DELTA]]
+  moore.nonblocking_assign %arg0, %arg1 : i42
+  // CHECK-NEXT: llhd.drv %arg0, %arg1 after %arg2
+  moore.delayed_nonblocking_assign %arg0, %arg1, %arg2 : i42
+  return
+}
+
+// CHECK-LABEL: func.func @RealConstantOp
+func.func @RealConstantOp() {
+  // CHECK: [[REAL:%.+]] = arith.constant 1.234500e+00 : f64
+  %real = moore.real_constant 1.234500e+00
+  // CHECK: [[SHORTREAL:%.+]] = arith.constant 1.234500e+00 : f32
+  %shortreal = moore.shortreal_constant 1.234500e+00
+  return
+}

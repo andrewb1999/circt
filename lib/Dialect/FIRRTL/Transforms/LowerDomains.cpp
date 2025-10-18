@@ -211,9 +211,15 @@ private:
   /// Erase all users of domain type ports.
   LogicalResult eraseDomainUsers(Value value) {
     for (auto *user : llvm::make_early_inc_range(value.getUsers())) {
+      // Casts disappear by forwarding their source to destination.
       if (auto castOp = dyn_cast<UnsafeDomainCastOp>(user)) {
         castOp.getResult().replaceAllUsesWith(castOp.getInput());
         castOp.erase();
+        continue;
+      }
+      // All other known users are deleted.
+      if (isa<DomainDefineOp>(user)) {
+        user->erase();
         continue;
       }
       return user->emitOpError()
@@ -249,6 +255,11 @@ private:
 };
 
 LogicalResult LowerModule::lowerModule() {
+  // Early exit if there is no domain information.  This _shouldn't_ be the case
+  // when this pass runs, but it avoids
+  if (op.getDomainInfo().empty())
+    return success();
+
   // Much of the lowering is conditioned on whether or not this module has a
   // body.  If it has a body, then we need to instantiate an object for each
   // domain port and hook up all the domain ports to annotations added to each
@@ -285,7 +296,7 @@ LogicalResult LowerModule::lowerModule() {
     auto port = cast<PortInfo>(ports[i]);
 
     // Mark domain type ports for removal.  Add information to `domainInfo`.
-    if (auto domain = dyn_cast<FlatSymbolRefAttr>(port.domains)) {
+    if (auto domain = dyn_cast_or_null<FlatSymbolRefAttr>(port.domains)) {
       eraseVector.set(i);
 
       // Instantiate a domain object with association information.
@@ -337,8 +348,8 @@ LogicalResult LowerModule::lowerModule() {
     // However, if there is no domain information, then annotations do not need
     // to be modified.  Early continue first, adding trackers otherwise.  Only
     // create one tracker for all associations.
-    ArrayAttr domainAttr = cast<ArrayAttr>(port.domains);
-    if (domainAttr.empty()) {
+    ArrayAttr domainAttr = cast_or_null<ArrayAttr>(port.domains);
+    if (!domainAttr || domainAttr.empty()) {
       portAnnotations.push_back(port.annotations.getArrayAttr());
       continue;
     }
@@ -415,6 +426,10 @@ LogicalResult LowerModule::lowerModule() {
 }
 
 LogicalResult LowerModule::lowerInstances() {
+  // Early exit if there is no work to do.
+  if (eraseVector.none() && newPorts.empty())
+    return success();
+
   // TODO: There is nothing to do unless this instance is a module or external
   // module.  This mirros code in the `lowerModule` member function.  Figure out
   // a way to clean this up, possible by making `LowerModule` a true noop if
@@ -437,14 +452,8 @@ LogicalResult LowerModule::lowerInstances() {
       if (failed(eraseDomainUsers(instanceOp.getResult(bit))))
         return failure();
 
-    ImplicitLocOpBuilder builder(instanceOp.getLoc(), instanceOp);
-    auto erased = instanceOp.erasePorts(builder, eraseVector);
-    auto inserted = erased.cloneAndInsertPorts(newPorts);
-    for (auto [oldIndex, newIndex] : resultMap) {
-      auto oldPort = erased.getResult(oldIndex);
-      auto newPort = inserted.getResult(newIndex);
-      oldPort.replaceAllUsesWith(newPort);
-    }
+    auto erased = instanceOp.cloneWithErasedPortsAndReplaceUses(eraseVector);
+    auto inserted = erased.cloneWithInsertedPortsAndReplaceUses(newPorts);
     instanceGraph.replaceInstance(instanceOp, inserted);
 
     instanceOp.erase();
@@ -493,8 +502,15 @@ LogicalResult LowerCircuit::lowerDomain(DomainOp op) {
   ImplicitLocOpBuilder builder(op.getLoc(), op);
   auto *context = op.getContext();
   auto name = op.getNameAttr();
-  // TODO: Update this once DomainOps have properties.
-  auto classIn = ClassOp::create(builder, name, {});
+  SmallVector<PortInfo> classInPorts;
+  for (auto field : op.getFields().getAsRange<DomainFieldAttr>())
+    classInPorts.append({{/*name=*/builder.getStringAttr(
+                              Twine(field.getName().getValue()) + "_in"),
+                          /*type=*/field.getType(), /*dir=*/Direction::In},
+                         {/*name=*/builder.getStringAttr(
+                              Twine(field.getName().getValue()) + "_out"),
+                          /*type=*/field.getType(), /*dir=*/Direction::Out}});
+  auto classIn = ClassOp::create(builder, name, classInPorts);
   auto classInType = classIn.getInstanceType();
   auto pathListType =
       ListType::get(context, cast<PropertyType>(PathType::get(context)));
@@ -512,11 +528,16 @@ LogicalResult LowerCircuit::lowerDomain(DomainOp op) {
                        {/*name=*/constants.getAssociationsOut(),
                         /*type=*/pathListType,
                         /*dir=*/Direction::Out}});
-  builder.setInsertionPointToStart(classOut.getBodyBlock());
-  PropAssignOp::create(builder, classOut.getArgument(1),
-                       classOut.getArgument(0));
-  PropAssignOp::create(builder, classOut.getArgument(3),
-                       classOut.getArgument(2));
+
+  auto connectPairWise = [&builder](ClassOp &classOp) {
+    builder.setInsertionPointToStart(classOp.getBodyBlock());
+    for (size_t i = 0, e = classOp.getNumPorts(); i != e; i += 2)
+      PropAssignOp::create(builder, classOp.getArgument(i + 1),
+                           classOp.getArgument(i));
+  };
+  connectPairWise(classIn);
+  connectPairWise(classOut);
+
   classes.insert({name, {classIn, classOut}});
   instanceGraph.addModule(classIn);
   instanceGraph.addModule(classOut);

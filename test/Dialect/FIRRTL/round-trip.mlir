@@ -197,8 +197,18 @@ firrtl.module @Fprintf(
 }
 
 // CHECK-LABEL: firrtl.domain @ClockDomain
-firrtl.domain @ClockDomain {
-}
+firrtl.domain @ClockDomain
+
+// CHECK-LABEL: firrtl.domain @PowerDomain [
+// CHECK-SAME:    #firrtl.domain.field<"name", !firrtl.string>
+// CHECK-SAME:    #firrtl.domain.field<"voltage", !firrtl.integer>
+// CHECK-SAME:    #firrtl.domain.field<"alwaysOn", !firrtl.bool>
+// CHECK-SAME:  ]
+firrtl.domain @PowerDomain [
+  #firrtl.domain.field<"name", !firrtl.string>,
+  #firrtl.domain.field<"voltage", !firrtl.integer>,
+  #firrtl.domain.field<"alwaysOn", !firrtl.bool>
+]
 
 firrtl.module @DomainsSubmodule(
   in %A: !firrtl.domain of @ClockDomain,
@@ -241,6 +251,15 @@ firrtl.module @AnonymousDomains(
 } {
   // CHECK: %0 = firrtl.unsafe_domain_cast %a domains %arg0 : !firrtl.uint<1>
   %0 = firrtl.unsafe_domain_cast %a domains %arg0 : !firrtl.uint<1>
+}
+
+// CHECK-LABEL: firrtl.module @DomainDefine
+firrtl.module @DomainDefine(
+  in  %x : !firrtl.domain of @ClockDomain,
+  out %y : !firrtl.domain of @ClockDomain
+) {
+  // CHECK: firrtl.domain.define %y, %x
+  firrtl.domain.define %y, %x
 }
 
 }

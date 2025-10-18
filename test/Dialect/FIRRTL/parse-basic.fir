@@ -2198,6 +2198,16 @@ circuit Domains:
   ; CHECK-LABEL: firrtl.domain @ClockDomain
   domain ClockDomain:
 
+  ; CHECK-LABEL: firrtl.domain @PowerDomain [
+  ; CHECK-SAME:    #firrtl.domain.field<"name", !firrtl.string>
+  ; CHECK-SAME:    #firrtl.domain.field<"voltage", !firrtl.integer>
+  ; CHECK-SAME:    #firrtl.domain.field<"alwaysOn", !firrtl.bool>
+  ; CHECK-SAME:  ]
+  domain PowerDomain:
+    name : String
+    voltage : Integer
+    alwaysOn : Bool
+
   module Foo:
     input A: Domain of ClockDomain
     input a: UInt<1> domains [A]
@@ -2212,6 +2222,7 @@ circuit Domains:
     input B: Domain of ClockDomain
     input a: UInt<1> domains [A]
     input ab: UInt<1> domains [A, B]
+    output C: Domain of ClockDomain
 
     ; CHECK: %{{.*}} = firrtl.unsafe_domain_cast %a : !firrtl.uint<1>
     node noDomains = unsafe_domain_cast(a)
@@ -2222,3 +2233,9 @@ circuit Domains:
 
     ; CHECK %foo_A, %foo_a = firrtl.instance foo @Foo(in A: !firrtl.domain of @ClockDomain, in a: !firrtl.uint<1> domains [A])
     inst foo of Foo
+  
+    ; CHECK: firrtl.domain.define %foo_A, %A
+    domain_define foo.A = A
+
+    ; CHECK: firrtl.domain.define %C, %foo_A
+    domain_define C = foo.A

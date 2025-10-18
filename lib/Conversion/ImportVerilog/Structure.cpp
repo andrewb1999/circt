@@ -498,12 +498,6 @@ struct ModuleVisitor : public BaseVisitor {
 
   // Handle continuous assignments.
   LogicalResult visit(const slang::ast::ContinuousAssignSymbol &assignNode) {
-    if (const auto *delay = assignNode.getDelay()) {
-      auto loc = context.convertLocation(delay->sourceRange);
-      return mlir::emitError(loc,
-                             "delayed continuous assignments not supported");
-    }
-
     const auto &expr =
         assignNode.getAssignment().as<slang::ast::AssignmentExpression>();
     auto lhs = context.convertLvalueExpression(expr.left());
@@ -515,6 +509,19 @@ struct ModuleVisitor : public BaseVisitor {
     if (!rhs)
       return failure();
 
+    // Handle delayed assignments.
+    if (auto *timingCtrl = assignNode.getDelay()) {
+      auto *ctrl = timingCtrl->as_if<slang::ast::DelayControl>();
+      assert(ctrl && "slang guarantees this to be a simple delay");
+      auto delay = context.convertRvalueExpression(
+          ctrl->expr, moore::TimeType::get(builder.getContext()));
+      if (!delay)
+        return failure();
+      moore::DelayedContinuousAssignOp::create(builder, loc, lhs, rhs, delay);
+      return success();
+    }
+
+    // Otherwise this is a regular assignment.
     moore::ContinuousAssignOp::create(builder, loc, lhs, rhs);
     return success();
   }
@@ -555,13 +562,12 @@ struct ModuleVisitor : public BaseVisitor {
       return success();
 
     // If the block has a name, add it to the list of block name prefices.
-    SmallString<64> prefixBuffer;
-    auto prefix = blockNamePrefix;
-    if (!genNode.name.empty()) {
-      prefixBuffer += blockNamePrefix;
-      prefixBuffer += genNode.name;
-      prefixBuffer += '.';
-      prefix = prefixBuffer;
+    SmallString<64> prefix = blockNamePrefix;
+    if (!genNode.name.empty() ||
+        genNode.getParentScope()->asSymbol().kind !=
+            slang::ast::SymbolKind::GenerateBlockArray) {
+      prefix += genNode.getExternalName();
+      prefix += '.';
     }
 
     // Visit each member of the generate block.
@@ -575,27 +581,20 @@ struct ModuleVisitor : public BaseVisitor {
   LogicalResult visit(const slang::ast::GenerateBlockArraySymbol &genArrNode) {
     // If the block has a name, add it to the list of block name prefices and
     // prepare to append the array index and a `.` in each iteration.
-    SmallString<64> prefixBuffer;
-    if (!genArrNode.name.empty()) {
-      prefixBuffer += blockNamePrefix;
-      prefixBuffer += genArrNode.name;
-    }
-    auto prefixBufferBaseLen = prefixBuffer.size();
+    SmallString<64> prefix = blockNamePrefix;
+    prefix += genArrNode.getExternalName();
+    prefix += '_';
+    auto prefixBaseLen = prefix.size();
 
     // Visit each iteration entry of the generate block.
     for (const auto *entry : genArrNode.entries) {
-      // Append the index to the prefix if this block has a name.
-      auto prefix = blockNamePrefix;
-      if (prefixBufferBaseLen > 0) {
-        prefixBuffer.resize(prefixBufferBaseLen);
-        prefixBuffer += '_';
-        if (entry->arrayIndex)
-          prefixBuffer += entry->arrayIndex->toString();
-        else
-          Twine(entry->constructIndex).toVector(prefixBuffer);
-        prefixBuffer += '.';
-        prefix = prefixBuffer;
-      }
+      // Append the index to the prefix.
+      prefix.resize(prefixBaseLen);
+      if (entry->arrayIndex)
+        prefix += entry->arrayIndex->toString();
+      else
+        Twine(entry->constructIndex).toVector(prefix);
+      prefix += '.';
 
       // Visit this iteration entry.
       if (failed(entry->asSymbol().visit(ModuleVisitor(context, loc, prefix))))
@@ -1101,7 +1100,31 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
     valueSymbols.insert(subroutine.returnValVar, returnVar);
   }
 
+  // Save previous callback
+  auto prevCb = rvalueReadCallback;
+  auto prevCbGuard =
+      llvm::make_scope_exit([&] { rvalueReadCallback = prevCb; });
+
+  // Capture this function's captured context directly
+  rvalueReadCallback = [lowering, prevCb](moore::ReadOp rop) {
+    if (prevCb)
+      prevCb(rop); // chain previous callback
+
+    mlir::Value ref = rop.getInput();
+    // Only capture refs defined outside this function’s region
+    if (!lowering->op.getBody().isAncestor(ref.getParentRegion())) {
+      auto [it, inserted] =
+          lowering->captureIndex.try_emplace(ref, lowering->captures.size());
+      if (inserted)
+        lowering->captures.push_back(ref);
+    }
+  };
+
   if (failed(convertStatement(subroutine.getBody())))
+    return failure();
+
+  // Plumb captures into the function as extra block arguments
+  if (failed(finalizeFunctionBodyCaptures(*lowering)))
     return failure();
 
   // If there was no explicit return statement provided by the user, insert a
@@ -1129,5 +1152,51 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
       var->erase();
     }
   }
+  return success();
+}
+
+LogicalResult
+Context::finalizeFunctionBodyCaptures(FunctionLowering &lowering) {
+  if (lowering.captures.empty())
+    return success();
+
+  MLIRContext *ctx = getContext();
+
+  // Build new input type list: existing inputs + capture ref types.
+  SmallVector<Type> newInputs(lowering.op.getFunctionType().getInputs().begin(),
+                              lowering.op.getFunctionType().getInputs().end());
+  for (Value cap : lowering.captures) {
+    // Expect captures to be refs.
+    Type capTy = cap.getType();
+    if (!isa<moore::RefType>(capTy)) {
+      return lowering.op.emitError(
+          "expected captured value to be a ref-like type");
+    }
+    newInputs.push_back(capTy);
+  }
+
+  // Results unchanged.
+  auto newFuncTy = FunctionType::get(
+      ctx, newInputs, lowering.op.getFunctionType().getResults());
+  lowering.op.setFunctionType(newFuncTy);
+
+  // Add the new block arguments to the entry block.
+  Block &entry = lowering.op.getBody().front();
+  SmallVector<Value> capArgs;
+  capArgs.reserve(lowering.captures.size());
+  for (Type t :
+       llvm::ArrayRef<Type>(newInputs).take_back(lowering.captures.size())) {
+    capArgs.push_back(entry.addArgument(t, lowering.op.getLoc()));
+  }
+
+  // Replace uses of each captured Value *inside the function body* with the new
+  // arg. Keep uses outside untouched (e.g., in callers).
+  for (auto [cap, idx] : lowering.captureIndex) {
+    Value arg = capArgs[idx];
+    cap.replaceUsesWithIf(arg, [&](OpOperand &use) {
+      return lowering.op->isProperAncestor(use.getOwner());
+    });
+  }
+
   return success();
 }

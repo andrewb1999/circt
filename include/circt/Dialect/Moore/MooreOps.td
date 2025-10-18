@@ -337,6 +337,16 @@ class AssignOpBase<string mnemonic, list<Trait> traits = []> :
   }];
 }
 
+class DelayedAssignOpBase<string mnemonic, list<Trait> traits = []> :
+    AssignOpBase<mnemonic, traits> {
+  let arguments = (ins RefType:$dst, UnpackedType:$src, TimeType:$delay);
+  let assemblyFormat = [{
+    $dst `,` $src `,` $delay attr-dict `:` type($src)
+  }];
+}
+
+// Continuous assignment
+
 def ContinuousAssignOp : AssignOpBase<"assign", [HasParent<"SVModuleOp">]> {
   let summary = "Continuous assignment within a module";
   let description = [{
@@ -347,6 +357,19 @@ def ContinuousAssignOp : AssignOpBase<"assign", [HasParent<"SVModuleOp">]> {
     See IEEE 1800-2017 § 10.3 "Continuous assignments".
   }];
 }
+
+def DelayedContinuousAssignOp :
+    DelayedAssignOpBase<"delayed_assign", [HasParent<"SVModuleOp">]> {
+  let summary = "Delayed continuous assignment within a module";
+  let description = [{
+    A continuous assignment with a delay.
+
+    See the `moore.assign` op.
+    See IEEE 1800-2017 § 10.3 "Continuous assignments".
+  }];
+}
+
+// Blocking assignment
 
 def BlockingAssignOp : AssignOpBase<"blocking_assign", [
   DeclareOpInterfaceMethods<PromotableMemOpInterface>
@@ -365,6 +388,8 @@ def BlockingAssignOp : AssignOpBase<"blocking_assign", [
   );
 }
 
+// Non-blocking assignment
+
 def NonBlockingAssignOp : AssignOpBase<"nonblocking_assign"> {
   let summary = "Nonblocking procedural assignment";
   let description = [{
@@ -375,6 +400,17 @@ def NonBlockingAssignOp : AssignOpBase<"nonblocking_assign"> {
     in a subsequent time step as dictated by the delay or event control.
 
     See IEEE 1800-2017 § 10.4.2 "Nonblocking procedural assignments".
+  }];
+}
+
+def DelayedNonBlockingAssignOp :
+    DelayedAssignOpBase<"delayed_nonblocking_assign"> {
+  let summary = "Delayed nonblocking procedural assignment";
+  let description = [{
+    A nonblocking procedural assignment with an intra-assignment delay control.
+
+    See the `moore.nonblocking_assign` op.
+    See IEEE 1800-2017 § 9.4.5 "Intra-assignment timing controls".
   }];
 }
 
@@ -535,6 +571,23 @@ def StringConstantOp : MooreOp<"string_constant", [Pure]> {
   let assemblyFormat = "$value attr-dict `:` type($result)";
 }
 
+def ShortrealLiteralOp : MooreOp<"shortreal_constant", [Pure]> {
+  let summary = "Produce a constant shortreal value";
+  let description = [{
+    Produces a constant value of shortreal type.
+
+    Example:
+    ```mlir
+    %0 = moore.shortreal_constant 1.23
+    ```
+    The shortreal type has fixed-point(1.2) and exponent(2.0e10) formats and corresponds to IEEE 754 f32.
+    See IEEE 1800-2017 § 5.7.2 "Real literal constants".
+  }];
+  let arguments = (ins F32Attr:$value);
+  let results = (outs RealF32:$result);
+  let assemblyFormat = "$value attr-dict";
+}
+
 def RealLiteralOp : MooreOp<"real_constant", [Pure]> {
   let summary = "Produce a constant real value";
   let description = [{
@@ -544,12 +597,12 @@ def RealLiteralOp : MooreOp<"real_constant", [Pure]> {
     ```mlir
     %0 = moore.real_constant 1.23
     ```
-    The real type has fixed-point(1.2) and exponent(2.0e10) formats.
+    The real type has fixed-point(1.2) and exponent(2.0e10) formats and corresponds to IEEE 754 f64.
     See IEEE 1800-2017 § 5.7.2 "Real literal constants".
   }];
   let arguments = (ins F64Attr:$value);
   let results = (outs RealF64:$result);
-  let assemblyFormat = "$value attr-dict `:` type($result)";
+  let assemblyFormat = "$value attr-dict";
 }
 
 //===----------------------------------------------------------------------===//
@@ -665,6 +718,37 @@ def LogicToTimeOp : MooreOp<"logic_to_time", [Pure]> {
   let results = (outs TimeType:$result);
   let assemblyFormat = "$input attr-dict";
   let hasFolder = 1;
+}
+
+def RealToIntOp : MooreOp<"real_to_int", [
+  Pure
+]> {
+  let summary = "Convert a real value to a two-valued integer";
+  let description = [{
+    See IEEE 1800-2023 Section 6.24.1: "Cast operator" and 6.12:
+    "Real, shortreal and realtime data types". Accordingly,
+    output values are rounded.
+  }];
+  let arguments = (ins RealType:$input);
+  let results = (outs TwoValuedIntType:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input) `->` type($result)
+  }];
+}
+
+def IntToRealOp : MooreOp<"int_to_real", [
+  Pure
+]> {
+  let summary = "Convert an integer value to a real";
+  let description = [{
+    See IEEE 1800-2023 Section 6.24.1: "Cast operator" and 6.12:
+    "Real, shortreal and realtime data types".
+  }];
+  let arguments = (ins TwoValuedIntType:$input);
+  let results = (outs RealType:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input) `->` type($result)
+  }];
 }
 
 //===----------------------------------------------------------------------===//

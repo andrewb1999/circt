@@ -427,6 +427,7 @@ struct RvalueExprVisitor : public ExprVisitor {
     if (!lhs)
       return {};
 
+    // Determine the right-hand side value of the assignment.
     context.lvalueStack.push_back(lhs);
     auto rhs = context.convertRvalueExpression(
         expr.right(), cast<moore::RefType>(lhs.getType()).getNestedType());
@@ -434,16 +435,38 @@ struct RvalueExprVisitor : public ExprVisitor {
     if (!rhs)
       return {};
 
-    if (expr.timingControl) {
-      auto loc = context.convertLocation(expr.timingControl->sourceRange);
-      mlir::emitError(loc, "delayed assignments not supported");
-      return {};
+    // If this is a blocking assignment, we can insert the delay/wait ops of the
+    // optional timing control directly in between computing the RHS and
+    // executing the assignment.
+    if (!expr.isNonBlocking()) {
+      if (expr.timingControl)
+        if (failed(context.convertTimingControl(*expr.timingControl)))
+          return {};
+      moore::BlockingAssignOp::create(builder, loc, lhs, rhs);
+      return rhs;
     }
 
-    if (expr.isNonBlocking())
-      moore::NonBlockingAssignOp::create(builder, loc, lhs, rhs);
-    else
-      moore::BlockingAssignOp::create(builder, loc, lhs, rhs);
+    // For non-blocking assignments, we only support time delays for now.
+    if (expr.timingControl) {
+      // Handle regular time delays.
+      if (auto *ctrl = expr.timingControl->as_if<slang::ast::DelayControl>()) {
+        auto delay = context.convertRvalueExpression(
+            ctrl->expr, moore::TimeType::get(builder.getContext()));
+        if (!delay)
+          return {};
+        moore::DelayedNonBlockingAssignOp::create(builder, loc, lhs, rhs,
+                                                  delay);
+        return rhs;
+      }
+
+      // All other timing controls are not supported.
+      auto loc = context.convertLocation(expr.timingControl->sourceRange);
+      mlir::emitError(loc)
+          << "unsupported non-blocking assignment timing control: "
+          << slang::ast::toString(expr.timingControl->kind);
+      return {};
+    }
+    moore::NonBlockingAssignOp::create(builder, loc, lhs, rhs);
     return rhs;
   }
 
@@ -962,6 +985,55 @@ struct RvalueExprVisitor : public ExprVisitor {
       arguments.push_back(value);
     }
 
+    if (!lowering->captures.empty()) {
+      auto materializeCaptureAtCall = [&](Value cap) -> Value {
+        // Captures are expected to be moore::RefType.
+        auto refTy = dyn_cast<moore::RefType>(cap.getType());
+        if (!refTy) {
+          lowering->op.emitError(
+              "expected captured value to be moore::RefType");
+          return {};
+        }
+
+        // Expected case: the capture stems from a variable of any parent
+        // scope. We need to walk up, since definition might be a couple regions
+        // up.
+        Region *capRegion = [&]() -> Region * {
+          if (auto ba = dyn_cast<BlockArgument>(cap))
+            return ba.getOwner()->getParent();
+          if (auto *def = cap.getDefiningOp())
+            return def->getParentRegion();
+          return nullptr;
+        }();
+
+        Region *callRegion =
+            builder.getBlock() ? builder.getBlock()->getParent() : nullptr;
+
+        for (Region *r = callRegion; r; r = r->getParentRegion()) {
+          if (r == capRegion) {
+            // Safe to use the SSA value directly here.
+            return cap;
+          }
+        }
+
+        // Otherwise we can’t legally rematerialize this capture here.
+        lowering->op.emitError()
+            << "cannot materialize captured ref at call site; non-symbol "
+            << "source: "
+            << (cap.getDefiningOp()
+                    ? cap.getDefiningOp()->getName().getStringRef()
+                    : "<block-arg>");
+        return {};
+      };
+
+      for (Value cap : lowering->captures) {
+        Value mat = materializeCaptureAtCall(cap);
+        if (!mat)
+          return {};
+        arguments.push_back(mat);
+      }
+    }
+
     // Create the call.
     auto callOp =
         mlir::func::CallOp::create(builder, loc, lowering->op, arguments);
@@ -1061,8 +1133,7 @@ struct RvalueExprVisitor : public ExprVisitor {
 
   /// Handle real literals.
   Value visit(const slang::ast::RealLiteral &expr) {
-    return moore::RealLiteralOp::create(
-        builder, loc, builder.getF64FloatAttr(expr.getValue()));
+    return context.materializeSVReal(*expr.getConstant(), *expr.type, loc);
   }
 
   /// Helper function to convert RValues at creation of a new Struct, Array or
@@ -1476,6 +1547,37 @@ Value Context::convertToBool(Value value) {
   return {};
 }
 
+/// Materialize a Slang real literal as a constant op.
+Value Context::materializeSVReal(const slang::ConstantValue &svreal,
+                                 const slang::ast::Type &astType,
+                                 Location loc) {
+  mlir::FloatType fTy;
+  Type resultType;
+  double val;
+
+  if (const auto *floatType = astType.as_if<slang::ast::FloatingType>()) {
+    if (floatType->floatKind == slang::ast::FloatingType::ShortReal) {
+      fTy = mlir::Float32Type::get(getContext());
+      resultType = moore::RealType::getShortReal(getContext());
+      val = svreal.shortReal().v;
+
+      mlir::FloatAttr attr = mlir::FloatAttr::get(fTy, val);
+      return moore::ShortrealLiteralOp::create(builder, loc, resultType, attr)
+          .getResult();
+    }
+    if (floatType->floatKind == slang::ast::FloatingType::Real) {
+      fTy = mlir::Float64Type::get(getContext());
+      resultType = moore::RealType::getReal(getContext());
+      val = svreal.real().v;
+
+      mlir::FloatAttr attr = mlir::FloatAttr::get(fTy, val);
+      return moore::RealLiteralOp::create(builder, loc, resultType, attr)
+          .getResult();
+    }
+  }
+  return {};
+}
+
 /// Materialize a Slang integer literal as a constant op.
 Value Context::materializeSVInt(const slang::SVInt &svint,
                                 const slang::ast::Type &astType, Location loc) {
@@ -1556,6 +1658,8 @@ Value Context::materializeConstant(const slang::ConstantValue &constant,
     return materializeFixedSizeUnpackedArrayType(constant, *arr, loc);
   if (constant.isInteger())
     return materializeSVInt(constant.integer(), type, loc);
+  if (constant.isReal() || constant.isShortReal())
+    return materializeSVReal(constant, type, loc);
 
   return {};
 }
@@ -1732,6 +1836,31 @@ Value Context::materializeConversion(Type type, Value value, bool isSigned,
   if (isa<moore::FormatStringType>(type) &&
       isa<moore::StringType>(value.getType())) {
     return builder.createOrFold<moore::FormatStringOp>(loc, value);
+  }
+
+  // Handle Real To Int conversion
+  if (isa<moore::IntType>(type) && isa<moore::RealType>(value.getType())) {
+    auto twoValInt = builder.createOrFold<moore::RealToIntOp>(
+        loc, dyn_cast<moore::IntType>(type).getTwoValued(), value);
+
+    if (dyn_cast<moore::IntType>(type).getDomain() == moore::Domain::FourValued)
+      return materializePackedToSBVConversion(*this, twoValInt, loc);
+    return twoValInt;
+  }
+
+  // Handle Int to Real conversion
+  if (isa<moore::RealType>(type) && isa<moore::IntType>(value.getType())) {
+    Value twoValInt;
+    // Check if int needs to be converted to two-valued first
+    if (dyn_cast<moore::IntType>(value.getType()).getDomain() ==
+        moore::Domain::TwoValued)
+      twoValInt = value;
+    else
+      twoValInt = materializeConversion(
+          dyn_cast<moore::IntType>(value.getType()).getTwoValued(), value, true,
+          loc);
+
+    return builder.createOrFold<moore::IntToRealOp>(loc, type, twoValInt);
   }
 
   // TODO: Handle other conversions with dedicated ops.

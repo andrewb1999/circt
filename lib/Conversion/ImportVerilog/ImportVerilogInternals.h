@@ -49,6 +49,8 @@ struct ModuleLowering {
 /// Function lowering information.
 struct FunctionLowering {
   mlir::func::FuncOp op;
+  llvm::SmallVector<Value, 4> captures;
+  llvm::DenseMap<Value, unsigned> captureIndex;
 };
 
 /// Information about a loops continuation and exit blocks relevant while
@@ -110,6 +112,7 @@ struct Context {
   FunctionLowering *
   declareFunction(const slang::ast::SubroutineSymbol &subroutine);
   LogicalResult convertFunction(const slang::ast::SubroutineSymbol &subroutine);
+  LogicalResult finalizeFunctionBodyCaptures(FunctionLowering &lowering);
 
   // Convert a statement AST node to MLIR ops.
   LogicalResult convertStatement(const slang::ast::Statement &stmt);
@@ -134,7 +137,14 @@ struct Context {
                             const slang::ast::Symbol &outermostModule);
   LogicalResult traverseInstanceBody(const slang::ast::Symbol &symbol);
 
-  // Convert a slang timing control into an MLIR timing control.
+  // Convert timing controls into a corresponding set of ops that delay
+  // execution of the current block. Produces an error if the implicit event
+  // control `@*` or `@(*)` is used.
+  LogicalResult convertTimingControl(const slang::ast::TimingControl &ctrl);
+  // Convert timing controls into a corresponding set of ops that delay
+  // execution of the current block. Then converts the given statement, taking
+  // note of the rvalues it reads and adding them to a wait op in case an
+  // implicit event control `@*` or `@(*)` is used.
   LogicalResult convertTimingControl(const slang::ast::TimingControl &ctrl,
                                      const slang::ast::Statement &stmt);
 
@@ -165,6 +175,10 @@ struct Context {
   /// Helper function to materialize an `SVInt` as an SSA value.
   Value materializeSVInt(const slang::SVInt &svint,
                          const slang::ast::Type &type, Location loc);
+
+  /// Helper function to materialize a real value as an SSA value.
+  Value materializeSVReal(const slang::ConstantValue &svreal,
+                          const slang::ast::Type &type, Location loc);
 
   /// Helper function to materialize an unpacked array of `SVInt`s as an SSA
   /// value.

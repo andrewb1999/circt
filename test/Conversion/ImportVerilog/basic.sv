@@ -1879,17 +1879,17 @@ module GenerateConstructs;
     // CHECK: [[TMP:%.+]] = moore.constant 0
     // CHECK: dbg.variable "i", [[TMP]]
     // CHECK: [[TMP:%.+]] = moore.constant 0
-    // CHECK: g1 = moore.variable [[TMP]]
+    // CHECK: %genblk1_0.g1 = moore.variable [[TMP]]
     // CHECK: [[TMP:%.+]] = moore.constant 1
     // CHECK: dbg.variable "i", [[TMP]]
     // CHECK: [[TMP:%.+]] = moore.constant 1
-    // CHECK: g1 = moore.variable [[TMP]]
+    // CHECK: %genblk1_1.g1 = moore.variable [[TMP]]
     for (i = 0; i < 2; i = i + 1) begin
       integer g1 = i;
     end
 
     // CHECK: [[TMP:%.+]] = moore.constant 2 : i32
-    // CHECK: g2 = moore.variable [[TMP]] : <i32>
+    // CHECK: %genblk2.g2 = moore.variable [[TMP]] : <i32>
     if (p == 2) begin
       int g2 = 2;
     end else begin
@@ -1897,7 +1897,7 @@ module GenerateConstructs;
     end
     
     // CHECK: [[TMP:%.+]] = moore.constant 2 : i32
-    // CHECK: g3 = moore.variable [[TMP]] : <i32>
+    // CHECK: %genblk3.g3 = moore.variable [[TMP]] : <i32>
     case (p)
       2: begin
         int g3 = 2;
@@ -3245,3 +3245,139 @@ function automatic void ConcatSformatf(string testStr, string otherString, ref s
    // CHECK-NEXT: moore.blocking_assign [[LV]], [[CONV]] : l64
    $sformat(logicVector, "%s %s", testStr, otherString);
 endfunction
+
+// CHECK-LABEL: moore.module @ContinuousAssignment(
+module ContinuousAssignment;
+  // CHECK-NEXT: [[A:%.+]] = moore.variable
+  // CHECK-NEXT: [[B:%.+]] = moore.variable
+  bit [41:0] a;
+  bit [41:0] b;
+
+  // CHECK-NEXT: [[TMP:%.+]] = moore.read [[B]]
+  // CHECK-NEXT: [[NOTB:%.+]] = moore.not [[TMP]]
+  // CHECK-NEXT: moore.assign [[A]], [[NOTB]]
+  assign a = ~b;
+
+  // CHECK-NEXT: [[TMP:%.+]] = moore.read [[B]]
+  // CHECK-NEXT: [[NOTB:%.+]] = moore.not [[TMP]]
+  // CHECK-NEXT: [[TIME:%.+]] = moore.constant_time 1000000 fs
+  // CHECK-NEXT: moore.delayed_assign [[A]], [[NOTB]], [[TIME]]
+  assign #1ns a = ~b;
+endmodule
+
+// CHECK-LABEL: func.func private @BlockingAssignment(
+// CHECK-SAME: [[A:%.+]]: !moore.ref<i42>
+// CHECK-SAME: [[B:%.+]]: !moore.i42
+// CHECK-SAME: [[C:%.+]]: !moore.i1
+task BlockingAssignment(
+  output bit [41:0] a,
+  input  bit [41:0] b,
+  input  bit c
+);
+  // CHECK-NEXT: [[NOTB:%.+]] = moore.not [[B]]
+  // CHECK-NEXT: moore.blocking_assign [[A]], [[NOTB]]
+  a = ~b;
+
+  // CHECK-NEXT: [[NOTB:%.+]] = moore.not [[B]]
+  // CHECK-NEXT: [[TIME:%.+]] = moore.constant_time 1000000 fs
+  // CHECK-NEXT: moore.wait_delay [[TIME]]
+  // CHECK-NEXT: moore.blocking_assign [[A]], [[NOTB]]
+  a = #1ns ~b;
+
+  // CHECK-NEXT: [[NOTB:%.+]] = moore.not [[B]]
+  // CHECK-NEXT: moore.wait_event {
+  // CHECK-NEXT:   moore.detect_event posedge [[C]]
+  // CHECK-NEXT: }
+  // CHECK-NEXT: moore.blocking_assign [[A]], [[NOTB]]
+  a = @(posedge c) ~b;
+endtask
+
+// CHECK-LABEL: func.func private @NonBlockingAssignment(
+// CHECK-SAME: [[A:%.+]]: !moore.ref<i42>
+// CHECK-SAME: [[B:%.+]]: !moore.i42
+task NonBlockingAssignment(
+  output bit [41:0] a,
+  input  bit [41:0] b
+);
+  // CHECK-NEXT: [[NOTB:%.+]] = moore.not [[B]]
+  // CHECK-NEXT: moore.nonblocking_assign [[A]], [[NOTB]]
+  a <= ~b;
+
+  // CHECK-NEXT: [[NOTB:%.+]] = moore.not [[B]]
+  // CHECK-NEXT: [[TIME:%.+]] = moore.constant_time 1000000 fs
+  // CHECK-NEXT: moore.delayed_nonblocking_assign [[A]], [[NOTB]], [[TIME]]
+  a <= #1ns ~b;
+endtask
+
+// CHECK-LABEL: func.func private @RealConversion(
+// CHECK-SAME: [[SR:%[^,]+]]: !moore.f32
+// CHECK-SAME: [[LR:%[^,]+]]: !moore.f64
+// CHECK-SAME: [[INT:%[^,]+]]: !moore.i42
+// CHECK-SAME: [[LINT:%[^,]+]]: !moore.i64
+function automatic void RealConversion(shortreal sr, real r, bit[41:0] i, longint longi);
+   // CHECK: [[INTTEST:%.+]] = moore.real_to_int [[SR]] : f32 -> i32
+   int intTest = int'(sr);
+    // CHECK: [[INTTEST2:%.+]] = moore.real_to_int [[LR]] : f64 -> i32
+   int intTest2 = int'(r);
+   // CHECK: [[LINTTEST:%.+]] = moore.real_to_int [[SR]] : f32 -> i64
+   longint longIntTest = longint'(sr);
+   // CHECK: [[LINTTEST2:%.+]] = moore.real_to_int [[LR]] : f64 -> i64
+   longint longIntTest2 = longint'(r);
+
+
+   // CHECK: [[SRTEST:%.+]] = moore.int_to_real [[INT]] : i42 -> f32
+   shortreal srTest = shortreal'(i);
+   // CHECK: [[SRTEST2:%.+]] = moore.int_to_real [[LINT]] : i64 -> f32
+   shortreal srTest2 = shortreal'(longi);
+   // CHECK: [[RTEST:%.+]] = moore.int_to_real [[INT]] : i42 -> f64
+   real rTest = real'(i);
+   // CHECK: [[RTEST2:%.+]] = moore.int_to_real [[LINT]] : i64 -> f64
+   real rTest2 = real'(longi);
+
+   // CHECK: [[IMM:%.+]] = moore.real_to_int [[LR]] : f64 -> i32
+   // CHECK-NEXT: [[F:%.+]] = moore.int_to_logic [[IMM]] : i32
+   // CHECK-NEXT: [[logicTest:%.+]] = moore.variable [[F]] : <l32>
+   logic [31:0] logicTest = r;
+
+   // CHECK: [[R:%.+]] = moore.read [[logicTest]] : <l32>
+   // CHECK-NEXT: [[IMM2:%.+]] = moore.logic_to_int [[R]] : l32
+   // CHECK-Next: [[F2:%.+]] = moore.int_to_real [[IMM2]] : i32 -> f64
+   real realTest = real'(logicTest);
+endfunction
+
+// CHECK: func.func private @testRealLiteral() -> !moore.f64 {
+function automatic real testRealLiteral();
+   // CHECK: [[TMP:%.+]] = moore.real_constant 1.234500e+00
+   localparam test = 1.2345;
+    // CHECK-NEXT: return [[TMP]] : !moore.f64
+   return test;
+endfunction
+
+// CHECK: func.func private @testShortrealLiteral() -> !moore.f32 {
+function automatic shortreal testShortrealLiteral();
+   // CHECK: [[TMP:%.+]] = moore.shortreal_constant 1.234500e+00
+   localparam test = shortreal'(1.2345);
+    // CHECK-NEXT: return [[TMP]] : !moore.f32
+   return test;
+endfunction
+
+// CHECK: moore.module @testFunctionCapture() {
+module testFunctionCapture();
+
+    // CHECK: [[A:%.+]] = moore.variable : <l1>
+    logic a;
+
+    function logic testCapture;
+        return a;
+    endfunction
+
+    // CHECK: [[RETURNEDA:%.+]] = func.call @testCapture([[A]]) : (!moore.ref<l1>) -> !moore.l1
+    // CHECK: [[B:%.+]] = moore.variable [[RETURNEDA]] : <l1>
+    logic b = testCapture();
+
+    // These checks need to be here since testCapture gets moved to after the variable decl,
+    // and file check only checks forward.
+    // CHECK: func.func private @testCapture(%arg0: !moore.ref<l1>) -> !moore.l1 {
+    // CHECK: [[CAPTUREDA:%.+]] = moore.read %arg0 : <l1>
+    // CHECK: return [[CAPTUREDA]] : !moore.l1
+endmodule

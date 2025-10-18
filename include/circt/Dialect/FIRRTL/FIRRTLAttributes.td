@@ -14,6 +14,7 @@
 #define CIRCT_DIALECT_FIRRTL_FIRRTLATTRIBUTES_TD
 
 include "FIRRTLDialect.td"
+include "FIRRTLTypes.td"
 include "mlir/IR/BuiltinAttributeInterfaces.td"
 include "circt/Types.td"
 
@@ -208,5 +209,20 @@ def InternalPathArrayAttr
 //===----------------------------------------------------------------------===//
 
 def LayerArrayAttr : TypedArrayRefAttrBase<SymbolRefAttr, "an array of layers">;
+
+def DomainFieldAttr : AttrDef<FIRRTLDialect, "DomainField"> {
+  let mnemonic = "domain.field";
+  let summary = "A single field of a domain";
+  let parameters = (
+    ins "::mlir::StringAttr":$name,
+        "::circt::firrtl::PropertyType":$type
+  );
+  let assemblyFormat = [{
+    `<` $name `,` $type `>`
+  }];
+}
+
+def DomainFieldArrayAttr :
+  TypedArrayAttrBase<DomainFieldAttr, "an array of domain fields">;
 
 #endif // CIRCT_DIALECT_FIRRTL_FIRRTLATTRIBUTES_TD

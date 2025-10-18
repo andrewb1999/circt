@@ -90,18 +90,37 @@ moore.module @Module() {
   moore.assign %v1, %2 : i1
 
   moore.procedure always {
-    // CHECK: %[[TMP1:.+]] = moore.read %v2
-    // CHECK: moore.blocking_assign %v1, %[[TMP1]] : i1
-    %3 = moore.read %v2 : <i1>
-    moore.blocking_assign %v1, %3 : i1
-    // CHECK: %[[TMP2:.+]] = moore.read %v2
-    // CHECK: moore.nonblocking_assign %v1, %[[TMP2]] : i1
-    %4 = moore.read %v2 : <i1>
-    moore.nonblocking_assign %v1, %4 : i1
     // CHECK: %a = moore.variable : <i32>
     %a = moore.variable : <i32>
     moore.return
   }
+}
+
+// CHECK-LABEL: moore.module @ContinuousAssignments
+moore.module @ContinuousAssignments(
+  in %arg0: !moore.ref<i42>,
+  in %arg1: !moore.i42,
+  in %arg2: !moore.time
+) {
+  // CHECK: moore.assign %arg0, %arg1 : i42
+  moore.assign %arg0, %arg1 : i42
+  // CHECK: moore.delayed_assign %arg0, %arg1, %arg2 : i42
+  moore.delayed_assign %arg0, %arg1, %arg2 : i42
+}
+
+// CHECK-LABEL: func.func @ProceduralAssignments
+func.func @ProceduralAssignments(
+  %arg0: !moore.ref<i42>,
+  %arg1: !moore.i42,
+  %arg2: !moore.time
+) {
+  // CHECK: moore.blocking_assign %arg0, %arg1 : i42
+  moore.blocking_assign %arg0, %arg1 : i42
+  // CHECK: moore.nonblocking_assign %arg0, %arg1 : i42
+  moore.nonblocking_assign %arg0, %arg1 : i42
+  // CHECK: moore.delayed_nonblocking_assign %arg0, %arg1, %arg2 : i42
+  moore.delayed_nonblocking_assign %arg0, %arg1, %arg2 : i42
+  return
 }
 
 // CHECK-LABEL: moore.module @Expressions
@@ -447,5 +466,23 @@ func.func @TimeConversion(%arg0: !moore.time, %arg1: !moore.l64) {
   moore.time_to_logic %arg0
   // CHECK: moore.logic_to_time %arg1
   moore.logic_to_time %arg1
+  return
+}
+
+// CHECK-LABEL: func.func @RealConversion32(%arg0: !moore.f32, %arg1: !moore.i42)
+func.func @RealConversion32(%arg0: !moore.f32, %arg1: !moore.i42) {
+  // CHECK: %0 = moore.real_to_int %arg0 : f32 -> i42
+  %0 = moore.real_to_int %arg0 : f32 -> i42
+  // CHECK: %1 = moore.int_to_real %arg1 : i42 -> f32
+  %1 = moore.int_to_real %arg1 : i42 -> f32
+  return
+}
+
+// CHECK-LABEL: func.func @RealConversion64(%arg0: !moore.f64, %arg1: !moore.i42)
+func.func @RealConversion64(%arg0: !moore.f64, %arg1: !moore.i42) {
+  // CHECK: %0 = moore.real_to_int %arg0 : f64 -> i42
+  %0 = moore.real_to_int %arg0 : f64 -> i42
+  // CHECK: %1 = moore.int_to_real %arg1 : i42 -> f64
+  %1 = moore.int_to_real %arg1 : i42 -> f64
   return
 }
