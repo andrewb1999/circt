@@ -30,6 +30,7 @@ using namespace arc;
 
 namespace {
 struct StripSVPass : public arc::impl::StripSVBase<StripSVPass> {
+  using Base::Base;
   void runOnOperation() override;
   SmallVector<Operation *> opsToDelete;
   SmallPtrSet<StringAttr, 4> clockGateModuleNames;
@@ -97,6 +98,22 @@ void StripSVPass::runOnOperation() {
   for (auto verb : mlirModule.getOps<sv::MacroDeclOp>())
     opsToDelete.push_back(verb);
 
+  mlirModule.walk([&](sv::MacroRefExprOp macroRef) {
+    StringRef macroName = macroRef.getMacroName();
+    bool isConditionMacro = macroName == "STOP_COND_" ||
+                            macroName == "PRINTF_COND_" ||
+                            macroName == "ASSERT_VERBOSE_COND_";
+
+    if (macroRef.getType().isInteger(1) && isConditionMacro) {
+      OpBuilder builder(macroRef);
+      auto trueConst = hw::ConstantOp::create(builder, macroRef.getLoc(),
+                                              builder.getI1Type(), 1);
+
+      macroRef.replaceAllUsesWith(trueConst->getResult(0));
+      opsToDelete.push_back(macroRef);
+    }
+  });
+
   for (auto module : mlirModule.getOps<hw::HWModuleOp>()) {
     for (Operation &op : *module.getBodyBlock()) {
       // Remove ifdefs and verbatim.
@@ -135,13 +152,11 @@ void StripSVPass::runOnOperation() {
       // Canonicalize registers.
       if (auto reg = dyn_cast<seq::FirRegOp>(&op)) {
         OpBuilder builder(reg);
-        Value next;
-        // Note: this register will have an sync reset regardless.
-        if (reg.hasReset())
-          next = comb::MuxOp::create(builder, reg.getLoc(), reg.getReset(),
-                                     reg.getResetValue(), reg.getNext(), false);
-        else
-          next = reg.getNext();
+
+        if (reg.getIsAsync() && !asyncResetsAsSync) {
+          reg.emitOpError("only synchronous resets are currently supported");
+          return signalPassFailure();
+        }
 
         Value presetValue;
         // Materialize initial value, assume zero initialization as default.
@@ -154,9 +169,9 @@ void StripSVPass::runOnOperation() {
         }
 
         Value compReg = seq::CompRegOp::create(
-            builder, reg.getLoc(), next.getType(), next, reg.getClk(),
-            reg.getNameAttr(), Value{}, Value{}, /*initialValue*/ presetValue,
-            reg.getInnerSymAttr());
+            builder, reg.getLoc(), reg.getType(), reg.getNext(), reg.getClk(),
+            reg.getNameAttr(), reg.getReset(), reg.getResetValue(),
+            /*initialValue*/ presetValue, reg.getInnerSymAttr());
         reg.replaceAllUsesWith(compReg);
         opsToDelete.push_back(reg);
         continue;
@@ -180,8 +195,4 @@ void StripSVPass::runOnOperation() {
   }
   for (auto *op : opsToDelete)
     op->erase();
-}
-
-std::unique_ptr<Pass> arc::createStripSVPass() {
-  return std::make_unique<StripSVPass>();
 }

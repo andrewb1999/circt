@@ -26,7 +26,109 @@ hw.module @reg_with_argument_initial(in %clk: !seq.clock, in %in: i32, in %init:
 
 // -----
 
-hw.module @variadic_op(in %input: i32) {
-  // expected-error @below {{variadic operations not are not currently supported}}
-  %and = comb.and %input, %input, %input : i32
+hw.module @dual_clock_error(in %in : i32, in %clk : !seq.clock, in %clk1 : !seq.clock) {
+  %0 = seq.compreg %in, %clk : i32
+// expected-error @below {{Multi-clock designs are not currently supported.}}
+  %1 = seq.compreg %in, %clk1 : i32
+}
+
+// -----
+
+hw.module @non_int_reg(in %clk : !seq.clock) {
+  // expected-error @below {{Only integer typed seq.compregs are supported in BTOR2.}}
+  %0 = seq.compreg %clk, %clk : !seq.clock
+}
+
+// -----
+
+hw.module @non_int_reg(in %clk : !seq.clock) {
+  // expected-error @below {{Only integer typed seq.firregs are supported in BTOR2.}}
+  %0 = seq.firreg %clk clock %clk : !seq.clock
+}
+
+// -----
+
+hw.module @nullary_variadic() {
+  // expected-error @below {{variadic operations with no operands are not supported}}
+  "comb.concat"() : () -> (i0)
+}
+
+// -----
+
+hw.module @multi_event_always(in %clk : !seq.clock) {
+  %0 = seq.from_clock %clk
+  // expected-error @below {{Multiple events in sv.always are not supported.}}
+  sv.always posedge %0, negedge %0 {
+  }
+}
+
+// -----
+
+hw.module @multi_clk_always(in %clk : !seq.clock) {
+  %0 = seq.from_clock %clk
+  // expected-error @below {{Only posedge clocking is supported in sv.always.}}
+  sv.always negedge %0 {
+  }
+}
+
+// -----
+
+hw.module @i1_clk_always(in %clk : i1) {
+  // expected-error @below {{This pass only currently supports sv.always ops that use a top-level seq.clock input (converted using seq.from_clock) as their clock.}}
+  sv.always posedge %clk {
+  }
+}
+
+// -----
+
+hw.module @multi_clk_always(in %clk : !seq.clock, in %clk1 : !seq.clock) {
+  %0 = seq.from_clock %clk
+  %1 = seq.from_clock %clk1
+  sv.always posedge %0 {
+  }
+  // expected-error @below {{Multi-clock designs are not currently supported.}}
+  sv.always posedge %1 {
+  }
+}
+
+// -----
+
+hw.module @from_clock_comb(in %clk : !seq.clock) {
+  // expected-error @below {{This pass only supports seq.from_clock results being used by sv.always and verif.clocked_assert operations.}}
+  %0 = seq.from_clock %clk
+  %1 = comb.and %0, %0 : i1
+}
+
+// -----
+
+// expected-error @below {{Inputs converted to clocks may only have one user.}}
+hw.module @to_clock_and_comb(in %a : i1) {
+  %0 = seq.to_clock %a
+  %1 = comb.and %a, %a : i1
+}
+
+// -----
+
+hw.module @to_clock_reuse(in %a : i1) {
+  // expected-error @below {{This pass only supports seq.to_clock results being used by seq.firreg and seq.compreg operations.}}
+  %0 = seq.to_clock %a
+  %1 = seq.from_clock %0
+}
+
+// -----
+
+hw.module @to_clock_reuse(in %a : i1, in %b : i1) {
+  %0 = comb.and %a, %b : i1
+  // expected-error @below {{This pass only supports seq.to_clock operations that take a top-level input as their argument.}}
+  %1 = seq.to_clock %0
+}
+
+// -----
+
+hw.module @to_clock_reuse(in %a : i1, in %b : i1, in %c : i32) {
+  %0 = seq.to_clock %a
+  %1 = seq.to_clock %b
+  %2 = seq.compreg %c, %0 : i32
+  // expected-error @below {{Multi-clock designs are not currently supported.}}
+  %3 = seq.compreg %c, %1 : i32
 }

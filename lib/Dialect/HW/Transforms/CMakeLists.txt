@@ -1,5 +1,9 @@
 add_circt_dialect_library(CIRCTHWTransforms
   HWAggregateToComb.cpp
+  HWConvertBitcasts.cpp
+  HWBypassInnerSymbols.cpp
+  HWIMDeadCodeElim.cpp
+  HWParameterizeConstantPorts.cpp
   HWPrintInstanceGraph.cpp
   HWSpecialize.cpp
   PrintHWModuleGraph.cpp
@@ -7,6 +11,7 @@ add_circt_dialect_library(CIRCTHWTransforms
   VerifyInnerRefNamespace.cpp
   FlattenModules.cpp
   FooWires.cpp
+  HWVectorization.cpp
 
   DEPENDS
   CIRCTHWTransformsIncGen

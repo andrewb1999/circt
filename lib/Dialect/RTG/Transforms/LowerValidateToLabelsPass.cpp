@@ -38,8 +38,13 @@ void LowerValidateToLabelsPass::runOnOperation() {
 
   auto result = rootOp->walk([&](rtg::ValidateOp validateOp) -> WalkResult {
     Location loc = validateOp.getLoc();
-    auto regOp = validateOp.getRef().getDefiningOp<rtg::FixedRegisterOp>();
+    auto regOp = validateOp.getRef().getDefiningOp<rtg::ConstantOp>();
     if (!regOp)
+      return validateOp->emitError(
+          "could not determine register defining operation");
+
+    auto reg = dyn_cast<rtg::RegisterAttrInterface>(regOp.getValue());
+    if (!reg)
       return validateOp->emitError("could not determine register");
 
     if (!validateOp.getId().has_value())
@@ -47,10 +52,9 @@ void LowerValidateToLabelsPass::runOnOperation() {
 
     OpBuilder builder(validateOp);
     auto intrinsicLabel = validateOp.getRef().getType().getIntrinsicLabel(
-        regOp.getReg(), validateOp.getId().value());
-    Value lbl = rtg::LabelDeclOp::create(
-        builder, loc, StringAttr::get(&getContext(), intrinsicLabel),
-        ValueRange());
+        reg, validateOp.getId().value());
+    Value lbl = rtg::ConstantOp::create(
+        builder, loc, rtg::LabelAttr::get(&getContext(), intrinsicLabel));
     rtg::LabelOp::create(builder, loc, rtg::LabelVisibility::global, lbl);
     validateOp.getValue().replaceAllUsesWith(validateOp.getDefaultValue());
     validateOp.getValues().replaceAllUsesWith(

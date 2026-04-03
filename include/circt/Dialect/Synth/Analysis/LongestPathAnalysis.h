@@ -95,7 +95,10 @@ struct DebugPoint {
 struct OpenPath {
   OpenPath(circt::igraph::InstancePath path, Value value, size_t bitPos,
            int64_t delay = 0, llvm::ImmutableList<DebugPoint> history = {})
-      : startPoint(path, value, bitPos), delay(delay), history(history) {}
+      : OpenPath(Object(path, value, bitPos), delay, history) {}
+  OpenPath(Object startPoint, int64_t delay = 0,
+           llvm::ImmutableList<DebugPoint> history = {})
+      : startPoint(startPoint), delay(delay), history(history) {}
   OpenPath() = default;
 
   const Object &getStartPoint() const { return startPoint; }
@@ -342,8 +345,8 @@ public:
   // Sort the paths by delay in descending order.
   void sortInDescendingOrder();
 
-  // Sort and drop all paths except the longest path per end point.
-  void sortAndDropNonCriticalPathsPerEndPoint();
+  // Drop all paths except the longest path per end point or start point.
+  void dropNonCriticalPaths(bool perEndPoint = true);
 
   // Merge another collection into this one.
   void merge(const LongestPathCollection &other);

@@ -32,19 +32,29 @@ hw.module @Basic_MIG(in %a: i2, in %b: i2, in %c: i2, out f: i2) {
 }
 
 // CHECK-LABEL: hw.module @Basic_Comb
-hw.module @Basic_Comb(in %a: i2, in %b: i2, out f: i2) {
+hw.module @Basic_Comb(in %cond: i1, in %a: i2, in %b: i2, out f: i2, out g: i2, out h: i2, out i: i2) {
   %0 = comb.and %a, %b : i2
   %1 = comb.or %a, %b : i2
   %2 = comb.xor %a, %b : i2
-  // CHECK-DAG: %[[EXTRACT_A_1:.+]] = comb.extract %a from 1 : (i2) -> i1
-  // CHECK-DAG: %[[EXTRACT_B_1:.+]] = comb.extract %b from 1 : (i2) -> i1
-  // CHECK-DAG: %[[AND_0:.+]] = comb.and %[[EXTRACT_A_1]], %[[EXTRACT_B_1]]
-  // CHECK-DAG: %[[EXTRACT_A_0:.+]] = comb.extract %a from 0 : (i2) -> i1
-  // CHECK-DAG: %[[EXTRACT_B_0:.+]] = comb.extract %b from 0 : (i2) -> i1
-  // CHECK-DAG: %[[AND_1:.+]] = comb.and %[[EXTRACT_A_0]], %[[EXTRACT_B_0]]
-  // CHECK-DAG: %[[CONCAT:.+]] = comb.concat %[[AND_0]], %[[AND_1]]
-  // CHECK-DAG: hw.output %[[CONCAT]] : i2
-  hw.output %0 : i2
+  %3 = comb.mux %cond, %a, %b : i2
+  // CHECK-DAG: %[[A0:.+]] = comb.extract %a from 0 : (i2) -> i1
+  // CHECK-DAG: %[[A1:.+]] = comb.extract %a from 1 : (i2) -> i1
+  // CHECK-DAG: %[[B0:.+]] = comb.extract %b from 0 : (i2) -> i1
+  // CHECK-DAG: %[[B1:.+]] = comb.extract %b from 1 : (i2) -> i1
+  // CHECK-DAG: %[[AND0:.+]] = comb.and %[[A0]], %[[B0]] : i1
+  // CHECK-DAG: %[[AND1:.+]] = comb.and %[[A1]], %[[B1]] : i1
+  // CHECK-DAG: %[[AND:.+]] = comb.concat %[[AND1]], %[[AND0]] : i1, i1
+  // CHECK-DAG: %[[OR0:.+]] = comb.or %[[A0]], %[[B0]] : i1
+  // CHECK-DAG: %[[OR1:.+]] = comb.or %[[A1]], %[[B1]] : i1
+  // CHECK-DAG: %[[OR:.+]] = comb.concat %[[OR1]], %[[OR0]] : i1, i1
+  // CHECK-DAG: %[[XOR0:.+]] = comb.xor %[[A0]], %[[B0]] : i1
+  // CHECK-DAG: %[[XOR1:.+]] = comb.xor %[[A1]], %[[B1]] : i1
+  // CHECK-DAG: %[[XOR:.+]] = comb.concat %[[XOR1]], %[[XOR0]] : i1, i1
+  // CHECK-DAG: %[[MUX0:.+]] = comb.mux %cond, %[[A0]], %[[B0]] : i1
+  // CHECK-DAG: %[[MUX1:.+]] = comb.mux %cond, %[[A1]], %[[B1]] : i1
+  // CHECK-DAG: %[[MUX:.+]] = comb.concat %[[MUX1]], %[[MUX0]] : i1, i1
+  // CHECK-DAG: hw.output %[[AND]], %[[OR]], %[[XOR]], %[[MUX]] : i2, i2, i2, i2
+  hw.output %0, %1, %2, %3 : i2, i2, i2, i2
 }
 
 // CHECK-LABEL: hw.module @Constant_Propagation
@@ -83,4 +93,25 @@ hw.module @Namehint(in %a: i2, in %b: i2, out f: i2) {
   // CHECK-NEXT: %[[AND_INV_1:.+]] = synth.aig.and_inv
   // CHECK-SAME:  {sv.namehint = "foo[1]"} : i1
   hw.output %0 : i2
+}
+
+// CHECK-LABEL: hw.module @Choice
+hw.module @Choice(in %a: i2, in %b: i2, in %c: i2, out f: i2, out g: i2) {
+  %0 = synth.choice %a, %b, %c : i2
+  %c1_i2 = hw.constant 1 : i2
+  %c0_i2 = hw.constant 0 : i2
+  // bit 0 is not equal so it's allowed to choose whatever value we want.
+  %1 = synth.choice %c0_i2, %c1_i2 : i2
+  // CHECK-DAG: %[[A0:.+]] = comb.extract %a from 0
+  // CHECK-DAG: %[[A1:.+]] = comb.extract %a from 1
+  // CHECK-DAG: %[[B0:.+]] = comb.extract %b from 0
+  // CHECK-DAG: %[[B1:.+]] = comb.extract %b from 1
+  // CHECK-DAG: %[[C0:.+]] = comb.extract %c from 0
+  // CHECK-DAG: %[[C1:.+]] = comb.extract %c from 1
+  // CHECK-NEXT: %[[CH0:.+]] = synth.choice %[[A0]], %[[B0]], %[[C0]]
+  // CHECK-NEXT: %[[CH1:.+]] = synth.choice %[[A1]], %[[B1]], %[[C1]]
+  // CHECK-NEXT: %[[CONCAT1:.+]] = comb.concat %[[CH1]], %[[CH0]]
+  // CHECK:      %[[CONCAT2:.+]] = comb.concat %false, %true
+  // CHECK-NEXT: hw.output %[[CONCAT1]], %[[CONCAT2]]
+  hw.output %0, %1 : i2, i2
 }

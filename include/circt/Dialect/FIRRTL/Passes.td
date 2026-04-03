@@ -39,8 +39,6 @@ def LowerFIRRTLAnnotations : Pass<"firrtl-lower-annotations", "firrtl::CircuitOp
       "Ignore unknown annotations.">,
     Option<"noRefTypePorts", "no-ref-type-ports", "bool", "false",
       "Create normal ports, not ref type ports.">,
-    Option<"allowAddingPortsOnPublic", "allow-adding-ports-on-public-modules", "bool", "false",
-      "Allow public modules to gain additional ports as a result of wiring.">,
   ];
   let dependentDialects = ["hw::HWDialect"];
   let statistics = [
@@ -54,8 +52,6 @@ def LowerFIRRTLAnnotations : Pass<"firrtl-lower-annotations", "firrtl::CircuitOp
       "Number of unhandled annotations">,
     Statistic<"numReusedHierPathOps", "num-reused-hierpath",
       "Number of reused HierPathOp's">,
-    Statistic<"numPublicPortsWired", "num-public-ports-wired",
-      "Number of ports on public modules added due to wiring">,
   ];
 }
 
@@ -219,7 +215,7 @@ def CreateSiFiveMetadata : Pass<"firrtl-emit-metadata", "mlir::ModuleOp"> {
 def FlattenMemory : Pass<"firrtl-flatten-memory", "firrtl::FModuleOp"> {
   let summary = "Flatten aggregate memory data to a UInt";
   let description = [{
-    This pass flattens the aggregate data of memory into a UInt, and inserts
+    This pass converts the data type of memories into a flat UInt, and inserts
     appropriate bitcasts to access the data.
   }];
   let statistics = [
@@ -458,7 +454,8 @@ def GrandCentral : Pass<"firrtl-grand-central", "CircuitOp"> {
                 "Instantiate companions in the design"),
               clEnumValN(CompanionMode::Drop, "drop",
                 "Remove companions from the design"))
-           }]>
+           }]>,
+    Option<"noViews", "no-views", "bool", "false", "Delete FIRRTL view intrinsics">,
   ];
   let statistics = [
     Statistic<"numViews", "num-views-created",
@@ -909,6 +906,47 @@ def CheckLayers : Pass<"firrtl-check-layers", "firrtl::CircuitOp"> {
   }];
 }
 
+def PopulateInstanceChoiceSymbols : Pass<"firrtl-populate-instance-choice-symbols",
+                                         "firrtl::CircuitOp"> {
+  let summary = "Populate instance macros for instance choices";
+  let description = [{
+    This pass populates globally unique instance macros for all instance choice
+    operations. These macros will be used as macro names when lowering to
+    SystemVerilog.
+
+    The instance macro can be used as a "real" instance verilog name for the
+    given choice.
+  }];
+  let dependentDialects = ["sv::SVDialect"];
+}
+
+def InferDomains : Pass<"firrtl-infer-domains", "firrtl::CircuitOp"> {
+  let summary = "Infer and type check all firrtl domains";
+  let description = [{
+    This pass does domain inference on a FIRRTL circuit.  The end result of this
+    is either a corrrctly domain-checked FIRRTL circuit or failure with verbose
+    error messages indicating why the FIRRTL circuit has illegal domain
+    constructs.
+
+    E.g., this pass can be used to check for illegal clock-domain-crossings if
+    clock domains are specified for signals in the design.
+  }];
+  let options = [Option<"mode", "mode", "InferDomainsMode",
+                        "InferDomainsMode::Infer", "infer, check, infer-all.",
+                        [{
+                 llvm::cl::values(
+                   clEnumValN(InferDomainsMode::Strip, "strip",
+                    "Erase domains from the circuit without checking"),
+                   clEnumValN(InferDomainsMode::Infer, "infer",
+                     "Check domains with inference for private modules"),
+                   clEnumValN(InferDomainsMode::Check, "check",
+                     "Check domains without inference"),
+                   clEnumValN(InferDomainsMode::InferAll, "infer-all",
+                     "Check domains with inference for both public and private "
+                     "modules"))
+      }]>];
+}
+
 def LowerDomains : Pass<"firrtl-lower-domains", "firrtl::CircuitOp"> {
   let summary = "lower domain information to properties";
   let description = [{
@@ -920,5 +958,22 @@ def LowerDomains : Pass<"firrtl-lower-domains", "firrtl::CircuitOp"> {
       "Number of domains lowered">
   ];
 }
+
+def AnnotateInputOnlyModules : Pass<"firrtl-annotate-input-only-modules",
+                                    "firrtl::CircuitOp"> {
+  let summary = "Annotate input-only modules with InlineAnnotation";
+  let description = [{
+    This pass identifies modules that have only input ports (no output or inout
+    ports) and annotates them with `firrtl.passes.InlineAnnotation`. These
+    modules don't produce any hardware outputs.
+
+    Inlining these modules is necessary because some synthesis tools treat
+    modules without outputs as blackboxes, which can cause synthesis errors.
+  }];
+  let statistics = [
+    Statistic<"numAnnotated", "num-annotated", "Number of modules annotated">
+  ];
+}
+
 
 #endif // CIRCT_DIALECT_FIRRTL_PASSES_TD

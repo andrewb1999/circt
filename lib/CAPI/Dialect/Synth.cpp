@@ -203,6 +203,12 @@ void synthLongestPathCollectionMerge(SynthLongestPathCollection dest,
   destWrapper->merge(*srcWrapper);
 }
 
+void synthLongestPathCollectionDropNonCriticalPaths(
+    SynthLongestPathCollection collection, bool perEndPoint) {
+  auto *wrapper = unwrap(collection);
+  wrapper->dropNonCriticalPaths(perEndPoint);
+}
+
 //===----------------------------------------------------------------------===//
 // DataflowPath
 //===----------------------------------------------------------------------===//
@@ -307,4 +313,12 @@ size_t synthLongestPathObjectBitPos(SynthLongestPathObject rawObject) {
   if (auto *object = dyn_cast<Object *>(ptr))
     return object->bitPos;
   return std::get<2>(*dyn_cast<DataflowPath::OutputPort *>(ptr));
+}
+
+MlirValue synthLongestPathObjectGetValue(SynthLongestPathObject rawObject) {
+  auto ptr = unwrap(rawObject);
+  if (auto *object = dyn_cast<Object *>(ptr))
+    return wrap(object->value);
+  // Output ports don't have an associated value
+  return {nullptr};
 }

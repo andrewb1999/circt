@@ -25,10 +25,21 @@
 #include "esi/Ports.h"
 
 #include <cstdint>
+#include <list>
 
 namespace esi {
 class AcceleratorConnection;
 class Engine;
+namespace services {
+class Service;
+}
+
+// While building the design, keep around a std::map of active services indexed
+// by the service name. When a new service is encountered during descent, add it
+// to the table (perhaps overwriting one). Modifications to the table only apply
+// to the current branch, so copy this and update it at each level of the tree.
+using ServiceTable = std::map<std::string, services::Service *>;
+
 namespace services {
 
 /// Add a custom interface to a service client at a particular point in the
@@ -38,7 +49,9 @@ public:
   using BundlePort::BundlePort;
   virtual ~ServicePort() = default;
   // Get a description of the service port.
-  virtual std::optional<std::string> toString() const { return std::nullopt; }
+  virtual std::optional<std::string> toString(bool oneLine = false) const {
+    return std::nullopt;
+  }
 };
 
 /// Parent class of all APIs modeled as 'services'. May or may not map to a
@@ -107,6 +120,14 @@ public:
   /// Get the ESI version number to check version compatibility.
   virtual uint32_t getEsiVersion() const = 0;
 
+  /// Get the current cycle count of the accelerator system.
+  virtual std::optional<uint64_t> getCycleCount() const { return std::nullopt; }
+  /// Get the "core" clock frequency of the accelerator system in Hz. Returns
+  /// nullopt if the accelerator does not provide this information.
+  virtual std::optional<uint64_t> getCoreClockFrequency() const {
+    return std::nullopt;
+  }
+
   /// Return the JSON-formatted system manifest.
   virtual std::string getJsonManifest() const;
 
@@ -170,7 +191,8 @@ public:
     /// Write a 64-bit value to this region, not the global address space.
     virtual void write(uint32_t addr, uint64_t data);
 
-    virtual std::optional<std::string> toString() const override {
+    virtual std::optional<std::string>
+    toString(bool oneLine = false) const override {
       return "MMIO region " + toHex(desc.base) + " - " +
              toHex(desc.base + desc.size);
     }
@@ -188,6 +210,12 @@ public:
 
   /// Get the ESI version number to check version compatibility.
   uint32_t getEsiVersion() const override;
+
+  /// Get the current cycle count of the accelerator system's core clock.
+  std::optional<uint64_t> getCycleCount() const override;
+  /// Get the "core" clock frequency of the accelerator system in Hz. Returns
+  /// nullopt if the accelerator does not provide this information.
+  std::optional<uint64_t> getCoreClockFrequency() const override;
 
   /// Return the zlib compressed JSON system manifest.
   virtual std::vector<uint8_t> getCompressedManifest() const override;
@@ -249,6 +277,68 @@ public:
   virtual void unmapMemory(void *ptr) const {}
 };
 
+/// Service for raw communication channels to/from the accelerator.
+class ChannelService : public Service {
+public:
+  ChannelService(AppIDPath id, AcceleratorConnection &,
+                 ServiceImplDetails details, HWClientDetails clients);
+
+  virtual std::string getServiceSymbol() const override;
+  virtual BundlePort *getPort(AppIDPath id,
+                              const BundleType *type) const override;
+
+  /// A port which reads data from the accelerator (to_host).
+  class ToHost : public ServicePort {
+    friend class ChannelService;
+    using ServicePort::ServicePort;
+
+  public:
+    static ToHost *get(AppID id, const BundleType *type,
+                       ReadChannelPort &dataPort);
+    void connect();
+    std::future<MessageData> read();
+
+    virtual std::optional<std::string>
+    toString(bool oneLine = false) const override {
+      const esi::Type *dataType =
+          dynamic_cast<const ChannelType *>(type->findChannel("data").first)
+              ->getInner();
+      return "channel to_host " + dataType->toString(oneLine);
+    }
+
+  private:
+    ReadChannelPort *dataPort = nullptr;
+    bool connected = false;
+  };
+
+  /// A port which writes data to the accelerator (from_host).
+  class FromHost : public ServicePort {
+    friend class ChannelService;
+    using ServicePort::ServicePort;
+
+  public:
+    static FromHost *get(AppID id, const BundleType *type,
+                         WriteChannelPort &dataPort);
+    void connect();
+    void write(const MessageData &data);
+
+    virtual std::optional<std::string>
+    toString(bool oneLine = false) const override {
+      const esi::Type *dataType =
+          dynamic_cast<const ChannelType *>(type->findChannel("data").first)
+              ->getInner();
+      return "channel from_host " + dataType->toString(oneLine);
+    }
+
+  private:
+    WriteChannelPort *dataPort = nullptr;
+    bool connected = false;
+  };
+
+private:
+  std::string symbol;
+};
+
 /// Service for calling functions.
 class FuncService : public Service {
 public:
@@ -282,10 +372,12 @@ public:
           ->getInner();
     }
 
-    virtual std::optional<std::string> toString() const override {
+    virtual std::optional<std::string>
+    toString(bool oneLine = false) const override {
       const esi::Type *argType = getArgType();
       const esi::Type *resultType = getResultType();
-      return "function " + resultType->getID() + "(" + argType->getID() + ")";
+      return "function " + resultType->toString(oneLine) + "(" +
+             argType->toString(oneLine) + ")";
     }
 
   private:
@@ -338,10 +430,12 @@ public:
           ->getInner();
     }
 
-    virtual std::optional<std::string> toString() const override {
+    virtual std::optional<std::string>
+    toString(bool oneLine = false) const override {
       const esi::Type *argType = getArgType();
       const esi::Type *resultType = getResultType();
-      return "callback " + resultType->getID() + "(" + argType->getID() + ")";
+      return "callback " + resultType->toString(oneLine) + "(" +
+             argType->toString(oneLine) + ")";
     }
 
   private:
@@ -365,37 +459,51 @@ public:
   virtual std::string getServiceSymbol() const override;
   virtual BundlePort *getPort(AppIDPath id,
                               const BundleType *type) const override;
+  virtual Service *getChildService(Service::Type service, AppIDPath id = {},
+                                   std::string implName = {},
+                                   ServiceImplDetails details = {},
+                                   HWClientDetails clients = {}) override;
+  MMIO::MMIORegion *getMMIORegion() const;
 
   /// A telemetry port which gets attached to a service port.
-  class Telemetry : public ServicePort {
+  class Metric : public ServicePort {
     friend class TelemetryService;
-    Telemetry(AppID id, const BundleType *type, PortMap channels);
+    Metric(AppID id, const BundleType *type, PortMap channels,
+           const TelemetryService *telemetryService,
+           std::optional<uint64_t> offset);
 
   public:
-    static Telemetry *get(AppID id, BundleType *type, WriteChannelPort &get,
-                          ReadChannelPort &data);
-
     void connect();
     std::future<MessageData> read();
+    uint64_t readInt();
 
-    virtual std::optional<std::string> toString() const override {
+    virtual std::optional<std::string>
+    toString(bool oneLine = false) const override {
       const esi::Type *dataType =
           dynamic_cast<const ChannelType *>(type->findChannel("data").first)
               ->getInner();
-      return "telemetry " + dataType->getID();
+      return "telemetry " + dataType->toString(oneLine);
     }
 
   private:
-    WriteChannelPort *get_req;
-    ReadChannelPort *data;
+    const TelemetryService *telemetryService;
+    MMIO::MMIORegion *mmio;
+    std::optional<uint64_t> offset;
   };
 
-  const std::map<AppIDPath, Telemetry *> &getTelemetryPorts() {
-    return telemetryPorts;
+  std::map<AppIDPath, Metric *> getTelemetryPorts() {
+    std::map<AppIDPath, Metric *> ports;
+    getTelemetryPorts(ports);
+    return ports;
   }
+  void getTelemetryPorts(std::map<AppIDPath, Metric *> &ports);
 
 private:
-  mutable std::map<AppIDPath, Telemetry *> telemetryPorts;
+  AppIDPath id;
+  mutable MMIO::MMIORegion *mmio;
+  std::map<AppIDPath, uint64_t> portAddressAssignments;
+  mutable std::map<AppIDPath, Metric *> telemetryPorts;
+  std::list<TelemetryService *> children;
 };
 
 /// Registry of services which can be instantiated directly by the Accelerator

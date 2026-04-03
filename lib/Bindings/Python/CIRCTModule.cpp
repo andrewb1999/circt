@@ -32,10 +32,13 @@
 #endif
 #include "circt-c/Dialect/SV.h"
 #include "circt-c/Dialect/Seq.h"
+#include "circt-c/Dialect/Sim.h"
 #include "circt-c/Dialect/Verif.h"
+#include "circt-c/ExportLLVM.h"
 #include "circt-c/ExportVerilog.h"
 #include "mlir-c/Bindings/Python/Interop.h"
 #include "mlir-c/Dialect/Index.h"
+#include "mlir-c/Dialect/LLVM.h"
 #include "mlir-c/Dialect/SCF.h"
 #include "mlir-c/Dialect/SMT.h"
 #include "mlir-c/IR.h"
@@ -43,6 +46,7 @@
 #include "mlir/Bindings/Python/NanobindAdaptors.h"
 
 #include "llvm-c/ErrorHandling.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Signals.h"
 
 #include "NanobindUtils.h"
@@ -66,7 +70,7 @@ static void registerPasses() {
   registerSynthesisPipeline();
   mlirRegisterCIRCTConversionPasses();
   mlirRegisterCIRCTTransformsPasses();
-  mlirRegisterTransformsCSE();
+  mlirRegisterTransformsCSEPass();
 }
 
 NB_MODULE(_circt, m) {
@@ -83,6 +87,10 @@ NB_MODULE(_circt, m) {
         MlirContext context = mlirPythonCapsuleToContext(wrappedCapsule.ptr());
 
         // Collect CIRCT dialects to register.
+
+        MlirDialectHandle arc = mlirGetDialectHandle__arc__();
+        mlirDialectHandleRegisterDialect(arc, context);
+        mlirDialectHandleLoadDialect(arc, context);
 
         MlirDialectHandle comb = mlirGetDialectHandle__comb__();
         mlirDialectHandleRegisterDialect(comb, context);
@@ -116,6 +124,10 @@ NB_MODULE(_circt, m) {
         mlirDialectHandleRegisterDialect(index, context);
         mlirDialectHandleLoadDialect(index, context);
 
+        MlirDialectHandle llvm = mlirGetDialectHandle__llvm__();
+        mlirDialectHandleRegisterDialect(llvm, context);
+        mlirDialectHandleLoadDialect(llvm, context);
+
         MlirDialectHandle scf = mlirGetDialectHandle__scf__();
         mlirDialectHandleRegisterDialect(scf, context);
         mlirDialectHandleLoadDialect(scf, context);
@@ -141,6 +153,10 @@ NB_MODULE(_circt, m) {
         MlirDialectHandle seq = mlirGetDialectHandle__seq__();
         mlirDialectHandleRegisterDialect(seq, context);
         mlirDialectHandleLoadDialect(seq, context);
+
+        MlirDialectHandle sim = mlirGetDialectHandle__sim__();
+        mlirDialectHandleRegisterDialect(sim, context);
+        mlirDialectHandleLoadDialect(sim, context);
 
         MlirDialectHandle sv = mlirGetDialectHandle__sv__();
         mlirDialectHandleRegisterDialect(sv, context);
@@ -178,7 +194,6 @@ NB_MODULE(_circt, m) {
 
   m.def("export_verilog", [](MlirModule mod, nb::object fileObject) {
     circt::python::PyFileAccumulator accum(fileObject, false);
-    nb::gil_scoped_release();
     mlirExportVerilog(mod, accum.getCallback(), accum.getUserData());
   });
 
@@ -187,6 +202,13 @@ NB_MODULE(_circt, m) {
     mlirExportSplitVerilog(mod, cDirectory);
   });
 
+  m.def("export_llvm_ir", [](MlirModule mod, nb::object fileObject) {
+    circt::python::PyFileAccumulator accum(fileObject, false);
+    mlirExportLLVMIR(mod, accum.getCallback(), accum.getUserData());
+  });
+
+  nb::module_ arc = m.def_submodule("_arc", "Arc API");
+  circt::python::populateDialectArcSubmodule(arc);
   nb::module_ synth = m.def_submodule("_synth", "synth API");
   circt::python::populateDialectSynthSubmodule(synth);
   nb::module_ esi = m.def_submodule("_esi", "ESI API");
@@ -199,6 +221,8 @@ NB_MODULE(_circt, m) {
   circt::python::populateDialectSeqSubmodule(seq);
   nb::module_ om = m.def_submodule("_om", "OM API");
   circt::python::populateDialectOMSubmodule(om);
+  nb::module_ pipeline = m.def_submodule("_pipeline", "Pipeline API");
+  circt::python::populateDialectPipelineSubmodule(pipeline);
   nb::module_ rtg = m.def_submodule("_rtg", "RTG API");
   circt::python::populateDialectRTGSubmodule(rtg);
 #ifdef CIRCT_INCLUDE_TESTS

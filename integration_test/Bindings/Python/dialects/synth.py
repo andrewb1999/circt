@@ -3,7 +3,7 @@
 
 import circt
 from circt.dialects import hw, comb, synth, seq
-from circt.ir import Context, Location, Module, InsertionPoint, IntegerType, ArrayAttr
+from circt.ir import Context, Location, Module, InsertionPoint, IntegerType, ArrayAttr, BlockArgument
 from circt.passmanager import PassManager
 from circt.dialects.synth import LongestPathAnalysis, LongestPathCollection, DataflowPath
 
@@ -128,10 +128,43 @@ with Context() as ctx, Location.unknown():
     # CHECK-NEXT: minus index slice: True
     print("minus index slice:", len(collection[:-2]) == len(collection) - 2)
 
+    # Test value and is_output_port properties
+    path = collection[0]
+    start_obj = path.start_point
+    end_obj = path.end_point
+
+    # CHECK-NEXT: start_point has value: True
+    print("start_point has value:", start_obj.value is not None)
+
+    # Test downcasting to BlockArgument and accessing owner
+    try:
+      block_arg = BlockArgument(start_obj.value)
+      # CHECK-NEXT: start_point is BlockArgument: True
+      print("start_point is BlockArgument:", True)
+    except ValueError:
+      pass
+
+    # CHECK-NEXT: start_point is_output_port: False
+    print("start_point is_output_port:", start_obj.is_output_port)
+
+    # CHECK-NEXT: end_point is_output_port: True
+    print("end_point is_output_port:", end_obj.is_output_port)
+    # CHECK-NEXT: end_point has no value: True
+    print("end_point has no value:", end_obj.value is None)
+
     # Test framegraph emission.
     # CHECK: top:test_aig;c[0] 0
     # CHECK: top:test_aig;child:test_child;a[0] 2
     print(collection.longest_path.to_flamegraph())
+
+    original_length = len(collection)
+    collection.drop_non_critical_paths(per_end_point=True)
+    after_per_end_point = len(collection)
+    collection.drop_non_critical_paths(per_end_point=False)
+    after_per_start_point = len(collection)
+    # CHECK-NEXT: drop_non_critical_paths: True True
+    print("drop_non_critical_paths:", original_length > after_per_end_point,
+          after_per_end_point > after_per_start_point)
 
     test_child = m.body.operations[0]
     body_block = test_child.regions[0].blocks[0]

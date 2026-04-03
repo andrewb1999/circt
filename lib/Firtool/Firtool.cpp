@@ -37,8 +37,7 @@ LogicalResult firtool::populatePreprocessTransforms(mlir::PassManager &pm,
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createLowerFIRRTLAnnotations(
       {/*ignoreAnnotationClassless=*/opt.shouldDisableClasslessAnnotations(),
        /*ignoreAnnotationUnknown=*/opt.shouldDisableUnknownAnnotations(),
-       /*noRefTypePorts=*/opt.shouldLowerNoRefTypePortAnnotations(),
-       /*allowAddingPortsOnPublic=*/opt.shouldAllowAddingPortsOnPublic()}));
+       /*noRefTypePorts=*/opt.shouldLowerNoRefTypePortAnnotations()}));
 
   if (opt.shouldEnableDebugInfo())
     pm.nest<firrtl::CircuitOp>().addNestedPass<firrtl::FModuleOp>(
@@ -130,6 +129,14 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
     modulePM.addPass(firrtl::createSFCCompat());
   }
 
+  // InferDomains runs after ExpandWhens because FIRRTL allows for last-connect
+  // semantics and users have historically relied on this behavior to set
+  // default connections that are then overridden later.  If this pass is run
+  // before ExpandWhens, then users can get errors if they rely on last-connect
+  // semantics.
+  if (auto mode = FirtoolOptions::toInferDomainsPassMode(opt.getDomainMode()))
+    pm.nest<firrtl::CircuitOp>().addPass(firrtl::createInferDomains({*mode}));
+
   pm.addNestedPass<firrtl::CircuitOp>(firrtl::createCheckCombLoops());
 
   // Must run this pass after all diagnostic passes have run, otherwise it can
@@ -205,6 +212,13 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
     pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
         createSimpleCanonicalizerPass());
     pm.addPass(firrtl::createIMDeadCodeElim());
+    if (opt.shouldInlineInputOnlyModules()) {
+      pm.nest<firrtl::CircuitOp>().addPass(
+          firrtl::createAnnotateInputOnlyModules());
+      pm.nest<firrtl::CircuitOp>().addPass(firrtl::createInliner());
+      pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
+          createSimpleCanonicalizerPass());
+    }
   }
 
   // Always run this, required for legalization.
@@ -223,6 +237,11 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
 LogicalResult firtool::populateLowFIRRTLToHW(mlir::PassManager &pm,
                                              const FirtoolOptions &opt,
                                              StringRef inputFilename) {
+  // Populate instance macros for instance choice operations before lowering to
+  // HW.
+  pm.nest<firrtl::CircuitOp>().addPass(
+      firrtl::createPopulateInstanceChoiceSymbols());
+
   // Run layersink immediately before LowerXMR. LowerXMR will "freeze" the
   // location of probed objects by placing symbols on them. Run layersink first
   // so that probed objects can be sunk if possible.
@@ -261,7 +280,8 @@ LogicalResult firtool::populateLowFIRRTLToHW(mlir::PassManager &pm,
   // Run this after output directories are (otherwise) assigned,
   // so generated interfaces can be appropriately marked.
   pm.addNestedPass<firrtl::CircuitOp>(
-      firrtl::createGrandCentral({/*companionMode=*/opt.getCompanionMode()}));
+      firrtl::createGrandCentral({/*companionMode=*/opt.getCompanionMode(),
+                                  /*noViews*/ opt.getNoViews()}));
 
   // Read black box source files into the IR.
   StringRef blackBoxRoot = opt.getBlackBoxRootPath().empty()
@@ -309,17 +329,11 @@ LogicalResult firtool::populateLowFIRRTLToHW(mlir::PassManager &pm,
 LogicalResult firtool::populateHWToSV(mlir::PassManager &pm,
                                       const FirtoolOptions &opt) {
   pm.nestAny().addPass(verif::createStripContractsPass());
-  pm.addPass(verif::createLowerFormalToHWPass());
+  pm.addPass(verif::createLowerTestsPass());
   pm.addPass(
       verif::createLowerSymbolicValuesPass({opt.getSymbolicValueLowering()}));
 
-  if (opt.shouldExtractTestCode())
-    pm.addPass(sv::createSVExtractTestCodePass(
-        opt.shouldEtcDisableInstanceExtraction(),
-        opt.shouldEtcDisableRegisterExtraction(),
-        opt.shouldEtcDisableModuleInlining()));
-
-  pm.addPass(seq::createExternalizeClockGatePass(opt.getClockGateOptions()));
+  pm.addPass(seq::createExternalizeClockGate(opt.getClockGateOptions()));
   pm.addPass(circt::createLowerSimToSVPass());
   pm.addPass(circt::createLowerSeqToSVPass(
       {/*disableRegRandomization=*/!opt.isRandomEnabled(
@@ -329,7 +343,7 @@ LogicalResult firtool::populateHWToSV(mlir::PassManager &pm,
        /*emitSeparateAlwaysBlocks=*/
        opt.shouldEmitSeparateAlwaysBlocks()}));
   pm.addNestedPass<hw::HWModuleOp>(createLowerVerifToSVPass());
-  pm.addPass(seq::createHWMemSimImplPass(
+  pm.addPass(seq::createHWMemSimImpl(
       {/*disableMemRandomization=*/!opt.isRandomEnabled(
            FirtoolOptions::RandomKind::Mem),
        /*disableRegRandomization=*/
@@ -348,8 +362,8 @@ LogicalResult firtool::populateHWToSV(mlir::PassManager &pm,
     modulePM.addPass(mlir::createCSEPass());
     modulePM.addPass(createSimpleCanonicalizerPass());
     modulePM.addPass(mlir::createCSEPass());
-    modulePM.addPass(sv::createHWCleanupPass(
-        /*mergeAlwaysBlocks=*/!opt.shouldEmitSeparateAlwaysBlocks()));
+    modulePM.addPass(sv::createHWCleanup(
+        {/*mergeAlwaysBlocks=*/!opt.shouldEmitSeparateAlwaysBlocks()}));
   }
 
   // Check inner symbols and inner refs.
@@ -370,11 +384,11 @@ populatePrepareForExportVerilog(mlir::PassManager &pm,
   pm.addNestedPass<hw::HWModuleOp>(verif::createVerifyClockedAssertLikePass());
 
   // Legalize unsupported operations within the modules.
-  pm.nest<hw::HWModuleOp>().addPass(sv::createHWLegalizeModulesPass());
+  pm.nest<hw::HWModuleOp>().addPass(sv::createHWLegalizeModules());
 
   // Tidy up the IR to improve verilog emission quality.
   if (!opt.shouldDisableOptimization())
-    pm.nest<hw::HWModuleOp>().addPass(sv::createPrettifyVerilogPass());
+    pm.nest<hw::HWModuleOp>().addPass(sv::createPrettifyVerilog());
 
   if (opt.shouldStripFirDebugInfo())
     pm.addPass(circt::createStripDebugInfoWithPredPass([](mlir::Location loc) {
@@ -389,7 +403,7 @@ populatePrepareForExportVerilog(mlir::PassManager &pm,
 
   // Emit module and testbench hierarchy JSON files.
   if (opt.shouldExportModuleHierarchy())
-    pm.addPass(sv::createHWExportModuleHierarchyPass());
+    pm.addPass(sv::createHWExportModuleHierarchy());
 
   // Check inner symbols and inner refs.
   pm.addPass(hw::createVerifyInnerRefNamespace());
@@ -439,11 +453,19 @@ LogicalResult firtool::populateFinalizeIR(mlir::PassManager &pm,
   return success();
 }
 
+/// BTOR2 emission pipeline, triggered with `--btor2` flag.
 LogicalResult firtool::populateHWToBTOR2(mlir::PassManager &pm,
                                          const FirtoolOptions &opt,
                                          llvm::raw_ostream &os) {
-  pm.addNestedPass<hw::HWModuleOp>(circt::createLowerLTLToCorePass());
-  pm.addNestedPass<hw::HWModuleOp>(circt::verif::createPrepareForFormalPass());
+  auto &mpm = pm.nest<hw::HWModuleOp>();
+  // Lower all supported `ltl` ops
+  mpm.addPass(circt::createLowerLTLToCorePass());
+  // LTLToCore can generate shiftreg which should be lowered before emission
+  mpm.addPass(circt::seq::createLowerSeqShiftReg());
+  // ShiftReg Lowering generates compreg.ce, which we don't support, so lower
+  mpm.addPass(circt::seq::createLowerSeqCompRegCE());
+  // Do final formal specific lowerings, e.g. inline wires eagerly
+  mpm.addPass(circt::verif::createPrepareForFormalPass());
   pm.addPass(circt::hw::createFlattenModules());
   pm.addPass(circt::createConvertHWToBTOR2Pass(os));
   return success();
@@ -480,11 +502,6 @@ struct FirtoolCmdOptions {
       llvm::cl::desc(
           "Create real ports instead of ref type ports when resolving "
           "wiring problems inside the LowerAnnotations pass"),
-      llvm::cl::init(false), llvm::cl::Hidden};
-
-  llvm::cl::opt<bool> allowAddingPortsOnPublic{
-      "allow-adding-ports-on-public-modules",
-      llvm::cl::desc("Allow adding ports to public modules"),
       llvm::cl::init(false), llvm::cl::Hidden};
 
   llvm::cl::opt<bool> probesToSignals{
@@ -575,6 +592,13 @@ struct FirtoolCmdOptions {
       llvm::cl::Hidden,
   };
 
+  llvm::cl::opt<bool> noViews{
+      "no-views",
+      llvm::cl::desc(
+          "Disable lowering of FIRRTL view intrinsics (delete them instead)"),
+      llvm::cl::init(false),
+  };
+
   llvm::cl::opt<bool> disableAggressiveMergeConnections{
       "disable-aggressive-merge-connections",
       llvm::cl::desc(
@@ -605,10 +629,6 @@ struct FirtoolCmdOptions {
   llvm::cl::opt<std::string> replSeqMemFile{
       "repl-seq-mem-file", llvm::cl::desc("File name for seq mem metadata"),
       llvm::cl::init("")};
-
-  llvm::cl::opt<bool> extractTestCode{
-      "extract-test-code", llvm::cl::desc("Run the extract test code pass"),
-      llvm::cl::init(false)};
 
   llvm::cl::opt<bool> ignoreReadEnableMem{
       "ignore-read-enable-mem",
@@ -665,21 +685,6 @@ struct FirtoolCmdOptions {
       llvm::cl::desc(
           "Prevent always blocks from being merged and emit constructs into "
           "separate always blocks whenever possible"),
-      llvm::cl::init(false)};
-
-  llvm::cl::opt<bool> etcDisableInstanceExtraction{
-      "etc-disable-instance-extraction",
-      llvm::cl::desc("Disable extracting instances only that feed test code"),
-      llvm::cl::init(false)};
-
-  llvm::cl::opt<bool> etcDisableRegisterExtraction{
-      "etc-disable-register-extraction",
-      llvm::cl::desc("Disable extracting registers that only feed test code"),
-      llvm::cl::init(false)};
-
-  llvm::cl::opt<bool> etcDisableModuleInlining{
-      "etc-disable-module-inlining",
-      llvm::cl::desc("Disable inlining modules that only feed test code"),
       llvm::cl::init(false)};
 
   llvm::cl::opt<bool> addVivadoRAMAddressConflictSynthesisBugWorkaround{
@@ -758,6 +763,26 @@ struct FirtoolCmdOptions {
       llvm::cl::desc("Emit bindfiles for private modules"),
       llvm::cl::init(false)};
 
+  llvm::cl::opt<bool> inlineInputOnlyModules{
+      "inline-input-only-modules", llvm::cl::desc("Inline input-only modules"),
+      llvm::cl::init(false)};
+
+  llvm::cl::opt<firtool::FirtoolOptions::DomainMode> domainMode{
+      "domain-mode", llvm::cl::desc("Enable domain inference and checking"),
+      llvm::cl::init(firtool::FirtoolOptions::DomainMode::Strip),
+      llvm::cl::values(
+          clEnumValN(firtool::FirtoolOptions::DomainMode::Check, "check",
+                     "Check domains without inference"),
+          clEnumValN(firtool::FirtoolOptions::DomainMode::Disable, "disable",
+                     "Disable domain checking"),
+          clEnumValN(firtool::FirtoolOptions::DomainMode::Infer, "infer",
+                     "Check domains with inference for private modules"),
+          clEnumValN(firtool::FirtoolOptions::DomainMode::InferAll, "infer-all",
+                     "Check domains with inference for both public and private "
+                     "modules"),
+          clEnumValN(firtool::FirtoolOptions::DomainMode::Strip, "strip",
+                     "Erase all domain information"))};
+
   //===----------------------------------------------------------------------===
   // Lint options
   //===----------------------------------------------------------------------===
@@ -787,20 +812,19 @@ void circt::firtool::registerFirtoolCLOptions() {
 circt::firtool::FirtoolOptions::FirtoolOptions()
     : outputFilename("-"), disableAnnotationsUnknown(false),
       disableAnnotationsClassless(false), lowerAnnotationsNoRefTypePorts(false),
-      allowAddingPortsOnPublic(false), probesToSignals(false),
+      probesToSignals(false),
       preserveAggregate(firrtl::PreserveAggregate::None),
       preserveMode(firrtl::PreserveValues::None), enableDebugInfo(false),
       buildMode(BuildModeRelease), disableLayerSink(false),
       disableOptimization(false), vbToBV(false), noDedup(false),
       dedupClasses(true), companionMode(firrtl::CompanionMode::Bind),
-      disableAggressiveMergeConnections(false), lowerMemories(false),
-      blackBoxRootPath(""), replSeqMem(false), replSeqMemFile(""),
-      extractTestCode(false), ignoreReadEnableMem(false),
+      noViews(false), disableAggressiveMergeConnections(false),
+      lowerMemories(false), blackBoxRootPath(""), replSeqMem(false),
+      replSeqMemFile(""), ignoreReadEnableMem(false),
       disableRandom(RandomKind::None), outputAnnotationFilename(""),
       enableAnnotationWarning(false), addMuxPragmas(false),
       verificationFlavor(firrtl::VerificationFlavor::None),
-      emitSeparateAlwaysBlocks(false), etcDisableInstanceExtraction(false),
-      etcDisableRegisterExtraction(false), etcDisableModuleInlining(false),
+      emitSeparateAlwaysBlocks(false),
       addVivadoRAMAddressConflictSynthesisBugWorkaround(false),
       ckgModuleName("EICG_wrapper"), ckgInputName("in"), ckgOutputName("out"),
       ckgEnableName("en"), ckgTestEnableName("test_en"), ckgInstName("ckg"),
@@ -809,14 +833,14 @@ circt::firtool::FirtoolOptions::FirtoolOptions()
       disableCSEinClasses(false), selectDefaultInstanceChoice(false),
       symbolicValueLowering(verif::SymbolicValueLowering::ExtModule),
       disableWireElimination(false), lintStaticAsserts(true),
-      lintXmrsInDesign(true), emitAllBindFiles(false) {
+      lintXmrsInDesign(true), emitAllBindFiles(false),
+      inlineInputOnlyModules(false), domainMode(DomainMode::Disable) {
   if (!clOptions.isConstructed())
     return;
   outputFilename = clOptions->outputFilename;
   disableAnnotationsUnknown = clOptions->disableAnnotationsUnknown;
   disableAnnotationsClassless = clOptions->disableAnnotationsClassless;
   lowerAnnotationsNoRefTypePorts = clOptions->lowerAnnotationsNoRefTypePorts;
-  allowAddingPortsOnPublic = clOptions->allowAddingPortsOnPublic;
   probesToSignals = clOptions->probesToSignals;
   preserveAggregate = clOptions->preserveAggregate;
   preserveMode = clOptions->preserveMode;
@@ -828,13 +852,13 @@ circt::firtool::FirtoolOptions::FirtoolOptions()
   noDedup = clOptions->noDedup;
   dedupClasses = clOptions->dedupClasses;
   companionMode = clOptions->companionMode;
+  noViews = clOptions->noViews;
   disableAggressiveMergeConnections =
       clOptions->disableAggressiveMergeConnections;
   lowerMemories = clOptions->lowerMemories;
   blackBoxRootPath = clOptions->blackBoxRootPath;
   replSeqMem = clOptions->replSeqMem;
   replSeqMemFile = clOptions->replSeqMemFile;
-  extractTestCode = clOptions->extractTestCode;
   ignoreReadEnableMem = clOptions->ignoreReadEnableMem;
   disableRandom = clOptions->disableRandom;
   outputAnnotationFilename = clOptions->outputAnnotationFilename;
@@ -842,9 +866,6 @@ circt::firtool::FirtoolOptions::FirtoolOptions()
   addMuxPragmas = clOptions->addMuxPragmas;
   verificationFlavor = clOptions->verificationFlavor;
   emitSeparateAlwaysBlocks = clOptions->emitSeparateAlwaysBlocks;
-  etcDisableInstanceExtraction = clOptions->etcDisableInstanceExtraction;
-  etcDisableRegisterExtraction = clOptions->etcDisableRegisterExtraction;
-  etcDisableModuleInlining = clOptions->etcDisableModuleInlining;
   addVivadoRAMAddressConflictSynthesisBugWorkaround =
       clOptions->addVivadoRAMAddressConflictSynthesisBugWorkaround;
   ckgModuleName = clOptions->ckgModuleName;
@@ -862,4 +883,6 @@ circt::firtool::FirtoolOptions::FirtoolOptions()
   lintStaticAsserts = clOptions->lintStaticAsserts;
   lintXmrsInDesign = clOptions->lintXmrsInDesign;
   emitAllBindFiles = clOptions->emitAllBindFiles;
+  inlineInputOnlyModules = clOptions->inlineInputOnlyModules;
+  domainMode = clOptions->domainMode;
 }

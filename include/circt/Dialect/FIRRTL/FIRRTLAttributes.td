@@ -46,11 +46,11 @@ def DomainInfoAttr : ArrayAttrBase<
     And<[
       // Guarantee this is an ArrayAttr first
       CPred<"llvm::isa<::mlir::ArrayAttr>($_self)">,
-      // Guarantee all elements are a FlatSymbolRefAttr or ArrayAttr.
+      // Guarantee all elements are ArrayAttr (associations only).
       CPred<"::llvm::all_of(cast<mlir::ArrayAttr>($_self), "
             "[&](::mlir::Attribute attr) { return isa_and_nonnull<"
-            "::mlir::FlatSymbolRefAttr, ::mlir::ArrayAttr>(attr);})">]>,
-    "domain attributes must be an empty array or array-of-arrays"> {
+            "::mlir::ArrayAttr>(attr);})">]>,
+    "domain associations must be an empty array or array-of-arrays"> {
   let constBuilderCall = "$_builder.getArrayAttr($0)";
 }
 
@@ -181,28 +181,6 @@ def MemoryInitAttr : AttrDef<FIRRTLDialect, "MemoryInit"> {
   );
  let assemblyFormat = "`<` $filename `,` $isBinary `,` $isInline `>`";
 }
-
-/// An attribute holding internal path for ref-type ports.
-def InternalPathAttr : AttrDef<FIRRTLDialect, "InternalPath"> {
-  let summary = "Internal path for ref-type ports";
-  let mnemonic = "internalpath";
-  let parameters = (ins OptionalParameter<"::mlir::StringAttr">:$path);
-  let assemblyFormat = "(`<` $path^ `>`)?";
-  let builders = [
-     AttrBuilderWithInferredContext<(ins "::mlir::StringAttr":$path), [{
-       return $_get(path.getContext(), path);
-     }]>,
-     AttrBuilder<(ins "::llvm::StringRef":$path), [{
-       return $_get($_ctxt, ::mlir::StringAttr::get($_ctxt, path));
-     }]>,
-     AttrBuilder<(ins), [{
-       return $_get($_ctxt, ::mlir::StringAttr());
-     }]>
-  ];
-}
-
-def InternalPathArrayAttr
-  : TypedArrayAttrBase<InternalPathAttr, "InternalPath array attribute">;
 
 //===----------------------------------------------------------------------===//
 // Miscellaneous attributes

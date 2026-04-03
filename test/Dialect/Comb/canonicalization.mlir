@@ -796,6 +796,21 @@ hw.module @fold_mux_tree1r(in %sel: i2, in %a: i8, in %b: i8, in %c: i8, in %d: 
   hw.output %5 : i8
 }
 
+// CHECK-LABEL: hw.module @parameter
+hw.module @parameter<in: i8> (in %a: i8, out o1: i8) {
+  %param = hw.param.value i8 = #hw.param.decl.ref<"in">
+  // CHECK-NEXT: %[[PARAM:.+]] = hw.param.value i8 = #hw.param.decl.ref<"in">
+  // CHECK-NEXT: comb.and %a, %[[PARAM]]
+  // CHECK-NEXT: comb.or %a, %[[PARAM]]
+  // CHECK-NEXT: comb.xor %a, %[[PARAM]]
+  // CHECK-NEXT: comb.mul %a, %[[PARAM]]
+  %0 = comb.and %a, %param : i8
+  %1 = comb.or %a, %param : i8
+  %2 = comb.xor %a, %param : i8
+  %3 = comb.mul %a, %param : i8
+  %result = comb.add %0, %1, %2, %3 : i8
+  hw.output %result : i8
+}
 
 // CHECK-LABEL: hw.module @fold_mux_tree2
 // This is a sparse tree with 5/8ths load.
@@ -1240,6 +1255,71 @@ hw.module @moduloZeroDividend(in %arg0 : i32, out o1: i32, out o2: i32) {
   hw.output %0, %1 : i32, i32
 }
 
+// CHECK-LABEL: hw.module @divuPowerOfTwo
+hw.module @divuPowerOfTwo(in %arg0 : i8, out o1: i8, out o2: i8, out o3: i8, out o4: i8, out o5: i8) {
+  // divu(x, 2) -> concat(0, extract(x, 1, 7))
+  // CHECK: [[EXT1:%.+]] = comb.extract %arg0 from 1 : (i8) -> i7
+  // CHECK-NEXT: [[RES1:%.+]] = comb.concat %false, [[EXT1]] : i1, i7
+  %c2 = hw.constant 2 : i8
+  %0 = comb.divu bin %arg0, %c2 : i8
+
+  // divu(x, 4) -> concat(00, extract(x, 2, 6))
+  // CHECK-NEXT: [[EXT2:%.+]] = comb.extract %arg0 from 2 : (i8) -> i6
+  // CHECK-NEXT: [[RES2:%.+]] = comb.concat %c0_i2, [[EXT2]] : i2, i6
+  %c4 = hw.constant 4 : i8
+  %1 = comb.divu bin %arg0, %c4 : i8
+
+  // divu(x, 16) -> concat(0000, extract(x, 4, 4))
+  // CHECK-NEXT: [[EXT4:%.+]] = comb.extract %arg0 from 4 : (i8) -> i4
+  // CHECK-NEXT: [[RES3:%.+]] = comb.concat %c0_i4, [[EXT4]] : i4, i4
+  %c16 = hw.constant 16 : i8
+  %2 = comb.divu bin %arg0, %c16 : i8
+
+  // divu(x, 3) -> not canonicalized (not power of two)
+  // CHECK-NEXT: [[RES4:%.+]] = comb.divu bin %arg0, %c3_i8 : i8
+  %c3 = hw.constant 3 : i8
+  %3 = comb.divu bin %arg0, %c3 : i8
+
+  // Make sure canonicalization does not happen if there is no bin flag.
+  // CHECK-NEXT: [[RES5:%.+]] = comb.divu %arg0, %c2_i8 : i8
+  %4 = comb.divu %arg0, %c2 : i8
+
+  // CHECK: hw.output [[RES1]], [[RES2]], [[RES3]], [[RES4]], [[RES5]]
+  hw.output %0, %1, %2, %3, %4 : i8, i8, i8, i8, i8
+}
+
+// CHECK-LABEL: hw.module @moduPowerOfTwo
+hw.module @moduPowerOfTwo(in %arg0 : i8, out o1: i8, out o2: i8, out o3: i8, out o4: i8, out o5: i8) {
+  // modu(x, 2) -> concat(0000000, extract(x, 0, 1))
+  // CHECK:      [[EXT1:%.+]] = comb.extract %arg0 from 0 : (i8) -> i1
+  // CHECK-NEXT: [[RES1:%.+]] = comb.concat %c0_i7, [[EXT1]] : i7, i1
+  %c2 = hw.constant 2 : i8
+  %0 = comb.modu bin %arg0, %c2 : i8
+
+  // modu(x, 4) -> concat(000000, extract(x, 0, 2))
+  // CHECK-NEXT: [[EXT2:%.+]] = comb.extract %arg0 from 0 : (i8) -> i2
+  // CHECK-NEXT: [[RES2:%.+]] = comb.concat %c0_i6, [[EXT2]] : i6, i2
+  %c4 = hw.constant 4 : i8
+  %1 = comb.modu bin %arg0, %c4 : i8
+
+  // modu(x, 16) -> concat(0000, extract(x, 0, 4))
+  // CHECK-NEXT: [[EXT4:%.+]] = comb.extract %arg0 from 0 : (i8) -> i4
+  // CHECK-NEXT: [[RES3:%.+]] = comb.concat %c0_i4, [[EXT4]] : i4, i4
+  %c16 = hw.constant 16 : i8
+  %2 = comb.modu bin %arg0, %c16 : i8
+
+  // modu(x, 3) -> not canonicalized (not power of two)
+  // CHECK-NEXT: [[RES4:%.+]] = comb.modu bin %arg0, %c3_i8 : i8
+  %c3 = hw.constant 3 : i8
+  %3 = comb.modu bin %arg0, %c3 : i8
+
+  // Make sure canonicalization does not happen if there is no bin flag.
+  // CHECK-NEXT: [[RES5:%.+]] = comb.modu %arg0, %c2_i8 : i8
+  %4 = comb.modu %arg0, %c2 : i8
+  // CHECK: hw.output [[RES1]], [[RES2]], [[RES3]], [[RES4]], [[RES5]]
+  hw.output %0, %1, %2, %3, %4 : i8, i8, i8, i8, i8
+}
+
 // CHECK-LABEL: hw.module @orWithNegation
 hw.module @orWithNegation(in %arg0 : i32, out o1: i32) {
   // CHECK: [[ALLONES:%.*]] = hw.constant -1 : i32
@@ -1284,7 +1364,7 @@ hw.module @muxCommon(in %cond: i1, in %cond2: i1, in %cond3: i1,
                      in %arg0 : i32, in %arg1 : i32, in %arg2: i32, in %arg3: i32,
   out o1: i32, out o2: i32, out o3: i32, out o4: i32, out o5: i32,
   out orResult: i32, out o6: i32, out o7: i32, out o8 : i1, out o9: i32,
-  out o10: i32, out o11: i1, out o12: i32) {
+  out o10: i32, out o11: i1, out o12: i32, out o13: i32) {
   // CHECK: [[TRUE:%.+]] = hw.constant true
   // CHECK: [[FALSE:%.+]] = hw.constant false
   %true = hw.constant true
@@ -1352,10 +1432,13 @@ hw.module @muxCommon(in %cond: i1, in %cond2: i1, in %cond3: i1,
   %3 = comb.mux %cond2, %arg0, %2 : i32
   %o12 = comb.mux %cond3, %arg0, %3 : i32
 
+  // CHECK: [[O13:%.+]] = comb.mux %cond, %arg0, [[LOOPMUX]] : i32
+  %o13 = comb.mux %cond, %arg0, %2 : i32
+
   // CHECK: hw.output [[O1]], [[O2]], [[O3]], [[O4]], [[O5]], [[ORRESULT]],
   // CHECK: [[O6]], [[O7]], [[O8]], [[O9]], [[O10]]
-  hw.output %o1, %o2, %o3, %o4, %o5, %orResult, %o6, %o7, %o8, %o9, %o10, %o11, %o12
-    : i32, i32, i32, i32, i32, i32, i32, i32, i1, i32, i32, i1, i32
+  hw.output %o1, %o2, %o3, %o4, %o5, %orResult, %o6, %o7, %o8, %o9, %o10, %o11, %o12, %o13
+    : i32, i32, i32, i32, i32, i32, i32, i32, i1, i32, i32, i1, i32, i32
 }
 
 // CHECK-LABEL: @flatten_multi_use_and
@@ -1745,6 +1828,63 @@ hw.module @cantCombineOppositeNonBinCmpIntoConstant(in %tag_0: i4, in %tag_1: i4
             i1, i1, i1, i1, i1, i1, i1, i1, i1, i1, i4, i4
 }
 
+// Ensure canonicalization is not confused by i0.
+// CHECK-LABEL: hw.module @i0checks
+// CHECK-SAME: in %[[I32_VAL:[^ ]*]] : i32, in %[[I1_VAL:[^ ]*]] : i1, in %[[I0_VAL:[^ ]*]] : i0
+// CHECK-DAG: %[[FALSE:.*]] = hw.constant false
+// CHECK-DAG: %[[ZERO:.*]] = hw.constant 0 : i0
+// CHECK-DAG: %[[CONCAT:.*]] = comb.concat %[[I0_VAL]], %[[I32_VAL]] : i0, i32
+// CHECK-DAG: %[[CONCAT_REVERSE:.*]] = comb.concat %[[I32_VAL]], %[[I0_VAL]] : i32, i0
+// CHECK-DAG: %[[CONCAT_REMAINS:.*]] = comb.concat %[[I32_VAL]], %[[I0_VAL]], %i1_val : i32, i0, i1
+// CHECK-DAG: %[[CONCAT_ITSELF:.*]] = comb.concat %[[I0_VAL]], %[[ZERO]] : i0, i0
+// CHECK-DAG: %[[DIVS:.*]] = comb.divs %[[I0_VAL]], %[[ZERO]] : i0
+// CHECK-DAG: %[[DIVU:.*]] = comb.divu %[[I0_VAL]], %[[ZERO]] : i0
+// CHECK-DAG: %[[ICMP_EQ:.*]] = comb.icmp eq %[[I0_VAL]], %[[ZERO]] : i0
+// CHECK-DAG: %[[ICMP_NE:.*]] = comb.icmp ne %[[I0_VAL]], %[[ZERO]] : i0
+// CHECK-DAG: %[[MODS:.*]] = comb.mods %[[I0_VAL]], %[[ZERO]] : i0
+// CHECK-DAG: %[[MODU:.*]] = comb.modu %[[I0_VAL]], %[[ZERO]] : i0
+// CHECK-DAG: hw.output %[[I0_VAL]], %[[I0_VAL]], %[[ZERO]], %[[ZERO]], %[[I0_VAL]], %[[ZERO]], %[[CONCAT]], %[[CONCAT_REVERSE]], %[[CONCAT_REMAINS]], %[[CONCAT_ITSELF]], %[[DIVS]], %[[DIVU]], %[[ICMP_EQ]], %[[ICMP_NE]], %[[MODS]], %[[MODU]], %[[FALSE]], %[[ZERO]], %[[ZERO]], %[[I0_VAL]], %[[I0_VAL]], %[[I0_VAL]] : i0, i0, i0, i0, i0, i0, i32, i32, i33, i0, i0, i0, i1, i1, i0, i0, i1, i0, i0, i0, i0, i0
+hw.module @i0checks(in %i32_val: i32, in %i1_val: i1, in %i0_val: i0, out add: i0, out sub: i0, out mul: i0, out or: i0, out xor: i0, out and: i0, out concat: i32, out concat_reverse: i32, out concat_remains: i33, out concat_itself: i0, out divs: i0, out divu: i0, out icmp_eq: i1, out icmp_ne: i1, out mods: i0, out modu: i0, out parity: i1, out replicate: i0, out extract: i0, out shl: i0, out shrs: i0, out shru: i0) {
+  %zero = hw.constant 0 : i0
+
+  %add = comb.add %i0_val, %zero : i0
+  %sub = comb.sub %i0_val, %zero : i0
+  %mul = comb.mul %i0_val, %zero : i0
+
+  %or = comb.or %i0_val, %zero : i0
+  %xor = comb.xor %i0_val, %zero : i0
+  %and = comb.and %i0_val, %zero : i0
+
+  %concat = comb.concat %i0_val, %i32_val : i0, i32
+  %concat_reverse = comb.concat %i32_val, %i0_val : i32, i0
+  %concat_remains = comb.concat %i32_val, %i0_val, %i1_val : i32, i0, i1
+  %concat_itself = comb.concat %i0_val, %zero : i0, i0
+
+  %divs = comb.divs %i0_val, %zero : i0
+  %divu = comb.divu %i0_val, %zero : i0
+
+  %icmp_eq = comb.icmp eq %i0_val, %zero : i0
+  %icmp_ne = comb.icmp ne %i0_val, %zero : i0
+
+  %mods = comb.mods %i0_val, %zero : i0
+  %modu = comb.modu %i0_val, %zero : i0
+
+  %parity = comb.parity %zero : i0
+  %replicate = comb.replicate %zero : (i0) -> i0
+  %extract = comb.extract %zero from 0 : (i0) -> i0
+
+  %shl = comb.shl %i0_val, %zero : i0
+  %shrs = comb.shrs %i0_val, %zero : i0
+  %shru = comb.shru %i0_val, %zero : i0
+
+  hw.output %add, %sub, %mul, %or, %xor, %and, %concat,
+            %concat_reverse, %concat_remains, %concat_itself,
+            %divs, %divu, %icmp_eq, %icmp_ne, %mods, %modu,
+            %parity, %replicate, %extract, %shl, %shrs, %shru :
+            i0, i0, i0, i0, i0, i0, i32, i32, i33, i0, i0,
+            i0, i1, i1, i0, i0, i1, i0, i0, i0, i0, i0
+}
+
 // CHECK-LABEL: hw.module @mul_0
 hw.module @mul_0(in %arg0: i0, in %arg1: i0, out out: i0) {
   // CHECK: %[[C0:.+]] = hw.constant 0 : i0
@@ -1956,4 +2096,35 @@ hw.module @issue9403(in %sel: i1, out out1: ui1) {
   %false = hwarith.constant 0 : ui1
   %mux1 = comb.mux %sel, %true, %false : ui1
   hw.output %mux1 : ui1
+}
+
+// CHECK-LABEL: @notSext
+// ~sext(a) -> sext(~a)
+hw.module @notSext(in %a : i3, out negsext : i8) {
+  // CHECK-NEXT: %c-1_i3 = hw.constant -1 : i3
+  // CHECK-NEXT: %[[NOTA:.+]] = comb.xor bin %a, %c-1_i3 : i3
+  // CHECK-NEXT: %[[NOTASIGN:.+]] = comb.extract %[[NOTA]] from 2 : (i3) -> i1
+  // CHECK-NEXT: %[[SIGNBITS:.+]] = comb.replicate %[[NOTASIGN]] : (i1) -> i5
+  // CHECK-NEXT: %[[NEGSEXT:.+]] = comb.concat %[[SIGNBITS]], %[[NOTA]] : i5, i3
+  // CHECK-NEXT: hw.output %[[NEGSEXT]] : i8
+  %c-1_i8 = hw.constant -1 : i8
+  // sext(a)
+  %0 = comb.extract %a from 2 : (i3) -> i1
+  %1 = comb.replicate %0 : (i1) -> i5
+  %2 = comb.concat %1, %a : i5, i3
+  // ~sext(a)
+  %3 = comb.xor %2, %c-1_i8 : i8
+  hw.output %3 : i8
+}
+
+// CHECK-LABEL: hw.module private @SextMatcherBlockArguments
+// Test that SextMatcher doesn't crash on block arguments (module ports)
+hw.module private @SextMatcherBlockArguments(in %a : i6, in %b : i2, in %c : i27) {
+  %c-1_i35 = hw.constant -1 : i35
+  %0 = comb.concat %a, %c, %b : i6, i27, i2
+  %wire = hw.wire %0  : i35
+  %1 = comb.xor bin %wire, %c-1_i35 : i35
+  %2 = comb.extract %1 from 34 : (i35) -> i1
+  %3 = comb.extract %1 from 26 : (i35) -> i1
+  hw.output
 }

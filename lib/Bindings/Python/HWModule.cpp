@@ -16,12 +16,16 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include "NanobindUtils.h"
+#include "mlir-c/IR.h"
 #include "mlir-c/Support.h"
+#include "mlir/Bindings/Python/IRCore.h"
+#include "mlir/Bindings/Python/NanobindAdaptors.h"
 #include <nanobind/nanobind.h>
 namespace nb = nanobind;
 
 using namespace circt;
 using namespace mlir::python::nanobind_adaptors;
+using mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::DefaultingPyMlirContext;
 
 /// Populate the hw python module.
 void circt::python::populateDialectHWSubmodule(nb::module_ &m) {
@@ -122,9 +126,10 @@ void circt::python::populateDialectHWSubmodule(nb::module_ &m) {
   mlir_type_subclass(m, "StructType", hwTypeIsAStructType)
       .def_classmethod(
           "get",
-          [](nb::object cls, nb::list pyFieldInfos) {
+          [](nb::object cls, nb::list pyFieldInfos,
+             DefaultingPyMlirContext context) {
             llvm::SmallVector<HWStructFieldInfo> mlirFieldInfos;
-            MlirContext ctx;
+            MlirContext ctx = context.resolve().get();
 
             // Since we're just passing string refs to the type constructor,
             // copy them into a temporary vector to give them all new addresses.
@@ -132,16 +137,24 @@ void circt::python::populateDialectHWSubmodule(nb::module_ &m) {
             for (size_t i = 0, e = pyFieldInfos.size(); i < e; ++i) {
               auto tuple = nb::cast<nb::tuple>(pyFieldInfos[i]);
               auto type = nb::cast<MlirType>(tuple[1]);
-              ctx = mlirTypeGetContext(type);
+              // Only override if the context is null.
+              if (mlirContextIsNull(ctx)) {
+                ctx = mlirTypeGetContext(type);
+              }
               names.emplace_back(nb::cast<std::string>(tuple[0]));
               auto nameStringRef =
                   mlirStringRefCreate(names[i].data(), names[i].size());
               mlirFieldInfos.push_back(HWStructFieldInfo{
                   mlirIdentifierGet(ctx, nameStringRef), type});
             }
+            if (mlirContextIsNull(ctx)) {
+              throw std::invalid_argument(
+                  "StructType requires a context if no fields provided.");
+            }
             return cls(hwStructTypeGet(ctx, mlirFieldInfos.size(),
                                        mlirFieldInfos.data()));
-          })
+          },
+          nb::arg("cls"), nb::arg("fields"), nb::arg("context") = nb::none())
       .def("get_field",
            [](MlirType self, std::string fieldName) {
              return hwStructTypeGetField(
@@ -160,6 +173,56 @@ void circt::python::populateDialectHWSubmodule(nb::module_ &m) {
           auto fieldName = mlirIdentifierStr(field.name);
           std::string name(fieldName.data, fieldName.length);
           fields.append(nb::make_tuple(name, field.type));
+        }
+        return fields;
+      });
+
+  mlir_type_subclass(m, "UnionType", hwTypeIsAUnionType)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, nb::list pyFieldInfos) {
+            llvm::SmallVector<HWUnionFieldInfo> mlirFieldInfos;
+            MlirContext ctx;
+
+            // Since we're just passing string refs to the type constructor,
+            // copy them into a temporary vector to give them all new addresses.
+            llvm::SmallVector<llvm::SmallString<8>> names;
+            for (size_t i = 0, e = pyFieldInfos.size(); i < e; ++i) {
+              auto tuple = nb::cast<nb::tuple>(pyFieldInfos[i]);
+              if (tuple.size() < 3)
+                throw std::invalid_argument(
+                    "UnionType field info must be a tuple of (name, type, "
+                    "offset)");
+              auto type = nb::cast<MlirType>(tuple[1]);
+              size_t offset = nb::cast<size_t>(tuple[2]);
+              ctx = mlirTypeGetContext(type);
+              names.emplace_back(nb::cast<std::string>(tuple[0]));
+              auto nameStringRef =
+                  mlirStringRefCreate(names[i].data(), names[i].size());
+              mlirFieldInfos.push_back(HWUnionFieldInfo{
+                  mlirIdentifierGet(ctx, nameStringRef), type, offset});
+            }
+            return cls(hwUnionTypeGet(ctx, mlirFieldInfos.size(),
+                                      mlirFieldInfos.data()));
+          })
+      .def("get_field",
+           [](MlirType self, std::string fieldName) {
+             return hwUnionTypeGetField(
+                 self, mlirStringRefCreateFromCString(fieldName.c_str()));
+           })
+      .def("get_field_index",
+           [](MlirType self, const std::string &fieldName) {
+             return hwUnionTypeGetFieldIndex(
+                 self, mlirStringRefCreateFromCString(fieldName.c_str()));
+           })
+      .def("get_fields", [](MlirType self) {
+        intptr_t num_fields = hwUnionTypeGetNumFields(self);
+        nb::list fields;
+        for (intptr_t i = 0; i < num_fields; ++i) {
+          auto field = hwUnionTypeGetFieldNum(self, i);
+          auto fieldName = mlirIdentifierStr(field.name);
+          std::string name(fieldName.data, fieldName.length);
+          fields.append(nb::make_tuple(name, field.type, field.offset));
         }
         return fields;
       });

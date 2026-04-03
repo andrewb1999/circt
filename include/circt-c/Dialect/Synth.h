@@ -104,6 +104,9 @@ MLIR_CAPI_EXPORTED void
 synthLongestPathCollectionMerge(SynthLongestPathCollection dest,
                                 SynthLongestPathCollection src);
 
+MLIR_CAPI_EXPORTED void synthLongestPathCollectionDropNonCriticalPaths(
+    SynthLongestPathCollection collection, bool perEndPoint);
+
 //===----------------------------------------------------------------------===//
 // DataflowPath API
 //===----------------------------------------------------------------------===//
@@ -153,6 +156,9 @@ synthLongestPathObjectName(SynthLongestPathObject object);
 
 MLIR_CAPI_EXPORTED size_t
 synthLongestPathObjectBitPos(SynthLongestPathObject object);
+
+MLIR_CAPI_EXPORTED MlirValue
+synthLongestPathObjectGetValue(SynthLongestPathObject object);
 
 #ifdef __cplusplus
 }

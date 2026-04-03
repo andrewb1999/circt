@@ -1,0 +1,593 @@
+// RUN: circt-opt -pass-pipeline='builtin.module(firrtl.circuit(firrtl-infer-domains{mode=infer-all}))' %s | FileCheck %s
+
+// Legal domain usage - no crossing.
+// CHECK-LABEL: firrtl.circuit "LegalDomains"
+firrtl.circuit "LegalDomains" {
+  firrtl.domain @ClockDomain
+  firrtl.module @LegalDomains(
+    in  %A: !firrtl.domain<@ClockDomain()>,
+    in  %a: !firrtl.uint<1> domains [%A],
+    out %b: !firrtl.uint<1> domains [%A]
+  ) {
+    // Connecting within the same domain is legal.
+    firrtl.matchingconnect %b, %a : !firrtl.uint<1>
+  }
+}
+
+// Domain inference through connections.
+// CHECK-LABEL: firrtl.circuit "DomainInference"
+firrtl.circuit "DomainInference" {
+  firrtl.domain @ClockDomain
+  firrtl.module @DomainInference(
+    in %A: !firrtl.domain<@ClockDomain()>,
+    in %a: !firrtl.uint<1> domains [%A],
+    // CHECK: out %c: !firrtl.uint<1> domains [%A]
+    out %c: !firrtl.uint<1>
+  ) {
+    %b = firrtl.wire : !firrtl.uint<1>  // No explicit domain
+
+    // This should infer that %b is in domain %A.
+    firrtl.matchingconnect %b, %a : !firrtl.uint<1>
+
+    // This should be legal since %b is now inferred to be in domain %A.
+    firrtl.matchingconnect %c, %b : !firrtl.uint<1>
+  }
+}
+
+// Unsafe domain cast
+// CHECK-LABEL: firrtl.circuit "UnsafeDomainCast"
+firrtl.circuit "UnsafeDomainCast" {
+  firrtl.domain @ClockDomain
+  firrtl.module @UnsafeDomainCast(
+    in %A: !firrtl.domain<@ClockDomain()>,
+    in %B: !firrtl.domain<@ClockDomain()>,
+    in %a: !firrtl.uint<1> domains [%A],
+    out %c: !firrtl.uint<1> domains [%B]
+  ) {
+    // Unsafe cast from domain A to domain B.
+    %b = firrtl.unsafe_domain_cast %a domains[%B] : !firrtl.uint<1> domains[!firrtl.domain<@ClockDomain()>]
+
+    // This should be legal since we explicitly cast.
+    firrtl.matchingconnect %c, %b : !firrtl.uint<1>
+  }
+}
+
+// Domain sequence matching.
+// CHECK-LABEL: firrtl.circuit "LegalSequences"
+firrtl.circuit "LegalSequences" {
+  firrtl.domain @ClockDomain
+  firrtl.domain @PowerDomain
+  firrtl.module @LegalSequences(
+    in  %C: !firrtl.domain<@ClockDomain()>,
+    in  %P: !firrtl.domain<@PowerDomain()>,
+    in  %a: !firrtl.uint<1> domains [%C, %P],
+    out %b: !firrtl.uint<1> domains [%C, %P]
+  ) {
+    firrtl.matchingconnect %b, %a : !firrtl.uint<1>
+  }
+}
+
+// Domain sequence order equivalence - should be legal
+// CHECK-LABEL: SequenceOrderEquivalence
+firrtl.circuit "SequenceOrderEquivalence" {
+  firrtl.domain @ClockDomain
+  firrtl.domain @PowerDomain
+  firrtl.module @SequenceOrderEquivalence(
+    in %A: !firrtl.domain<@ClockDomain()>,
+    in %B: !firrtl.domain<@PowerDomain()>,
+    in %a: !firrtl.uint<1> domains [%A, %B],
+    out %b: !firrtl.uint<1> domains [%B, %A]
+  ) {
+    // This should be legal since domain order doesn't matter in canonical representation
+    firrtl.matchingconnect %b, %a : !firrtl.uint<1>
+  }
+}
+
+// Domain sequence inference
+// CHECK-LABEL: SequenceInference
+firrtl.circuit "SequenceInference" {
+  firrtl.domain @ClockDomain
+  firrtl.domain @PowerDomain
+  firrtl.module @SequenceInference(
+    in %A: !firrtl.domain<@ClockDomain()>,
+    in %B: !firrtl.domain<@PowerDomain()>,
+    in %a: !firrtl.uint<1> domains [%A, %B],
+    out %d: !firrtl.uint<1>
+  ) {
+    %c = firrtl.wire : !firrtl.uint<1>
+
+    // %c should infer domain sequence [%A, %B]
+    firrtl.matchingconnect %c, %a : !firrtl.uint<1>
+
+    // This should be legal since %c has inferred [%A, %B]
+    firrtl.matchingconnect %d, %c : !firrtl.uint<1>
+  }
+}
+
+// Unsafe domain cast with sequences
+// CHECK-LABEL: UnsafeSequenceCast
+firrtl.circuit "UnsafeSequenceCast" {
+  firrtl.domain @ClockDomain
+  firrtl.domain @PowerDomain
+
+  firrtl.module @UnsafeSequenceCast(
+    in %C1: !firrtl.domain<@ClockDomain()>,
+    in %C2: !firrtl.domain<@ClockDomain()>,
+    in %P1: !firrtl.domain<@PowerDomain()>,
+    in  %i: !firrtl.uint<1> domains [%C1, %P1],
+    out %o: !firrtl.uint<1> domains [%C2, %P1]
+  ) {
+    %0 = firrtl.unsafe_domain_cast %i domains[%C2] : !firrtl.uint<1> domains[!firrtl.domain<@ClockDomain()>]
+    firrtl.matchingconnect %o, %0 : !firrtl.uint<1>
+  }
+}
+
+//  Different port types domain inference.
+// CHECK-LABEL: DifferentPortTypes
+firrtl.circuit "DifferentPortTypes" {
+  firrtl.domain @ClockDomain
+  firrtl.module @DifferentPortTypes(
+    in %A: !firrtl.domain<@ClockDomain()>,
+    in %uint_input: !firrtl.uint<8> domains [%A],
+    in %sint_input: !firrtl.sint<4> domains [%A],
+    out %uint_output: !firrtl.uint<8>,
+    out %sint_output: !firrtl.sint<4>
+  ) {
+    firrtl.matchingconnect %uint_output, %uint_input : !firrtl.uint<8>
+    firrtl.matchingconnect %sint_output, %sint_input : !firrtl.sint<4>
+  }
+}
+
+// Domain inference through wires.
+// CHECK-LABEL: DomainInferenceThroughWires
+firrtl.circuit "DomainInferenceThroughWires" {
+  firrtl.domain @ClockDomain
+  firrtl.module @DomainInferenceThroughWires(
+    in %A: !firrtl.domain<@ClockDomain()>,
+    in %input: !firrtl.uint<1> domains [%A],
+    // CHECK: out %output: !firrtl.uint<1> domains [%A]
+    out %output: !firrtl.uint<1>
+  ) {
+    %wire1 = firrtl.wire : !firrtl.uint<1>
+    %wire2 = firrtl.wire : !firrtl.uint<1>
+
+    firrtl.matchingconnect %wire1, %input : !firrtl.uint<1>
+    firrtl.matchingconnect %wire2, %wire1 : !firrtl.uint<1>
+    firrtl.matchingconnect %output, %wire2 : !firrtl.uint<1>
+  }
+}
+
+// Export: add output domain port for domain created internally.
+// CHECK-LABEL: ExportDomain
+firrtl.circuit "ExportDomain" {
+  firrtl.domain @ClockDomain
+
+  firrtl.extmodule @Foo(
+    out A: !firrtl.domain<@ClockDomain()>,
+    out o: !firrtl.uint<1> domains [A]
+  )
+
+  firrtl.module @ExportDomain(
+    // CHECK: out %ClockDomain: !firrtl.domain<@ClockDomain()>
+    // CHECK: out %o: !firrtl.uint<1> domains [%ClockDomain]
+    out %o: !firrtl.uint<1>
+  ) {
+    %foo_A, %foo_o = firrtl.instance foo @Foo(
+      out A: !firrtl.domain<@ClockDomain()>,
+      out o: !firrtl.uint<1> domains [A]
+    )
+    firrtl.matchingconnect %o, %foo_o : !firrtl.uint<1>
+    // CHECK: firrtl.domain.define %ClockDomain, %foo_A : !firrtl.domain<@ClockDomain()>
+  }
+}
+
+// Export: Reuse already-exported domain.
+// CHECK-LABEL: ReuseExportedDomain
+firrtl.circuit "ReuseExportedDomain" {
+    firrtl.domain @ClockDomain
+
+  firrtl.extmodule @Foo(
+    out A: !firrtl.domain<@ClockDomain()>,
+    out o: !firrtl.uint<1> domains [A]
+  )
+
+  firrtl.module @ReuseExportedDomain(
+    out %A: !firrtl.domain<@ClockDomain()>,
+    // CHECK: out %o: !firrtl.uint<1> domains [%A]
+    out %o: !firrtl.uint<1>
+  ) {
+    %foo_A, %foo_o = firrtl.instance foo @Foo(
+      out A: !firrtl.domain<@ClockDomain()>,
+      out o: !firrtl.uint<1> domains [A]
+    )
+    firrtl.matchingconnect %o, %foo_o : !firrtl.uint<1>
+    firrtl.domain.define %A, %foo_A : !firrtl.domain<@ClockDomain()>
+  }
+}
+
+// CHECK-LABEL: RegisterInference
+firrtl.circuit "RegisterInference" {
+  firrtl.domain @ClockDomain
+  firrtl.module @RegisterInference(
+    in  %A: !firrtl.domain<@ClockDomain()>,
+    in  %clock: !firrtl.clock domains [%A],
+    // CHECK: in %d: !firrtl.uint<1> domains [%A]
+    in  %d: !firrtl.uint<1>,
+    // CHECK: out %q: !firrtl.uint<1> domains [%A]
+    out %q: !firrtl.uint<1>
+  ) {
+    %r = firrtl.reg %clock : !firrtl.clock, !firrtl.uint<1>
+    firrtl.matchingconnect %r, %d : !firrtl.uint<1>
+    firrtl.matchingconnect %q, %r : !firrtl.uint<1>
+  }
+}
+
+// CHECK-LABEL: InstanceUpdate
+firrtl.circuit "InstanceUpdate" {
+  firrtl.domain @ClockDomain
+
+  firrtl.module @Foo(in %i : !firrtl.uint<1>) {}
+
+  // CHECK: firrtl.module @InstanceUpdate(in %ClockDomain: !firrtl.domain<@ClockDomain()>, in %i: !firrtl.uint<1> domains [%ClockDomain]) {
+  // CHECK:   %foo_ClockDomain, %foo_i = firrtl.instance foo @Foo(in ClockDomain: !firrtl.domain<@ClockDomain()>, in i: !firrtl.uint<1> domains [ClockDomain])
+  // CHECK:   firrtl.connect %foo_i, %i : !firrtl.uint<1>
+  // CHECK:   firrtl.domain.define %foo_ClockDomain, %ClockDomain : !firrtl.domain<@ClockDomain()>
+  // CHECK: }
+  firrtl.module @InstanceUpdate(in %i : !firrtl.uint<1>) {
+    %foo_i = firrtl.instance foo @Foo(in i: !firrtl.uint<1>)
+    firrtl.connect %foo_i, %i : !firrtl.uint<1>, !firrtl.uint<1>
+  }
+}
+
+// CHECK-LABEL: InstanceChoiceUpdate
+firrtl.circuit "InstanceChoiceUpdate" {
+  firrtl.domain @ClockDomain
+
+  firrtl.option @Option {
+    firrtl.option_case @X
+    firrtl.option_case @Y
+  }
+
+  firrtl.module @Foo(in %i : !firrtl.uint<1>) {}
+  firrtl.module @Bar(in %i : !firrtl.uint<1>) {}
+  firrtl.module @Baz(in %i : !firrtl.uint<1>) {}
+
+  // CHECK: firrtl.module @InstanceChoiceUpdate(in %ClockDomain: !firrtl.domain<@ClockDomain()>, in %i: !firrtl.uint<1> domains [%ClockDomain]) {
+  // CHECK:   %inst_ClockDomain, %inst_i = firrtl.instance_choice inst @Foo alternatives @Option { @X -> @Bar, @Y -> @Baz } (in ClockDomain: !firrtl.domain<@ClockDomain()>, in i: !firrtl.uint<1> domains [ClockDomain])
+  // CHECK:   firrtl.connect %inst_i, %i : !firrtl.uint<1>
+  // CHECK:   firrtl.domain.define %inst_ClockDomain, %ClockDomain : !firrtl.domain<@ClockDomain()>
+  // CHECK: }
+  firrtl.module @InstanceChoiceUpdate(in %i : !firrtl.uint<1>) {
+    %inst_i = firrtl.instance_choice inst @Foo alternatives @Option { @X -> @Bar, @Y -> @Baz } (in i : !firrtl.uint<1>)
+    firrtl.connect %inst_i, %i : !firrtl.uint<1>, !firrtl.uint<1>
+  }
+}
+
+// CHECK-LABEL: ConstantInMultipleDomains
+firrtl.circuit "ConstantInMultipleDomains" {
+  firrtl.domain @ClockDomain
+
+  firrtl.extmodule @Foo(in A: !firrtl.domain<@ClockDomain()>, in i: !firrtl.uint<1> domains [A])
+
+  firrtl.module @ConstantInMultipleDomains(in %A: !firrtl.domain<@ClockDomain()>, in %B: !firrtl.domain<@ClockDomain()>) {
+    %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
+    %x_A, %x_i = firrtl.instance x @Foo(in A: !firrtl.domain<@ClockDomain()>, in i: !firrtl.uint<1> domains [A])
+    firrtl.domain.define %x_A, %A : !firrtl.domain<@ClockDomain()>
+    firrtl.matchingconnect %x_i, %c0_ui1 : !firrtl.uint<1>
+
+    %y_A, %y_i = firrtl.instance y @Foo(in A: !firrtl.domain<@ClockDomain()>, in i: !firrtl.uint<1> domains [A])
+    firrtl.domain.define %y_A, %B : !firrtl.domain<@ClockDomain()>
+    firrtl.matchingconnect %y_i, %c0_ui1 : !firrtl.uint<1>
+  }
+}
+
+firrtl.circuit "Top" {
+  firrtl.domain @ClockDomain
+  firrtl.extmodule @Foo(
+    in ClockDomain : !firrtl.domain<@ClockDomain()>,
+    in i: !firrtl.uint<1> domains [ClockDomain],
+    out o : !firrtl.uint<1> domains [ClockDomain]
+  )
+
+  firrtl.module @Top(in %ClockDomain : !firrtl.domain<@ClockDomain()> ) {
+    %foo1_ClockDomain, %foo1_i, %foo1_o = firrtl.instance foo1 @Foo(
+      in ClockDomain : !firrtl.domain<@ClockDomain()>,
+      in i: !firrtl.uint<1> domains [ClockDomain],
+      out o : !firrtl.uint<1> domains [ClockDomain]
+    )
+
+    %foo2_ClockDomain, %foo2_i, %foo2_o = firrtl.instance foo2 @Foo(
+      in ClockDomain : !firrtl.domain<@ClockDomain()>,
+      in i: !firrtl.uint<1> domains [ClockDomain],
+      out o : !firrtl.uint<1> domains [ClockDomain]
+    )
+
+    firrtl.domain.define %foo1_ClockDomain, %ClockDomain : !firrtl.domain<@ClockDomain()>
+    firrtl.matchingconnect %foo2_i, %foo1_o : !firrtl.uint<1>
+    firrtl.matchingconnect %foo1_i, %foo2_o : !firrtl.uint<1>
+  }
+}
+
+// CHECK-LABEL: UndrivenInstanceDomainPort
+firrtl.circuit "UndrivenInstanceDomainPort" {
+  firrtl.domain @ClockDomain
+
+  firrtl.extmodule @Foo(in c : !firrtl.domain<@ClockDomain()>)
+
+  // CHECK: firrtl.module @UndrivenInstanceDomainPort() {
+  // CHECK:   %foo_c = firrtl.instance foo @Foo(in c: !firrtl.domain<@ClockDomain()>)
+  // CHECK:   %ClockDomain = firrtl.domain.anon : !firrtl.domain<@ClockDomain()>
+  // CHECK:   firrtl.domain.define %foo_c, %ClockDomain : !firrtl.domain<@ClockDomain()>
+  // CHECK: }
+  firrtl.module @UndrivenInstanceDomainPort() {
+    %foo_c = firrtl.instance foo @Foo(in c : !firrtl.domain<@ClockDomain()>)
+  }
+}
+
+// CHECK-LABEL: UndrivenInstanceChoiceDomainPort
+firrtl.circuit "UndrivenInstanceChoiceDomainPort" {
+  firrtl.domain @ClockDomain
+
+  firrtl.option @Option {
+    firrtl.option_case @X
+  }
+
+  firrtl.extmodule @Foo(in c : !firrtl.domain<@ClockDomain()>)
+  firrtl.extmodule @Bar(in c : !firrtl.domain<@ClockDomain()>)
+
+  // CHECK: firrtl.module @UndrivenInstanceChoiceDomainPort() {
+  // CHECK:   %inst_c = firrtl.instance_choice inst @Foo alternatives @Option { @X -> @Bar } (in c: !firrtl.domain<@ClockDomain()>)
+  // CHECK:   %ClockDomain = firrtl.domain.anon : !firrtl.domain<@ClockDomain()>
+  // CHECK:   firrtl.domain.define %inst_c, %ClockDomain : !firrtl.domain<@ClockDomain()>
+  // CHECK: }
+  firrtl.module @UndrivenInstanceChoiceDomainPort() {
+    %inst_c = firrtl.instance_choice inst @Foo alternatives @Option { @X -> @Bar } (in c : !firrtl.domain<@ClockDomain()>)
+  }
+}
+
+// Unable to infer domain of port, when port is driven by constant.
+firrtl.circuit "UnableToInferDomainOfPortDrivenByConstant" {
+  firrtl.domain @ClockDomain
+
+// CHECK: firrtl.module @Foo(in %ClockDomain: !firrtl.domain<@ClockDomain()>, in %i: !firrtl.uint<1> domains [%ClockDomain])
+  firrtl.module @Foo(in %i: !firrtl.uint<1>) {}
+
+  // CHECK: firrtl.module @UnableToInferDomainOfPortDrivenByConstant() {
+  // CHECK:   %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
+  // CHECK:   %foo_ClockDomain, %foo_i = firrtl.instance foo @Foo(in ClockDomain: !firrtl.domain<@ClockDomain()>, in i: !firrtl.uint<1> domains [ClockDomain])
+  // CHECK:   %ClockDomain = firrtl.domain.anon : !firrtl.domain<@ClockDomain()>
+  // CHECK:   firrtl.matchingconnect %foo_i, %c0_ui1 : !firrtl.uint<1>
+  // CHECK:   firrtl.domain.define %foo_ClockDomain, %ClockDomain : !firrtl.domain<@ClockDomain()>
+  // CHECK: }
+  firrtl.module @UnableToInferDomainOfPortDrivenByConstant() {
+    %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
+    %foo_i = firrtl.instance foo @Foo(in i: !firrtl.uint<1>)
+    firrtl.matchingconnect %foo_i, %c0_ui1 : !firrtl.uint<1>
+  }
+}
+
+// Unable to infer domain of port, when port is driven by arithmetic on constant.
+firrtl.circuit "UnableToInferDomainOfPortDrivenByConstantExpr" {
+  firrtl.domain @ClockDomain
+
+  // CHECK: firrtl.module @Foo(in %ClockDomain: !firrtl.domain<@ClockDomain()>, in %i: !firrtl.uint<2> domains [%ClockDomain])
+  firrtl.module @Foo(in %i: !firrtl.uint<2>) {}
+
+  // CHECK: firrtl.module @UnableToInferDomainOfPortDrivenByConstantExpr() {
+  // CHECK:   %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
+  // CHECK:   %0 = firrtl.add %c0_ui1, %c0_ui1 : (!firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<2>
+  // CHECK:   %foo_ClockDomain, %foo_i = firrtl.instance foo @Foo(in ClockDomain: !firrtl.domain<@ClockDomain()>, in i: !firrtl.uint<2> domains [ClockDomain])
+  // CHECK:   %ClockDomain = firrtl.domain.anon : !firrtl.domain<@ClockDomain()>
+  // CHECK:   firrtl.matchingconnect %foo_i, %0 : !firrtl.uint<2>
+  // CHECK:   firrtl.domain.define %foo_ClockDomain, %ClockDomain : !firrtl.domain<@ClockDomain()>
+  // CHECK: }
+  firrtl.module @UnableToInferDomainOfPortDrivenByConstantExpr() {
+    %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
+    %0 = firrtl.add %c0_ui1, %c0_ui1 : (!firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<2>
+    %foo_i = firrtl.instance foo @Foo(in i: !firrtl.uint<2>)
+    firrtl.matchingconnect %foo_i, %0 : !firrtl.uint<2>
+  }
+}
+
+// Name of inferred domain port is already taken. Ensure name freshness.
+firrtl.circuit "NameAlreadyTaken" {
+  firrtl.domain @ClockDomain
+  // CHECK: firrtl.module @NameAlreadyTaken(in %ClockDomain_0: !firrtl.domain<@ClockDomain()>, in %ClockDomain: !firrtl.uint<1> domains [%ClockDomain_0])
+  firrtl.module @NameAlreadyTaken(in %ClockDomain: !firrtl.uint<1>) {}
+}
+
+firrtl.circuit "NodeTest" {
+  firrtl.domain @ClockDomain
+  // CHECK: firrtl.module @NodeTest(in %ClockDomain: !firrtl.domain<@ClockDomain()>, in %i: !firrtl.uint<1> domains [%ClockDomain], out %o: !firrtl.uint<1> domains [%ClockDomain]) {
+  // CHECK:   %n = firrtl.node %i : !firrtl.uint<1>
+  // CHECK:   firrtl.matchingconnect %o, %n : !firrtl.uint<1>
+  // CHECK: }
+  firrtl.module @NodeTest(in %i: !firrtl.uint<1>, out %o: !firrtl.uint<1>) {
+    %n = firrtl.node %i : !firrtl.uint<1>
+    firrtl.matchingconnect %o, %n : !firrtl.uint<1>
+  }
+}
+
+firrtl.circuit "PrimOpTest" {
+  firrtl.domain @ClockDomain
+  // CHECK: firrtl.module @PrimOpTest(in %ClockDomain: !firrtl.domain<@ClockDomain()>, in %i: !firrtl.uint<1> domains [%ClockDomain], in %j: !firrtl.uint<2> domains [%ClockDomain], out %o: !firrtl.uint<3> domains [%ClockDomain]) {
+  // CHECK:   %0 = firrtl.cat %i, %j : (!firrtl.uint<1>, !firrtl.uint<2>) -> !firrtl.uint<3>
+  // CHECK:   firrtl.matchingconnect %o, %0 : !firrtl.uint<3>
+  // CHECK: }
+  firrtl.module @PrimOpTest(in %i: !firrtl.uint<1>, in %j: !firrtl.uint<2>, out %o: !firrtl.uint<3>) {
+    %x = firrtl.cat %i, %j : (!firrtl.uint<1>, !firrtl.uint<2>) -> !firrtl.uint<3>
+    firrtl.matchingconnect %o, %x : !firrtl.uint<3>
+  }
+}
+
+// Test that a port correctly infers an association with an output domain where
+// the output domain is driven by a domain create inside the module.  No
+// additional domain ports should be inferred.
+//
+// CHECK-LABEL: firrtl.circuit "UnsafeDomainCastInference"
+firrtl.circuit "UnsafeDomainCastInference" {
+  firrtl.domain @ClockDomain [#firrtl.domain.field<"id", !firrtl.integer>]
+
+  // CHECK: firrtl.module @UnsafeDomainCastInference
+  // CHECK-NOT:  !firrtl.domain
+  // CHECK-SAME: in %A: !firrtl.domain
+  // CHECK-NOT:  !firrtl.domain
+  // CHECK-SAME: out %B: !firrtl.domain
+  // CHECK-NOT:  !firrtl.domain
+  // CHECK-SAME: out %b: !firrtl.uint<1> domains [%B]
+  // CHECK-NOT:  !firrtl.domain
+  firrtl.module @UnsafeDomainCastInference(
+    in %A: !firrtl.domain<@ClockDomain(id: !firrtl.integer)>,
+    out %B: !firrtl.domain<@ClockDomain(id: !firrtl.integer)>,
+    in %a: !firrtl.uint<1> domains [%A],
+    out %b: !firrtl.uint<1>
+  ) {
+    // CHECK-NEXT: firrtl.domain.subfield
+    %id = firrtl.domain.subfield %A["id"] : !firrtl.domain<@ClockDomain(id: !firrtl.integer)>
+    %C = firrtl.domain.create(%id) : !firrtl.domain<@ClockDomain(id: !firrtl.integer)>
+    firrtl.domain.define %B, %C : !firrtl.domain<@ClockDomain(id: !firrtl.integer)>
+
+    %0 = firrtl.unsafe_domain_cast %a domains[%C] : !firrtl.uint<1> domains[!firrtl.domain<@ClockDomain(id: !firrtl.integer)>]
+    firrtl.matchingconnect %b, %0 : !firrtl.uint<1>
+  }
+}
+
+// Nothing is inferred here.  This is similar to the previous example, except
+// `%b` is put on domain `B`.  This is testing that C` does properly unify with
+// `B`.
+//
+// CHECK-LABEL: firrtl.circuit "UnsafeDomainCastMatching"
+firrtl.circuit "UnsafeDomainCastMatching" {
+  firrtl.domain @ClockDomain [#firrtl.domain.field<"id", !firrtl.integer>]
+
+  // CHECK: firrtl.module @UnsafeDomainCastMatching
+  // CHECK-NOT:  !firrtl.domain
+  // CHECK-SAME: in %A: !firrtl.domain
+  // CHECK-NOT:  !firrtl.domain
+  // CHECK-SAME: out %B: !firrtl.domain
+  // CHECK-NOT:  !firrtl.domain
+  // CHECK-SAME: in %a: !firrtl.uint<1> domains [%A]
+  // CHECK-NOT:  !firrtl.domain
+  // CHECK-SAME: out %b: !firrtl.uint<1> domains [%B]
+  // CHECK-NOT:  !firrtl.domain
+  firrtl.module @UnsafeDomainCastMatching(
+    in %A: !firrtl.domain<@ClockDomain(id: !firrtl.integer)>,
+    out %B: !firrtl.domain<@ClockDomain(id: !firrtl.integer)>,
+    in %a: !firrtl.uint<1> domains [%A],
+    out %b: !firrtl.uint<1> domains [%B]
+  ) {
+    // CHECK: firrtl.domain.subfield
+    %id = firrtl.domain.subfield %A["id"] : !firrtl.domain<@ClockDomain(id: !firrtl.integer)>
+    %C = firrtl.domain.create(%id) : !firrtl.domain<@ClockDomain(id: !firrtl.integer)>
+    firrtl.domain.define %B, %C : !firrtl.domain<@ClockDomain(id: !firrtl.integer)>
+
+    %0 = firrtl.unsafe_domain_cast %a domains[%B] : !firrtl.uint<1> domains[!firrtl.domain<@ClockDomain(id: !firrtl.integer)>]
+    firrtl.matchingconnect %b, %0 : !firrtl.uint<1>
+  }
+}
+
+// Test that domain.define is placed at the end of the block to avoid
+// use-before-def issues.
+// CHECK-LABEL: DomainDefineAfterValue
+firrtl.circuit "DomainDefineAfterValue" {
+  firrtl.domain @ClockDomain
+  firrtl.extmodule private @Consumer(
+    in D: !firrtl.domain<@ClockDomain()>,
+    in clk: !firrtl.clock domains [D]
+  )
+  firrtl.extmodule private @Producer(
+    out D: !firrtl.domain<@ClockDomain()>,
+    out clk: !firrtl.clock domains [D]
+  )
+  firrtl.module @DomainDefineAfterValue() {
+    %consumer_D, %consumer_clk = firrtl.instance consumer @Consumer(
+      in D: !firrtl.domain<@ClockDomain()>,
+      in clk: !firrtl.clock domains [D]
+    )
+    %producer_D, %producer_clk = firrtl.instance producer @Producer(
+      out D: !firrtl.domain<@ClockDomain()>,
+      out clk: !firrtl.clock domains [D]
+    )
+    // CHECK: firrtl.matchingconnect %consumer_clk, %producer_clk
+    firrtl.matchingconnect %consumer_clk, %producer_clk : !firrtl.clock
+    // CHECK-NEXT: firrtl.domain.define %consumer_D, %producer_D
+  }
+}
+
+// Wire with explicit domain association.
+// CHECK-LABEL: firrtl.circuit "WireWithDomain"
+firrtl.circuit "WireWithDomain" {
+  firrtl.domain @ClockDomain
+  firrtl.module @WireWithDomain(
+    in %A: !firrtl.domain<@ClockDomain()>,
+    in %a: !firrtl.uint<1> domains [%A],
+    // CHECK: out %b: !firrtl.uint<1> domains [%A]
+    out %b: !firrtl.uint<1>
+  ) {
+    // Wire with explicit domain A
+    %w = firrtl.wire domains[%A] : !firrtl.uint<1> domains[!firrtl.domain<@ClockDomain()>]
+
+    // Connection from domain A port to wire with domain A (should pass)
+    firrtl.matchingconnect %w, %a : !firrtl.uint<1>
+    // Infer that %b is also in domain A
+    firrtl.matchingconnect %b, %w : !firrtl.uint<1>
+  }
+}
+
+// Wire with multiple domain associations propagates both domains to output.
+// CHECK-LABEL: firrtl.circuit "WireMultipleDomains"
+firrtl.circuit "WireMultipleDomains" {
+  firrtl.domain @ClockDomain
+  firrtl.domain @PowerDomain
+  firrtl.module @WireMultipleDomains(
+    in %CL: !firrtl.domain<@ClockDomain()>,
+    in %PW: !firrtl.domain<@PowerDomain()>,
+    // CHECK: out %b: !firrtl.uint<8> domains [%CL, %PW]
+    out %b: !firrtl.uint<8>
+  ) {
+    // Wire associated with both clock and power domains
+    // CHECK: %state = firrtl.wire domains[%CL, %PW]
+    %state = firrtl.wire domains[%CL, %PW] : !firrtl.uint<8> domains[!firrtl.domain<@ClockDomain()>, !firrtl.domain<@PowerDomain()>]
+    firrtl.matchingconnect %b, %state : !firrtl.uint<8>
+  }
+}
+
+// Wire domain propagation through chain.
+// CHECK-LABEL: firrtl.circuit "WireDomainPropagation"
+firrtl.circuit "WireDomainPropagation" {
+  firrtl.domain @ClockDomain
+  firrtl.module @WireDomainPropagation(
+    in %A: !firrtl.domain<@ClockDomain()>,
+    in %a: !firrtl.uint<1> domains [%A],
+    // CHECK: out %d: !firrtl.uint<1> domains [%A]
+    out %d: !firrtl.uint<1>
+  ) {
+    // Wire with explicit domain
+    %w1 = firrtl.wire domains[%A] : !firrtl.uint<1> domains[!firrtl.domain<@ClockDomain()>]
+    // Wire without explicit domain (inferred)
+    // CHECK: %w2 = firrtl.wire{{.*}}domains[%A]{{.*}}!firrtl.uint<1>
+    %w2 = firrtl.wire : !firrtl.uint<1>
+
+    firrtl.matchingconnect %w1, %a : !firrtl.uint<1>
+    firrtl.matchingconnect %w2, %w1 : !firrtl.uint<1>
+    firrtl.matchingconnect %d, %w2 : !firrtl.uint<1>
+  }
+}
+
+// Wire domain inference from connections.
+// CHECK-LABEL: firrtl.circuit "WireInferFromConnect"
+firrtl.circuit "WireInferFromConnect" {
+  firrtl.domain @ClockDomain
+  firrtl.module @WireInferFromConnect(
+    in %A: !firrtl.domain<@ClockDomain()>,
+    in %a: !firrtl.uint<1> domains [%A],
+    // CHECK: out %b: !firrtl.uint<1> domains [%A]
+    out %b: !firrtl.uint<1>
+  ) {
+    // CHECK: %w = firrtl.wire{{.*}}%A{{.*}}!firrtl.uint<1>
+    %w = firrtl.wire : !firrtl.uint<1>
+
+    firrtl.matchingconnect %w, %a : !firrtl.uint<1>
+    firrtl.matchingconnect %b, %w : !firrtl.uint<1>
+  }
+}

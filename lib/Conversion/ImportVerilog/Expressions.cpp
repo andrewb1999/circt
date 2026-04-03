@@ -7,9 +7,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "ImportVerilogInternals.h"
+#include "circt/Dialect/Moore/MooreTypes.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/IR/Value.h"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/SystemSubroutine.h"
+#include "slang/ast/types/AllTypes.h"
 #include "slang/syntax/AllSyntax.h"
+#include "llvm/ADT/ScopeExit.h"
 
 using namespace circt;
 using namespace ImportVerilog;
@@ -35,15 +40,31 @@ static Value getSelectIndex(Context &context, Location loc, Value index,
                             const slang::ConstantRange &range) {
   auto &builder = context.builder;
   auto indexType = cast<moore::UnpackedType>(index.getType());
-  auto bw = std::max(llvm::Log2_32_Ceil(std::max(std::abs(range.lower()),
-                                                 std::abs(range.upper()))),
-                     indexType.getBitSize().value());
 
-  auto offset = range.isLittleEndian() ? range.lower() : range.upper();
-  bool isSigned = (offset < 0);
+  // Compute offset first so we know if it is negative.
+  auto lo = range.lower();
+  auto hi = range.upper();
+  auto offset = range.isLittleEndian() ? lo : hi;
+
+  // If any bound is negative we need a signed index type.
+  const bool needSigned = (lo < 0) || (hi < 0);
+
+  // Magnitude over full range, not just the chosen offset.
+  const uint64_t maxAbs = std::max<uint64_t>(std::abs(lo), std::abs(hi));
+
+  // Bits needed from the range:
+  //  - unsigned: ceil(log2(maxAbs + 1)) (ensure at least 1)
+  //  - signed:   ceil(log2(maxAbs)) + 1 sign bit (ensure at least 2 when neg)
+  unsigned want = needSigned
+                      ? (llvm::Log2_64_Ceil(std::max<uint64_t>(1, maxAbs)) + 1)
+                      : std::max<unsigned>(1, llvm::Log2_64_Ceil(maxAbs + 1));
+
+  // Keep at least as wide as the incoming index.
+  const unsigned bw = std::max<unsigned>(want, indexType.getBitSize().value());
+
   auto intType =
       moore::IntType::get(index.getContext(), bw, indexType.getDomain());
-  index = context.materializeConversion(intType, index, isSigned, loc);
+  index = context.materializeConversion(intType, index, needSigned, loc);
 
   if (offset == 0) {
     if (range.isLittleEndian())
@@ -53,7 +74,7 @@ static Value getSelectIndex(Context &context, Location loc, Value index,
   }
 
   auto offsetConst =
-      moore::ConstantOp::create(builder, loc, intType, offset, isSigned);
+      moore::ConstantOp::create(builder, loc, intType, offset, needSigned);
   if (range.isLittleEndian())
     return moore::SubOp::create(builder, loc, index, offsetConst);
   else
@@ -82,6 +103,59 @@ static uint64_t getTimeScaleInFemtoseconds(Context &context) {
   return scale;
 }
 
+static Value visitClassProperty(Context &context,
+                                const slang::ast::ClassPropertySymbol &expr) {
+  auto loc = context.convertLocation(expr.location);
+  auto builder = context.builder;
+  auto type = context.convertType(expr.getType());
+  auto fieldTy = cast<moore::UnpackedType>(type);
+  auto fieldRefTy = moore::RefType::get(fieldTy);
+
+  if (expr.lifetime == slang::ast::VariableLifetime::Static) {
+
+    // Variable may or may not have been hoisted already. Hoist if not.
+    if (!context.globalVariables.lookup(&expr)) {
+      if (failed(context.convertGlobalVariable(expr))) {
+        return {};
+      }
+    }
+    // Try the static variable after it has been hoisted.
+    if (auto globalOp = context.globalVariables.lookup(&expr))
+      return moore::GetGlobalVariableOp::create(builder, loc, globalOp);
+
+    mlir::emitError(loc) << "Failed to access static member variable "
+                         << expr.name << " as a global variable";
+    return {};
+  }
+
+  // Get the scope's implicit this variable
+  mlir::Value instRef = context.getImplicitThisRef();
+  if (!instRef) {
+    mlir::emitError(loc) << "class property '" << expr.name
+                         << "' referenced without an implicit 'this'";
+    return {};
+  }
+
+  auto fieldSym = mlir::FlatSymbolRefAttr::get(builder.getContext(), expr.name);
+
+  moore::ClassHandleType classTy =
+      cast<moore::ClassHandleType>(instRef.getType());
+
+  auto targetClassHandle =
+      context.getAncestorClassWithProperty(classTy, expr.name, loc);
+  if (!targetClassHandle)
+    return {};
+
+  auto upcastRef = context.materializeConversion(targetClassHandle, instRef,
+                                                 false, instRef.getLoc());
+  if (!upcastRef)
+    return {};
+
+  Value fieldRef = moore::ClassPropertyRefOp::create(builder, loc, fieldRefTy,
+                                                     upcastRef, fieldSym);
+  return fieldRef;
+}
+
 namespace {
 /// A visitor handling expressions that can be lowered as lvalue and rvalue.
 struct ExprVisitor {
@@ -104,6 +178,57 @@ struct ExprVisitor {
     return context.convertRvalueExpression(expr);
   }
 
+  /// Materialize the rvalue of a symbol, regardless of whether it is backed by
+  /// a local reference, global variable, or class property.
+  Value materializeSymbolRvalue(const slang::ast::ValueSymbol &sym) {
+    if (auto value = context.valueSymbols.lookup(&sym)) {
+      if (isa<moore::RefType>(value.getType())) {
+        auto readOp = moore::ReadOp::create(builder, loc, value);
+        if (context.rvalueReadCallback)
+          context.rvalueReadCallback(readOp);
+        return readOp.getResult();
+      }
+      return value;
+    }
+
+    if (auto globalOp = context.globalVariables.lookup(&sym)) {
+      auto ref = moore::GetGlobalVariableOp::create(builder, loc, globalOp);
+      auto readOp = moore::ReadOp::create(builder, loc, ref);
+      if (context.rvalueReadCallback)
+        context.rvalueReadCallback(readOp);
+      return readOp.getResult();
+    }
+
+    if (auto *const property = sym.as_if<slang::ast::ClassPropertySymbol>()) {
+      auto fieldRef = visitClassProperty(context, *property);
+      auto readOp = moore::ReadOp::create(builder, loc, fieldRef);
+      if (context.rvalueReadCallback)
+        context.rvalueReadCallback(readOp);
+      return readOp.getResult();
+    }
+
+    return {};
+  }
+
+  Value visit(const slang::ast::NewArrayExpression &expr) {
+    Type type = context.convertType(*expr.type);
+
+    // TODO: Handle 'initExpr' if it exists
+
+    if (expr.initExpr()) {
+      mlir::emitError(loc)
+          << "unsupported expression: array `new` with initializer\n";
+      return {};
+    }
+
+    auto initialSize = context.convertRvalueExpression(
+        expr.sizeExpr(), context.convertType(*expr.sizeExpr().type));
+    if (!initialSize)
+      return {};
+
+    return moore::OpenUArrayCreateOp::create(builder, loc, type, initialSize);
+  }
+
   /// Handle single bit selections.
   Value visit(const slang::ast::ElementSelectExpression &expr) {
     auto type = context.convertType(*expr.type);
@@ -115,11 +240,54 @@ struct ExprVisitor {
     auto derefType = value.getType();
     if (isLvalue)
       derefType = cast<moore::RefType>(derefType).getNestedType();
-    if (!isa<moore::IntType, moore::ArrayType, moore::UnpackedArrayType>(
-            derefType)) {
+
+    if (!isa<moore::IntType, moore::ArrayType, moore::UnpackedArrayType,
+             moore::QueueType, moore::AssocArrayType, moore::StringType,
+             moore::OpenUnpackedArrayType>(derefType)) {
       mlir::emitError(loc) << "unsupported expression: element select into "
                            << expr.value().type->toString() << "\n";
       return {};
+    }
+
+    // Associative Arrays are a special case so handle them separately.
+    if (isa<moore::AssocArrayType>(derefType)) {
+      auto assocArray = cast<moore::AssocArrayType>(derefType);
+      auto expectedIndexType = assocArray.getIndexType();
+      auto givenIndex = context.convertRvalueExpression(expr.selector());
+
+      if (!givenIndex)
+        return {};
+
+      if (givenIndex.getType() != expectedIndexType) {
+        mlir::emitError(loc)
+            << "Incorrect index type: expected index type of "
+            << expectedIndexType << " but was given " << givenIndex.getType();
+      }
+
+      if (isLvalue)
+        return moore::AssocArrayExtractRefOp::create(
+            builder, loc, moore::RefType::get(cast<moore::UnpackedType>(type)),
+            value, givenIndex);
+
+      return moore::AssocArrayExtractOp::create(builder, loc, type, value,
+                                                givenIndex);
+    }
+
+    // Handle string indexing.
+    if (isa<moore::StringType>(derefType)) {
+      if (isLvalue) {
+        mlir::emitError(loc) << "string index assignment not supported";
+        return {};
+      }
+
+      // Convert the index to an rvalue with the required type (TwoValuedI32).
+      auto i32Type = moore::IntType::getInt(builder.getContext(), 32);
+      auto index = context.convertRvalueExpression(expr.selector(), i32Type);
+      if (!index)
+        return {};
+
+      // Create the StringGetOp operation.
+      return moore::StringGetOp::create(builder, loc, value, index);
     }
 
     auto resultType =
@@ -132,23 +300,81 @@ struct ExprVisitor {
 
       auto lowBit = constValue->integer().as<uint32_t>().value();
       if (isLvalue)
-        return moore::ExtractRefOp::create(builder, loc, resultType, value,
-                                           range.translateIndex(lowBit));
+        return llvm::TypeSwitch<Type, Value>(derefType)
+            .Case<moore::QueueType>([&](moore::QueueType) {
+              mlir::emitError(loc)
+                  << "Unexpected LValue extract on Queue Type!";
+              return Value();
+            })
+            .Default([&](Type) {
+              return moore::ExtractRefOp::create(builder, loc, resultType,
+                                                 value,
+                                                 range.translateIndex(lowBit));
+            });
       else
-        return moore::ExtractOp::create(builder, loc, resultType, value,
-                                        range.translateIndex(lowBit));
+        return llvm::TypeSwitch<Type, Value>(derefType)
+            .Case<moore::QueueType>([&](moore::QueueType) {
+              mlir::emitError(loc)
+                  << "Unexpected RValue extract on Queue Type!";
+              return Value();
+            })
+            .Default([&](Type) {
+              return moore::ExtractOp::create(builder, loc, resultType, value,
+                                              range.translateIndex(lowBit));
+            });
     }
 
+    // Save the queue which is being indexed: this allows us to handle the `$`
+    // operator, which evaluates to the last valid index in the queue.
+    Value savedQueue = context.currentQueue;
+    llvm::scope_exit restoreQueue([&] { context.currentQueue = savedQueue; });
+    if (isa<moore::QueueType>(derefType)) {
+      // For QueueSizeBIOp, we need a byvalue queue, so if the queue is an
+      // lvalue (because we're assigning to it), we need to dereference it
+      if (isa<moore::RefType>(value.getType())) {
+        context.currentQueue = moore::ReadOp::create(builder, loc, value);
+      } else {
+        context.currentQueue = value;
+      }
+    }
     auto lowBit = context.convertRvalueExpression(expr.selector());
+
     if (!lowBit)
       return {};
     lowBit = getSelectIndex(context, loc, lowBit, range);
     if (isLvalue)
-      return moore::DynExtractRefOp::create(builder, loc, resultType, value,
-                                            lowBit);
+      return llvm::TypeSwitch<Type, Value>(derefType)
+          .Case<moore::QueueType>([&](moore::QueueType) {
+            return moore::DynQueueRefElementOp::create(builder, loc, resultType,
+                                                       value, lowBit);
+          })
+          .Default([&](Type) {
+            return moore::DynExtractRefOp::create(builder, loc, resultType,
+                                                  value, lowBit);
+          });
+
     else
-      return moore::DynExtractOp::create(builder, loc, resultType, value,
-                                         lowBit);
+      return llvm::TypeSwitch<Type, Value>(derefType)
+          .Case<moore::QueueType>([&](moore::QueueType) {
+            return moore::DynQueueExtractOp::create(builder, loc, resultType,
+                                                    value, lowBit, lowBit);
+          })
+          .Default([&](Type) {
+            return moore::DynExtractOp::create(builder, loc, resultType, value,
+                                               lowBit);
+          });
+  }
+
+  /// Handle null assignments to variables.
+  /// Compare with IEEE 1800-2023 Table 6-7 - Default variable initial values
+  Value visit(const slang::ast::NullLiteral &expr) {
+    auto type = context.convertType(*expr.type);
+    if (isa<moore::ClassHandleType, moore::ChandleType, moore::EventType,
+            moore::NullType>(type))
+      return moore::NullOp::create(builder, loc);
+    mlir::emitError(loc) << "No null value definition found for value of type "
+                         << type;
+    return {};
   }
 
   /// Handle range bit selections.
@@ -158,6 +384,41 @@ struct ExprVisitor {
     if (!type || !value)
       return {};
 
+    auto derefType = value.getType();
+    if (isLvalue)
+      derefType = cast<moore::RefType>(derefType).getNestedType();
+
+    if (isa<moore::QueueType>(derefType)) {
+      return handleQueueRangeSelectExpressions(expr, type, value);
+    }
+    return handleArrayRangeSelectExpressions(expr, type, value);
+  }
+
+  // Handles range selections into queues, in which neither bound needs to be
+  // constant
+  Value handleQueueRangeSelectExpressions(
+      const slang::ast::RangeSelectExpression &expr, Type type, Value value) {
+    Value savedQueue = context.currentQueue;
+    llvm::scope_exit restoreQueue([&] { context.currentQueue = savedQueue; });
+    context.currentQueue = value;
+
+    auto lowerIdx = context.convertRvalueExpression(expr.left());
+    auto upperIdx = context.convertRvalueExpression(expr.right());
+    auto resultType =
+        isLvalue ? moore::RefType::get(cast<moore::UnpackedType>(type)) : type;
+
+    if (isLvalue) {
+      mlir::emitError(loc) << "queue lvalue range selections are not supported";
+      return {};
+    }
+    return moore::DynQueueExtractOp::create(builder, loc, resultType, value,
+                                            lowerIdx, upperIdx);
+  }
+
+  // Handles range selections into arrays, which currently require a constant
+  // upper bound
+  Value handleArrayRangeSelectExpressions(
+      const slang::ast::RangeSelectExpression &expr, Type type, Value value) {
     std::optional<int32_t> constLeft;
     std::optional<int32_t> constRight;
     if (auto *constant = expr.left().getConstant())
@@ -288,6 +549,24 @@ struct ExprVisitor {
   /// Handle concatenations.
   Value visit(const slang::ast::ConcatenationExpression &expr) {
     SmallVector<Value> operands;
+    if (expr.type->isString()) {
+      for (auto *operand : expr.operands()) {
+        assert(!isLvalue && "checked by Slang");
+        auto value = convertLvalueOrRvalueExpression(*operand);
+        if (!value)
+          return {};
+        value = context.materializeConversion(
+            moore::StringType::get(context.getContext()), value, false,
+            value.getLoc());
+        if (!value)
+          return {};
+        operands.push_back(value);
+      }
+      return moore::StringConcatOp::create(builder, loc, operands);
+    }
+    if (expr.type->isQueue()) {
+      return handleQueueConcat(expr);
+    }
     for (auto *operand : expr.operands()) {
       // Handle empty replications like `{0{...}}` which may occur within
       // concatenations. Slang assigns them a `void` type which we can check for
@@ -309,40 +588,211 @@ struct ExprVisitor {
       return moore::ConcatOp::create(builder, loc, operands);
   }
 
+  // Handles a `ConcatenationExpression` which produces a queue as a result.
+  // Intuitively, queue concatenations are the same as unpacked array
+  // concatenations. However, because queues may vary in size, we can't
+  // just convert each argument to a simple bit vector.
+  Value handleQueueConcat(const slang::ast::ConcatenationExpression &expr) {
+    SmallVector<Value> operands;
+
+    auto queueType =
+        cast<moore::QueueType>(context.convertType(*expr.type, loc));
+    auto elementType = queueType.getElementType();
+
+    // Strategy:
+    // QueueConcatOp only takes queues, so other types must be converted to
+    // queues.
+    // - Unpacked arrays have a conversion to queues via
+    // `QueueFromUnpackedArrayOp`.
+    // - For individual elements, we create a new queue for each contiguous
+    // sequence of elements, and add this to the QueueConcatOp.
+
+    // The current contiguous sequence of individual elements.
+    Value contigElements;
+
+    for (auto *operand : expr.operands()) {
+      bool isSingleElement =
+          context.convertType(*operand->type, loc) == elementType;
+
+      // If the subsequent operand is not a single element, add the current
+      // sequence of contiguous elements to the QueueConcatOp
+      if (!isSingleElement && contigElements) {
+        operands.push_back(moore::ReadOp::create(builder, loc, contigElements));
+        contigElements = {};
+      }
+
+      assert(!isLvalue && "checked by Slang");
+      auto value = convertLvalueOrRvalueExpression(*operand);
+      if (!value)
+        return {};
+
+      // If value is an element of the queue, create an empty queue and add
+      // that element.
+      if (value.getType() == elementType) {
+        auto queueRefType =
+            moore::RefType::get(context.getContext(), queueType);
+
+        if (!contigElements) {
+          contigElements =
+              moore::VariableOp::create(builder, loc, queueRefType, {}, {});
+        }
+        moore::QueuePushBackOp::create(builder, loc, contigElements, value);
+        continue;
+      }
+
+      // Otherwise, the value should be directly convertible to a queue type.
+      // If the type is a queue type with the same element type, skip this step,
+      // since we don't need to cast things like queue<T, 10> to queue<T, 0>,
+      // - QueueConcatOp doesn't mind the queue bounds.
+      if (!(isa<moore::QueueType>(value.getType()) &&
+            cast<moore::QueueType>(value.getType()).getElementType() ==
+                elementType)) {
+        value = context.materializeConversion(queueType, value, false,
+                                              value.getLoc());
+      }
+
+      operands.push_back(value);
+    }
+
+    if (contigElements) {
+      operands.push_back(moore::ReadOp::create(builder, loc, contigElements));
+    }
+
+    return moore::QueueConcatOp::create(builder, loc, queueType, operands);
+  }
+
   /// Handle member accesses.
   Value visit(const slang::ast::MemberAccessExpression &expr) {
     auto type = context.convertType(*expr.type);
-    auto valueType = expr.value().type;
-    auto value = convertLvalueOrRvalueExpression(expr.value());
-    if (!type || !value)
+    if (!type)
       return {};
 
-    auto resultType =
-        isLvalue ? moore::RefType::get(cast<moore::UnpackedType>(type)) : type;
+    auto *valueType = expr.value().type.get();
     auto memberName = builder.getStringAttr(expr.member.name);
+
+    // Handle virtual interfaces. We represent virtual interface handles as a
+    // Moore struct containing references to interface members. Member access
+    // returns the stored reference directly (for lvalues) or reads it (for
+    // rvalues).
+    if (valueType->isVirtualInterface()) {
+      auto memberType = dyn_cast<moore::UnpackedType>(type);
+      if (!memberType) {
+        mlir::emitError(loc)
+            << "unsupported virtual interface member type: " << type;
+        return {};
+      }
+      auto resultRefType = moore::RefType::get(memberType);
+
+      // Always use the rvalue of the base handle to avoid creating
+      // ref<ref<T>> for lvalue member access.
+      Value base = context.convertRvalueExpression(expr.value());
+      if (!base)
+        return {};
+
+      auto memberRef = moore::StructExtractOp::create(
+          builder, loc, resultRefType, memberName, base);
+      if (isLvalue)
+        return memberRef;
+      return moore::ReadOp::create(builder, loc, memberRef);
+    }
 
     // Handle structs.
     if (valueType->isStruct()) {
+      auto resultType =
+          isLvalue ? moore::RefType::get(cast<moore::UnpackedType>(type))
+                   : type;
+      auto value = convertLvalueOrRvalueExpression(expr.value());
+      if (!value)
+        return {};
+
       if (isLvalue)
         return moore::StructExtractRefOp::create(builder, loc, resultType,
                                                  memberName, value);
-      else
-        return moore::StructExtractOp::create(builder, loc, resultType,
-                                              memberName, value);
+      return moore::StructExtractOp::create(builder, loc, resultType,
+                                            memberName, value);
     }
 
     // Handle unions.
     if (valueType->isPackedUnion() || valueType->isUnpackedUnion()) {
+      auto resultType =
+          isLvalue ? moore::RefType::get(cast<moore::UnpackedType>(type))
+                   : type;
+      auto value = convertLvalueOrRvalueExpression(expr.value());
+      if (!value)
+        return {};
+
       if (isLvalue)
         return moore::UnionExtractRefOp::create(builder, loc, resultType,
                                                 memberName, value);
-      else
-        return moore::UnionExtractOp::create(builder, loc, type, memberName,
-                                             value);
+      return moore::UnionExtractOp::create(builder, loc, type, memberName,
+                                           value);
+    }
+
+    // Handle classes.
+    if (valueType->isClass()) {
+      auto valTy = context.convertType(*valueType);
+      if (!valTy)
+        return {};
+      auto targetTy = cast<moore::ClassHandleType>(valTy);
+
+      // `MemberAccessExpression`s may refer to either variables that may or may
+      // not be compile time constants, or to class parameters which are always
+      // elaboration-time constant.
+      //
+      // We distinguish these cases, and materialize a runtime member access
+      // for variables, but force constant conversion for parameter accesses.
+      //
+      // Also see this discussion:
+      // https://github.com/MikePopoloski/slang/issues/1641
+
+      if (expr.member.kind != slang::ast::SymbolKind::Parameter) {
+
+        // We need to pick the closest ancestor that declares a property with
+        // the relevant name. System Verilog explicitly enforces lexical
+        // shadowing, as shown in IEEE 1800-2023 Section 8.14 "Overridden
+        // members".
+        moore::ClassHandleType upcastTargetTy =
+            context.getAncestorClassWithProperty(targetTy, expr.member.name,
+                                                 loc);
+        if (!upcastTargetTy)
+          return {};
+
+        // Convert the class handle to the required target type for property
+        // shadowing purposes.
+        Value baseVal =
+            context.convertRvalueExpression(expr.value(), upcastTargetTy);
+        if (!baseVal)
+          return {};
+
+        // @field and result type !moore.ref<T>.
+        auto fieldSym = mlir::FlatSymbolRefAttr::get(builder.getContext(),
+                                                     expr.member.name);
+        auto fieldRefTy = moore::RefType::get(cast<moore::UnpackedType>(type));
+
+        // Produce a ref to the class property from the (possibly upcast)
+        // handle.
+        Value fieldRef = moore::ClassPropertyRefOp::create(
+            builder, loc, fieldRefTy, baseVal, fieldSym);
+
+        // If we need an RValue, read the reference, otherwise return
+        return isLvalue ? fieldRef
+                        : moore::ReadOp::create(builder, loc, fieldRef);
+      }
+
+      slang::ConstantValue constVal;
+      if (auto param = expr.member.as_if<slang::ast::ParameterSymbol>()) {
+        constVal = param->getValue();
+        if (auto value = context.materializeConstant(constVal, *expr.type, loc))
+          return value;
+      }
+
+      mlir::emitError(loc) << "Parameter " << expr.member.name
+                           << " has no constant value";
+      return {};
     }
 
     mlir::emitError(loc, "expression of type ")
-        << value.getType() << " has no member fields";
+        << valueType->toString() << " has no member fields";
     return {};
   }
 };
@@ -368,6 +818,7 @@ struct RvalueExprVisitor : public ExprVisitor {
 
   // Handle named values, such as references to declared variables.
   Value visit(const slang::ast::NamedValueExpression &expr) {
+    // Handle local variables.
     if (auto value = context.valueSymbols.lookup(&expr.symbol)) {
       if (isa<moore::RefType>(value.getType())) {
         auto readOp = moore::ReadOp::create(builder, loc, value);
@@ -376,6 +827,56 @@ struct RvalueExprVisitor : public ExprVisitor {
         value = readOp.getResult();
       }
       return value;
+    }
+
+    // Handle global variables.
+    if (auto globalOp = context.globalVariables.lookup(&expr.symbol)) {
+      auto value = moore::GetGlobalVariableOp::create(builder, loc, globalOp);
+      return moore::ReadOp::create(builder, loc, value);
+    }
+
+    // We're reading a class property.
+    if (auto *const property =
+            expr.symbol.as_if<slang::ast::ClassPropertySymbol>()) {
+      auto fieldRef = visitClassProperty(context, *property);
+      return moore::ReadOp::create(builder, loc, fieldRef).getResult();
+    }
+
+    // Slang may resolve `vif.member` accesses (with `vif` being a virtual
+    // interface handle) directly to a NamedValueExpression for `member`.
+    // Reconstruct the virtual interface access by consulting the mapping
+    // populated at declaration sites.
+    if (auto access = context.virtualIfaceMembers.lookup(&expr.symbol);
+        access.base) {
+      auto type = context.convertType(*expr.type);
+      if (!type)
+        return {};
+      auto memberType = dyn_cast<moore::UnpackedType>(type);
+      if (!memberType) {
+        mlir::emitError(loc)
+            << "unsupported virtual interface member type: " << type;
+        return {};
+      }
+
+      Value base = materializeSymbolRvalue(*access.base);
+      if (!base) {
+        auto d = mlir::emitError(loc, "unknown name `")
+                 << access.base->name << "`";
+        d.attachNote(context.convertLocation(access.base->location))
+            << "no rvalue generated for virtual interface base";
+        return {};
+      }
+
+      auto fieldName = access.fieldName
+                           ? access.fieldName
+                           : builder.getStringAttr(expr.symbol.name);
+      auto memberRefType = moore::RefType::get(memberType);
+      auto memberRef = moore::StructExtractOp::create(
+          builder, loc, memberRefType, fieldName, base);
+      auto readOp = moore::ReadOp::create(builder, loc, memberRef);
+      if (context.rvalueReadCallback)
+        context.rvalueReadCallback(readOp);
+      return readOp.getResult();
     }
 
     // Try to materialize constant values directly.
@@ -413,6 +914,22 @@ struct RvalueExprVisitor : public ExprVisitor {
     return {};
   }
 
+  // Handle arbitrary symbol references. Slang uses this expression to represent
+  // "real" interface instances in virtual interface assignments.
+  Value visit(const slang::ast::ArbitrarySymbolExpression &expr) {
+    const auto &canonTy = expr.type->getCanonicalType();
+    if (const auto *vi = canonTy.as_if<slang::ast::VirtualInterfaceType>()) {
+      auto value = context.materializeVirtualInterfaceValue(*vi, loc);
+      if (failed(value))
+        return {};
+      return *value;
+    }
+
+    mlir::emitError(loc) << "unsupported arbitrary symbol expression of type "
+                         << expr.type->toString();
+    return {};
+  }
+
   // Handle type conversions (explicit and implicit).
   Value visit(const slang::ast::ConversionExpression &expr) {
     auto type = context.convertType(*expr.type);
@@ -442,7 +959,9 @@ struct RvalueExprVisitor : public ExprVisitor {
       if (expr.timingControl)
         if (failed(context.convertTimingControl(*expr.timingControl)))
           return {};
-      moore::BlockingAssignOp::create(builder, loc, lhs, rhs);
+      auto assignOp = moore::BlockingAssignOp::create(builder, loc, lhs, rhs);
+      if (context.variableAssignCallback)
+        context.variableAssignCallback(assignOp);
       return rhs;
     }
 
@@ -454,8 +973,10 @@ struct RvalueExprVisitor : public ExprVisitor {
             ctrl->expr, moore::TimeType::get(builder.getContext()));
         if (!delay)
           return {};
-        moore::DelayedNonBlockingAssignOp::create(builder, loc, lhs, rhs,
-                                                  delay);
+        auto assignOp = moore::DelayedNonBlockingAssignOp::create(
+            builder, loc, lhs, rhs, delay);
+        if (context.variableAssignCallback)
+          context.variableAssignCallback(assignOp);
         return rhs;
       }
 
@@ -466,7 +987,9 @@ struct RvalueExprVisitor : public ExprVisitor {
           << slang::ast::toString(expr.timingControl->kind);
       return {};
     }
-    moore::NonBlockingAssignOp::create(builder, loc, lhs, rhs);
+    auto assignOp = moore::NonBlockingAssignOp::create(builder, loc, lhs, rhs);
+    if (context.variableAssignCallback)
+      context.variableAssignCallback(assignOp);
     return rhs;
   }
 
@@ -499,15 +1022,124 @@ struct RvalueExprVisitor : public ExprVisitor {
       postValue =
           isInc ? moore::AddOp::create(builder, loc, preValue, one).getResult()
                 : moore::SubOp::create(builder, loc, preValue, one).getResult();
-      moore::BlockingAssignOp::create(builder, loc, arg, postValue);
+      auto assignOp =
+          moore::BlockingAssignOp::create(builder, loc, arg, postValue);
+      if (context.variableAssignCallback)
+        context.variableAssignCallback(assignOp);
     }
+
     if (isPost)
       return preValue;
     return postValue;
   }
 
+  // Helper function to create pre and post increments and decrements.
+  Value createRealIncrement(Value arg, bool isInc, bool isPost) {
+    Value preValue = moore::ReadOp::create(builder, loc, arg);
+    Value postValue;
+
+    bool isTime = isa<moore::TimeType>(preValue.getType());
+    if (isTime)
+      preValue = context.materializeConversion(
+          moore::RealType::get(context.getContext(), moore::RealWidth::f64),
+          preValue, false, loc);
+
+    moore::RealType realTy =
+        llvm::dyn_cast<moore::RealType>(preValue.getType());
+    if (!realTy)
+      return {};
+
+    FloatAttr oneAttr;
+    if (realTy.getWidth() == moore::RealWidth::f32) {
+      oneAttr = builder.getFloatAttr(builder.getF32Type(), 1.0);
+    } else if (realTy.getWidth() == moore::RealWidth::f64) {
+      auto oneVal = isTime ? getTimeScaleInFemtoseconds(context) : 1.0;
+      oneAttr = builder.getFloatAttr(builder.getF64Type(), oneVal);
+    } else {
+      mlir::emitError(loc) << "cannot construct increment for " << realTy;
+      return {};
+    }
+    auto one = moore::ConstantRealOp::create(builder, loc, oneAttr);
+
+    postValue =
+        isInc
+            ? moore::AddRealOp::create(builder, loc, preValue, one).getResult()
+            : moore::SubRealOp::create(builder, loc, preValue, one).getResult();
+
+    if (isTime)
+      postValue = context.materializeConversion(
+          moore::TimeType::get(context.getContext()), postValue, false, loc);
+
+    auto assignOp =
+        moore::BlockingAssignOp::create(builder, loc, arg, postValue);
+
+    if (context.variableAssignCallback)
+      context.variableAssignCallback(assignOp);
+
+    if (isPost)
+      return preValue;
+    return postValue;
+  }
+
+  Value visitRealUOp(const slang::ast::UnaryExpression &expr) {
+    Type opFTy = context.convertType(*expr.operand().type);
+
+    using slang::ast::UnaryOperator;
+    Value arg;
+    if (expr.op == UnaryOperator::Preincrement ||
+        expr.op == UnaryOperator::Predecrement ||
+        expr.op == UnaryOperator::Postincrement ||
+        expr.op == UnaryOperator::Postdecrement)
+      arg = context.convertLvalueExpression(expr.operand());
+    else
+      arg = context.convertRvalueExpression(expr.operand(), opFTy);
+    if (!arg)
+      return {};
+
+    // Only covers expressions in 'else' branch above.
+    if (isa<moore::TimeType>(arg.getType()))
+      arg = context.materializeConversion(
+          moore::RealType::get(context.getContext(), moore::RealWidth::f64),
+          arg, false, loc);
+
+    switch (expr.op) {
+      // `+a` is simply `a`
+    case UnaryOperator::Plus:
+      return arg;
+    case UnaryOperator::Minus:
+      return moore::NegRealOp::create(builder, loc, arg);
+
+    case UnaryOperator::Preincrement:
+      return createRealIncrement(arg, true, false);
+    case UnaryOperator::Predecrement:
+      return createRealIncrement(arg, false, false);
+    case UnaryOperator::Postincrement:
+      return createRealIncrement(arg, true, true);
+    case UnaryOperator::Postdecrement:
+      return createRealIncrement(arg, false, true);
+
+    case UnaryOperator::LogicalNot:
+      arg = context.convertToBool(arg);
+      if (!arg)
+        return {};
+      return moore::NotOp::create(builder, loc, arg);
+
+    default:
+      mlir::emitError(loc) << "Unary operator " << slang::ast::toString(expr.op)
+                           << " not supported with real values!\n";
+      return {};
+    }
+  }
+
   // Handle unary operators.
   Value visit(const slang::ast::UnaryExpression &expr) {
+    // First check whether we need real or integral BOps
+    const auto *floatType =
+        expr.operand().type->as_if<slang::ast::FloatingType>();
+    // If op is real-typed, treat as real BOp.
+    if (floatType)
+      return visitRealUOp(expr);
+
     using slang::ast::UnaryOperator;
     Value arg;
     if (expr.op == UnaryOperator::Preincrement ||
@@ -571,6 +1203,139 @@ struct RvalueExprVisitor : public ExprVisitor {
     return {};
   }
 
+  /// Handles logical operators (§11.4.7), assuming lhs/rhs are rvalues already.
+  Value buildLogicalBOp(slang::ast::BinaryOperator op, Value lhs, Value rhs,
+                        std::optional<Domain> domain = std::nullopt) {
+    using slang::ast::BinaryOperator;
+    // TODO: These should short-circuit; RHS should be in a separate block.
+
+    if (domain) {
+      lhs = context.convertToBool(lhs, domain.value());
+      rhs = context.convertToBool(rhs, domain.value());
+    } else {
+      lhs = context.convertToBool(lhs);
+      rhs = context.convertToBool(rhs);
+    }
+
+    if (!lhs || !rhs)
+      return {};
+
+    switch (op) {
+    case BinaryOperator::LogicalAnd:
+      return moore::AndOp::create(builder, loc, lhs, rhs);
+
+    case BinaryOperator::LogicalOr:
+      return moore::OrOp::create(builder, loc, lhs, rhs);
+
+    case BinaryOperator::LogicalImplication: {
+      // (lhs -> rhs) == (!lhs || rhs)
+      auto notLHS = moore::NotOp::create(builder, loc, lhs);
+      return moore::OrOp::create(builder, loc, notLHS, rhs);
+    }
+
+    case BinaryOperator::LogicalEquivalence: {
+      // (lhs <-> rhs) == (lhs && rhs) || (!lhs && !rhs)
+      auto notLHS = moore::NotOp::create(builder, loc, lhs);
+      auto notRHS = moore::NotOp::create(builder, loc, rhs);
+      auto both = moore::AndOp::create(builder, loc, lhs, rhs);
+      auto notBoth = moore::AndOp::create(builder, loc, notLHS, notRHS);
+      return moore::OrOp::create(builder, loc, both, notBoth);
+    }
+
+    default:
+      llvm_unreachable("not a logical BinaryOperator");
+    }
+  }
+
+  Value visitHandleBOp(const slang::ast::BinaryExpression &expr) {
+    // Convert operands to the chosen target type.
+    auto lhs = context.convertRvalueExpression(expr.left());
+    if (!lhs)
+      return {};
+    auto rhs = context.convertRvalueExpression(expr.right());
+    if (!rhs)
+      return {};
+
+    using slang::ast::BinaryOperator;
+    switch (expr.op) {
+
+    case BinaryOperator::Equality:
+      return moore::HandleEqOp::create(builder, loc, lhs, rhs);
+    case BinaryOperator::Inequality:
+      return moore::HandleNeOp::create(builder, loc, lhs, rhs);
+    case BinaryOperator::CaseEquality:
+      return moore::HandleCaseEqOp::create(builder, loc, lhs, rhs);
+    case BinaryOperator::CaseInequality:
+      return moore::HandleCaseNeOp::create(builder, loc, lhs, rhs);
+
+    default:
+      mlir::emitError(loc)
+          << "Binary operator " << slang::ast::toString(expr.op)
+          << " not supported with class handle valued operands!\n";
+      return {};
+    }
+  }
+
+  Value visitRealBOp(const slang::ast::BinaryExpression &expr) {
+    // Convert operands to the chosen target type.
+    auto lhs = context.convertRvalueExpression(expr.left());
+    if (!lhs)
+      return {};
+    auto rhs = context.convertRvalueExpression(expr.right());
+    if (!rhs)
+      return {};
+
+    if (isa<moore::TimeType>(lhs.getType()) ||
+        isa<moore::TimeType>(rhs.getType())) {
+      lhs = context.materializeConversion(
+          moore::RealType::get(context.getContext(), moore::RealWidth::f64),
+          lhs, false, loc);
+      rhs = context.materializeConversion(
+          moore::RealType::get(context.getContext(), moore::RealWidth::f64),
+          rhs, false, loc);
+    }
+
+    using slang::ast::BinaryOperator;
+    switch (expr.op) {
+    case BinaryOperator::Add:
+      return moore::AddRealOp::create(builder, loc, lhs, rhs);
+    case BinaryOperator::Subtract:
+      return moore::SubRealOp::create(builder, loc, lhs, rhs);
+    case BinaryOperator::Multiply:
+      return moore::MulRealOp::create(builder, loc, lhs, rhs);
+    case BinaryOperator::Divide:
+      return moore::DivRealOp::create(builder, loc, lhs, rhs);
+    case BinaryOperator::Power:
+      return moore::PowRealOp::create(builder, loc, lhs, rhs);
+
+    case BinaryOperator::Equality:
+      return moore::EqRealOp::create(builder, loc, lhs, rhs);
+    case BinaryOperator::Inequality:
+      return moore::NeRealOp::create(builder, loc, lhs, rhs);
+
+    case BinaryOperator::GreaterThan:
+      return moore::FgtOp::create(builder, loc, lhs, rhs);
+    case BinaryOperator::LessThan:
+      return moore::FltOp::create(builder, loc, lhs, rhs);
+    case BinaryOperator::GreaterThanEqual:
+      return moore::FgeOp::create(builder, loc, lhs, rhs);
+    case BinaryOperator::LessThanEqual:
+      return moore::FleOp::create(builder, loc, lhs, rhs);
+
+    case BinaryOperator::LogicalAnd:
+    case BinaryOperator::LogicalOr:
+    case BinaryOperator::LogicalImplication:
+    case BinaryOperator::LogicalEquivalence:
+      return buildLogicalBOp(expr.op, lhs, rhs);
+
+    default:
+      mlir::emitError(loc) << "Binary operator "
+                           << slang::ast::toString(expr.op)
+                           << " not supported with real valued operands!\n";
+      return {};
+    }
+  }
+
   // Helper function to convert two arguments to a simple bit vector type and
   // pass them into a binary op.
   template <class ConcreteOp>
@@ -586,6 +1351,25 @@ struct RvalueExprVisitor : public ExprVisitor {
 
   // Handle binary operators.
   Value visit(const slang::ast::BinaryExpression &expr) {
+    // First check whether we need real or integral BOps
+    const auto *rhsFloatType =
+        expr.right().type->as_if<slang::ast::FloatingType>();
+    const auto *lhsFloatType =
+        expr.left().type->as_if<slang::ast::FloatingType>();
+
+    // If either arg is real-typed, treat as real BOp.
+    if (rhsFloatType || lhsFloatType)
+      return visitRealBOp(expr);
+
+    // Check whether we are comparing against a Class Handle or CHandle
+    const auto rhsIsClass = expr.right().type->isClass();
+    const auto lhsIsClass = expr.left().type->isClass();
+    const auto rhsIsChandle = expr.right().type->isCHandle();
+    const auto lhsIsChandle = expr.left().type->isCHandle();
+    // If either arg is class handle-typed, treat as class handle BOp.
+    if (rhsIsClass || lhsIsClass || rhsIsChandle || lhsIsChandle)
+      return visitHandleBOp(expr);
+
     auto lhs = context.convertRvalueExpression(expr.left());
     if (!lhs)
       return {};
@@ -650,6 +1434,9 @@ struct RvalueExprVisitor : public ExprVisitor {
       else if (isa<moore::StringType>(lhs.getType()))
         return moore::StringCmpOp::create(
             builder, loc, moore::StringCmpPredicate::eq, lhs, rhs);
+      else if (isa<moore::QueueType>(lhs.getType()))
+        return moore::QueueCmpOp::create(
+            builder, loc, moore::UArrayCmpPredicate::eq, lhs, rhs);
       else
         return createBinary<moore::EqOp>(lhs, rhs);
     case BinaryOperator::Inequality:
@@ -659,6 +1446,9 @@ struct RvalueExprVisitor : public ExprVisitor {
       else if (isa<moore::StringType>(lhs.getType()))
         return moore::StringCmpOp::create(
             builder, loc, moore::StringCmpPredicate::ne, lhs, rhs);
+      else if (isa<moore::QueueType>(lhs.getType()))
+        return moore::QueueCmpOp::create(
+            builder, loc, moore::UArrayCmpPredicate::ne, lhs, rhs);
       else
         return createBinary<moore::NeOp>(lhs, rhs);
     case BinaryOperator::CaseEquality:
@@ -703,54 +1493,11 @@ struct RvalueExprVisitor : public ExprVisitor {
       else
         return createBinary<moore::UltOp>(lhs, rhs);
 
-    // See IEEE 1800-2017 § 11.4.7 "Logical operators".
-    case BinaryOperator::LogicalAnd: {
-      // TODO: This should short-circuit. Put the RHS code into a separate
-      // block.
-      lhs = context.convertToBool(lhs, domain);
-      if (!lhs)
-        return {};
-      rhs = context.convertToBool(rhs, domain);
-      if (!rhs)
-        return {};
-      return moore::AndOp::create(builder, loc, lhs, rhs);
-    }
-    case BinaryOperator::LogicalOr: {
-      // TODO: This should short-circuit. Put the RHS code into a separate
-      // block.
-      lhs = context.convertToBool(lhs, domain);
-      if (!lhs)
-        return {};
-      rhs = context.convertToBool(rhs, domain);
-      if (!rhs)
-        return {};
-      return moore::OrOp::create(builder, loc, lhs, rhs);
-    }
-    case BinaryOperator::LogicalImplication: {
-      // `(lhs -> rhs)` equivalent to `(!lhs || rhs)`.
-      lhs = context.convertToBool(lhs, domain);
-      if (!lhs)
-        return {};
-      rhs = context.convertToBool(rhs, domain);
-      if (!rhs)
-        return {};
-      auto notLHS = moore::NotOp::create(builder, loc, lhs);
-      return moore::OrOp::create(builder, loc, notLHS, rhs);
-    }
-    case BinaryOperator::LogicalEquivalence: {
-      // `(lhs <-> rhs)` equivalent to `(lhs && rhs) || (!lhs && !rhs)`.
-      lhs = context.convertToBool(lhs, domain);
-      if (!lhs)
-        return {};
-      rhs = context.convertToBool(rhs, domain);
-      if (!rhs)
-        return {};
-      auto notLHS = moore::NotOp::create(builder, loc, lhs);
-      auto notRHS = moore::NotOp::create(builder, loc, rhs);
-      auto both = moore::AndOp::create(builder, loc, lhs, rhs);
-      auto notBoth = moore::AndOp::create(builder, loc, notLHS, notRHS);
-      return moore::OrOp::create(builder, loc, both, notBoth);
-    }
+    case BinaryOperator::LogicalAnd:
+    case BinaryOperator::LogicalOr:
+    case BinaryOperator::LogicalImplication:
+    case BinaryOperator::LogicalEquivalence:
+      return buildLogicalBOp(expr.op, lhs, rhs, domain);
 
     case BinaryOperator::LogicalShiftLeft:
       return createBinary<moore::ShlOp>(lhs, rhs);
@@ -827,58 +1574,16 @@ struct RvalueExprVisitor : public ExprVisitor {
         context.convertRvalueExpression(expr.left()));
     if (!lhs)
       return {};
+
     // All conditions for determining whether it is inside.
     SmallVector<Value> conditions;
 
     // Traverse open range list.
     for (const auto *listExpr : expr.rangeList()) {
-      Value cond;
-      // The open range list on the right-hand side of the inside operator is a
-      // comma-separated list of expressions or ranges.
-      if (const auto *openRange =
-              listExpr->as_if<slang::ast::ValueRangeExpression>()) {
-        // Handle ranges.
-        auto lowBound = context.convertToSimpleBitVector(
-            context.convertRvalueExpression(openRange->left()));
-        auto highBound = context.convertToSimpleBitVector(
-            context.convertRvalueExpression(openRange->right()));
-        if (!lowBound || !highBound)
-          return {};
-        Value leftValue, rightValue;
-        // Determine if the expression on the left-hand side is inclusively
-        // within the range.
-        if (openRange->left().type->isSigned() ||
-            expr.left().type->isSigned()) {
-          leftValue = moore::SgeOp::create(builder, loc, lhs, lowBound);
-        } else {
-          leftValue = moore::UgeOp::create(builder, loc, lhs, lowBound);
-        }
-        if (openRange->right().type->isSigned() ||
-            expr.left().type->isSigned()) {
-          rightValue = moore::SleOp::create(builder, loc, lhs, highBound);
-        } else {
-          rightValue = moore::UleOp::create(builder, loc, lhs, highBound);
-        }
-        cond = moore::AndOp::create(builder, loc, leftValue, rightValue);
-      } else {
-        // Handle expressions.
-        if (!listExpr->type->isIntegral()) {
-          if (listExpr->type->isUnpackedArray()) {
-            mlir::emitError(
-                loc, "unpacked arrays in 'inside' expressions not supported");
-            return {};
-          }
-          mlir::emitError(
-              loc, "only simple bit vectors supported in 'inside' expressions");
-          return {};
-        }
+      auto cond = context.convertInsideCheck(lhs, loc, *listExpr);
+      if (!cond)
+        return {};
 
-        auto value = context.convertToSimpleBitVector(
-            context.convertRvalueExpression(*listExpr));
-        if (!value)
-          return {};
-        cond = moore::WildcardEqOp::create(builder, loc, lhs, value);
-      }
       conditions.push_back(cond);
     }
 
@@ -939,12 +1644,6 @@ struct RvalueExprVisitor : public ExprVisitor {
 
   /// Handle calls.
   Value visit(const slang::ast::CallExpression &expr) {
-    // Class method calls are currently not supported.
-    if (expr.thisClass()) {
-      mlir::emitError(loc, "unsupported class method call");
-      return {};
-    }
-
     // Try to materialize constant values directly.
     auto constant = context.evaluateConstant(expr);
     if (auto value = context.materializeConstant(constant, *expr.type, loc))
@@ -955,11 +1654,87 @@ struct RvalueExprVisitor : public ExprVisitor {
         expr.subroutine);
   }
 
+  /// Get both the actual `this` argument of a method call and the required
+  /// class type.
+  std::pair<Value, moore::ClassHandleType>
+  getMethodReceiverTypeHandle(const slang::ast::CallExpression &expr) {
+
+    moore::ClassHandleType handleTy;
+    Value thisRef;
+
+    // Qualified call: t.m(...), extract from thisClass.
+    if (const slang::ast::Expression *recvExpr = expr.thisClass()) {
+      thisRef = context.convertRvalueExpression(*recvExpr);
+      if (!thisRef)
+        return {};
+    } else {
+      // Unqualified call inside a method body: try using implicit %this.
+      thisRef = context.getImplicitThisRef();
+      if (!thisRef) {
+        mlir::emitError(loc) << "method '" << expr.getSubroutineName()
+                             << "' called without an object";
+        return {};
+      }
+    }
+    handleTy = cast<moore::ClassHandleType>(thisRef.getType());
+    return {thisRef, handleTy};
+  }
+
+  /// Build a method call including implicit this argument.
+  mlir::CallOpInterface
+  buildMethodCall(const slang::ast::SubroutineSymbol *subroutine,
+                  FunctionLowering *lowering,
+                  moore::ClassHandleType actualHandleTy, Value actualThisRef,
+                  SmallVector<Value> &arguments,
+                  SmallVector<Type> &resultTypes) {
+
+    // Get the expected receiver type from the lowered method
+    auto funcTy = cast<FunctionType>(lowering->op.getFunctionType());
+    auto expected0 = funcTy.getInput(0);
+    auto expectedHdlTy = cast<moore::ClassHandleType>(expected0);
+
+    // Upcast the handle as necessary.
+    auto implicitThisRef = context.materializeConversion(
+        expectedHdlTy, actualThisRef, false, actualThisRef.getLoc());
+
+    // Build an argument list where the this reference is the first argument.
+    SmallVector<Value> explicitArguments;
+    explicitArguments.reserve(arguments.size() + 1);
+    explicitArguments.push_back(implicitThisRef);
+    explicitArguments.append(arguments.begin(), arguments.end());
+
+    // Method call: choose direct vs virtual.
+    const bool isVirtual =
+        (subroutine->flags & slang::ast::MethodFlags::Virtual) != 0;
+
+    if (!isVirtual) {
+      auto calleeSym = lowering->op.getName();
+      if (lowering->isCoroutine())
+        return moore::CallCoroutineOp::create(builder, loc, resultTypes,
+                                              calleeSym, explicitArguments);
+      return mlir::func::CallOp::create(builder, loc, resultTypes, calleeSym,
+                                        explicitArguments);
+    }
+
+    auto funcName = subroutine->name;
+    auto method = moore::VTableLoadMethodOp::create(
+        builder, loc, funcTy, actualThisRef,
+        SymbolRefAttr::get(context.getContext(), funcName));
+    return mlir::func::CallIndirectOp::create(builder, loc, method,
+                                              explicitArguments);
+  }
+
   /// Handle subroutine calls.
   Value visitCall(const slang::ast::CallExpression &expr,
                   const slang::ast::SubroutineSymbol *subroutine) {
+
+    const bool isMethod = (subroutine->thisVar != nullptr);
+
     auto *lowering = context.declareFunction(*subroutine);
     if (!lowering)
+      return {};
+    auto convertedFunction = context.convertFunction(*subroutine);
+    if (failed(convertedFunction))
       return {};
 
     // Convert the call arguments. Input arguments are converted to an rvalue.
@@ -976,100 +1751,96 @@ struct RvalueExprVisitor : public ExprVisitor {
         expr = &assign->left();
 
       Value value;
-      if (declArg->direction == slang::ast::ArgumentDirection::In)
-        value = context.convertRvalueExpression(*expr);
-      else
-        value = context.convertLvalueExpression(*expr);
+      auto type = context.convertType(declArg->getType());
+      if (declArg->direction == slang::ast::ArgumentDirection::In) {
+        value = context.convertRvalueExpression(*expr, type);
+      } else {
+        Value lvalue = context.convertLvalueExpression(*expr);
+        auto unpackedType = dyn_cast<moore::UnpackedType>(type);
+        if (!unpackedType)
+          return {};
+        value =
+            context.materializeConversion(moore::RefType::get(unpackedType),
+                                          lvalue, expr->type->isSigned(), loc);
+      }
       if (!value)
         return {};
       arguments.push_back(value);
     }
 
-    if (!lowering->captures.empty()) {
-      auto materializeCaptureAtCall = [&](Value cap) -> Value {
-        // Captures are expected to be moore::RefType.
-        auto refTy = dyn_cast<moore::RefType>(cap.getType());
-        if (!refTy) {
-          lowering->op.emitError(
-              "expected captured value to be moore::RefType");
-          return {};
-        }
-
-        // Expected case: the capture stems from a variable of any parent
-        // scope. We need to walk up, since definition might be a couple regions
-        // up.
-        Region *capRegion = [&]() -> Region * {
-          if (auto ba = dyn_cast<BlockArgument>(cap))
-            return ba.getOwner()->getParent();
-          if (auto *def = cap.getDefiningOp())
-            return def->getParentRegion();
-          return nullptr;
-        }();
-
-        Region *callRegion =
-            builder.getBlock() ? builder.getBlock()->getParent() : nullptr;
-
-        for (Region *r = callRegion; r; r = r->getParentRegion()) {
-          if (r == capRegion) {
-            // Safe to use the SSA value directly here.
-            return cap;
-          }
-        }
-
-        // Otherwise we can’t legally rematerialize this capture here.
-        lowering->op.emitError()
-            << "cannot materialize captured ref at call site; non-symbol "
-            << "source: "
-            << (cap.getDefiningOp()
-                    ? cap.getDefiningOp()->getName().getStringRef()
-                    : "<block-arg>");
+    // Pass captured variables as extra arguments. Each captured AST symbol is
+    // resolved to an MLIR value through the scoped symbol table, which
+    // naturally handles transitive captures (the caller’s own capture block
+    // argument will be found for variables captured from an outer scope).
+    for (auto *sym : lowering->capturedSymbols) {
+      Value val = context.valueSymbols.lookup(sym);
+      if (!val) {
+        mlir::emitError(loc) << "failed to resolve captured variable `"
+                             << sym->name << "` at call site";
         return {};
-      };
-
-      for (Value cap : lowering->captures) {
-        Value mat = materializeCaptureAtCall(cap);
-        if (!mat)
-          return {};
-        arguments.push_back(mat);
       }
+      arguments.push_back(val);
     }
 
-    // Create the call.
-    auto callOp =
-        mlir::func::CallOp::create(builder, loc, lowering->op, arguments);
+    // Determine result types from the declared/converted func op.
+    SmallVector<Type> resultTypes(
+        cast<FunctionType>(lowering->op.getFunctionType()).getResults().begin(),
+        cast<FunctionType>(lowering->op.getFunctionType()).getResults().end());
 
+    mlir::CallOpInterface callOp;
+    if (isMethod) {
+      // Class functions -> build func.call / func.indirect_call with implicit
+      // this argument
+      auto [thisRef, tyHandle] = getMethodReceiverTypeHandle(expr);
+      callOp = buildMethodCall(subroutine, lowering, tyHandle, thisRef,
+                               arguments, resultTypes);
+    } else if (lowering->isCoroutine()) {
+      // Free task -> moore.call_coroutine
+      auto coroutine = cast<moore::CoroutineOp>(lowering->op);
+      callOp =
+          moore::CallCoroutineOp::create(builder, loc, coroutine, arguments);
+    } else {
+      // Free function -> func.call
+      auto funcOp = cast<mlir::func::FuncOp>(lowering->op);
+      callOp = mlir::func::CallOp::create(builder, loc, funcOp, arguments);
+    }
+
+    auto result = resultTypes.size() > 0 ? callOp->getOpResult(0) : Value{};
     // For calls to void functions we need to have a value to return from this
     // function. Create a dummy `unrealized_conversion_cast`, which will get
     // deleted again later on.
-    if (callOp.getNumResults() == 0)
+    if (resultTypes.size() == 0)
       return mlir::UnrealizedConversionCastOp::create(
                  builder, loc, moore::VoidType::get(context.getContext()),
                  ValueRange{})
           .getResult(0);
 
-    return callOp.getResult(0);
+    return result;
   }
 
   /// Handle system calls.
   Value visitCall(const slang::ast::CallExpression &expr,
                   const slang::ast::CallExpression::SystemCallInfo &info) {
+    using ksn = slang::parsing::KnownSystemName;
     const auto &subroutine = *info.subroutine;
+    auto nameId = subroutine.knownNameId;
 
     // $rose, $fell, $stable, $changed, and $past are only valid in
     // the context of properties and assertions. Those are treated in the
     // LTLDialect; treat them there instead.
-    bool isAssertionCall =
-        llvm::StringSwitch<bool>(subroutine.name)
-            .Cases("$rose", "$fell", "$stable", "$past", true)
-            .Default(false);
-
-    if (isAssertionCall)
+    switch (nameId) {
+    case ksn::Rose:
+    case ksn::Fell:
+    case ksn::Stable:
+    case ksn::Changed:
+    case ksn::Past:
+    case ksn::Sampled:
       return context.convertAssertionCallExpression(expr, info, loc);
+    default:
+      break;
+    }
 
     auto args = expr.arguments();
-
-    FailureOr<Value> result;
-    Value value;
 
     // $sformatf() and $sformat look like system tasks, but we handle string
     // formatting differently from expression evaluation, so handle them
@@ -1077,7 +1848,7 @@ struct RvalueExprVisitor : public ExprVisitor {
     // According to IEEE 1800-2023 Section 21.3.3 "Formatting data to a
     // string" $sformatf works just like the string formatting but returns
     // a StringType.
-    if (!subroutine.name.compare("$sformatf")) {
+    if (nameId == ksn::SFormatF) {
       // Create the FormatString
       auto fmtValue = context.convertFormatString(
           expr.arguments(), loc, moore::IntFormat::Decimal, false);
@@ -1086,54 +1857,27 @@ struct RvalueExprVisitor : public ExprVisitor {
       return fmtValue.value();
     }
 
-    // Call the conversion function with the appropriate arity. These return one
-    // of the following:
-    //
-    // - `failure()` if the system call was recognized but some error occurred
-    // - `Value{}` if the system call was not recognized
-    // - non-null `Value` result otherwise
-    switch (args.size()) {
-    case (0):
-      result = context.convertSystemCallArity0(subroutine, loc);
-      break;
-
-    case (1):
-      value = context.convertRvalueExpression(*args[0]);
-      if (!value)
-        return {};
-      result = context.convertSystemCallArity1(subroutine, loc, value);
-      break;
-
-    default:
-      break;
-    }
-
-    // If we have recognized the system call but the conversion has encountered
-    // and already reported an error, simply return the usual null `Value` to
-    // indicate failure.
-    if (failed(result))
+    // Convert the system call using unified dispatch
+    auto result = context.convertSystemCall(subroutine, loc, args);
+    if (!result)
       return {};
 
-    // If we have recognized the system call and got a non-null `Value` result,
-    // return that.
-    if (*result)
-      return *result;
-
-    // Otherwise we didn't recognize the system call.
-    mlir::emitError(loc) << "unsupported system call `" << subroutine.name
-                         << "`";
-    return {};
+    auto ty = context.convertType(*expr.type);
+    return context.materializeConversion(ty, result, expr.type->isSigned(),
+                                         loc);
   }
 
   /// Handle string literals.
   Value visit(const slang::ast::StringLiteral &expr) {
     auto type = context.convertType(*expr.type);
-    return moore::StringConstantOp::create(builder, loc, type, expr.getValue());
+    return moore::ConstantStringOp::create(builder, loc, type, expr.getValue());
   }
 
   /// Handle real literals.
   Value visit(const slang::ast::RealLiteral &expr) {
-    return context.materializeSVReal(*expr.getConstant(), *expr.type, loc);
+    auto fTy = mlir::Float64Type::get(context.getContext());
+    auto attr = mlir::FloatAttr::get(fTy, expr.getValue());
+    return moore::ConstantRealOp::create(builder, loc, attr).getResult();
   }
 
   /// Helper function to convert RValues at creation of a new Struct, Array or
@@ -1381,6 +2125,92 @@ struct RvalueExprVisitor : public ExprVisitor {
     return context.convertAssertionExpression(expr.body, loc);
   }
 
+  Value visit(const slang::ast::UnboundedLiteral &expr) {
+    assert(context.getIndexedQueue() &&
+           "slang checks $ only used within queue index expression");
+
+    // Compute queue size and subtract one to get the last element
+    auto queueSize =
+        moore::QueueSizeBIOp::create(builder, loc, context.getIndexedQueue());
+    auto one = moore::ConstantOp::create(builder, loc, queueSize.getType(), 1);
+    auto lastElement = moore::SubOp::create(builder, loc, queueSize, one);
+
+    return lastElement;
+  }
+
+  // A new class expression can stand for one of two things:
+  // 1) A call to the `new` method (ctor) of a class made outside the scope of
+  // the class
+  // 2) A call to the `super.new` method, i.e. the constructor of the base
+  // class, within the scope of a class, more specifically, within the new
+  // method override of a class.
+  // In the first case we should emit an allocation and a call to the ctor if it
+  // exists (it's optional in System Verilog), in the second case we should emit
+  // a call to the parent's ctor (System Verilog only has single inheritance, so
+  // super is always unambiguous), but no allocation, as the child class' new
+  // invocation already allocated space for both its own and its parent's
+  // properties.
+  Value visit(const slang::ast::NewClassExpression &expr) {
+    auto type = context.convertType(*expr.type);
+    auto classTy = dyn_cast<moore::ClassHandleType>(type);
+    Value newObj;
+
+    // We are calling new from within a new function, and it's pointing to
+    // super. Check the implicit this ref to figure out the super class type.
+    // Do not allocate a new object.
+    if (!classTy && expr.isSuperClass) {
+      newObj = context.getImplicitThisRef();
+      if (!newObj || !newObj.getType() ||
+          !isa<moore::ClassHandleType>(newObj.getType())) {
+        mlir::emitError(loc) << "implicit this ref was not set while "
+                                "converting new class function";
+        return {};
+      }
+      auto thisType = cast<moore::ClassHandleType>(newObj.getType());
+      auto classDecl =
+          cast<moore::ClassDeclOp>(*context.symbolTable.lookupNearestSymbolFrom(
+              context.intoModuleOp, thisType.getClassSym()));
+      auto baseClassSym = classDecl.getBase();
+      classTy = circt::moore::ClassHandleType::get(context.getContext(),
+                                                   baseClassSym.value());
+    } else {
+      // We are calling from outside a class; allocate space for the object.
+      newObj = moore::ClassNewOp::create(builder, loc, classTy, {});
+    }
+
+    const auto *constructor = expr.constructorCall();
+    // If there's no ctor, we are done.
+    if (!constructor)
+      return newObj;
+
+    if (const auto *callConstructor =
+            constructor->as_if<slang::ast::CallExpression>())
+      if (const auto *subroutine =
+              std::get_if<const slang::ast::SubroutineSymbol *>(
+                  &callConstructor->subroutine)) {
+        // Bit paranoid, but virtually free checks that new is a class method
+        // and the subroutine has already been converted.
+        if (!(*subroutine)->thisVar) {
+          mlir::emitError(loc) << "Expected subroutine called by new to use an "
+                                  "implicit this reference";
+          return {};
+        }
+        if (failed(context.convertFunction(**subroutine)))
+          return {};
+        // Pass the newObj as the implicit this argument of the ctor.
+        auto savedThis = context.currentThisRef;
+        context.currentThisRef = newObj;
+        llvm::scope_exit restoreThis(
+            [&] { context.currentThisRef = savedThis; });
+        // Emit a call to ctor
+        if (!visitCall(*callConstructor, *subroutine))
+          return {};
+        // Return new handle
+        return newObj;
+      }
+    return {};
+  }
+
   /// Emit an error for all other expressions.
   template <typename T>
   Value visit(T &&node) {
@@ -1408,8 +2238,48 @@ struct LvalueExprVisitor : public ExprVisitor {
 
   // Handle named values, such as references to declared variables.
   Value visit(const slang::ast::NamedValueExpression &expr) {
+    // Handle local variables.
     if (auto value = context.valueSymbols.lookup(&expr.symbol))
       return value;
+
+    // Handle global variables.
+    if (auto globalOp = context.globalVariables.lookup(&expr.symbol))
+      return moore::GetGlobalVariableOp::create(builder, loc, globalOp);
+
+    if (auto *const property =
+            expr.symbol.as_if<slang::ast::ClassPropertySymbol>()) {
+      return visitClassProperty(context, *property);
+    }
+
+    if (auto access = context.virtualIfaceMembers.lookup(&expr.symbol);
+        access.base) {
+      auto type = context.convertType(*expr.type);
+      if (!type)
+        return {};
+      auto memberType = dyn_cast<moore::UnpackedType>(type);
+      if (!memberType) {
+        mlir::emitError(loc)
+            << "unsupported virtual interface member type: " << type;
+        return {};
+      }
+
+      Value base = materializeSymbolRvalue(*access.base);
+      if (!base) {
+        auto d = mlir::emitError(loc, "unknown name `")
+                 << access.base->name << "`";
+        d.attachNote(context.convertLocation(access.base->location))
+            << "no rvalue generated for virtual interface base";
+        return {};
+      }
+
+      auto fieldName = access.fieldName
+                           ? access.fieldName
+                           : builder.getStringAttr(expr.symbol.name);
+      auto memberRefType = moore::RefType::get(memberType);
+      return moore::StructExtractOp::create(builder, loc, memberRefType,
+                                            fieldName, base);
+    }
+
     auto d = mlir::emitError(loc, "unknown name `") << expr.symbol.name << "`";
     d.attachNote(context.convertLocation(expr.symbol.location))
         << "no lvalue generated for " << slang::ast::toString(expr.symbol.kind);
@@ -1418,8 +2288,13 @@ struct LvalueExprVisitor : public ExprVisitor {
 
   // Handle hierarchical values, such as `Top.sub.var = x`.
   Value visit(const slang::ast::HierarchicalValueExpression &expr) {
+    // Handle local variables.
     if (auto value = context.valueSymbols.lookup(&expr.symbol))
       return value;
+
+    // Handle global variables.
+    if (auto globalOp = context.globalVariables.lookup(&expr.symbol))
+      return moore::GetGlobalVariableOp::create(builder, loc, globalOp);
 
     // Emit an error for those hierarchical values not recorded in the
     // `valueSymbols`.
@@ -1551,29 +2426,40 @@ Value Context::convertToBool(Value value) {
 Value Context::materializeSVReal(const slang::ConstantValue &svreal,
                                  const slang::ast::Type &astType,
                                  Location loc) {
-  mlir::FloatType fTy;
-  Type resultType;
-  double val;
+  const auto *floatType = astType.as_if<slang::ast::FloatingType>();
+  assert(floatType);
 
-  if (const auto *floatType = astType.as_if<slang::ast::FloatingType>()) {
-    if (floatType->floatKind == slang::ast::FloatingType::ShortReal) {
-      fTy = mlir::Float32Type::get(getContext());
-      resultType = moore::RealType::getShortReal(getContext());
-      val = svreal.shortReal().v;
+  FloatAttr attr;
+  if (svreal.isShortReal() &&
+      floatType->floatKind == slang::ast::FloatingType::ShortReal) {
+    attr = FloatAttr::get(builder.getF32Type(), svreal.shortReal().v);
+  } else if (svreal.isReal() &&
+             floatType->floatKind == slang::ast::FloatingType::Real) {
+    attr = FloatAttr::get(builder.getF64Type(), svreal.real().v);
+  } else {
+    mlir::emitError(loc) << "invalid real constant";
+    return {};
+  }
 
-      mlir::FloatAttr attr = mlir::FloatAttr::get(fTy, val);
-      return moore::ShortrealLiteralOp::create(builder, loc, resultType, attr)
-          .getResult();
-    }
-    if (floatType->floatKind == slang::ast::FloatingType::Real) {
-      fTy = mlir::Float64Type::get(getContext());
-      resultType = moore::RealType::getReal(getContext());
-      val = svreal.real().v;
+  return moore::ConstantRealOp::create(builder, loc, attr);
+}
 
-      mlir::FloatAttr attr = mlir::FloatAttr::get(fTy, val);
-      return moore::RealLiteralOp::create(builder, loc, resultType, attr)
-          .getResult();
-    }
+/// Materialize a Slang string literal as a literal string constant op.
+Value Context::materializeString(const slang::ConstantValue &stringLiteral,
+                                 const slang::ast::Type &astType,
+                                 Location loc) {
+  slang::ConstantValue intVal = stringLiteral.convertToInt();
+  auto effectiveWidth = intVal.getEffectiveWidth();
+  if (!effectiveWidth)
+    return {};
+
+  auto intTy = moore::IntType::getInt(getContext(), effectiveWidth.value());
+
+  if (astType.isString()) {
+    auto immInt = moore::ConstantStringOp::create(builder, loc, intTy,
+                                                  stringLiteral.toString())
+                      .getResult();
+    return moore::IntToStringOp::create(builder, loc, immInt).getResult();
   }
   return {};
 }
@@ -1660,6 +2546,8 @@ Value Context::materializeConstant(const slang::ConstantValue &constant,
     return materializeSVInt(constant.integer(), type, loc);
   if (constant.isReal() || constant.isShortReal())
     return materializeSVReal(constant, type, loc);
+  if (constant.isString())
+    return materializeString(constant, type, loc);
 
   return {};
 }
@@ -1777,6 +2665,39 @@ static Value materializeSBVToPackedConversion(Context &context,
   return builder.createOrFold<moore::SBVToPackedOp>(loc, packedType, value);
 }
 
+/// Check whether the actual handle is a subclass of another handle type
+/// and return a properly upcast version if so.
+static mlir::Value maybeUpcastHandle(Context &context, mlir::Value actualHandle,
+                                     moore::ClassHandleType expectedHandleTy) {
+  auto loc = actualHandle.getLoc();
+
+  auto actualTy = actualHandle.getType();
+  auto actualHandleTy = dyn_cast<moore::ClassHandleType>(actualTy);
+  if (!actualHandleTy) {
+    mlir::emitError(loc) << "expected a !moore.class<...> value, got "
+                         << actualTy;
+    return {};
+  }
+
+  // Fast path: already the expected handle type.
+  if (actualHandleTy == expectedHandleTy)
+    return actualHandle;
+
+  if (!context.isClassDerivedFrom(actualHandleTy, expectedHandleTy)) {
+    mlir::emitError(loc)
+        << "receiver class " << actualHandleTy.getClassSym()
+        << " is not the same as, or derived from, expected base class "
+        << expectedHandleTy.getClassSym().getRootReference();
+    return {};
+  }
+
+  // Only implicit upcasting is allowed - down casting should never be implicit.
+  auto casted = moore::ClassUpcastOp::create(context.builder, loc,
+                                             expectedHandleTy, actualHandle)
+                    .getResult();
+  return casted;
+}
+
 Value Context::materializeConversion(Type type, Value value, bool isSigned,
                                      Location loc) {
   // Nothing to do if the types are already equal.
@@ -1838,6 +2759,26 @@ Value Context::materializeConversion(Type type, Value value, bool isSigned,
     return builder.createOrFold<moore::FormatStringOp>(loc, value);
   }
 
+  // If converting between two queue types of the same element type, then we
+  // just need to convert the queue bounds.
+  if (isa<moore::QueueType>(type) && isa<moore::QueueType>(value.getType()) &&
+      cast<moore::QueueType>(type).getElementType() ==
+          cast<moore::QueueType>(value.getType()).getElementType())
+    return builder.createOrFold<moore::QueueResizeOp>(loc, type, value);
+
+  // Convert from UnpackedArrayType to QueueType
+  if (isa<moore::QueueType>(type) &&
+      isa<moore::UnpackedArrayType>(value.getType())) {
+    auto queueElType = dyn_cast<moore::QueueType>(type).getElementType();
+    auto unpackedArrayElType =
+        dyn_cast<moore::UnpackedArrayType>(value.getType()).getElementType();
+
+    if (queueElType == unpackedArrayElType) {
+      return builder.createOrFold<moore::QueueFromUnpackedArrayOp>(loc, type,
+                                                                   value);
+    }
+  }
+
   // Handle Real To Int conversion
   if (isa<moore::IntType>(type) && isa<moore::RealType>(value.getType())) {
     auto twoValInt = builder.createOrFold<moore::RealToIntOp>(
@@ -1860,8 +2801,82 @@ Value Context::materializeConversion(Type type, Value value, bool isSigned,
           dyn_cast<moore::IntType>(value.getType()).getTwoValued(), value, true,
           loc);
 
-    return builder.createOrFold<moore::IntToRealOp>(loc, type, twoValInt);
+    if (isSigned)
+      return builder.createOrFold<moore::SIntToRealOp>(loc, type, twoValInt);
+    return builder.createOrFold<moore::UIntToRealOp>(loc, type, twoValInt);
   }
+
+  auto getBuiltinFloatType = [&](moore::RealType type) -> Type {
+    if (type.getWidth() == moore::RealWidth::f32)
+      return mlir::Float32Type::get(builder.getContext());
+
+    return mlir::Float64Type::get(builder.getContext());
+  };
+
+  // Handle f64/f32 to time conversion
+  if (isa<moore::TimeType>(type) && isa<moore::RealType>(value.getType())) {
+    auto intType =
+        moore::IntType::get(builder.getContext(), 64, Domain::TwoValued);
+    Type floatType =
+        getBuiltinFloatType(cast<moore::RealType>(value.getType()));
+    auto scale = moore::ConstantRealOp::create(
+        builder, loc, value.getType(),
+        FloatAttr::get(floatType, getTimeScaleInFemtoseconds(*this)));
+    auto scaled = builder.createOrFold<moore::MulRealOp>(loc, value, scale);
+    auto asInt = moore::RealToIntOp::create(builder, loc, intType, scaled);
+    auto asLogic = moore::IntToLogicOp::create(builder, loc, asInt);
+    return moore::LogicToTimeOp::create(builder, loc, asLogic);
+  }
+
+  // Handle time to f64/f32 conversion
+  if (isa<moore::RealType>(type) && isa<moore::TimeType>(value.getType())) {
+    auto asLogic = moore::TimeToLogicOp::create(builder, loc, value);
+    auto asInt = moore::LogicToIntOp::create(builder, loc, asLogic);
+    auto asReal = moore::UIntToRealOp::create(builder, loc, type, asInt);
+    Type floatType = getBuiltinFloatType(cast<moore::RealType>(type));
+    auto scale = moore::ConstantRealOp::create(
+        builder, loc, type,
+        FloatAttr::get(floatType, getTimeScaleInFemtoseconds(*this)));
+    return moore::DivRealOp::create(builder, loc, asReal, scale);
+  }
+
+  // Handle Int to String
+  if (isa<moore::StringType>(type)) {
+    if (auto intType = dyn_cast<moore::IntType>(value.getType())) {
+      if (intType.getDomain() == moore::Domain::FourValued)
+        value = moore::LogicToIntOp::create(builder, loc, value);
+      return moore::IntToStringOp::create(builder, loc, value);
+    }
+  }
+
+  // Handle String to Int
+  if (auto intType = dyn_cast<moore::IntType>(type)) {
+    if (isa<moore::StringType>(value.getType())) {
+      value = moore::StringToIntOp::create(builder, loc, intType.getTwoValued(),
+                                           value);
+
+      if (intType.getDomain() == moore::Domain::FourValued)
+        return moore::IntToLogicOp::create(builder, loc, value);
+
+      return value;
+    }
+  }
+
+  // Handle Int to FormatString
+  if (isa<moore::FormatStringType>(type)) {
+    auto asStr = materializeConversion(moore::StringType::get(getContext()),
+                                       value, isSigned, loc);
+    if (!asStr)
+      return {};
+    return moore::FormatStringOp::create(builder, loc, asStr, {}, {}, {});
+  }
+
+  if (isa<moore::RealType>(type) && isa<moore::RealType>(value.getType()))
+    return builder.createOrFold<moore::ConvertRealOp>(loc, type, value);
+
+  if (isa<moore::ClassHandleType>(type) &&
+      isa<moore::ClassHandleType>(value.getType()))
+    return maybeUpcastHandle(*this, value, cast<moore::ClassHandleType>(type));
 
   // TODO: Handle other conversions with dedicated ops.
   if (value.getType() != type)
@@ -1869,148 +2884,437 @@ Value Context::materializeConversion(Type type, Value value, bool isSigned,
   return value;
 }
 
-FailureOr<Value>
-Context::convertSystemCallArity0(const slang::ast::SystemSubroutine &subroutine,
-                                 Location loc) {
-
-  auto systemCallRes =
-      llvm::StringSwitch<std::function<FailureOr<Value>()>>(subroutine.name)
-          .Case("$urandom",
-                [&]() -> Value {
-                  return moore::UrandomBIOp::create(builder, loc, nullptr);
-                })
-          .Case("$random",
-                [&]() -> Value {
-                  return moore::RandomBIOp::create(builder, loc, nullptr);
-                })
-          .Case(
-              "$time",
-              [&]() -> Value { return moore::TimeBIOp::create(builder, loc); })
-          .Case(
-              "$stime",
-              [&]() -> Value { return moore::TimeBIOp::create(builder, loc); })
-          .Case(
-              "$realtime",
-              [&]() -> Value { return moore::TimeBIOp::create(builder, loc); })
-          .Default([&]() -> Value { return {}; });
-  return systemCallRes();
+/// Helper function to convert real math builtin functions that take exactly
+/// one argument.
+template <typename OpTy>
+static Value
+convertRealMathBI(Context &context, Location loc, StringRef name,
+                  std::span<const slang::ast::Expression *const> args) {
+  // Slang already checks the arity of real math builtins.
+  assert(args.size() == 1 && "real math builtin expects 1 argument");
+  auto value = context.convertRvalueExpression(*args[0]);
+  if (!value)
+    return {};
+  return OpTy::create(context.builder, loc, value);
 }
 
-FailureOr<Value>
-Context::convertSystemCallArity1(const slang::ast::SystemSubroutine &subroutine,
-                                 Location loc, Value value) {
-  auto systemCallRes =
-      llvm::StringSwitch<std::function<FailureOr<Value>()>>(subroutine.name)
-          // Signed and unsigned system functions.
-          .Case("$signed", [&]() { return value; })
-          .Case("$unsigned", [&]() { return value; })
+Value Context::convertSystemCall(
+    const slang::ast::SystemSubroutine &subroutine, Location loc,
+    std::span<const slang::ast::Expression *const> args) {
+  using ksn = slang::parsing::KnownSystemName;
+  StringRef name = subroutine.name;
+  auto nameId = subroutine.knownNameId;
+  size_t numArgs = args.size();
 
-          // Math functions in SystemVerilog.
-          .Case("$clog2",
-                [&]() -> FailureOr<Value> {
-                  value = convertToSimpleBitVector(value);
-                  if (!value)
-                    return failure();
-                  return (Value)moore::Clog2BIOp::create(builder, loc, value);
-                })
-          .Case("$ln",
-                [&]() -> Value {
-                  return moore::LnBIOp::create(builder, loc, value);
-                })
-          .Case("$log10",
-                [&]() -> Value {
-                  return moore::Log10BIOp::create(builder, loc, value);
-                })
-          .Case("$sin",
-                [&]() -> Value {
-                  return moore::SinBIOp::create(builder, loc, value);
-                })
-          .Case("$cos",
-                [&]() -> Value {
-                  return moore::CosBIOp::create(builder, loc, value);
-                })
-          .Case("$tan",
-                [&]() -> Value {
-                  return moore::TanBIOp::create(builder, loc, value);
-                })
-          .Case("$exp",
-                [&]() -> Value {
-                  return moore::ExpBIOp::create(builder, loc, value);
-                })
-          .Case("$sqrt",
-                [&]() -> Value {
-                  return moore::SqrtBIOp::create(builder, loc, value);
-                })
-          .Case("$floor",
-                [&]() -> Value {
-                  return moore::FloorBIOp::create(builder, loc, value);
-                })
-          .Case("$ceil",
-                [&]() -> Value {
-                  return moore::CeilBIOp::create(builder, loc, value);
-                })
-          .Case("$asin",
-                [&]() -> Value {
-                  return moore::AsinBIOp::create(builder, loc, value);
-                })
-          .Case("$acos",
-                [&]() -> Value {
-                  return moore::AcosBIOp::create(builder, loc, value);
-                })
-          .Case("$atan",
-                [&]() -> Value {
-                  return moore::AtanBIOp::create(builder, loc, value);
-                })
-          .Case("$sinh",
-                [&]() -> Value {
-                  return moore::SinhBIOp::create(builder, loc, value);
-                })
-          .Case("$cosh",
-                [&]() -> Value {
-                  return moore::CoshBIOp::create(builder, loc, value);
-                })
-          .Case("$tanh",
-                [&]() -> Value {
-                  return moore::TanhBIOp::create(builder, loc, value);
-                })
-          .Case("$asinh",
-                [&]() -> Value {
-                  return moore::AsinhBIOp::create(builder, loc, value);
-                })
-          .Case("$acosh",
-                [&]() -> Value {
-                  return moore::AcoshBIOp::create(builder, loc, value);
-                })
-          .Case("$atanh",
-                [&]() -> Value {
-                  return moore::AtanhBIOp::create(builder, loc, value);
-                })
-          .Case("$urandom",
-                [&]() -> Value {
-                  return moore::UrandomBIOp::create(builder, loc, value);
-                })
-          .Case("$random",
-                [&]() -> Value {
-                  return moore::RandomBIOp::create(builder, loc, value);
-                })
-          .Case("$realtobits",
-                [&]() -> Value {
-                  return moore::RealtobitsBIOp::create(builder, loc, value);
-                })
-          .Case("$bitstoreal",
-                [&]() -> Value {
-                  return moore::BitstorealBIOp::create(builder, loc, value);
-                })
-          .Case("$shortrealtobits",
-                [&]() -> Value {
-                  return moore::ShortrealtobitsBIOp::create(builder, loc,
-                                                            value);
-                })
-          .Case("$bitstoshortreal",
-                [&]() -> Value {
-                  return moore::BitstoshortrealBIOp::create(builder, loc,
-                                                            value);
-                })
-          .Default([&]() -> Value { return {}; });
-  return systemCallRes();
+  //===--------------------------------------------------------------------===//
+  // Random Number System Functions
+  //===--------------------------------------------------------------------===//
+
+  // $urandom, $random, and $urandom_range all map to a single
+  // moore.builtin.urandom_range primitive with (minval, maxval, seed).
+  if (nameId == ksn::URandom || nameId == ksn::Random) {
+    auto i32Ty = moore::IntType::getInt(builder.getContext(), 32);
+    auto minval = moore::ConstantOp::create(builder, loc, i32Ty, 0);
+    auto maxval =
+        moore::ConstantOp::create(builder, loc, i32Ty, APInt::getAllOnes(32));
+    Value seed;
+    if (numArgs == 1) {
+      seed = convertLvalueExpression(*args[0]);
+      if (!seed)
+        return {};
+    }
+    return moore::UrandomRangeBIOp::create(builder, loc, minval, maxval, seed);
+  }
+
+  if (nameId == ksn::URandomRange) {
+    auto i32Ty = moore::IntType::getInt(builder.getContext(), 32);
+    auto maxval = convertRvalueExpression(*args[0]);
+    if (!maxval)
+      return {};
+    Value minval;
+    if (numArgs >= 2) {
+      minval = convertRvalueExpression(*args[1]);
+      if (!minval)
+        return {};
+    } else {
+      minval = moore::ConstantOp::create(builder, loc, i32Ty, 0);
+    }
+    return moore::UrandomRangeBIOp::create(builder, loc, minval, maxval,
+                                           Value{});
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Time System Functions
+  //===--------------------------------------------------------------------===//
+
+  if (nameId == ksn::Time || nameId == ksn::STime || nameId == ksn::RealTime) {
+    // Slang already checks the arity of time functions.
+    assert(numArgs == 0 && "time functions take no arguments");
+    return moore::TimeBIOp::create(builder, loc);
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Math System Functions
+  //===--------------------------------------------------------------------===//
+
+  if (nameId == ksn::Clog2) {
+    // Slang already checks the arity of `$clog2`.
+    assert(numArgs == 1 && "`$clog2` takes 1 argument");
+    auto value = convertRvalueExpression(*args[0]);
+    if (!value)
+      return {};
+    value = convertToSimpleBitVector(value);
+    if (!value)
+      return {};
+    return moore::Clog2BIOp::create(builder, loc, value);
+  }
+
+  // Real math functions (all take 1 real argument)
+  if (nameId == ksn::Ln)
+    return convertRealMathBI<moore::LnBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Log10)
+    return convertRealMathBI<moore::Log10BIOp>(*this, loc, name, args);
+  if (nameId == ksn::Exp)
+    return convertRealMathBI<moore::ExpBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Sqrt)
+    return convertRealMathBI<moore::SqrtBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Floor)
+    return convertRealMathBI<moore::FloorBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Ceil)
+    return convertRealMathBI<moore::CeilBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Sin)
+    return convertRealMathBI<moore::SinBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Cos)
+    return convertRealMathBI<moore::CosBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Tan)
+    return convertRealMathBI<moore::TanBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Asin)
+    return convertRealMathBI<moore::AsinBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Acos)
+    return convertRealMathBI<moore::AcosBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Atan)
+    return convertRealMathBI<moore::AtanBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Sinh)
+    return convertRealMathBI<moore::SinhBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Cosh)
+    return convertRealMathBI<moore::CoshBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Tanh)
+    return convertRealMathBI<moore::TanhBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Asinh)
+    return convertRealMathBI<moore::AsinhBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Acosh)
+    return convertRealMathBI<moore::AcoshBIOp>(*this, loc, name, args);
+  if (nameId == ksn::Atanh)
+    return convertRealMathBI<moore::AtanhBIOp>(*this, loc, name, args);
+
+  //===--------------------------------------------------------------------===//
+  // Type Conversion System Functions
+  //===--------------------------------------------------------------------===//
+
+  if (nameId == ksn::Signed || nameId == ksn::Unsigned) {
+    // Slang already checks the arity of `$signed`/`$unsigned`.
+    assert(numArgs == 1 && "`$signed`/`$unsigned` take 1 argument");
+    // These are just passthroughs in the IR; signedness is carried on the Slang
+    // AST type which we use to convert the IR.
+    return convertRvalueExpression(*args[0]);
+  }
+
+  if (nameId == ksn::RealToBits)
+    return convertRealMathBI<moore::RealtobitsBIOp>(*this, loc, name, args);
+  if (nameId == ksn::BitsToReal)
+    return convertRealMathBI<moore::BitstorealBIOp>(*this, loc, name, args);
+  if (nameId == ksn::ShortrealToBits)
+    return convertRealMathBI<moore::ShortrealtobitsBIOp>(*this, loc, name,
+                                                         args);
+  if (nameId == ksn::BitsToShortreal)
+    return convertRealMathBI<moore::BitstoshortrealBIOp>(*this, loc, name,
+                                                         args);
+
+  //===--------------------------------------------------------------------===//
+  // String Methods
+  //===--------------------------------------------------------------------===//
+
+  if (nameId == ksn::Len) {
+    // Slang already checks the arity of string methods.
+    assert(numArgs == 1 && "`len` takes 1 argument");
+    auto stringType = moore::StringType::get(getContext());
+    auto value = convertRvalueExpression(*args[0], stringType);
+    if (!value)
+      return {};
+    return moore::StringLenOp::create(builder, loc, value);
+  }
+
+  if (nameId == ksn::ToUpper) {
+    // Slang already checks the arity of string methods.
+    assert(numArgs == 1 && "`toupper` takes 1 argument");
+    auto stringType = moore::StringType::get(getContext());
+    auto value = convertRvalueExpression(*args[0], stringType);
+    if (!value)
+      return {};
+    return moore::StringToUpperOp::create(builder, loc, value);
+  }
+
+  if (nameId == ksn::ToLower) {
+    // Slang already checks the arity of string methods.
+    assert(numArgs == 1 && "`tolower` takes 1 argument");
+    auto stringType = moore::StringType::get(getContext());
+    auto value = convertRvalueExpression(*args[0], stringType);
+    if (!value)
+      return {};
+    return moore::StringToLowerOp::create(builder, loc, value);
+  }
+
+  if (nameId == ksn::Getc) {
+    // Slang already checks the arity of string methods.
+    assert(numArgs == 2 && "`getc` takes 2 arguments");
+    auto stringType = moore::StringType::get(getContext());
+    auto str = convertRvalueExpression(*args[0], stringType);
+    auto index = convertRvalueExpression(*args[1]);
+    if (!str || !index)
+      return {};
+    return moore::StringGetOp::create(builder, loc, str, index);
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Queue Methods
+  //===--------------------------------------------------------------------===//
+
+  if (nameId == ksn::ArraySize) {
+    // Slang already checks the arity of `size`.
+    assert(numArgs == 1 && "`size` takes 1 argument");
+    if (args[0]->type->isQueue()) {
+      auto value = convertRvalueExpression(*args[0]);
+      if (!value)
+        return {};
+      return moore::QueueSizeBIOp::create(builder, loc, value);
+    }
+    if (args[0]->type->getCanonicalType().kind ==
+        slang::ast::SymbolKind::DynamicArrayType) {
+      auto value = convertRvalueExpression(*args[0]);
+      if (!value)
+        return {};
+      return moore::OpenUArraySizeOp::create(builder, loc, value);
+    }
+    if (args[0]->type->isAssociativeArray()) {
+      auto value = convertLvalueExpression(*args[0]);
+      if (!value)
+        return {};
+      return moore::AssocArraySizeOp::create(builder, loc, value);
+    }
+    emitError(loc) << "unsupported member function `size` on type `"
+                   << args[0]->type->toString() << "`";
+    return {};
+  }
+
+  if (nameId == ksn::Delete) {
+    // Slang already checks the arity of `delete`.
+    assert(numArgs == 1 && "`delete` takes 1 argument");
+    if (args[0]->type->getCanonicalType().kind ==
+        slang::ast::SymbolKind::DynamicArrayType) {
+      auto value = convertRvalueExpression(*args[0]);
+      if (!value)
+        return {};
+      return moore::OpenUArrayDeleteOp::create(builder, loc, value);
+    }
+    emitError(loc) << "unsupported member function `delete` on type `"
+                   << args[0]->type->toString() << "`";
+    return {};
+  }
+
+  if (nameId == ksn::PopBack) {
+    // Slang already checks the arity and applicability of `pop_back`.
+    assert(numArgs == 1 && "`pop_back` takes 1 argument");
+    assert(args[0]->type->isQueue() && "`pop_back` is only valid on queues");
+    auto value = convertLvalueExpression(*args[0]);
+    if (!value)
+      return {};
+    return moore::QueuePopBackOp::create(builder, loc, value);
+  }
+
+  if (nameId == ksn::PopFront) {
+    // Slang already checks the arity and applicability of `pop_front`.
+    assert(numArgs == 1 && "`pop_front` takes 1 argument");
+    assert(args[0]->type->isQueue() && "`pop_front` is only valid on queues");
+    auto value = convertLvalueExpression(*args[0]);
+    if (!value)
+      return {};
+    return moore::QueuePopFrontOp::create(builder, loc, value);
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Associative Array Methods
+  //===--------------------------------------------------------------------===//
+
+  if (nameId == ksn::Num) {
+    if (args[0]->type->isAssociativeArray()) {
+      assert(numArgs == 1 && "`num` takes 1 argument");
+      auto value = convertLvalueExpression(*args[0]);
+      if (!value)
+        return {};
+      return moore::AssocArraySizeOp::create(builder, loc, value);
+    }
+    emitError(loc) << "unsupported system call `" << name << "`";
+    return {};
+  }
+
+  if (nameId == ksn::Exists) {
+    // Slang already checks the arity and applicability of `exists`.
+    assert(numArgs == 2 && "`exists` takes 2 arguments");
+    assert(args[0]->type->isAssociativeArray() &&
+           "`exists` is only valid on associative arrays");
+    auto array = convertLvalueExpression(*args[0]);
+    auto key = convertRvalueExpression(*args[1]);
+    if (!array || !key)
+      return {};
+    return moore::AssocArrayExistsOp::create(builder, loc, array, key);
+  }
+
+  // Associative array traversal methods (all take 2 arguments: array ref, key
+  // ref). These names are shared with enum built-in methods (next/prev/first/
+  // last), which take 1 or 2 arguments. Only handle the associative array case
+  // here; fall through to the unsupported diagnostic for other types.
+  if (nameId == ksn::First || nameId == ksn::Last || nameId == ksn::Next ||
+      nameId == ksn::Prev) {
+    if (args[0]->type->isAssociativeArray()) {
+      assert(numArgs == 2 && "traversal methods take 2 arguments");
+      auto array = convertLvalueExpression(*args[0]);
+      auto key = convertLvalueExpression(*args[1]);
+      if (!array || !key)
+        return {};
+      if (nameId == ksn::First)
+        return moore::AssocArrayFirstOp::create(builder, loc, array, key);
+      if (nameId == ksn::Last)
+        return moore::AssocArrayLastOp::create(builder, loc, array, key);
+      if (nameId == ksn::Next)
+        return moore::AssocArrayNextOp::create(builder, loc, array, key);
+      if (nameId == ksn::Prev)
+        return moore::AssocArrayPrevOp::create(builder, loc, array, key);
+      llvm_unreachable("all traversal cases handled above");
+    }
+    emitError(loc) << "unsupported system call `" << name << "`";
+    return {};
+  }
+
+  // Unrecognized system call
+  emitError(loc) << "unsupported system call `" << name << "`";
+  return {};
+}
+
+// Resolve any (possibly nested) SymbolRefAttr to an op from the root.
+static mlir::Operation *resolve(Context &context, mlir::SymbolRefAttr sym) {
+  return context.symbolTable.lookupNearestSymbolFrom(context.intoModuleOp, sym);
+}
+
+bool Context::isClassDerivedFrom(const moore::ClassHandleType &actualTy,
+                                 const moore::ClassHandleType &baseTy) {
+  if (!actualTy || !baseTy)
+    return false;
+
+  mlir::SymbolRefAttr actualSym = actualTy.getClassSym();
+  mlir::SymbolRefAttr baseSym = baseTy.getClassSym();
+
+  if (actualSym == baseSym)
+    return true;
+
+  auto *op = resolve(*this, actualSym);
+  auto decl = llvm::dyn_cast_or_null<moore::ClassDeclOp>(op);
+  // Walk up the inheritance chain via ClassDeclOp::$base (SymbolRefAttr).
+  while (decl) {
+    mlir::SymbolRefAttr curBase = decl.getBaseAttr();
+    if (!curBase)
+      break;
+    if (curBase == baseSym)
+      return true;
+    decl = llvm::dyn_cast_or_null<moore::ClassDeclOp>(resolve(*this, curBase));
+  }
+  return false;
+}
+
+moore::ClassHandleType
+Context::getAncestorClassWithProperty(const moore::ClassHandleType &actualTy,
+                                      llvm::StringRef fieldName, Location loc) {
+  // Start at the actual class symbol.
+  mlir::SymbolRefAttr classSym = actualTy.getClassSym();
+
+  while (classSym) {
+    // Resolve the class declaration from the root symbol table owner.
+    auto *op = resolve(*this, classSym);
+    auto decl = llvm::dyn_cast_or_null<moore::ClassDeclOp>(op);
+    if (!decl)
+      break;
+
+    // Scan the class body for a property with the requested symbol name.
+    for (auto &block : decl.getBody()) {
+      for (auto &opInBlock : block) {
+        if (auto prop =
+                llvm::dyn_cast<moore::ClassPropertyDeclOp>(&opInBlock)) {
+          if (prop.getSymName() == fieldName) {
+            // Found a declaring ancestor: return its handle type.
+            return moore::ClassHandleType::get(actualTy.getContext(), classSym);
+          }
+        }
+      }
+    }
+
+    // Not found here—climb to the base class (if any) and continue.
+    classSym = decl.getBaseAttr(); // may be null; loop ends if so
+  }
+
+  // No ancestor declares that property.
+  mlir::emitError(loc) << "unknown property `" << fieldName << "`";
+  return {};
+}
+
+//===--------------------------------------------------------------------===//
+// Value Range Expression Methods
+//===--------------------------------------------------------------------===//
+
+Value Context::convertInsideCheck(Value insideLhs, Location loc,
+                                  const slang::ast::Expression &expr) {
+  // The value range list on the right-hand side of the inside operator is a
+  // comma-separated list of expressions or ranges.
+  if (const auto *valueRange = expr.as_if<slang::ast::ValueRangeExpression>()) {
+    auto lowBound =
+        convertToSimpleBitVector(convertRvalueExpression(valueRange->left()));
+    auto highBound =
+        convertToSimpleBitVector(convertRvalueExpression(valueRange->right()));
+    if (!insideLhs || !lowBound || !highBound)
+      return {};
+
+    Value rangeLhs, rangeRhs;
+    // Determine if the insideLhs on the left-hand side is inclusively
+    // within the range.
+    if (valueRange->left().type->isSigned() ||
+        insideLhs.getType().isSignedInteger()) {
+      rangeLhs = moore::SgeOp::create(builder, loc, insideLhs, lowBound);
+    } else {
+      rangeLhs = moore::UgeOp::create(builder, loc, insideLhs, lowBound);
+    }
+
+    if (valueRange->right().type->isSigned() ||
+        insideLhs.getType().isSignedInteger()) {
+      rangeRhs = moore::SleOp::create(builder, loc, insideLhs, highBound);
+    } else {
+      rangeRhs = moore::UleOp::create(builder, loc, insideLhs, highBound);
+    }
+
+    return moore::AndOp::create(builder, loc, rangeLhs, rangeRhs);
+  }
+
+  // Handle expressions.
+  if (!expr.type->isIntegral()) {
+    if (expr.type->isUnpackedArray()) {
+      mlir::emitError(loc,
+                      "unpacked arrays in 'inside' expressions not supported");
+      return {};
+    }
+    mlir::emitError(
+        loc, "only simple bit vectors supported in 'inside' expressions");
+    return {};
+  }
+
+  auto value = convertToSimpleBitVector(convertRvalueExpression(expr));
+  if (!value)
+    return {};
+  return moore::WildcardEqOp::create(builder, loc, insideLhs, value);
 }

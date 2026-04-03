@@ -1,7 +1,7 @@
 add_circt_dialect_library(CIRCTMooreTransforms
-LowerConcatRef.cpp
+SimplifyRefs.cpp
 SimplifyProcedures.cpp
-
+CreateVTables.cpp
 
   DEPENDS
   CIRCTMooreTransformsIncGen

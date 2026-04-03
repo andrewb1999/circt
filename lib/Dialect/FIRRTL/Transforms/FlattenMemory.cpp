@@ -45,7 +45,7 @@ struct FlattenMemoryPass
     return false;
   };
 
-  /// This pass flattens the aggregate data of memory into a UInt, and inserts
+  /// This pass converts data types of memories to a flat UInt, and inserts
   /// appropriate bitcasts to access the data.
   void runOnOperation() override {
     LLVM_DEBUG(llvm::dbgs() << "\n Running lower memory on module:"
@@ -53,6 +53,10 @@ struct FlattenMemoryPass
     SmallVector<Operation *> opsToErase;
     getOperation().getBodyBlock()->walk([&](MemOp memOp) {
       LLVM_DEBUG(llvm::dbgs() << "\n Memory:" << memOp);
+
+      // Nothing to do if the memory already has UInt type
+      if (type_isa<UIntType>(memOp.getDataType()))
+        return;
 
       // Cannot flatten a memory if it has debug ports, because debug port
       // implies a memtap and we cannot transform the datatype for a memory that
@@ -136,11 +140,11 @@ struct FlattenMemoryPass
         // memory with the wire.  We will be reconstructing the original type
         // in the wire from the bitvector of the flattened memory.
         auto result = memOp.getResult(index);
-        auto wire = WireOp::create(builder, result.getType(),
-                                   (memOp.getName() + "_" +
-                                    memOp.getPortName(index).getValue())
-                                       .str())
-                        .getResult();
+        auto wire =
+            WireOp::create(
+                builder, result.getType(),
+                (memOp.getName() + "_" + memOp.getPortName(index)).str())
+                .getResult();
         result.replaceAllUsesWith(wire);
         result = wire;
         auto newResult = flatMem.getResult(index);
@@ -209,7 +213,7 @@ struct FlattenMemoryPass
   }
 
 private:
-  // Convert an aggregate type into a flat list of fields. This is used to
+  // Convert a type into a flat list of fields. This is used to
   // flatten the aggregate memory datatype. Recursively populate the results
   // with each ground type field.
   static bool flattenType(FIRRTLType type,
@@ -238,15 +242,14 @@ private:
           })
           .Default([&](auto) { return false; });
     };
-    // Return true only if this is an aggregate with more than one element.
-    return flatten(type) && results.size() > 1;
+    return flatten(type);
   }
 
   Value getSubWhatever(ImplicitLocOpBuilder *builder, Value val, size_t index) {
     if (BundleType bundle = type_dyn_cast<BundleType>(val.getType()))
-      return builder->create<SubfieldOp>(val, index);
+      return SubfieldOp::create(*builder, val, index);
     if (FVectorType fvector = type_dyn_cast<FVectorType>(val.getType()))
-      return builder->create<SubindexOp>(val, index);
+      return SubindexOp::create(*builder, val, index);
 
     llvm_unreachable("Unknown aggregate type");
     return nullptr;

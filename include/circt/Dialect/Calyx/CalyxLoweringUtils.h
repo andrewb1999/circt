@@ -83,7 +83,7 @@ TGroup createGroup(OpBuilder &builder, calyx::ComponentOp compOp, Location loc,
                    Twine uniqueName) {
   mlir::IRRewriter::InsertionGuard guard(builder);
   builder.setInsertionPointToEnd(compOp.getWiresOp().getBodyBlock());
-  return builder.create<TGroup>(loc, uniqueName.str());
+  return TGroup::create(builder, loc, uniqueName.str());
 }
 
 // Creates a new calyx::StaticGroupOp group within compOp.
@@ -543,7 +543,7 @@ public:
       }
       }
     }
-    return builder.create<TLibraryOp>(loc, getUniqueName(name), resTypes);
+    return TLibraryOp::create(builder, loc, getUniqueName(name), resTypes);
   }
 
   template <typename TLibraryOp>

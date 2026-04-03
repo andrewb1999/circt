@@ -8,6 +8,8 @@ Welcome to the CIRCT project!
 (experimental!) effort looking to apply MLIR and the LLVM development
 methodology to the domain of hardware design tools.
 
+CIRCT is an [LLVM Incubator Project](https://llvm.org/docs/DeveloperPolicy.html#incubating-new-projects) and follows all LLVM policies. Before contributing, please review our [Developer Policy](DeveloperPolicy.md) and [AI Tool Use Policy](AIToolPolicy.md).
+
 Take a look at the following diagram, which gives a brief overview of the
 current [dialects and how they interact](https://circt.llvm.org/includes/img/dialects.svg):
 
@@ -106,6 +108,8 @@ To get something that runs fast, use `-DCMAKE_BUILD_TYPE=Release` or
 `-DCMAKE_BUILD_TYPE=RelWithDebInfo` if you want to go fast and optionally if
 you want debug info to go with it.  `Release` mode makes a very large difference
 in performance.
+
+To use the verilog frontend add `-DCIRCT_SLANG_FRONTEND_ENABLED=ON`.
 
 If you plan to use the Python bindings, you should also specify
 `-DCIRCT_BINDINGS_PYTHON_ENABLED=ON`.

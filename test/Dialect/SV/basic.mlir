@@ -241,35 +241,61 @@ hw.module @test1(in %arg0: i1, in %arg1: i1, in %arg8: i8) {
     sv.exit
   }
 
-  // Severity Message Tasks
+  // Severity Message Tasks (run-time)
   // CHECK-NEXT: sv.initial {
-  // CHECK-NEXT: sv.fatal 1
-  // CHECK-NEXT: sv.fatal 1, "hello"
-  // CHECK-NEXT: sv.fatal 1, "hello %d"(%arg0) : i1
-  // CHECK-NEXT: sv.error
-  // CHECK-NEXT: sv.error "hello"
-  // CHECK-NEXT: sv.error "hello %d"(%arg0) : i1
-  // CHECK-NEXT: sv.warning
-  // CHECK-NEXT: sv.warning "hello"
-  // CHECK-NEXT: sv.warning "hello %d"(%arg0) : i1
-  // CHECK-NEXT: sv.info
-  // CHECK-NEXT: sv.info "hello"
-  // CHECK-NEXT: sv.info "hello %d"(%arg0) : i1
+  // CHECK-NEXT: sv.fatal.procedural 1
+  // CHECK-NEXT: sv.fatal.procedural 1, "hello"
+  // CHECK-NEXT: sv.fatal.procedural 1, "hello %d"(%arg0) : i1
+  // CHECK-NEXT: sv.error.procedural
+  // CHECK-NEXT: sv.error.procedural "hello"
+  // CHECK-NEXT: sv.error.procedural "hello %d"(%arg0) : i1
+  // CHECK-NEXT: sv.warning.procedural
+  // CHECK-NEXT: sv.warning.procedural "hello"
+  // CHECK-NEXT: sv.warning.procedural "hello %d"(%arg0) : i1
+  // CHECK-NEXT: sv.info.procedural
+  // CHECK-NEXT: sv.info.procedural "hello"
+  // CHECK-NEXT: sv.info.procedural "hello %d"(%arg0) : i1
   // CHECK-NEXT: }
   sv.initial {
-    sv.fatal 1
-    sv.fatal 1, "hello"
-    sv.fatal 1, "hello %d"(%arg0) : i1
-    sv.error
-    sv.error "hello"
-    sv.error "hello %d"(%arg0) : i1
-    sv.warning
-    sv.warning "hello"
-    sv.warning "hello %d"(%arg0) : i1
-    sv.info
-    sv.info "hello"
-    sv.info "hello %d"(%arg0) : i1
+    sv.fatal.procedural 1
+    sv.fatal.procedural 1, "hello"
+    sv.fatal.procedural 1, "hello %d"(%arg0) : i1
+    sv.error.procedural
+    sv.error.procedural "hello"
+    sv.error.procedural "hello %d"(%arg0) : i1
+    sv.warning.procedural
+    sv.warning.procedural "hello"
+    sv.warning.procedural "hello %d"(%arg0) : i1
+    sv.info.procedural
+    sv.info.procedural "hello"
+    sv.info.procedural "hello %d"(%arg0) : i1
   }
+
+  // Elaboration-time Severity Message Tasks
+  // CHECK-NEXT: sv.fatal 1
+  // CHECK-NEXT: sv.fatal 1, "elaboration fatal"
+  // CHECK-NEXT: sv.fatal 1, "elaboration fatal %d"(%arg0) : i1
+  // CHECK-NEXT: sv.error
+  // CHECK-NEXT: sv.error "elaboration error"
+  // CHECK-NEXT: sv.error "elaboration error %d"(%arg0) : i1
+  // CHECK-NEXT: sv.warning
+  // CHECK-NEXT: sv.warning "elaboration warning"
+  // CHECK-NEXT: sv.warning "elaboration warning %d"(%arg0) : i1
+  // CHECK-NEXT: sv.info
+  // CHECK-NEXT: sv.info "elaboration info"
+  // CHECK-NEXT: sv.info "elaboration info %d"(%arg0) : i1
+  sv.fatal 1
+  sv.fatal 1, "elaboration fatal"
+  sv.fatal 1, "elaboration fatal %d"(%arg0) : i1
+  sv.error
+  sv.error "elaboration error"
+  sv.error "elaboration error %d"(%arg0) : i1
+  sv.warning
+  sv.warning "elaboration warning"
+  sv.warning "elaboration warning %d"(%arg0) : i1
+  sv.info
+  sv.info "elaboration info"
+  sv.info "elaboration info %d"(%arg0) : i1
 
   // Tests for ReadMemOp ($readmemb/$readmemh)
   // CHECK-NEXT: sv.initial {
@@ -445,4 +471,33 @@ hw.module @test_fflush(in %a : i32) {
     sv.fflush
     sv.fflush fd %a
   }
+}
+
+emit.file "test_header.vh" sym @test_header {
+  emit.verbatim "`define TEST_MACRO 1'b1"
+}
+
+// CHECK-LABEL: sv.verbatim.source @VerbatimTestModule.v
+// CHECK-SAME:    <WIDTH: i32 = 8>
+// CHECK-SAME:    attributes {
+// CHECK-SAME:      additional_files = [@test_header],
+// CHECK-SAME:      content = "module VerbatimTestModule(); endmodule",
+// CHECK-SAME:      output_file = #hw.output_file<"VerbatimTestModule.v">,
+// CHECK-SAME:      verilogName = "VerbatimTestModule"
+// CHECK-SAME:    }
+sv.verbatim.source @VerbatimTestModule.v<WIDTH: i32 = 8> attributes {
+    content = "module VerbatimTestModule(); endmodule",
+    output_file = #hw.output_file<"VerbatimTestModule.v">,
+    additional_files = [@test_header],
+    verilogName = "VerbatimTestModule"
+}
+
+// CHECK-LABEL: sv.verbatim.module @VerbatimTestModule
+// CHECK-SAME:    <WIDTH: i32 = 8>
+// CHECK-SAME:    (in %clk : i1, out out : i1)
+// CHECK-SAME:    attributes {
+// CHECK-SAME:      source = @VerbatimTestModule.v
+// CHECK-SAME:    }
+sv.verbatim.module @VerbatimTestModule<WIDTH: i32 = 8>(in %clk: i1, out out: i1) attributes {
+  source = @VerbatimTestModule.v
 }

@@ -82,7 +82,7 @@ public:
   // Write the location of the buffer to the MMIO space.
   void writeBufferPtr();
   // Connect allocate a buffer and prime the pump.
-  void connectImpl(std::optional<unsigned>) override;
+  void connectImpl(const ChannelPort::ConnectOptions &options) override;
   // Check for buffer fill.
   bool pollImpl() override;
 
@@ -189,9 +189,10 @@ void OneItemBuffersToHostReadPort::writeBufferPtr() {
                       reinterpret_cast<uint64_t>(buffer->getDevicePtr()));
 }
 
-void OneItemBuffersToHostReadPort::connectImpl(std::optional<unsigned>) {
+void OneItemBuffersToHostReadPort::connectImpl(
+    const ChannelPort::ConnectOptions &options) {
   engine->connect();
-  buffer = engine->hostMem->allocate(bufferSize, {});
+  buffer = engine->hostMem->allocate(bufferSize, {true, false});
   writeBufferPtr();
 }
 
@@ -279,14 +280,14 @@ public:
   }
 
   // Connect allocate a buffer and prime the pump.
-  void connectImpl(std::optional<unsigned>) override;
-
-  void write(const MessageData &) override;
-  bool tryWrite(const MessageData &data) override;
+  void connectImpl(const ChannelPort::ConnectOptions &options) override;
 
   std::string identifier() const { return idPath.toStr() + "." + channelName; }
 
 protected:
+  void writeImpl(const MessageData &) override;
+  bool tryWriteImpl(const MessageData &data) override;
+
   // Size of buffer based on type.
   size_t bufferSize;
   // Owning engine.
@@ -382,23 +383,24 @@ void OneItemBuffersFromHost::connect() {
   connected = true;
 }
 
-void OneItemBuffersFromHostWritePort::connectImpl(std::optional<unsigned>) {
+void OneItemBuffersFromHostWritePort::connectImpl(
+    const ChannelPort::ConnectOptions &options) {
   engine->connect();
-  data_buffer =
-      engine->hostMem->allocate(std::max(bufferSize, (size_t)512), {});
-  completion_buffer = engine->hostMem->allocate(512, {});
+  data_buffer = engine->hostMem->allocate(std::max(bufferSize, (size_t)512),
+                                          {false, false});
+  completion_buffer = engine->hostMem->allocate(512, {true, false});
   // Set the last byte to '1' to indicate that the buffer is ready to be filled
   // and sent to the device.
   *static_cast<uint8_t *>(completion_buffer->getPtr()) = 1;
 }
 
-void OneItemBuffersFromHostWritePort::write(const MessageData &data) {
-  while (!tryWrite(data))
+void OneItemBuffersFromHostWritePort::writeImpl(const MessageData &data) {
+  while (!tryWriteImpl(data))
     // Wait for the device to read the last data we sent.
     std::this_thread::yield();
 }
 
-bool OneItemBuffersFromHostWritePort::tryWrite(const MessageData &data) {
+bool OneItemBuffersFromHostWritePort::tryWriteImpl(const MessageData &data) {
   Logger &logger = engine->conn.getLogger();
 
   // Check to see if there's an outstanding write.

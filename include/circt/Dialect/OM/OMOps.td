@@ -155,7 +155,7 @@ def ClassOp : OMClassLike<"class", [
 
 def ClassFieldsOp : OMOp<"class.fields", [Terminator, ReturnLike, Pure,
       HasParent<"ClassOp">]> {
-  let arguments = (ins Variadic<AnyType>:$fields, 
+  let arguments = (ins Variadic<AnyType>:$fields,
                        OptionalAttr<LocationArrayAttr>:$field_locs);
   let assemblyFormat = [{
     attr-dict ($fields^ `:` qualified(type($fields)))?
@@ -184,15 +184,16 @@ def ClassExternOp : OMClassLike<"class.extern", [NoTerminator]> {
 // Object instantiations and fields
 //===----------------------------------------------------------------------===//
 
-def ObjectOp : OMOp<"object",
-    [DeclareOpInterfaceMethods<SymbolUserOpInterface>, Pure]> {
+def ObjectOp : OMOp<"object", [
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+]> {
   let arguments = (ins
     SymbolNameAttr:$className,
     Variadic<AnyType>:$actualParams
   );
 
   let results = (outs
-    ClassType:$result
+    Res<ClassType, "", [MemAlloc]>:$result
   );
 
   let builders = [
@@ -414,6 +415,23 @@ def FrozenEmptyPathOp : OMOp<"frozenpath_empty", [Pure]> {
   let assemblyFormat = "attr-dict";
 }
 
+def UnknownValueOp : OMOp<"unknown", [
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+]> {
+  let summary = "An operation with an unknown value used to tie-off connections";
+  let description = [{
+
+    An operation that is used to tie-off connections to objects for which we do
+    not care about the value being used.
+
+    This is used in situations where a class exists and is instantiated, but the
+    instantiator has no reasonable value that it can or should drive.
+  }];
+  let arguments = (ins);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
 def AnyCastOp : OMOp<"any_cast", [Pure]> {
   let summary = "Cast any value to any type.";
 
@@ -496,6 +514,26 @@ def IntegerShlOp : IntegerBinaryArithmeticOp<"integer.shl"> {
     %2 = om.integer.shl %0, %1 : !om.integer
     ```
   }];
+}
+
+def StringConcatOp : OMOp<"string.concat", [Pure, SameOperandsAndResultType]> {
+  let summary = "Concatenate multiple string values";
+  let description = [{
+    Perform string concatenation of multiple OM string values.
+
+    Example:
+    ```mlir
+    %3 = om.string.concat %0, %1, %2 : !om.string
+    ```
+  }];
+
+  let arguments = (ins Variadic<StringType>:$strings);
+  let results = (outs StringType:$result);
+
+  let assemblyFormat = "$strings attr-dict `:` type($result)";
+
+  let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
 
 #endif // CIRCT_DIALECT_OM_OMOPS_TD

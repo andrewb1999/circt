@@ -121,3 +121,35 @@ hw.module @maj_inv_constants_fold(out o1 : i2, out o2 : i2) {
   // CHECK: hw.output %c-2_i2, %c-1_i2 : i2, i2
   hw.output %0, %1 : i2, i2
 }
+
+// CHECK-LABEL: hw.module @parameter
+// Make sure that the parameter doesn't cause crash
+hw.module @parameter<in: i8> (in %a: i8, out o1: i8) {
+  %param = hw.param.value i8 = #hw.param.decl.ref<"in">
+  // CHECK-NEXT: %[[PARAM:.+]] = hw.param.value i8 = #hw.param.decl.ref<"in">
+  // CHECK-NEXT: synth.aig.and_inv
+  // CHECK-NEXT: synth.mig.maj_inv
+  %0 = synth.aig.and_inv %a, %param : i8
+  %1 = synth.mig.maj_inv %0, %a, %param : i8
+  hw.output %1 : i8
+}
+
+// CHECK-LABEL: hw.module @choice_single_operand
+hw.module @choice_single_operand(in %a: i4, out o: i4) {
+  // CHECK-NEXT: hw.output %a : i4
+  %0 = synth.choice %a : i4
+  hw.output %0 : i4
+}
+
+// CHECK-LABEL: func @test_transitive_merge
+func.func @test_transitive_merge(%x: i32, %y: i32, %z: i32, %u: i32, %v: i32) -> (i32, i32) {
+  %0 = synth.choice %x, %y, %z : i32
+  %1 = synth.choice %0, %u : i32
+  %2 = synth.choice %z, %v : i32
+  
+  // CHECK-NEXT: %[[MEGA_CHOICE:.*]] = synth.choice %arg3, %arg0, %arg1, %arg2, %arg4 : i32
+  // CHECK-NEXT: return %[[MEGA_CHOICE]], %[[MEGA_CHOICE]] : i32
+  return %1, %2 : i32, i32
+}
+
+

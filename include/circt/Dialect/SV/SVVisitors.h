@@ -43,10 +43,10 @@ public:
             FWriteOp, FFlushOp, SystemFunctionOp, VerbatimOp, MacroRefOp,
             FuncCallOp, FuncCallProceduralOp, ReturnOp, IncludeOp, MacroErrorOp,
             // Type declarations.
-            InterfaceOp, InterfaceSignalOp, InterfaceModportOp,
-            InterfaceInstanceOp, GetModportOp, AssignInterfaceSignalOp,
-            ReadInterfaceSignalOp, MacroDeclOp, MacroDefOp, FuncOp,
-            FuncDPIImportOp,
+            InterfaceOp, SVVerbatimSourceOp, InterfaceSignalOp,
+            InterfaceModportOp, InterfaceInstanceOp, GetModportOp,
+            AssignInterfaceSignalOp, ReadInterfaceSignalOp, MacroDeclOp,
+            MacroDefOp, FuncOp, FuncDPIImportOp,
             // Verification statements.
             AssertOp, AssumeOp, CoverOp, AssertConcurrentOp, AssumeConcurrentOp,
             CoverConcurrentOp, AssertPropertyOp, AssumePropertyOp,
@@ -56,7 +56,8 @@ public:
             // Simulator control tasks
             StopOp, FinishOp, ExitOp,
             // Severity message tasks
-            FatalOp, ErrorOp, WarningOp, InfoOp,
+            FatalProceduralOp, FatalOp, ErrorProceduralOp, WarningProceduralOp,
+            InfoProceduralOp, ErrorOp, WarningOp, InfoOp,
             // Memory loading tasks
             ReadMemOp,
             // Generate statements
@@ -147,6 +148,7 @@ public:
 
   // Type declarations.
   HANDLE(InterfaceOp, Unhandled);
+  HANDLE(SVVerbatimSourceOp, Unhandled);
   HANDLE(InterfaceInstanceOp, Unhandled);
   HANDLE(InterfaceSignalOp, Unhandled);
   HANDLE(InterfaceModportOp, Unhandled);
@@ -178,7 +180,11 @@ public:
   HANDLE(ExitOp, Unhandled);
 
   // Severity message tasks
+  HANDLE(FatalProceduralOp, Unhandled);
   HANDLE(FatalOp, Unhandled);
+  HANDLE(ErrorProceduralOp, Unhandled);
+  HANDLE(WarningProceduralOp, Unhandled);
+  HANDLE(InfoProceduralOp, Unhandled);
   HANDLE(ErrorOp, Unhandled);
   HANDLE(WarningOp, Unhandled);
   HANDLE(InfoOp, Unhandled);

@@ -54,7 +54,6 @@ circuit Foo: %[[
   ; CHECK: FILE "testbench{{[/\]}}Bar_Verification.sv"
   ; CHECK: module Bar_Verification();
   ; CHECK:   wire c = 1'h0;
-  ; CHECK:   wire c_probe = c;
   ; CHECK:   VerificationHelper helper ();
   ; CHECK: endmodule
 
@@ -66,7 +65,7 @@ circuit Foo: %[[
 
   ; CHECK: FILE "testbench{{[/\]}}Foo.sv"
   ; CHECK: module Foo();
-  ; CHECK:  wire d = Foo.bar.verification.c_probe;
+  ; CHECK:  wire d = Foo.bar.verification.c;
   ; CHECK:   Bar bar (
   ; CHECK:   .a (d)
   ; CHECK:   );
@@ -92,7 +91,6 @@ circuit TestHarness:
 
   ; CHECK: module DUT_Verification();
   ; CHECK:   reg  [31:0] pc_d;
-  ; CHECK:   wire [31:0] pc_d_probe = pc_d;
   ; CHECK:   always @(posedge DUT.clock)
   ; CHECK:     pc_d <= DUT.a;
   ; CHECK: endmodule
@@ -132,7 +130,7 @@ circuit TestHarness:
   ; CHECK:   `ifndef SYNTHESIS
   ; CHECK:     always @(posedge TestHarness.clock) begin
   ; CHECK:       if ((`PRINTF_COND_) & TestHarness.reset)
-  ; CHECK:         $fwrite(32'h80000002, "The last PC was: %x", TestHarness.dut.verification.pc_d_probe);
+  ; CHECK:         $fwrite(32'h80000002, "The last PC was: %x", TestHarness.dut.verification.pc_d);
   ; CHECK:     end // always @(posedge)
   ; CHECK:   `endif // not def SYNTHESIS
   ; CHECK: endmodule
@@ -333,3 +331,19 @@ circuit Top:
     inst foo of Foo
 
 ; CHECK: `include "layers-Bar-A.sv"
+
+; // -----
+
+; Check that bindfile for Top should include layers-MyExt-A when defname is
+; empty, falling back to the module name.
+
+FIRRTL version 5.1.0
+circuit TopEmptyDefname:
+  layer A, bind:
+
+  extmodule MyExt knownlayer A:
+
+  public module TopEmptyDefname:
+    inst ext of MyExt
+
+; CHECK: `include "layers-MyExt-A.sv"

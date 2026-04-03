@@ -11,7 +11,7 @@
 ## themselves since it needs to be compiled for each Python version and OS then
 ## packed together. Eventually, we'll just be distributing (lots of) binaries.
 ##
-## We require Python development package and pybind11 to compile the Python API.
+## We require Python development package and nanobind to compile the Python API.
 ##
 ## ESI cosimulation requires Cap'nProto as we use it for our RPC with the
 ## simulator. It must be fetched separately, but is optional if you don't want
@@ -129,6 +129,7 @@ set(ESICppRuntimeSources
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/Ports.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/Types.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/Utils.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/Values.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/backends/Trace.cpp
 )
 set(ESICppRuntimeHeaders
@@ -141,9 +142,11 @@ set(ESICppRuntimeHeaders
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Engines.h
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Logging.h
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Manifest.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Values.h
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Types.h
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Ports.h
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/Services.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/TypedPorts.h
 )
 set(ESICppRuntimeBackendHeaders
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/backends/Trace.h
@@ -168,6 +171,11 @@ else()
   )
 endif()
 add_library(esiaccel::ESICppRuntime ALIAS ESICppRuntime)
+
+# Set debug postfix for Windows libraries
+if(WIN32)
+  set_target_properties(ESICppRuntime PROPERTIES DEBUG_POSTFIX "_d")
+endif()
 
 target_include_directories(ESICppRuntime PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
@@ -208,8 +216,17 @@ install(TARGETS ESICppRuntime
   COMPONENT ESIRuntime
 )
 
+# Install PDB files for Windows Debug builds
+if(WIN32 AND MSVC)
+  install(FILES $<TARGET_PDB_FILE:ESICppRuntime>
+    DESTINATION ${ESIRT_INSTALL_LIBDIR}
+    COMPONENT ESIRuntime
+    OPTIONAL
+  )
+endif()
+
 install(FILES ${ESICppRuntimeHeaders}
-  DESTINATION include/esi
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/esi
   COMPONENT ESIRuntime
 )
 
@@ -239,29 +256,54 @@ set(ESIRuntimePath "${CMAKE_CURRENT_BINARY_DIR}"
 add_executable(esiquery
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tools/esiquery.cpp
 )
+# Set debug postfix for Windows executables
+if(WIN32)
+  set_target_properties(esiquery PROPERTIES DEBUG_POSTFIX "_d")
+endif()
 target_link_libraries(esiquery PRIVATE
   ESICppRuntime
   CLI11::CLI11
+  nlohmann_json::nlohmann_json
 )
 add_dependencies(ESIRuntime esiquery)
 install(TARGETS esiquery
   DESTINATION ${ESIRT_INSTALL_BINDIR}
   COMPONENT ESIRuntime
 )
+# Install PDB files for Windows Debug builds
+if(WIN32 AND MSVC)
+  install(FILES $<TARGET_PDB_FILE:esiquery>
+    DESTINATION ${ESIRT_INSTALL_BINDIR}
+    COMPONENT ESIRuntime
+    OPTIONAL
+  )
+endif()
 
 ##===----------------------------------------------------------------------===//
 ## The esitester tool is both an example and test driver. As it is not intended
-## for production use, it is not installed.
+## for production use, it is not installed or included in wheels.
 ##===----------------------------------------------------------------------===//
 
 add_executable(esitester
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tools/esitester.cpp
 )
+# Set debug postfix for Windows executables
+if(WIN32)
+  set_target_properties(esitester PROPERTIES DEBUG_POSTFIX "_d")
+endif()
 target_link_libraries(esitester PRIVATE
   ESICppRuntime
   CLI11::CLI11
 )
-add_dependencies(ESIRuntime esitester)
+# Install PDB files for Windows Debug builds
+if(WIN32 AND MSVC)
+  install(FILES $<TARGET_PDB_FILE:esitester>
+    DESTINATION ${ESIRT_INSTALL_BINDIR}
+    COMPONENT ESIRuntime
+    OPTIONAL
+  )
+endif()
+
 
 # Add the Python bindings.
 add_subdirectory(python)
@@ -284,48 +326,89 @@ if(ESI_COSIM)
     find_package(gRPC REQUIRED CONFIG)
   endif()
 
-  add_library(CosimBackend SHARED
-    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/backends/Cosim.cpp
+  set(PROTO_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
+  # CosimRpc library - wraps gRPC/protobuf dependencies
+  add_library(CosimRpc SHARED
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/backends/RpcClient.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/backends/RpcServer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cosim.proto
   )
   set(ESICppRuntimeBackendHeaders
     ${ESICppRuntimeBackendHeaders}
-    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/backends/Cosim.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/backends/RpcClient.h
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/backends/RpcServer.h
   )
 
-  target_link_libraries(CosimBackend PUBLIC
+  # Set debug postfix for Windows libraries
+  if(WIN32)
+    set_target_properties(CosimRpc PROPERTIES DEBUG_POSTFIX "_d")
+  endif()
+
+  target_link_libraries(CosimRpc PUBLIC
     ESICppRuntime
     protobuf::libprotobuf
     gRPC::grpc++
   )
-  set(PROTO_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-  target_include_directories(CosimBackend PUBLIC "$<BUILD_INTERFACE:${PROTO_BINARY_DIR}>")
+  target_include_directories(CosimRpc PUBLIC "$<BUILD_INTERFACE:${PROTO_BINARY_DIR}>")
   protobuf_generate(
-      TARGET CosimBackend
+      TARGET CosimRpc
       PROTOC_OUT_DIR "${PROTO_BINARY_DIR}")
   protobuf_generate(
-      TARGET CosimBackend
+      TARGET CosimRpc
       LANGUAGE grpc
       GENERATE_EXTENSIONS .grpc.pb.h .grpc.pb.cc
       PLUGIN "protoc-gen-grpc=\$<TARGET_FILE:gRPC::grpc_cpp_plugin>"
       PROTOC_OUT_DIR "${PROTO_BINARY_DIR}")
+
+
+  # CosimBackend library - the ESI backend plugin
+  add_library(CosimBackend SHARED
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/backends/Cosim.cpp
+  )
+  set(ESICppRuntimeBackendHeaders
+    ${ESICppRuntimeBackendHeaders}
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/esi/backends/Cosim.h
+  )
+
+  # Set debug postfix for Windows libraries
+  if(WIN32)
+    set_target_properties(CosimBackend PROPERTIES DEBUG_POSTFIX "_d")
+  endif()
+
+  target_link_libraries(CosimBackend PUBLIC
+    ESICppRuntime
+    CosimRpc
+  )
+  target_include_directories(CosimBackend PUBLIC "$<BUILD_INTERFACE:${PROTO_BINARY_DIR}>")
 
   add_dependencies(ESIRuntime CosimBackend)
 
   if(WIN32)
     # Windows cosim backend carries a lot of runtime dependencies, mainly
     # transitively through gRPC. Make sure they're installed as well.
-    install(TARGETS CosimBackend
+    install(TARGETS CosimRpc CosimBackend
       DESTINATION ${ESIRT_INSTALL_LIBDIR}
       RUNTIME_DEPENDENCIES
         PRE_EXCLUDE_REGEXES "api-ms-" "ext-ms-"
         POST_EXCLUDE_REGEXES ".*system32/.*\\.dll"
       COMPONENT ESIRuntime
     )
+    # Install PDB files for Windows Debug builds
+    if(MSVC)
+      install(FILES $<TARGET_PDB_FILE:CosimRpc>
+        DESTINATION ${ESIRT_INSTALL_LIBDIR}
+        COMPONENT ESIRuntime
+        OPTIONAL
+      )
+      install(FILES $<TARGET_PDB_FILE:CosimBackend>
+        DESTINATION ${ESIRT_INSTALL_LIBDIR}
+        COMPONENT ESIRuntime
+        OPTIONAL
+      )
+    endif()
   else()
-    install(TARGETS CosimBackend
+    install(TARGETS CosimRpc CosimBackend
       DESTINATION ${ESIRT_INSTALL_LIBDIR}
       COMPONENT ESIRuntime
     )
@@ -372,6 +455,12 @@ if (XRT_PATH)
 endif()
 
 install(FILES ${ESICppRuntimeBackendHeaders}
-  DESTINATION include/esi/backends
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/esi/backends
   COMPONENT ESIRuntime
 )
+
+# C++ unit tests (self-contained, no CIRCT/LLVM dependency).
+option(BUILD_TESTING "Build ESI runtime C++ unit tests" ON)
+if(BUILD_TESTING)
+  add_subdirectory(tests/cpp)
+endif()

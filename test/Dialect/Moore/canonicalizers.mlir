@@ -493,3 +493,19 @@ func.func @sub(%arg0: !moore.i32) -> !moore.i32 {
   // CHECK: return %arg0 :
   return %1 : !moore.i32
 }
+
+// CHECK-LABEL: @convertReal
+func.func @convertReal(%arg0: !moore.f32) -> !moore.f32 {
+  // CHECK-NOT: moore.convert_real
+  %0 = moore.convert_real %arg0 : !moore.f32 -> !moore.f32
+  return %0 : !moore.f32
+}
+
+// A self-referencing continuous assignment (assign w = w) must not crash.
+// CHECK-LABEL: moore.module @SelfAssignNet
+moore.module @SelfAssignNet() {
+  // CHECK: %w = moore.assigned_variable %w : l1
+  %w = moore.net wire : <l1>
+  %0 = moore.read %w : <l1>
+  moore.assign %w, %0 : l1
+}

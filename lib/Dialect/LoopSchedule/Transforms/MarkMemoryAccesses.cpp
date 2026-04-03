@@ -10,8 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
-
 #include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleAttributes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
@@ -26,6 +24,13 @@
 #include "llvm/ADT/StringExtras.h"
 #include <set>
 
+namespace circt {
+namespace loopschedule {
+#define GEN_PASS_DEF_MARKMEMORYACCESSES
+#include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h.inc"
+} // namespace loopschedule
+} // namespace circt
+
 using namespace circt;
 using namespace loopschedule;
 using namespace mlir;
@@ -37,7 +42,7 @@ using namespace mlir::affine;
 
 namespace {
 struct MarkMemoryAccessesPass
-    : public MarkMemoryAccessesBase<MarkMemoryAccessesPass> {
+    : public circt::loopschedule::impl::MarkMemoryAccessesBase<MarkMemoryAccessesPass> {
   void runOnOperation() override;
 };
 } // end anonymous namespace

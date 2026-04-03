@@ -14,6 +14,30 @@ hw.module @err(in %a: i1, in %b: i1) {
 
 // -----
 
+hw.module @err(in %a: i0) {
+  // expected-error @+1 {{op replicate must produce integer multiple of operand}}
+  %0 = comb.replicate %a : (i0) -> i16
+}
+
+// -----
+
+// This constraint is not absolutely necessary, and is enforced only to help diagnose bugs.
+// See https://github.com/llvm/circt/pull/6959#discussion_r1588142448
+hw.module @err(in %a: i0) {
+  // expected-error @+1 {{from bit too large for input}}
+  %0 = comb.extract %a from 1000 : (i0) -> i0
+}
+
+// -----
+
+// Checks extract verifier does not overflow.
+hw.module @err(in %a: i16) {
+  // expected-error @+1 {{from bit too large for input}}
+  %0 = comb.extract %a from 0xFFFFFFFF : (i16) -> i8
+}
+
+// -----
+
 hw.module @err(in %a: i4, out out: i7) {
   // expected-note @+1 {{prior use here}}
   %0 = comb.concat %a, %a : i4, i4
@@ -29,4 +53,18 @@ hw.module @err(in %a: i4, out out: i7) {
   // expected-error @+1 {{'comb.concat' op failed to infer returned types}}
   %0 = "comb.concat"(%a, %a) : (i4, i4) -> i7
   hw.output %0 : i7
+}
+
+// -----
+
+hw.module @err() {
+  // expected-error @below {{number of operands and types do not match: got 0 operands and 1 types}}
+  comb.concat : i1
+}
+
+// -----
+
+hw.module @err(in %arg0: i1) {
+  // expected-error @below {{number of operands and types do not match: got 1 operands and 0 types}}
+  comb.concat %arg0 :
 }

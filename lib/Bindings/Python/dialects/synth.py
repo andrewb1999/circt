@@ -5,9 +5,9 @@
 from . import synth, hw
 from ._synth_ops_gen import *
 from .._mlir_libs._circt._synth import _LongestPathAnalysis, _LongestPathCollection, _LongestPathDataflowPath, _LongestPathHistory, _LongestPathObject
-
+from ..ir import Value
 from dataclasses import dataclass
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Union, Optional
 
 # ============================================================================
 # Core Data Structures for Synth Longest Path Analysis
@@ -85,6 +85,16 @@ class Object:
     """Get the bit position for multi-bit signals."""
     return self._object.bit_pos
 
+  @property
+  def value(self) -> Optional[Value]:
+    """Get the MLIR value associated with this object, if any."""
+    return self._object.value
+
+  @property
+  def is_output_port(self) -> bool:
+    """Check if this object represents an output port."""
+    return self.value is None
+
 
 @dataclass
 class DebugPoint:
@@ -102,15 +112,6 @@ class DebugPoint:
   object: Object
   delay: int
   comment: str
-
-  @classmethod
-  def from_dict(cls, data: Dict[str, Any]) -> "DebugPoint":
-    """Create a DebugPoint from a dictionary representation."""
-    return cls(
-        object=Object.from_dict(data["object"]),
-        delay=data["delay"],
-        comment=data["comment"],
-    )
 
 
 @dataclass
@@ -330,6 +331,17 @@ class LongestPathCollection:
     """
     self.collection.merge(src.collection)
     # Re-initialize to reflect the merged collection
+    self.__init__(self.collection)
+
+  def drop_non_critical_paths(self, per_end_point: bool = True):
+    """
+        Drop all paths except the longest path per end point or start point.
+        Args:
+            per_end_point: Whether to keep only the longest path per end point
+                           (True) or per start point (False)
+    """
+    self.collection.drop_non_critical_paths(per_end_point)
+    # Re-initialize to reflect the dropped paths
     self.__init__(self.collection)
 
 

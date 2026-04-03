@@ -169,10 +169,35 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
                 markForRemoval(send);
                 return success();
               }
-            // Get an InnerRefAttr to the value being sent.
 
-            // Add a node, don't need to have symbol on defining operation,
-            // just a way to send out the value.
+            // If the value is a block argument (port), add an inner symbol
+            // directly to the port instead of creating a node.
+            if (isa<BlockArgument>(xmrDef)) {
+              addReachingSendsEntry(send.getResult(), getInnerRefTo(xmrDef));
+              markForRemoval(send);
+              return success();
+            }
+
+            // Get an InnerRefAttr to the value being sent.
+            auto *xmrDefOp = xmrDef.getDefiningOp();
+
+            // Add the symbol directly if the operation targets a specific
+            // result. This ensures that operations like InstanceOp and MemOp,
+            // which have inner symbols that target the operation itself (not a
+            // specific result), still get nodes created to distinguish which
+            // result is being referenced.
+            if (auto innerSymOp =
+                    dyn_cast_or_null<hw::InnerSymbolOpInterface>(xmrDefOp))
+              if (innerSymOp.getTargetResultIndex()) {
+                addReachingSendsEntry(send.getResult(), getInnerRefTo(xmrDef));
+                markForRemoval(send);
+                return success();
+              }
+
+            // The operation cannot support an inner symbol, or it has
+            // multiple results and doesn't target a specific result, so
+            // create a node and replace all uses of the original value with
+            // the node (except the node itself).
             ImplicitLocOpBuilder b(xmrDef.getLoc(), &getContext());
             b.setInsertionPointAfterValue(xmrDef);
             SmallString<32> opName;
@@ -184,7 +209,7 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
                 rootKnown) {
               opName = name + "_probe";
               nameKind = NameKindEnum::InterestingName;
-            } else if (auto *xmrDefOp = xmrDef.getDefiningOp()) {
+            } else if (xmrDefOp) {
               // Inspect "name" directly for ops that aren't named by above.
               // (e.g., firrtl.constant)
               if (auto name = xmrDefOp->getAttrOfType<StringAttr>("name")) {
@@ -192,7 +217,20 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
                 nameKind = NameKindEnum::InterestingName;
               }
             }
-            xmrDef = NodeOp::create(b, xmrDef, opName, nameKind).getResult();
+            auto node = NodeOp::create(b, xmrDef, opName, nameKind);
+            auto newValue = node.getResult();
+            // Replace all uses except the node itself and except when the value
+            // is the destination of a connect (operand 0). We need to preserve
+            // connect destinations to maintain proper flow semantics.
+            xmrDef.replaceUsesWithIf(newValue, [&](OpOperand &operand) {
+              if (operand.getOwner() == node.getOperation())
+                return false;
+              if (isa<FConnectLike>(operand.getOwner()) &&
+                  operand.getOperandNumber() == 0)
+                return false;
+              return true;
+            });
+            xmrDef = newValue;
 
             // Create a new entry for this RefSendOp. The path is currently
             // local.
@@ -416,11 +454,8 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
   /// Generate the ABI ref_<module> prefix string into `prefix`.
   void getRefABIPrefix(FModuleLike mod, SmallVectorImpl<char> &prefix) {
     auto modName = mod.getModuleName();
-    if (auto ext = dyn_cast<FExtModuleOp>(*mod)) {
-      // Use defName for module portion, if set.
-      if (auto defname = ext.getDefname(); defname && !defname->empty())
-        modName = *defname;
-    }
+    if (auto ext = dyn_cast<FExtModuleOp>(*mod))
+      modName = ext.getExtModuleName();
     (Twine("ref_") + modName).toVector(prefix);
   }
 
@@ -587,22 +622,11 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
                                  InstanceGraph &instanceGraph) {
     Operation *mod = inst.getReferencedModule(instanceGraph);
     if (auto extRefMod = dyn_cast<FExtModuleOp>(mod)) {
-      // Extern modules can generate RefType ports, they have an attached
-      // attribute which specifies the internal path into the extern module.
-      // This string attribute will be used to generate the final xmr.
-      auto internalPaths = extRefMod.getInternalPaths();
       auto numPorts = inst.getNumResults();
       SmallString<128> circuitRefPrefix;
 
       /// Get the resolution string for this ref-type port.
       auto getPath = [&](size_t portNo) {
-        // If there's an internal path specified (with path), use that.
-        if (internalPaths)
-          if (auto path =
-                  cast<InternalPathAttr>(internalPaths->getValue()[portNo])
-                      .getPath())
-            return path;
-
         // Otherwise, we're using the ref ABI.  Generate the prefix string
         // and return the macro for the specified port.
         if (circuitRefPrefix.empty())
@@ -806,7 +830,7 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
         for (const auto &res : llvm::enumerate(mem.getResults())) {
           if (isa<RefType>(mem.getResult(res.index()).getType()))
             continue;
-          resultNames.push_back(mem.getPortName(res.index()));
+          resultNames.push_back(mem.getPortNameAttr(res.index()));
           resultTypes.push_back(res.value().getType());
           portAnnotations.push_back(mem.getPortAnnotation(res.index()));
           oldResults.push_back(res.value());

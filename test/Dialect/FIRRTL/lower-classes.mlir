@@ -200,7 +200,7 @@ firrtl.circuit "PathModule" {
   // CHECK:   om.object @PathTest
   // CHECK: om.class @PathTest(%basepath: !om.basepath)
   firrtl.class @PathTest() {
-    
+
     // CHECK: om.path_create reference %basepath [[PORT_PATH]]
     %port_path = firrtl.path reference distinct[0]<>
 
@@ -374,6 +374,21 @@ firrtl.circuit "ModuleWithPropertySubmodule" {
   }
 }
 
+// CHECK-LABEL: firrtl.circuit "ModuleWithObjectNoPorts"
+firrtl.circuit "ModuleWithObjectNoPorts" {
+  firrtl.class private @Metadata() {
+  }
+  // Ensure that a module with no property ports, but contains an object results
+  // in a class.
+  //
+  // CHECK: om.class @Baz_Class
+  firrtl.module private @Baz() {
+    // CHECK: om.object @Metadata
+    %meta = firrtl.object @Metadata()
+  }
+  firrtl.extmodule @ModuleWithObjectNoPorts()
+}
+
 // CHECK-LABEL: firrtl.circuit "DownwardReferences"
 firrtl.circuit "DownwardReferences" {
   firrtl.class @MyClass() {
@@ -406,6 +421,19 @@ firrtl.circuit "IntegerArithmetic" {
 
     // CHECK: om.integer.shl %in0, %in1 : !om.integer
     %3 = firrtl.integer.shl %in0, %in1 : (!firrtl.integer, !firrtl.integer) -> !firrtl.integer
+  }
+}
+
+// CHECK-LABEL: firrtl.circuit "StringCat"
+firrtl.circuit "StringCat" {
+  firrtl.module @StringCat() {}
+
+  // CHECK-LABEL: om.class @StringConcatClass
+  firrtl.class @StringConcatClass(in %a: !firrtl.string, in %b: !firrtl.string, out %c: !firrtl.string) {
+    // CHECK: %[[CONCAT:.+]] = om.string.concat %a, %b : !om.string
+    %0 = firrtl.string.concat %a, %b : !firrtl.string
+    // CHECK: om.class.fields %[[CONCAT]]
+    firrtl.propassign %c, %0 : !firrtl.string
   }
 }
 
@@ -552,21 +580,21 @@ firrtl.circuit "RTLPorts" {
     // CHECK: [[PORTS_LIST:%.+]] = om.list_create [[INPUT_OBJ]], [[OUTPUT_OBJ]]
 
     // CHECK: om.object @NeedsRTLPorts(%basepath, [[MODULE_PATH]], [[PORTS_LIST]])
-    %object = firrtl.object @NeedsRTLPorts(in containingModule_in: !firrtl.path, out containingModule: !firrtl.path)
-    %field = firrtl.object.subfield %object[containingModule_in] : !firrtl.class<@NeedsRTLPorts(in containingModule_in: !firrtl.path, out containingModule: !firrtl.path)>
+    %object = firrtl.object @NeedsRTLPorts(in __in_containingModule: !firrtl.path, out containingModule: !firrtl.path)
+    %field = firrtl.object.subfield %object[__in_containingModule] : !firrtl.class<@NeedsRTLPorts(in __in_containingModule: !firrtl.path, out containingModule: !firrtl.path)>
     firrtl.propassign %field, %path : !firrtl.path
 
     // Add a second instance to ensure the RtlPorts class is only declared once.
-    %object2 = firrtl.object @NeedsRTLPorts(in containingModule_in: !firrtl.path, out containingModule: !firrtl.path)
-    %field2 = firrtl.object.subfield %object2[containingModule_in] : !firrtl.class<@NeedsRTLPorts(in containingModule_in: !firrtl.path, out containingModule: !firrtl.path)>
+    %object2 = firrtl.object @NeedsRTLPorts(in __in_containingModule: !firrtl.path, out containingModule: !firrtl.path)
+    %field2 = firrtl.object.subfield %object2[__in_containingModule] : !firrtl.class<@NeedsRTLPorts(in __in_containingModule: !firrtl.path, out containingModule: !firrtl.path)>
     firrtl.propassign %field2, %path : !firrtl.path
   }
 
-  // CHECK: om.class @NeedsRTLPorts(%basepath: !om.basepath, %containingModule_in: !om.path, %ports: !om.list<!om.class.type<@RtlPort>>)
+  // CHECK: om.class @NeedsRTLPorts(%basepath: !om.basepath, %__in_containingModule: !om.path, %ports: !om.list<!om.class.type<@RtlPort>>)
   // CHECK-SAME: -> (containingModule: !om.path, ports: !om.list<!om.class.type<@RtlPort>>)
-  firrtl.class @NeedsRTLPorts(in %containingModule_in: !firrtl.path, out %containingModule: !firrtl.path) {
-    // CHECK: om.class.fields  %containingModule_in, %ports : !om.path, !om.list<!om.class.type<@RtlPort>>
-    firrtl.propassign %containingModule, %containingModule_in : !firrtl.path
+  firrtl.class @NeedsRTLPorts(in %__in_containingModule: !firrtl.path, out %containingModule: !firrtl.path) {
+    // CHECK: om.class.fields  %__in_containingModule, %ports : !om.path, !om.list<!om.class.type<@RtlPort>>
+    firrtl.propassign %containingModule, %__in_containingModule : !firrtl.path
   }
 
   // CHECK: om.class @RtlPort(%ref: !om.path, %direction: !om.string, %width: !om.integer)  -> (ref: !om.path, direction: !om.string, width: !om.integer)
@@ -609,5 +637,69 @@ firrtl.circuit "MissingConversionCastRegression" {
   }
 
   firrtl.class private @Bar() {
+  }
+}
+
+// Test that external modules with the same defname:
+//
+// 1. create only one class
+// 2. drop property ports from both external modules
+//
+// See: https://github.com/llvm/circt/issues/9468
+//
+// CHECK-LABEL: firrtl.circuit "SameDefname"
+firrtl.circuit "SameDefname" {
+  // CHECK:      firrtl.extmodule @Bar_1
+  // CHECK-NOT:    in a: !firrtl.integer
+  // CHECK-SAME:   out b: !firrtl.uint<1>
+  firrtl.extmodule @Bar_1<WIDTH: ui32 = 1>(
+    in a: !firrtl.integer,
+    out b: !firrtl.uint<1>
+  ) attributes {defname = "Bar"}
+  // CHECK:      firrtl.extmodule @Bar_2
+  // CHECK-NOT:    in a: !firrtl.integer
+  // CHECK-SAME:   out b: !firrtl.uint<2>
+  firrtl.extmodule @Bar_2<WIDTH: ui32 = 2>(
+    in a: !firrtl.integer,
+    out b: !firrtl.uint<2>
+  ) attributes {defname = "Bar"}
+  // CHECK:      om.class.extern @Bar_Class(
+  // CHECK-SAME:   %basepath: !om.basepath
+  // CHECK-SAME:   %a: !om.integer
+  firrtl.module @SameDefname() {
+    %bar_1_a, %bar_1_b = firrtl.instance bar_1 @Bar_1(
+      in a: !firrtl.integer,
+      out b: !firrtl.uint<1>
+    )
+    %bar_2_a, %bar_2_b = firrtl.instance bar_2 @Bar_2(
+      in a: !firrtl.integer,
+      out b: !firrtl.uint<2>
+    )
+    %0 = firrtl.integer 0
+    firrtl.propassign %bar_1_a, %0 : !firrtl.integer
+    firrtl.propassign %bar_2_a, %0 : !firrtl.integer
+  }
+}
+
+firrtl.circuit "UnknownValue" {
+  // Simple class for testing unknown object references
+  firrtl.class private @SimpleClass(out %value: !firrtl.integer) {
+    %0 = firrtl.integer 42
+    firrtl.propassign %value, %0 : !firrtl.integer
+  }
+
+  // CHECK-LABEL: om.class @UnknownValue_Class
+  // CHECK-SAME: -> (a: !om.integer, b: !om.string, c: !om.class.type<@SimpleClass>)
+  firrtl.module @UnknownValue(out %a: !firrtl.integer, out %b: !firrtl.string, out %c: !firrtl.class<@SimpleClass(out value: !firrtl.integer)>) {
+    // CHECK: %[[UNKNOWN_INT:.+]] = om.unknown : !om.integer
+    %0 = firrtl.unknown : !firrtl.integer
+    firrtl.propassign %a, %0 : !firrtl.integer
+    // CHECK: %[[UNKNOWN_STR:.+]] = om.unknown : !om.string
+    %1 = firrtl.unknown : !firrtl.string
+    firrtl.propassign %b, %1 : !firrtl.string
+    // CHECK: %[[UNKNOWN_OBJ:.+]] = om.unknown : !om.class.type<@SimpleClass>
+    %2 = firrtl.unknown : !firrtl.class<@SimpleClass(out value: !firrtl.integer)>
+    firrtl.propassign %c, %2 : !firrtl.class<@SimpleClass(out value: !firrtl.integer)>
+    // CHECK: om.class.fields %[[UNKNOWN_INT]], %[[UNKNOWN_STR]], %[[UNKNOWN_OBJ]] : !om.integer, !om.string, !om.class.type<@SimpleClass>
   }
 }

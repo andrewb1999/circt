@@ -9,12 +9,14 @@
 add_circt_dialect_library(CIRCTSynthAnalysis
   LongestPathAnalysis.cpp
   PrintLongestPathAnalysis.cpp
+  ResourceUsageAnalysis.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/Synth
 
   DEPENDS
   CIRCTSynthTransformsIncGen
+  CIRCTConversionPassIncGen
 
   LINK_COMPONENTS
   Support

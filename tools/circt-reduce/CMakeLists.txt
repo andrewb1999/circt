@@ -13,10 +13,13 @@ set(LIBS
   CIRCTEmitReductions
   CIRCTHWReductions
   CIRCTFIRRTLReductions
+  CIRCTOMReductions
+  CIRCTRTGReductions
   CIRCTReduceLib
   MLIRIR
   MLIRBytecodeWriter
   MLIRParser
+  MLIRPluginsLib
   MLIRSupport
   MLIRTransforms
   MLIRReduceLib

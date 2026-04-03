@@ -35,6 +35,7 @@ class SourceFiles:
     self.dpi_sv: List[Path] = [
         CosimCollateralDir / "Cosim_DpiPkg.sv",
         CosimCollateralDir / "Cosim_Endpoint.sv",
+        CosimCollateralDir / "Cosim_CycleCount.sv",
         CosimCollateralDir / "Cosim_Manifest.sv",
     ]
     # Name of the top module.
@@ -115,6 +116,7 @@ class Simulator:
                sources: SourceFiles,
                run_dir: Path,
                debug: bool,
+               save_waveform: bool = False,
                run_stdout_callback: Optional[Callable[[str], None]] = None,
                run_stderr_callback: Optional[Callable[[str], None]] = None,
                compile_stdout_callback: Optional[Callable[[str], None]] = None,
@@ -130,6 +132,9 @@ class Simulator:
       sources: SourceFiles describing RTL/DPI inputs.
       run_dir: Directory where build/run artifacts are placed.
       debug: Enable cosim debug mode.
+      save_waveform: When True and debug=True, dump simulator waveforms to a
+        waveform file. The exact format depends on the backend (e.g. FST for
+        Verilator, VCD for Questa). Requires debug to be enabled.
       run_stdout_callback: Line-based callback for runtime stdout.
       run_stderr_callback: Line-based callback for runtime stderr.
       compile_stdout_callback: Line-based callback for compile stdout.
@@ -142,6 +147,7 @@ class Simulator:
     self.sources = sources
     self.run_dir = run_dir
     self.debug = debug
+    self.save_waveform = save_waveform
     self.macro_definitions = macro_definitions
 
     # Unified list of any log file handles we opened.
@@ -210,16 +216,18 @@ class Simulator:
       if isinstance(ret, int) and ret != 0:
         print("====== Compilation failure")
 
-        # If we have the default file loggers, print the compilation logs to
-        # console. Else, assume that the user has already captured them.
-        if self.UsesStderr:
-          if self._compile_stderr_log is not None:
-            self._compile_stderr_log.seek(0)
-            print(self._compile_stderr_log.read())
-        else:
-          if self._compile_stdout_log is not None:
-            self._compile_stdout_log.seek(0)
-            print(self._compile_stdout_log.read())
+        # Always print both stdout and stderr so that linker errors (which go
+        # to stdout for cmake/ninja) are not silently hidden.
+        if self._compile_stdout_log is not None:
+          self._compile_stdout_log.seek(0)
+          stdout_content = self._compile_stdout_log.read()
+          if stdout_content:
+            print(stdout_content)
+        if self._compile_stderr_log is not None:
+          self._compile_stderr_log.seek(0)
+          stderr_content = self._compile_stderr_log.read()
+          if stderr_content:
+            print(stderr_content)
 
         return ret
     return 0
@@ -227,6 +235,16 @@ class Simulator:
   def run_command(self, gui: bool) -> List[str]:
     """Return the command to run the simulation."""
     assert False, "Must be implemented by subclass"
+
+  @property
+  def waveform_extension(self) -> str:
+    """File extension for waveform dumps.
+
+    Subclasses should override if their format differs.  The Verilator C++
+    driver writes FST (via ``VerilatedFstC``); the generic SV driver uses
+    ``$dumpfile/$dumpvars`` which produces VCD.
+    """
+    return ".vcd"
 
   def run_proc(self, gui: bool = False) -> SimProcess:
     """Run the simulation process. Returns the Popen object and the port which
@@ -250,10 +268,15 @@ class Simulator:
     # Run the simulation.
     simEnv = Simulator.get_env()
     if self.debug:
-      simEnv["COSIM_DEBUG_FILE"] = "cosim_debug.log"
+      debug_file = (self.run_dir / "cosim_debug.log").resolve()
+      simEnv["COSIM_DEBUG_FILE"] = str(debug_file)
       if "DEBUG_PERIOD" not in simEnv:
         # Slow the simulation down to one tick per millisecond.
         simEnv["DEBUG_PERIOD"] = "1"
+      if self.save_waveform:
+        waveform_file = (self.run_dir /
+                         f"cosim_waveform{self.waveform_extension}").resolve()
+        simEnv["SAVE_WAVE"] = str(waveform_file)
     rcmd = self.run_command(gui)
     # Start process with asynchronous output capture.
     proc, threads = self._start_process_with_callbacks(
@@ -380,3 +403,19 @@ class Simulator:
     finally:
       if simProc and simProc.proc.poll() is None:
         simProc.force_stop()
+
+
+def get_simulator(name: str,
+                  sources: SourceFiles,
+                  rundir: Path,
+                  debug: bool,
+                  save_waveform: bool = False) -> Simulator:
+  name = name.lower()
+  if name == "verilator":
+    from .verilator import Verilator
+    return Verilator(sources, rundir, debug, save_waveform=save_waveform)
+  elif name == "questa":
+    from .questa import Questa
+    return Questa(sources, rundir, debug, save_waveform=save_waveform)
+  else:
+    raise ValueError(f"Unknown simulator: {name}")

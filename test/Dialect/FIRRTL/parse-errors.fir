@@ -107,7 +107,7 @@ circuit subfield_of_ground_type :
   public module subfield_of_ground_type :
     input a: UInt<1>
     output b: UInt<1>
-    ; expected-error @+1 {{subfield requires bundle or object operand}}
+    ; expected-error @+1 {{subfield requires bundle, object, or domain operand}}
     connect b, a.a
 
 ;// -----
@@ -607,52 +607,10 @@ circuit InProbeTop:
 FIRRTL version 4.0.0
 circuit InProbeExt:
   extmodule BadExtMod:
-    input p : Probe<UInt<1>> ; expected-error {{references in ports must be output on extmodule and intmodule}}
+    input p : Probe<UInt<1>> ; expected-error {{input probe not allowed}}
 
-  module InProbeExt:
+  public module InProbeExt:
     inst e of BadExtMod
-
-;// -----
-
-FIRRTL version 3.0.0
-circuit RefDupe:
-  extmodule RefDupe:
-    output p : Probe<UInt<2>>
-    ref p is "x.y"
-    ref p is "a.z" ; expected-error {{duplicate ref statement for 'p'}}
-
-;// -----
-; Either use ref statements or ABI, can't partially use ref statements.
-
-FIRRTL version 3.0.0
-circuit MissingRef:
-  extmodule MissingRef:
-    output p : Probe<UInt<2>> ; expected-error {{no ref statement found for ref port "p"}}
-    output q : Probe<UInt<2>>
-    ref q is "foo.bar"
-
-;// -----
-
-FIRRTL version 3.0.0
-circuit UnusedRef:
-  extmodule UnusedRef:
-    ref p is "x.y" ; expected-error {{unused ref statement}}
-
-;// -----
-
-FIRRTL version 3.0.0
-circuit RefNotString:
-  extmodule RefNotString:
-    output p : Probe<UInt<2>>
-    ref p is a.b ; expected-error {{expected string in ref statement}}
-
-;// -----
-
-FIRRTL version 3.0.0
-circuit RefForAggElement:
-  extmodule RefForAggElement:
-    output p : { x: Probe<UInt<2>> }
-    ref p.x is a.b ; expected-error {{ref statements for aggregate elements not yet supported}}
 
 ;// -----
 
@@ -663,14 +621,6 @@ circuit ConnectWrongType:
     output b: SInt<1>
 
     connect b, a ; expected-error {{cannot connect non-equivalent type}}
-
-;// -----
-FIRRTL version 4.0.0
-
-circuit RefStatementDeprecated:
-  extmodule RefStatementDeprecated:
-    output p : Probe<UInt<1>>
-    ref p is "x.y" ; expected-error {{ref statements were removed in FIRRTL 4.0.0, but the specified FIRRTL version was 4.0.0}}
 
 ;// -----
 
@@ -1978,3 +1928,39 @@ circuit Domains:
     input  y : Domain of D
     ; expected-error @below {{expected domain-type expression, got '!firrtl.uint<1>'}}
     domain_define x.a = y
+
+;// -----
+
+FIRRTL version 5.0.0
+circuit Foo:
+  public module Foo:
+    output a: Integer
+    ; expected-error @below {{unknown property expressions are a FIRRTL 5.1.0+ feature}}
+    propassign a, Unknown(Integer)
+
+;// -----
+
+FIRRTL version 5.1.0
+circuit Foo:
+  public module Foo:
+    output a: Integer
+    ; expected-error @below {{expected property type}}
+    propassign a, Unknown(UInt<1>)
+
+;// -----
+
+FIRRTL version 5.0.0
+circuit AsResetVersion:
+  public module AsResetVersion:
+    input in: UInt<1>
+    ; expected-error @below {{reset casts are a FIRRTL 5.1.0+ feature}}
+    node x = asReset(in)
+
+;// -----
+
+FIRRTL version 5.1.0
+circuit OOBFormatString:
+  public module Oops:
+    input clk : Clock
+    ; expected-error @below {{not enough operands for format string}}
+    printf(clk, UInt<1>(0h1), "oops: %d")

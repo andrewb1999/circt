@@ -43,6 +43,13 @@ struct AppID {
     return name == other.name && idx == other.idx;
   }
   bool operator!=(const AppID &other) const { return !(*this == other); }
+  friend std::ostream &operator<<(std::ostream &os, const AppID &id);
+
+  std::string toString() const {
+    if (idx.has_value())
+      return name + "[" + std::to_string(idx.value()) + "]";
+    return name;
+  }
 };
 bool operator<(const AppID &a, const AppID &b);
 
@@ -53,6 +60,7 @@ public:
   AppIDPath operator+(const AppIDPath &b) const;
   AppIDPath parent() const;
   std::string toStr() const;
+  friend std::ostream &operator<<(std::ostream &os, const AppIDPath &path);
 };
 bool operator<(const AppIDPath &a, const AppIDPath &b);
 
@@ -106,6 +114,8 @@ class MessageData {
 public:
   /// Adopts the data vector buffer.
   MessageData() = default;
+  MessageData(std::span<const uint8_t> data)
+      : data(data.data(), data.data() + data.size()) {}
   MessageData(std::vector<uint8_t> &data) : data(std::move(data)) {}
   MessageData(std::vector<uint8_t> &&data) : data(std::move(data)) {}
   MessageData(const uint8_t *data, size_t size) : data(data, data + size) {}
@@ -126,6 +136,7 @@ public:
 
   /// Get the size of the data in bytes.
   size_t getSize() const { return data.size(); }
+  size_t size() const { return getSize(); }
 
   /// Returns true if this message contains no data.
   bool empty() const { return data.empty(); }
@@ -158,7 +169,6 @@ private:
 } // namespace esi
 
 std::ostream &operator<<(std::ostream &, const esi::ModuleInfo &);
-std::ostream &operator<<(std::ostream &, const esi::AppID &);
 
 //===----------------------------------------------------------------------===//
 // Functions which should be in the standard library.

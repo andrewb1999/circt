@@ -77,6 +77,13 @@ def UIntTypes : Constraint<CPred<"type_isa<UIntType>($0.getType())">>;
 // Constraint that enforces types mismatches
 def mismatchTypes : Constraint<CPred<"!areAnonymousTypesEquivalent($0.getType(), $1.getType())">>;
 
+// Constraint that enforces types mismatches, ignoring const qualifiers
+def mismatchTypesIgnoringConst : Constraint<CPred<[{
+  !areAnonymousTypesEquivalent(
+    type_cast<FIRRTLBaseType>($0.getType()).getAllConstDroppedType(),
+    type_cast<FIRRTLBaseType>($1.getType()).getAllConstDroppedType())
+  }]>>;
+
 // Constraint that enforces types of known width
 def KnownWidth : Constraint<CPred<[{
   type_isa<FIRRTLBaseType>($0.getType()) &&
@@ -237,19 +244,19 @@ def extendAnd : Pat <
   (AndPrimOp:$old $lhs, $rhs),
   (MoveNameHint $old, (AndPrimOp (PadPrimOp $lhs, (TypeWidth32 $old)),
                                  (PadPrimOp $rhs, (TypeWidth32 $old)))),
-  [(KnownWidth $lhs), (KnownWidth $rhs), (mismatchTypes $lhs, $rhs)]>;
+  [(KnownWidth $lhs), (KnownWidth $rhs), (mismatchTypesIgnoringConst $lhs, $rhs)]>;
 
 def extendOr : Pat <
   (OrPrimOp:$old $lhs, $rhs),
   (MoveNameHint $old, (OrPrimOp (PadPrimOp $lhs, (TypeWidth32 $old)),
                                 (PadPrimOp $rhs, (TypeWidth32 $old)))),
-  [(KnownWidth $lhs), (KnownWidth $rhs), (mismatchTypes $lhs, $rhs)]>;
+  [(KnownWidth $lhs), (KnownWidth $rhs), (mismatchTypesIgnoringConst $lhs, $rhs)]>;
 
 def extendXor : Pat <
   (XorPrimOp:$old $lhs, $rhs),
   (MoveNameHint $old, (XorPrimOp (PadPrimOp $lhs, (TypeWidth32 $old)),
                                  (PadPrimOp $rhs, (TypeWidth32 $old)))),
-  [(KnownWidth $lhs), (KnownWidth $rhs), (mismatchTypes $lhs, $rhs)]>;
+  [(KnownWidth $lhs), (KnownWidth $rhs), (mismatchTypesIgnoringConst $lhs, $rhs)]>;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Move constants to the right
@@ -318,7 +325,7 @@ def SubFromZeroUnsigned : Pat <
 //sub(a,a) -> 0
 def SubOfSelf : Pat <
   (SubPrimOp:$old $x, $x),
-  (NativeCodeCall<"$_builder.create<ConstantOp>($0.getLoc(), type_cast<IntType>($0.getType()), getIntZerosAttr($0.getType()))"> $old),
+  (NativeCodeCall<"ConstantOp::create($_builder, $0.getLoc(), type_cast<IntType>($0.getType()), getIntZerosAttr($0.getType()))"> $old),
   [(KnownWidth $x)]>;
 
 // sub((pad a, n), b) -> pad(sub(a, b), n)
@@ -336,7 +343,7 @@ def SubOfPadR : Pat <
 // and(x, 0) -> 0, fold can't handle all cases
 def AndOfZero : Pat <
   (AndPrimOp:$old $x, (ConstantOp:$zcst $cst)),
-  (NativeCodeCall<"$_builder.create<ConstantOp>($0.getLoc(), type_cast<IntType>($0.getType()), getIntZerosAttr($0.getType()))"> $old),
+  (NativeCodeCall<"ConstantOp::create($_builder, $0.getLoc(), type_cast<IntType>($0.getType()), getIntZerosAttr($0.getType()))"> $old),
   [(KnownWidth $x), (ZeroConstantOp $zcst)]>;
 
 // and(x, -1) -> x, fold can't handle all cases
@@ -362,12 +369,12 @@ def AndOfPad : Pat <
 def AndOfAsSIntL : Pat<
   (AndPrimOp:$old (AsSIntPrimOp $x), $y),
   (MoveNameHint $old, (AndPrimOp $x, (AsUIntPrimOp $y))),
-  [(KnownWidth $x), (EqualIntSize $x, $y)]>;
+  [(IntTypes $x), (KnownWidth $x), (EqualIntSize $x, $y)]>;
 
 def AndOfAsSIntR : Pat<
   (AndPrimOp:$old $x, (AsSIntPrimOp $y)),
   (MoveNameHint $old, (AndPrimOp (AsUIntPrimOp $x), $y)),
-  [(KnownWidth $x), (EqualIntSize $x, $y)]>;
+  [(IntTypes $y), (KnownWidth $x), (EqualIntSize $x, $y)]>;
 
 // or(x, 0) -> x, fold can't handle all cases
 def OrOfZero : Pat <
@@ -378,7 +385,7 @@ def OrOfZero : Pat <
 // or(x, -1) -> -1, fold can't handle all cases
 def OrOfAllOne : Pat <
   (OrPrimOp:$old $x, (ConstantOp:$ocst $cst)),
-  (NativeCodeCall<"$_builder.create<ConstantOp>($0.getLoc(), type_cast<IntType>($0.getType()), getIntOnesAttr($0.getType()))"> $old),
+  (NativeCodeCall<"ConstantOp::create($_builder, $0.getLoc(), type_cast<IntType>($0.getType()), getIntOnesAttr($0.getType()))"> $old),
   [(KnownWidth $x), (EqualTypes $x, $ocst), (AllOneConstantOp $ocst)]>;
 
 /// or(x,x) -> x, fold can't handle all cases
@@ -410,7 +417,7 @@ def XorOfZero : Pat <
 /// xor(x,x) -> 0, fold can't handle all cases
 def XorOfSelf : Pat <
   (XorPrimOp:$old $x, $x),
-  (NativeCodeCall<"$_builder.create<ConstantOp>($0.getLoc(), type_cast<IntType>($0.getType()), getIntZerosAttr($0.getType()))"> $old),
+  (NativeCodeCall<"ConstantOp::create($_builder, $0.getLoc(), type_cast<IntType>($0.getType()), getIntZerosAttr($0.getType()))"> $old),
   [(KnownWidth $x)]>;
 
 /// xor(x, pad(y, n)) -> cat(head(x), xor(tail(x), y))
@@ -496,7 +503,7 @@ def AndRasUInt : Pat <
 /// andr(pad(x:U,n)) -> 0 (where pad is doing something)
 def AndRPadU : Pat <
   (AndRPrimOp:$old (PadPrimOp:$pad $x, $n)),
-  (NativeCodeCall<"$_builder.create<ConstantOp>($0.getLoc(), type_cast<IntType>($0.getType()), getIntZerosAttr($0.getType()))"> $old),
+  (NativeCodeCall<"ConstantOp::create($_builder, $0.getLoc(), type_cast<IntType>($0.getType()), getIntZerosAttr($0.getType()))"> $old),
   [(KnownWidth $x), (UIntTypes $x), (IntTypeWidthGT32 $pad, $x)]>;
 
 /// andr(pad(x:S,n)) -> andr(x)
@@ -538,7 +545,7 @@ def BitsOfAsUInt : Pat<
   (MoveNameHint $old, (BitsPrimOp $x, $oHigh, $oLow)),
   [(KnownWidth $x)]>;
 
-// bits(asUInt) -> bits
+// bits(and(x, y)) -> and(bits(x), bits(y))
 def BitsOfAnd : Pat<
   (BitsPrimOp:$old (AndPrimOp $x, $y), I32Attr:$oHigh, I32Attr:$oLow),
   (MoveNameHint $old, (AndPrimOp (BitsPrimOp $x, $oHigh, $oLow), (BitsPrimOp $y, $oHigh, $oLow))),
@@ -647,7 +654,7 @@ def CatDoubleConst : Pat <
 def CatCast : Pat <
   (CatPrimOp:$old (variadic (AsUIntPrimOp $x), (AsUIntPrimOp $y))),
   (MoveNameHint $old, (CatPrimOp (variadic $x, $y))),
-  [(EqualSigns $x, $y)]>;
+  [(IntTypes $x), (IntTypes $y), (EqualSigns $x, $y)]>;
 
 // cat(bits a:b x, bits b+1:c x) -> bits( a:c x)
 def CatBitsBits : Pat <

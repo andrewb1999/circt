@@ -9,92 +9,102 @@ set(ESIPythonRuntimeSources
   esiaccel/types.py
   esiaccel/utils.py
   esiaccel/cosim/questa.py
+  esiaccel/cosim/pytest.py
   esiaccel/cosim/simulator.py
   esiaccel/cosim/verilator.py
 )
 
-# Pybind11 is used to wrap the ESICppRuntime APIs.
+# Nanobind is used to wrap the ESICppRuntime APIs.
 find_package(Python3 COMPONENTS Interpreter Development.Module)
 if(Python3_FOUND)
   IF(MSVC)
-    # Work around an issue with pybind11 and cmake incompatibility on Windows in debug mode.
+    # Work around an issue with nanobind and cmake incompatibility on Windows in debug mode.
     set_target_properties(Python3::Module PROPERTIES
           MAP_IMPORTED_CONFIG_DEBUG ";RELEASE")
   ENDIF(MSVC)
 
-  if(pybind11_DIR)
-    message(STATUS "Using explicit pybind11 cmake directory: ${pybind11_DIR} (-Dpybind11_DIR to change)")
+  if(nanobind_DIR)
+    message(STATUS "Using explicit nanobind cmake directory: ${nanobind_DIR} (-Dnanobind_DIR to change)")
   else()
-    message(STATUS "Checking for pybind11 in python path...")
+    message(STATUS "Checking for nanobind in python path...")
     execute_process(
       COMMAND "${Python3_EXECUTABLE}"
-      -c "import pybind11;print(pybind11.get_cmake_dir(), end='')"
+      -c "import nanobind;print(nanobind.cmake_dir(), end='')"
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       RESULT_VARIABLE STATUS
       OUTPUT_VARIABLE PACKAGE_DIR
       ERROR_QUIET)
     if(NOT STATUS EQUAL "0")
-      message(FATAL_ERROR "pybind11 not found (install via 'pip install pybind11' or set pybind11_DIR)")
+      message(FATAL_ERROR "nanobind not found (install via 'pip install nanobind' or set nanobind_DIR)")
     endif()
     message(STATUS "found (${PACKAGE_DIR})")
-    set(pybind11_DIR "${PACKAGE_DIR}")
+    set(nanobind_DIR "${PACKAGE_DIR}")
   endif()
 
-  # Now, find pybind11.
-  find_package(pybind11 CONFIG)
-  if (NOT pybind11_FOUND)
-    message (STATUS "Could not find pybind11. Disabling Python API.")
+  # Now, find nanobind.
+  find_package(Python COMPONENTS Interpreter Development.Module)
+  find_package(nanobind CONFIG)
+  if (NOT nanobind_FOUND)
+    message (STATUS "Could not find nanobind. Disabling Python API.")
     if (WHEEL_BUILD)
-      message (FATAL_ERROR "pybind11 is required for a wheel build.")
+      message (FATAL_ERROR "nanobind is required for a wheel build.")
     endif()
+  elseif(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # On MSVC in Debug mode, nanobind's CRT mismatch causes linking issues
+    # with the Python import library. Disable the Python module entirely.
+    message(WARNING "Disabling ESI Python API in MSVC Debug mode due to nanobind CRT incompatibility.")
   else()
-    # Compile Pybind11 module and copy to the correct python directory.
-    pybind11_add_module(esiCppAccel
+    # Compile nanobind module and copy to the correct python directory.
+    nanobind_add_module(esiCppAccel
       ${CMAKE_CURRENT_SOURCE_DIR}/esiaccel/esiCppAccel.cpp)
+
+    # For wheel builds on Linux, force static linking of libstdc++ to avoid
+    # undefined symbols when ESICppRuntime's static libstdc++ symbols aren't
+    # exported in its dynamic symbol table.
+    if(WHEEL_BUILD AND UNIX AND NOT APPLE)
+      target_link_options(esiCppAccel PRIVATE
+        -static-libstdc++
+        -static-libgcc
+        -Wl,--exclude-libs,ALL
+      )
+    endif()
+
     target_link_libraries(esiCppAccel PRIVATE ESICppRuntime)
     set_target_properties(esiCppAccel PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/esiaccel"
     )
 
-    # Check for stubgen and generate stubs if available.
-    find_program(STUBGEN pybind11-stubgen)
-    if ("${STUBGEN}" STREQUAL "STUBGEN-NOTFOUND")
-      message(STATUS "pybind11_stubgen not found. Skipping stub generation.")
+    # Use nanobind's built-in stubgen for stub generation.
+    if(WIN32)
+      # I just wasted all day trying to figure out the DLL search path on
+      # Windows both locally and in the runner. I'm done. Windows wheels
+      # won't have a stub until somebody else figures this out.
+      # TODO: have the patience to make this work.
+      message(WARNING "Stub generation is not supported on Windows.")
     else()
-      if(WIN32)
-        # I just wasted all day trying to figure out the DLL search path on
-        # Windows both locally and in the runner. I'm done. Windows wheels
-        # won't have a stub until somebody else figures this out.
-        # TODO: have the patience to make this work.
-        message(WARNING "pybind11-stubgen is not supported on Windows.")
-      else()
-        set(stubgen_python_path "$ENV{PYTHONPATH}:${CMAKE_CURRENT_BINARY_DIR}")
-        add_custom_command(
-            TARGET esiCppAccel
-            POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH="${stubgen_python_path}"
-                ${STUBGEN}
-                  -o "${CMAKE_CURRENT_BINARY_DIR}"
-                  esiaccel.esiCppAccel
+      set(stubgen_python_path "$ENV{PYTHONPATH}:${CMAKE_CURRENT_BINARY_DIR}")
+      add_custom_command(
+          TARGET esiCppAccel
+          POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH="${stubgen_python_path}"
+              "${Python3_EXECUTABLE}" -m nanobind.stubgen
+                -m esiaccel.esiCppAccel
+                -o "${CMAKE_CURRENT_BINARY_DIR}/esiaccel/esiCppAccel.pyi"
+      )
+      if (WHEEL_BUILD)
+        install(FILES "${CMAKE_CURRENT_BINARY_DIR}/esiaccel/esiCppAccel.pyi"
+          DESTINATION .
+          COMPONENT ESIRuntime
         )
-        if (WHEEL_BUILD)
-          install(FILES "${CMAKE_CURRENT_BINARY_DIR}/esiaccel/esiCppAccel.pyi"
-            DESTINATION .
-            COMPONENT ESIRuntime
-          )
-        else()
-          install(FILES "${CMAKE_CURRENT_BINARY_DIR}/esiaccel/esiCppAccel.pyi"
-            DESTINATION python/esiaccel
-            COMPONENT ESIRuntime
-          )
-        endif()
+      else()
+        install(FILES "${CMAKE_CURRENT_BINARY_DIR}/esiaccel/esiCppAccel.pyi"
+          DESTINATION python/esiaccel
+          COMPONENT ESIRuntime
+        )
       endif()
     endif()
 
     if (WHEEL_BUILD)
-      if ("${STUBGEN}" STREQUAL "STUBGEN-NOTFOUND")
-        message (FATAL_ERROR "pybind11_stubgen is required for a wheel build.")
-      endif()
       set_target_properties(esiCppAccel PROPERTIES
         INSTALL_RPATH "$ORIGIN/lib")
     else()
@@ -144,7 +154,7 @@ if(Python3_FOUND)
     endforeach()
 
     # Custom target for the Python runtime just aggregates the python sources
-    # and Pybind11 module.
+    # and nanobind module.
     add_custom_target(ESIPythonRuntime
       DEPENDS
         ${ESIPythonRuntimeSources}

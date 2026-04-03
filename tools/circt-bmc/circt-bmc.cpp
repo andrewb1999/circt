@@ -12,22 +12,29 @@
 
 #include "circt/Conversion/CombToSMT.h"
 #include "circt/Conversion/HWToSMT.h"
+#include "circt/Conversion/Passes.h"
 #include "circt/Conversion/SMTToZ3LLVM.h"
 #include "circt/Conversion/VerifToSMT.h"
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/Emit/EmitDialect.h"
 #include "circt/Dialect/Emit/EmitPasses.h"
 #include "circt/Dialect/HW/HWDialect.h"
+#include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/HW/HWPasses.h"
+#include "circt/Dialect/LTL/LTLDialect.h"
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/OM/OMPasses.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
+#include "circt/Dialect/Verif/VerifPasses.h"
 #include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
 #include "circt/Tools/circt-bmc/Passes.h"
+#include "circt/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/LLVMIR/Transforms/Passes.h"
 #include "mlir/Dialect/SMT/IR/SMTDialect.h"
 #include "mlir/IR/BuiltinDialect.h"
@@ -42,6 +49,7 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/InitLLVM.h"
@@ -68,7 +76,8 @@ static cl::OptionCategory mainCategory("circt-bmc Options");
 
 static cl::opt<std::string>
     moduleName("module",
-               cl::desc("Specify a named module to verify properties over."),
+               cl::desc("Specify a named module (or verif.formal op) to verify "
+                        "properties over."),
                cl::value_desc("module name"), cl::cat(mainCategory));
 
 static cl::opt<int> clockBound(
@@ -113,6 +122,13 @@ static cl::opt<bool> risingClocksOnly(
     "rising-clocks-only",
     cl::desc("Only consider the circuit and property on rising clock edges"),
     cl::init(false), cl::cat(mainCategory));
+
+static cl::opt<bool> flattenModules(
+    "flatten-modules",
+    cl::desc("Flatten all module instances before processing (which will "
+             "increase code size but allows multiple assertions across module "
+             "boundaries to be supported)"),
+    cl::init(true), cl::cat(mainCategory));
 
 #ifdef CIRCT_BMC_ENABLE_JIT
 
@@ -186,6 +202,16 @@ static LogicalResult executeBMC(MLIRContext &context) {
 
   pm.addPass(om::createStripOMPass());
   pm.addPass(emit::createStripEmitPass());
+  pm.addPass(verif::createLowerTestsPass());
+  if (flattenModules) {
+    hw::FlattenModulesOptions options;
+    // We can inline public hw.modules since we're only operating over one
+    // builtin.module
+    options.inlinePublic = true;
+    pm.addPass(hw::createFlattenModules(options));
+  }
+  pm.addNestedPass<hw::HWModuleOp>(createLowerLTLToCorePass());
+  pm.addNestedPass<hw::HWModuleOp>(verif::createCombineAssertLikePass());
   pm.addPass(createExternalizeRegisters());
   LowerToBMCOptions lowerToBMCOptions;
   lowerToBMCOptions.bound = clockBound;
@@ -340,6 +366,7 @@ int main(int argc, char **argv) {
     circt::seq::SeqDialect,
     mlir::smt::SMTDialect,
     circt::verif::VerifDialect,
+    circt::ltl::LTLDialect,
     mlir::arith::ArithDialect,
     mlir::BuiltinDialect,
     mlir::func::FuncDialect,
@@ -347,6 +374,7 @@ int main(int argc, char **argv) {
   >();
   // clang-format on
   mlir::func::registerInlinerExtension(registry);
+  mlir::LLVM::registerInlinerInterface(registry);
   mlir::registerBuiltinDialectTranslation(registry);
   mlir::registerLLVMDialectTranslation(registry);
   MLIRContext context(registry);

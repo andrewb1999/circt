@@ -8,6 +8,8 @@
 function void dummyA(int x); endfunction
 function void dummyB(real x); endfunction
 function void dummyC(shortreal x); endfunction
+function void dummyD(string x); endfunction
+function void dummyE(byte x); endfunction
 
 // IEEE 1800-2017 § 20.2 "Simulation control system tasks"
 // CHECK-LABEL: func.func private @SimulationControlBuiltins(
@@ -68,94 +70,111 @@ function void DisplayAndSeverityBuiltins(int x, real r);
   // CHECK: moore.builtin.display [[TMP3]]
   $write("foo %s", "bar");
 
-  // CHECK: moore.fmt.int binary [[X]], width 32, align right, pad zero : i32
+  // CHECK: moore.fmt.int binary [[X]], align right, pad zero : i32
   $write("%b", x);
-  // CHECK: moore.fmt.int binary [[X]], width 32, align right, pad zero : i32
+  // CHECK: moore.fmt.int binary [[X]], align right, pad zero : i32
   $write("%B", x);
-  // CHECK: moore.fmt.int binary [[X]], width 0, align right, pad zero : i32
+  // CHECK: moore.fmt.int binary [[X]], align right, pad zero width 0 : i32
   $write("%0b", x);
-  // CHECK: moore.fmt.int binary [[X]], width 42, align right, pad zero : i32
+  // CHECK: moore.fmt.int binary [[X]], align right, pad zero width 42 : i32
   $write("%42b", x);
-  // CHECK: moore.fmt.int binary [[X]], width 42, align left, pad zero : i32
+  // CHECK: moore.fmt.int binary [[X]], align left, pad zero width 42 : i32
   $write("%-42b", x);
 
-  // CHECK: moore.fmt.int octal [[X]], width 11, align right, pad zero : i32
+  // CHECK: moore.fmt.int octal [[X]], align right, pad zero : i32
   $write("%o", x);
-  // CHECK: moore.fmt.int octal [[X]], width 11, align right, pad zero : i32
+  // CHECK: moore.fmt.int octal [[X]], align right, pad zero : i32
   $write("%O", x);
-  // CHECK: moore.fmt.int octal [[X]], width 0, align right, pad zero : i32
+  // CHECK: moore.fmt.int octal [[X]], align right, pad zero width 0 : i32
   $write("%0o", x);
-  // CHECK: moore.fmt.int octal [[X]], width 19, align right, pad zero : i32
+  // CHECK: moore.fmt.int octal [[X]], align right, pad zero width 19 : i32
   $write("%19o", x);
-  // CHECK: moore.fmt.int octal [[X]], width 19, align left, pad zero : i32
+  // CHECK: moore.fmt.int octal [[X]], align left, pad zero width 19 : i32
   $write("%-19o", x);
 
-  // CHECK: moore.fmt.real float [[R]]
+  // CHECK: moore.fmt.real float [[R]], align right : f64
   $write("%f", r);
-  // CHECK: [[XR:%.+]] = moore.int_to_real [[X]] : i32 -> f64
+  // CHECK: moore.fmt.real exponential [[R]], align right : f64
+  $write("%e", r);
+  // CHECK: moore.fmt.real general [[R]], align right : f64
+  $write("%g", r);
+  // CHECK: moore.fmt.real float [[R]], align left fracDigits 1 : f64
+  $write("%-.f", r);
+  // CHECK: moore.fmt.real exponential [[R]], align right fieldWidth 10 : f64
+  $write("%10e", r);
+  // CHECK: moore.fmt.real general [[R]], align right fracDigits 5 : f64
+  $write("%0.5g", r);
+  // CHECK: moore.fmt.real float [[R]], align left fieldWidth 20 fracDigits 5 : f64
+  $write("%-20.5f", r);
+  // CHECK: moore.fmt.real exponential [[R]], align right fieldWidth 10 fracDigits 1 : f64
+  $write("%10.e", r);
+  // CHECK: moore.fmt.real general [[R]], align right fieldWidth 9 fracDigits 8 : f64
+  $write("%9.8g", r);
+
+  // CHECK: [[XR:%.+]] = moore.sint_to_real [[X]] : i32 -> f64
   // CHECK: [[TMP:%.+]] = moore.fmt.real float [[XR]]
   // CHECK: moore.builtin.display [[TMP]]
   $write("%f", x);
 
-  // CHECK: moore.fmt.int decimal [[X]], width 10, align right, pad space : i32
+  // CHECK: moore.fmt.int decimal [[X]], align right, pad space signed : i32
   $write("%d", x);
-  // CHECK: moore.fmt.int decimal [[X]], width 10, align right, pad space : i32
+  // CHECK: moore.fmt.int decimal [[X]], align right, pad space signed : i32
   $write("%D", x);
-  // CHECK: moore.fmt.int decimal [[X]], width 0, align right, pad space : i32
+  // CHECK: moore.fmt.int decimal [[X]], align right, pad space width 0 signed : i32
   $write("%0d", x);
-  // CHECK: moore.fmt.int decimal [[X]], width 19, align right, pad space : i32
+  // CHECK: moore.fmt.int decimal [[X]], align right, pad space width 19 signed : i32
   $write("%19d", x);
-  // CHECK: moore.fmt.int decimal [[X]], width 19, align left, pad space : i32
+  // CHECK: moore.fmt.int decimal [[X]], align left, pad space width 19 signed : i32
   $write("%-19d", x);
 
-  // CHECK: moore.fmt.int hex_lower [[X]], width 8, align right, pad zero : i32
+  // CHECK: moore.fmt.int hex_lower [[X]], align right, pad zero : i32
   $write("%h", x);
-  // CHECK: moore.fmt.int hex_lower [[X]], width 8, align right, pad zero : i32
+  // CHECK: moore.fmt.int hex_lower [[X]], align right, pad zero : i32
   $write("%x", x);
-  // CHECK: moore.fmt.int hex_upper [[X]], width 8, align right, pad zero : i32
+  // CHECK: moore.fmt.int hex_upper [[X]], align right, pad zero : i32
   $write("%H", x);
-  // CHECK: moore.fmt.int hex_upper [[X]], width 8, align right, pad zero : i32
+  // CHECK: moore.fmt.int hex_upper [[X]], align right, pad zero : i32
   $write("%X", x);
-  // CHECK: moore.fmt.int hex_lower [[X]], width 0, align right, pad zero : i32
+  // CHECK: moore.fmt.int hex_lower [[X]], align right, pad zero width 0 : i32
   $write("%0h", x);
-  // CHECK: moore.fmt.int hex_lower [[X]], width 19, align right, pad zero : i32
+  // CHECK: moore.fmt.int hex_lower [[X]], align right, pad zero width 19 : i32
   $write("%19h", x);
-  // CHECK: moore.fmt.int hex_lower [[X]], width 19, align right, pad zero : i32
+  // CHECK: moore.fmt.int hex_lower [[X]], align right, pad zero width 19 : i32
   $write("%019h", x);
-  // CHECK: moore.fmt.int hex_lower [[X]], width 19, align left, pad zero : i32
+  // CHECK: moore.fmt.int hex_lower [[X]], align left, pad zero width 19 : i32
   $write("%-19h", x);
-  // CHECK: moore.fmt.int hex_lower [[X]], width 19, align left, pad zero : i32
+  // CHECK: moore.fmt.int hex_lower [[X]], align left, pad zero width 19 : i32
   $write("%-019h", x);
 
-  // CHECK: [[TMP:%.+]] = moore.fmt.int decimal [[X]], width 10, align right, pad space : i32
+  // CHECK: [[TMP:%.+]] = moore.fmt.int decimal [[X]], align right, pad space signed : i32
   // CHECK: moore.builtin.display [[TMP]]
   $write(x);
-  // CHECK: [[TMP:%.+]] = moore.fmt.int binary [[X]], width 32, align right, pad zero : i32
+  // CHECK: [[TMP:%.+]] = moore.fmt.int binary [[X]], align right, pad zero : i32
   // CHECK: moore.builtin.display [[TMP]]
   $writeb(x);
-  // CHECK: [[TMP:%.+]] = moore.fmt.int octal [[X]], width 11, align right, pad zero : i32
+  // CHECK: [[TMP:%.+]] = moore.fmt.int octal [[X]], align right, pad zero : i32
   // CHECK: moore.builtin.display [[TMP]]
   $writeo(x);
-  // CHECK: [[TMP:%.+]] = moore.fmt.int hex_lower [[X]], width 8, align right, pad zero : i32
+  // CHECK: [[TMP:%.+]] = moore.fmt.int hex_lower [[X]], align right, pad zero : i32
   // CHECK: moore.builtin.display [[TMP]]
   $writeh(x);
 
-  // CHECK: [[TMP1:%.+]] = moore.fmt.int decimal [[X]], width 10, align right, pad space : i32
+  // CHECK: [[TMP1:%.+]] = moore.fmt.int decimal [[X]], align right, pad space signed : i32
   // CHECK: [[TMP2:%.+]] = moore.fmt.literal "\0A"
   // CHECK: [[TMP3:%.+]] = moore.fmt.concat ([[TMP1]], [[TMP2]])
   // CHECK: moore.builtin.display [[TMP3]]
   $display(x);
-  // CHECK: [[TMP1:%.+]] = moore.fmt.int binary [[X]], width 32, align right, pad zero : i32
+  // CHECK: [[TMP1:%.+]] = moore.fmt.int binary [[X]], align right, pad zero : i32
   // CHECK: [[TMP2:%.+]] = moore.fmt.literal "\0A"
   // CHECK: [[TMP3:%.+]] = moore.fmt.concat ([[TMP1]], [[TMP2]])
   // CHECK: moore.builtin.display [[TMP3]]
   $displayb(x);
-  // CHECK: [[TMP1:%.+]] = moore.fmt.int octal [[X]], width 11, align right, pad zero : i32
+  // CHECK: [[TMP1:%.+]] = moore.fmt.int octal [[X]], align right, pad zero : i32
   // CHECK: [[TMP2:%.+]] = moore.fmt.literal "\0A"
   // CHECK: [[TMP3:%.+]] = moore.fmt.concat ([[TMP1]], [[TMP2]])
   // CHECK: moore.builtin.display [[TMP3]]
   $displayo(x);
-  // CHECK: [[TMP1:%.+]] = moore.fmt.int hex_lower [[X]], width 8, align right, pad zero : i32
+  // CHECK: [[TMP1:%.+]] = moore.fmt.int hex_lower [[X]], align right, pad zero : i32
   // CHECK: [[TMP2:%.+]] = moore.fmt.literal "\0A"
   // CHECK: [[TMP3:%.+]] = moore.fmt.concat ([[TMP1]], [[TMP2]])
   // CHECK: moore.builtin.display [[TMP3]]
@@ -166,6 +185,19 @@ function void DisplayAndSeverityBuiltins(int x, real r);
   // CHECK: [[TMP3:%.+]] = moore.fmt.concat ([[TMP1]], [[TMP2]])
   // CHECK: moore.builtin.display [[TMP3]]
   $display("%f", r);
+
+  // IEEE 1800-2017 § 21.2.1.6 "Hierarchical name format"
+  // CHECK: [[TMP1:%.+]] = moore.fmt.hier_path
+  // CHECK-NOT: escaped
+  // CHECK: [[TMP2:%.+]] = moore.fmt.literal "\0A"
+  // CHECK: [[TMP3:%.+]] = moore.fmt.concat ([[TMP1]], [[TMP2]])
+  // CHECK: moore.builtin.display [[TMP3]]
+  $display("%m");
+  // CHECK: [[TMP1:%.+]] = moore.fmt.hier_path escaped
+  // CHECK: [[TMP2:%.+]] = moore.fmt.literal "\0A"
+  // CHECK: [[TMP3:%.+]] = moore.fmt.concat ([[TMP1]], [[TMP2]])
+  // CHECK: moore.builtin.display [[TMP3]]
+  $display("%M");
 
   // CHECK: [[TMP:%.+]] = moore.fmt.literal ""
   // CHECK: moore.builtin.severity info [[TMP]]
@@ -266,21 +298,49 @@ function void MathBuiltins(int x, logic [41:0] y, real r);
 
 endfunction
 
+// IEEE 1800-2023 $ 18.3 "Random number system functions and methods"
 // CHECK-LABEL: func.func private @RandomBuiltins(
 // CHECK-SAME: [[X:%.+]]: !moore.i32
 function RandomBuiltins(int x);
-  // CHECK: [[URAND0:%.+]] = moore.builtin.urandom
+  // CHECK: [[XVAR:%.+]] = moore.variable [[X]] : <i32>
+  // All random system functions map to moore.builtin.urandom_range with
+  // (minval, maxval, optional seed ref).
+
+  // CHECK: [[ZERO1:%.+]] = moore.constant 0 : i32
+  // CHECK: [[MAX1:%.+]] = moore.constant -1 : i32
+  // CHECK: [[URAND0:%.+]] = moore.builtin.urandom_range [[ZERO1]], [[MAX1]]
   // CHECK-NEXT: call @dummyA([[URAND0]]) : (!moore.i32) -> ()
   dummyA($urandom());
-  // CHECK: [[URAND1:%.+]] = moore.builtin.urandom [[X]]
+
+  // CHECK: [[ZERO2:%.+]] = moore.constant 0 : i32
+  // CHECK: [[MAX2:%.+]] = moore.constant -1 : i32
+  // CHECK: [[URAND1:%.+]] = moore.builtin.urandom_range [[ZERO2]], [[MAX2]], [[XVAR]]
   // CHECK-NEXT: call @dummyA([[URAND1]]) : (!moore.i32) -> ()
   dummyA($urandom(x));
-  // CHECK: [[RAND0:%.+]] = moore.builtin.random
+
+  // CHECK: [[ZERO3:%.+]] = moore.constant 0 : i32
+  // CHECK: [[MAX3:%.+]] = moore.constant -1 : i32
+  // CHECK: [[RAND0:%.+]] = moore.builtin.urandom_range [[ZERO3]], [[MAX3]]
   // CHECK-NEXT: call @dummyA([[RAND0]]) : (!moore.i32) -> ()
   dummyA($random());
-  // CHECK: [[RAND1:%.+]] = moore.builtin.random [[X]]
+
+  // CHECK: [[ZERO4:%.+]] = moore.constant 0 : i32
+  // CHECK: [[MAX4:%.+]] = moore.constant -1 : i32
+  // CHECK: [[RAND1:%.+]] = moore.builtin.urandom_range [[ZERO4]], [[MAX4]], [[XVAR]]
   // CHECK-NEXT: call @dummyA([[RAND1]]) : (!moore.i32) -> ()
   dummyA($random(x));
+
+  // CHECK: [[XVAL1:%.+]] = moore.read [[XVAR]]
+  // CHECK: [[ZERO5:%.+]] = moore.constant 0 : i32
+  // CHECK: [[URANDRANGE1:%.+]] = moore.builtin.urandom_range [[ZERO5]], [[XVAL1]]
+  // CHECK-NEXT: call @dummyA([[URANDRANGE1]]) : (!moore.i32) -> ()
+  dummyA($urandom_range(x));
+
+  // CHECK: [[XVAL2:%.+]] = moore.read [[XVAR]]
+  // CHECK: [[XVAL3:%.+]] = moore.read [[XVAR]]
+  // CHECK: [[URANDRANGE2:%.+]] = moore.builtin.urandom_range [[XVAL3]], [[XVAL2]]
+  // CHECK-NEXT: call @dummyA([[URANDRANGE2]]) : (!moore.i32) -> ()
+  dummyA($urandom_range(x, x));
 endfunction
 
 // CHECK-LABEL: func.func private @TimeBuiltins(
@@ -319,19 +379,19 @@ function void SeverityBuiltinEdgeCase(string testStr);
   // CHECK-NEXT: [[INTVAR:%.+]] = moore.variable [[CONST]] : <i32>
   int val = 1234;
   // CHECK-NEXT: [[INTVAL1:%.+]] = moore.read [[INTVAR]] : <i32>
-  // CHECK-NEXT: [[FMTINT1:%.+]] = moore.fmt.int binary [[INTVAL1]], width 32, align right, pad zero : i32
+  // CHECK-NEXT: [[FMTINT1:%.+]] = moore.fmt.int binary [[INTVAL1]], align right, pad zero : i32
   // CHECK-NEXT: [[LINE1:%.+]] = moore.fmt.literal "\0A"
   // CHECK-NEXT: [[CONCAT1:%.+]] = moore.fmt.concat ([[FMTINT1]], [[LINE1]])
   // CHECK-NEXT: moore.builtin.display [[CONCAT1]]
   $displayb(val);
   // CHECK-NEXT: [[INTVAL2:%.+]] = moore.read [[INTVAR]] : <i32>
-  // CHECK-NEXT: [[FMTINT2:%.+]] = moore.fmt.int octal [[INTVAL2]], width 11, align right, pad zero : i32
+  // CHECK-NEXT: [[FMTINT2:%.+]] = moore.fmt.int octal [[INTVAL2]], align right, pad zero : i32
   // CHECK-NEXT: [[LINE2:%.+]] = moore.fmt.literal "\0A"
   // CHECK-NEXT: [[CONCAT2:%.+]] = moore.fmt.concat ([[FMTINT2]], [[LINE2]])
   // CHECK-NEXT: moore.builtin.display [[CONCAT2]]
   $displayo(val);
   // CHECK-NEXT: [[INTVAL3:%.+]] = moore.read [[INTVAR]] : <i32>
-  // CHECK-NEXT: [[FMTINT3:%.+]] = moore.fmt.int hex_lower [[INTVAL3]], width 8, align right, pad zero : i32
+  // CHECK-NEXT: [[FMTINT3:%.+]] = moore.fmt.int hex_lower [[INTVAL3]], align right, pad zero : i32
   // CHECK-NEXT: [[LINE3:%.+]] = moore.fmt.literal "\0A"
   // CHECK-NEXT: [[CONCAT3:%.+]] = moore.fmt.concat ([[FMTINT3]], [[LINE3]])
   // CHECK-NEXT: moore.builtin.display [[CONCAT3]]
@@ -344,41 +404,156 @@ function void SeverityBuiltinEdgeCase(string testStr);
   $fatal(1, $sformatf("%s 23", testStr));
 endfunction
 
+// IEEE 1800-2023 § 16.9.3 "Sampled value functions"
 // CHECK-LABEL: moore.module @SampleValueBuiltins(
 // CHECK-SAME: in [[CLK:%.+]] : !moore.l1
 module SampleValueBuiltins #() (
-    input clk_i
+    input clk_i,
+    input [7:0] data_i
 );
   // CHECK: [[CLKWIRE:%.+]] = moore.net name "clk_i" wire : <l1>
+  // CHECK: [[DATAWIRE:%.+]] = moore.net name "data_i" wire : <l8>
   // CHECK: moore.procedure always {
   // CHECK-NEXT: [[C:%.+]] = moore.read [[CLKWIRE]] : <l1>
-  // CHECK-NEXT: [[CB:%.+]] = moore.to_builtin_bool [[C]] : l1
+  // CHECK-NEXT: [[C_INT:%.+]] = moore.logic_to_int [[C]] : l1
+  // CHECK-NEXT: [[CB:%.+]] = moore.to_builtin_int [[C_INT]] : i1
   // CHECK-NEXT: [[C2:%.+]] = moore.read [[CLKWIRE]] : <l1>
-  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_bool [[C2]] : l1
+  // CHECK-NEXT: [[C2_INT:%.+]] = moore.logic_to_int [[C2]] : l1
+  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_int [[C2_INT]] : i1
+  // CHECK-NEXT: [[SAMPLED:%.+]] = ltl.sampled [[CURRENT]] : i1
+  sampled_clk: assert property (@(posedge clk_i) clk_i |=> $sampled(clk_i));
+  // CHECK: moore.procedure always {
+  // CHECK-NEXT: [[C:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C_INT:%.+]] = moore.logic_to_int [[C]] : l1
+  // CHECK-NEXT: [[CB:%.+]] = moore.to_builtin_int [[C_INT]] : i1
+  // CHECK-NEXT: [[C2:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2_INT:%.+]] = moore.logic_to_int [[C2]] : l1
+  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_int [[C2_INT]] : i1
   // CHECK-NEXT: [[PAST:%.+]] = ltl.past [[CURRENT]], 1 : i1
-  // CHECK-NEXT: [[NOTPAST:%.+]] = ltl.not [[PAST]] : !ltl.sequence
-  // CHECK-NEXT: [[NOTPASTANDCURRENT:%.+]] = ltl.and [[CURRENT]], [[NOTPAST]] : i1, !ltl.property
+  // CHECK-NEXT: [[ROSE:%.+]] = comb.icmp ult [[PAST]], [[CURRENT]] : i1
   rising_clk: assert property (@(posedge clk_i) clk_i |=> $rose(clk_i));
+  // Check that the output of rose can be used by non-LTL ops
+  // CHECK: moore.procedure always {
+  // CHECK-NEXT: [[C1:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2_INT:%.+]] = moore.logic_to_int [[C2]] : l1
+  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_int [[C2_INT]] : i1
+  // CHECK-NEXT: [[PAST:%.+]] = ltl.past [[CURRENT]], 1 : i1
+  // CHECK-NEXT: [[ROSE:%.+]] = comb.icmp ult [[PAST]], [[CURRENT]] : i1
+  // CHECK-NEXT: [[ROSE_INT:%.+]] = moore.from_builtin_int [[ROSE]] : i1
+  // CHECK-NEXT: [[ROSE_LOGIC:%.+]] = moore.int_to_logic [[ROSE_INT]] : i1
+  // CHECK-NEXT: [[EQ:%.+]] = moore.eq [[C1]], [[ROSE_LOGIC]] : l1 -> l1
+  rose_eq: assert property (@(posedge clk_i) clk_i == $rose(clk_i));
   // CHECK: moore.procedure always {
   // CHECK-NEXT: [[C:%.+]] = moore.read [[CLKWIRE]] : <l1>
-  // CHECK-NEXT: [[CB:%.+]] = moore.to_builtin_bool [[C]] : l1
+  // CHECK-NEXT: [[C_INT:%.+]] = moore.logic_to_int [[C]] : l1
+  // CHECK-NEXT: [[CB:%.+]] = moore.to_builtin_int [[C_INT]] : i1
   // CHECK-NEXT: [[C2:%.+]] = moore.read [[CLKWIRE]] : <l1>
-  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_bool [[C2]] : l1
+  // CHECK-NEXT: [[C2_INT:%.+]] = moore.logic_to_int [[C2]] : l1
+  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_int [[C2_INT]] : i1
   // CHECK-NEXT: [[PAST:%.+]] = ltl.past [[CURRENT]], 1 : i1
-  // CHECK-NEXT: [[NOTCURRENT:%.+]] = ltl.not [[CURRENT]] : i1
-  // CHECK-NEXT: [[PASTANDNOTCURRENT:%.+]] = ltl.and [[NOTCURRENT]], [[PAST]] : !ltl.property, !ltl.sequence
+  // CHECK-NEXT: [[FELL:%.+]] = comb.icmp ugt [[PAST]], [[CURRENT]] : i1
   falling_clk: assert property (@(posedge clk_i) clk_i |=> $fell(clk_i));
+  // Check that the output of fell can be used by non-LTL ops
+  // CHECK: moore.procedure always {
+  // CHECK-NEXT: [[C1:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2_INT:%.+]] = moore.logic_to_int [[C2]] : l1
+  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_int [[C2_INT]] : i1
+  // CHECK-NEXT: [[PAST:%.+]] = ltl.past [[CURRENT]], 1 : i1
+  // CHECK-NEXT: [[FELL:%.+]] = comb.icmp ugt [[PAST]], [[CURRENT]] : i1
+  // CHECK-NEXT: [[FELL_INT:%.+]] = moore.from_builtin_int [[FELL]] : i1
+  // CHECK-NEXT: [[FELL_LOGIC:%.+]] = moore.int_to_logic [[FELL_INT]] : i1
+  // CHECK-NEXT: [[EQ:%.+]] = moore.eq [[C1]], [[FELL_LOGIC]] : l1 -> l1
+  fell_eq: assert property (@(posedge clk_i) clk_i == $fell(clk_i));
   // CHECK: moore.procedure always {
   // CHECK-NEXT: [[C:%.+]] = moore.read [[CLKWIRE]] : <l1>
-  // CHECK-NEXT: [[CB:%.+]] = moore.to_builtin_bool [[C]] : l1
+  // CHECK-NEXT: [[C_INT:%.+]] = moore.logic_to_int [[C]] : l1
+  // CHECK-NEXT: [[CB:%.+]] = moore.to_builtin_int [[C_INT]] : i1
   // CHECK-NEXT: [[C2:%.+]] = moore.read [[CLKWIRE]] : <l1>
-  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_bool [[C2]] : l1
+  // CHECK-NEXT: [[C2_INT:%.+]] = moore.logic_to_int [[C2]] : l1
+  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_int [[C2_INT]] : i1
   // CHECK-NEXT: [[PAST:%.+]] = ltl.past [[CURRENT]], 1 : i1
-  // CHECK-NEXT: [[NOTPAST:%.+]] = ltl.not [[PAST]] : !ltl.sequence
-  // CHECK-NEXT: [[NOTCURRENT:%.+]] = ltl.not [[CURRENT]] : i1
-  // CHECK-NEXT: [[PASTANDCURRENT:%.+]] = ltl.and [[CURRENT]], [[PAST]] : i1, !ltl.sequence
-  // CHECK-NEXT: [[NOTPASTANDNOTCURRENT:%.+]] = ltl.and [[NOTCURRENT]], [[NOTPAST]] : !ltl.property, !ltl.property
-  // CHECK-NEXT: [[STABLE:%.+]] = ltl.or [[PASTANDCURRENT]], [[NOTPASTANDNOTCURRENT]] : !ltl.sequence, !ltl.property
+  // CHECK-NEXT: [[STABLE:%.+]] = comb.icmp eq [[PAST]], [[CURRENT]] : i1
   stable_clk: assert property (@(posedge clk_i) clk_i |=> $stable(clk_i));
+  // Check that the output of stable can be used by non-LTL ops
+  // CHECK: moore.procedure always {
+  // CHECK-NEXT: [[C1:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2_INT:%.+]] = moore.logic_to_int [[C2]] : l1
+  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_int [[C2_INT]] : i1
+  // CHECK-NEXT: [[PAST:%.+]] = ltl.past [[CURRENT]], 1 : i1
+  // CHECK-NEXT: [[STABLE:%.+]] = comb.icmp eq [[PAST]], [[CURRENT]] : i1
+  // CHECK-NEXT: [[STABLE_INT:%.+]] = moore.from_builtin_int [[STABLE]] : i1
+  // CHECK-NEXT: [[STABLE_LOGIC:%.+]] = moore.int_to_logic [[STABLE_INT]] : i1
+  // CHECK-NEXT: [[EQ:%.+]] = moore.eq [[C1]], [[STABLE_LOGIC]] : l1 -> l1
+  stable_eq: assert property (@(posedge clk_i) clk_i == $stable(clk_i));
+  // CHECK: moore.procedure always {
+  // CHECK-NEXT: [[C:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C_INT:%.+]] = moore.logic_to_int [[C]] : l1
+  // CHECK-NEXT: [[CB:%.+]] = moore.to_builtin_int [[C_INT]] : i1
+  // CHECK-NEXT: [[C2:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2_INT:%.+]] = moore.logic_to_int [[C2]] : l1
+  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_int [[C2_INT]] : i1
+  // CHECK-NEXT: [[PAST:%.+]] = ltl.past [[CURRENT]], 1 : i1
+  // CHECK-NEXT: [[CHANGED:%.+]] = comb.icmp ne [[PAST]], [[CURRENT]] : i1
+  changed_clk: assert property (@(posedge clk_i) clk_i |=> $changed(clk_i));
+  // Check that the output of changed can be used by non-LTL ops
+  // CHECK: moore.procedure always {
+  // CHECK-NEXT: [[C1:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2_INT:%.+]] = moore.logic_to_int [[C2]] : l1
+  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_int [[C2_INT]] : i1
+  // CHECK-NEXT: [[PAST:%.+]] = ltl.past [[CURRENT]], 1 : i1
+  // CHECK-NEXT: [[CHANGED:%.+]] = comb.icmp ne [[PAST]], [[CURRENT]] : i1
+  // CHECK-NEXT: [[CHANGED_INT:%.+]] = moore.from_builtin_int [[CHANGED]] : i1
+  // CHECK-NEXT: [[CHANGED_LOGIC:%.+]] = moore.int_to_logic [[CHANGED_INT]] : i1
+  // CHECK-NEXT: [[EQ:%.+]] = moore.eq [[C1]], [[CHANGED_LOGIC]] : l1 -> l1
+  changed_eq: assert property (@(posedge clk_i) clk_i == $changed(clk_i));
+  // CHECK: moore.procedure always {
+  // CHECK-NEXT: [[C:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C_INT:%.+]] = moore.logic_to_int [[C]] : l1
+  // CHECK-NEXT: [[CB:%.+]] = moore.to_builtin_int [[C_INT]] : i1
+  // CHECK-NEXT: [[C2:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2_INT:%.+]] = moore.logic_to_int [[C2]] : l1
+  // CHECK-NEXT: [[CURRENT:%.+]] = moore.to_builtin_int [[C2_INT]] : i1
+  // CHECK-NEXT: [[PAST:%.+]] = ltl.past [[CURRENT]], 1 : i1
+  past_clk: assert property (@(posedge clk_i) clk_i |=> $past(clk_i));
+  // Check that the output of past can be used by non-LTL ops
+  // CHECK: moore.procedure always {
+  // CHECK-NEXT: [[C1:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2:%.+]] = moore.read [[CLKWIRE]] : <l1>
+  // CHECK-NEXT: [[C2_INT:%.+]] = moore.logic_to_int [[C2]] : l1
+  // CHECK-NEXT: [[CB:%.+]] = moore.to_builtin_int [[C2_INT]] : i1
+  // CHECK-NEXT: [[PAST:%.+]] = ltl.past [[CB]], 1 : i1
+  // CHECK-NEXT: [[PAST_INT:%.+]] = moore.from_builtin_int [[PAST]] : i1
+  // CHECK-NEXT: [[PAST_LOGIC:%.+]] = moore.int_to_logic [[PAST_INT]] : i1
+  // CHECK-NEXT: [[EQ:%.+]] = moore.eq [[C1]], [[PAST_LOGIC]] : l1 -> l1
+  past_eq: assert property (@(posedge clk_i) clk_i == $past(clk_i));
+  // Test $past on wider bitvectors
+  // CHECK: moore.procedure always {
+  // CHECK-NEXT: [[D1:%.+]] = moore.read [[DATAWIRE]] : <l8>
+  // CHECK-NEXT: [[D2:%.+]] = moore.read [[DATAWIRE]] : <l8>
+  // CHECK-NEXT: [[D2_INT:%.+]] = moore.logic_to_int [[D2]] : l8
+  // CHECK-NEXT: [[DB:%.+]] = moore.to_builtin_int [[D2_INT]] : i8
+  // CHECK-NEXT: [[PAST:%.+]] = ltl.past [[DB]], 1 : i8
+  // CHECK-NEXT: [[PAST_INT:%.+]] = moore.from_builtin_int [[PAST]] : i8
+  // CHECK-NEXT: [[PAST_LOGIC:%.+]] = moore.int_to_logic [[PAST_INT]] : i8
+  // CHECK-NEXT: [[EQ:%.+]] = moore.eq [[D1]], [[PAST_LOGIC]] : l8 -> l1
+  past_data: assert property (@(posedge clk_i) data_i == $past(data_i));
 
 endmodule
+
+// CHECK-LABEL: func.func private @StringBuiltins(
+// CHECK-SAME: [[STR:%.+]]: !moore.string
+// CHECK-SAME: [[INT:%.+]]: !moore.i32
+function void StringBuiltins(string string_in, int int_in);
+  // CHECK: [[LEN:%.+]] = moore.string.len [[STR]]
+  dummyA(string_in.len());
+  // CHECK: [[LEN:%.+]] = moore.string.toupper [[STR]]
+  dummyD(string_in.toupper());
+  // CHECK: [[LEN:%.+]] = moore.string.tolower [[STR]]
+  dummyD(string_in.tolower());
+  // CHECK: [[CHAR:%.+]] = moore.string.get [[STR]]{{\[}}[[INT]]]
+  dummyE(string_in.getc(int_in));
+endfunction

@@ -16,11 +16,17 @@
 #include "esi/Accelerator.h"
 #include "esi/Services.h"
 
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcovered-switch-default"
+#endif
 #include <nlohmann/json.hpp>
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 #include <sstream>
 
 using namespace ::esi;
-using ServiceTable = AcceleratorConnection::ServiceTable;
 
 // This is a proxy class to the manifest JSON. It is used to avoid having to
 // include the JSON parser in the header. Forward references don't work since
@@ -300,7 +306,8 @@ Manifest::Impl::buildAccelerator(AcceleratorConnection &acc) const {
 
   return std::make_unique<Accelerator>(
       getModInfo(designJson),
-      getChildInstances({}, acc, activeSvcs, designJson), services, ports);
+      getChildInstances({}, acc, activeSvcs, designJson), services,
+      std::move(ports));
 }
 
 std::optional<ModuleInfo>
@@ -372,7 +379,7 @@ Manifest::Impl::getChildInstance(AppIDPath idPath, AcceleratorConnection &acc,
   auto ports = getBundlePorts(acc, idPath, activeServices, child);
   return std::make_unique<Instance>(parseIDChecked(child.at("appID")),
                                     getModInfo(child), std::move(children),
-                                    services, ports);
+                                    services, std::move(ports));
 }
 
 services::Service *Manifest::Impl::getService(AppIDPath idPath,
@@ -575,6 +582,55 @@ ArrayType *parseArray(const nlohmann::json &typeJson, Context &cache) {
                        parseType(typeJson.at("element"), cache), size);
 }
 
+WindowType *parseWindow(const nlohmann::json &typeJson, Context &cache) {
+  assert(typeJson.at("mnemonic") == "window");
+  std::string name = typeJson.at("name");
+  const Type *intoType = parseType(typeJson.at("into"), cache);
+  const Type *loweredType = parseType(typeJson.at("loweredType"), cache);
+
+  // Parse the frames information.
+  std::vector<WindowType::Frame> frames;
+  for (auto &frameJson : typeJson.at("frames")) {
+    WindowType::Frame frame;
+    frame.name = frameJson.at("name");
+    for (auto &fieldJson : frameJson.at("fields")) {
+      WindowType::Field field;
+      field.name = fieldJson.at("name");
+      if (fieldJson.contains("numItems"))
+        field.numItems = fieldJson.at("numItems");
+      if (fieldJson.contains("bulkCountWidth"))
+        field.bulkCountWidth = fieldJson.at("bulkCountWidth");
+      frame.fields.push_back(field);
+    }
+    frames.push_back(frame);
+  }
+
+  return new WindowType(typeJson.at("id"), name, intoType, loweredType, frames);
+}
+
+ListType *parseList(const nlohmann::json &typeJson, Context &cache) {
+  assert(typeJson.at("mnemonic") == "list");
+  return new ListType(typeJson.at("id"),
+                      parseType(typeJson.at("element"), cache));
+}
+
+TypeAliasType *parseTypeAlias(const nlohmann::json &typeJson, Context &cache) {
+  assert(typeJson.at("mnemonic") == "alias");
+  std::string id = typeJson.at("id");
+  std::string name = typeJson.value("name", "");
+
+  const Type *innerType = nullptr;
+  if (typeJson.contains("inner"))
+    innerType = parseType(typeJson.at("inner"), cache);
+  else
+    throw std::runtime_error("typealias missing inner type");
+
+  if (name.empty())
+    name = id;
+
+  return new TypeAliasType(id, name, innerType);
+}
+
 using TypeParser = std::function<Type *(const nlohmann::json &, Context &)>;
 const std::map<std::string_view, TypeParser> typeParsers = {
     {"bundle", parseBundleType},
@@ -582,8 +638,11 @@ const std::map<std::string_view, TypeParser> typeParsers = {
     {"std::any", [](const nlohmann::json &typeJson,
                     Context &cache) { return new AnyType(typeJson.at("id")); }},
     {"int", parseInt},
+    {"alias", parseTypeAlias},
     {"struct", parseStruct},
     {"array", parseArray},
+    {"window", parseWindow},
+    {"list", parseList},
 
 };
 
@@ -665,7 +724,7 @@ const std::vector<const Type *> &Manifest::getTypeTable() const {
 // Print a module info, including the extra metadata.
 std::ostream &operator<<(std::ostream &os, const ModuleInfo &m) {
   auto printAny = [&os](std::any a) {
-    if (auto *c = std::any_cast<Constant>(&a))
+    if (std::any_cast<Constant>(&a))
       a = std::any_cast<Constant>(a).value;
 
     const std::type_info &t = a.type();
@@ -756,7 +815,6 @@ bool operator<(const AppIDPath &a, const AppIDPath &b) {
       return a[i] < b[i];
   return false;
 }
-} // namespace esi
 
 std::ostream &operator<<(std::ostream &os, const AppID &id) {
   os << id.name;
@@ -772,3 +830,5 @@ std::ostream &operator<<(std::ostream &os, const AppIDPath &path) {
   }
   return os;
 }
+
+} // namespace esi

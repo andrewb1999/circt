@@ -23,6 +23,7 @@
 
 namespace circt {
 namespace firtool {
+
 //===----------------------------------------------------------------------===//
 // FirtoolOptions
 //===----------------------------------------------------------------------===//
@@ -35,6 +36,37 @@ public:
   // Helper Types
   enum BuildMode { BuildModeDefault, BuildModeDebug, BuildModeRelease };
   enum class RandomKind { None, Mem, Reg, All };
+
+  enum class DomainMode {
+    /// Erase domains from the input circuit.
+    Strip,
+    /// Disable domain checking.
+    Disable,
+    /// Check domains without inference.
+    Check,
+    /// Check domains with inference for private modules.
+    Infer,
+    /// Check domains with inference for both public and private modules.
+    InferAll,
+  };
+
+  /// Convert the "domain mode" firtool option to a "firrtl::InferDomainsMode",
+  /// the configuration for a pass.
+  static constexpr std::optional<firrtl::InferDomainsMode>
+  toInferDomainsPassMode(DomainMode mode) {
+    switch (mode) {
+    case DomainMode::Strip:
+      return firrtl::InferDomainsMode::Strip;
+    case DomainMode::Disable:
+      return std::nullopt;
+    case DomainMode::Check:
+      return firrtl::InferDomainsMode::Check;
+    case DomainMode::Infer:
+      return firrtl::InferDomainsMode::Infer;
+    case DomainMode::InferAll:
+      return firrtl::InferDomainsMode::InferAll;
+    }
+  }
 
   bool isRandomEnabled(RandomKind kind) const {
     return disableRandom != RandomKind::All && disableRandom != kind;
@@ -64,6 +96,8 @@ public:
   }
   firrtl::CompanionMode getCompanionMode() const { return companionMode; }
 
+  bool getNoViews() const { return noViews; }
+
   seq::ExternalizeClockGateOptions getClockGateOptions() const {
     return {ckgModuleName, ckgInputName,      ckgOutputName,
             ckgEnableName, ckgTestEnableName, ckgInstName};
@@ -89,9 +123,6 @@ public:
   bool shouldLowerNoRefTypePortAnnotations() const {
     return lowerAnnotationsNoRefTypePorts;
   }
-  bool shouldAllowAddingPortsOnPublic() const {
-    return allowAddingPortsOnPublic;
-  }
   bool shouldConvertProbesToSignals() const { return probesToSignals; }
   bool shouldReplaceSequentialMemories() const { return replSeqMem; }
   bool shouldDisableLayerSink() const { return disableLayerSink; }
@@ -102,15 +133,6 @@ public:
   bool shouldEnableDebugInfo() const { return enableDebugInfo; }
   bool shouldIgnoreReadEnableMemories() const { return ignoreReadEnableMem; }
   bool shouldConvertVecOfBundle() const { return vbToBV; }
-  bool shouldEtcDisableInstanceExtraction() const {
-    return etcDisableInstanceExtraction;
-  }
-  bool shouldEtcDisableRegisterExtraction() const {
-    return etcDisableRegisterExtraction;
-  }
-  bool shouldEtcDisableModuleInlining() const {
-    return etcDisableModuleInlining;
-  }
   bool shouldStripDebugInfo() const { return stripDebugInfo; }
   bool shouldStripFirDebugInfo() const { return stripFirDebugInfo; }
   bool shouldExportModuleHierarchy() const { return exportModuleHierarchy; }
@@ -126,7 +148,6 @@ public:
   bool shouldAddVivadoRAMAddressConflictSynthesisBugWorkaround() const {
     return addVivadoRAMAddressConflictSynthesisBugWorkaround;
   }
-  bool shouldExtractTestCode() const { return extractTestCode; }
   bool shouldFixupEICGWrapper() const { return fixupEICGWrapper; }
   bool shouldDisableCSEinClasses() const { return disableCSEinClasses; }
   bool shouldSelectDefaultInstanceChoice() const {
@@ -143,6 +164,10 @@ public:
   bool getLintXmrsInDesign() const { return lintXmrsInDesign; }
 
   bool getEmitAllBindFiles() const { return emitAllBindFiles; }
+
+  bool shouldInlineInputOnlyModules() const { return inlineInputOnlyModules; }
+
+  DomainMode getDomainMode() const { return domainMode; }
 
   // Setters, used by the CAPI
   FirtoolOptions &setOutputFilename(StringRef name) {
@@ -162,11 +187,6 @@ public:
 
   FirtoolOptions &setLowerAnnotationsNoRefTypePorts(bool value) {
     lowerAnnotationsNoRefTypePorts = value;
-    return *this;
-  }
-
-  FirtoolOptions &setAllowAddingPortsOnPublic(bool value) {
-    allowAddingPortsOnPublic = value;
     return *this;
   }
 
@@ -227,6 +247,11 @@ public:
     return *this;
   }
 
+  FirtoolOptions &setNoViews(bool value) {
+    noViews = value;
+    return *this;
+  }
+
   FirtoolOptions &setDisableAggressiveMergeConnections(bool value) {
     disableAggressiveMergeConnections = value;
     return *this;
@@ -249,11 +274,6 @@ public:
 
   FirtoolOptions &setReplSeqMemFile(StringRef value) {
     replSeqMemFile = value;
-    return *this;
-  }
-
-  FirtoolOptions &setExtractTestCode(bool value) {
-    extractTestCode = value;
     return *this;
   }
 
@@ -289,21 +309,6 @@ public:
 
   FirtoolOptions &setEmitSeparateAlwaysBlocks(bool value) {
     emitSeparateAlwaysBlocks = value;
-    return *this;
-  }
-
-  FirtoolOptions &setEtcDisableInstanceExtraction(bool value) {
-    etcDisableInstanceExtraction = value;
-    return *this;
-  }
-
-  FirtoolOptions &setEtcDisableRegisterExtraction(bool value) {
-    etcDisableRegisterExtraction = value;
-    return *this;
-  }
-
-  FirtoolOptions &setEtcDisableModuleInlining(bool value) {
-    etcDisableModuleInlining = value;
     return *this;
   }
 
@@ -393,6 +398,16 @@ public:
     return *this;
   }
 
+  FirtoolOptions &setInlineInputOnlyModules(bool value) {
+    inlineInputOnlyModules = value;
+    return *this;
+  }
+
+  FirtoolOptions &setDomainMode(DomainMode value) {
+    domainMode = value;
+    return *this;
+  }
+
 private:
   std::string outputFilename;
 
@@ -400,7 +415,6 @@ private:
   bool disableAnnotationsUnknown;
   bool disableAnnotationsClassless;
   bool lowerAnnotationsNoRefTypePorts;
-  bool allowAddingPortsOnPublic;
 
   bool probesToSignals;
   firrtl::PreserveAggregate::PreserveMode preserveAggregate;
@@ -413,12 +427,12 @@ private:
   bool noDedup;
   bool dedupClasses;
   firrtl::CompanionMode companionMode;
+  bool noViews;
   bool disableAggressiveMergeConnections;
   bool lowerMemories;
   std::string blackBoxRootPath;
   bool replSeqMem;
   std::string replSeqMemFile;
-  bool extractTestCode;
   bool ignoreReadEnableMem;
   RandomKind disableRandom;
   std::string outputAnnotationFilename;
@@ -426,9 +440,6 @@ private:
   bool addMuxPragmas;
   firrtl::VerificationFlavor verificationFlavor;
   bool emitSeparateAlwaysBlocks;
-  bool etcDisableInstanceExtraction;
-  bool etcDisableRegisterExtraction;
-  bool etcDisableModuleInlining;
   bool addVivadoRAMAddressConflictSynthesisBugWorkaround;
   std::string ckgModuleName;
   std::string ckgInputName;
@@ -447,6 +458,8 @@ private:
   bool lintStaticAsserts;
   bool lintXmrsInDesign;
   bool emitAllBindFiles;
+  bool inlineInputOnlyModules;
+  DomainMode domainMode;
 };
 
 void registerFirtoolCLOptions();

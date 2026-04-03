@@ -11,8 +11,7 @@ firrtl.circuit "xmr" {
     %x = firrtl.ref.resolve %1 : !firrtl.probe<uint<2>>
     // CHECK-NOT: firrtl.ref.resolve
     firrtl.matchingconnect %o, %x : !firrtl.uint<2>
-    // CHECK:      %w = firrtl.wire : !firrtl.uint<2>
-    // CHECK:      %w_probe = firrtl.node sym @[[wSym]] interesting_name %w : !firrtl.uint<2>
+    // CHECK:      %w = firrtl.wire sym @[[wSym]] : !firrtl.uint<2>
     // CHECK-NEXT: %[[#xmr:]] = firrtl.xmr.deref @xmrPath : !firrtl.uint<2>
     // CHECK:      firrtl.matchingconnect %o, %[[#xmr]] : !firrtl.uint<2>
   }
@@ -87,8 +86,8 @@ firrtl.circuit "Top" {
 firrtl.circuit "Top" {
   // CHECK: hw.hierpath private @[[path:[a-zA-Z0-9_]+]] [@Top::@bar, @Bar::@barXMR, @XmrSrcMod::@[[xmrSym:[a-zA-Z0-9_]+]]]
   firrtl.module @XmrSrcMod(in %pa: !firrtl.uint<1>, out %_a: !firrtl.probe<uint<1>>) {
-    // CHECK: firrtl.module @XmrSrcMod(in %pa: !firrtl.uint<1>) {
-    // CHECK-NEXT: firrtl.node sym @[[xmrSym]]
+    // CHECK: firrtl.module @XmrSrcMod(in %pa: !firrtl.uint<1> sym @[[xmrSym]]) {
+    // CHECK-NEXT: }
     %1 = firrtl.ref.send %pa : !firrtl.uint<1>
     firrtl.ref.define %_a, %1 : !firrtl.probe<uint<1>>
   }
@@ -485,7 +484,7 @@ firrtl.circuit "Top" {
                      out %c: !firrtl.probe<uint<1>>,
                      out %d: !firrtl.probe<uint<1>>) {
     %w = firrtl.wire sym @w : !firrtl.uint<1>
-    // CHECK: firrtl.node sym @[[TOP_W_SYM]] interesting_name %w
+    // CHECK: %w = firrtl.wire sym @[[TOP_W_SYM]]
     %0 = firrtl.ref.send %w : !firrtl.uint<1>
     firrtl.ref.define %a, %0 : !firrtl.probe<uint<1>>
 
@@ -507,44 +506,13 @@ firrtl.circuit "Top" {
   // CHECK-LABEL: firrtl.module @Foo()
   firrtl.module @Foo(out %x: !firrtl.probe<uint<1>>, out %y: !firrtl.probe<uint<1>>) {
     %w = firrtl.wire sym @x : !firrtl.uint<1>
-    // CHECK: firrtl.node sym @[[FOO_X_SYM]] interesting_name %w
+    // CHECK: %w = firrtl.wire sym @[[FOO_X_SYM]]
     %0 = firrtl.ref.send %w : !firrtl.uint<1>
     firrtl.ref.define %x, %0 : !firrtl.probe<uint<1>>
 
     %z = firrtl.verbatim.expr "internal.path" : () -> !firrtl.uint<1>
     %1 = firrtl.ref.send %z : !firrtl.uint<1>
     firrtl.ref.define %y, %1 : !firrtl.probe<uint<1>>
-  }
-}
-
-// -----
-// Check resolving XMR's to internalPaths
-
-// CHECK-LABEL: firrtl.circuit "InternalPaths"
-firrtl.circuit "InternalPaths" {
-  firrtl.extmodule private @RefExtMore(in in: !firrtl.uint<1>,
-                                       out r: !firrtl.probe<uint<1>>,
-                                       out data: !firrtl.uint<3>,
-                                       out r2: !firrtl.probe<vector<bundle<a: uint<3>>, 3>>) attributes {convention = #firrtl<convention scalarized>, internalPaths = [#firrtl.internalpath, #firrtl.internalpath<"path.to.internal.signal">, #firrtl.internalpath, #firrtl.internalpath<"in">]}
-  // CHECK: hw.hierpath private @xmrPath [@InternalPaths::@[[EXT_SYM:.+]]]
-  // CHECK: module public @InternalPaths(
-  firrtl.module public @InternalPaths(in %in: !firrtl.uint<1>) {
-    // CHECK: firrtl.instance ext sym @[[EXT_SYM]] @RefExtMore
-    %ext_in, %ext_r, %ext_data, %ext_r2 =
-      firrtl.instance ext @RefExtMore(in in: !firrtl.uint<1>,
-                                      out r: !firrtl.probe<uint<1>>,
-                                      out data: !firrtl.uint<3>,
-                                      out r2: !firrtl.probe<vector<bundle<a: uint<3>>, 3>>)
-   firrtl.matchingconnect %ext_in, %in : !firrtl.uint<1>
-
-   // CHECK: %[[XMR_R:.+]] = firrtl.xmr.deref @xmrPath, ".path.to.internal.signal" : !firrtl.uint<1>
-   // CHECK: %node_r = firrtl.node %[[XMR_R]]
-   %read_r  = firrtl.ref.resolve %ext_r : !firrtl.probe<uint<1>>
-   %node_r = firrtl.node %read_r : !firrtl.uint<1>
-   // CHECK: %[[XMR_R2:.+]] = firrtl.xmr.deref @xmrPath, ".in" : !firrtl.vector<bundle<a: uint<3>>, 3>
-   // CHECK: %node_r2 = firrtl.node %[[XMR_R2]]
-   %read_r2  = firrtl.ref.resolve %ext_r2 : !firrtl.probe<vector<bundle<a: uint<3>>, 3>>
-   %node_r2 = firrtl.node %read_r2 : !firrtl.vector<bundle<a: uint<3>>, 3>
   }
 }
 
@@ -586,9 +554,9 @@ firrtl.circuit "RefABI" {
 firrtl.circuit "BasicRefSub" {
   // CHECK:  hw.hierpath private @[[XMRPATH:.+]] [@BasicRefSub::@[[C_SYM:[^,]+]], @Child::@[[REF_SYM:[^,]+]]]
   // CHECK-LABEL: firrtl.module private @Child
-  // CHECK-SAME: in %in: !firrtl.bundle<a: uint<1>, b: uint<2>>)
+  // CHECK-SAME: in %in: !firrtl.bundle<a: uint<1>, b: uint<2>> sym @[[REF_SYM]])
   firrtl.module private @Child(in %in : !firrtl.bundle<a: uint<1>, b: uint<2>>, out %out : !firrtl.probe<uint<2>>) {
-    // CHECK-NEXT: firrtl.node sym @[[REF_SYM]] interesting_name %in
+    // CHECK-NEXT: }
     %ref = firrtl.ref.send %in : !firrtl.bundle<a: uint<1>, b: uint<2>>
     %sub = firrtl.ref.sub %ref[1] : !firrtl.probe<bundle<a: uint<1>, b: uint<2>>>
     firrtl.ref.define %out, %sub : !firrtl.probe<uint<2>>
@@ -766,8 +734,7 @@ firrtl.circuit "RefSubOutputPort" {
 // CHECK-LABEL: "WireProbe"
 firrtl.circuit "WireProbe" {
   // CHECK: hierpath {{.*}} [@WireProbe::@[[SYM:[^ ]+]]]
-  // CHECK: @WireProbe(in %x: !firrtl.uint<5>) {
-  // CHECK-NEXT: firrtl.node sym @[[SYM]]
+  // CHECK: @WireProbe(in %x: !firrtl.uint<5> sym @[[SYM]]) {
   // CHECK-NEXT: }
   firrtl.module @WireProbe(in %x: !firrtl.uint<5>, out %p: !firrtl.probe<uint<5>>) {
     // CHECK-NOT: firrtl.wire
@@ -790,7 +757,7 @@ firrtl.circuit "Foo" {
     //CHECK: sv.ifdef
     sv.ifdef @A {
       %b = firrtl.wire : !firrtl.uint<1>
-      // CHECK: firrtl.node sym @[[SYM]] {{.*}} %b
+      // CHECK: %b = firrtl.wire sym @[[SYM]]
       %0 = firrtl.ref.send %b : !firrtl.uint<1>
       firrtl.ref.define %a, %0 : !firrtl.probe<uint<1>>
     }
@@ -817,5 +784,34 @@ firrtl.circuit "PF" {
   firrtl.module @Other(out %p: !firrtl.probe<uint<1>>) {
     %c_p = firrtl.instance c @Child(out p: !firrtl.probe<uint<1>>)
     firrtl.ref.define %p, %c_p : !firrtl.probe<uint<1>>
+  }
+}
+
+
+// -----
+// Test that instance results used in both connects and ref.send preserve
+// correct flow semantics. The node created for the XMR should not replace
+// uses where the instance result is the destination of a connect.
+
+// CHECK-LABEL: firrtl.circuit "ConnectFlow"
+firrtl.circuit "ConnectFlow" {
+  firrtl.extmodule @Ext(in clock: !firrtl.clock)
+
+  // CHECK: firrtl.module @ConnectFlow()
+  firrtl.module @ConnectFlow(out %probe: !firrtl.probe<clock>) {
+    // CHECK: %ext_clock = firrtl.instance ext @Ext(in clock: !firrtl.clock)
+    %ext_clock = firrtl.instance ext @Ext(in clock: !firrtl.clock)
+
+    // CHECK-NEXT: %ext_clock_probe = firrtl.node sym @{{[^ ]+}} interesting_name %ext_clock
+    // CHECK-NEXT: %invalid_clock = firrtl.invalidvalue
+    %invalid_clock = firrtl.invalidvalue : !firrtl.clock
+
+    // CHECK-NEXT: firrtl.matchingconnect %ext_clock, %invalid_clock
+    // The connect should still use %ext_clock (not %ext_clock_probe) to preserve sink flow
+    firrtl.matchingconnect %ext_clock, %invalid_clock : !firrtl.clock
+
+    // The ref.send and ref.define are removed by LowerXMR
+    %0 = firrtl.ref.send %ext_clock : !firrtl.clock
+    firrtl.ref.define %probe, %0 : !firrtl.probe<clock>
   }
 }

@@ -1,6 +1,7 @@
 // RUN: circt-opt %s | circt-opt | FileCheck %s
 
 %true = hw.constant true
+%c0_i8 = hw.constant 0 : i8
 
 //===----------------------------------------------------------------------===//
 // Types
@@ -73,6 +74,10 @@ ltl.repeat %s, 42, 1337 : !ltl.sequence
 // Properties
 //===----------------------------------------------------------------------===//
 
+// CHECK: ltl.boolean_constant true
+%bc = ltl.boolean_constant true
+unrealized_conversion_cast %bc : !ltl.property to index
+
 // CHECK: ltl.not {{%.+}} : i1
 // CHECK: ltl.not {{%.+}} : !ltl.sequence
 // CHECK: ltl.not {{%.+}} : !ltl.property
@@ -92,6 +97,14 @@ ltl.until %p, %p : !ltl.property, !ltl.property
 ltl.eventually %true : i1
 ltl.eventually %s : !ltl.sequence
 ltl.eventually %p : !ltl.property
+
+// CHECK: ltl.past {{%.+}}, 1 : i1
+// CHECK: ltl.past {{%.+}}, 5 : i8
+ltl.past %true, 1 : i1
+ltl.past %c0_i8, 5 : i8
+
+// CHECK: ltl.past {{%.+}}, 5 clk {{%.+}} : i8
+ltl.past %c0_i8, 5 clk %true : i8
 
 //===----------------------------------------------------------------------===//
 // Clocking

@@ -747,9 +747,9 @@ void HWMemSimImplPass::runOnOperation() {
       auto nameAttr = builder.getStringAttr(oldModule.getName());
 
       // The requirements for macro replacement:
-      // 1. read latency and write latency of one.
+      // 1. read latency and write latency of at least one.
       // 2. undefined read-under-write behavior.
-      if (replSeqMem && ((mem.readLatency == 1 && mem.writeLatency == 1) &&
+      if (replSeqMem && ((mem.readLatency >= 1 && mem.writeLatency >= 1) &&
                          mem.dataWidth > 0)) {
         HWModuleExternOp::create(builder, oldModule.getLoc(), nameAttr,
                                  oldModule.getPortList());
@@ -778,9 +778,4 @@ void HWMemSimImplPass::runOnOperation() {
 
   if (!anythingChanged)
     markAllAnalysesPreserved();
-}
-
-std::unique_ptr<Pass>
-circt::seq::createHWMemSimImplPass(const HWMemSimImplOptions &options) {
-  return std::make_unique<HWMemSimImplPass>(options);
 }

@@ -11,13 +11,22 @@
 //===----------------------------------------------------------------------===//
 
 #include "ImportVerilogInternals.h"
+#include "circt/Conversion/MooreToCore.h"
+#include "circt/Dialect/LLHD/LLHDPasses.h"
+#include "circt/Dialect/Moore/MoorePasses.h"
+#include "circt/Dialect/Seq/SeqPasses.h"
+#include "circt/Transforms/Passes.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Support/Timing.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
+#include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/Support/SourceMgr.h"
 
+#include "slang/analysis/AnalysisManager.h"
 #include "slang/diagnostics/DiagnosticClient.h"
 #include "slang/driver/Driver.h"
 #include "slang/parsing/Preprocessor.h"
@@ -58,12 +67,33 @@ static Location convertLocation(MLIRContext *context,
   return UnknownLoc::get(context);
 }
 
+/// Convert a slang `SourceRange` to an MLIR `Location`.
+static Location convertLocation(MLIRContext *context,
+                                const slang::SourceManager &sourceManager,
+                                slang::SourceRange range) {
+  auto start = range.start();
+  auto end = range.end();
+  if (start && start.buffer() != slang::SourceLocation::NoLocation.buffer()) {
+    auto fileName = sourceManager.getFileName(start);
+    auto startLine = sourceManager.getLineNumber(start);
+    auto startColumn = sourceManager.getColumnNumber(start);
+    if (end && end.buffer() == start.buffer()) {
+      auto endLine = sourceManager.getLineNumber(end);
+      auto endColumn = sourceManager.getColumnNumber(end);
+      return FileLineColRange::get(context, fileName, startLine, startColumn,
+                                   endLine, endColumn);
+    }
+    return FileLineColLoc::get(context, fileName, startLine, startColumn);
+  }
+  return UnknownLoc::get(context);
+}
+
 Location Context::convertLocation(slang::SourceLocation loc) {
   return ::convertLocation(getContext(), sourceManager, loc);
 }
 
 Location Context::convertLocation(slang::SourceRange range) {
-  return convertLocation(range.start());
+  return ::convertLocation(getContext(), sourceManager, range);
 }
 
 namespace {
@@ -76,8 +106,10 @@ public:
   void report(const slang::ReportedDiagnostic &diag) override {
     // Generate the primary MLIR diagnostic.
     auto &diagEngine = context->getDiagEngine();
-    auto mlirDiag = diagEngine.emit(convertLocation(diag.location),
-                                    getSeverity(diag.severity));
+    Location loc = !diag.ranges.empty() ? convertLocation(diag.ranges[0])
+                                        : convertLocation(diag.location);
+
+    auto mlirDiag = diagEngine.emit(loc, getSeverity(diag.severity));
     mlirDiag << diag.formattedMessage;
 
     // Append the name of the option that can be used to control this
@@ -107,6 +139,11 @@ public:
   /// Convert a slang `SourceLocation` to an MLIR `Location`.
   Location convertLocation(slang::SourceLocation loc) const {
     return ::convertLocation(context, *sourceManager, loc);
+  }
+
+  /// Convert a slang `SourceRange` to an MLIR `Location`.
+  Location convertLocation(slang::SourceRange range) const {
+    return ::convertLocation(context, *sourceManager, range);
   }
 
   static DiagnosticSeverity getSeverity(slang::DiagnosticSeverity severity) {
@@ -208,6 +245,12 @@ LogicalResult ImportDriver::prepareDriver(SourceMgr &sourceMgr) {
   for (const auto &libExt : options.libExts)
     driver.sourceLoader.addSearchExtension(libExt);
 
+  for (const auto &[i, f] : llvm::enumerate(options.libraryFiles)) {
+    // Include a space to avoid conflicts with explicitly-specified names.
+    auto libName = "library " + std::to_string(i);
+    driver.sourceLoader.addLibraryFiles(libName, f);
+  }
+
   for (const auto &includeDir : options.includeDirs)
     if (driver.sourceManager.addUserDirectories(includeDir))
       return failure();
@@ -260,6 +303,11 @@ LogicalResult ImportDriver::importVerilog(ModuleOp module) {
   // Elaborate the input.
   auto compileTimer = ts.nest("Verilog elaboration");
   auto compilation = driver.createCompilation();
+
+  // Semantic analysis
+  auto analysisTimer = ts.nest("Semantic analysis");
+  driver.runAnalysis(*compilation);
+
   for (auto &diag : compilation->getAllDiagnostics())
     driver.diagEngine.issue(diag);
   if (!parseSuccess || driver.diagEngine.getNumErrors() > 0)
@@ -389,4 +437,108 @@ void circt::registerFromVerilogTranslation() {
           module = {};
         return module;
       });
+}
+
+//===----------------------------------------------------------------------===//
+// Pass Pipeline
+//===----------------------------------------------------------------------===//
+
+/// Optimize and simplify the Moore dialect IR.
+void circt::populateVerilogToMoorePipeline(OpPassManager &pm) {
+  {
+    // Perform an initial cleanup and preprocessing across all
+    // modules/functions.
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createCSEPass());
+    anyPM.addPass(mlir::createCanonicalizerPass());
+  }
+
+  pm.addPass(moore::createVTablesPass());
+
+  // Remove unused symbols.
+  pm.addPass(mlir::createSymbolDCEPass());
+
+  {
+    // Perform module-specific transformations.
+    auto &modulePM = pm.nest<moore::SVModuleOp>();
+    modulePM.addPass(moore::createSimplifyRefsPass());
+    // TODO: Enable the following once it not longer interferes with @(...)
+    // event control checks. The introduced dummy variables make the event
+    // control observe a static local variable that never changes, instead of
+    // observing a module-wide signal.
+    // modulePM.addPass(moore::createSimplifyProceduresPass());
+    modulePM.addPass(mlir::createSROA());
+  }
+
+  {
+    // Perform a final cleanup across all modules/functions.
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createMem2Reg());
+    anyPM.addPass(mlir::createCSEPass());
+    anyPM.addPass(mlir::createCanonicalizerPass());
+  }
+}
+
+/// Convert Moore dialect IR into core dialect IR
+void circt::populateMooreToCorePipeline(OpPassManager &pm) {
+  // Perform the conversion.
+  pm.addPass(createConvertMooreToCorePass());
+
+  {
+    // Conversion to the core dialects likely uncovers new canonicalization
+    // opportunities.
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createCSEPass());
+    anyPM.addPass(mlir::createCanonicalizerPass());
+  }
+}
+
+/// Convert LLHD dialect IR into core dialect IR
+void circt::populateLlhdToCorePipeline(
+    OpPassManager &pm, const LlhdToCorePipelineOptions &options) {
+  // Inline function calls and lower SCF to CF.
+  pm.addNestedPass<hw::HWModuleOp>(llhd::createWrapProceduralOpsPass());
+  pm.addPass(mlir::createSCFToControlFlowPass());
+  pm.addPass(llhd::createInlineCallsPass());
+  pm.addPass(mlir::createSymbolDCEPass());
+
+  // Simplify processes, replace signals with process results, and detect
+  // registers.
+  auto &modulePM = pm.nest<hw::HWModuleOp>();
+  // See https://github.com/llvm/circt/issues/8804.
+  if (options.sroa) {
+    modulePM.addPass(mlir::createSROA());
+  }
+  modulePM.addPass(llhd::createMem2RegPass());
+  modulePM.addPass(llhd::createHoistSignalsPass());
+  modulePM.addPass(llhd::createDeseqPass());
+  modulePM.addPass(llhd::createLowerProcessesPass());
+  modulePM.addPass(mlir::createCSEPass());
+  modulePM.addPass(mlir::createCanonicalizerPass());
+
+  // Unroll loops and remove control flow.
+  modulePM.addPass(llhd::createUnrollLoopsPass());
+  modulePM.addPass(mlir::createCSEPass());
+  modulePM.addPass(mlir::createCanonicalizerPass());
+  modulePM.addPass(llhd::createRemoveControlFlowPass());
+  modulePM.addPass(mlir::createCSEPass());
+  modulePM.addPass(mlir::createCanonicalizerPass());
+
+  // Convert `arith.select` generated by some of the control flow canonicalizers
+  // to `comb.mux`.
+  modulePM.addPass(createMapArithToCombPass(true));
+
+  // Simplify module-level signals.
+  modulePM.addPass(llhd::createCombineDrivesPass());
+  modulePM.addPass(llhd::createSig2Reg());
+  modulePM.addPass(mlir::createCSEPass());
+  modulePM.addPass(mlir::createCanonicalizerPass());
+
+  // Map `seq.firreg` with array type and `hw.array_inject` self-feedback to
+  // `seq.firmem` ops.
+  if (options.detectMemories) {
+    modulePM.addPass(seq::createRegOfVecToMem());
+    modulePM.addPass(mlir::createCSEPass());
+    modulePM.addPass(mlir::createCanonicalizerPass());
+  }
 }

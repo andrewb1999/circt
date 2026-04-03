@@ -11,14 +11,22 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
+
+namespace circt {
+namespace loopschedule {
+#define GEN_PASS_DEF_UNROLLMARKEDLOOPS
+#include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h.inc"
+} // namespace loopschedule
+} // namespace circt
 
 using namespace circt;
 using namespace loopschedule;
@@ -27,7 +35,7 @@ using namespace mlir::affine;
 namespace {
 
 struct UnrollMarkedLoopsPass
-    : public UnrollMarkedLoopsBase<UnrollMarkedLoopsPass> {
+    : public circt::loopschedule::impl::UnrollMarkedLoopsBase<UnrollMarkedLoopsPass> {
   void runOnOperation() override;
 };
 

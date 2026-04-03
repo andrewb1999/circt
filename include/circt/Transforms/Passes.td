@@ -89,8 +89,36 @@ def MapArithToCombPass : Pass<"map-arith-to-comb"> {
     Rather, it provides a simple way (mostly for testing purposes) to map
     `arith` operations.
   }];
-  let constructor = "circt::createMapArithToCombPass()";
+  let options = [
+    Option<"enableBestEffortLowering", "enable-best-effort-lowering",
+           "bool", /*default=*/"false",
+           "Enable best effort lowering of operations"
+           "(eg, existing arith operations that have no lowering stay as is)">
+  ];
+  
+  let constructor = "circt::createMapArithToCombPass(/*enableBestEffortLowering=*/false)";
   let dependentDialects = ["circt::hw::HWDialect, mlir::arith::ArithDialect, circt::comb::CombDialect"];
+}
+
+def ConvertIndexToUInt : Pass<"convert-index-to-uint", "::mlir::ModuleOp"> {
+  let summary = "Rewrite index-based switch comparisons into unsigned integer ops.";
+  let description = [{
+    Replace `arith.cmpi` operations whose operands are `index` values (often
+    produced when lowering `scf.index_switch`) with comparisons over the
+    original integer type so that downstream hardware mapping passes (e.g.
+    `--map-arith-to-comb`) do not encounter unsupported index-typed arithmetic.
+    The pass converts any associated index constants and erases the redundant
+    casts that become dead afterwards. For example, it rewrites:
+
+      `arith.cmpi eq, (arith.index_cast %v : i4 to index),
+                      (arith.constant 5 : index)`
+
+    into:
+
+      `arith.cmpi eq, %v, (arith.constant 5 : i4)`
+  }];
+  let constructor = "circt::createConvertIndexToUIntPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect"];
 }
 
 def InsertMergeBlocks : Pass<"insert-merge-blocks", "::mlir::ModuleOp"> {

@@ -21,6 +21,7 @@
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/Synth/Transforms/SynthPasses.h"
 #include "circt/Support/Passes.h"
+#include "circt/Support/SATSolver.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -40,10 +41,12 @@ static void addOpName(SmallVectorImpl<std::string> &ops) {
   (ops.push_back(AllowedOpTy::getOperationName().str()), ...);
 }
 template <typename... OpToLowerTy>
-static std::unique_ptr<Pass> createLowerVariadicPass(bool timingAware) {
+static std::unique_ptr<Pass>
+createLowerVariadicPass(bool timingAware, bool reuseSubsets = false) {
   LowerVariadicOptions options;
   addOpName<OpToLowerTy...>(options.opNames);
   options.timingAware = timingAware;
+  options.reuseSubsets = reuseSubsets;
   return createLowerVariadic(options);
 }
 void circt::synth::buildCombLoweringPipeline(
@@ -59,8 +62,9 @@ void circt::synth::buildCombLoweringPipeline(
       circt::ConvertDatapathToCombOptions datapathOptions;
       datapathOptions.timingAware = options.timingAware;
       pm.addPass(createConvertDatapathToComb(datapathOptions));
-      pm.addPass(createSimpleCanonicalizerPass());
     }
+    pm.addPass(createCSEPass());
+    pm.addPass(createSimpleCanonicalizerPass());
     // Partially legalize Comb, then run CSE and canonicalization.
     circt::ConvertCombToSynthOptions convOptions;
     addOpName<comb::AndOp, comb::OrOp, comb::XorOp, comb::MuxOp, comb::ICmpOp,
@@ -80,7 +84,9 @@ void circt::synth::buildCombLoweringPipeline(
   if (options.targetIR.getValue() == TargetIR::AIG) {
     // For AIG, lower variadic XoR since AIG cannot keep variadic
     // representation.
-    pm.addPass(createLowerVariadicPass<comb::XorOp>(options.timingAware));
+    pm.addPass(createLowerVariadicPass<comb::XorOp>(
+        options.timingAware,
+        options.synthesisStrategy == OptimizationStrategyArea));
   } else if (options.targetIR.getValue() == TargetIR::MIG) {
     // For MIG, lower variadic And, Or, and Xor since MIG cannot keep variadic
     // representation.
@@ -115,6 +121,21 @@ void circt::synth::buildSynthOptimizationPipeline(
   pm.addPass(createLowerVariadicPass(options.timingAware));
   pm.addPass(createStructuralHash());
 
+  // SOP balancing.
+  if (!options.disableSOPBalancing) {
+    SOPBalancingOptions sopOptions;
+    // FIXME: The following is very small compared to the default value of ABC
+    // (6/8) and mockturtle(4/25) due to inefficient implementation of
+    // CutRewriter.
+    sopOptions.maxCutInputSize = 4;
+    sopOptions.maxCutsPerRoot = 4;
+    pm.addPass(synth::createSOPBalancing(sopOptions));
+    pm.addPass(createStructuralHash());
+  }
+
+  if (!options.disableFunctionalReduction && hasIncrementalSATSolverBackend())
+    pm.addPass(createFunctionalReduction());
+
   if (!options.abcCommands.empty()) {
     synth::ABCRunnerOptions abcOptions;
     abcOptions.abcPath = options.abcPath;
@@ -123,7 +144,7 @@ void circt::synth::buildSynthOptimizationPipeline(
     abcOptions.continueOnFailure = options.ignoreAbcFailures;
     pm.addPass(synth::createABCRunner(abcOptions));
   }
-  // TODO: Add balancing, rewriting, FRAIG conversion, etc.
+  // TODO: Add more balancing and rewriting passes.
 }
 
 //===----------------------------------------------------------------------===//

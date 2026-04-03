@@ -11,6 +11,7 @@ add_subdirectory(circt-rtl-sim)
 add_subdirectory(circt-synth)
 add_subdirectory(circt-test)
 add_subdirectory(circt-translate)
+add_subdirectory(domaintool)
 add_subdirectory(firld)
 add_subdirectory(firtool)
 add_subdirectory(handshake-runner)
@@ -18,6 +19,8 @@ add_subdirectory(hlstool)
 add_subdirectory(kanagawatool)
 add_subdirectory(om-linker)
 add_subdirectory(py-split-input-file)
+
+# NOTE: circt-tblgen is included in the root CMakeLists.txt
 
 if(CIRCT_SLANG_FRONTEND_ENABLED)
   add_subdirectory(circt-verilog)

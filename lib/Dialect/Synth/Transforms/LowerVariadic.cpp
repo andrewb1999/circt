@@ -19,9 +19,17 @@
 #include "circt/Dialect/Synth/SynthOps.h"
 #include "circt/Dialect/Synth/Transforms/SynthPasses.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
+#include "mlir/IR/Block.h"
 #include "mlir/IR/OpDefinition.h"
-#include "llvm/ADT/PointerIntPair.h"
-#include "llvm/ADT/PriorityQueue.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Value.h"
+#include "mlir/Support/LLVM.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
+#include <iterator>
+#include <vector>
 
 #define DEBUG_TYPE "synth-lower-variadic"
 
@@ -41,40 +49,6 @@ using namespace synth;
 
 namespace {
 
-/// Helper class for delay-aware variadic operation lowering.
-/// Stores a value along with its arrival time for priority queue ordering.
-class ValueWithArrivalTime {
-  /// The value and an optional inversion flag packed together.
-  /// The inversion flag is used for AndInverterOp lowering.
-  llvm::PointerIntPair<Value, 1, bool> value;
-
-  /// The arrival time (delay) of this value in the circuit.
-  int64_t arrivalTime;
-
-  /// Value numbering for deterministic ordering when arrival times are equal.
-  /// This ensures consistent results across runs when multiple values have
-  /// the same delay.
-  size_t valueNumbering = 0;
-
-public:
-  ValueWithArrivalTime(Value value, int64_t arrivalTime, bool invert,
-                       size_t valueNumbering)
-      : value(value, invert), arrivalTime(arrivalTime),
-        valueNumbering(valueNumbering) {}
-
-  Value getValue() const { return value.getPointer(); }
-  bool isInverted() const { return value.getInt(); }
-
-  /// Comparison operator for priority queue. Values with earlier arrival times
-  /// have higher priority. When arrival times are equal, use value numbering
-  /// for determinism.
-  bool operator>(const ValueWithArrivalTime &other) const {
-    return arrivalTime > other.arrivalTime ||
-           (arrivalTime == other.arrivalTime &&
-            valueNumbering > other.valueNumbering);
-  }
-};
-
 struct LowerVariadicPass : public impl::LowerVariadicBase<LowerVariadicPass> {
   using LowerVariadicBase::LowerVariadicBase;
   void runOnOperation() override;
@@ -91,51 +65,145 @@ static LogicalResult replaceWithBalancedTree(
     Operation *op, llvm::function_ref<bool(OpOperand &)> isInverted,
     llvm::function_ref<Value(ValueWithArrivalTime, ValueWithArrivalTime)>
         createBinaryOp) {
-  // Min-heap priority queue ordered by arrival time.
-  // Values with earlier arrival times are processed first.
-  llvm::PriorityQueue<ValueWithArrivalTime, std::vector<ValueWithArrivalTime>,
-                      std::greater<ValueWithArrivalTime>>
-      queue;
-
-  // Counter for deterministic ordering when arrival times are equal.
+  // Collect all operands with their arrival times and inversion flags
+  SmallVector<ValueWithArrivalTime> operands;
   size_t valueNumber = 0;
 
-  auto push = [&](Value value, bool invert) {
+  for (size_t i = 0, e = op->getNumOperands(); i < e; ++i) {
     int64_t delay = 0;
     // If analysis is available, use it to compute the delay.
     // If not available, use zero delay and `valueNumber` will be used instead.
     if (analysis) {
-      auto result = analysis->getMaxDelay(value);
+      auto result = analysis->getMaxDelay(op->getOperand(i));
       if (failed(result))
         return failure();
       delay = *result;
     }
-    ValueWithArrivalTime entry(value, delay, invert, valueNumber++);
-    queue.push(entry);
-    return success();
-  };
-
-  // Enqueue all operands with their arrival times and inversion flags.
-  for (size_t i = 0, e = op->getNumOperands(); i < e; ++i)
-    if (failed(push(op->getOperand(i), isInverted(op->getOpOperand(i)))))
-      return failure();
-
-  // Build balanced tree by repeatedly combining the two earliest values.
-  // This greedy approach minimizes the maximum depth of late-arriving signals.
-  while (queue.size() >= 2) {
-    auto lhs = queue.top();
-    queue.pop();
-    auto rhs = queue.top();
-    queue.pop();
-    // Create and enqueue the combined value.
-    if (failed(push(createBinaryOp(lhs, rhs), /*inverted=*/false)))
-      return failure();
+    operands.push_back(ValueWithArrivalTime(op->getOperand(i), delay,
+                                            isInverted(op->getOpOperand(i)),
+                                            valueNumber++));
   }
 
-  // Get the final result and replace the original operation.
-  auto result = queue.top().getValue();
-  rewriter.replaceOp(op, result);
+  // Use shared tree building utility
+  auto result = buildBalancedTreeWithArrivalTimes<ValueWithArrivalTime>(
+      operands,
+      // Combine: create binary operation and compute new arrival time
+      [&](const ValueWithArrivalTime &lhs, const ValueWithArrivalTime &rhs) {
+        Value combined = createBinaryOp(lhs, rhs);
+        int64_t newDelay = 0;
+        if (analysis) {
+          auto delayResult = analysis->getMaxDelay(combined);
+          if (succeeded(delayResult))
+            newDelay = *delayResult;
+        }
+        return ValueWithArrivalTime(combined, newDelay, false, valueNumber++);
+      });
+
+  rewriter.replaceOp(op, result.getValue());
   return success();
+}
+
+using OperandKey = llvm::SmallVector<std::pair<mlir::Value, bool>>;
+
+namespace llvm {
+template <>
+struct DenseMapInfo<OperandKey> {
+  static OperandKey getEmptyKey() {
+    // Return a vector containing the mlir::Value empty key
+    return {{DenseMapInfo<mlir::Value>::getEmptyKey(), false}};
+  }
+
+  static OperandKey getTombstoneKey() {
+    // Return a vector containing the mlir::Value tombstone key
+    return {{DenseMapInfo<mlir::Value>::getTombstoneKey(), false}};
+  }
+
+  static unsigned getHashValue(const OperandKey &val) {
+    llvm::hash_code hash = 0;
+    // Iteratively combine the hash of each pair in the vector
+    for (const auto &pair : val) {
+      hash = llvm::hash_combine(
+          hash, DenseMapInfo<mlir::Value>::getHashValue(pair.first),
+          pair.second);
+    }
+    return static_cast<unsigned>(hash);
+  }
+
+  static bool isEqual(const OperandKey &lhs, const OperandKey &rhs) {
+    // std::vector and std::pair already implement operator==,
+    // which does a deep equality check of the elements.
+    return lhs == rhs;
+  }
+};
+} // namespace llvm
+
+// Struct for ordering the andInverterOp operations we have already seen
+struct OperandPairLess {
+  bool operator()(const std::pair<mlir::Value, bool> &lhs,
+                  const std::pair<mlir::Value, bool> &rhs) const {
+    if (lhs.first != rhs.first) {
+      auto lhsArg = llvm::dyn_cast<mlir::BlockArgument>(lhs.first);
+      auto rhsArg = llvm::dyn_cast<mlir::BlockArgument>(rhs.first);
+      if (lhsArg && rhsArg)
+        return lhsArg.getArgNumber() < rhsArg.getArgNumber();
+      if (lhsArg)
+        return true;
+      if (rhsArg)
+        return false;
+
+      auto *lhsOp = lhs.first.getDefiningOp();
+      auto *rhsOp = rhs.first.getDefiningOp();
+      return lhsOp->isBeforeInBlock(rhsOp);
+    }
+    return lhs.second < rhs.second;
+  }
+};
+
+static OperandKey getSortedOperandKey(aig::AndInverterOp op) {
+  OperandKey key;
+  for (size_t i = 0, e = op.getNumOperands(); i < e; ++i)
+    key.emplace_back(op.getOperand(i), op.isInverted(i));
+
+  std::sort(key.begin(), key.end(), OperandPairLess());
+  return key;
+}
+
+static void simplifyWithExistingOperations(
+    aig::AndInverterOp op, mlir::IRRewriter &rewriter,
+    llvm::DenseMap<OperandKey, mlir::Value> &seenExpressions) {
+
+  if (op.getNumOperands() <= 2)
+    return;
+
+  OperandKey allOperands = getSortedOperandKey(op);
+  mlir::SmallVector<Value> newValues;
+  mlir::SmallVector<bool> newInversions;
+
+  for (auto it = allOperands.begin(); it != allOperands.end(); ++it) {
+    // Look at the remaining operands from 'it' to the end
+    OperandKey remaining(it, allOperands.end());
+
+    auto match = seenExpressions.find(remaining);
+    if (match != seenExpressions.end() && match->second != op.getResult()) {
+      newValues.push_back(match->second);
+      newInversions.push_back(false);
+
+      // We found a match that covers everything from 'it' to the end,
+      // so we can stop searching.
+      break;
+    }
+
+    // No match, add it to the new list of values and inversions.
+    newValues.push_back(it->first);
+    newInversions.push_back(it->second);
+  }
+
+  if (newValues.size() < allOperands.size()) {
+    rewriter.modifyOpInPlace(op, [&]() {
+      op.getOperation()->setOperands(newValues);
+      op.setInverted(newInversions);
+    });
+  }
 }
 
 void LowerVariadicPass::runOnOperation() {
@@ -176,6 +244,25 @@ void LowerVariadicPass::runOnOperation() {
   mlir::IRRewriter rewriter(&getContext());
   rewriter.setListener(analysis);
 
+  // Simplify exising andInverterOps by reusing operations.
+  if (reuseSubsets) {
+    llvm::DenseMap<OperandKey, mlir::Value> seenExpressions;
+    // First collect all the andInverterOp operations in the block.
+    for (auto &op : moduleOp.getBodyBlock()->getOperations()) {
+      if (auto andInverterOp = llvm::dyn_cast<aig::AndInverterOp>(op)) {
+        OperandKey key = getSortedOperandKey(andInverterOp);
+        seenExpressions[key] = andInverterOp.getResult();
+      }
+    }
+    // Now try to replace operations with subsets.
+    for (auto &op : moduleOp.getBodyBlock()->getOperations()) {
+      if (auto andInverterOp = llvm::dyn_cast<aig::AndInverterOp>(op)) {
+        simplifyWithExistingOperations(andInverterOp, rewriter,
+                                       seenExpressions);
+      }
+    }
+  }
+
   // FIXME: Currently only top-level operations are lowered due to the lack of
   //        topological sorting in across nested regions.
   for (auto &opRef :
@@ -197,9 +284,9 @@ void LowerVariadicPass::runOnOperation() {
           },
           // Create binary AndInverterOp with inversion flags.
           [&](ValueWithArrivalTime lhs, ValueWithArrivalTime rhs) {
-            return rewriter.create<aig::AndInverterOp>(
-                op->getLoc(), lhs.getValue(), rhs.getValue(), lhs.isInverted(),
-                rhs.isInverted());
+            return aig::AndInverterOp::create(
+                rewriter, op->getLoc(), lhs.getValue(), rhs.getValue(),
+                lhs.isInverted(), rhs.isInverted());
           });
       if (failed(result))
         return signalPassFailure();

@@ -15,12 +15,15 @@ add_circt_public_c_api_library(CIRCTCAPIConversion
   CIRCTCombToLLVM
   CIRCTCombToSMT
   CIRCTConvertToArcs
+  CIRCTConvertToLLVM
   CIRCTDatapathToComb
   CIRCTDatapathToSMT
   CIRCTDCToHW
   CIRCTExportVerilog
   CIRCTFIRRTLToHW
   CIRCTFSMToSV
+  CIRCTFSMToSMT
+  CIRCTFSMToCore
   CIRCTHandshakeToDC
   CIRCTHandshakeToHW
   CIRCTHWArithToHW
@@ -40,4 +43,5 @@ add_circt_public_c_api_library(CIRCTCAPIConversion
   CIRCTCFToHandshake
   CIRCTVerifToSMT
   CIRCTVerifToSV
+  CIRCTCoreToFSM
 )

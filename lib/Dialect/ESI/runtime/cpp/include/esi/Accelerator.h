@@ -39,14 +39,24 @@ namespace esi {
 class AcceleratorServiceThread;
 
 //===----------------------------------------------------------------------===//
-// Constants used by low-level APIs.
+// Metadata constants which may or may not be used by various backends. Provided
+// here since they are intended to be somewhat standard.
 //===----------------------------------------------------------------------===//
 
 constexpr uint32_t MetadataOffset = 8;
+
 constexpr uint64_t MagicNumberLo = 0xE5100E51;
 constexpr uint64_t MagicNumberHi = 0x207D98E5;
 constexpr uint64_t MagicNumber = MagicNumberLo | (MagicNumberHi << 32);
+constexpr uint64_t MagicNumberOffset = 0;
+
 constexpr uint32_t ExpectedVersionNumber = 0;
+constexpr uint64_t VersionNumberOffset = 8;
+
+constexpr uint32_t ManifestPtrOffset = 0x10;
+
+constexpr uint32_t CycleCountOffset = 0x20;
+constexpr uint32_t CoreFreqOffset = 0x28;
 
 //===----------------------------------------------------------------------===//
 // Accelerator design hierarchy root.
@@ -65,8 +75,8 @@ public:
   Accelerator(std::optional<ModuleInfo> info,
               std::vector<std::unique_ptr<Instance>> children,
               std::vector<services::Service *> services,
-              std::vector<std::unique_ptr<BundlePort>> &ports)
-      : HWModule(info, std::move(children), services, ports) {}
+              std::vector<std::unique_ptr<BundlePort>> &&ports)
+      : HWModule(info, std::move(children), services, std::move(ports)) {}
 };
 
 //===----------------------------------------------------------------------===//
@@ -85,13 +95,6 @@ public:
 
   /// Disconnect from the accelerator cleanly.
   virtual void disconnect();
-
-  // While building the design, keep around a std::map of active services
-  // indexed by the service name. When a new service is encountered during
-  // descent, add it to the table (perhaps overwriting one). Modifications to
-  // the table only apply to the current branch, so copy this and update it at
-  // each level of the tree.
-  using ServiceTable = std::map<std::string, services::Service *>;
 
   /// Return a pointer to the accelerator 'service' thread (or threads). If the
   /// thread(s) are not running, they will be started when this method is
@@ -165,7 +168,7 @@ private:
 
   /// Cache services via a unique_ptr so they get free'd automatically when
   /// Accelerator objects get deconstructed.
-  using ServiceCacheKey = std::tuple<const std::type_info *, AppIDPath>;
+  using ServiceCacheKey = std::tuple<std::string, AppIDPath>;
   std::map<ServiceCacheKey, std::unique_ptr<Service>> serviceCache;
 
   std::unique_ptr<AcceleratorServiceThread> serviceThread;
@@ -175,12 +178,6 @@ private:
 };
 
 namespace registry {
-
-// Connect to an ESI accelerator given a backend name and connection specifier.
-// Alternatively, instantiate the backend directly (if you're using C++).
-std::unique_ptr<AcceleratorConnection> connect(Context &ctxt,
-                                               const std::string &backend,
-                                               const std::string &connection);
 
 namespace internal {
 

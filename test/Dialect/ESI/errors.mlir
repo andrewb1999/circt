@@ -120,8 +120,22 @@ hw.module.extern @TypeAModuleDst(in %windowed: !TypeAwin1)
 
 // -----
 
+!TypeA = !hw.struct<a1: !hw.array<4xi3>, a2: !hw.array<5xi2>>
+// expected-error @+1 {{cannot have two array or list fields with num items (in "a2")}}
+!TypeAwin1 = !esi.window<
+  "TypeAwin1", !TypeA, [
+    <"FrameA", [
+      <"a1", 1>,
+      <"a2", 1>
+    ]>
+  ]>
+
+
+
+// -----
+
 !TypeA = !hw.struct<bar: i6>
-// expected-error @+1 {{cannot specify num items on non-array field "bar"}}
+// expected-error @+1 {{specification of num items only allowed on array or list fields (in "bar")}}
 !TypeAwin1 = !esi.window<
   "TypeAwin1", !TypeA, [
     <"FrameA", [
@@ -139,20 +153,6 @@ hw.module.extern @TypeAModuleDst(in %windowed: !TypeAwin1)
   "TypeAwin1", !TypeA, [
     <"FrameA", [
       <"bar", 8>
-    ]>
-  ]>
-
-hw.module.extern @TypeAModuleDst(in %windowed: !TypeAwin1)
-
-// -----
-
-!TypeA = !hw.struct<foo : i3, bar: !hw.array<5xi2>>
-// expected-error @+1 {{array with size specified must be in their own frame (in "bar")}}
-!TypeAwin1 = !esi.window<
-  "TypeAwin1", !TypeA, [
-    <"FrameA", [
-      <"foo">,
-      <"bar", 5>
     ]>
   ]>
 
@@ -211,4 +211,15 @@ hw.module @wrap_multi_unwrap(in %a_data: i8, in %a_valid: i1, out a_ready: i1) {
   // expected-note @+1 {{channel used here}}
   %ab_data, %ab_valid = esi.unwrap.vr %a_chan, %true : i8
   hw.output %a_ready : i1
+}
+
+// -----
+
+hw.module @wrap_vo_multi_unwrap(in %a_data: i8, in %a_valid: i1) {
+  // expected-error @+1 {{'esi.wrap.vo' op channels must have at most one consumer}}
+  %a_chan = esi.wrap.vo %a_data, %a_valid : i8
+  // expected-note @+1 {{channel used here}}
+  %ap_data, %ap_valid = esi.unwrap.vo %a_chan : !esi.channel<i8, ValidOnly>
+  // expected-note @+1 {{channel used here}}
+  %ab_data, %ab_valid = esi.unwrap.vo %a_chan : !esi.channel<i8, ValidOnly>
 }

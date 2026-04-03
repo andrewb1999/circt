@@ -7,8 +7,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/HW/HWOps.h"
-#include "circt/Dialect/LLHD/IR/LLHDOps.h"
-#include "circt/Dialect/LLHD/Transforms/LLHDPasses.h"
+#include "circt/Dialect/LLHD/LLHDOps.h"
+#include "circt/Dialect/LLHD/LLHDPasses.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Threading.h"
@@ -24,7 +24,7 @@
 namespace circt {
 namespace llhd {
 #define GEN_PASS_DEF_INLINECALLSPASS
-#include "circt/Dialect/LLHD/Transforms/LLHDPasses.h.inc"
+#include "circt/Dialect/LLHD/LLHDPasses.h.inc"
 } // namespace llhd
 } // namespace circt
 
@@ -100,8 +100,9 @@ LogicalResult InlineCallsPass::runOnRegion(Region &region,
   // the inlined operations immediately after visiting the call.
   for (auto &block : region) {
     for (auto &op : block) {
-      // If this is an op after a call, pop that call off the call stack.
-      if (!inlineEndMarkers.empty() && inlineEndMarkers.back().first == &op) {
+      // Pop all calls that are followed by this op off the call stack.
+      while (!inlineEndMarkers.empty() &&
+             inlineEndMarkers.back().first == &op) {
         assert(inlineEndMarkers.back().second == callStack.back());
         LLVM_DEBUG(llvm::dbgs()
                    << "- Finished @"
@@ -130,6 +131,10 @@ LogicalResult InlineCallsPass::runOnRegion(Region &region,
         d.attachNote(calledOp->getLoc()) << "call target defined here";
         return failure();
       }
+
+      // Skip extern declarations (e.g. DPI-C imports) — nothing to inline.
+      if (funcOp.isDeclaration())
+        continue;
 
       // Ensure that we are not recursively inlining a function, which would
       // just expand infinitely in the IR.

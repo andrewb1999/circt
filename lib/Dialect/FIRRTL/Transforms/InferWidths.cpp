@@ -1552,8 +1552,8 @@ LogicalResult InferenceMapping::mapOperation(Operation *op) {
       // Handle operations with a single result type that always has a
       // well-known width.
       .Case<LEQPrimOp, LTPrimOp, GEQPrimOp, GTPrimOp, EQPrimOp, NEQPrimOp,
-            AsClockPrimOp, AsAsyncResetPrimOp, AndRPrimOp, OrRPrimOp,
-            XorRPrimOp>([&](auto op) {
+            AsClockPrimOp, AsAsyncResetPrimOp, AsResetPrimOp, AndRPrimOp,
+            OrRPrimOp, XorRPrimOp>([&](auto op) {
         auto width = op.getType().getBitWidthOrSentinel();
         assert(width > 0 && "width should have been checked by verifier");
         setExpr(op.getResult(), solver.known(width));
@@ -1595,8 +1595,8 @@ LogicalResult InferenceMapping::mapOperation(Operation *op) {
       })
 
       // Handle the no-ops that don't interact with width inference.
-      .Case<PrintFOp, FFlushOp, SkipOp, StopOp, WhenOp, AssertOp, AssumeOp,
-            UnclockedAssumeIntrinsicOp, CoverOp>([&](auto) {})
+      .Case<AssertOp, AssumeOp, CoverOp, DomainDefineOp, FFlushOp, PrintFOp,
+            SkipOp, StopOp, UnclockedAssumeIntrinsicOp, WhenOp>([&](auto) {})
 
       // Handle instances of other modules.
       .Case<InstanceOp>([&](auto op) {

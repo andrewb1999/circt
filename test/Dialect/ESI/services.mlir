@@ -112,7 +112,8 @@ hw.module @InOutLoopback (in %clk: !seq.clock) {
 // CONN-NEXT:     [[r2:%.+]] = esi.cosim.from_host [[clk]], [[rst]], "loopback_inout.req" : !esi.channel<i16>
 // CONN-NEXT:     %bundle, %resp = esi.bundle.pack [[r2]] : !esi.bundle<[!esi.channel<i16> to "req", !esi.channel<i8> from "resp"]>
 // CONN-NEXT:     esi.cosim.to_host [[clk]], [[rst]], %resp, "loopback_inout.resp" : !esi.channel<i8>
-// CONN-NEXT:     hw.instance "m1" @InOutLoopback(clk: %0: !seq.clock, loopback_inout: %bundle: !esi.bundle<[!esi.channel<i16> to "req", !esi.channel<i8> from "resp"]>) -> ()
+// CONN-NEXT:     hw.instance "__cycle_counter" @Cosim_CycleCount<CORE_CLOCK_FREQUENCY_HZ: i64 = 0>(clk: [[clk]]: !seq.clock, rst: [[rst]]: i1) -> ()
+// CONN-NEXT:     hw.instance "m1" @InOutLoopback(clk: [[clk]]: !seq.clock, loopback_inout: %bundle: !esi.bundle<[!esi.channel<i16> to "req", !esi.channel<i8> from "resp"]>) -> ()
 esi.pure_module @LoopbackCosimPure {
   %clk = esi.pure_module.input "clk" : !seq.clock
   %rst = esi.pure_module.input "rst" : i1
@@ -254,6 +255,6 @@ hw.module @HostmemRW(in %clk : !seq.clock, in %rst : i1, in %write : !esi.channe
 
 esi.service.std.telemetry @telemetry
 hw.module @TelemetryTest1(in %clk : !seq.clock, in %rst : i1, in %value: !esi.channel<ui64>) {
-  %telemetryBundle = esi.service.req <@telemetry::@report> (#esi.appid<"telemetry">) : !esi.bundle<[!esi.channel<i1> to "get", !esi.channel<ui64> from "data"]>
-  esi.bundle.unpack %value from %telemetryBundle : !esi.bundle<[!esi.channel<i1> to "get", !esi.channel<ui64> from "data"]>
+  %telemetryBundle = esi.service.req <@telemetry::@report> (#esi.appid<"telemetry">) : !esi.bundle<[!esi.channel<i0> to "get", !esi.channel<ui64> from "data"]>
+  esi.bundle.unpack %value from %telemetryBundle : !esi.bundle<[!esi.channel<i0> to "get", !esi.channel<ui64> from "data"]>
 }

@@ -363,6 +363,46 @@ struct AndInverterToMIGConversion
   }
 };
 
+struct MajorityInverterToAIGConversion
+    : OpConversionPattern<synth::mig::MajorityInverterOp> {
+  using OpConversionPattern<
+      synth::mig::MajorityInverterOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(synth::mig::MajorityInverterOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Only handle 1 or 3-input majority inverter for now.
+    if (op.getNumOperands() > 3)
+      return failure();
+
+    if (op.getNumOperands() == 1) {
+      bool inverts[1] = {op.getInverted()[0]};
+      replaceOpWithNewOpAndCopyNamehint<synth::aig::AndInverterOp>(
+          rewriter, op, adaptor.getInputs(), inverts);
+      return success();
+    }
+
+    assert(op.getNumOperands() == 3 && "Expected 3 operands for majority op");
+    auto getProduct = [&](unsigned idx1, unsigned idx2) {
+      bool inverts[2] = {op.getInverted()[idx1], op.getInverted()[idx2]};
+      return synth::aig::AndInverterOp::create(
+          rewriter, op.getLoc(),
+          ValueRange{adaptor.getInputs()[idx1], adaptor.getInputs()[idx2]},
+          inverts);
+    };
+
+    // Majority is the OR of the three pairwise products. Materialize that OR as
+    // a NOR followed by an inverter so it stays in AIG form.
+    Value products[3] = {getProduct(0, 1), getProduct(0, 2), getProduct(1, 2)};
+    bool allInverted[3] = {true, true, true};
+    auto notOr = synth::aig::AndInverterOp::create(rewriter, op.getLoc(),
+                                                   products, allInverted);
+    replaceOpWithNewOpAndCopyNamehint<synth::aig::AndInverterOp>(
+        rewriter, op, notOr,
+        /*invert=*/true);
+    return success();
+  }
+};
+
 /// Lower a comb::XorOp operation to AIG operations
 struct CombXorOpConversion : OpConversionPattern<XorOp> {
   using OpConversionPattern<XorOp>::OpConversionPattern;
@@ -990,20 +1030,8 @@ struct CombDivUOpConversion : DivModOpConversionBase<DivUOp> {
   matchAndRewrite(DivUOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // Check if the divisor is a power of two.
-    if (auto rhsConstantOp = adaptor.getRhs().getDefiningOp<hw::ConstantOp>())
-      if (rhsConstantOp.getValue().isPowerOf2()) {
-        // Extract upper bits.
-        size_t extractAmount = rhsConstantOp.getValue().ceilLogBase2();
-        size_t width = op.getType().getIntOrFloatBitWidth();
-        Value upperBits = rewriter.createOrFold<comb::ExtractOp>(
-            op.getLoc(), adaptor.getLhs(), extractAmount,
-            width - extractAmount);
-        Value constZero = hw::ConstantOp::create(rewriter, op.getLoc(),
-                                                 APInt::getZero(extractAmount));
-        replaceOpWithNewOpAndCopyNamehint<comb::ConcatOp>(
-            rewriter, op, op.getType(), ArrayRef<Value>{constZero, upperBits});
-        return success();
-      }
+    if (llvm::succeeded(comb::convertDivUByPowerOfTwo(op, rewriter)))
+      return success();
 
     // When rhs is not power of two and the number of unknown bits are small,
     // create a mux tree that emulates all possible cases.
@@ -1024,19 +1052,8 @@ struct CombModUOpConversion : DivModOpConversionBase<ModUOp> {
   matchAndRewrite(ModUOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // Check if the divisor is a power of two.
-    if (auto rhsConstantOp = adaptor.getRhs().getDefiningOp<hw::ConstantOp>())
-      if (rhsConstantOp.getValue().isPowerOf2()) {
-        // Extract lower bits.
-        size_t extractAmount = rhsConstantOp.getValue().ceilLogBase2();
-        size_t width = op.getType().getIntOrFloatBitWidth();
-        Value lowerBits = rewriter.createOrFold<comb::ExtractOp>(
-            op.getLoc(), adaptor.getLhs(), 0, extractAmount);
-        Value constZero = hw::ConstantOp::create(
-            rewriter, op.getLoc(), APInt::getZero(width - extractAmount));
-        replaceOpWithNewOpAndCopyNamehint<comb::ConcatOp>(
-            rewriter, op, op.getType(), ArrayRef<Value>{constZero, lowerBits});
-        return success();
-      }
+    if (llvm::succeeded(comb::convertModUByPowerOfTwo(op, rewriter)))
+      return success();
 
     // When rhs is not power of two and the number of unknown bits are small,
     // create a mux tree that emulates all possible cases.
@@ -1445,8 +1462,8 @@ populateCombToAIGConversionPatterns(RewritePatternSet &patterns,
                  circt::synth::AndInverterVariadicOpConversion,
                  CombAddOpConversion</*useMIG=*/true>>(patterns.getContext());
   } else {
-    patterns.add<CombOrToAIGConversion, CombAddOpConversion</*useMIG=*/false>>(
-        patterns.getContext());
+    patterns.add<CombOrToAIGConversion, MajorityInverterToAIGConversion,
+                 CombAddOpConversion</*useMIG=*/false>>(patterns.getContext());
   }
 
   // Add div/mod patterns with a threshold given by the pass option.

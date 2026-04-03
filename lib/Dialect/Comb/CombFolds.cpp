@@ -75,7 +75,8 @@ struct ComplementMatcher {
   ComplementMatcher(SubType lhs) : lhs(std::move(lhs)) {}
   bool match(Operation *op) {
     auto xorOp = dyn_cast<XorOp>(op);
-    return xorOp && xorOp.isBinaryNot() && lhs.match(op->getOperand(0));
+    return xorOp && xorOp.isBinaryNot() &&
+           mlir::detail::matchOperandOrValueAtIndex(op, 0, lhs);
   }
 };
 } // end anonymous namespace
@@ -830,17 +831,19 @@ OpFoldResult AndOp::fold(FoldAdaptor adaptor) {
 
   // and(x, 01, 10) -> 00 -- annulment.
   for (auto operand : inputs) {
-    if (!operand)
+    auto attr = dyn_cast_or_null<IntegerAttr>(operand);
+    if (!attr)
       continue;
-    value &= cast<IntegerAttr>(operand).getValue();
+    value &= attr.getValue();
     if (value.isZero())
       return getIntAttr(value, getContext());
   }
 
   // and(x, -1) -> x.
-  if (inputs.size() == 2 && inputs[1] &&
-      cast<IntegerAttr>(inputs[1]).getValue().isAllOnes())
-    return getInputs()[0];
+  if (inputs.size() == 2)
+    if (auto intAttr = dyn_cast_or_null<IntegerAttr>(inputs[1]))
+      if (intAttr.getValue().isAllOnes())
+        return getInputs()[0];
 
   // and(x, x, x) -> x.  This also handles and(x) -> x.
   if (llvm::all_of(getInputs(),
@@ -1115,17 +1118,19 @@ OpFoldResult OrOp::fold(FoldAdaptor adaptor) {
   auto inputs = adaptor.getInputs();
   // or(x, 10, 01) -> 11
   for (auto operand : inputs) {
-    if (!operand)
+    auto attr = dyn_cast_or_null<IntegerAttr>(operand);
+    if (!attr)
       continue;
-    value |= cast<IntegerAttr>(operand).getValue();
+    value |= attr.getValue();
     if (value.isAllOnes())
       return getIntAttr(value, getContext());
   }
 
   // or(x, 0) -> x
-  if (inputs.size() == 2 && inputs[1] &&
-      cast<IntegerAttr>(inputs[1]).getValue().isZero())
-    return getInputs()[0];
+  if (inputs.size() == 2)
+    if (auto intAttr = dyn_cast_or_null<IntegerAttr>(inputs[1]))
+      if (intAttr.getValue().isZero())
+        return getInputs()[0];
 
   // or(x, x, x) -> x.  This also handles or(x) -> x
   if (llvm::all_of(getInputs(),
@@ -1266,18 +1271,17 @@ OpFoldResult XorOp::fold(FoldAdaptor adaptor) {
     return IntegerAttr::get(getType(), 0);
 
   // xor(x, 0) -> x
-  if (inputs.size() == 2 && inputs[1] &&
-      cast<IntegerAttr>(inputs[1]).getValue().isZero())
-    return getInputs()[0];
+  if (inputs.size() == 2)
+    if (auto intAttr = dyn_cast_or_null<IntegerAttr>(inputs[1]))
+      if (intAttr.getValue().isZero())
+        return getInputs()[0];
 
   // xor(xor(x,1),1) -> x
   // but not self loop
-  if (isBinaryNot()) {
-    Value subExpr;
-    if (matchPattern(getOperand(0), m_Complement(m_Any(&subExpr))) &&
-        subExpr != getResult())
-      return subExpr;
-  }
+  Value subExpr;
+  if (matchPattern(getResult(), m_Complement(m_Complement(m_Any(&subExpr)))) &&
+      subExpr != getResult())
+    return subExpr;
 
   // Constant fold
   return constFoldAssociativeOp(inputs, hw::PEO::Xor);
@@ -1365,6 +1369,19 @@ LogicalResult XorOp::canonicalize(XorOp op, PatternRewriter &rewriter) {
           return canonicalizeXorIcmpTrue(op, i, rewriter), success();
       }
     }
+  }
+
+  // xor(sext(x), -1) -> sext(xor(x,-1))
+  // More concisely: ~sext(x) = sext(~x)
+  Value base;
+  // Check for sext of the inverted value
+  if (matchPattern(op.getResult(), m_Complement(m_Sext(m_Any(&base))))) {
+    // Create negated sext: ~sext(x) = sext(~x)
+    auto negBase = createOrFoldNot(rewriter, op.getLoc(), base, true);
+    auto sextNegBase =
+        createOrFoldSExt(rewriter, op.getLoc(), negBase, op.getType());
+    replaceOpAndCopyNamehint(rewriter, op, sextNegBase);
+    return success();
   }
 
   // xor(x, xor(...)) -> xor(x, ...) -- flatten
@@ -1573,9 +1590,10 @@ OpFoldResult MulOp::fold(FoldAdaptor adaptor) {
 
   // mul(x, 0, 1) -> 0 -- annulment
   for (auto operand : inputs) {
-    if (!operand)
+    auto attr = dyn_cast_or_null<IntegerAttr>(operand);
+    if (!attr)
       continue;
-    value *= cast<IntegerAttr>(operand).getValue();
+    value *= attr.getValue();
     if (value.isZero())
       return getIntAttr(value, getContext());
   }
@@ -1697,6 +1715,20 @@ OpFoldResult ModSOp::fold(FoldAdaptor adaptor) {
     return {};
   return foldMod<ModSOp, /*isSigned=*/true>(*this, adaptor.getOperands());
 }
+
+LogicalResult DivUOp::canonicalize(DivUOp op, PatternRewriter &rewriter) {
+  if (isOpTriviallyRecursive(op) || !op.getTwoState())
+    return failure();
+  return convertDivUByPowerOfTwo(op, rewriter);
+}
+
+LogicalResult ModUOp::canonicalize(ModUOp op, PatternRewriter &rewriter) {
+  if (isOpTriviallyRecursive(op) || !op.getTwoState())
+    return failure();
+
+  return convertModUByPowerOfTwo(op, rewriter);
+}
+
 //===----------------------------------------------------------------------===//
 // ConcatOp
 //===----------------------------------------------------------------------===//
@@ -2087,7 +2119,7 @@ bool comb::foldMuxChainWithComparison(
 
   // Build the array_create and the array_get.
   auto fusedLoc = rewriter.getFusedLoc(locationsFound);
-  auto array = rewriter.create<hw::ArrayCreateOp>(fusedLoc, table);
+  auto array = hw::ArrayCreateOp::create(rewriter, fusedLoc, table);
   replaceOpWithNewOpAndCopyNamehint<hw::ArrayGetOp>(rewriter, rootMux, array,
                                                     indexValue);
   return true;
@@ -2183,7 +2215,7 @@ static bool foldCommonMuxValue(MuxOp op, bool isTrueOperand,
       otherValue = subMux.getFalseValue();
     else if (subMux.getFalseValue() == commonValue) {
       otherValue = subMux.getTrueValue();
-      subCond = createOrFoldNot(op.getLoc(), subCond, rewriter);
+      subCond = createOrFoldNot(rewriter, op.getLoc(), subCond);
     } else {
       // We can't fold `mux(cond, a, mux(a, x, y))`.
       return false;
@@ -2191,7 +2223,7 @@ static bool foldCommonMuxValue(MuxOp op, bool isTrueOperand,
 
     // Invert the outer cond if needed, and combine the mux conditions.
     if (!isTrueOperand)
-      cond = createOrFoldNot(op.getLoc(), cond, rewriter);
+      cond = createOrFoldNot(rewriter, op.getLoc(), cond);
     cond = rewriter.createOrFold<OrOp>(op.getLoc(), cond, subCond, false);
     replaceOpWithNewOpAndCopyNamehint<MuxOp>(rewriter, op, cond, commonValue,
                                              otherValue, op.getTwoState());
@@ -2202,7 +2234,7 @@ static bool foldCommonMuxValue(MuxOp op, bool isTrueOperand,
   // TrueOperand, And inverts for False operand.
   bool isaAndOp = isa<AndOp>(subExpr);
   if (isTrueOperand ^ isaAndOp)
-    cond = createOrFoldNot(op.getLoc(), cond, rewriter);
+    cond = createOrFoldNot(rewriter, op.getLoc(), cond);
 
   auto extendedCond =
       rewriter.createOrFold<ReplicateOp>(op.getLoc(), op.getType(), cond);
@@ -2420,7 +2452,7 @@ LogicalResult MuxRewriter::matchAndRewrite(MuxOp op,
     if (value.getBitWidth() == 1) {
       // mux(a, 0, b) -> and(~a, b) for single-bit values.
       if (value.isZero()) {
-        auto notCond = createOrFoldNot(op.getLoc(), op.getCond(), rewriter);
+        auto notCond = createOrFoldNot(rewriter, op.getLoc(), op.getCond());
         replaceOpWithNewOpAndCopyNamehint<AndOp>(rewriter, op, notCond,
                                                  op.getFalseValue(), false);
         return success();
@@ -2552,7 +2584,8 @@ LogicalResult MuxRewriter::matchAndRewrite(MuxOp op,
   if (auto falseMux = op.getFalseValue().getDefiningOp<MuxOp>();
       falseMux && falseMux != op) {
     // mux(selector, x, mux(selector, y, z) = mux(selector, x, z)
-    if (op.getCond() == falseMux.getCond()) {
+    if (op.getCond() == falseMux.getCond() &&
+        falseMux.getFalseValue() != falseMux) {
       replaceOpWithNewOpAndCopyNamehint<MuxOp>(
           rewriter, op, op.getCond(), op.getTrueValue(),
           falseMux.getFalseValue(), op.getTwoStateAttr());
@@ -2651,7 +2684,7 @@ LogicalResult MuxRewriter::matchAndRewrite(MuxOp op,
   if (foldMuxOfUniformArrays(op, rewriter))
     return success();
 
-  // mux(cond, opA(cond), opB(cond)) -> mux(cond, opA(1), opB(1))
+  // mux(cond, opA(cond), opB(cond)) -> mux(cond, opA(1), opB(0))
   if (op.getTrueValue().getDefiningOp() &&
       op.getTrueValue().getDefiningOp() != op)
     if (assumeMuxCondInOperand(op.getCond(), op.getTrueValue(), true, rewriter))

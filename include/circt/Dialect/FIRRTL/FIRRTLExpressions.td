@@ -761,6 +761,7 @@ let hasCanonicalizer=1 in {
 }
 def AsAsyncResetPrimOp
   : UnaryPrimOp<"asAsyncReset", OneBitCastableType, AsyncResetType>;
+def AsResetPrimOp : UnaryPrimOp<"asReset", UInt1Type, ResetType>;
 def AsClockPrimOp : UnaryPrimOp<"asClock", OneBitCastableType, ClockType>;
 def NegPrimOp : UnaryPrimOp<"neg", IntType, SIntType>;
 let hasCanonicalizer = true in
@@ -1270,6 +1271,7 @@ def FIntegerConstantOp : FIRRTLOp<"integer", [Pure, ConstantLike]> {
   let results = (outs FIntegerType:$result);
   let hasFolder = 1;
   let hasCustomAssemblyFormat = true;
+  let hasVerifier = true;
 }
 
 def UnresolvedPathOp : FIRRTLOp<"unresolved_path", [Pure]> {
@@ -1447,6 +1449,42 @@ def IntegerShlOp : IntegerBinaryPrimOp<"integer.shl"> {
                                          !firrtl.integer
     ```
   }];
+}
+
+def StringConcatOp : FIRRTLOp<"string.concat", [Pure, SameOperandsAndResultType]> {
+  let summary = "Concatenate multiple string values";
+  let description = [{
+    Produces a value of string type by concatenating multiple string operands.
+
+    Example:
+    ```mlir
+    %3 = firrtl.string.concat %0, %1, %2 : !firrtl.string
+    ```
+  }];
+
+  let arguments = (ins Variadic<StringType>:$inputs);
+  let results = (outs StringType:$result);
+
+  let assemblyFormat = "$inputs attr-dict `:` type($result)";
+
+  let hasFolder = 1;
+  let hasCanonicalizer = 1;
+}
+
+def UnknownValueOp : FIRRTLOp<"unknown", [
+  Pure,
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+]> {
+  let summary = "A property with an unknown value used to tie-off connections";
+  let description = [{
+    An operation that is used to tie-off property connections where we do not
+    care about the value.
+
+    This lowers to an `om::UnknownOp`.
+  }];
+  let arguments = (ins);
+  let results = (outs PropertyType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -1696,6 +1734,17 @@ def LTLImplicationIntrinsicOp : BinaryLTLIntrinsicOp<"implication">;
 def LTLUntilIntrinsicOp : BinaryLTLIntrinsicOp<"until">;
 def LTLEventuallyIntrinsicOp : UnaryLTLIntrinsicOp<"eventually">;
 
+// Past
+def LTLPastIntrinsicOp : LTLIntrinsicOp<"past"> {
+  let arguments = (ins NonConstUInt1Type:$input,
+                       I64Attr:$delay,
+                       Optional<ClockType>:$clock);
+  let assemblyFormat = [{
+    $input `,` $delay (`,` $clock^)? attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
 // Clocking
 def LTLClockIntrinsicOp : LTLIntrinsicOp<"clock"> {
   let arguments = (ins NonConstUInt1Type:$input, ClockType:$clock);
@@ -1772,9 +1821,53 @@ def UnsafeDomainCastOp :
   let arguments = (ins PassiveType:$input, Variadic<DomainType>:$domains);
   let results = (outs PassiveType:$result);
   let assemblyFormat = [{
-    $input (`domains` $domains^)? attr-dict-with-keyword `:` qualified(type($input))
+    $input (`domains` `[` $domains^ `]`)? attr-dict-with-keyword `:` qualified(type($input)) (`domains` `[` qualified(type($domains))^ `]`)?
   }];
   let hasFolder = 1;
+}
+
+def DomainSubfieldOp : FIRRTLOp<"domain.subfield", [
+    Pure,
+    DeclareOpInterfaceMethods<InferTypeOpInterface>
+]> {
+  let summary = "Extract a field value from a domain instance";
+  let description = [{
+    Extracts a property value from a domain instance by field index.
+
+    Example:
+    ```mlir
+    %name_str = firrtl.string "ClkA"
+    %period_int = firrtl.integer 100
+    %domain = firrtl.domain.create(%name_str, %period_int) : !firrtl.domain<@ClockDomain(name: !firrtl.string, period: !firrtl.integer)>
+    %extracted_name = firrtl.domain.subfield %domain[name] : !firrtl.domain<@ClockDomain(name: !firrtl.string, period: !firrtl.integer)>
+    %extracted_period = firrtl.domain.subfield %domain[period] : !firrtl.domain<@ClockDomain(name: !firrtl.string, period: !firrtl.integer)>
+    ```
+  }];
+
+  let arguments = (ins DomainType:$input, I32Attr:$fieldIndex);
+  let results = (outs PropertyType:$result);
+
+  let hasCustomAssemblyFormat = true;
+  let hasVerifier = false;
+
+  let extraClassDeclaration = [{
+    /// Infer the return type of this operation.
+    static Type inferReturnType(Type inType, uint32_t fieldIndex,
+                                std::optional<Location> loc);
+
+    static Type inferReturnType(ValueRange operands,
+                                mlir::DictionaryAttr attrs,
+                                mlir::OpaqueProperties properties,
+                                mlir::RegionRange regions,
+                                std::optional<Location> loc);
+
+    /// Create a DomainSubfieldOp with the given parameters.
+    static DomainSubfieldOp create(OpBuilder &builder, Type resultType,
+                                   Value base, unsigned fieldIndex);
+
+    /// Get the field name for this field index
+    StringAttr getFieldName();
+  }];
 }
 
 #endif // CIRCT_DIALECT_FIRRTL_FIRRTLEXPRESSIONS_TD

@@ -2,17 +2,22 @@
 # RUN: %PYTHON% %s %t 2>&1 | FileCheck %s
 
 from pycde import (Clock, Input, InputChannel, Output, OutputChannel, Module,
-                   Reset, generator, types)
+                   Reset, generator)
 from pycde import esi
 from pycde.common import AppID, Constant, RecvBundle, SendBundle
 from pycde.constructs import Wire
 from pycde.esi import HostMem, MMIO
 from pycde.module import Metadata
 from pycde.support import _obj_to_attribute, optional_dict_to_dict_attr
-from pycde.types import (Any, Bits, Bundle, BundledChannel, Channel,
-                         ChannelDirection, ChannelSignaling, UInt, StructType,
-                         ClockType)
+from pycde.types import (Bit, Bits, Bundle, BundledChannel, Channel,
+                         ChannelDirection, ChannelSignaling, ClockType, List,
+                         StructType, UInt, Window)
 from pycde.testing import unittestmodule
+
+BIT = Bit
+I16 = Bits(16)
+I24 = Bits(24)
+I32 = Bits(32)
 
 # CHECK: Channel<UInt<4>, ValidReady>
 print(Channel(UInt(4)))
@@ -22,6 +27,9 @@ print(Channel(UInt(4), ChannelSignaling.FIFO))
 
 # CHECK: Channel<UInt<4>, ValidReady(1)>
 print(Channel(UInt(4), ChannelSignaling.ValidReady, 1))
+
+# CHECK: Channel<UInt<4>, ValidOnly>
+print(Channel(UInt(4), ChannelSignaling.ValidOnly))
 
 TestBundle = Bundle([
     BundledChannel("resp", ChannelDirection.FROM, Bits(16)),
@@ -58,11 +66,11 @@ class HostComms:
 # CHECK:         %req = esi.bundle.unpack %chanOutput from [[B0]] : !esi.bundle<[!esi.channel<i16> from "resp", !esi.channel<i24> to "req"]>
 # CHECK:         %rawOutput, %valid = esi.unwrap.vr %req, %ready : i24
 # CHECK:         [[R0:%.+]] = comb.extract %rawOutput from 0 : (i24) -> i16
-# CHECK:         %chanOutput, %ready = esi.wrap.vr [[R0]], %valid : i16
+# CHECK:         %chanOutput, %ready = esi.wrap.vr [[R0]], %valid {sv.namehint = "loopback"} : i16
 @unittestmodule(print=True)
 class LoopbackInOutTop(Module):
   clk = Clock()
-  rst = Input(types.i1)
+  rst = Input(BIT)
 
   metadata = Metadata(
       name="LoopbackInOut",
@@ -80,12 +88,12 @@ class LoopbackInOutTop(Module):
     # Use Cosim to implement the 'HostComms' service.
     esi.Cosim(HostComms, self.clk, self.rst)
 
-    loopback = Wire(types.channel(types.i16))
+    loopback = Wire(Channel(I16))
     call_bundle = HostComms.req_resp(AppID("loopback_inout", 0))
     froms = call_bundle.unpack(resp=loopback)
     from_host = froms['req']
 
-    ready = Wire(types.i1)
+    ready = Wire(BIT)
     wide_data, valid = from_host.unwrap(ready)
     data = wide_data[0:16]
     data_chan, data_ready = loopback.type.wrap(data, valid)
@@ -121,14 +129,14 @@ class LoopbackCoercedCall(Module):
 # CHECK-NEXT:     %arg = esi.bundle.unpack [[R2]] from [[R0]] : !esi.bundle<[!esi.channel<i24> to "arg", !esi.channel<i16, FIFO> from "result"]>
 # CHECK-NEXT:     %rawOutput, %valid = esi.unwrap.vr %arg, %ready : i24
 # CHECK-NEXT:     [[R1:%.+]] = comb.extract %rawOutput from 0 : (i24) -> i16
-# CHECK-NEXT:     %chanOutput, %ready = esi.wrap.vr [[R1]], %valid : i16
+# CHECK-NEXT:     %chanOutput, %ready = esi.wrap.vr [[R1]], %valid {sv.namehint = "loopback_src"} : i16
 # CHECK-NEXT:     hw.output
 # CHECK-NEXT:   }
 # CHECK-NEXT:   esi.service.std.func @_FuncService
 @unittestmodule(print=True)
 class LoopbackCall(Module):
   clk = Clock()
-  rst = Input(Bits(1))
+  rst = Input(BIT)
 
   metadata = Metadata(
       name="LoopbackCall",
@@ -137,13 +145,13 @@ class LoopbackCall(Module):
 
   @generator
   def construct(self):
-    loopback_src = Wire(types.channel(types.i16))
+    loopback_src = Wire(Channel(I16))
     loopback = loopback_src.buffer(self.clk, self.rst, 1, ChannelSignaling.FIFO)
     args = esi.FuncService.get_call_chans(name=AppID("loopback"),
                                           arg_type=Bits(24),
                                           result=loopback)
 
-    ready = Wire(types.i1)
+    ready = Wire(BIT)
     wide_data, valid = args.unwrap(ready)
     data = wide_data[0:16]
     data_chan, data_ready = loopback_src.type.wrap(data, valid)
@@ -153,7 +161,7 @@ class LoopbackCall(Module):
 
 class Producer(Module):
   clk = Clock()
-  int_out = OutputChannel(types.i32)
+  int_out = OutputChannel(I32)
 
   @generator
   def construct(ports):
@@ -178,14 +186,14 @@ class PureTest(esi.PureModule):
     esi.PureModule.param("STR")
 
 
-ExStruct = types.struct({
+ExStruct = StructType({
     'a': Bits(4),
     'b': UInt(32),
 })
 
 Bundle1 = Bundle([
-    BundledChannel("req", ChannelDirection.TO, types.channel(types.i32)),
-    BundledChannel("resp", ChannelDirection.FROM, types.channel(types.i1)),
+    BundledChannel("req", ChannelDirection.TO, Channel(I32)),
+    BundledChannel("resp", ChannelDirection.FROM, Channel(BIT)),
 ])
 # CHECK: Bundle<[('req', ChannelDirection.TO, Channel<Bits<32>, ValidReady>), ('resp', ChannelDirection.FROM, Channel<Bits<1>, ValidReady>)]>
 print(Bundle1)
@@ -202,8 +210,8 @@ class SendBundleTest(Module):
   clk = Clock()
   rst = Reset()
   b_send = SendBundle(Bundle1)
-  s1_in = InputChannel(types.i32)
-  i1_out = OutputChannel(types.i1)
+  s1_in = InputChannel(I32)
+  i1_out = OutputChannel(BIT)
 
   @generator
   def build(self):
@@ -218,8 +226,8 @@ class SendBundleTest(Module):
 @unittestmodule()
 class RecvBundleTest(Module):
   b_recv = RecvBundle(Bundle1)
-  s1_out = OutputChannel(types.i32)
-  i1_in = InputChannel(types.i1)
+  s1_out = OutputChannel(I32)
+  i1_in = InputChannel(BIT)
 
   @generator
   def build(self):
@@ -227,22 +235,60 @@ class RecvBundleTest(Module):
     self.s1_out = to_channels['req']
 
 
-# CHECK-LABEL:  hw.module @ChannelTransform(in %s1_in : !esi.channel<i32>, out s2_out : !esi.channel<i8>)
+# CHECK-LABEL:  hw.module @ListTest(in %lst_in : !esi.window<"default_window", !hw.struct<data: !esi.list<i8>>, [<"", [<"data">]>]>, out lst_out : !esi.window<"default_window", !hw.struct<data: !esi.list<i8>>, [<"", [<"data">]>]>)
+# CHECK-NEXT:     hw.output %lst_in : !esi.window<"default_window", !hw.struct<data: !esi.list<i8>>, [<"", [<"data">]>]>
+@unittestmodule()
+class ListTest(Module):
+  list_window = Window.default_of(List(Bits(8)))
+  lst_in = Input(list_window)
+  lst_out = Output(list_window)
+
+  @generator
+  def build(self):
+    self.lst_out = self.lst_in
+
+
+# CHECK-LABEL:  hw.module @ChannelTransform(in %clk : !seq.clock, in %s1_in : !esi.channel<i32>, out s2_out : !esi.channel<i8>)
 # CHECK-NEXT:     %valid, %ready, %data = esi.snoop.vr %s1_in : !esi.channel<i32>
-# CHECK-NEXT:     %transaction, %{{.+}} = esi.snoop.xact %s1_in : !esi.channel<i32>
+# CHECK-NEXT:     %transaction, [[SNOOP_DATA:%.+]] = esi.snoop.xact %s1_in : !esi.channel<i32>
+# CHECK-NEXT:     [[CLK_I1:%.+]] = seq.from_clock %clk
+# CHECK-NEXT:     sv.alwaysff(posedge [[CLK_I1]]) {
+# CHECK-NEXT:       sv.if %transaction {
+# CHECK-NEXT:         sv.info.procedural "Pre-transform: %p"([[SNOOP_DATA]]) : i32
+# CHECK-NEXT:       }
+# CHECK-NEXT:     }
 # CHECK-NEXT:     %rawOutput, [[VALID2:%.+]] = esi.unwrap.vr %s1_in, [[READY2:%.+]] : i32
 # CHECK-NEXT:     [[R0:%.+]] = comb.extract %rawOutput from 0 : (i32) -> i8
 # CHECK-NEXT:     %chanOutput, [[READY2]] = esi.wrap.vr [[R0]], [[VALID2]] : i8
 # CHECK-NEXT:     hw.output %chanOutput : !esi.channel<i8>
 @unittestmodule()
 class ChannelTransform(Module):
+  clk = Clock()
   s1_in = InputChannel(Bits(32))
   s2_out = OutputChannel(Bits(8))
 
   @generator
   def build(self):
+    from pycde.testing import print_info
     valid, ready, data = self.s1_in.snoop()
-    xact, _ = self.s1_in.snoop_xact()
+    xact, snooped_data = self.s1_in.snoop_xact()
+    xact.when_true(lambda: print_info("Pre-transform: %p", snooped_data))
+    self.s2_out = self.s1_in.transform(lambda x: x[0:8])
+
+
+# CHECK-LABEL: hw.module @ValidOnlyTransform(in %s1_in : !esi.channel<i32, ValidOnly>, out s2_out : !esi.channel<i8, ValidOnly>)
+# CHECK-NEXT:     %rawOutput, %valid = esi.unwrap.vo %s1_in : !esi.channel<i32, ValidOnly>
+# CHECK-NEXT:     [[R0:%.+]] = comb.extract %rawOutput from 0 : (i32) -> i8
+# CHECK-NEXT:     [[R1:%.+]] = esi.wrap.vo [[R0]], %valid : i8
+# CHECK-NEXT:     %true = hw.constant true
+# CHECK-NEXT:     hw.output [[R1]] : !esi.channel<i8, ValidOnly>
+@unittestmodule()
+class ValidOnlyTransform(Module):
+  s1_in = Input(Channel(Bits(32), ChannelSignaling.ValidOnly))
+  s2_out = Output(Channel(Bits(8), ChannelSignaling.ValidOnly))
+
+  @generator
+  def build(self):
     self.s2_out = self.s1_in.transform(lambda x: x[0:8])
 
 

@@ -15,17 +15,96 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Value.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/LogicalResult.h"
 
 using namespace mlir;
 using namespace circt;
+using namespace circt::synth;
 using namespace circt::synth::mig;
 using namespace circt::synth::aig;
 
 #define GET_OP_CLASSES
 #include "circt/Dialect/Synth/Synth.cpp.inc"
+
+LogicalResult ChoiceOp::verify() {
+  if (getNumOperands() < 1)
+    return emitOpError("requires at least one operand");
+  return success();
+}
+
+OpFoldResult ChoiceOp::fold(FoldAdaptor adaptor) {
+  if (adaptor.getInputs().size() == 1)
+    return getOperand(0);
+  return {};
+}
+
+// Canonicalize a network of synth.choice operations by computing their
+// transitive closure and flattening them into a single choice operation.
+// This merges nested choices and deduplicates shared operands.
+// Pattern matched:
+//   %0 = synth.choice %x, %y, %z
+//   %1 = synth.choice %0, %u
+//   %2 = synth.choice %z, %v
+//     =>
+//   %merged = synth.choice %x, %y, %z, %u, %v
+LogicalResult ChoiceOp::canonicalize(ChoiceOp op, PatternRewriter &rewriter) {
+  llvm::SetVector<Value> worklist;
+  llvm::SmallSetVector<Operation *, 4> visitedChoices;
+
+  auto addToWorklist = [&](ChoiceOp choice) -> bool {
+    if (choice->getBlock() == op->getBlock() && visitedChoices.insert(choice)) {
+      worklist.insert(choice.getInputs().begin(), choice.getInputs().end());
+      return true;
+    }
+    return false;
+  };
+
+  addToWorklist(op);
+
+  bool mergedOtherChoices = false;
+
+  // Look up and down at definitions and users.
+  for (unsigned i = 0; i < worklist.size(); ++i) {
+    Value val = worklist[i];
+    if (auto defOp = val.getDefiningOp<synth::ChoiceOp>()) {
+
+      if (addToWorklist(defOp))
+        mergedOtherChoices = true;
+    }
+
+    for (Operation *user : val.getUsers()) {
+      if (auto userChoice = llvm::dyn_cast<synth::ChoiceOp>(user)) {
+        if (addToWorklist(userChoice)) {
+          mergedOtherChoices = true;
+        }
+      }
+    }
+  }
+
+  llvm::SmallVector<mlir::Value> finalOperands;
+  for (Value v : worklist) {
+    if (!visitedChoices.contains(v.getDefiningOp())) {
+      finalOperands.push_back(v);
+    }
+  }
+
+  if (!mergedOtherChoices && finalOperands.size() == op.getInputs().size())
+    return llvm::failure();
+
+  auto newChoice = synth::ChoiceOp::create(rewriter, op->getLoc(), op.getType(),
+                                           finalOperands);
+  for (Operation *visited : visitedChoices.takeVector())
+    rewriter.replaceOp(visited, newChoice);
+
+  for (auto value : newChoice.getInputs())
+    rewriter.replaceAllUsesExcept(value, newChoice.getResult(), newChoice);
+
+  return success();
+}
 
 LogicalResult MajorityInverterOp::verify() {
   if (getNumOperands() % 2 != 1)
@@ -65,18 +144,51 @@ llvm::APInt MajorityInverterOp::evaluate(ArrayRef<APInt> inputs) {
 }
 
 OpFoldResult MajorityInverterOp::fold(FoldAdaptor adaptor) {
-  // TODO: Implement maj(x, 1, 1) = 1, maj(x, 0, 0) = 0
 
   SmallVector<APInt, 3> inputValues;
-  for (auto input : adaptor.getInputs()) {
+  SmallVector<size_t, 3> nonConstantValues;
+  for (auto [i, input] : llvm::enumerate(adaptor.getInputs())) {
     auto attr = llvm::dyn_cast_or_null<IntegerAttr>(input);
-    if (!attr)
-      return {};
-    inputValues.push_back(attr.getValue());
+    if (attr)
+      inputValues.push_back(attr.getValue());
+    else
+      nonConstantValues.push_back(i);
   }
 
-  auto result = evaluate(inputValues);
-  return IntegerAttr::get(getType(), result);
+  if (nonConstantValues.size() == 0)
+    return IntegerAttr::get(getType(), evaluate(inputValues));
+
+  if (getNumOperands() != 3)
+    return {};
+
+  auto getConstant = [&](unsigned index) -> std::optional<llvm::APInt> {
+    APInt value;
+    if (mlir::matchPattern(getInputs()[index], mlir::m_ConstantInt(&value)))
+      return isInverted(index) ? ~value : value;
+    return std::nullopt;
+  };
+  if (nonConstantValues.size() == 1) {
+    auto k = nonConstantValues[0]; // for 3 operands
+    auto i = (k + 1) % 3;
+    auto j = (k + 2) % 3;
+    auto c1 = getConstant(i);
+    auto c2 = getConstant(j);
+    // x c c -> c
+    // x c !c -> x
+    // x ~c ~c -> ~c
+    if (c1 == c2) {
+      return IntegerAttr::get(IntegerType::get(getContext(), c1->getBitWidth()),
+                              c1.value());
+    } else {
+      if (isInverted(k)) {
+        (*this)->setOperands({getOperand(i)});
+        (*this).setInverted({true});
+        return getResult();
+      } else
+        return getOperand(k);
+    }
+  }
+  return {};
 }
 
 LogicalResult MajorityInverterOp::canonicalize(MajorityInverterOp op,
@@ -91,15 +203,6 @@ LogicalResult MajorityInverterOp::canonicalize(MajorityInverterOp op,
   // For now, only support 3 operands.
   if (op.getNumOperands() != 3)
     return failure();
-
-  // Return if the idx-th operand is a constant (inverted if necessary),
-  // otherwise return std::nullopt.
-  auto getConstant = [&](unsigned index) -> std::optional<llvm::APInt> {
-    APInt value;
-    if (mlir::matchPattern(op.getInputs()[index], mlir::m_ConstantInt(&value)))
-      return op.isInverted(index) ? ~value : value;
-    return std::nullopt;
-  };
 
   // Replace the op with the idx-th operand (inverted if necessary).
   auto replaceWithIndex = [&](int index) {
@@ -126,21 +229,6 @@ LogicalResult MajorityInverterOp::canonicalize(MajorityInverterOp op,
           return replaceWithIndex(k);
         return replaceWithIndex(i);
       }
-
-      // If i and j are constant.
-      if (auto c1 = getConstant(i)) {
-        if (auto c2 = getConstant(j)) {
-          // If both constants are equal, we can fold.
-          if (*c1 == *c2) {
-            rewriter.replaceOpWithNewOp<hw::ConstantOp>(
-                op, op.getType(), mlir::IntegerAttr::get(op.getType(), *c1));
-            return success();
-          }
-          // If constants are complementary, we can fold.
-          if (*c1 == ~*c2)
-            return replaceWithIndex(k);
-        }
-      }
     }
   }
   return failure();
@@ -155,20 +243,21 @@ OpFoldResult AndInverterOp::fold(FoldAdaptor adaptor) {
     return getOperand(0);
 
   auto inputs = adaptor.getInputs();
-  if (inputs.size() == 2 && inputs[1]) {
-    auto value = cast<IntegerAttr>(inputs[1]).getValue();
-    if (isInverted(1))
-      value = ~value;
-    if (value.isZero())
-      return IntegerAttr::get(
-          IntegerType::get(getContext(), value.getBitWidth()), value);
-    if (value.isAllOnes()) {
-      if (isInverted(0))
-        return {};
+  if (inputs.size() == 2)
+    if (auto intAttr = dyn_cast_or_null<IntegerAttr>(inputs[1])) {
+      auto value = intAttr.getValue();
+      if (isInverted(1))
+        value = ~value;
+      if (value.isZero())
+        return IntegerAttr::get(
+            IntegerType::get(getContext(), value.getBitWidth()), value);
+      if (value.isAllOnes()) {
+        if (isInverted(0))
+          return {};
 
-      return getOperand(0);
+        return getOperand(0);
+      }
     }
-  }
   return {};
 }
 

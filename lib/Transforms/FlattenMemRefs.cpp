@@ -16,6 +16,7 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/ControlFlow/Transforms/StructuralTypeConversions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
@@ -50,17 +51,20 @@ struct FunctionRewrite {
   FunctionType type;
 };
 
-static std::atomic<unsigned> globalCounter(0);
-static DenseMap<StringAttr, StringAttr> globalNameMap;
+struct FlattenMemRefsState {
+  unsigned counter = 0;
+  DenseMap<StringAttr, StringAttr> nameMap;
+};
 
 static MemRefType getFlattenedMemRefType(MemRefType type) {
   return MemRefType::get(SmallVector<int64_t>{type.getNumElements()},
                          type.getElementType());
 }
 
-static std::string getFlattenedMemRefName(StringAttr baseName,
+static std::string getFlattenedMemRefName(FlattenMemRefsState &state,
+                                          StringAttr baseName,
                                           MemRefType type) {
-  unsigned uniqueID = globalCounter++;
+  unsigned uniqueID = state.counter++;
   return llvm::formatv("{0}_{1}x{2}_{3}", baseName, type.getNumElements(),
                        type.getElementType(), uniqueID);
 }
@@ -193,7 +197,9 @@ struct AllocaOpConversion : public OpConversionPattern<memref::AllocaOp> {
 };
 
 struct GlobalOpConversion : public OpConversionPattern<memref::GlobalOp> {
-  using OpConversionPattern::OpConversionPattern;
+  GlobalOpConversion(TypeConverter &typeConverter, MLIRContext *context,
+                     FlattenMemRefsState &state)
+      : OpConversionPattern(typeConverter, context), state(state) {}
 
   LogicalResult
   matchAndRewrite(memref::GlobalOp op, OpAdaptor adaptor,
@@ -211,9 +217,10 @@ struct GlobalOpConversion : public OpConversionPattern<memref::GlobalOp> {
       flattenedVals.push_back(attr);
 
     auto newTypeAttr = TypeAttr::get(newType);
-    auto newNameStr = getFlattenedMemRefName(op.getConstantAttrName(), type);
+    auto newNameStr =
+        getFlattenedMemRefName(state, op.getConstantAttrName(), type);
     auto newName = rewriter.getStringAttr(newNameStr);
-    globalNameMap[op.getSymNameAttr()] = newName;
+    state.nameMap[op.getSymNameAttr()] = newName;
 
     RankedTensorType tensorType = RankedTensorType::get(
         {static_cast<int64_t>(flattenedVals.size())}, type.getElementType());
@@ -225,10 +232,15 @@ struct GlobalOpConversion : public OpConversionPattern<memref::GlobalOp> {
 
     return success();
   }
+
+private:
+  FlattenMemRefsState &state;
 };
 
 struct GetGlobalOpConversion : public OpConversionPattern<memref::GetGlobalOp> {
-  using OpConversionPattern::OpConversionPattern;
+  GetGlobalOpConversion(TypeConverter &typeConverter, MLIRContext *context,
+                        FlattenMemRefsState &state)
+      : OpConversionPattern(typeConverter, context), state(state) {}
 
   LogicalResult
   matchAndRewrite(memref::GetGlobalOp op, OpAdaptor adaptor,
@@ -243,8 +255,8 @@ struct GetGlobalOpConversion : public OpConversionPattern<memref::GetGlobalOp> {
 
     MemRefType newType = getFlattenedMemRefType(type);
     auto originalName = globalOp.getSymNameAttr();
-    auto newNameIt = globalNameMap.find(originalName);
-    if (newNameIt == globalNameMap.end())
+    auto newNameIt = state.nameMap.find(originalName);
+    if (newNameIt == state.nameMap.end())
       return failure();
     auto newName = newNameIt->second;
 
@@ -252,6 +264,9 @@ struct GetGlobalOpConversion : public OpConversionPattern<memref::GetGlobalOp> {
 
     return success();
   }
+
+private:
+  FlattenMemRefsState &state;
 };
 
 struct ReshapeOpConversion : public OpConversionPattern<memref::ReshapeOp> {
@@ -286,23 +301,6 @@ struct OperandConversionPattern : public OpConversionPattern<TOp> {
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.replaceOpWithNewOp<TOp>(op, op->getResultTypes(),
                                      adaptor.getOperands(), op->getAttrs());
-    return success();
-  }
-};
-
-// Cannot use OperandConversionPattern for branch op since the default builder
-// doesn't provide a method for communicating block successors.
-struct CondBranchOpConversion
-    : public OpConversionPattern<mlir::cf::CondBranchOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(mlir::cf::CondBranchOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<mlir::cf::CondBranchOp>(
-        op, adaptor.getCondition(), adaptor.getTrueDestOperands(),
-        adaptor.getFalseDestOperands(), /*branch_weights=*/nullptr,
-        op.getTrueDest(), op.getFalseDest());
     return success();
   }
 };
@@ -378,13 +376,14 @@ static void populateFlattenMemRefsLegality(ConversionTarget &target) {
       [](memref::GlobalOp op) { return isUniDimensional(op.getType()); });
   target.addDynamicallyLegalOp<memref::GetGlobalOp>(
       [](memref::GetGlobalOp op) { return isUniDimensional(op.getType()); });
-  addGenericLegalityConstraint<mlir::cf::CondBranchOp, mlir::cf::BranchOp,
-                               func::CallOp, func::ReturnOp, memref::DeallocOp,
+  addGenericLegalityConstraint<func::CallOp, func::ReturnOp, memref::DeallocOp,
                                memref::CopyOp>(target);
 
   target.addDynamicallyLegalOp<func::FuncOp>([](func::FuncOp op) {
-    auto argsConverted = llvm::none_of(op.getBlocks(), [](auto &block) {
-      return hasMultiDimMemRef(block.getArguments());
+    auto argsConverted = llvm::all_of(op.getArgumentTypes(), [](Type type) {
+      if (auto memref = dyn_cast<MemRefType>(type))
+        return isUniDimensional(memref);
+      return true;
     });
 
     auto resultsConverted = llvm::all_of(op.getResultTypes(), [](Type type) {
@@ -439,23 +438,27 @@ public:
 
     auto *ctx = &getContext();
     TypeConverter typeConverter;
+    FlattenMemRefsState state;
     populateTypeConversionPatterns(typeConverter);
 
     RewritePatternSet patterns(ctx);
     SetVector<StringRef> rewrittenCallees;
     patterns.add<LoadOpConversion, StoreOpConversion, AllocOpConversion,
-                 AllocaOpConversion, GlobalOpConversion, GetGlobalOpConversion,
-                 ReshapeOpConversion, OperandConversionPattern<func::ReturnOp>,
+                 AllocaOpConversion, ReshapeOpConversion,
+                 OperandConversionPattern<func::ReturnOp>,
                  OperandConversionPattern<memref::DeallocOp>,
-                 CondBranchOpConversion,
                  OperandConversionPattern<memref::DeallocOp>,
                  OperandConversionPattern<memref::CopyOp>, CallOpConversion>(
         typeConverter, ctx);
+    patterns.add<GlobalOpConversion, GetGlobalOpConversion>(typeConverter, ctx,
+                                                            state);
     populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(
         patterns, typeConverter);
 
     ConversionTarget target(*ctx);
     populateFlattenMemRefsLegality(target);
+    mlir::cf::populateCFStructuralTypeConversionsAndLegality(typeConverter,
+                                                             patterns, target);
 
     if (applyPartialConversion(getOperation(), target, std::move(patterns))
             .failed()) {

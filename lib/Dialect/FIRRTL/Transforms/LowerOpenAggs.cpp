@@ -306,7 +306,7 @@ LogicalResult Visitor::visit(FModuleLike mod) {
           auto orientation =
               (Direction)((unsigned)port.direction ^ field.isFlip);
           PortInfo pi(name, field.type, orientation, /*symName=*/StringAttr{},
-                      port.loc, std::nullopt);
+                      port.loc, std::nullopt, port.domains);
           newPorts.emplace_back(idxOfInsertPoint, pi);
         }
         return success();
@@ -547,7 +547,7 @@ LogicalResult Visitor::visitDecl(InstanceOp op) {
         // If not identity, mark this port for eventual removal.
         portsToErase.set(newIndex);
 
-        auto portName = op.getPortName(index);
+        auto portName = op.getPortNameAttr(index);
         auto portDirection = op.getPortDirection(index);
         auto portDomain = op.getPortDomain(index);
         auto loc = op.getLoc();
@@ -607,19 +607,19 @@ LogicalResult Visitor::visitDecl(InstanceOp op) {
         if (pmi.identity) {
           // (Just do the RAUW here instead of tracking the mapping for this
           // too.)
-          assert(oldResult.getType() == newInst.getType(newIndex));
-          oldResult.replaceAllUsesWith(newInst.getResult(newIndex));
+          assert(oldResult.getType() == newInst->getResult(newIndex).getType());
+          oldResult.replaceAllUsesWith(newInst->getResult(newIndex));
           return success();
         }
 
         // Create mappings for updating open aggregate users.
         auto newPortIndex = newIndex;
         if (pmi.hwType)
-          hwOnlyAggMap[oldResult] = newInst.getResult(newPortIndex++);
+          hwOnlyAggMap[oldResult] = newInst->getResult(newPortIndex++);
 
         for (auto &field : pmi.fields) {
           auto ref = FieldRef(oldResult, field.fieldID);
-          auto newVal = newInst.getResult(newPortIndex++);
+          auto newVal = newInst->getResult(newPortIndex++);
           assert(newVal.getType() == field.type);
           nonHWValues[ref] = newVal;
         }
@@ -703,6 +703,13 @@ FailureOr<MappingInfo> Visitor::mapType(Type type, Location errorLoc,
   }
 
   SmallVector<hw::InnerSymPropertiesAttr> newProps;
+  SmallVector<hw::InnerSymPropertiesAttr> oldProps;
+  if (sym) {
+    llvm::append_range(oldProps, sym.getProps());
+    llvm::sort(oldProps, [](const auto &p, const auto &q) {
+      return p.getFieldID() < q.getFieldID();
+    });
+  }
 
   // NOLINTBEGIN(misc-no-recursion)
   auto recurse = [&](auto &&f, FIRRTLType type, const Twine &suffix = "",
@@ -785,15 +792,32 @@ FailureOr<MappingInfo> Visitor::mapType(Type type, Location errorLoc,
       return failure();
 
     // If there's a symbol on this, add it with adjusted fieldID.
-    if (sym)
-      if (auto symOnThis = sym.getSymIfExists(fieldID)) {
+    if (sym) {
+      // If types changed, copy symbol over for specifically this fieldID.
+      // If they did not, copy over range of symbols for the type.
+      // The logic here is if they didn't change we didn't recurse into it,
+      // and so need to grab all symbols on and within this type.
+      auto maxFieldID = (type != *newType)
+                            ? fieldID
+                            : fieldID + hw::FieldIdImpl::getMaxFieldID(type);
+      assert((isa<FIRRTLBaseType>(type) || maxFieldID == fieldID) &&
+             "unexpected non-base type with fields");
+      auto propFind = [](auto &prop, auto fID) {
+        return prop.getFieldID() < fID;
+      };
+      for (auto symIt = llvm::lower_bound(oldProps, fieldID, propFind);
+           symIt != oldProps.end() && symIt->getFieldID() <= maxFieldID;
+           ++symIt) {
+        auto symToMap = symIt->getName();
         if (!*newType)
           return mlir::emitError(errorLoc, "inner symbol ")
-                 << symOnThis << " mapped to non-HW type";
+                 << symToMap << " mapped to non-HW type";
+        auto relFieldID = symIt->getFieldID() - fieldID;
         newProps.push_back(hw::InnerSymPropertiesAttr::get(
-            context, symOnThis, newFieldID,
+            context, symToMap, newFieldID + relFieldID,
             StringAttr::get(context, "public")));
       }
+    }
     return newType;
   };
 

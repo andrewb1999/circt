@@ -6,8 +6,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h"
 #include "circt/Analysis/NameAnalysis.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
@@ -30,6 +31,13 @@
 #include <limits>
 
 using namespace mlir;
+namespace circt {
+namespace loopschedule {
+#define GEN_PASS_DEF_BITWIDTHREDUCTIONFORLOOPSCHEDULE
+#include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h.inc"
+} // namespace loopschedule
+} // namespace circt
+
 using namespace mlir::affine;
 using namespace mlir::arith;
 using namespace circt;
@@ -37,9 +45,9 @@ using namespace circt::loopschedule;
 
 namespace {
 struct BitwidthReductionForLoopSchedule
-    : public BitwidthReductionForLoopScheduleBase<
+    : public circt::loopschedule::impl::BitwidthReductionForLoopScheduleBase<
           BitwidthReductionForLoopSchedule> {
-  using BitwidthReductionForLoopScheduleBase<
+  using circt::loopschedule::impl::BitwidthReductionForLoopScheduleBase<
       BitwidthReductionForLoopSchedule>::BitwidthReductionForLoopScheduleBase;
   void runOnOperation() override;
 };

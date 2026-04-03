@@ -29,6 +29,7 @@
 #include "circt/Dialect/OM/OMOps.h"
 #include "circt/Dialect/SV/SVAttributes.h"
 #include "circt/Dialect/SV/SVOps.h"
+#include "circt/Dialect/SV/SVTypes.h"
 #include "circt/Dialect/SV/SVVisitors.h"
 #include "circt/Dialect/Verif/VerifVisitors.h"
 #include "circt/Support/LLVM.h"
@@ -194,8 +195,12 @@ StringRef ExportVerilog::getSymOpName(Operation *symOp) {
   if (auto attr = symOp->getAttrOfType<StringAttr>("hw.verilogName"))
     return attr.getValue();
   return TypeSwitch<Operation *, StringRef>(symOp)
-      .Case<HWModuleOp, HWModuleExternOp, HWModuleGeneratedOp, FuncOp>(
+      .Case<HWModuleOp, HWModuleExternOp, HWModuleGeneratedOp,
+            sv::SVVerbatimModuleOp, FuncOp>(
           [](Operation *op) { return getVerilogModuleName(op); })
+      .Case<SVVerbatimSourceOp>([](SVVerbatimSourceOp op) {
+        return op.getVerilogNameAttr().getValue();
+      })
       .Case<InterfaceOp>([&](InterfaceOp op) {
         return getVerilogModuleNameAttr(op).getValue();
       })
@@ -263,8 +268,9 @@ bool ExportVerilog::isVerilogExpression(Operation *op) {
 
 // NOLINTBEGIN(misc-no-recursion)
 /// Push this type's dimension into a vector.
-static void getTypeDims(SmallVectorImpl<Attribute> &dims, Type type,
-                        Location loc) {
+static void getTypeDims(
+    SmallVectorImpl<Attribute> &dims, Type type, Location loc,
+    llvm::function_ref<mlir::InFlightDiagnostic(Location)> errorHandler) {
   if (auto integer = hw::type_dyn_cast<IntegerType>(type)) {
     if (integer.getWidth() != 1)
       dims.push_back(getInt32Attr(type.getContext(), integer.getWidth()));
@@ -272,7 +278,7 @@ static void getTypeDims(SmallVectorImpl<Attribute> &dims, Type type,
   }
   if (auto array = hw::type_dyn_cast<ArrayType>(type)) {
     dims.push_back(getInt32Attr(type.getContext(), array.getNumElements()));
-    getTypeDims(dims, array.getElementType(), loc);
+    getTypeDims(dims, array.getElementType(), loc, errorHandler);
 
     return;
   }
@@ -282,26 +288,27 @@ static void getTypeDims(SmallVectorImpl<Attribute> &dims, Type type,
   }
 
   if (auto inout = hw::type_dyn_cast<InOutType>(type))
-    return getTypeDims(dims, inout.getElementType(), loc);
+    return getTypeDims(dims, inout.getElementType(), loc, errorHandler);
   if (auto uarray = hw::type_dyn_cast<hw::UnpackedArrayType>(type))
-    return getTypeDims(dims, uarray.getElementType(), loc);
+    return getTypeDims(dims, uarray.getElementType(), loc, errorHandler);
   if (auto uarray = hw::type_dyn_cast<sv::UnpackedOpenArrayType>(type))
-    return getTypeDims(dims, uarray.getElementType(), loc);
-
-  if (hw::type_isa<InterfaceType, StructType, EnumType>(type))
+    return getTypeDims(dims, uarray.getElementType(), loc, errorHandler);
+  if (hw::type_isa<InterfaceType, StructType, EnumType, UnionType>(type))
     return;
 
-  mlir::emitError(loc, "value has an unsupported verilog type ") << type;
+  errorHandler(loc) << "value has an unsupported verilog type " << type;
 }
 // NOLINTEND(misc-no-recursion)
 
 /// True iff 'a' and 'b' have the same wire dims.
-static bool haveMatchingDims(Type a, Type b, Location loc) {
+static bool haveMatchingDims(
+    Type a, Type b, Location loc,
+    llvm::function_ref<mlir::InFlightDiagnostic(Location)> errorHandler) {
   SmallVector<Attribute, 4> aDims;
-  getTypeDims(aDims, a, loc);
+  getTypeDims(aDims, a, loc, errorHandler);
 
   SmallVector<Attribute, 4> bDims;
-  getTypeDims(bDims, b, loc);
+  getTypeDims(bDims, b, loc, errorHandler);
 
   return aDims == bDims;
 }
@@ -731,7 +738,8 @@ static bool isExpressionUnableToInline(Operation *op,
                                        const LoweringOptions &options) {
   if (auto cast = dyn_cast<BitcastOp>(op))
     if (!haveMatchingDims(cast.getInput().getType(), cast.getResult().getType(),
-                          op->getLoc())) {
+                          op->getLoc(),
+                          [&](Location loc) { return emitError(loc); })) {
       // Even if dimentions don't match, we can inline when its user doesn't
       // rely on the type.
       if (op->hasOneUse() &&
@@ -1107,6 +1115,11 @@ public:
   InFlightDiagnostic emitOpError(Operation *op, const Twine &message) {
     state.encounteredError = true;
     return op->emitOpError(message);
+  }
+
+  InFlightDiagnostic emitError(Location loc, const Twine &message = "") {
+    state.encounteredError = true;
+    return mlir::emitError(loc, message);
   }
 
   void emitLocationImpl(llvm::StringRef location) {
@@ -1632,7 +1645,7 @@ static void emitDim(Attribute width, raw_ostream &os, Location loc,
   // attribute so it gets printed in canonical form.
   auto typedAttr = dyn_cast<TypedAttr>(width);
   if (!typedAttr) {
-    mlir::emitError(loc, "untyped dimension attribute ") << width;
+    emitter.emitError(loc, "untyped dimension attribute ") << width;
     return;
   }
   auto negOne =
@@ -1642,8 +1655,8 @@ static void emitDim(Attribute width, raw_ostream &os, Location loc,
   os << '[';
   if (!downTo)
     os << "0:";
-  emitter.printParamValue(width, os, [loc]() {
-    return mlir::emitError(loc, "invalid parameter in type");
+  emitter.printParamValue(width, os, [loc, &emitter]() {
+    return emitter.emitError(loc, "invalid parameter in type");
   });
   if (downTo)
     os << ":0";
@@ -1661,7 +1674,8 @@ static void emitDims(ArrayRef<Attribute> dims, raw_ostream &os, Location loc,
 /// Emit a type's packed dimensions.
 void ModuleEmitter::emitTypeDims(Type type, Location loc, raw_ostream &os) {
   SmallVector<Attribute, 4> dims;
-  getTypeDims(dims, type, loc);
+  getTypeDims(dims, type, loc,
+              [&](Location loc) { return this->emitError(loc); });
   emitDims(dims, os, loc, *this);
 }
 
@@ -1698,7 +1712,7 @@ static bool printPackedTypeImpl(Type type, raw_ostream &os, Location loc,
                                 Type optionalAliasType = {},
                                 bool emitAsTwoStateType = false) {
   return TypeSwitch<Type, bool>(type)
-      .Case<IntegerType>([&](IntegerType integerType) {
+      .Case<IntegerType>([&](IntegerType integerType) -> bool {
         if (emitAsTwoStateType && dims.empty()) {
           auto typeName = getTwoStateIntegerAtomType(integerType.getWidth());
           if (!typeName.empty()) {
@@ -1742,9 +1756,11 @@ static bool printPackedTypeImpl(Type type, raw_ostream &os, Location loc,
                                    emitAsTwoStateType);
       })
       .Case<EnumType>([&](EnumType enumType) {
+        assert(enumType.getBitWidth().has_value() &&
+               "enum type must have bitwidth");
         os << "enum ";
         if (enumType.getBitWidth() != 32)
-          os << "bit [" << enumType.getBitWidth() - 1 << ":0] ";
+          os << "bit [" << *enumType.getBitWidth() - 1 << ":0] ";
         os << "{";
         Type enumPrefixType = optionalAliasType ? optionalAliasType : enumType;
         llvm::interleaveComma(
@@ -1832,20 +1848,26 @@ static bool printPackedTypeImpl(Type type, raw_ostream &os, Location loc,
       })
 
       .Case<InterfaceType>([](InterfaceType ifaceType) { return false; })
+      .Case<ModportType>([&](ModportType modportType) {
+        auto modportAttr = modportType.getModport();
+        os << modportAttr.getRootReference().getValue() << "."
+           << modportAttr.getNestedReferences().front().getValue();
+        return true;
+      })
       .Case<UnpackedArrayType>([&](UnpackedArrayType arrayType) {
         os << "<<unexpected unpacked array>>";
-        mlir::emitError(loc, "Unexpected unpacked array in packed type ")
+        emitter.emitError(loc, "Unexpected unpacked array in packed type ")
             << arrayType;
         return true;
       })
       .Case<TypeAliasType>([&](TypeAliasType typeRef) {
         auto typedecl = typeRef.getTypeDecl(emitter.state.symbolCache);
         if (!typedecl) {
-          mlir::emitError(loc, "unresolvable type reference");
+          emitter.emitError(loc, "unresolvable type reference");
           return false;
         }
         if (typedecl.getType() != typeRef.getInnerType()) {
-          mlir::emitError(loc, "declared type did not match aliased type");
+          emitter.emitError(loc, "declared type did not match aliased type");
           return false;
         }
 
@@ -1855,7 +1877,8 @@ static bool printPackedTypeImpl(Type type, raw_ostream &os, Location loc,
       })
       .Default([&](Type type) {
         os << "<<invalid type '" << type << "'>>";
-        mlir::emitError(loc, "value has an unsupported verilog type ") << type;
+        emitter.emitError(loc, "value has an unsupported verilog type ")
+            << type;
         return true;
       });
 }
@@ -2637,7 +2660,7 @@ SubExprInfo ExprEmitter::emitSubExpr(Value exp,
   unsigned subExprStartIndex = buffer.tokens.size();
   if (op)
     ps.addCallback({op, true});
-  auto done = llvm::make_scope_exit([&]() {
+  llvm::scope_exit done([&]() {
     if (op)
       ps.addCallback({op, false});
   });
@@ -2729,7 +2752,9 @@ SubExprInfo ExprEmitter::visitTypeOp(BitcastOp op) {
   // their dimensions don't match. SystemVerilog uses the wire declaration to
   // know what type this value is being casted to.
   Type toType = op.getType();
-  if (!haveMatchingDims(toType, op.getInput().getType(), op.getLoc())) {
+  if (!haveMatchingDims(
+          toType, op.getInput().getType(), op.getLoc(),
+          [&](Location loc) { return emitter.emitError(loc, ""); })) {
     ps << "/*cast(bit";
     ps.invokeWithStringOS(
         [&](auto &os) { emitter.emitTypeDims(toType, op.getLoc(), os); });
@@ -3572,6 +3597,7 @@ private:
   friend class ltl::Visitor<PropertyEmitter, EmittedProperty>;
 
   EmittedProperty visitUnhandledLTL(Operation *op);
+  EmittedProperty visitLTL(ltl::BooleanConstantOp op);
   EmittedProperty visitLTL(ltl::AndOp op);
   EmittedProperty visitLTL(ltl::OrOp op);
   EmittedProperty visitLTL(ltl::IntersectOp op);
@@ -3709,6 +3735,12 @@ EmittedProperty PropertyEmitter::emitNestedProperty(
 EmittedProperty PropertyEmitter::visitUnhandledLTL(Operation *op) {
   emitOpError(op, "emission as Verilog property or sequence not supported");
   ps << "<<unsupported: " << PPExtString(op->getName().getStringRef()) << ">>";
+  return {PropertyPrecedence::Symbol};
+}
+
+EmittedProperty PropertyEmitter::visitLTL(ltl::BooleanConstantOp op) {
+  // Emit the boolean constant value as a literal.
+  ps << (op.getValueAttr().getValue() ? "1'h1" : "1'h0");
   return {PropertyPrecedence::Symbol};
 }
 
@@ -3935,8 +3967,8 @@ void NameCollector::collectNames(Block &block) {
     // Instances have an instance name to recognize but we don't need to look
     // at the result values since wires used by instances should be traversed
     // anyway.
-    if (isa<InstanceOp, InstanceChoiceOp, InterfaceInstanceOp,
-            FuncCallProceduralOp, FuncCallOp>(op))
+    if (isa<InstanceOp, InterfaceInstanceOp, FuncCallProceduralOp, FuncCallOp>(
+            op))
       continue;
     if (isa<ltl::LTLDialect, debug::DebugDialect>(op.getDialect()))
       continue;
@@ -4041,7 +4073,6 @@ private:
   LogicalResult visitStmt(OutputOp op);
 
   LogicalResult visitStmt(InstanceOp op);
-  LogicalResult visitStmt(InstanceChoiceOp op);
   void emitInstancePortList(Operation *op, ModulePortInfo &modPortInfo,
                             ArrayRef<Value> instPortValues);
 
@@ -4075,7 +4106,26 @@ private:
                                         std::optional<unsigned> verbosity,
                                         StringAttr message,
                                         ValueRange operands);
+
+  // Helper template for nonfatal message operations
+  template <typename OpTy>
+  LogicalResult emitNonfatalMessageOp(OpTy op, const char *taskName) {
+    return emitSeverityMessageTask(op, PPExtString(taskName), {},
+                                   op.getMessageAttr(), op.getSubstitutions());
+  }
+
+  // Helper template for fatal message operations
+  template <typename OpTy>
+  LogicalResult emitFatalMessageOp(OpTy op) {
+    return emitSeverityMessageTask(op, PPExtString("$fatal"), op.getVerbosity(),
+                                   op.getMessageAttr(), op.getSubstitutions());
+  }
+
+  LogicalResult visitSV(FatalProceduralOp op);
   LogicalResult visitSV(FatalOp op);
+  LogicalResult visitSV(ErrorProceduralOp op);
+  LogicalResult visitSV(WarningProceduralOp op);
+  LogicalResult visitSV(InfoProceduralOp op);
   LogicalResult visitSV(ErrorOp op);
   LogicalResult visitSV(WarningOp op);
   LogicalResult visitSV(InfoOp op);
@@ -4109,6 +4159,7 @@ private:
 
   LogicalResult visitSV(BindOp op);
   LogicalResult visitSV(InterfaceOp op);
+  LogicalResult visitSV(sv::SVVerbatimSourceOp op);
   LogicalResult visitSV(InterfaceSignalOp op);
   LogicalResult visitSV(InterfaceModportOp op);
   LogicalResult visitSV(AssignInterfaceSignalOp op);
@@ -4341,7 +4392,7 @@ LogicalResult StmtEmitter::emitOutputLikeOp(Operation *op,
     // directly when the instance is emitted.
     // Keep synced with countStatements() and visitStmt(InstanceOp).
     if (operand.hasOneUse() && operand.getDefiningOp() &&
-        isa<InstanceOp, InstanceChoiceOp>(operand.getDefiningOp())) {
+        isa<InstanceOp>(operand.getDefiningOp())) {
       ++operandIndex;
       continue;
     }
@@ -4756,24 +4807,36 @@ StmtEmitter::emitSeverityMessageTask(Operation *op, PPExtString taskName,
   return success();
 }
 
+LogicalResult StmtEmitter::visitSV(FatalProceduralOp op) {
+  return emitFatalMessageOp(op);
+}
+
 LogicalResult StmtEmitter::visitSV(FatalOp op) {
-  return emitSeverityMessageTask(op, PPExtString("$fatal"), op.getVerbosity(),
-                                 op.getMessageAttr(), op.getSubstitutions());
+  return emitFatalMessageOp(op);
+}
+
+LogicalResult StmtEmitter::visitSV(ErrorProceduralOp op) {
+  return emitNonfatalMessageOp(op, "$error");
+}
+
+LogicalResult StmtEmitter::visitSV(WarningProceduralOp op) {
+  return emitNonfatalMessageOp(op, "$warning");
+}
+
+LogicalResult StmtEmitter::visitSV(InfoProceduralOp op) {
+  return emitNonfatalMessageOp(op, "$info");
 }
 
 LogicalResult StmtEmitter::visitSV(ErrorOp op) {
-  return emitSeverityMessageTask(op, PPExtString("$error"), {},
-                                 op.getMessageAttr(), op.getSubstitutions());
+  return emitNonfatalMessageOp(op, "$error");
 }
 
 LogicalResult StmtEmitter::visitSV(WarningOp op) {
-  return emitSeverityMessageTask(op, PPExtString("$warning"), {},
-                                 op.getMessageAttr(), op.getSubstitutions());
+  return emitNonfatalMessageOp(op, "$warning");
 }
 
 LogicalResult StmtEmitter::visitSV(InfoOp op) {
-  return emitSeverityMessageTask(op, PPExtString("$info"), {},
-                                 op.getMessageAttr(), op.getSubstitutions());
+  return emitNonfatalMessageOp(op, "$info");
 }
 
 LogicalResult StmtEmitter::visitSV(ReadMemOp op) {
@@ -5531,29 +5594,6 @@ LogicalResult StmtEmitter::visitStmt(InstanceOp op) {
   return success();
 }
 
-LogicalResult StmtEmitter::visitStmt(InstanceChoiceOp op) {
-  startStatement();
-  Operation *choiceMacroDeclOp = state.symbolCache.getDefinition(
-      op->getAttrOfType<FlatSymbolRefAttr>("hw.choiceTarget"));
-
-  ps << "`" << PPExtString(getSymOpName(choiceMacroDeclOp)) << PP::nbsp
-     << PPExtString(getSymOpName(op));
-
-  Operation *defaultModuleOp =
-      state.symbolCache.getDefinition(op.getDefaultModuleNameAttr());
-  ModulePortInfo modPortInfo(cast<PortList>(defaultModuleOp).getPortList());
-  SmallVector<Value> instPortValues(modPortInfo.size());
-  op.getValues(instPortValues, modPortInfo);
-  emitInstancePortList(op, modPortInfo, instPortValues);
-
-  SmallPtrSet<Operation *, 8> ops;
-  ops.insert(op);
-  ps.addCallback({op, false});
-  emitLocationInfoAndNewLine(ops);
-
-  return success();
-}
-
 void StmtEmitter::emitInstancePortList(Operation *op,
                                        ModulePortInfo &modPortInfo,
                                        ArrayRef<Value> instPortValues) {
@@ -5687,6 +5727,18 @@ LogicalResult StmtEmitter::visitSV(InterfaceOp op) {
   emitStatementBlock(*op.getBodyBlock());
   startStatement();
   ps << "endinterface" << PP::newline;
+  ps.addCallback({op, false});
+  setPendingNewline();
+  return success();
+}
+
+LogicalResult StmtEmitter::visitSV(sv::SVVerbatimSourceOp op) {
+  emitSVAttributes(op);
+  startStatement();
+  ps.addCallback({op, true});
+
+  ps << op.getContent();
+
   ps.addCallback({op, false});
   setPendingNewline();
   return success();
@@ -6021,7 +6073,7 @@ LogicalResult StmtEmitter::emitDeclaration(Operation *op) {
     // Try inlining an assignment into declarations.
     // FIXME: Unpacked array is not inlined since several tools doesn't support
     // that syntax. See Issue 6363.
-    if (isa<sv::WireOp>(op) &&
+    if (!state.options.disallowDeclAssignments && isa<sv::WireOp>(op) &&
         !op->getParentOp()->hasTrait<ProceduralRegion>() &&
         !hasLeadingUnpackedType(op->getResult(0).getType())) {
       // Get a single assignments if any.
@@ -6046,7 +6098,8 @@ LogicalResult StmtEmitter::emitDeclaration(Operation *op) {
     // Try inlining a blocking assignment to logic op declaration.
     // FIXME: Unpacked array is not inlined since several tools doesn't support
     // that syntax. See Issue 6363.
-    if (isa<LogicOp>(op) && op->getParentOp()->hasTrait<ProceduralRegion>() &&
+    if (!state.options.disallowDeclAssignments && isa<LogicOp>(op) &&
+        op->getParentOp()->hasTrait<ProceduralRegion>() &&
         !hasLeadingUnpackedType(op->getResult(0).getType())) {
       // Get a single assignment which might be possible to inline.
       if (auto singleAssign = getSingleAssignAndCheckUsers<BPAssignOp>(op)) {
@@ -6413,31 +6466,37 @@ void ModuleEmitter::emitPortList(Operation *module,
         ps << (isZeroWidth ? "// " : "   ");
       }
 
-      // Emit the port direction.
+      // Emit the port direction and optional wire keyword.
       auto thisPortDirection = portInfo.at(portIdx).dir;
-      switch (thisPortDirection) {
-      case ModulePort::Direction::Output:
-        ps << "output ";
-        break;
-      case ModulePort::Direction::Input:
-        ps << (hasOutputs ? "input  " : "input ");
-        break;
-      case ModulePort::Direction::InOut:
-        ps << (hasOutputs ? "inout  " : "inout ");
-        break;
-      }
-      bool emitWireInPorts = state.options.emitWireInPorts;
-      if (emitWireInPorts)
-        ps << "wire ";
-
-      // Emit the type.
-      if (!portTypeStrings[portIdx].empty())
+      size_t startOfNamePos = (hasOutputs ? 7 : 6) +
+                              (state.options.emitWireInPorts ? 5 : 0) +
+                              maxTypeWidth;
+      // Modport-typed ports (e.g., MyBundle.sink) already encode their
+      // direction in the interface modport definition, so we suppress the
+      // direction and wire keywords for them.
+      if (!isa<ModportType>(portType)) {
+        switch (thisPortDirection) {
+        case ModulePort::Direction::Output:
+          ps << "output ";
+          break;
+        case ModulePort::Direction::Input:
+          ps << (hasOutputs ? "input  " : "input ");
+          break;
+        case ModulePort::Direction::InOut:
+          ps << (hasOutputs ? "inout  " : "inout ");
+          break;
+        }
+        if (state.options.emitWireInPorts)
+          ps << "wire ";
+        if (!portTypeStrings[portIdx].empty())
+          ps << portTypeStrings[portIdx];
+        if (portTypeStrings[portIdx].size() < maxTypeWidth)
+          ps.nbsp(maxTypeWidth - portTypeStrings[portIdx].size());
+      } else {
         ps << portTypeStrings[portIdx];
-      if (portTypeStrings[portIdx].size() < maxTypeWidth)
-        ps.nbsp(maxTypeWidth - portTypeStrings[portIdx].size());
-
-      size_t startOfNamePos =
-          (hasOutputs ? 7 : 6) + (emitWireInPorts ? 5 : 0) + maxTypeWidth;
+        if (portTypeStrings[portIdx].size() < startOfNamePos)
+          ps.nbsp(startOfNamePos - portTypeStrings[portIdx].size());
+      }
 
       // Emit the name.
       ps << PPExtString(portInfo.at(portIdx).getVerilogName());
@@ -6834,7 +6893,11 @@ void SharedEmitterState::gatherFiles(bool separateModules) {
           else
             rootFile.ops.push_back(info);
         })
-        .Case<HWModuleExternOp>([&](HWModuleExternOp op) {
+        .Case<sv::SVVerbatimSourceOp>([&](sv::SVVerbatimSourceOp op) {
+          symbolCache.addDefinition(op.getNameAttr(), op);
+          separateFile(op, op.getOutputFile().getFilename().getValue());
+        })
+        .Case<HWModuleExternOp, sv::SVVerbatimModuleOp>([&](auto op) {
           // Build the IR cache.
           symbolCache.addDefinition(op.getNameAttr(), op);
           collectPorts(op);
@@ -6968,14 +7031,14 @@ void SharedEmitterState::collectOpsForFile(const FileInfo &file,
 static void emitOperation(VerilogEmitterState &state, Operation *op) {
   TypeSwitch<Operation *>(op)
       .Case<HWModuleOp>([&](auto op) { ModuleEmitter(state).emitHWModule(op); })
-      .Case<HWModuleExternOp>([&](auto op) {
+      .Case<HWModuleExternOp, sv::SVVerbatimModuleOp>([&](auto op) {
         // External modules are _not_ emitted.
       })
       .Case<HWModuleGeneratedOp>(
           [&](auto op) { ModuleEmitter(state).emitHWGeneratedModule(op); })
       .Case<HWGeneratorSchemaOp>([&](auto op) { /* Empty */ })
       .Case<BindOp>([&](auto op) { ModuleEmitter(state).emitBind(op); })
-      .Case<InterfaceOp, VerbatimOp, IfDefOp>(
+      .Case<InterfaceOp, VerbatimOp, IfDefOp, sv::SVVerbatimSourceOp>(
           [&](auto op) { ModuleEmitter(state).emitStatement(op); })
       .Case<TypeScopeOp>([&](auto typedecls) {
         ModuleEmitter(state).emitStatement(typedecls);
@@ -7055,6 +7118,8 @@ void SharedEmitterState::emitOps(EmissionList &thingsToEmit,
                               stringOrOp.verilogLocs);
     emitOperation(state, op);
     stringOrOp.setString(buffer);
+    if (state.encounteredError)
+      encounteredError = true;
   });
 
   // Finally emit each entry now that we know it is a string.
@@ -7079,6 +7144,10 @@ void SharedEmitterState::emitOps(EmissionList &thingsToEmit,
                               entry.verilogLocs);
     emitOperation(state, op);
     state.addVerilogLocToOps(0, fileName);
+    if (state.encounteredError) {
+      encounteredError = true;
+      return;
+    }
   }
 }
 
@@ -7131,8 +7200,6 @@ static LogicalResult exportVerilogImpl(ModuleOp module, llvm::raw_ostream &os) {
 
 LogicalResult circt::exportVerilog(ModuleOp module, llvm::raw_ostream &os) {
   LoweringOptions options(module);
-  if (failed(lowerHWInstanceChoices(module)))
-    return failure();
   SmallVector<HWEmittableModuleLike> modulesToPrepare;
   module.walk(
       [&](HWEmittableModuleLike op) { modulesToPrepare.push_back(op); });
@@ -7152,7 +7219,6 @@ struct ExportVerilogPass
     // Prepare the ops in the module for emission.
     mlir::OpPassManager preparePM("builtin.module");
     preparePM.addPass(createLegalizeAnonEnums());
-    preparePM.addPass(createHWLowerInstanceChoices());
     auto &modulePM = preparePM.nestAny();
     modulePM.addPass(createPrepareForEmission());
     if (failed(runPipeline(preparePM, getOperation())))
@@ -7310,8 +7376,6 @@ static LogicalResult exportSplitVerilogImpl(ModuleOp module,
 
 LogicalResult circt::exportSplitVerilog(ModuleOp module, StringRef dirname) {
   LoweringOptions options(module);
-  if (failed(lowerHWInstanceChoices(module)))
-    return failure();
   SmallVector<HWEmittableModuleLike> modulesToPrepare;
   module.walk(
       [&](HWEmittableModuleLike op) { modulesToPrepare.push_back(op); });
@@ -7333,7 +7397,6 @@ struct ExportSplitVerilogPass
   void runOnOperation() override {
     // Prepare the ops in the module for emission.
     mlir::OpPassManager preparePM("builtin.module");
-    preparePM.addPass(createHWLowerInstanceChoices());
 
     auto &modulePM = preparePM.nest<hw::HWModuleOp>();
     modulePM.addPass(createPrepareForEmission());

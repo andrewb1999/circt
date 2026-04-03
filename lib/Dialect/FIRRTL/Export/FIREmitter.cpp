@@ -67,6 +67,7 @@ struct Emitter {
                       StringAttr moduleName, DictionaryAttr params);
   void emitEnabledLayers(ArrayRef<Attribute> layers);
   void emitKnownLayers(ArrayRef<Attribute> layers);
+  void emitRequirements(ArrayRef<Attribute> requirements);
   void emitParamAssign(ParamDeclAttr param, Operation *op,
                        std::optional<PPExtString> wordBeforeLHS = std::nullopt);
   void emitParamValue(Attribute value, Operation *op);
@@ -110,6 +111,8 @@ struct Emitter {
   void emitStatement(RefReleaseInitialOp op);
   void emitStatement(LayerBlockOp op);
   void emitStatement(GenericIntrinsicOp op);
+  void emitStatement(DomainCreateAnonOp op);
+  void emitStatement(DomainCreateOp op);
 
   template <class T>
   void emitVerifStatement(T op, StringRef mnemonic);
@@ -125,6 +128,7 @@ struct Emitter {
   void emitExpression(SubindexOp op);
   void emitExpression(SubaccessOp op);
   void emitExpression(OpenSubfieldOp op);
+  void emitExpression(DomainSubfieldOp op);
   void emitExpression(OpenSubindexOp op);
   void emitExpression(RefResolveOp op);
   void emitExpression(RefSendOp op);
@@ -142,6 +146,7 @@ struct Emitter {
   void emitExpression(GenericIntrinsicOp op);
   void emitExpression(CatPrimOp op);
   void emitExpression(UnsafeDomainCastOp op);
+  void emitExpression(UnknownValueOp op);
 
   void emitPrimExpr(StringRef mnemonic, Operation *op,
                     ArrayRef<uint32_t> attrs = {});
@@ -159,7 +164,7 @@ struct Emitter {
   void emitExpression(ShlPrimOp op) { emitPrimExpr("shl", op, op.getAmount()); }
   void emitExpression(ShrPrimOp op) { emitPrimExpr("shr", op, op.getAmount()); }
 
-  void emitExpression(TimeOp op){};
+  void emitExpression(TimeOp op) {}
 
   // Funnel all ops without attrs into `emitPrimExpr`.
 #define HANDLE(OPTYPE, MNEMONIC)                                               \
@@ -185,6 +190,7 @@ struct Emitter {
   HANDLE(AsSIntPrimOp, "asSInt");
   HANDLE(AsUIntPrimOp, "asUInt");
   HANDLE(AsAsyncResetPrimOp, "asAsyncReset");
+  HANDLE(AsResetPrimOp, "asReset");
   HANDLE(AsClockPrimOp, "asClock");
   HANDLE(CvtPrimOp, "cvt");
   HANDLE(NegPrimOp, "neg");
@@ -192,6 +198,7 @@ struct Emitter {
   HANDLE(AndRPrimOp, "andr");
   HANDLE(OrRPrimOp, "orr");
   HANDLE(XorRPrimOp, "xorr");
+  HANDLE(StringConcatOp, "string_concat");
 #undef HANDLE
 
   // Attributes
@@ -206,8 +213,7 @@ struct Emitter {
   }
 
   // Domains
-  void emitDomains(Attribute domains,
-                   const DenseMap<size_t, StringRef> &domainMap);
+  void emitDomains(Attribute attr, ArrayRef<PortInfo> ports);
 
   // Locations
   void emitLocation(Location loc);
@@ -390,7 +396,7 @@ private:
     SymbolTable symbolTable;
     hw::InnerSymbolTableCollection istc;
     hw::InnerRefNamespace irn{symbolTable, istc};
-    SymInfos(Operation *op) : symbolTable(op), istc(op){};
+    SymInfos(Operation *op) : symbolTable(op), istc(op) {}
   };
   std::optional<std::reference_wrapper<SymInfos>> symInfos;
 
@@ -454,6 +460,18 @@ void Emitter::emitKnownLayers(ArrayRef<Attribute> layers) {
     emitSymbol(cast<SymbolRefAttr>(layer));
     ps << PP::end;
   }
+}
+
+void Emitter::emitRequirements(ArrayRef<Attribute> requirements) {
+  if (requirements.empty())
+    return;
+  ps << PP::space;
+  ps.cbox(2, IndentStyle::Block);
+  ps << "requires" << PP::space;
+  llvm::interleaveComma(requirements, ps, [&](Attribute req) {
+    ps.writeQuotedEscaped(cast<StringAttr>(req).getValue());
+  });
+  ps << PP::end;
 }
 
 void Emitter::emitParamAssign(ParamDeclAttr param, Operation *op,
@@ -563,6 +581,8 @@ void Emitter::emitModule(FExtModuleOp op) {
   ps << "extmodule " << PPExtString(legalize(op.getNameAttr()));
   emitKnownLayers(op.getKnownLayers());
   emitEnabledLayers(op.getLayers());
+  if (auto reqs = op.getExternalRequirements())
+    emitRequirements(reqs.getValue());
   ps << PP::nbsp << ":" << PP::end;
   emitLocation(op);
 
@@ -615,19 +635,17 @@ void Emitter::emitModule(FIntModuleOp op) {
 /// during expression emission.
 void Emitter::emitModulePorts(ArrayRef<PortInfo> ports,
                               Block::BlockArgListType arguments) {
-  DenseMap<size_t, StringRef> domainMap;
+  // Emit the ports.
   for (unsigned i = 0, e = ports.size(); i < e; ++i) {
     startStatement();
     const auto &port = ports[i];
     ps << (port.direction == Direction::In ? "input " : "output ");
     auto legalName = legalize(port.name);
-    if (isa<DomainType>(port.type))
-      domainMap.insert({i, port.name});
     if (!arguments.empty())
       addValueName(arguments[i], legalName);
     ps << PPExtString(legalName) << " : ";
     emitType(port.type);
-    emitDomains(port.domains, domainMap);
+    emitDomains(port.domains, ports);
     emitLocation(ports[i].loc);
     setPendingNewline();
   }
@@ -755,7 +773,8 @@ void Emitter::emitStatementsInBlock(Block &block) {
               CombMemOp, MemoryPortOp, MemoryDebugPortOp, MemoryPortAccessOp,
               DomainDefineOp, RefDefineOp, RefForceOp, RefForceInitialOp,
               RefReleaseOp, RefReleaseInitialOp, LayerBlockOp,
-              GenericIntrinsicOp>([&](auto op) { emitStatement(op); })
+              GenericIntrinsicOp, DomainCreateAnonOp, DomainCreateOp>(
+            [&](auto op) { emitStatement(op); })
         .Default([&](auto op) {
           startStatement();
           ps << "// operation " << PPExtString(op->getName().getStringRef());
@@ -800,6 +819,19 @@ void Emitter::emitStatement(WireOp op) {
   ps.scopedBox(PP::ibox2, [&]() {
     ps << "wire " << PPExtString(legalName);
     emitTypeWithColon(op.getResult().getType());
+
+    // Emit domain associations if present
+    if (!op.getDomains().empty()) {
+      ps << PP::space << "domains" << PP::space << "[";
+      ps.scopedBox(PP::cbox0, [&]() {
+        llvm::interleaveComma(op.getDomains(), ps, [&](Value domain) {
+          auto name = lookupEmittedName(domain);
+          assert(name && "domain value must have a name");
+          ps << PPExtString(*name);
+        });
+      });
+      ps << "]";
+    }
   });
   emitLocationAndNewLine(op);
 }
@@ -1126,7 +1158,7 @@ void Emitter::emitStatement(InstanceOp op) {
   portName.push_back('.');
   unsigned baseLen = portName.size();
   for (unsigned i = 0, e = op.getNumResults(); i < e; ++i) {
-    portName.append(legalize(op.getPortName(i)));
+    portName.append(legalize(op.getPortNameAttr(i)));
     addValueName(op.getResult(i), portName);
     portName.resize(baseLen);
   }
@@ -1153,7 +1185,7 @@ void Emitter::emitStatement(InstanceChoiceOp op) {
   portName.push_back('.');
   unsigned baseLen = portName.size();
   for (unsigned i = 0, e = op.getNumResults(); i < e; ++i) {
-    portName.append(legalize(op.getPortName(i)));
+    portName.append(legalize(op.getPortNameAttr(i)));
     addValueName(op.getResult(i), portName);
     portName.resize(baseLen);
   }
@@ -1285,6 +1317,10 @@ void Emitter::emitStatement(MemoryPortAccessOp op) {
 }
 
 void Emitter::emitStatement(DomainDefineOp op) {
+  // If the source is an anonymous domain, then we can skip emitting this op.
+  if (isa_and_nonnull<DomainCreateAnonOp>(op.getSrc().getDefiningOp()))
+    return;
+
   startStatement();
   emitAssignLike([&]() { emitExpression(op.getDest()); },
                  [&]() { emitExpression(op.getSrc()); }, PPExtString("="),
@@ -1392,6 +1428,30 @@ void Emitter::emitStatement(GenericIntrinsicOp op) {
   emitLocationAndNewLine(op);
 }
 
+void Emitter::emitStatement(DomainCreateAnonOp op) {
+  // These ops are not emitted.
+}
+
+void Emitter::emitStatement(DomainCreateOp op) {
+  startStatement();
+  auto name = legalize(op.getNameAttr());
+  addValueName(op.getResult(), name);
+  ps.scopedBox(PP::ibox2, [&]() {
+    ps << "domain " << PPExtString(name) << " of "
+       << PPExtString(op.getDomainAttr().getValue());
+
+    auto fieldValues = op.getFieldValues();
+    if (fieldValues.empty())
+      return;
+
+    ps << "(" << PP::ibox0;
+    interleaveComma(fieldValues, [&](auto value) { emitExpression(value); });
+    ps << ")" << PP::end;
+  });
+
+  emitLocationAndNewLine(op);
+}
+
 void Emitter::emitExpression(Value value) {
   // Handle the trivial case where we already have a name for this value which
   // we can use.
@@ -1407,19 +1467,21 @@ void Emitter::emitExpression(Value value) {
       .Case<
           // Basic expressions
           ConstantOp, SpecialConstantOp, SubfieldOp, SubindexOp, SubaccessOp,
-          OpenSubfieldOp, OpenSubindexOp,
+          OpenSubfieldOp, OpenSubindexOp, DomainSubfieldOp,
           // Binary
           AddPrimOp, SubPrimOp, MulPrimOp, DivPrimOp, RemPrimOp, AndPrimOp,
           OrPrimOp, XorPrimOp, LEQPrimOp, LTPrimOp, GEQPrimOp, GTPrimOp,
           EQPrimOp, NEQPrimOp, DShlPrimOp, DShlwPrimOp, DShrPrimOp,
           // Unary
-          AsSIntPrimOp, AsUIntPrimOp, AsAsyncResetPrimOp, AsClockPrimOp,
-          CvtPrimOp, NegPrimOp, NotPrimOp, AndRPrimOp, OrRPrimOp, XorRPrimOp,
+          AsSIntPrimOp, AsUIntPrimOp, AsAsyncResetPrimOp, AsResetPrimOp,
+          AsClockPrimOp, CvtPrimOp, NegPrimOp, NotPrimOp, AndRPrimOp, OrRPrimOp,
+          XorRPrimOp,
           // Miscellaneous
           BitsPrimOp, HeadPrimOp, TailPrimOp, PadPrimOp, MuxPrimOp, ShlPrimOp,
           ShrPrimOp, UninferredResetCastOp, ConstCastOp, StringConstantOp,
           FIntegerConstantOp, BoolConstantOp, DoubleConstantOp, ListCreateOp,
           UnresolvedPathOp, GenericIntrinsicOp, CatPrimOp, UnsafeDomainCastOp,
+          UnknownValueOp, StringConcatOp,
           // Reference expressions
           RefSendOp, RefResolveOp, RefSubOp, RWProbeOp, RefCastOp,
           // Format String expressions
@@ -1490,6 +1552,12 @@ void Emitter::emitExpression(OpenSubfieldOp op) {
   auto type = op.getInput().getType();
   emitExpression(op.getInput());
   ps << "." << legalize(type.getElementNameAttr(op.getFieldIndex()));
+}
+
+// NOLINTNEXTLINE(misc-no-recursion)
+void Emitter::emitExpression(DomainSubfieldOp op) {
+  emitExpression(op.getInput());
+  ps << "." << legalize(op.getFieldName());
 }
 
 void Emitter::emitExpression(OpenSubindexOp op) {
@@ -1667,6 +1735,12 @@ void Emitter::emitExpression(UnsafeDomainCastOp op) {
   ps << ")" << PP::end;
 }
 
+void Emitter::emitExpression(UnknownValueOp op) {
+  ps << "Unknown(";
+  emitType(op.getType());
+  ps << ")";
+}
+
 void Emitter::emitAttribute(MemDirAttr attr) {
   switch (attr) {
   case MemDirAttr::Infer:
@@ -1780,32 +1854,27 @@ void Emitter::emitType(Type type, bool includeConst) {
         emitType(type.getElementType());
         ps << ">";
       })
-      .Case<DomainType>([&](DomainType type) { ps << "Domain"; })
+      .Case<DomainType>([&](DomainType type) {
+        ps << "Domain of " << PPExtString(type.getName().getValue());
+      })
       .Default([&](auto type) {
         llvm_unreachable("all types should be implemented");
       });
 }
 
-void Emitter::emitDomains(Attribute attr,
-                          const DenseMap<size_t, StringRef> &domainMap) {
+void Emitter::emitDomains(Attribute attr, ArrayRef<PortInfo> ports) {
   if (!attr)
     return;
-  if (auto domains = dyn_cast<ArrayAttr>(attr)) {
-    if (domains.empty())
-      return;
-    ps << " domains [";
-    ps.scopedBox(PP::ibox0, [&]() {
-      interleaveComma(domains, [&](Attribute attr) {
-        auto itr = domainMap.find(cast<IntegerAttr>(attr).getUInt());
-        assert(itr != domainMap.end() && "Unable to find domain");
-        ps.addAsString(itr->second);
-      });
-      ps << "]";
+  auto domains = cast<ArrayAttr>(attr);
+  if (domains.empty())
+    return;
+  ps << " domains [";
+  ps.scopedBox(PP::ibox0, [&]() {
+    interleaveComma(domains, [&](Attribute attr) {
+      ps.addAsString(ports[cast<IntegerAttr>(attr).getUInt()].name.getValue());
     });
-  } else {
-    auto kind = cast<FlatSymbolRefAttr>(attr);
-    ps << " of " << PPExtString(kind.getValue());
-  }
+    ps << "]";
+  });
 }
 
 /// Emit a location as `@[<filename> <line>:<column>]` annotation, including a

@@ -30,6 +30,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/YAMLTraits.h"
 #include <variant>
 
@@ -1823,7 +1824,7 @@ void GrandCentralPass::runOnOperation() {
   SmallVector<Annotation> worklist;
   bool removalError = false;
   AnnotationSet::removeAnnotations(circuitOp, [&](Annotation anno) {
-    if (anno.isClass(augmentedBundleTypeClass)) {
+    if (anno.isClass(augmentedBundleTypeAnnoClass)) {
       // If we are in "Instantiate" companion mode, then we don't need to
       // create the interface, so we can skip adding it to the worklist.  This
       // is a janky hack for situations where you want to synthesize assertion
@@ -1835,7 +1836,7 @@ void GrandCentralPass::runOnOperation() {
       ++numAnnosRemoved;
       return true;
     }
-    if (anno.isClass(extractGrandCentralClass)) {
+    if (anno.isClass(extractGrandCentralAnnoClass)) {
       if (maybeExtractInfo) {
         emitCircuitError("more than one 'ExtractGrandCentralAnnotation' was "
                          "found, but exactly one must be provided");
@@ -1845,10 +1846,10 @@ void GrandCentralPass::runOnOperation() {
 
       auto directory = anno.getMember<StringAttr>("directory");
       auto filename = anno.getMember<StringAttr>("filename");
-      if (!directory || !filename) {
+      if (!directory) {
         emitCircuitError()
             << "contained an invalid 'ExtractGrandCentralAnnotation' that does "
-               "not contain 'directory' and 'filename' fields: "
+               "not contain 'directory' field: "
             << anno.getDict();
         removalError = true;
         return false;
@@ -1929,13 +1930,23 @@ void GrandCentralPass::runOnOperation() {
     llvm::dbgs() << "\n";
   });
 
+  bool changed = false;
+  if (noViews && !views.empty()) {
+    changed = true;
+    for (auto &view : views)
+      view.erase();
+    views.clear();
+  }
+
   // Exit immediately if no annotations indicative of interfaces that need to be
   // built exist.  However, still generate the YAML file if the annotation for
   // this was passed in because some flows expect this.
   if (worklist.empty() && views.empty()) {
     for (auto &[yamlPath, intfs] : interfaceYAMLMap)
       emitHierarchyYamlFile(yamlPath.getValue(), intfs);
-    return markAllAnalysesPreserved();
+    if (!changed)
+      markAllAnalysesPreserved();
+    return;
   }
 
   // Setup the builder to create ops _inside the FIRRTL circuit_.  This is
@@ -1971,7 +1982,7 @@ void GrandCentralPass::runOnOperation() {
     TypeSwitch<Operation *>(op)
         .Case<RegOp, RegResetOp, WireOp, NodeOp>([&](auto op) {
           AnnotationSet::removeAnnotations(op, [&](Annotation annotation) {
-            if (!annotation.isClass(augmentedGroundTypeClass))
+            if (!annotation.isClass(augmentedGroundTypeAnnoClass))
               return false;
             auto maybeID = getID(op, annotation);
             if (!maybeID)
@@ -1988,7 +1999,7 @@ void GrandCentralPass::runOnOperation() {
         .Case<InstanceOp>([&](auto op) {
           AnnotationSet::removePortAnnotations(op, [&](unsigned i,
                                                        Annotation annotation) {
-            if (!annotation.isClass(augmentedGroundTypeClass))
+            if (!annotation.isClass(augmentedGroundTypeAnnoClass))
               return false;
             op.emitOpError()
                 << "is marked as an interface element, but this should be "
@@ -1999,7 +2010,7 @@ void GrandCentralPass::runOnOperation() {
         })
         .Case<MemOp>([&](auto op) {
           AnnotationSet::removeAnnotations(op, [&](Annotation annotation) {
-            if (!annotation.isClass(augmentedGroundTypeClass))
+            if (!annotation.isClass(augmentedGroundTypeAnnoClass))
               return false;
             op.emitOpError()
                 << "is marked as an interface element, but this does not make "
@@ -2010,7 +2021,7 @@ void GrandCentralPass::runOnOperation() {
           });
           AnnotationSet::removePortAnnotations(
               op, [&](unsigned i, Annotation annotation) {
-                if (!annotation.isClass(augmentedGroundTypeClass))
+                if (!annotation.isClass(augmentedGroundTypeAnnoClass))
                   return false;
                 op.emitOpError()
                     << "has port '" << i
@@ -2025,7 +2036,7 @@ void GrandCentralPass::runOnOperation() {
           // Handle annotations on the ports.
           AnnotationSet::removePortAnnotations(op, [&](unsigned i,
                                                        Annotation annotation) {
-            if (!annotation.isClass(augmentedGroundTypeClass))
+            if (!annotation.isClass(augmentedGroundTypeAnnoClass))
               return false;
             auto maybeID = getID(op, annotation);
             if (!maybeID)
@@ -2122,12 +2133,23 @@ void GrandCentralPass::runOnOperation() {
                   if (companionMode == CompanionMode::Bind)
                     instance->setAttr("lowerToBind", builder.getUnitAttr());
 
-                  instance->setAttr(
-                      "output_file",
-                      hw::OutputFileAttr::getFromFilename(
-                          &getContext(),
-                          maybeExtractInfo->bindFilename.getValue(),
-                          /*excludeFromFileList=*/true));
+                  // Determine the bind file name; use
+                  // <directory>/<module>-bind.sv if not specified.
+                  SmallString<128> bindFilename;
+                  if (maybeExtractInfo->bindFilename) {
+                    bindFilename = maybeExtractInfo->bindFilename.getValue();
+                  } else {
+                    bindFilename = maybeExtractInfo->directory.getValue();
+                    llvm::sys::path::append(
+                        bindFilename,
+                        i->getParent()->getModule().getModuleName().str() +
+                            "-bind" + ".sv");
+                  }
+
+                  instance->setAttr("output_file",
+                                    hw::OutputFileAttr::getFromFilename(
+                                        &getContext(), bindFilename,
+                                        /*excludeFromFileList=*/true));
                 }
               }
 

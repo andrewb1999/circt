@@ -519,7 +519,7 @@ public:
   OperationAnalyzer(Location loc)
       : ctx(nullptr, LongestPathAnalysisOptions(false, true, false)), loc(loc) {
     mlir::OpBuilder builder(loc->getContext());
-    moduleOp = builder.create<mlir::ModuleOp>(loc);
+    moduleOp = mlir::ModuleOp::create(builder, loc);
     emptyName = StringAttr::get(loc->getContext(), "");
   }
 
@@ -730,7 +730,8 @@ private:
   std::unique_ptr<llvm::ImmutableListFactory<DebugPoint>> debugPointFactory;
 
   // A map from the value point to the longest paths.
-  DenseMap<std::pair<Value, size_t>, SmallVector<OpenPath>> cachedResults;
+  DenseMap<std::pair<Value, size_t>, std::unique_ptr<SmallVector<OpenPath>>>
+      cachedResults;
 
   // A map from the object to the longest paths.
   DenseMap<Object, SmallVector<OpenPath>> endPointResults;
@@ -775,7 +776,7 @@ ArrayRef<OpenPath> LocalVisitor::getCachedPaths(Value value,
   // If not found, then consider it to be a constant.
   if (it == cachedResults.end())
     return {};
-  return it->second;
+  return *it->second;
 }
 
 void LocalVisitor::putUnclosedResult(const Object &object, int64_t delay,
@@ -817,6 +818,10 @@ LogicalResult LocalVisitor::markRegEndPoint(Value endPoint, Value start,
 
   // Get paths for each bit, and record them.
   for (size_t i = 0, e = bitWidth; i < e; ++i) {
+    // Call getOrComputePaths to make sure the paths are computed for endPoint.
+    // This avoids a race condition.
+    if (failed(getOrComputePaths(endPoint, i)))
+      return failure();
     if (failed(record(i, start, i)))
       return failure();
   }
@@ -1104,6 +1109,10 @@ LogicalResult LocalVisitor::visit(mlir::BlockArgument arg, size_t bitPos,
 
 FailureOr<ArrayRef<OpenPath>> LocalVisitor::getOrComputePaths(Value value,
                                                               size_t bitPos) {
+  if (auto *op = value.getDefiningOp())
+    if (op->hasTrait<OpTrait::ConstantLike>())
+      return ArrayRef<OpenPath>{};
+
   if (ec.contains({value, bitPos})) {
     auto leader = ec.findLeader({value, bitPos});
     // If this is not the leader, then use the leader.
@@ -1114,19 +1123,19 @@ FailureOr<ArrayRef<OpenPath>> LocalVisitor::getOrComputePaths(Value value,
 
   auto it = cachedResults.find({value, bitPos});
   if (it != cachedResults.end())
-    return ArrayRef<OpenPath>(it->second);
+    return ArrayRef<OpenPath>(*it->second);
 
-  SmallVector<OpenPath> results;
-  if (failed(visitValue(value, bitPos, results)))
+  auto results = std::make_unique<SmallVector<OpenPath>>();
+  if (failed(visitValue(value, bitPos, *results)))
     return {};
 
   // Unique the results.
-  filterPaths(results, ctx->doKeepOnlyMaxDelayPaths(), ctx->isLocalScope());
+  filterPaths(*results, ctx->doKeepOnlyMaxDelayPaths(), ctx->isLocalScope());
   LLVM_DEBUG({
     llvm::dbgs() << value << "[" << bitPos << "] "
-                 << "Found " << results.size() << " paths\n";
+                 << "Found " << results->size() << " paths\n";
     llvm::dbgs() << "====Paths:\n";
-    for (auto &path : results) {
+    for (auto &path : *results) {
       path.print(llvm::dbgs());
       llvm::dbgs() << "\n";
     }
@@ -1136,7 +1145,7 @@ FailureOr<ArrayRef<OpenPath>> LocalVisitor::getOrComputePaths(Value value,
   auto insertedResult =
       cachedResults.try_emplace({value, bitPos}, std::move(results));
   assert(insertedResult.second);
-  return ArrayRef<OpenPath>(insertedResult.first->second);
+  return ArrayRef<OpenPath>(*insertedResult.first->second);
 }
 
 LogicalResult LocalVisitor::visitValue(Value value, size_t bitPos,
@@ -1150,30 +1159,33 @@ LogicalResult LocalVisitor::visitValue(Value value, size_t bitPos,
     return visit(blockArg, bitPos, results);
 
   auto *op = value.getDefiningOp();
+
+  if (op->hasTrait<OpTrait::ConstantLike>())
+    return success();
+
   auto result =
       TypeSwitch<Operation *, LogicalResult>(op)
           .Case<comb::ConcatOp, comb::ExtractOp, comb::ReplicateOp,
                 aig::AndInverterOp, mig::MajorityInverterOp, comb::AndOp,
                 comb::OrOp, comb::MuxOp, comb::XorOp, comb::TruthTableOp,
-                seq::FirRegOp, seq::CompRegOp, hw::ConstantOp,
-                seq::FirMemReadOp, seq::FirMemReadWriteOp, hw::WireOp>(
-              [&](auto op) {
-                size_t idx = results.size();
-                auto result = visit(op, bitPos, results);
-                if (ctx->doTraceDebugPoints())
-                  if (auto name = op->template getAttrOfType<StringAttr>(
-                          "sv.namehint")) {
+                seq::FirRegOp, seq::CompRegOp, seq::FirMemReadOp,
+                seq::FirMemReadWriteOp, hw::WireOp>([&](auto op) {
+            size_t idx = results.size();
+            auto result = visit(op, bitPos, results);
+            if (ctx->doTraceDebugPoints())
+              if (auto name =
+                      op->template getAttrOfType<StringAttr>("sv.namehint")) {
 
-                    for (auto i = idx, e = results.size(); i < e; ++i) {
-                      DebugPoint debugPoint({}, value, bitPos, results[i].delay,
-                                            "namehint");
-                      auto newHistory = debugPointFactory->add(
-                          debugPoint, results[i].history);
-                      results[i].history = newHistory;
-                    }
-                  }
-                return result;
-              })
+                for (auto i = idx, e = results.size(); i < e; ++i) {
+                  DebugPoint debugPoint({}, value, bitPos, results[i].delay,
+                                        "namehint");
+                  auto newHistory =
+                      debugPointFactory->add(debugPoint, results[i].history);
+                  results[i].history = newHistory;
+                }
+              }
+            return result;
+          })
           .Case<hw::InstanceOp>([&](hw::InstanceOp op) {
             return visit(op, bitPos, cast<OpResult>(value).getResultNumber(),
                          results);
@@ -1207,6 +1219,7 @@ LogicalResult LocalVisitor::initializeAndRun(hw::InstanceOp instance) {
         return failure();
 
       for (auto &result : *computedResults) {
+        // Update debug history for this path segment if tracing is enabled.
         auto newHistory = ctx->doTraceDebugPoints()
                               ? mapList(debugPointFactory.get(), history,
                                         [&](DebugPoint p) {
@@ -1217,15 +1230,22 @@ LogicalResult LocalVisitor::initializeAndRun(hw::InstanceOp instance) {
                                           return p;
                                         })
                               : debugPointFactory->getEmptyList();
+        Object newEndPoint(newPath, endPoint, endPointBitPos);
+        // Determine if this path continues upward or terminates here.
+        // If the start point is a module input port, the path
+        // continues to the parent module and needs further propagation.
         if (auto newPort = dyn_cast<BlockArgument>(result.startPoint.value)) {
+          // Record as "unclosed" - this path segment crosses module
+          // boundaries and needs to be combined with paths in the parent.
           putUnclosedResult(
-              {newPath, endPoint, endPointBitPos}, result.delay + delay,
-              newHistory,
+              newEndPoint, result.delay + delay, newHistory,
               fromInputPortToEndPoint[{newPort, result.startPoint.bitPos}]);
         } else {
-          endPointResults[{newPath, endPoint, endPointBitPos}].emplace_back(
-              newPath, result.startPoint.value, result.startPoint.bitPos,
-              result.delay + delay,
+          // This path originates from an internal sequential element
+          // in the parent module, so it's a complete register-to-register path
+          // that can be recorded as closed.
+          endPointResults[newEndPoint].emplace_back(
+              result.startPoint, result.delay + delay,
               ctx->doTraceDebugPoints() ? concatList(debugPointFactory.get(),
                                                      newHistory, result.history)
                                         : debugPointFactory->getEmptyList());
@@ -1294,7 +1314,7 @@ LogicalResult LocalVisitor::initializeAndRun() {
                                      op.getEnable());
             })
             .Case<aig::AndInverterOp, comb::AndOp, comb::OrOp, comb::XorOp,
-                  comb::MuxOp>([&](auto op) {
+                  comb::MuxOp, seq::FirMemReadOp>([&](auto op) {
               // NOTE: Visiting and-inverter is not necessary but
               // useful to reduce recursion depth.
               for (size_t i = 0, e = getBitWidth(op); i < e; ++i)
@@ -1398,7 +1418,7 @@ OperationAnalyzer::getOrComputeLocalVisitor(Operation *op) {
   // Generate unique module name.
   auto moduleName = builder.getStringAttr("module_" + Twine(cache.size()));
   hw::HWModuleOp hwModule =
-      builder.create<hw::HWModuleOp>(op->getLoc(), moduleName, ports);
+      hw::HWModuleOp::create(builder, op->getLoc(), moduleName, ports);
 
   // Clone the operation inside the wrapper module
   builder.setInsertionPointToStart(hwModule.getBodyBlock());
@@ -1416,8 +1436,8 @@ OperationAnalyzer::getOrComputeLocalVisitor(Operation *op) {
 
     // Insert bitcast if input port type differs from operand type
     if (input.getType() != cloned->getOperand(idx).getType())
-      input = builder.create<hw::BitcastOp>(
-          op->getLoc(), cloned->getOperand(idx).getType(), input);
+      input = hw::BitcastOp::create(builder, op->getLoc(),
+                                    cloned->getOperand(idx).getType(), input);
 
     cloned->setOperand(idx, input);
   }
@@ -1430,10 +1450,9 @@ OperationAnalyzer::getOrComputeLocalVisitor(Operation *op) {
 
     // Insert bitcast if result type differs from output port type
     if (result.getType() != resultsTypes[idx])
-      result =
-          builder
-              .create<hw::BitcastOp>(op->getLoc(), resultsTypes[idx], result)
-              ->getResult(0);
+      result = hw::BitcastOp::create(builder, op->getLoc(), resultsTypes[idx],
+                                     result)
+                   ->getResult(0);
 
     outputs.push_back(result);
   }
@@ -2038,17 +2057,24 @@ void LongestPathCollection::sortInDescendingOrder() {
   });
 }
 
-void LongestPathCollection::sortAndDropNonCriticalPathsPerEndPoint() {
-  sortInDescendingOrder();
-  // Deduplicate paths by end-point, keeping only the worst-case delay per
-  // end-point. This gives us the critical delay for each end-point in the
-  // design
-  llvm::DenseSet<DataflowPath::EndPointType> seen;
-  for (size_t i = 0; i < paths.size(); ++i) {
-    if (seen.insert(paths[i].getEndPoint()).second)
-      paths[seen.size() - 1] = std::move(paths[i]);
+void LongestPathCollection::dropNonCriticalPaths(bool perEndPoint) {
+  // Deduplicate paths by start/end-point, keeping only the worst-case delay.
+  if (perEndPoint) {
+    llvm::DenseSet<DataflowPath::EndPointType> seen;
+    for (size_t i = 0; i < paths.size(); ++i) {
+      if (seen.insert(paths[i].getEndPoint()).second)
+        paths[seen.size() - 1] = std::move(paths[i]);
+    }
+
+    paths.resize(seen.size());
+  } else {
+    llvm::DenseSet<Object> seen;
+    for (size_t i = 0; i < paths.size(); ++i) {
+      if (seen.insert(paths[i].getStartPoint()).second)
+        paths[seen.size() - 1] = std::move(paths[i]);
+    }
+    paths.resize(seen.size());
   }
-  paths.resize(seen.size());
 }
 
 void LongestPathCollection::merge(const LongestPathCollection &other) {

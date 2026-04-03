@@ -260,7 +260,7 @@ void ExtractInstancesPass::collectAnnos() {
   StringRef clkgateFileName;
   StringRef clkgateWrapperModule;
   AnnotationSet::removeAnnotations(circuit, [&](Annotation anno) {
-    if (!anno.isClass(extractClockGatesAnnoClass))
+    if (!anno.isClass(extractClockGatesFileAnnoClass))
       return false;
     LLVM_DEBUG(llvm::dbgs()
                << "Clock gate extraction config: " << anno.getDict() << "\n");
@@ -290,7 +290,7 @@ void ExtractInstancesPass::collectAnnos() {
   StringRef memoryFileName;
   StringRef memoryWrapperModule;
   AnnotationSet::removeAnnotations(circuit, [&](Annotation anno) {
-    if (!anno.isClass(extractSeqMemsAnnoClass))
+    if (!anno.isClass(extractSeqMemsFileAnnoClass))
       return false;
     LLVM_DEBUG(llvm::dbgs()
                << "Memory extraction config: " << anno.getDict() << "\n");
@@ -563,7 +563,7 @@ void ExtractInstancesPass::extractInstances() {
     for (unsigned portIdx = 0; portIdx < numInstPorts; ++portIdx) {
       // Assemble the new port name as "<prefix>_<name>", where the prefix is
       // provided by the extraction annotation.
-      auto name = inst.getPortNameStr(portIdx);
+      auto name = inst.getPortName(portIdx);
       auto nameAttr = StringAttr::get(
           &getContext(),
           prefix.empty() ? Twine(name) : Twine(prefix) + "_" + name);
@@ -623,8 +623,8 @@ void ExtractInstancesPass::extractInstances() {
       auto oldParentInst = cast<InstanceOp>(*instRecord->getInstance());
       auto newParent = oldParentInst->getParentOfType<FModuleLike>();
       LLVM_DEBUG(llvm::dbgs() << "- Updating " << oldParentInst << "\n");
-      auto newParentInst =
-          oldParentInst.cloneWithInsertedPortsAndReplaceUses(newPorts);
+      auto newParentInst = cast<InstanceOp>(
+          oldParentInst.cloneWithInsertedPortsAndReplaceUses(newPorts));
       if (newParentInst.getInnerSymAttr())
         innerRefToInstances[getInnerRefTo(newParentInst)] = newParentInst;
 
@@ -913,7 +913,7 @@ void ExtractInstancesPass::groupInstances() {
       StringRef prefix(instPrefixNamesPair[inst].first);
       unsigned portNum = inst.getNumResults();
       for (unsigned portIdx = 0; portIdx < portNum; ++portIdx) {
-        auto name = inst.getPortNameStr(portIdx);
+        auto name = inst.getPortName(portIdx);
         auto nameAttr = builder.getStringAttr(
             prefix.empty() ? Twine(name) : Twine(prefix) + "_" + name);
         PortInfo port{nameAttr,

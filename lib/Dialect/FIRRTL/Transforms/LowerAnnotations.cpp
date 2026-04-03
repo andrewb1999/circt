@@ -318,7 +318,7 @@ static LogicalResult applyBodyTypeLoweringAnno(const AnnoPathValue &target,
   auto loc = op->getLoc();
   auto error = [&]() {
     auto diag = mlir::emitError(loc);
-    diag << typeLoweringAnnoClass;
+    diag << bodyTypeLoweringAnnoClass;
     return diag;
   };
 
@@ -591,102 +591,16 @@ static AnnoRecord NoTargetAnnotation = {noResolve,
 
 static llvm::StringMap<AnnoRecord> annotationRecords{{
 
-    // Testing Annotation
+    // Testing Annotations (manually maintained for testing infrastructure)
     {"circt.test", {stdResolve, applyWithoutTarget<true>}},
     {"circt.testLocalOnly", {stdResolve, applyWithoutTarget<>}},
     {"circt.testNT", {noResolve, applyWithoutTarget<>}},
     {"circt.missing", {tryResolve, applyWithoutTarget<true>}},
-    // Grand Central Views/Interfaces Annotations
-    {extractGrandCentralClass, NoTargetAnnotation},
-    {grandCentralHierarchyFileAnnoClass, NoTargetAnnotation},
-    {serializedViewAnnoClass, {noResolve, applyGCTView}},
-    {viewAnnoClass, {noResolve, applyGCTView}},
-    {companionAnnoClass, {stdResolve, applyWithoutTarget<>}},
-    {augmentedGroundTypeClass, {stdResolve, applyWithoutTarget<true>}},
-    // Grand Central Data Tap Annotations
-    {dataTapsClass, {noResolve, applyGCTDataTaps}},
-    {dataTapsBlackboxClass, {stdResolve, applyWithoutTarget<true>}},
-    {referenceKeySourceClass, {stdResolve, applyWithoutTarget<true>}},
-    {referenceKeyPortClass, {stdResolve, applyWithoutTarget<true>}},
-    {internalKeySourceClass, {stdResolve, applyWithoutTarget<true>}},
-    {internalKeyPortClass, {stdResolve, applyWithoutTarget<true>}},
-    {deletedKeyClass, {stdResolve, applyWithoutTarget<true>}},
-    {literalKeyClass, {stdResolve, applyWithoutTarget<true>}},
-    // Grand Central Mem Tap Annotations
-    {memTapClass, {noResolve, applyGCTMemTaps}},
-    {memTapSourceClass, {stdResolve, applyWithoutTarget<true>}},
-    {memTapPortClass, {stdResolve, applyWithoutTarget<true>}},
-    {memTapBlackboxClass, {stdResolve, applyWithoutTarget<true>}},
-    // Miscellaneous Annotations
-    {conventionAnnoClass, {stdResolve, applyConventionAnno}},
-    {typeLoweringAnnoClass, {stdResolve, applyBodyTypeLoweringAnno}},
-    {dontTouchAnnoClass,
-     {stdResolve, applyWithoutTarget<true, true, WireOp, NodeOp, RegOp,
-                                     RegResetOp, InstanceOp, MemOp, CombMemOp,
-                                     MemoryPortOp, SeqMemOp>}},
-    {modulePrefixAnnoClass, {stdResolve, applyModulePrefixAnno}},
-    {dutAnnoClass, {stdResolve, applyDUTAnno}},
-    {extractSeqMemsAnnoClass, NoTargetAnnotation},
-    {injectDUTHierarchyAnnoClass, NoTargetAnnotation},
-    {convertMemToRegOfVecAnnoClass, NoTargetAnnotation},
-    {sitestBlackBoxAnnoClass, NoTargetAnnotation},
-    {sitestBlackBoxLibrariesAnnoClass,
-     {stdResolve, applyWithoutTarget<false, FExtModuleOp>}},
-    {enumComponentAnnoClass, {noResolve, drop}},
-    {enumDefAnnoClass, {noResolve, drop}},
-    {enumVecAnnoClass, {noResolve, drop}},
-    {forceNameAnnoClass,
-     {stdResolve, applyWithoutTarget<true, FModuleOp, FExtModuleOp>}},
-    {flattenAnnoClass, {stdResolve, applyWithoutTarget<false, FModuleOp>}},
-    {inlineAnnoClass, {stdResolve, applyWithoutTarget<false, FModuleOp>}},
-    {noDedupAnnoClass,
-     {stdResolve, applyWithoutTarget<false, FModuleOp, FExtModuleOp>}},
-    {dedupGroupAnnoClass,
-     {stdResolve, applyWithoutTarget<false, FModuleOp, FExtModuleOp>}},
-    {blackBoxInlineAnnoClass,
-     {stdResolve, applyWithoutTarget<false, FExtModuleOp>}},
-    {blackBoxPathAnnoClass,
-     {stdResolve, applyWithoutTarget<false, FExtModuleOp>}},
-    {dontObfuscateModuleAnnoClass,
-     {stdResolve, applyWithoutTarget<false, FModuleOp>}},
-    {verifBlackBoxAnnoClass,
-     {stdResolve, applyWithoutTarget<false, FExtModuleOp>}},
-    {elaborationArtefactsDirectoryAnnoClass, NoTargetAnnotation},
-    {retimeModulesFileAnnoClass, NoTargetAnnotation},
-    {retimeModuleAnnoClass,
-     {stdResolve, applyWithoutTarget<false, FModuleOp, FExtModuleOp>}},
-    {metadataDirectoryAttrName, NoTargetAnnotation},
-    {moduleHierAnnoClass, NoTargetAnnotation},
-    {outputDirAnnoClass, {stdResolve, applyOutputDirAnno}},
-    {sitestTestHarnessBlackBoxAnnoClass, NoTargetAnnotation},
-    {testBenchDirAnnoClass, NoTargetAnnotation},
-    {testHarnessHierAnnoClass, NoTargetAnnotation},
-    {testHarnessPathAnnoClass, NoTargetAnnotation},
-    {extractAssertAnnoClass, NoTargetAnnotation},
-    {extractAssumeAnnoClass, NoTargetAnnotation},
-    {extractCoverageAnnoClass, NoTargetAnnotation},
-    {runFIRRTLTransformAnnoClass, {noResolve, drop}},
-    {mustDedupAnnoClass, NoTargetAnnotation},
-    {addSeqMemPortAnnoClass, NoTargetAnnotation},
-    {addSeqMemPortsFileAnnoClass, NoTargetAnnotation},
-    {extractClockGatesAnnoClass, NoTargetAnnotation},
-    {extractBlackBoxAnnoClass, {stdResolve, applyWithoutTarget<false>}},
-    {fullResetAnnoClass, {stdResolve, applyWithoutTarget<false>}},
-    {excludeFromFullResetAnnoClass,
-     {stdResolve, applyWithoutTarget<true, FModuleOp>}},
-    {fullAsyncResetAnnoClass, {stdResolve, convertToFullResetAnnotation}},
-    {ignoreFullAsyncResetAnnoClass,
-     {stdResolve, convertToExcludeFromFullResetAnnotation}},
-    {decodeTableAnnotation, {noResolve, drop}},
-    {blackBoxTargetDirAnnoClass, NoTargetAnnotation},
-    {traceNameAnnoClass, {stdResolve, applyTraceName}},
-    {traceAnnoClass, {stdResolve, applyWithoutTarget<true>}},
-    {loadMemoryFromFileAnnoClass, {stdResolve, applyLoadMemoryAnno<false>}},
-    {loadMemoryFromFileInlineAnnoClass,
-     {stdResolve, applyLoadMemoryAnno<true>}},
-    {wiringSinkAnnoClass, {stdResolve, applyWiring}},
-    {wiringSourceAnnoClass, {stdResolve, applyWiring}},
-    {attributeAnnoClass, {stdResolve, applyAttributeAnnotation}}}};
+
+// Auto-generated annotation records from FIRRTLAnnotations.td
+#define GET_ANNOTATION_RECORD_LIST
+#include "circt/Dialect/FIRRTL/FIRRTLAnnotationRecords.h.inc"
+}};
 
 LogicalResult
 registerAnnotationRecord(StringRef annoClass, AnnoRecord annoRecord,
@@ -1080,14 +994,11 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
         auto inst = cast<InstanceOp>(*instNode);
         auto mod = inst.getReferencedModule<FModuleOp>(instanceGraph);
         if (mod.isPublic()) {
-          if (!allowAddingPortsOnPublic) {
-            auto diag = emitError(
-                mod.getLoc(), "cannot wire port through this public module");
-            diag.attachNote(source.getLoc()) << "source here";
-            diag.attachNote(sink.getLoc()) << "sink here";
-            return diag;
-          }
-          ++numPublicPortsWired;
+          auto diag = emitError(mod.getLoc(),
+                                "cannot wire port through this public module");
+          diag.attachNote(source.getLoc()) << "source here";
+          diag.attachNote(sink.getLoc()) << "sink here";
+          return diag;
         }
         if (name.empty()) {
           if (problem.newNameHint.empty())
@@ -1187,7 +1098,7 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
       // this is a U-turn.
       for (auto [newPortIdx, problemIdx] : llvm::enumerate(problemIndices)) {
         auto &modifications = moduleModifications[enclosingModule];
-        auto newPort = clonedInst.getResult(newPortIdx + originalNumPorts);
+        auto newPort = clonedInst->getResult(newPortIdx + originalNumPorts);
         if (modifications.connectionMap.count(problemIdx)) {
           modifications.uturns.push_back({problemIdx, newPort});
           continue;

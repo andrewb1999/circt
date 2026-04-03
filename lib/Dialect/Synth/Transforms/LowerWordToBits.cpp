@@ -43,8 +43,8 @@ using namespace synth;
 
 /// Check if an operation should be lowered to bit-level operations.
 static bool shouldLowerOperation(Operation *op) {
-  return isa<aig::AndInverterOp, mig::MajorityInverterOp, comb::AndOp,
-             comb::OrOp, comb::XorOp>(op);
+  return isa<ChoiceOp, aig::AndInverterOp, mig::MajorityInverterOp, comb::AndOp,
+             comb::OrOp, comb::XorOp, comb::MuxOp>(op);
 }
 
 namespace {
@@ -87,7 +87,8 @@ private:
   template <typename OpTy>
   ArrayRef<Value> lowerInvertibleOperations(OpTy op);
   template <typename OpTy>
-  ArrayRef<Value> lowerCombOperations(OpTy op);
+  ArrayRef<Value> lowerCombLogicOperations(OpTy op);
+  ArrayRef<Value> lowerCombMux(comb::MuxOp op);
   ArrayRef<Value>
   lowerOp(Operation *op,
           llvm::function_ref<Value(OpBuilder &builder, ValueRange)> createOp);
@@ -183,6 +184,13 @@ const llvm::KnownBits &BitBlaster::computeKnownBits(Value value) {
                (operandsKnownBits[0] & operandsKnownBits[2]) |
                (operandsKnownBits[1] & operandsKnownBits[2]);
     }
+  } else if (auto choice = dyn_cast<ChoiceOp>(op)) {
+    result = computeKnownBits(choice.getInputs().front());
+    for (auto input : choice.getInputs().drop_front()) {
+      auto known = computeKnownBits(input);
+      result.One |= known.One;
+      result.Zero |= known.Zero;
+    }
   } else {
     // For other operations, use the standard known bits computation
     // TODO: This is not optimal as it has a depth limit and does not check
@@ -249,10 +257,18 @@ ArrayRef<Value> BitBlaster::lowerValueToBits(Value value) {
   }
 
   return TypeSwitch<Operation *, ArrayRef<Value>>(op)
+      .Case<ChoiceOp>([&](ChoiceOp op) {
+        auto createOp = [&](OpBuilder &builder, ValueRange operands) {
+          return builder.createOrFold<ChoiceOp>(
+              op.getLoc(), operands[0].getType(), operands);
+        };
+        return lowerOp(op, createOp);
+      })
       .Case<aig::AndInverterOp, mig::MajorityInverterOp>(
           [&](auto op) { return lowerInvertibleOperations(op); })
       .Case<comb::AndOp, comb::OrOp, comb::XorOp>(
-          [&](auto op) { return lowerCombOperations(op); })
+          [&](auto op) { return lowerCombLogicOperations(op); })
+      .Case<comb::MuxOp>([&](comb::MuxOp op) { return lowerCombMux(op); })
       .Default([&](auto op) {
         OpBuilder builder(value.getContext());
         builder.setInsertionPoint(op);
@@ -304,7 +320,7 @@ LogicalResult BitBlaster::run() {
     if (shouldLowerOperation(op)) {
       OpBuilder builder(op);
       std::reverse(results.begin(), results.end());
-      auto concat = builder.create<comb::ConcatOp>(value.getLoc(), results);
+      auto concat = comb::ConcatOp::create(builder, value.getLoc(), results);
       value.replaceAllUsesWith(concat);
       op->erase();
     }
@@ -316,8 +332,8 @@ LogicalResult BitBlaster::run() {
 Value BitBlaster::getBoolConstant(bool value) {
   if (!constants[value]) {
     auto builder = OpBuilder::atBlockBegin(moduleOp.getBodyBlock());
-    constants[value] = builder.create<hw::ConstantOp>(
-        builder.getUnknownLoc(), builder.getI1Type(), value);
+    constants[value] = hw::ConstantOp::create(builder, builder.getUnknownLoc(),
+                                              builder.getI1Type(), value);
   }
   return constants[value];
 }
@@ -331,10 +347,19 @@ ArrayRef<Value> BitBlaster::lowerInvertibleOperations(OpTy op) {
 }
 
 template <typename OpTy>
-ArrayRef<Value> BitBlaster::lowerCombOperations(OpTy op) {
+ArrayRef<Value> BitBlaster::lowerCombLogicOperations(OpTy op) {
   auto createOp = [&](OpBuilder &builder, ValueRange operands) {
     return builder.createOrFold<OpTy>(op.getLoc(), operands,
                                       op.getTwoStateAttr());
+  };
+  return lowerOp(op, createOp);
+}
+
+ArrayRef<Value> BitBlaster::lowerCombMux(comb::MuxOp op) {
+  auto createOp = [&](OpBuilder &builder, ValueRange operands) {
+    return builder.createOrFold<comb::MuxOp>(op.getLoc(), operands[0],
+                                             operands[1], operands[2],
+                                             op.getTwoStateAttr());
   };
   return lowerOp(op, createOp);
 }

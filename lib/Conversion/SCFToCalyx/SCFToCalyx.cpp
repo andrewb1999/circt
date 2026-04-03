@@ -195,7 +195,7 @@ public:
   void setResultRegs(scf::IfOp op, calyx::RegisterOp reg, unsigned idx) {
     assert(resultRegs[op.getOperation()].count(idx) == 0 &&
            "A register was already registered for the given yield result.\n");
-    assert(idx < op->getNumOperands());
+    assert(idx < op->getNumResults());
     resultRegs[op.getOperation()][idx] = reg;
   }
 
@@ -662,7 +662,7 @@ private:
     hw::ConstantOp c1 = createConstant(loc, rewriter, getComponent(), 1, 1);
     calyx::AssignOp::create(
         rewriter, loc, opPipe.getGo(), c1,
-        comb::createOrFoldNot(group.getLoc(), opPipe.getDone(), builder));
+        comb::createOrFoldNot(builder, group.getLoc(), opPipe.getDone()));
     // The group is done when the register write is complete.
     calyx::GroupDoneOp::create(rewriter, loc, reg.getDone());
 
@@ -742,7 +742,7 @@ private:
 
     calyx::AssignOp::create(
         rewriter, loc, calyxOp.getGo(), c1,
-        comb::createOrFoldNot(loc, calyxOp.getDone(), builder));
+        comb::createOrFoldNot(builder, loc, calyxOp.getDone()));
     calyx::GroupDoneOp::create(rewriter, loc, reg.getDone());
 
     return success();
@@ -1272,7 +1272,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   // Set the go and done signal
   calyx::AssignOp::create(
       rewriter, loc, calyxCmpFOp.getGo(), c1,
-      comb::createOrFoldNot(loc, calyxCmpFOp.getDone(), builder));
+      comb::createOrFoldNot(builder, loc, calyxCmpFOp.getDone()));
   calyx::GroupDoneOp::create(rewriter, loc, reg.getDone());
 
   cmpf.getResult().replaceAllUsesWith(reg.getOut());
@@ -1467,10 +1467,10 @@ static LogicalResult buildAllocOp(ComponentLoweringState &componentState,
     result.push_back(std::move(value));
   }
 
-  componentState.setDataField(memoryOp.getName(), result);
+  componentState.setDataField(memoryOp.instanceName(), result);
   std::string numType =
       memtype.getElementType().isInteger() ? "bitnum" : "ieee754_float";
-  componentState.setFormat(memoryOp.getName(), numType, isSigned,
+  componentState.setFormat(memoryOp.instanceName(), numType, isSigned,
                            elmTyBitWidth);
 
   return success();

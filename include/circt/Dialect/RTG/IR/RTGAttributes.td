@@ -51,6 +51,93 @@ def AnyContextAttr : RTGAttrDef<"AnyContext", [
   let assemblyFormat = "";
 }
 
+// The accessor type is a pointer instead of a reference because references
+// cannot be reassigned (in the attribute 'construct' function).
+class DenseSetParameter<string setOf, string desc = "">
+    : AttrOrTypeParameter<"const ::llvm::DenseSet<" # setOf # "> *", desc> {
+  let allocator = [{
+    $_dst = new ($_allocator.allocate<DenseSet<}] # setOf # [{>>())
+      DenseSet<}] # setOf # [{>($_self->begin(), $_self->end());
+  }];
+  let cppStorageType = "::llvm::DenseSet<" # setOf # ">";
+}
+
+def SetAttr : RTGAttrDef<"Set", [
+  DeclareAttrInterfaceMethods<TypedAttrInterface>,
+]> {
+  let summary = "an unordered set of elements";
+
+  let parameters = (ins
+      AttributeSelfTypeParameter<"", "rtg::SetType">:$type,
+      DenseSetParameter<"TypedAttr", "elements">:$elements);
+
+  let builders = [
+    AttrBuilderWithInferredContext<
+      (ins "rtg::SetType":$type,
+           "const ::llvm::DenseSet<::mlir::TypedAttr> *":$elements), [{
+      return $_get(type.getContext(), type, elements);
+    }]>
+  ];
+
+  let mnemonic = "set";
+  let hasCustomAssemblyFormat = true;
+
+  let genVerifyDecl = true;
+}
+
+// The accessor type is a pointer instead of a reference because references
+// cannot be reassigned (in the attribute 'construct' function).
+class DenseMapParameter<string keyOf, string valueOf, string desc = "">
+    : AttrOrTypeParameter<
+        "const ::llvm::DenseMap<" # keyOf # ", " # valueOf # "> *", desc> {
+  let allocator =
+    "$_dst = new ($_allocator.allocate<DenseMap<" # keyOf # ", " # valueOf #
+    ">>()) DenseMap<" # keyOf # ", " # valueOf #
+    ">($_self->begin(), $_self->end());";
+  let cppStorageType = "::llvm::DenseMap<" # keyOf # ", " # valueOf # ">";
+}
+
+def MapAttr : RTGAttrDef<"Map", [
+  DeclareAttrInterfaceMethods<TypedAttrInterface>,
+]> {
+  let summary = "a map from keys to values";
+
+  let parameters = (ins
+      AttributeSelfTypeParameter<"", "rtg::MapType">:$type,
+      DenseMapParameter<"TypedAttr", "TypedAttr", "map entries">:$entries);
+
+  let builders = [
+    AttrBuilderWithInferredContext<
+      (ins "rtg::MapType":$type,
+           "const ::llvm::DenseMap<::mlir::TypedAttr, " #
+           "::mlir::TypedAttr> *":$entries), [{
+      return $_get(type.getContext(), type, entries);
+    }]>,
+    AttrBuilderWithInferredContext<
+      (ins "rtg::MapType":$type), [{
+      ::llvm::DenseMap<::mlir::TypedAttr, ::mlir::TypedAttr> entries;
+      return $_get(type.getContext(), type, &entries);
+    }]>
+  ];
+
+  let mnemonic = "map";
+  let hasCustomAssemblyFormat = true;
+
+  let genVerifyDecl = true;
+}
+
+def TupleAttr : RTGAttrDef<"Tuple", [
+  DeclareAttrInterfaceMethods<TypedAttrInterface>,
+]> {
+  let summary = "a tuple";
+
+  let parameters =
+      (ins ArrayRefParameter<"::mlir::TypedAttr", "elements">:$elements);
+
+  let mnemonic = "tuple";
+  let assemblyFormat = "`<` $elements `>`";
+}
+
 //===----------------------------------------------------------------------===//
 // Attributes for ISA targets
 //===----------------------------------------------------------------------===//
@@ -85,6 +172,16 @@ def VirtualRegisterConfigAttr : RTGISAAttrDef<"VirtualRegisterConfig", [
   let assemblyFormat = "`[` $allowedRegs `]`";
 
   let genVerifyDecl = true;
+}
+
+def LabelAttr : RTGISAAttrDef<"Label", [
+  DeclareAttrInterfaceMethods<TypedAttrInterface>,
+]> {
+  let summary = "an assembly label";
+
+  let parameters = (ins StringRefParameter<"">:$name);
+
+  let assemblyFormat = "`<` $name `>`";
 }
 
 #endif // CIRCT_DIALECT_RTG_IR_RTGATTRIBUTES_TD

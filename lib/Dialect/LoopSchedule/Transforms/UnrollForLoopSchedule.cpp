@@ -6,8 +6,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
+#include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h"
 #include "circt/Analysis/DependenceAnalysis.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
@@ -25,6 +27,13 @@
 #include <cstdint>
 #include <limits>
 
+namespace circt {
+namespace loopschedule {
+#define GEN_PASS_DEF_UNROLLFORLOOPSCHEDULE
+#include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h.inc"
+} // namespace loopschedule
+} // namespace circt
+
 using namespace mlir;
 using namespace mlir::affine;
 using namespace circt::analysis;
@@ -32,7 +41,7 @@ using namespace circt::loopschedule;
 
 namespace {
 struct UnrollForLoopSchedule
-    : public UnrollForLoopScheduleBase<UnrollForLoopSchedule> {
+    : public circt::loopschedule::impl::UnrollForLoopScheduleBase<UnrollForLoopSchedule> {
   using UnrollForLoopScheduleBase<
       UnrollForLoopSchedule>::UnrollForLoopScheduleBase;
   void runOnOperation() override;

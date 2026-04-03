@@ -23,6 +23,7 @@ set(LLVM_OPTIONAL_SOURCES
   RTGTest.cpp
   SV.cpp
   Seq.cpp
+  Sim.cpp
   Synth.cpp
   Verif.cpp
 )
@@ -202,6 +203,9 @@ add_circt_public_c_api_library(CIRCTCAPIFSM
   CIRCTFSM
   CIRCTFSMTransforms
   CIRCTFSMToSV
+  CIRCTFSMToSMT
+  CIRCTCoreToFSM
+  CIRCTFSMToCore
 )
 
 add_circt_public_c_api_library(CIRCTCAPIHandshake
@@ -258,4 +262,12 @@ add_circt_public_c_api_library(CIRCTCAPISynth
   CIRCTSynthAnalysis
   CIRCTSynthTransforms
   CIRCTCAPISupport
+)
+
+add_circt_public_c_api_library(CIRCTCAPISim
+  Sim.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRCAPIIR
+  CIRCTSim
 )

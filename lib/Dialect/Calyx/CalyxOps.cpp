@@ -2334,7 +2334,7 @@ SmallVector<DictionaryAttr> SeqMemoryOp::portAttributes() {
   NamedAttrList done, clk, reset, contentEn;
   done.append(donePort, isSet);
   clk.append(clkPort, isSet);
-  clk.append(resetPort, isSet);
+  reset.append(resetPort, isSet);
   contentEn.append(goPort, isTwo);
   portAttributes.append({clk.getDictionary(context),       // Clk
                          reset.getDictionary(context),     // Reset

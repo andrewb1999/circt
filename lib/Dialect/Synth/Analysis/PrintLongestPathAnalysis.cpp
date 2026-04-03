@@ -94,7 +94,8 @@ LogicalResult PrintLongestPathAnalysisPass::printAnalysisResult(
   }
 
   size_t oldPathCount = collection.paths.size();
-  collection.sortAndDropNonCriticalPathsPerEndPoint();
+  collection.sortInDescendingOrder();
+  collection.dropNonCriticalPaths(/*perEndPoint=*/true);
   auto &longestPathForEachEndPoint = collection.paths;
 
   // Print analysis header
@@ -119,7 +120,7 @@ LogicalResult PrintLongestPathAnalysisPass::printAnalysisResult(
     jsonOS->attribute("module_name", top.getModuleNameAttr().getValue());
   }
 
-  auto deferClose = llvm::make_scope_exit([&]() {
+  llvm::scope_exit deferClose([&]() {
     if (jsonOS)
       jsonOS->objectEnd();
   });
@@ -150,7 +151,7 @@ void PrintLongestPathAnalysisPass::printTimingLevelStatistics(
     jsonOS->attributeBegin("timing_levels");
     jsonOS->arrayBegin();
   }
-  auto closeJson = llvm::make_scope_exit([&]() {
+  llvm::scope_exit closeJson([&]() {
     if (jsonOS) {
       jsonOS->arrayEnd();
       jsonOS->attributeEnd();
@@ -210,7 +211,7 @@ void PrintLongestPathAnalysisPass::printTopKPathDetails(
     jsonOS->attributeBegin("top_paths");
     jsonOS->arrayBegin();
   }
-  auto closeJson = llvm::make_scope_exit([&]() {
+  llvm::scope_exit closeJson([&]() {
     if (jsonOS) {
       jsonOS->arrayEnd();
       jsonOS->attributeEnd();
@@ -302,7 +303,7 @@ void PrintLongestPathAnalysisPass::runOnOperation() {
     jsonOS->arrayBegin();
   }
 
-  auto closeJson = llvm::make_scope_exit([&]() {
+  llvm::scope_exit closeJson([&]() {
     if (jsonOS)
       jsonOS->arrayEnd();
   });

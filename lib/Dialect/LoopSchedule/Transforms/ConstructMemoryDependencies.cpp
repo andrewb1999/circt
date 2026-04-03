@@ -10,8 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
-
 #include "circt/Analysis/NameAnalysis.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleAttributes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
@@ -34,6 +32,13 @@
 #include "llvm/Support/Casting.h"
 #include <set>
 
+namespace circt {
+namespace loopschedule {
+#define GEN_PASS_DEF_CONSTRUCTMEMORYDEPENDENCIES
+#include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h.inc"
+} // namespace loopschedule
+} // namespace circt
+
 using namespace circt;
 using namespace loopschedule;
 using namespace mlir;
@@ -45,7 +50,7 @@ using namespace mlir::affine;
 
 namespace {
 struct ConstructMemoryDependenciesPass
-    : public ConstructMemoryDependenciesBase<ConstructMemoryDependenciesPass> {
+    : public circt::loopschedule::impl::ConstructMemoryDependenciesBase<ConstructMemoryDependenciesPass> {
   void runOnOperation() override;
 };
 } // end anonymous namespace

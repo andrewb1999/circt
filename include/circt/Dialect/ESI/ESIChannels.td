@@ -18,6 +18,7 @@ include "mlir/IR/EnumAttr.td"
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 
+include "circt/Dialect/HW/HWTypeInterfaces.td"
 include "circt/Dialect/HW/HWTypes.td"
 include "circt/Dialect/Seq/SeqTypes.td"
 
@@ -34,15 +35,22 @@ def ChannelSignalingValidReady : I32EnumAttrCase<"ValidReady", 0>;
 // FIFO interface with a read latency of zero. Very similiar to valid-ready, but
 // cannot assert ready if data is not available.
 def ChannelSignalingFIFO      : I32EnumAttrCase<"FIFO",      1>;
+// Valid-only signaling. Like ValidReady but without the ready backpressure
+// signal. Fire-and-forget: the sender asserts valid and the receiver must
+// accept the data.
+def ChannelSignalingValidOnly : I32EnumAttrCase<"ValidOnly",  2>;
 
 def ChannelSignaling : I32EnumAttr<
     "ChannelSignaling",
     "ESI channel wire signaling standard",
-    [ChannelSignalingValidReady, ChannelSignalingFIFO]>{
+    [ChannelSignalingValidReady, ChannelSignalingFIFO,
+     ChannelSignalingValidOnly]>{
   let cppNamespace = "::circt::esi";
 }
 
-def ChannelTypeImpl : ESI_Type<"Channel"> {
+def ChannelTypeImpl : ESI_Type<"Channel", [
+  DeclareTypeInterfaceMethods<BitWidthTypeInterface>
+]> {
   let summary = "An ESI-compatible channel port";
   let description = [{
     An ESI port kind which models a latency-insensitive, unidirectional,
@@ -178,7 +186,7 @@ def WrapValidReadyOp : ESI_Op<"wrap.vr", [
   let arguments = (ins AnyType:$rawInput, I1:$valid);
   let results = (outs ChannelType:$chanOutput, I1:$ready);
   let hasCustomAssemblyFormat = 1;
-  let hasFolder = 1;
+  let hasCanonicalizeMethod = 1;
   let hasVerifier = 1;
 
   let builders = [
@@ -214,7 +222,6 @@ def WrapFIFOOp : ESI_Op<"wrap.fifo", [
   let arguments = (ins AnyType:$data, I1:$empty);
   let results = (outs ChannelType:$chanOutput, I1:$rden);
   let hasCanonicalizeMethod = true;
-  let hasFolder = true;
   let hasVerifier = 1;
 
   let assemblyFormat = [{
@@ -240,6 +247,51 @@ def UnwrapFIFOOp : ESI_Op<"unwrap.fifo", [
 
   let extraClassDeclaration = [{
     static LogicalResult mergeAndErase(UnwrapFIFOOp, WrapFIFOOp, PatternRewriter&);
+  }];
+}
+
+def WrapValidOnlyOp : ESI_Op<"wrap.vo", [
+    DeclareOpInterfaceMethods<InferTypeOpInterface>,
+    DeclareOpInterfaceMethods<ChannelOpInterface>
+  ]> {
+  let summary = "Wrap a value into an ESI port with valid-only signaling";
+  let description = [{
+    Wrap data with a valid bit into a ValidOnly ESI channel. Unlike
+    ValidReady, there is no ready backpressure signal. The sender fires
+    data whenever valid is asserted; the receiver must accept it.
+  }];
+
+  let arguments = (ins AnyType:$rawInput, I1:$valid);
+  let results = (outs ChannelType:$chanOutput);
+  let hasCanonicalizeMethod = 1;
+
+  let assemblyFormat = [{
+    $rawInput `,` $valid attr-dict `:` type($rawInput)
+  }];
+}
+
+def UnwrapValidOnlyOp : ESI_Op<"unwrap.vo", [
+    DeclareOpInterfaceMethods<InferTypeOpInterface>,
+    DeclareOpInterfaceMethods<ChannelOpInterface>
+  ]> {
+  let summary = "Unwrap a value from a valid-only ESI port";
+  let description = [{
+    Unwrap a ValidOnly channel into data and valid signals. There is no
+    ready input since ValidOnly has no backpressure.
+  }];
+
+  let arguments = (ins ChannelType:$chanInput);
+  let results = (outs AnyType:$rawOutput, I1:$valid);
+  let hasCanonicalizeMethod = true;
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    $chanInput attr-dict `:` qualified(type($chanInput))
+  }];
+
+  let extraClassDeclaration = [{
+    static LogicalResult mergeAndErase(UnwrapValidOnlyOp, WrapValidOnlyOp,
+                                       PatternRewriter&);
   }];
 }
 
@@ -307,7 +359,9 @@ def ChannelDirection : I32EnumAttr<"ChannelDirection",
 }
 
 
-def ChannelBundleType : ESI_Type<"ChannelBundle"> {
+def ChannelBundleType : ESI_Type<"ChannelBundle", [
+  DeclareTypeInterfaceMethods<BitWidthTypeInterface>
+]> {
   let summary = "a bundle of channels";
 
   let description = [{
@@ -397,11 +451,13 @@ def UnpackBundleOp : ESI_Op<"bundle.unpack", [
 // Data windows
 //===----------------------------------------------------------------------===//
 
-def ESIWindowType : ESI_Type<"Window"> {
+def ESIWindowType : ESI_Type<"Window", [
+  DeclareTypeInterfaceMethods<BitWidthTypeInterface>
+]> {
   let summary = "a data window";
   let description = [{
     A 'data window' allows designers to break up large messages into multiple
-    frames (aka phits) spread across multiple cycles. Windows are specified in
+    frames (aka flits) spread across multiple cycles. Windows are specified in
     terms of a mapping of struct fields to frames. The width of a window is the
     maximum frame size + the union tag (log2(#frames)).
 
@@ -413,7 +469,20 @@ def ESIWindowType : ESI_Type<"Window"> {
     - Array fields whose array length is not evenly divisible by 'numItems' will
     have an implicit frame inserted directly after containing the leftover array
     items.
-    - Array fields with an array length MUST be in their own frame.
+    - A frame which contains an array with a 'numItems' specification CANNOT
+    contain another array with 'numItems' specified or a list field.
+    - Likewise, a frame which contains a list field CANNOT contain another list
+    field or an array with 'numItems' specified.
+
+    When either a list or an array with 'numItems' is specified in a frame, all
+    the other fields in the frame are assumed to be constant over the length of
+    the list/array transmission. This allows for efficient hardware
+    implementations where the constant fields can be held in registers while the
+    list/array segments stream through. In general, when a struct field appears
+    in multiple frames, it must be constant throughout the message transmission.
+
+    Typically lowered to a union of structs. There is a special case of one
+    frame with no name. In this case, it is lowered to just the struct itself.
   }];
 
   let mnemonic = "window";
@@ -425,7 +494,7 @@ def ESIWindowType : ESI_Type<"Window"> {
 
   let extraClassDeclaration = [{
     /// Get the union which realizes this window during lowering.
-    circt::hw::UnionType getLoweredType() const;
+    Type getLoweredType() const;
   }];
 }
 
@@ -448,25 +517,53 @@ def WindowFieldType : ESI_Type<"WindowField"> {
   let summary = "a field-in-frame specifier";
   let description = [{
     Specify that a field should appear within the enclosing frame.
+    
+    'numItems' indicates how many items of the field should appear in the frame.
+    Only applicable to array or list fields. If not specified:
+    - For arrays, the entire array will appear in the frame.
+    - For lists, it is assumed to be 1.
+
+    For lists, there are two possible encodings:
+      - Parallel (default): a 'last' field to the struct to indicate that the
+      end of the list is this frame.  If 'numItems' is specified for a list, a
+      '<fieldName>_size' (representing the number of valid items in the array)
+      field will be added to the struct.  When `<fieldName>_size` is less than
+      'numItems', `last` MUST be true meaning that all frames must be full
+      except for the last one. This format matches typical on-chip hardware
+      streaming interfaces but is terribly inefficient for serial links.
+      - Serial (bulk transfer): in this encoding, there must be a 'header' frame
+      immediately preceding the frame which contains the list field. That frame
+      must include a special 'count' field which indicates how many items of the
+      list will be transmitted next. Once the number of items are transmitted
+      (transmitted frames == ceil(count/numItems)), the header is re-transmitted
+      to set up the next bulk transfer _for the same list_. If the transfer was
+      the last transfer, the header should set the count to zero. This method
+      allows for efficient transfers over serial links (no 'last' or '_size'
+      fields) without requiring knowledge of the total list size up front.
   }];
   let mnemonic = "window.field";
 
   let parameters = (ins
       "StringAttr":$fieldName,
-      OptionalParameter<"uint64_t", "# of items in arrays or lists">:$numItems);
+      OptionalParameter<"uint64_t", "# of items in arrays or lists">:$numItems,
+      OptionalParameter<"uint64_t", "bitwidth of the 'count' field in bulk mode">:$bulkCountWidth
+  );
 
   let assemblyFormat = [{
-    `<` $fieldName (`,` $numItems^)? `>`
+    `<` $fieldName (`,` $numItems^)? ( `countWidth` $bulkCountWidth^ )? `>`
   }];
+
+  let genVerifyDecl = 1;
 }
 
 def WrapWindow : ESI_Physical_Op<"window.wrap", [Pure]> {
   let summary = "wrap a union into a data window";
 
-  let arguments = (ins UnionType:$frame);
+  let arguments = (ins AnyType:$frame);
   let results = (outs ESIWindowType:$window);
   let hasVerifier = 1;
   let hasFolder = 1;
+  let hasCanonicalizeMethod = 1;
 
   let assemblyFormat = [{
      $frame attr-dict `:` custom<InferWindowRet>(type($frame), type($window))
@@ -480,7 +577,7 @@ def UnwrapWindow : ESI_Physical_Op<"window.unwrap", [
   let summary = "unwrap a data window into a union";
 
   let arguments = (ins ESIWindowType:$window);
-  let results = (outs UnionType:$frame);
+  let results = (outs AnyType:$frame);
   let hasFolder = 1;
 
   let assemblyFormat = [{
