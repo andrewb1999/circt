@@ -8,14 +8,12 @@ module {
     %c1 = arith.constant 1 : i32
     loopschedule.step {
       loopschedule.sequential trip_count = 10 iter_args(%i = %c0) : (i32) -> () {
-        %cond = arith.cmpi slt, %i, %c10 : i32
-        loopschedule.register %cond : i1
-      } do {
-        %0 = loopschedule.step {
+        %0:2 = loopschedule.step {
+          %cond = arith.cmpi slt, %i, %c10 : i32
           %next = arith.addi %i, %c1 : i32
-          loopschedule.register %next : i32
-        } : i32
-        loopschedule.terminator iter_args(%0), results() : (i32) -> ()
+          loopschedule.register %next, %cond : i32, i1
+        } : i32, i1
+        loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (i32) -> ()
       }
     }
     return

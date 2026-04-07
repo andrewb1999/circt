@@ -653,26 +653,11 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
   auto pipeline = builder.create<LoopSchedulePipelineOp>(
       resultTypes, ii, tripCountAttr, iterArgs);
 
-  // Create the condition
-  Block &condBlock = pipeline.getCondBlock();
+  // Stash a reference to the scf.before body and its terminator. We will
+  // clone the combinational condition ops into the first pipeline stage and
+  // register the resulting i1 as an extra result of that stage. The
+  // loopschedule.terminator's `condition` operand will be that stage result.
   auto scfCond = cast<scf::ConditionOp>(loop.getBeforeBody()->getTerminator());
-  builder.setInsertionPointToStart(&condBlock);
-
-  IRMapping mapper;
-
-  for (size_t i = 0; i < iterArgs.size(); ++i) {
-    auto oldArg = loop.getBeforeArguments()[i];
-    auto newArg = condBlock.getArgument(i);
-    mapper.map(oldArg, newArg);
-  }
-
-  for (auto &op : loop.getBeforeBody()->getOperations()) {
-    if (!op.hasTrait<OpTrait::IsTerminator>()) {
-      builder.clone(op, mapper);
-    }
-  }
-  condBlock.getTerminator()->insertOperands(
-      0, mapper.lookup(scfCond.getCondition()));
 
   // Add the non-yield and non-if operations to their start time groups.
   DenseMap<unsigned, SmallVector<Operation *>> startGroups;
@@ -688,9 +673,15 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
   IRMapping valueMap;
   // Nested loops are not supported yet.
   assert(iterArgs.size() == loop.getAfterBody()->getNumArguments());
-  for (size_t i = 0; i < iterArgs.size(); ++i)
+  for (size_t i = 0; i < iterArgs.size(); ++i) {
     valueMap.map(loop.getAfterBody()->getArgument(i),
                  pipeline.getStagesBlock().getArgument(i));
+    // The before-body's combinational ops (which compute the loop condition)
+    // will be cloned into the first stage and likewise reference the
+    // pipeline's iter_args via the stages block arguments.
+    valueMap.map(loop.getBeforeArguments()[i],
+                 pipeline.getStagesBlock().getArgument(i));
+  }
 
   // Create the stages.
   Block &stagesBlock = pipeline.getStagesBlock();
@@ -878,14 +869,22 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
   for (size_t i = 0; i < iterArgs.size(); ++i) {
     iterArgNeedsForwarding.push_back(false);
   }
+  // The first stage in `startTimes` order will host the loop condition's
+  // combinational ops; track the resulting stage result so the
+  // loopschedule.terminator can reference it.
+  Value pipelineCondResult;
+
   // Create stages along with maps
   for (auto i : enumerate(startTimes)) {
     auto startTime = i.value();
     auto lastStage = i.index() == startTimes.size() - 1;
+    auto isFirstStage = i.index() == 0;
     auto group = startGroups[startTime];
     llvm::sort(group,
                [&](Operation *a, Operation *b) { return dom.dominates(a, b); });
     auto stageTypes = registerTypes[startTime];
+    if (isFirstStage)
+      stageTypes.push_back(builder.getI1Type());
     uint64_t largestLatency = 1;
     if (lastStage) {
       // Last stage must end after all ops have finished
@@ -904,8 +903,10 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
     //   stageTypes.push_back(lowerBound.getType());
     // }
 
-    // Create the stage itself.
-    builder.setInsertionPoint(stagesBlock.getTerminator());
+    // Create the stage itself. The pipeline op no longer has a default
+    // terminator (we'll create one after all stages are built), so insert at
+    // end of the stages block.
+    builder.setInsertionPointToEnd(&stagesBlock);
     auto startTimeAttr =
         builder.getIntegerAttr(builder.getIntegerType(64), startTime);
     auto endTimeAttr =
@@ -966,26 +967,28 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
     stageTerminator->insertOperands(stageTerminator->getNumOperands(),
                                     stageOperands);
 
-    // Add the induction variable increment to the first stage.
-    // if (startTime == 0) {
-    //   auto incResult =
-    //       builder.create<arith::AddIOp>(stagesBlock.getArgument(0), step);
-    //   stageTerminator->insertOperands(stageTerminator->getNumOperands(),
-    //                                   incResult->getResults());
-    // }
+    // For the first stage, clone the scf.before-body's combinational
+    // condition ops into this stage and register the resulting i1 condition
+    // as the stage's last result.
+    if (isFirstStage) {
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPoint(stageTerminator);
+      for (auto &op : loop.getBeforeBody()->getOperations()) {
+        if (op.hasTrait<OpTrait::IsTerminator>())
+          continue;
+        builder.clone(op, stageValueMaps[startTime]);
+      }
+      Value mappedCond = stageValueMaps[startTime].lookup(scfCond.getCondition());
+      stageTerminator->insertOperands(stageTerminator->getNumOperands(),
+                                      mappedCond);
+      pipelineCondResult = stage.getResult(stage.getNumResults() - 1);
+    }
   }
-
-  // Add the iter args and results to the terminator.
-  auto stagesTerminator =
-      cast<LoopScheduleTerminatorOp>(stagesBlock.getTerminator());
 
   // Collect iter args and results from the induction variable increment and any
   // mapped values that were originally yielded.
   SmallVector<Value> termIterArgs;
   SmallVector<Value> termResults;
-  // termIterArgs.push_back(
-  //     stagesBlock.front().getResult(stagesBlock.front().getNumResults() -
-  //     1));
 
   for (auto value : loop.getAfterBody()->getTerminator()->getOperands()) {
     unsigned lookupTime =
@@ -996,8 +999,11 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
     termResults.push_back(stageValueMaps[lookupTime].lookup(value));
   }
 
-  stagesTerminator.getIterArgsMutable().append(termIterArgs);
-  stagesTerminator.getResultsMutable().append(termResults);
+  // Build the loopschedule.terminator with the condition produced by the
+  // first stage plus the iter_args and results.
+  builder.setInsertionPointToEnd(&stagesBlock);
+  builder.create<LoopScheduleTerminatorOp>(pipelineCondResult, termIterArgs,
+                                           termResults);
 
   // Replace loop results with pipeline results.
   for (size_t i = 0; i < loop.getNumResults(); ++i)
@@ -1070,26 +1076,11 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
   auto sequential = builder.create<LoopScheduleSequentialOp>(
       loop.getLoc(), resultTypes, tripCountAttr, iterArgs);
 
-  // Create the condition
-  Block &condBlock = sequential.getCondBlock();
+  // Stash a reference to the scf.before terminator. We'll clone the
+  // combinational condition ops into the first loopschedule.step body and
+  // register the resulting i1 as an extra result of that step. The
+  // loopschedule.terminator's `condition` operand will be that step result.
   auto scfCond = cast<scf::ConditionOp>(loop.getBeforeBody()->getTerminator());
-  builder.setInsertionPointToStart(&condBlock);
-
-  IRMapping mapper;
-
-  for (size_t i = 0; i < iterArgs.size(); ++i) {
-    auto oldArg = loop.getBeforeArguments()[i];
-    auto newArg = condBlock.getArgument(i);
-    mapper.map(oldArg, newArg);
-  }
-
-  for (auto &op : loop.getBeforeBody()->getOperations()) {
-    if (!op.hasTrait<OpTrait::IsTerminator>()) {
-      builder.clone(op, mapper);
-    }
-  }
-  condBlock.getTerminator()->insertOperands(
-      0, mapper.lookup(scfCond.getCondition()));
 
   // Maintain mappings of values in the loop body and results of stages
   IRMapping valueMap;
@@ -1186,9 +1177,15 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
   // Maintain mappings of values in the loop body and results of stages,
   // initially populated with the iter args.
   valueMap.clear();
-  for (size_t i = 0; i < iterArgs.size(); ++i)
+  for (size_t i = 0; i < iterArgs.size(); ++i) {
     valueMap.map(loop.getAfter().getArgument(i),
                  sequential.getScheduleBlock().getArgument(i));
+    // The before-body's combinational ops (which compute the loop condition)
+    // will be cloned into the first step and likewise reference the
+    // sequential loop's iter_args via the schedule block arguments.
+    valueMap.map(loop.getBeforeArguments()[i],
+                 sequential.getScheduleBlock().getArgument(i));
+  }
 
   // Create the stages.
   builder.setInsertionPointToStart(&scheduleBlock);
@@ -1202,9 +1199,14 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
   DenseMap<uint32_t, SmallVector<Value>> reregisterValues;
 
   LoopScheduleStepOp lastStep;
+  // The first step in `startTimes` order will host the loop condition's
+  // combinational ops; track the resulting step result so the
+  // loopschedule.terminator can reference it.
+  Value sequentialCondResult;
   DominanceInfo dom(getOperation());
   for (auto i : enumerate(startTimes)) {
     auto startTime = i.value();
+    auto isFirstStep = i.index() == 0;
     auto group = startGroups[startTime];
     OpBuilder::InsertionGuard g(builder);
 
@@ -1252,6 +1254,10 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
     for (auto val : reregisterValues[startTime]) {
       stepTypes.push_back(val.getType());
     }
+
+    // The first step gains an extra i1 result for the loop condition.
+    if (isFirstStep)
+      stepTypes.push_back(builder.getI1Type());
 
     // Create the step itself.
     auto step = builder.create<LoopScheduleStepOp>(stepTypes);
@@ -1330,6 +1336,23 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
       valueMap.map(val, newValue);
     }
 
+    // For the first step, clone the scf.before-body's combinational
+    // condition ops into this step and register the resulting i1 condition
+    // as the step's last result.
+    if (isFirstStep) {
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPoint(stepTerminator);
+      for (auto &op : loop.getBeforeBody()->getOperations()) {
+        if (op.hasTrait<OpTrait::IsTerminator>())
+          continue;
+        builder.clone(op, valueMap);
+      }
+      Value mappedCond = valueMap.lookup(scfCond.getCondition());
+      stepTerminator->insertOperands(stepTerminator->getNumOperands(),
+                                     mappedCond);
+      sequentialCondResult = step->getResult(step->getNumResults() - 1);
+    }
+
     // Add the step results to the value map for the original op.
     for (auto t : movedOps) {
       Operation *op = std::get<0>(t);
@@ -1363,10 +1386,6 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
     }
   }
 
-  // Add the iter args and results to the terminator.
-  auto scheduleTerminator =
-      cast<LoopScheduleTerminatorOp>(scheduleBlock.getTerminator());
-
   // Collect iter args and results from the induction variable increment and any
   // mapped values that were originally yielded.
   SmallVector<Value> termIterArgs;
@@ -1375,8 +1394,11 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
     termIterArgs.push_back(valueMap.lookup(value));
   }
 
-  scheduleTerminator.getIterArgsMutable().append(termIterArgs);
-  scheduleTerminator.getResultsMutable().append(termIterArgs);
+  // Build the loopschedule.terminator with the condition produced by the
+  // first step plus the iter_args and results.
+  builder.setInsertionPointToEnd(&scheduleBlock);
+  builder.create<LoopScheduleTerminatorOp>(sequentialCondResult, termIterArgs,
+                                           termIterArgs);
 
   // Replace loop results with sequential results.
   for (size_t i = 0; i < loop.getNumResults(); ++i) {

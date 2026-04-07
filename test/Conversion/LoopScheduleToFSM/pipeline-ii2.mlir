@@ -32,18 +32,16 @@ func.func @pipeline_ii2(%arg0: i32) -> i32 {
   %c10 = arith.constant 10 : index
   %c0_i32 = arith.constant 0 : i32
   %0 = loopschedule.pipeline II = 2 iter_args(%i = %c0, %acc = %c0_i32) : (index, i32) -> i32 {
-    %cond = arith.cmpi ult, %i, %c10 : index
-    loopschedule.register %cond : i1
-  } do {
-    %1:2 = loopschedule.pipeline.stage start = 0 end = 2 {
+    %1:3 = loopschedule.pipeline.stage start = 0 end = 2 {
+      %cond = arith.cmpi ult, %i, %c10 : index
       %next_i = arith.addi %i, %c1 : index
       %partial = arith.addi %acc, %arg0 : i32
-      loopschedule.register %next_i, %partial : index, i32
-    } : index, i32
+      loopschedule.register %next_i, %partial, %cond : index, i32, i1
+    } : index, i32, i1
     %2 = loopschedule.pipeline.stage start = 2 end = 4 {
       loopschedule.register %1#1 : i32
     } : i32
-    loopschedule.terminator iter_args(%1#0, %1#1), results(%2) : (index, i32) -> (i32)
+    loopschedule.terminator condition(%1#2), iter_args(%1#0, %1#1), results(%2) : (index, i32) -> (i32)
   }
   return %0 : i32
 }

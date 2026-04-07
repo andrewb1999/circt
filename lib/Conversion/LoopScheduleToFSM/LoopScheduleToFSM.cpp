@@ -1081,7 +1081,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // --- Create iter arg registers ---
   SmallVector<Value> iterArgRegs;
   for (auto [init, iterArg] :
-       llvm::zip(seqOp.getInits(), seqOp.getConditionBlock()->getArguments())) {
+       llvm::zip(seqOp.getInits(), seqOp.getScheduleBlock().getArguments())) {
     Value mappedInit = localMapping.lookup(init);
     auto regName = hw.getStringAttr(
         node.prefix + "_iter_arg_" + std::to_string(iterArgRegs.size()));
@@ -1091,23 +1091,6 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     Value muxed = comb::MuxOp::create(hw, loc, fsmFirstIter, mappedInit, reg);
     localMapping.map(iterArg, muxed);
   }
-
-  // Map schedule block arguments to condition block args.
-  for (auto [schedArg, condArg] :
-       llvm::zip(seqOp.getScheduleBlock().getArguments(),
-                 seqOp.getConditionBlock()->getArguments()))
-    localMapping.map(schedArg, localMapping.lookup(condArg));
-
-  // --- Lower condition block ---
-  hw.setInsertionPointToEnd(hwBody);
-  for (auto &op : seqOp.getConditionBlock()->getOperations()) {
-    if (isa<LoopScheduleRegisterOp>(&op))
-      continue;
-    hw.clone(op, localMapping);
-  }
-  auto condRegOp =
-      cast<LoopScheduleRegisterOp>(seqOp.getConditionBlock()->getTerminator());
-  condBE.setValue(localMapping.lookup(condRegOp.getOperands()[0]));
 
   // --- Lower step bodies ---
   for (auto [stepIdx, stepOp] : llvm::enumerate(steps)) {
@@ -1307,6 +1290,12 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     for (auto [result, regVal] :
          llvm::zip(stepOp.getResults(), regOp.getOperands()))
       localMapping.map(result, localMapping.lookup(regVal));
+
+    // After lowering the first step, the loop's condition value (which the
+    // verifier guarantees is produced by the first phase) is now available in
+    // the mapping. Wire it into the FSM instance via the condition backedge.
+    if (stepIdx == 0)
+      condBE.setValue(localMapping.lookup(terminatorOp.getCondition()));
   }
 
   // --- Wire up iter_arg feedback ---
@@ -1383,21 +1372,15 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   }
 
   for (auto [arg, be] :
-       llvm::zip(pipOp.getCondBlock().getArguments(), iterArgBackedges))
-    mapping.map(arg, Value(be));
-  for (auto [arg, be] :
        llvm::zip(pipOp.getStagesBlock().getArguments(), iterArgBackedges))
     mapping.map(arg, Value(be));
 
-  for (auto &op : pipOp.getCondBlock().getOperations()) {
-    if (isa<LoopScheduleRegisterOp>(&op))
-      continue;
-    hwBuilder.clone(op, mapping);
-  }
-
-  auto condRegOp =
-      cast<LoopScheduleRegisterOp>(pipOp.getCondBlock().getTerminator());
-  Value condValue = mapping.lookup(condRegOp.getOperands()[0]);
+  // The loop condition is produced by the first stage (verifier-enforced),
+  // so it isn't available until that stage's body has been lowered. Stand it
+  // up as a backedge here so the active/CE chain can be built first; resolve
+  // it after lowering stage 0 below.
+  Backedge condValueBE = bb.get(hwBuilder.getI1Type());
+  Value condValue = Value(condValueBE);
 
   Backedge activeNextBE = bb.get(hwBuilder.getI1Type());
   auto activeReg = seq::CompRegOp::create(
@@ -1410,17 +1393,17 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       comb::OrOp::create(hwBuilder, loc, startSignal, holdActive);
   activeNextBE.setValue(activeNext);
 
-  uint64_t ii = pipOp.getII();
+  uint64_t II = pipOp.getII();
   Value ceGen;
-  if (ii == 1) {
+  if (II == 1) {
     ceGen = active;
   } else {
-    unsigned counterWidth = llvm::Log2_64_Ceil(ii);
+    unsigned counterWidth = llvm::Log2_64_Ceil(II);
     Type counterType = IntegerType::get(ctx, counterWidth);
     Value cZero = hw::ConstantOp::create(hwBuilder, loc, counterType, 0);
     Value cOne = hw::ConstantOp::create(hwBuilder, loc, counterType, 1);
     Value cIIMinusOne =
-        hw::ConstantOp::create(hwBuilder, loc, counterType, ii - 1);
+        hw::ConstantOp::create(hwBuilder, loc, counterType, II - 1);
 
     Backedge counterBackedge = bb.get(counterType);
     auto counterReg = seq::CompRegOp::create(
@@ -1480,6 +1463,22 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     }
 
     auto regOp = cast<LoopScheduleRegisterOp>(body.getTerminator());
+
+    // Resolve the condition backedge from stage 0's *unregistered* condition
+    // value: the loop's combinational gate should not be delayed by the
+    // pipeline registers. The verifier guarantees the terminator's condition
+    // is one of stage 0's results, which corresponds to the register operand
+    // at the same index.
+    if (stageIdx == 0) {
+      auto condResult = cast<OpResult>(terminatorOp.getCondition());
+      condValueBE.setValue(
+          mapping.lookup(regOp.getOperand(condResult.getResultNumber())));
+      // Refresh the local condValue handle: BackedgeBuilder's RAUW updates
+      // the underlying placeholder's uses, but the local Value snapshot still
+      // points at the (now-orphaned) cast op.
+      condValue = Value(condValueBE);
+    }
+
     for (auto [regIdx, val] : llvm::enumerate(regOp.getOperands())) {
       Value mappedVal = mapping.lookup(val);
       Value resetVal = createZeroConstant(hwBuilder, loc, mappedVal.getType());
@@ -1559,21 +1558,14 @@ LogicalResult LoopScheduleToFSMPass::lowerPipeline(
   }
 
   for (auto [arg, be] :
-       llvm::zip(pipOp.getCondBlock().getArguments(), iterArgBackedges))
-    mapping.map(arg, Value(be));
-  for (auto [arg, be] :
        llvm::zip(pipOp.getStagesBlock().getArguments(), iterArgBackedges))
     mapping.map(arg, Value(be));
 
-  for (auto &op : pipOp.getCondBlock().getOperations()) {
-    if (isa<LoopScheduleRegisterOp>(&op))
-      continue;
-    hwBuilder.clone(op, mapping);
-  }
-
-  auto condRegOp =
-      cast<LoopScheduleRegisterOp>(pipOp.getCondBlock().getTerminator());
-  Value condValue = mapping.lookup(condRegOp.getOperands()[0]);
+  // The loop condition is produced by the first stage (verifier-enforced),
+  // so it isn't available until that stage's body has been lowered. Use a
+  // backedge for now and resolve it after lowering stage 0 below.
+  Backedge condValueBE = bb.get(hwBuilder.getI1Type());
+  Value condValue = Value(condValueBE);
 
   Backedge activeNextBE = bb.get(hwBuilder.getI1Type());
   auto activeReg = seq::CompRegOp::create(
@@ -1657,6 +1649,22 @@ LogicalResult LoopScheduleToFSMPass::lowerPipeline(
     }
 
     auto regOp = cast<LoopScheduleRegisterOp>(body.getTerminator());
+
+    // Resolve the condition backedge from stage 0's *unregistered* condition
+    // value: the loop's combinational gate should not be delayed by the
+    // pipeline registers. The verifier guarantees the terminator's condition
+    // is one of stage 0's results, which corresponds to the register operand
+    // at the same index.
+    if (stageIdx == 0) {
+      auto condResult = cast<OpResult>(terminatorOp.getCondition());
+      condValueBE.setValue(
+          mapping.lookup(regOp.getOperand(condResult.getResultNumber())));
+      // Refresh the local condValue handle: BackedgeBuilder's RAUW updates
+      // the underlying placeholder's uses, but the local Value snapshot still
+      // points at the (now-orphaned) cast op.
+      condValue = Value(condValueBE);
+    }
+
     for (auto [regIdx, val] : llvm::enumerate(regOp.getOperands())) {
       Value mappedVal = mapping.lookup(val);
       Value resetVal = createZeroConstant(hwBuilder, loc, mappedVal.getType());

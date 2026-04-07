@@ -11,30 +11,26 @@ module {
     %c8_i4 = arith.constant -8 : i4
     loopschedule.step {
       loopschedule.sequential trip_count = 8 iter_args(%i = %c0_i4) : (i4) -> () {
-        %cond = arith.cmpi ult, %i, %c8_i4 : i4
-        loopschedule.register %cond : i1
-      } do {
-        %0 = loopschedule.step {
+        %0:2 = loopschedule.step {
+          %cond = arith.cmpi ult, %i, %c8_i4 : i4
           loopschedule.store %c42_i32, %arg0[%i : i4] : memref<8xi32>
           %next = arith.addi %i, %c1_i4 : i4
-          loopschedule.register %next : i4
-        } : i4
-        loopschedule.terminator iter_args(%0), results() : (i4) -> ()
+          loopschedule.register %next, %cond : i4, i1
+        } : i4, i1
+        loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (i4) -> ()
       }
     }
     loopschedule.step {
       loopschedule.sequential trip_count = 8 iter_args(%j = %c0_i4) : (i4) -> () {
-        %cond = arith.cmpi ult, %j, %c8_i4 : i4
-        loopschedule.register %cond : i1
-      } do {
-        %0 = loopschedule.step {
+        %0:2 = loopschedule.step {
+          %cond = arith.cmpi ult, %j, %c8_i4 : i4
           %val = loopschedule.load %arg0[%j : i4] : memref<8xi32>
           %inc = arith.addi %val, %c0_i32 : i32
           loopschedule.store %inc, %arg0[%j : i4] : memref<8xi32>
           %next = arith.addi %j, %c1_i4 : i4
-          loopschedule.register %next : i4
-        } : i4
-        loopschedule.terminator iter_args(%0), results() : (i4) -> ()
+          loopschedule.register %next, %cond : i4, i1
+        } : i4, i1
+        loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (i4) -> ()
       }
     }
     return

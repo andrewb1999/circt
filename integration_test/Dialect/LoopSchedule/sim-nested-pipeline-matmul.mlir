@@ -29,22 +29,16 @@ module {
     loopschedule.step {
       // Outer loop: i = 0..1
       loopschedule.sequential trip_count = 2 iter_args(%i = %c0_i2) : (i2) -> () {
-        %cond_i = arith.cmpi ult, %i, %c2_i2 : i2
-        loopschedule.register %cond_i : i1
-      } do {
-        %0 = loopschedule.step {
+        %0:2 = loopschedule.step {
+          %cond_i = arith.cmpi ult, %i, %c2_i2 : i2
           // Middle loop: j = 0..1
           loopschedule.sequential trip_count = 2 iter_args(%j = %c0_i2) : (i2) -> () {
-            %cond_j = arith.cmpi ult, %j, %c2_i2 : i2
-            loopschedule.register %cond_j : i1
-          } do {
-            %1 = loopschedule.step {
+            %1:2 = loopschedule.step {
+              %cond_j = arith.cmpi ult, %j, %c2_i2 : i2
               // Inner loop: pipeline with k=0..1, accumulating into acc
               %acc = loopschedule.pipeline II = 1 iter_args(%k = %c0_i2, %pacc = %c0_i32) : (i2, i32) -> i32 {
-                %cond_k = arith.cmpi ult, %k, %c2_i2 : i2
-                loopschedule.register %cond_k : i1
-              } do {
-                %2:2 = loopschedule.pipeline.stage start = 0 end = 1 {
+                %2:3 = loopschedule.pipeline.stage start = 0 end = 1 {
+                  %cond_k = arith.cmpi ult, %k, %c2_i2 : i2
                   // a_addr = i*2 + k
                   %i_ext = arith.extui %i : i2 to i4
                   %k_ext = arith.extui %k : i2 to i4
@@ -61,9 +55,9 @@ module {
                   %new_acc = arith.addi %pacc, %prod : i32
                   // Advance k
                   %next_k = arith.addi %k, %c1_i2 : i2
-                  loopschedule.register %next_k, %new_acc : i2, i32
-                } : i2, i32
-                loopschedule.terminator iter_args(%2#0, %2#1), results(%2#1) : (i2, i32) -> (i32)
+                  loopschedule.register %next_k, %new_acc, %cond_k : i2, i32, i1
+                } : i2, i32, i1
+                loopschedule.terminator condition(%2#2), iter_args(%2#0, %2#1), results(%2#1) : (i2, i32) -> (i32)
               }
               // After inner pipeline: store C[i*2+j] = acc
               %i_ext2 = arith.extui %i : i2 to i4
@@ -73,15 +67,15 @@ module {
               loopschedule.store %acc, %arg2[%c_addr : i4] : memref<4xi32>
               // Advance j
               %next_j = arith.addi %j, %c1_i2 : i2
-              loopschedule.register %next_j : i2
-            } : i2
-            loopschedule.terminator iter_args(%1), results() : (i2) -> ()
+              loopschedule.register %next_j, %cond_j : i2, i1
+            } : i2, i1
+            loopschedule.terminator condition(%1#1), iter_args(%1#0), results() : (i2) -> ()
           }
           // Advance i
           %next_i = arith.addi %i, %c1_i2 : i2
-          loopschedule.register %next_i : i2
-        } : i2
-        loopschedule.terminator iter_args(%0), results() : (i2) -> ()
+          loopschedule.register %next_i, %cond_i : i2, i1
+        } : i2, i1
+        loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (i2) -> ()
       }
     }
     return

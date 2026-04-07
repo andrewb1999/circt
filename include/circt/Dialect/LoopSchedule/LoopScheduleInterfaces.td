@@ -36,11 +36,8 @@ def LoopOpInterface : OpInterface<"LoopInterface"> {
       "Block*",
       "getBodyBlock">,
     InterfaceMethod<
-      "Get a pointer to the condition block.",
-      "Block*",
-      "getConditionBlock">,
-    InterfaceMethod<
-      "Get the SSA value corresponding to the loop condition.",
+      "Get the SSA value corresponding to the loop condition (the condition "
+      "operand of the loop's `loopschedule.terminator`).",
       "Value",
       "getConditionValue">,
     InterfaceMethod<

@@ -39,49 +39,25 @@ LogicalResult loopschedule::verifyLoop(Operation *op) {
 
   auto loop = cast<LoopInterface>(op);
 
-  // Verify the condition block is "combinational" based on an allowlist of
-  // Arithmetic ops.
-  Block *conditionBlock = loop.getConditionBlock();
-  Operation *nonCombinational;
-  WalkResult conditionWalk = conditionBlock->walk([&](Operation *op) {
-    if (isa<LoopScheduleDialect>(op->getDialect()))
-      return WalkResult::advance();
-
-    if (!isa<arith::AddIOp, arith::AndIOp, arith::BitcastOp, arith::CmpIOp,
-             arith::ConstantOp, arith::IndexCastOp, arith::MulIOp, arith::OrIOp,
-             arith::SelectOp, arith::ShLIOp, arith::ExtSIOp, arith::CeilDivSIOp,
-             arith::DivSIOp, arith::FloorDivSIOp, arith::RemSIOp,
-             arith::ShRSIOp, arith::SubIOp, arith::TruncIOp, arith::DivUIOp,
-             arith::RemUIOp, arith::ShRUIOp, arith::XOrIOp, arith::ExtUIOp>(
-            op)) {
-      nonCombinational = op;
-      return WalkResult::interrupt();
-    }
-
-    return WalkResult::advance();
-  });
-
-  if (conditionWalk.wasInterrupted())
-    return loop.emitOpError("condition must have a combinational body, found ")
-           << *nonCombinational;
-
-  // Verify the condition block terminates with a value of type i1.
-  TypeRange conditionResults =
-      conditionBlock->getTerminator()->getOperandTypes();
-  if (conditionResults.size() != 1)
-    return loop.emitOpError(
-               "condition must terminate with a single result, found ")
-           << conditionResults;
-
-  if (!conditionResults.front().isInteger(1))
-    return loop.emitOpError(
-               "condition must terminate with an i1 result, found ")
-           << conditionResults.front();
-
   // Verify the body block contains at least one phase and a terminator.
   Block *stagesBlock = loop.getBodyBlock();
   if (stagesBlock->getOperations().size() < 2)
     return loop.emitOpError("body must contain at least one phase");
+
+  // Verify the loop's condition value is produced by the first phase.
+  auto firstPhaseRange = stagesBlock->getOps<PhaseInterface>();
+  if (firstPhaseRange.empty())
+    return loop.emitOpError("body must contain at least one phase");
+  Operation *firstPhase = (*firstPhaseRange.begin()).getOperation();
+  Value condValue = loop.getConditionValue();
+  if (!condValue)
+    return loop.emitOpError("missing condition value on terminator");
+  if (!condValue.getType().isInteger(1))
+    return loop.emitOpError("loop condition must be i1, found ")
+           << condValue.getType();
+  if (condValue.getDefiningOp() != firstPhase)
+    return loop.emitOpError(
+        "loop condition must be produced by the first phase of the body");
 
   // Verify iter_args are produced by the first phase that uses it
   // and is only used before new value is produced
@@ -170,14 +146,7 @@ ParseResult LoopSchedulePipelineOp::parse(OpAsmParser &parser,
       return failure();
   }
 
-  // Parse condition region.
-  Region *condition = result.addRegion();
-  if (parser.parseRegion(*condition, regionArgs))
-    return failure();
-
   // Parse stages region.
-  if (parser.parseKeyword("do"))
-    return failure();
   Region *stages = result.addRegion();
   if (parser.parseRegion(*stages, regionArgs))
     return failure();
@@ -205,54 +174,12 @@ void LoopSchedulePipelineOp::print(OpAsmPrinter &p) {
                                 getResultTypes());
   p.printType(type);
 
-  // Print condition region.
-  p << ' ';
-  p.printRegion(getCondition(), /*printEntryBlockArgs=*/false);
-  p << " do";
-
   // Print stages region.
   p << ' ';
   p.printRegion(getStages(), /*printEntryBlockArgs=*/false);
 }
 
 LogicalResult LoopSchedulePipelineOp::verify() {
-  // Verify the condition block is "combinational" based on an allowlist of
-  // Arithmetic ops.
-  Block &conditionBlock = getCondition().front();
-  Operation *nonCombinational;
-  WalkResult conditionWalk = conditionBlock.walk([&](Operation *op) {
-    if (isa_and_nonnull<LoopScheduleDialect>(op->getDialect()))
-      return WalkResult::advance();
-
-    if (!isa<arith::AddIOp, arith::AndIOp, arith::BitcastOp, arith::CmpIOp,
-             arith::ConstantOp, arith::IndexCastOp, arith::MulIOp, arith::OrIOp,
-             arith::SelectOp, arith::ShLIOp, arith::ExtSIOp, arith::CeilDivSIOp,
-             arith::DivSIOp, arith::FloorDivSIOp, arith::RemSIOp,
-             arith::ShRSIOp, arith::SubIOp, arith::TruncIOp, arith::DivUIOp,
-             arith::RemUIOp, arith::ShRUIOp, arith::XOrIOp, arith::ExtUIOp>(
-            op)) {
-      nonCombinational = op;
-      return WalkResult::interrupt();
-    }
-
-    return WalkResult::advance();
-  });
-
-  if (conditionWalk.wasInterrupted())
-    return emitOpError("condition must have a combinational body, found ")
-           << *nonCombinational;
-
-  // Verify the condition block terminates with a value of type i1.
-  TypeRange conditionResults =
-      conditionBlock.getTerminator()->getOperandTypes();
-  if (conditionResults.size() != 1)
-    return emitOpError("condition must terminate with a single result, found ")
-           << conditionResults;
-
-  if (conditionResults.front() != IntegerType::get(getContext(), 1))
-    return emitOpError("condition must terminate with an i1 result, found ")
-           << conditionResults.front();
-
   // Verify the stages block contains at least one stage and a terminator.
   Block &stagesBlock = getStages().front();
 
@@ -281,22 +208,12 @@ LogicalResult LoopSchedulePipelineOp::verify() {
     }
   }
 
-  // Verify iter_args used in condition are produced by first stage
-  // auto firstStage =
-  // *stagesBlock.getOps<LoopSchedulePipelineStageOp>().begin(); auto
-  // termIterArgs = getTerminatorIterArgs(); for (auto arg :
-  // getConditionBlock()->getArguments()) {
-  //   auto numUses = std::distance(arg.getUses().begin(), arg.getUses().end());
-  //   if (numUses == 0)
-  //     continue;
-  //   auto termIterArg = termIterArgs[arg.getArgNumber()];
-  //   if (termIterArg.getDefiningOp() != firstStage.getOperation())
-  //     return emitOpError("Iter args used in condition block must be produced
-  //     "
-  //                        "by first pipeline stage");
-  // }
-
   return success();
+}
+
+Value LoopSchedulePipelineOp::getConditionValue() {
+  return cast<LoopScheduleTerminatorOp>(getStagesBlock().getTerminator())
+      .getCondition();
 }
 
 void LoopSchedulePipelineOp::build(OpBuilder &builder, OperationState &state,
@@ -311,23 +228,15 @@ void LoopSchedulePipelineOp::build(OpBuilder &builder, OperationState &state,
     state.addAttribute("tripCount", *tripCount);
   state.addOperands(iterArgs);
 
-  Region *condRegion = state.addRegion();
-  Block &condBlock = condRegion->emplaceBlock();
-
   SmallVector<Location, 4> argLocs;
   for (auto arg : iterArgs)
     argLocs.push_back(arg.getLoc());
-  condBlock.addArguments(iterArgs.getTypes(), argLocs);
-  builder.setInsertionPointToEnd(&condBlock);
-  LoopScheduleRegisterOp::create(builder, builder.getUnknownLoc(),
-                                 ValueRange());
 
   Region *stagesRegion = state.addRegion();
   Block &stagesBlock = stagesRegion->emplaceBlock();
   stagesBlock.addArguments(iterArgs.getTypes(), argLocs);
-  builder.setInsertionPointToEnd(&stagesBlock);
-  LoopScheduleTerminatorOp::create(builder, builder.getUnknownLoc(),
-                                   ValueRange(), ValueRange());
+  // Note: no default terminator is inserted; the loop's terminator requires
+  // a `condition` operand which only the producer can supply.
 }
 
 uint64_t LoopSchedulePipelineOp::getBodyLatency() {
@@ -482,14 +391,7 @@ ParseResult LoopScheduleSequentialOp::parse(OpAsmParser &parser,
       return failure();
   }
 
-  // Parse condition region.
-  Region *condition = result.addRegion();
-  if (parser.parseRegion(*condition, regionArgs))
-    return failure();
-
-  // Parse stages region.
-  if (parser.parseKeyword("do"))
-    return failure();
+  // Parse schedule region.
   Region *stages = result.addRegion();
   if (parser.parseRegion(*stages, regionArgs))
     return failure();
@@ -514,12 +416,7 @@ void LoopScheduleSequentialOp::print(OpAsmPrinter &p) {
                                 getResultTypes());
   p.printType(type);
 
-  // Print condition region.
-  p << ' ';
-  p.printRegion(getCondition(), /*printEntryBlockArgs=*/false);
-  p << " do";
-
-  // Print stages region.
+  // Print schedule region.
   p << ' ';
   p.printRegion(getSchedule(), /*printEntryBlockArgs=*/false);
 }
@@ -550,22 +447,20 @@ void LoopScheduleSequentialOp::build(OpBuilder &builder, OperationState &state,
     state.addAttribute("tripCount", *tripCount);
   state.addOperands(iterArgs);
 
-  Region *condRegion = state.addRegion();
-  Block &condBlock = condRegion->emplaceBlock();
-
   SmallVector<Location, 4> argLocs;
   for (auto arg : iterArgs)
     argLocs.push_back(arg.getLoc());
-  condBlock.addArguments(iterArgs.getTypes(), argLocs);
-  builder.setInsertionPointToEnd(&condBlock);
-  builder.create<LoopScheduleRegisterOp>(builder.getUnknownLoc(), ValueRange());
 
   Region *scheduleRegion = state.addRegion();
   Block &scheduleBlock = scheduleRegion->emplaceBlock();
   scheduleBlock.addArguments(iterArgs.getTypes(), argLocs);
-  builder.setInsertionPointToEnd(&scheduleBlock);
-  builder.create<LoopScheduleTerminatorOp>(builder.getUnknownLoc(),
-                                           ValueRange(), ValueRange());
+  // Note: no default terminator is inserted; the loop's terminator requires
+  // a `condition` operand which only the producer can supply.
+}
+
+Value LoopScheduleSequentialOp::getConditionValue() {
+  return cast<LoopScheduleTerminatorOp>(getScheduleBlock().getTerminator())
+      .getCondition();
 }
 
 bool LoopScheduleSequentialOp::canStall() {
@@ -668,16 +563,17 @@ LoopScheduleRegisterOp LoopScheduleStepOp::getRegisterOp() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult LoopScheduleRegisterOp::verify() {
-  LoopSchedulePipelineStageOp stage =
-      (*this)->getParentOfType<LoopSchedulePipelineStageOp>();
-
-  // If this doesn't terminate a stage, it is terminating the condition.
-  if (stage == nullptr)
-    return success();
-
-  // Verify stage terminates with the same types as the result types.
+  // Verify the parent phase terminates with the same types as its result types.
   TypeRange registerTypes = getOperandTypes();
-  TypeRange resultTypes = stage.getResultTypes();
+  TypeRange resultTypes;
+  if (auto stage = (*this)->getParentOfType<LoopSchedulePipelineStageOp>())
+    resultTypes = stage.getResultTypes();
+  else if (auto step = (*this)->getParentOfType<LoopScheduleStepOp>())
+    resultTypes = step.getResultTypes();
+  else
+    return emitOpError("must be inside a 'loopschedule.pipeline.stage' or "
+                       "'loopschedule.step'");
+
   if (registerTypes != resultTypes)
     return emitOpError("operand types (")
            << registerTypes << ") must match result types (" << resultTypes
@@ -691,6 +587,13 @@ LogicalResult LoopScheduleRegisterOp::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult LoopScheduleTerminatorOp::verify() {
+  // Verify the condition operand is defined by a phase op.
+  Value cond = getCondition();
+  if (cond.getDefiningOp<LoopSchedulePipelineStageOp>() == nullptr &&
+      cond.getDefiningOp<LoopScheduleStepOp>() == nullptr)
+    return emitOpError("'condition' must be defined by a "
+                       "'loopschedule.pipeline.stage' or 'loopschedule.step'");
+
   // Verify loop terminates with the same `iter_args` types as the pipeline.
   auto iterArgs = getIterArgs();
   TypeRange terminatorArgTypes = iterArgs.getTypes();

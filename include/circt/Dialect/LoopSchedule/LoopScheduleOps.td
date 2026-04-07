@@ -39,7 +39,7 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
 
     This is the top-level operation representing a high-level pipeline. It is
     not isolated from above, but could be if this is helpful. A pipeline
-    contains two regions: `condition` and `stages`.
+    contains a single `stages` region.
 
     The pipeline may accept an optional `inits`, similar to the SCF dialect,
     for representing loop-carried values like induction variables or reductions.
@@ -51,13 +51,9 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
     less than the loop's initiation interval. For example, with II=1, each
     `init` must be used and registered in the same stage.
 
-    The single-block `condition` region dictates the condition under which the
-    pipeline should execute. It has a `register` terminator, and the
-    pipeline initiates new iterations while the registered value is `true : i1`.
-    It may access SSA values dominating the pipeline, as well as `inits`,
-    which are block arguments. The body of the block may only contain
-    "combinational" operations, which are currently defined to be simple
-    arithmetic, comparisons, and selects from the `Standard` dialect.
+    The pipeline initiates new iterations while the condition operand of
+    `loopschedule.terminator` is `true : i1`. The condition must be produced
+    by the first `loopschedule.pipeline.stage`.
 
     The single-block `stages` region wraps `loopschedule.pipeline.stage`
     operations. It has a `loopschedule.terminator` terminator, which can
@@ -77,7 +73,6 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
   );
 
   let regions = (region
-    SizedRegion<1>:$condition,
     SizedRegion<1>:$stages
   );
 
@@ -93,7 +88,6 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
   ];
 
   let extraClassDeclaration = [{
-    Block &getCondBlock() { return getCondition().front(); }
     Block &getStagesBlock() { return getStages().front(); }
 
     Block::BlockArgListType getBodyArgs() {
@@ -102,12 +96,7 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
     Block *getBodyBlock() {
       return &getStagesBlock();
     }
-    Block *getConditionBlock() {
-      return &getCondBlock();
-    }
-    Value getConditionValue() {
-      return getCondBlock().getTerminator()->getOperand(0);
-    }
+    Value getConditionValue();
     Operation::operand_range getTerminatorIterArgs();
     std::optional<uint64_t> getBound() {
       return getTripCount();
@@ -213,21 +202,19 @@ def LoopScheduleSequentialOp : LoopScheduleOp<"sequential", [LoopOpInterface]> {
 
     This is the top-level operation representing a sequential loop. It is
     not isolated from above, but could be if this is helpful. A sequential
-    loop contains two regions: `condition` and `stages`.
+    loop contains a single `schedule` region.
 
-    The sequential loop may accept an optional `inits`, similar to the SCF 
-    dialect, for representing loop-carried values like induction variables or 
-    reductions. When the sequential loop starts execution, the registers 
-    indicated as `inits` by `loopschedule.terminator` should be initialized 
+    The sequential loop may accept an optional `inits`, similar to the SCF
+    dialect, for representing loop-carried values like induction variables or
+    reductions. When the sequential loop starts execution, the registers
+    indicated as `inits` by `loopschedule.terminator` should be initialized
     to the initial values specified in the `inits` section here.
 
-    The single-block `condition` region dictates the condition under which the
-    sequential loop should execute. It has a `register` terminator, and the
-    loop initiates new iterations while the registered value is `true : i1`.
-    It may access SSA values dominating the loop, as well as `inits`,
-    which are block arguments.
+    The loop initiates new iterations while the condition operand of
+    `loopschedule.terminator` is `true : i1`. The condition must be produced
+    by the first `loopschedule.step`.
 
-    The single-block `steps` region wraps `loopschedule.step`
+    The single-block `schedule` region wraps `loopschedule.step`
     operations. It has a `loopschedule.terminator` terminator, which can
     both return results from the loop and register `inits`. Steps may
     access SSA values dominating the loop, as well as `inits`, which are
@@ -249,7 +236,6 @@ def LoopScheduleSequentialOp : LoopScheduleOp<"sequential", [LoopOpInterface]> {
   );
 
   let regions = (region
-    SizedRegion<1>:$condition,
     SizedRegion<1>:$schedule
   );
 
@@ -265,7 +251,6 @@ def LoopScheduleSequentialOp : LoopScheduleOp<"sequential", [LoopOpInterface]> {
   ];
 
   let extraClassDeclaration = [{
-    Block &getCondBlock() { return getCondition().front(); }
     Block &getScheduleBlock() { return getSchedule().front(); }
     Block::BlockArgListType getBodyArgs() {
       return getScheduleBlock().getArguments();
@@ -273,12 +258,7 @@ def LoopScheduleSequentialOp : LoopScheduleOp<"sequential", [LoopOpInterface]> {
     Block *getBodyBlock() {
       return &getScheduleBlock();
     }
-    Block *getConditionBlock() {
-      return &getCondBlock();
-    }
-    Value getConditionValue() {
-      return getCondBlock().getTerminator()->getOperand(0);
-    }
+    Value getConditionValue();
     Operation::operand_range getTerminatorIterArgs();
     std::optional<uint64_t> getBound() {
       return getTripCount();
@@ -355,7 +335,7 @@ def LoopScheduleStepOp : LoopScheduleOp<"step",
 }
 
 def LoopScheduleRegisterOp : LoopScheduleOp<"register",
-    [ParentOneOf<["LoopSchedulePipelineOp", "LoopSchedulePipelineStageOp", "LoopScheduleSequentialOp", "LoopScheduleStepOp"]>, Terminator]> {
+    [ParentOneOf<["LoopSchedulePipelineStageOp", "LoopScheduleStepOp"]>, Terminator]> {
   let summary = "LoopSchedule dialect loop register.";
   let description = [{
     The `loopschedule.register` terminates a pipeline stage and
@@ -381,25 +361,31 @@ def LoopScheduleTerminatorOp : LoopScheduleOp<"terminator",
   let summary = "LoopSchedule dialect terminator.";
   let description = [{
     The `loopschedule.terminator` operation represents the terminator of
-    a `loopschedule.pipeline`.
+    a `loopschedule.pipeline` or `loopschedule.sequential` op.
+
+    The `condition` operand is an `i1` value that controls whether the loop
+    initiates a new iteration. It must be produced by the first phase
+    (`loopschedule.pipeline.stage` or `loopschedule.step`) of the body.
 
     The `results` section accepts a variadic list of values which become the
-    pipeline’s return values. These must be results of a stage, and their types
-    must match the pipeline's return types. The results need not be defined in
-    the final stage, and it is up to lowering passes to preserve these values
-    until the final stage is complete.
+    loop's return values. These must be results of a phase, and their types
+    must match the loop's return types. The results need not be defined in
+    the final phase, and it is up to lowering passes to preserve these values
+    until the final phase is complete.
 
     The `iter_args` section accepts a variadic list of values which become the
-    next iteration’s `iter_args`. These may be the results of any stage, and
-    their types must match the pipeline's `iter_args` types.
+    next iteration's `iter_args`. These may be the results of any phase, and
+    their types must match the loop's `iter_args` types.
   }];
 
   let arguments = (ins
+    I1:$condition,
     Variadic<AnyType>:$iter_args,
     Variadic<AnyType>:$results
   );
 
   let assemblyFormat = [{
+    `condition` `(` $condition `)` `,`
     `iter_args` `(` $iter_args `)` `,`
     `results` `(` $results `)` `:`
     functional-type($iter_args, $results) attr-dict
