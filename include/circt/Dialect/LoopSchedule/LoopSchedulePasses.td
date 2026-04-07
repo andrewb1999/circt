@@ -64,4 +64,18 @@ def PipelineForLoopSchedule : Pass<"pipeline-for-loopschedule", "::mlir::func::F
   let dependentDialects = ["mlir::affine::AffineDialect", "mlir::func::FuncDialect"];
 }
 
+def LoopScheduleTestbenchGeneration : Pass<"loopschedule-testbench-generation", "mlir::ModuleOp"> {
+  let summary = "Generate a simulation testbench for LoopScheduleToFSM output";
+  let constructor = "circt::loopschedule::createLoopScheduleTestbenchGenerationPass()";
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::sv::SVDialect",
+    "circt::comb::CombDialect"
+  ];
+  let options = [
+    Option<"dataDir", "data-dir", "std::string", "",
+           "Directory containing hex data files for testbench inputs/outputs">
+  ];
+}
+
 #endif // CIRCT_DIALECT_LOOPSCHEDULE_PASSES_TD

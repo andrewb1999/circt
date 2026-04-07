@@ -6,6 +6,7 @@ add_circt_dialect_library(CIRCTLoopScheduleTransforms
   BitwidthReductionForLoopSchedule.cpp
   UnrollSubLoops.cpp
   UnrollMarkedLoops.cpp
+  LoopScheduleTestbenchGeneration.cpp
 
   DEPENDS
   CIRCTLoopScheduleTransformsIncGen
@@ -13,6 +14,9 @@ add_circt_dialect_library(CIRCTLoopScheduleTransforms
 
   LINK_LIBS PUBLIC
   CIRCTLoopSchedule
+  CIRCTHW
+  CIRCTSV
+  CIRCTComb
   MLIRIR
   MLIRPass
   MLIRTransformUtils

@@ -198,6 +198,23 @@ def LoopScheduleToCalyx : Pass<"lower-loopschedule-to-calyx", "mlir::ModuleOp"> 
   ];
 }
 
+//===----------------------------------------------------------------------===//
+// LoopScheduleToFSM
+//===----------------------------------------------------------------------===//
+
+def LoopScheduleToFSM : Pass<"lower-loopschedule-to-fsm", "mlir::ModuleOp"> {
+  let summary = "Lower LoopSchedule to FSM + HW";
+  let description = [{
+    This pass lowers LoopSchedule pipeline and sequential operations to
+    FSM state machines with HW module wrappers and Seq registers.
+  }];
+  let constructor = "circt::createLoopScheduleToFSMPass()";
+  let dependentDialects = [
+    "fsm::FSMDialect", "loopschedule::LoopScheduleDialect",
+    "hw::HWDialect", "comb::CombDialect", "seq::SeqDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
 
 //===----------------------------------------------------------------------===//
 // PipelineToHW

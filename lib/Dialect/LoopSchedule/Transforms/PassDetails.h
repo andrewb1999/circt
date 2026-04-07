@@ -16,8 +16,11 @@
 #ifndef DIALECT_LOOPSCHEDULE_TRANSFORMS_PASSDETAILS_H
 #define DIALECT_LOOPSCHEDULE_TRANSFORMS_PASSDETAILS_H
 
+#include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
