@@ -192,10 +192,13 @@ void LoopScheduleTestbenchGenerationPass::generateAttributeMode(
       hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0);
   Value trueVal =
       hw::ConstantOp::create(builder, loc, builder.getI1Type(), 1);
-  auto i8Type = builder.getIntegerType(8);
+  // Use a 24-bit timeout counter (16M cycles) to comfortably handle deeply
+  // nested sequential loops, where multi-step bodies make per-iteration
+  // cycle counts grow super-linearly with nesting depth.
+  auto i8Type = builder.getIntegerType(24);
   Value c0_i8 = hw::ConstantOp::create(builder, loc, i8Type, 0);
   Value c1_i8 = hw::ConstantOp::create(builder, loc, i8Type, 1);
-  Value cFF_i8 = hw::ConstantOp::create(builder, loc, i8Type, 255);
+  Value cFF_i8 = hw::ConstantOp::create(builder, loc, i8Type, 0xFFFFFF);
   Value fd = hw::ConstantOp::create(builder, loc, builder.getIntegerType(32),
                                     0x80000002);
 
@@ -368,10 +371,13 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
       hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0);
   Value trueVal =
       hw::ConstantOp::create(builder, loc, builder.getI1Type(), 1);
-  auto i8Type = builder.getIntegerType(8);
+  // Use a 24-bit timeout counter (16M cycles) to comfortably handle deeply
+  // nested sequential loops, where multi-step bodies make per-iteration
+  // cycle counts grow super-linearly with nesting depth.
+  auto i8Type = builder.getIntegerType(24);
   Value c0_i8 = hw::ConstantOp::create(builder, loc, i8Type, 0);
   Value c1_i8 = hw::ConstantOp::create(builder, loc, i8Type, 1);
-  Value cFF_i8 = hw::ConstantOp::create(builder, loc, i8Type, 255);
+  Value cFF_i8 = hw::ConstantOp::create(builder, loc, i8Type, 0xFFFFFF);
   Value fd = hw::ConstantOp::create(builder, loc, builder.getIntegerType(32),
                                     0x80000002);
 

@@ -107,14 +107,27 @@ private:
   void buildLoopTree(LoopScheduleSequentialOp seqOp, LoopNode &node,
                      const std::string &prefix, unsigned &loopCounter);
 
-  /// Create FSM machine for a leaf sequential loop.
-  fsm::MachineOp createLeafFSM(OpBuilder &builder, Location loc,
-                                StringRef fsmName, unsigned numSteps);
-
-  /// Create FSM machine for a non-leaf sequential loop (has one child).
-  fsm::MachineOp createNonLeafFSM(OpBuilder &builder, Location loc,
-                                   StringRef fsmName, unsigned numSteps,
-                                   unsigned childStepIdx);
+  /// Create FSM machine for a sequential loop.
+  ///
+  /// `waitStepIndices` lists the step indices whose body launches an external
+  /// computation that must be waited on (a child sequential loop, a pipeline
+  /// child, or any future variable-latency op). It must be sorted ascending.
+  /// Each such step gets dedicated child_start/child_done/post_active signals
+  /// and inserts WAIT_<i>/POST_<i> states around STEP_<i>. Steps not in the
+  /// list are "regular" steps that drive step_active_<i> in their STEP_<i>
+  /// state.
+  ///
+  /// Inputs (fixed order):
+  ///   start, cond, child_done_0..C-1            (C = waitStepIndices.size())
+  ///
+  /// Outputs (fixed order):
+  ///   done, first_iter, iter_advance,
+  ///   step_active_0..N-1,                       (N = numSteps)
+  ///   child_start_0..C-1,
+  ///   post_active_0..C-1
+  fsm::MachineOp createSequentialFSM(OpBuilder &builder, Location loc,
+                                      StringRef fsmName, unsigned numSteps,
+                                      ArrayRef<unsigned> waitStepIndices);
 
   /// Create linear run-once FSM for sequencing top-level function steps.
   /// stepChildKind[i]: -1 = leaf, 0 = sequential child, 1 = pipeline child.
@@ -370,110 +383,78 @@ collectReferencedConstants(LoopScheduleSequentialOp seqOp) {
 // FSM machine creation
 //===----------------------------------------------------------------------===//
 
-fsm::MachineOp LoopScheduleToFSMPass::createLeafFSM(OpBuilder &builder,
-                                                      Location loc,
-                                                      StringRef fsmName,
-                                                      unsigned numSteps) {
-  auto *ctx = builder.getContext();
-  auto i1 = builder.getI1Type();
-
-  // Inputs: start, cond.  Outputs: done, first_iter, step_active.
-  auto funcType = FunctionType::get(ctx, {i1, i1}, {i1, i1, i1});
-  auto machine =
-      fsm::MachineOp::create(builder, loc, fsmName, "IDLE", funcType);
-  machine.setArgNamesAttr(builder.getStrArrayAttr({"start", "cond"}));
-  machine.setResNamesAttr(
-      builder.getStrArrayAttr({"done", "first_iter", "step_active"}));
-
-  OpBuilder fb(ctx);
-  fb.setInsertionPointToEnd(&machine.getBody().front());
-
-  Value trueVal = hw::ConstantOp::create(fb, loc, i1, 1);
-  Value falseVal = hw::ConstantOp::create(fb, loc, i1, 0);
-  auto fiVar = fsm::VariableOp::create(
-      fb, loc, i1, fb.getBoolAttr(true), "first_iter");
-
-  // --- IDLE ---
-  {
-    auto st = fsm::StateOp::create(fb, loc, "IDLE");
-    Block *ob = st.ensureOutput(fb);
-    ob->getTerminator()->erase();
-    fb.setInsertionPointToEnd(ob);
-    fsm::OutputOp::create(fb, loc, ValueRange{falseVal, fiVar, falseVal});
-    Block *tb = &st.getTransitions().front();
-    fb.setInsertionPointToEnd(tb);
-    fsm::TransitionOp::create(
-        fb, loc, StringRef("COND"),
-        [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(0)); },
-        [&]() { fsm::UpdateOp::create(fb, loc, fiVar, trueVal); });
-  }
-  fb.setInsertionPointToEnd(&machine.getBody().front());
-
-  // --- COND ---
-  {
-    auto st = fsm::StateOp::create(fb, loc, "COND");
-    Block *ob = st.ensureOutput(fb);
-    ob->getTerminator()->erase();
-    fb.setInsertionPointToEnd(ob);
-    fsm::OutputOp::create(fb, loc, ValueRange{falseVal, fiVar, falseVal});
-    Block *tb = &st.getTransitions().front();
-    fb.setInsertionPointToEnd(tb);
-    fsm::TransitionOp::create(
-        fb, loc, StringRef("STEP_0"),
-        [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(1)); },
-        [&]() { fsm::UpdateOp::create(fb, loc, fiVar, falseVal); });
-    fsm::TransitionOp::create(fb, loc, StringRef("DONE"));
-  }
-  fb.setInsertionPointToEnd(&machine.getBody().front());
-
-  // --- STEP_i ---
-  for (unsigned i = 0; i < numSteps; ++i) {
-    std::string name = "STEP_" + std::to_string(i);
-    auto st = fsm::StateOp::create(fb, loc, name);
-    Block *ob = st.ensureOutput(fb);
-    ob->getTerminator()->erase();
-    fb.setInsertionPointToEnd(ob);
-    fsm::OutputOp::create(fb, loc, ValueRange{falseVal, fiVar, trueVal});
-    Block *tb = &st.getTransitions().front();
-    fb.setInsertionPointToEnd(tb);
-    std::string next =
-        (i + 1 < numSteps) ? "STEP_" + std::to_string(i + 1) : "COND";
-    fsm::TransitionOp::create(fb, loc, StringRef(next));
-    fb.setInsertionPointToEnd(&machine.getBody().front());
-  }
-
-  // --- DONE ---
-  {
-    auto st = fsm::StateOp::create(fb, loc, "DONE");
-    Block *ob = st.ensureOutput(fb);
-    ob->getTerminator()->erase();
-    fb.setInsertionPointToEnd(ob);
-    fsm::OutputOp::create(fb, loc, ValueRange{trueVal, fiVar, falseVal});
-    Block *tb = &st.getTransitions().front();
-    fb.setInsertionPointToEnd(tb);
-    fsm::TransitionOp::create(fb, loc, StringRef("IDLE"));
-  }
-  fb.setInsertionPointToEnd(&machine.getBody().front());
-
-  return machine;
-}
-
-fsm::MachineOp LoopScheduleToFSMPass::createNonLeafFSM(
+fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     OpBuilder &builder, Location loc, StringRef fsmName, unsigned numSteps,
-    unsigned childStepIdx) {
+    ArrayRef<unsigned> waitStepIndices) {
   auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
 
-  // Inputs: start, cond, child_done.
-  // Outputs: done, first_iter, child_start, step_active, post_active.
-  auto funcType =
-      FunctionType::get(ctx, {i1, i1, i1}, {i1, i1, i1, i1, i1});
+  // For each step, the index into waitStepIndices if it's a wait step, or -1.
+  SmallVector<int> stepWaitIdx(numSteps, -1);
+  for (auto [j, i] : llvm::enumerate(waitStepIndices)) {
+    assert(i < numSteps && "wait step index out of range");
+    assert(stepWaitIdx[i] == -1 && "duplicate wait step index");
+    stepWaitIdx[i] = (int)j;
+  }
+  // Verify ascending order (caller contract).
+  for (unsigned k = 1; k < waitStepIndices.size(); ++k)
+    assert(waitStepIndices[k - 1] < waitStepIndices[k] &&
+           "waitStepIndices must be sorted ascending");
+
+  unsigned numWaits = waitStepIndices.size();
+
+  // Determine which state's exit advances iter_arg: the FSM's last cycle
+  // before transitioning back to COND. That's POST_<last> if the last step
+  // is a wait, otherwise STEP_<last>.
+  bool lastIsWait = numSteps > 0 && stepWaitIdx[numSteps - 1] >= 0;
+
+  // Inputs: start, cond, child_done_0..C-1.
+  SmallVector<Type> inputTypes;
+  inputTypes.push_back(i1); // start
+  inputTypes.push_back(i1); // cond
+  for (unsigned j = 0; j < numWaits; ++j)
+    inputTypes.push_back(i1); // child_done_j
+
+  // Outputs: done, first_iter, iter_advance,
+  //          step_active_0..N-1,
+  //          child_start_0..C-1, child_active_0..C-1, post_active_0..C-1.
+  // child_start_j  : 1-cycle pulse in STEP_<wait_step_j>; drives child start.
+  // child_active_j : high while child j is producing on the wires
+  //                  (in STEP_<wait_step_j> launch AND throughout WAIT_<...>).
+  //                  Used to mux child j's mem ports out of the parent module.
+  // post_active_j  : high in POST_<wait_step_j> (parent's post-child phase).
+  unsigned numOutputs = 3 + numSteps + 3 * numWaits;
+  SmallVector<Type> outTypes(numOutputs, i1);
+
+  auto funcType = FunctionType::get(ctx, inputTypes, outTypes);
   auto machine =
       fsm::MachineOp::create(builder, loc, fsmName, "IDLE", funcType);
-  machine.setArgNamesAttr(
-      builder.getStrArrayAttr({"start", "cond", "child_done"}));
-  machine.setResNamesAttr(builder.getStrArrayAttr(
-      {"done", "first_iter", "child_start", "step_active", "post_active"}));
+
+  SmallVector<Attribute> argNames;
+  argNames.push_back(builder.getStringAttr("start"));
+  argNames.push_back(builder.getStringAttr("cond"));
+  for (unsigned j = 0; j < numWaits; ++j)
+    argNames.push_back(
+        builder.getStringAttr("child_done_" + std::to_string(j)));
+  machine.setArgNamesAttr(builder.getArrayAttr(argNames));
+
+  SmallVector<Attribute> resNames;
+  resNames.push_back(builder.getStringAttr("done"));
+  resNames.push_back(builder.getStringAttr("first_iter"));
+  resNames.push_back(builder.getStringAttr("iter_advance"));
+  for (unsigned i = 0; i < numSteps; ++i)
+    resNames.push_back(
+        builder.getStringAttr("step_active_" + std::to_string(i)));
+  for (unsigned j = 0; j < numWaits; ++j)
+    resNames.push_back(
+        builder.getStringAttr("child_start_" + std::to_string(j)));
+  for (unsigned j = 0; j < numWaits; ++j)
+    resNames.push_back(
+        builder.getStringAttr("child_active_" + std::to_string(j)));
+  for (unsigned j = 0; j < numWaits; ++j)
+    resNames.push_back(
+        builder.getStringAttr("post_active_" + std::to_string(j)));
+  machine.setResNamesAttr(builder.getArrayAttr(resNames));
 
   OpBuilder fb(ctx);
   fb.setInsertionPointToEnd(&machine.getBody().front());
@@ -483,10 +464,27 @@ fsm::MachineOp LoopScheduleToFSMPass::createNonLeafFSM(
   auto fiVar = fsm::VariableOp::create(
       fb, loc, i1, fb.getBoolAttr(true), "first_iter");
 
-  // Helper: done, first_iter(var), child_start, step_active, post_active
-  auto out = [&](bool d, bool cs, bool sa, bool pa) -> SmallVector<Value, 5> {
-    return {d ? trueVal : falseVal, fiVar, cs ? trueVal : falseVal,
-            sa ? trueVal : falseVal, pa ? trueVal : falseVal};
+  // Helper: build output vector.
+  //   activeStep    : index of step_active to drive high (-1 = none)
+  //   activeChild   : index into waitStepIndices for child_start (-1 = none)
+  //   activeLive    : index into waitStepIndices for child_active (-1 = none)
+  //   activePost    : index into waitStepIndices for post_active (-1 = none)
+  auto buildOut = [&](Value done, bool iterAdv, int activeStep,
+                      int activeChild, int activeLive,
+                      int activePost) -> SmallVector<Value> {
+    SmallVector<Value> v;
+    v.push_back(done);
+    v.push_back(fiVar);
+    v.push_back(iterAdv ? trueVal : falseVal);
+    for (unsigned i = 0; i < numSteps; ++i)
+      v.push_back((int)i == activeStep ? trueVal : falseVal);
+    for (unsigned j = 0; j < numWaits; ++j)
+      v.push_back((int)j == activeChild ? trueVal : falseVal);
+    for (unsigned j = 0; j < numWaits; ++j)
+      v.push_back((int)j == activeLive ? trueVal : falseVal);
+    for (unsigned j = 0; j < numWaits; ++j)
+      v.push_back((int)j == activePost ? trueVal : falseVal);
+    return v;
   };
 
   // --- IDLE ---
@@ -495,8 +493,7 @@ fsm::MachineOp LoopScheduleToFSMPass::createNonLeafFSM(
     Block *ob = st.ensureOutput(fb);
     ob->getTerminator()->erase();
     fb.setInsertionPointToEnd(ob);
-    auto v = out(false, false, false, false);
-    fsm::OutputOp::create(fb, loc, v);
+    fsm::OutputOp::create(fb, loc, buildOut(falseVal, false, -1, -1, -1, -1));
     Block *tb = &st.getTransitions().front();
     fb.setInsertionPointToEnd(tb);
     fsm::TransitionOp::create(
@@ -512,8 +509,7 @@ fsm::MachineOp LoopScheduleToFSMPass::createNonLeafFSM(
     Block *ob = st.ensureOutput(fb);
     ob->getTerminator()->erase();
     fb.setInsertionPointToEnd(ob);
-    auto v = out(false, false, false, false);
-    fsm::OutputOp::create(fb, loc, v);
+    fsm::OutputOp::create(fb, loc, buildOut(falseVal, false, -1, -1, -1, -1));
     Block *tb = &st.getTransitions().front();
     fb.setInsertionPointToEnd(tb);
     fsm::TransitionOp::create(
@@ -524,74 +520,101 @@ fsm::MachineOp LoopScheduleToFSMPass::createNonLeafFSM(
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
 
-  // --- STEP states ---
-  std::string waitName = "WAIT_" + std::to_string(childStepIdx);
-  std::string postName = "POST_" + std::to_string(childStepIdx);
-
+  // --- STEP_i (and WAIT_i / POST_i for wait steps) ---
   for (unsigned i = 0; i < numSteps; ++i) {
-    std::string name = "STEP_" + std::to_string(i);
-    bool isLaunch = (i == childStepIdx);
+    bool isWait = stepWaitIdx[i] >= 0;
+    bool isLast = (i + 1 == numSteps);
+    std::string stepName = "STEP_" + std::to_string(i);
+    std::string nextStepName = isLast ? "COND" : "STEP_" + std::to_string(i + 1);
 
-    auto st = fsm::StateOp::create(fb, loc, name);
-    Block *ob = st.ensureOutput(fb);
-    ob->getTerminator()->erase();
-    fb.setInsertionPointToEnd(ob);
-
-    if (isLaunch) {
-      auto v = out(false, true, false, false); // child_start=1
-      fsm::OutputOp::create(fb, loc, v);
-    } else {
-      auto v = out(false, false, true, false); // step_active=1
-      fsm::OutputOp::create(fb, loc, v);
+    // STEP_i
+    {
+      auto st = fsm::StateOp::create(fb, loc, stepName);
+      Block *ob = st.ensureOutput(fb);
+      ob->getTerminator()->erase();
+      fb.setInsertionPointToEnd(ob);
+      if (isWait) {
+        // Launch state: drive child_start_j AND child_active_j (the latter
+        // also stays high through WAIT_i so external mem-port muxes can
+        // forward this child's outputs). iter_advance is handled in POST_i.
+        fsm::OutputOp::create(
+            fb, loc,
+            buildOut(falseVal, /*iterAdv=*/false, /*activeStep=*/-1,
+                     /*activeChild=*/stepWaitIdx[i],
+                     /*activeLive=*/stepWaitIdx[i], /*activePost=*/-1));
+      } else {
+        // Regular step. iter_advance only when this is the last state of
+        // the trip (last step and not a wait — wait advances in POST).
+        bool iterAdv = isLast;
+        fsm::OutputOp::create(
+            fb, loc,
+            buildOut(falseVal, iterAdv, /*activeStep=*/(int)i,
+                     /*activeChild=*/-1, /*activeLive=*/-1,
+                     /*activePost=*/-1));
+      }
+      Block *tb = &st.getTransitions().front();
+      fb.setInsertionPointToEnd(tb);
+      if (isWait) {
+        std::string waitName = "WAIT_" + std::to_string(i);
+        fsm::TransitionOp::create(fb, loc, StringRef(waitName));
+      } else {
+        fsm::TransitionOp::create(fb, loc, StringRef(nextStepName));
+      }
     }
+    fb.setInsertionPointToEnd(&machine.getBody().front());
 
-    Block *tb = &st.getTransitions().front();
-    fb.setInsertionPointToEnd(tb);
+    if (!isWait)
+      continue;
 
-    if (isLaunch) {
-      fsm::TransitionOp::create(fb, loc, StringRef(waitName));
-    } else {
-      std::string next =
-          (i + 1 < numSteps) ? "STEP_" + std::to_string(i + 1) : "COND";
-      fsm::TransitionOp::create(fb, loc, StringRef(next));
+    // WAIT_i: wait for child_done_j, then go to POST_i.
+    std::string waitName = "WAIT_" + std::to_string(i);
+    std::string postName = "POST_" + std::to_string(i);
+    unsigned childDoneArgIdx = 2 + (unsigned)stepWaitIdx[i];
+    {
+      auto st = fsm::StateOp::create(fb, loc, waitName);
+      Block *ob = st.ensureOutput(fb);
+      ob->getTerminator()->erase();
+      fb.setInsertionPointToEnd(ob);
+      // WAIT_i: child j is still producing on the wires. Keep
+      // child_active_j high so external mem-port muxes route the child
+      // until it deasserts done.
+      fsm::OutputOp::create(
+          fb, loc,
+          buildOut(falseVal, /*iterAdv=*/false, /*activeStep=*/-1,
+                   /*activeChild=*/-1, /*activeLive=*/stepWaitIdx[i],
+                   /*activePost=*/-1));
+      Block *tb = &st.getTransitions().front();
+      fb.setInsertionPointToEnd(tb);
+      fsm::TransitionOp::create(
+          fb, loc, StringRef(postName),
+          [&]() {
+            fsm::ReturnOp::create(fb, loc,
+                                  machine.getArgument(childDoneArgIdx));
+          },
+          []() {});
+    }
+    fb.setInsertionPointToEnd(&machine.getBody().front());
+
+    // POST_i: drive post_active_j; iter_advance if this is the last step.
+    {
+      auto st = fsm::StateOp::create(fb, loc, postName);
+      Block *ob = st.ensureOutput(fb);
+      ob->getTerminator()->erase();
+      fb.setInsertionPointToEnd(ob);
+      bool iterAdv = isLast;
+      fsm::OutputOp::create(
+          fb, loc,
+          buildOut(falseVal, iterAdv, /*activeStep=*/-1,
+                   /*activeChild=*/-1, /*activeLive=*/-1,
+                   /*activePost=*/stepWaitIdx[i]));
+      Block *tb = &st.getTransitions().front();
+      fb.setInsertionPointToEnd(tb);
+      fsm::TransitionOp::create(fb, loc, StringRef(nextStepName));
     }
     fb.setInsertionPointToEnd(&machine.getBody().front());
   }
 
-  // --- WAIT ---
-  {
-    auto st = fsm::StateOp::create(fb, loc, waitName);
-    Block *ob = st.ensureOutput(fb);
-    ob->getTerminator()->erase();
-    fb.setInsertionPointToEnd(ob);
-    auto v = out(false, false, false, false);
-    fsm::OutputOp::create(fb, loc, v);
-    Block *tb = &st.getTransitions().front();
-    fb.setInsertionPointToEnd(tb);
-    fsm::TransitionOp::create(
-        fb, loc, StringRef(postName),
-        [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(2)); },
-        []() {});
-  }
-  fb.setInsertionPointToEnd(&machine.getBody().front());
-
-  // --- POST ---
-  {
-    auto st = fsm::StateOp::create(fb, loc, postName);
-    Block *ob = st.ensureOutput(fb);
-    ob->getTerminator()->erase();
-    fb.setInsertionPointToEnd(ob);
-    auto v = out(false, false, false, true); // post_active=1
-    fsm::OutputOp::create(fb, loc, v);
-    Block *tb = &st.getTransitions().front();
-    fb.setInsertionPointToEnd(tb);
-    // After POST: go to next step after child, or back to COND.
-    std::string next = (childStepIdx + 1 < numSteps)
-                           ? "STEP_" + std::to_string(childStepIdx + 1)
-                           : "COND";
-    fsm::TransitionOp::create(fb, loc, StringRef(next));
-  }
-  fb.setInsertionPointToEnd(&machine.getBody().front());
+  (void)lastIsWait; // documented above for clarity; not otherwise needed.
 
   // --- DONE ---
   {
@@ -599,8 +622,7 @@ fsm::MachineOp LoopScheduleToFSMPass::createNonLeafFSM(
     Block *ob = st.ensureOutput(fb);
     ob->getTerminator()->erase();
     fb.setInsertionPointToEnd(ob);
-    auto v = out(true, false, false, false);
-    fsm::OutputOp::create(fb, loc, v);
+    fsm::OutputOp::create(fb, loc, buildOut(trueVal, false, -1, -1, -1, -1));
     Block *tb = &st.getTransitions().front();
     fb.setInsertionPointToEnd(tb);
     fsm::TransitionOp::create(fb, loc, StringRef("IDLE"));
@@ -1016,25 +1038,27 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   auto terminatorOp =
       cast<LoopScheduleTerminatorOp>(seqOp.getScheduleBlock().getTerminator());
 
-  // Determine which step contains a child.
-  int childStepIdx = -1;
-  for (unsigned i = 0; i < node.stepChildIdx.size(); ++i) {
+  unsigned numSteps = steps.size();
+
+  // Collect the step indices that need to wait on an external done signal
+  // (today: child sequential loops and pipeline children; tomorrow: any
+  // variable-latency op). Sorted ascending by construction.
+  SmallVector<unsigned> waitStepIndices;
+  // For each waitStepIndices entry j, stepWaitIdx maps the loop step index
+  // back to j; -1 for "regular" steps.
+  SmallVector<int> stepWaitIdx(numSteps, -1);
+  for (unsigned i = 0; i < numSteps; ++i) {
     if (node.stepChildIdx[i] >= 0 || node.stepPipelineIdx[i] >= 0) {
-      childStepIdx = i;
-      break;
+      stepWaitIdx[i] = (int)waitStepIndices.size();
+      waitStepIndices.push_back(i);
     }
   }
+  unsigned numWaits = waitStepIndices.size();
 
   // --- Create FSM machine ---
   std::string fsmName = node.prefix + "_fsm";
   builder.setInsertionPointToEnd(moduleOp.getBody());
-
-  fsm::MachineOp machine;
-  if (node.isLeaf())
-    machine = createLeafFSM(builder, loc, fsmName, steps.size());
-  else
-    machine = createNonLeafFSM(builder, loc, fsmName, steps.size(),
-                               childStepIdx);
+  (void)createSequentialFSM(builder, loc, fsmName, numSteps, waitStepIndices);
 
   // --- Create FSM instance with backedges ---
   hw.setInsertionPointToEnd(hwBody);
@@ -1042,41 +1066,48 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
   Backedge condBE = bb.get(i1);
 
-  Value fsmDone, fsmFirstIter, fsmStepActive, fsmPostActive, fsmChildStart;
-  std::optional<Backedge> childDoneBE;
+  // One backedge per wait step for its child_done input.
+  SmallVector<Backedge> childDoneBEs;
+  childDoneBEs.reserve(numWaits);
+  for (unsigned j = 0; j < numWaits; ++j)
+    childDoneBEs.push_back(bb.get(i1));
 
-  if (node.isLeaf()) {
-    auto inst = fsm::HWInstanceOp::create(
-        hw, loc, TypeRange{i1, i1, i1},
-        hw.getStringAttr(fsmName + "_inst"),
-        hw.getAttr<FlatSymbolRefAttr>(fsmName),
-        ValueRange{startSignal, Value(condBE)}, clk, rst);
-    fsmDone = inst.getResult(0);
-    fsmFirstIter = inst.getResult(1);
-    fsmStepActive = inst.getResult(2);
-  } else {
-    childDoneBE = bb.get(i1);
-    auto inst = fsm::HWInstanceOp::create(
-        hw, loc, TypeRange{i1, i1, i1, i1, i1},
-        hw.getStringAttr(fsmName + "_inst"),
-        hw.getAttr<FlatSymbolRefAttr>(fsmName),
-        ValueRange{startSignal, Value(condBE), Value(*childDoneBE)}, clk, rst);
-    fsmDone = inst.getResult(0);
-    fsmFirstIter = inst.getResult(1);
-    fsmChildStart = inst.getResult(2);
-    fsmStepActive = inst.getResult(3);
-    fsmPostActive = inst.getResult(4);
-  }
+  // Build instance inputs: start, cond, child_done_0..C-1.
+  SmallVector<Value> instInputs;
+  instInputs.push_back(startSignal);
+  instInputs.push_back(Value(condBE));
+  for (auto &be : childDoneBEs)
+    instInputs.push_back(Value(be));
 
-  // Compute clock enable for iter arg registers.
-  Value ce;
-  if (node.isLeaf()) {
-    ce = comb::OrOp::create(hw, loc, fsmStepActive, fsmFirstIter);
-  } else {
-    Value spOr =
-        comb::OrOp::create(hw, loc, fsmStepActive, fsmPostActive);
-    ce = comb::OrOp::create(hw, loc, spOr, fsmFirstIter);
-  }
+  // Result types: done, first_iter, iter_advance,
+  //               step_active_0..N-1, child_start_0..C-1,
+  //               child_active_0..C-1, post_active_0..C-1.
+  unsigned numFsmResults = 3 + numSteps + 3 * numWaits;
+  SmallVector<Type> resTys(numFsmResults, i1);
+  auto inst = fsm::HWInstanceOp::create(
+      hw, loc, resTys, hw.getStringAttr(fsmName + "_inst"),
+      hw.getAttr<FlatSymbolRefAttr>(fsmName), instInputs, clk, rst);
+
+  Value fsmDone = inst.getResult(0);
+  Value fsmFirstIter = inst.getResult(1);
+  Value fsmIterAdvance = inst.getResult(2);
+  SmallVector<Value> fsmStepActives(numSteps);
+  for (unsigned i = 0; i < numSteps; ++i)
+    fsmStepActives[i] = inst.getResult(3 + i);
+  SmallVector<Value> fsmChildStarts(numWaits);
+  for (unsigned j = 0; j < numWaits; ++j)
+    fsmChildStarts[j] = inst.getResult(3 + numSteps + j);
+  SmallVector<Value> fsmChildActives(numWaits);
+  for (unsigned j = 0; j < numWaits; ++j)
+    fsmChildActives[j] = inst.getResult(3 + numSteps + numWaits + j);
+  SmallVector<Value> fsmPostActives(numWaits);
+  for (unsigned j = 0; j < numWaits; ++j)
+    fsmPostActives[j] = inst.getResult(3 + numSteps + 2 * numWaits + j);
+
+  // Clock enable for iter_arg registers: advance exactly once per loop trip,
+  // on the FSM's last cycle before COND. first_iter forces the init load on
+  // entry to a new loop invocation.
+  Value ce = comb::OrOp::create(hw, loc, fsmIterAdvance, fsmFirstIter);
 
   // --- Create iter arg registers ---
   SmallVector<Value> iterArgRegs;
@@ -1098,10 +1129,13 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     hw.setInsertionPointToEnd(hwBody);
 
     int childIdx = node.stepChildIdx[stepIdx];
+    int waitIdx = stepWaitIdx[stepIdx];
     if (childIdx >= 0) {
       // This step contains a child sequential loop.
       auto &childNode = node.children[childIdx];
       auto childSeqOp = childNode.seqOp;
+      Value stepChildStart = fsmChildStarts[waitIdx];
+      Value stepPostActive = fsmPostActives[waitIdx];
 
       // Lower pre-child ops.
       for (auto &op : *body) {
@@ -1120,7 +1154,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
         if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
           // Pre-child stores fire only during the child-launch state.
-          if (failed(handleStore(storeOp, hw, localMapping, fsmChildStart,
+          if (failed(handleStore(storeOp, hw, localMapping, stepChildStart,
                                   localMemPorts)))
             return failure();
           continue;
@@ -1142,7 +1176,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       SmallVector<Value> childInputs;
       childInputs.push_back(clk);
       childInputs.push_back(rst);
-      childInputs.push_back(fsmChildStart);
+      childInputs.push_back(stepChildStart);
       for (Value cap : childCaptured)
         childInputs.push_back(localMapping.lookup(cap));
       for (auto &memInfo : memrefArgs)
@@ -1156,15 +1190,18 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       // Extract child outputs: done, results..., (addr, wrData, wrEn) per mem...
       unsigned outIdx = 0;
       Value childDone = childInst.getResult(outIdx++);
-      childDoneBE->setValue(childDone);
+      childDoneBEs[waitIdx].setValue(childDone);
 
       // Map child sequential op results.
       for (auto result : childSeqOp.getResults())
         localMapping.map(result, childInst.getResult(outIdx++));
 
-      // Extract child memory outputs and mux with parent's.
-      Value parentActive =
-          comb::OrOp::create(hw, loc, fsmStepActive, fsmPostActive);
+      // Mux child memory ports against the parent's. Use this child's own
+      // child_active_j predicate so multiple sibling children can priority-
+      // chain on the same memory port without clobbering each other: each
+      // child contributes a `mux(child_active_j, childPort, prev)` layer
+      // over what was already there.
+      Value childActive = fsmChildActives[waitIdx];
       for (auto &memInfo : memrefArgs) {
         Value childAddr = childInst.getResult(outIdx++);
         Value childWrData = childInst.getResult(outIdx++);
@@ -1182,11 +1219,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
             : hw::ConstantOp::create(hw, loc, i1, 0);
 
         ports.addr =
-            comb::MuxOp::create(hw, loc, parentActive, myAddr, childAddr);
+            comb::MuxOp::create(hw, loc, childActive, childAddr, myAddr);
         ports.wrData =
-            comb::MuxOp::create(hw, loc, parentActive, myWrData, childWrData);
+            comb::MuxOp::create(hw, loc, childActive, childWrData, myWrData);
         ports.wrEn =
-            comb::MuxOp::create(hw, loc, parentActive, myWrEn, childWrEn);
+            comb::MuxOp::create(hw, loc, childActive, childWrEn, myWrEn);
       }
 
       // Lower post-child ops with wrEnGate = postActive.
@@ -1203,7 +1240,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           continue;
 
         if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-          if (failed(handleStore(storeOp, hw, localMapping, fsmPostActive,
+          if (failed(handleStore(storeOp, hw, localMapping, stepPostActive,
                                   localMemPorts)))
             return failure();
           continue;
@@ -1221,6 +1258,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       // This step contains a pipeline child.
       int pipIdx = node.stepPipelineIdx[stepIdx];
       auto pipOp = node.pipelineChildren[pipIdx];
+      Value stepChildStart = fsmChildStarts[waitIdx];
+      Value stepPostActive = fsmPostActives[waitIdx];
 
       // Lower pre-pipeline ops.
       for (auto &op : *body) {
@@ -1245,10 +1284,10 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       Value pipDone;
       std::string pipPrefix = node.prefix + "_pip" + std::to_string(pipIdx);
       if (failed(lowerPipelineChild(pipOp, hw, loc, hwBody, localMapping, clk,
-                                    rst, fsmChildStart, pipPrefix, pipDone,
+                                    rst, stepChildStart, pipPrefix, pipDone,
                                     localMemPorts)))
         return failure();
-      childDoneBE->setValue(pipDone);
+      childDoneBEs[waitIdx].setValue(pipDone);
 
       // Lower post-pipeline ops with wrEnGate = postActive.
       hw.setInsertionPointToEnd(hwBody);
@@ -1264,7 +1303,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           continue;
 
         if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-          if (failed(handleStore(storeOp, hw, localMapping, fsmPostActive,
+          if (failed(handleStore(storeOp, hw, localMapping, stepPostActive,
                                   localMemPorts)))
             return failure();
           continue;
@@ -1279,9 +1318,10 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         hw.clone(op, localMapping);
       }
     } else {
-      // Regular step (no child). Gate stores with step_active.
-      if (failed(lowerStepBody(body, hw, localMapping, fsmStepActive,
-                               localMemPorts)))
+      // Regular step (no child). Gate stores with this step's per-step
+      // active signal so the store fires only in its STEP_i state.
+      if (failed(lowerStepBody(body, hw, localMapping,
+                               fsmStepActives[stepIdx], localMemPorts)))
         return failure();
     }
 
