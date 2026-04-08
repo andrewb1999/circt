@@ -1196,6 +1196,145 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
     startTimes.push_back(group.first);
   llvm::sort(startTimes);
 
+  // === Bucket merge for loopschedule.delay emission ===
+  //
+  // When `enableDelayMerging` is on, coalesce groups whose start times fall
+  // within an earlier group's running latency into a single multi-cycle step.
+  // The base group's ops live at offset 0 inside the step body; merged groups
+  // are wrapped in a `loopschedule.delay` region with latency = offset.
+  //
+  // After the merge, `startGroups[t]` only contains the offset-0 ops for the
+  // bucket whose baseTime is `t`, and `delayOffsetGroups[t]` (only set for
+  // base times of merged buckets) contains a map from offset>0 to the ops
+  // that should appear inside that delay region.
+  DenseMap<uint32_t, std::map<uint32_t, SmallVector<Operation *>>>
+      delayOffsetGroups;
+  if (enableDelayMerging) {
+    auto opLatency = [&](Operation *op) -> uint32_t {
+      auto opr = problem.getLinkedOperatorType(op);
+      if (!opr)
+        return 1;
+      auto lat = problem.getLatency(*opr);
+      return lat.value_or(1);
+    };
+    auto groupMaxLat = [&](ArrayRef<Operation *> g) -> uint32_t {
+      uint32_t m = 1;
+      for (auto *op : g)
+        m = std::max(m, opLatency(op));
+      return m;
+    };
+    auto groupContainsLoop = [](ArrayRef<Operation *> g) {
+      for (auto *op : g)
+        if (isa<LoopInterface>(op))
+          return true;
+      return false;
+    };
+
+    // Collect ops that produce loop iter_args (operands of the after-body
+    // terminator). These must remain at offset 0 of their bucket so the
+    // existing iter_arg plumbing keeps working.
+    DenseSet<Operation *> iterArgProducers;
+    for (auto &operand : anchor->getOpOperands()) {
+      if (auto *def = operand.get().getDefiningOp())
+        iterArgProducers.insert(def);
+    }
+    auto groupHasIterArgProducer = [&](ArrayRef<Operation *> g) {
+      for (auto *op : g)
+        if (iterArgProducers.count(op))
+          return true;
+      return false;
+    };
+
+    // Collect ops referenced by the loop's combinational condition. These
+    // also must remain at offset 0 of the first bucket so the cond is
+    // available at cycle 0 of the first step.
+    DenseSet<Operation *> condTransitiveDeps;
+    {
+      std::queue<Value> worklist;
+      worklist.push(scfCond.getCondition());
+      DenseSet<Value> seen;
+      while (!worklist.empty()) {
+        Value v = worklist.front();
+        worklist.pop();
+        if (!seen.insert(v).second)
+          continue;
+        auto *def = v.getDefiningOp();
+        if (!def)
+          continue;
+        if (def->getParentRegion() == &loop.getBefore()) {
+          for (auto operand : def->getOperands())
+            worklist.push(operand);
+          continue;
+        }
+        condTransitiveDeps.insert(def);
+      }
+    }
+    auto groupHasCondDep = [&](ArrayRef<Operation *> g) {
+      for (auto *op : g)
+        if (condTransitiveDeps.count(op))
+          return true;
+      return false;
+    };
+
+    struct StepBucket {
+      uint32_t baseTime;
+      uint32_t latency;
+      std::map<uint32_t, SmallVector<Operation *>> opsByOffset;
+    };
+    SmallVector<StepBucket> buckets;
+    for (auto t : startTimes) {
+      auto &group = startGroups[t];
+      uint32_t lat = groupMaxLat(group);
+      bool merged = false;
+      if (!group.empty() && !groupContainsLoop(group) &&
+          !groupHasIterArgProducer(group) && !groupHasCondDep(group)) {
+        for (auto &b : llvm::reverse(buckets)) {
+          auto it0 = b.opsByOffset.find(0);
+          if (it0 != b.opsByOffset.end() && groupContainsLoop(it0->second))
+            continue;
+          if (b.baseTime <= t && t < b.baseTime + b.latency) {
+            uint32_t off = t - b.baseTime;
+            b.opsByOffset[off].append(group.begin(), group.end());
+            uint32_t newLat = off + lat;
+            if (newLat > b.latency)
+              b.latency = newLat;
+            merged = true;
+            break;
+          }
+        }
+      }
+      if (!merged) {
+        StepBucket b;
+        b.baseTime = t;
+        b.latency = lat;
+        b.opsByOffset[0] = group;
+        buckets.push_back(b);
+      }
+    }
+
+    // Rewrite startGroups / startTimes to contain only bucket baseTimes with
+    // their offset-0 ops, and stash offset>0 groups in `delayOffsetGroups`.
+    DenseSet<uint32_t> bucketBases;
+    for (auto &b : buckets)
+      bucketBases.insert(b.baseTime);
+    SmallVector<unsigned> toErase;
+    for (auto &kv : startGroups)
+      if (!bucketBases.count(kv.first))
+        toErase.push_back(kv.first);
+    for (auto t : toErase)
+      startGroups.erase(t);
+    for (auto &b : buckets) {
+      startGroups[b.baseTime] = b.opsByOffset[0];
+      for (auto &kv : b.opsByOffset)
+        if (kv.first != 0)
+          delayOffsetGroups[b.baseTime][kv.first] = kv.second;
+    }
+    startTimes.clear();
+    for (auto &b : buckets)
+      startTimes.push_back(b.baseTime);
+    llvm::sort(startTimes);
+  }
+
   DenseMap<uint32_t, SmallVector<Value>> reregisterValues;
 
   LoopScheduleStepOp lastStep;
@@ -1253,6 +1392,38 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
     // Add return types for values we already know need to be reregistered.
     for (auto val : reregisterValues[startTime]) {
       stepTypes.push_back(val.getType());
+    }
+
+    // Delay-region exports: each op in a delay region whose result has any
+    // user with a later original startTime needs its result to escape via
+    // the delay's register AND become a step result. We follow the same
+    // criterion as opsWithReturns above; in-bucket higher-offset uses are a
+    // (harmless) false positive — they'd already get the value via the
+    // delay op's own result through valueMap.
+    SmallVector<Operation *> delayExportOps; // ops whose results escape the step
+    DenseMap<Operation *, unsigned>
+        delayExportFirstStepIdx; // op → first step result index
+    if (delayOffsetGroups.count(startTime)) {
+      for (auto &offsetEntry : delayOffsetGroups[startTime]) {
+        for (auto *op : offsetEntry.second) {
+          bool exports = false;
+          for (auto *user : op->getUsers()) {
+            auto *ua = loop.getAfter().findAncestorOpInRegion(*user);
+            auto ut = problem.getStartTime(ua);
+            if ((ut.has_value() && *ut > startTime) ||
+                isLoopTerminator(user)) {
+              exports = true;
+              break;
+            }
+          }
+          if (exports) {
+            delayExportFirstStepIdx[op] = stepTypes.size();
+            for (auto t : op->getResultTypes())
+              stepTypes.push_back(t);
+            delayExportOps.push_back(op);
+          }
+        }
+      }
     }
 
     // The first step gains an extra i1 result for the loop condition.
@@ -1336,6 +1507,96 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
       valueMap.map(val, newValue);
     }
 
+    // Emit delay regions for offsets > 0 in this bucket. Each delay op
+    // wraps the ops scheduled at offset cycles into the step. Every cloned
+    // op's results are registered as delay results so subsequent in-bucket
+    // ops can reference them via valueMap. Ops whose results were marked
+    // for export to the step (delayExportFirstStepIdx) also have their
+    // delay results inserted into the step's terminator.
+    if (delayOffsetGroups.count(startTime)) {
+      OpBuilder::InsertionGuard guard(builder);
+      // Insert delay ops at the end of the step body (just before the
+      // implicit register terminator).
+      builder.setInsertionPoint(stepTerminator);
+      for (auto &offsetEntry : delayOffsetGroups[startTime]) {
+        uint32_t offset = offsetEntry.first;
+        auto &delayOps = offsetEntry.second;
+
+        // Sort by dominance for stable ordering inside the delay body.
+        llvm::sort(delayOps, [&](Operation *a, Operation *b) {
+          return dom.dominates(a, b);
+        });
+
+        // Compute delay result types: register every cloned op's results
+        // (simple, slightly wasteful but correct).
+        SmallVector<Type> delayResultTypes;
+        for (auto *op : delayOps)
+          for (auto t : op->getResultTypes())
+            delayResultTypes.push_back(t);
+
+        Location dLoc = delayOps.front()->getLoc();
+        auto delayOp = LoopScheduleDelayOp::create(builder, dLoc,
+                                                   (uint64_t)offset,
+                                                   delayResultTypes);
+        Block &delayBlock = delayOp.getBodyBlock();
+        auto *delayTerminator = delayBlock.getTerminator();
+
+        // Clone delay ops into the delay body.
+        OpBuilder::InsertionGuard innerGuard(builder);
+        builder.setInsertionPointToStart(&delayBlock);
+        DenseMap<Operation *, Operation *> delayOldToNew;
+        SmallVector<Value> delayRegOperands;
+        for (auto *op : delayOps) {
+          auto *newOp = builder.clone(*op, valueMap);
+          dependenceAnalysis->replaceOp(op, newOp);
+          delayOldToNew[op] = newOp;
+          // Update valueMap so subsequent in-delay ops see this clone.
+          for (auto [orig, clone] :
+               llvm::zip(op->getResults(), newOp->getResults()))
+            valueMap.map(orig, clone);
+          for (auto r : newOp->getResults())
+            delayRegOperands.push_back(r);
+        }
+        // Set the delay's register terminator operands.
+        delayTerminator->setOperands(delayRegOperands);
+
+        // Map original op results to the delay op's external results so
+        // later ops in the same step (in higher-offset delay regions) see
+        // the delay op result through valueMap.
+        unsigned delayResultIdx = 0;
+        for (auto *op : delayOps) {
+          for (auto orig : op->getResults()) {
+            valueMap.map(orig, delayOp.getResult(delayResultIdx++));
+          }
+        }
+
+        // For ops whose results escape this step, append the delay's
+        // result to the step terminator at the pre-computed step index.
+        // (We assume the existing iteration order over delayOffsetGroups
+        // matches the order used during stepTypes computation, which it
+        // does because both iterate the std::map in offset order.)
+        for (auto *op : delayOps) {
+          auto it = delayExportFirstStepIdx.find(op);
+          if (it == delayExportFirstStepIdx.end())
+            continue;
+          // Find the delay op's results corresponding to this op.
+          unsigned firstDelayIdx = 0;
+          for (auto *o : delayOps) {
+            if (o == op)
+              break;
+            firstDelayIdx += o->getNumResults();
+          }
+          for (unsigned i = 0, e = op->getNumResults(); i < e; ++i) {
+            unsigned stepIdx = it->second + i;
+            (void)stepIdx;
+            stepTerminator->insertOperands(
+                stepTerminator->getNumOperands(),
+                delayOp.getResult(firstDelayIdx + i));
+          }
+        }
+      }
+    }
+
     // For the first step, clone the scf.before-body's combinational
     // condition ops into this step and register the resulting i1 condition
     // as the step's last result.
@@ -1362,6 +1623,15 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
         auto newValue = step->getResult(resultIndex + i);
         auto oldValue = op->getResult(i);
         valueMap.map(oldValue, newValue);
+      }
+    }
+
+    // Same for delay-region exports: map the original op result to the
+    // step result so later steps reference the step boundary.
+    for (auto *op : delayExportOps) {
+      unsigned firstIdx = delayExportFirstStepIdx[op];
+      for (unsigned i = 0, e = op->getNumResults(); i < e; ++i) {
+        valueMap.map(op->getResult(i), step->getResult(firstIdx + i));
       }
     }
 
