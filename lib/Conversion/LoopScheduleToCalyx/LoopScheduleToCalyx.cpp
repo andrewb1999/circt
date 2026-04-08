@@ -106,8 +106,9 @@ public:
 //===----------------------------------------------------------------------===//
 
 /// A variant of types representing schedulable operations.
-using Schedulable = std::variant<calyx::StaticGroupOp, LoopWrapper,
-                                 PhaseInterface, LoopScheduleIfOp>;
+using Schedulable =
+    std::variant<calyx::StaticGroupOp, LoopWrapper, PhaseInterface,
+                 LoopScheduleIfOp, LoopScheduleDelayOp>;
 
 using PhaseRegister = std::variant<calyx::RegisterOp, Value>;
 
@@ -209,6 +210,17 @@ public:
     if (!noStallLastCycleWires.contains(loop))
       return std::nullopt;
     return noStallLastCycleWires[loop];
+  }
+
+  void addDelayPadGroup(LoopScheduleDelayOp delay,
+                        calyx::StaticGroupOp group) {
+    assert(!delayPadGroups.contains(delay));
+    delayPadGroups[delay] = group;
+  }
+
+  calyx::StaticGroupOp getDelayPadGroup(LoopScheduleDelayOp delay) {
+    assert(delayPadGroups.contains(delay));
+    return delayPadGroups[delay];
   }
 
   void addPhaseDynamicAccess(PhaseInterface phase, Value port,
@@ -324,6 +336,8 @@ private:
   SmallVector<calyx::MemoryInterface> writeEnSet;
 
   DenseMap<PhaseInterface, SmallVector<Value>> holdCEInPhase;
+
+  DenseMap<LoopScheduleDelayOp, calyx::StaticGroupOp> delayPadGroups;
 };
 
 /// Handles the current state of lowering of a Calyx component. It is mainly
@@ -400,8 +414,8 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                   LoopInterface, LoopScheduleTerminatorOp, LoopScheduleYieldOp,
                   LoopScheduleIfOp, LoopScheduleBufferOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
-              .template Case<FuncOp, LoopScheduleRegisterOp, PhaseInterface,
-                             ReturnOp>([&](auto) {
+              .template Case<FuncOp, LoopScheduleRegisterOp, LoopScheduleDelayOp,
+                             PhaseInterface, ReturnOp>([&](auto) {
                 /// Skip: these special cases will be handled separately.
                 return true;
               })
@@ -2603,6 +2617,51 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
   }
 };
 
+/// Walks `loopschedule.delay` ops, registers each as a schedulable in its
+/// enclosing step's body block, creates a static padding group of latency
+/// `delay.latency`, and forwards the delay's results to the inner register
+/// operands so the parent step's terminator can read them.
+class BuildDelayGroups : public calyx::FuncOpPartialLoweringPattern {
+  using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
+
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
+    auto compOp = getState<ComponentLoweringState>().getComponentOp();
+    auto res = funcOp.walk([&](LoopScheduleDelayOp delayOp) {
+      auto *registerOp = delayOp.getBody().front().getTerminator();
+
+      // Forward each delay result to the corresponding register operand so
+      // outside uses see the inner SSA value. This produces a temporarily
+      // invalid IR (cross-region reference) but the surrounding func.func is
+      // erased before verification runs.
+      assert(registerOp->getNumOperands() == delayOp->getNumResults());
+      for (size_t i = 0, e = delayOp->getNumResults(); i < e; ++i)
+        delayOp->getResult(i).replaceAllUsesWith(registerOp->getOperand(i));
+
+      // Create the padding static group. Empty body — calyx static groups
+      // declare implicit done after `latency` cycles, so the body needs no
+      // assignments.
+      auto groupName =
+          getState<ComponentLoweringState>().getUniqueName("delay_pad");
+      auto padGroup = calyx::createStaticGroup(rewriter, compOp,
+                                               delayOp.getLoc(), groupName,
+                                               delayOp.getLatency());
+      getState<ComponentLoweringState>().addDelayPadGroup(delayOp, padGroup);
+
+      // Register the delay as a schedulable in its parent step's body block.
+      getState<ComponentLoweringState>().addBlockSchedulable(delayOp->getBlock(),
+                                                             delayOp);
+      return WalkResult::advance();
+    });
+
+    if (res.wasInterrupted())
+      return failure();
+
+    return success();
+  }
+};
+
 /// Builds a control schedule by traversing the CFG of the function and
 /// associating this with the previously created groups.
 /// For simplicity, the generated control flow is expanded for all possible
@@ -2771,6 +2830,24 @@ private:
         rewriter.setInsertionPointAfter(loopParentCtrlOp);
         if (res.failed())
           return loopOp.getOperation()->emitError("Cannot schedule loop body");
+      } else if (auto *delaySchedPtr =
+                     std::get_if<LoopScheduleDelayOp>(&sched)) {
+        auto &delayOp = *delaySchedPtr;
+        // Emit `static_seq { delay_pad; static_par { body } }` so the body
+        // schedulables fire `latency` cycles into the enclosing static par.
+        auto seqOp = rewriter.create<calyx::StaticSeqOp>(delayOp.getLoc());
+        rewriter.setInsertionPointToEnd(seqOp.getBodyBlock());
+        auto padGroup =
+            getState<ComponentLoweringState>().getDelayPadGroup(delayOp);
+        rewriter.create<calyx::EnableOp>(delayOp.getLoc(),
+                                         padGroup.getSymName());
+        auto parOp = rewriter.create<calyx::StaticParOp>(delayOp.getLoc());
+        rewriter.setInsertionPointToEnd(parOp.getBodyBlock());
+        path.insert(&delayOp.getBody().front());
+        auto res = scheduleBasicBlock(rewriter, path, parOp.getBodyBlock(),
+                                      &delayOp.getBody().front());
+        if (res.failed())
+          return delayOp->emitOpError("Failed to schedule delay op block");
       } else if (auto *ifSchedPtr = std::get_if<LoopScheduleIfOp>(&sched)) {
         auto &ifOp = *ifSchedPtr;
         auto phaseOp = ifOp->getParentOfType<PhaseInterface>();
@@ -3310,6 +3387,11 @@ void LoopScheduleToCalyxPass::runOnOperation() {
 
   addOncePattern<BuildIfGroups>(loweringPatterns, patternState, funcMap,
                                 *loweringState);
+
+  /// Register `loopschedule.delay` ops as schedulables and create their
+  /// padding groups.
+  addOncePattern<BuildDelayGroups>(loweringPatterns, patternState, funcMap,
+                                   *loweringState);
 
   /// This pattern traverses the CFG of the program and generates a control
   /// schedule based on the calyx::StaticGroupOp's which were registered for
