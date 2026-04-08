@@ -559,20 +559,67 @@ LoopScheduleRegisterOp LoopScheduleStepOp::getRegisterOp() {
 }
 
 //===----------------------------------------------------------------------===//
+// LoopScheduleDelayOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult LoopScheduleDelayOp::verify() {
+  if (getLatency() < 1)
+    return emitOpError("latency must be >= 1 (use plain ops for offset 0)");
+
+  // Verify that result types match register types.
+  auto regOp = getRegisterOp();
+  auto regOpTypes = regOp.getOperandTypes();
+  auto delayResTypes = getResultTypes();
+
+  if (regOpTypes.size() != delayResTypes.size())
+    return emitOpError("number of results (")
+           << delayResTypes.size()
+           << ") must match number of register operands (" << regOpTypes.size()
+           << ")";
+  for (auto p : llvm::zip(regOpTypes, delayResTypes)) {
+    if (std::get<0>(p) != std::get<1>(p))
+      return emitOpError("delay op result types do not match register op types");
+  }
+  return success();
+}
+
+void LoopScheduleDelayOp::build(OpBuilder &builder, OperationState &state,
+                                uint64_t latency, TypeRange resultTypes) {
+  OpBuilder::InsertionGuard g(builder);
+
+  state.addAttribute(getLatencyAttrName(state.name),
+                     builder.getI64IntegerAttr(latency));
+  state.addTypes(resultTypes);
+
+  Region *region = state.addRegion();
+  Block &block = region->emplaceBlock();
+  builder.setInsertionPointToEnd(&block);
+  builder.create<LoopScheduleRegisterOp>(builder.getUnknownLoc(), ValueRange());
+}
+
+LoopScheduleRegisterOp LoopScheduleDelayOp::getRegisterOp() {
+  return cast<LoopScheduleRegisterOp>(this->getBodyBlock().getTerminator());
+}
+
+//===----------------------------------------------------------------------===//
 // LoopScheduleRegisterOp
 //===----------------------------------------------------------------------===//
 
 LogicalResult LoopScheduleRegisterOp::verify() {
   // Verify the parent phase terminates with the same types as its result types.
+  // ParentOneOf the immediate parent: pipeline.stage, step, or delay.
   TypeRange registerTypes = getOperandTypes();
   TypeRange resultTypes;
-  if (auto stage = (*this)->getParentOfType<LoopSchedulePipelineStageOp>())
+  Operation *parent = (*this)->getParentOp();
+  if (auto stage = dyn_cast_or_null<LoopSchedulePipelineStageOp>(parent))
     resultTypes = stage.getResultTypes();
-  else if (auto step = (*this)->getParentOfType<LoopScheduleStepOp>())
+  else if (auto step = dyn_cast_or_null<LoopScheduleStepOp>(parent))
     resultTypes = step.getResultTypes();
+  else if (auto delay = dyn_cast_or_null<LoopScheduleDelayOp>(parent))
+    resultTypes = delay.getResultTypes();
   else
-    return emitOpError("must be inside a 'loopschedule.pipeline.stage' or "
-                       "'loopschedule.step'");
+    return emitOpError("must be inside a 'loopschedule.pipeline.stage', "
+                       "'loopschedule.step', or 'loopschedule.delay'");
 
   if (registerTypes != resultTypes)
     return emitOpError("operand types (")

@@ -334,8 +334,54 @@ def LoopScheduleStepOp : LoopScheduleOp<"step",
   }];
 }
 
+def LoopScheduleDelayOp : LoopScheduleOp<"delay",
+    [ParentOneOf<["LoopScheduleStepOp", "LoopScheduleDelayOp"]>,
+     SingleBlockImplicitTerminator<"LoopScheduleRegisterOp">]> {
+  let summary = "Delays the start of its body by `latency` cycles within "
+                "the enclosing step.";
+  let description = [{
+    The `loopschedule.delay` operation models a sub-step start-time offset.
+    Operations in its single-block body are scheduled to begin executing
+    `latency` cycles after the start of the enclosing `loopschedule.step`.
+    Values referenced by ops outside the delay region are passed out via
+    its terminating `loopschedule.register`.
+
+    A delay op contributes `latency + max(child end cycles)` cycles to its
+    enclosing step's total latency. Multiple delay ops in the same step
+    body run concurrently with each other and with the step's offset-0 ops
+    (the enclosing step is conceptually a static-par).
+  }];
+
+  let arguments = (ins I64Attr:$latency);
+
+  let results = (outs
+    Variadic<AnyType>:$results
+  );
+
+  let regions = (region
+    SizedRegion<1>:$body
+  );
+
+  let assemblyFormat = [{
+    $latency $body (`->` qualified(type($results))^)? attr-dict
+  }];
+
+  let hasVerifier = 1;
+
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins "uint64_t":$latency, "mlir::TypeRange":$resultTypes)>
+  ];
+
+  let extraClassDeclaration = [{
+    Block &getBodyBlock() { return getBody().front(); }
+    LoopScheduleRegisterOp getRegisterOp();
+  }];
+}
+
 def LoopScheduleRegisterOp : LoopScheduleOp<"register",
-    [ParentOneOf<["LoopSchedulePipelineStageOp", "LoopScheduleStepOp"]>, Terminator]> {
+    [ParentOneOf<["LoopSchedulePipelineStageOp", "LoopScheduleStepOp",
+                  "LoopScheduleDelayOp"]>, Terminator]> {
   let summary = "LoopSchedule dialect loop register.";
   let description = [{
     The `loopschedule.register` terminates a pipeline stage and
