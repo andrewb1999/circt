@@ -53,6 +53,23 @@ def StripDebugInfoWithPred : Pass<"strip-debuginfo-with-pred", "::mlir::ModuleOp
            "intended to be used for testing."> ];
 }
 
+def SCFWhileLoopFlattening :
+    Pass<"scf-while-loop-flattening", "::mlir::func::FuncOp"> {
+  let summary = "Flatten perfect nests of scf.while loops";
+  let description = [{
+    Flattens a perfect nest of `scf.while` loops, each of which is
+    structurally a for-loop (single IV iter-arg, constant init, bound, and
+    step, as recognized by `getSCFWhileConstantTripCount`), into a single
+    `scf.while`. Rather than recovering per-level indices from a linearized
+    counter via div/mod, each level keeps its own IV register and the
+    updates cascade through `arith.select` / `arith.cmpi` so the output
+    lowers to cheap combinational hardware.
+  }];
+  let constructor = "circt::createSCFWhileLoopFlatteningPass()";
+  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::arith::ArithDialect",
+                           "mlir::func::FuncDialect"];
+}
+
 def IfOpHoisting : Pass<"if-op-hoisting", "::mlir::func::FuncOp"> {
   let summary = "Hoist scf IfOps to arith.select when possible";
   let description = [{Hoist scf IfOps to arith.select when possible}];

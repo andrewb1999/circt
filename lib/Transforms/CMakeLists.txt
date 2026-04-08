@@ -14,6 +14,7 @@ add_circt_library(CIRCTTransforms
   PrintOpCount.cpp
   MemoryBanking.cpp
   PrintOpCount.cpp
+  SCFWhileLoopFlattening.cpp
   StripDebugInfoWithPred.cpp
 
   ADDITIONAL_HEADER_DIRS
@@ -23,6 +24,7 @@ add_circt_library(CIRCTTransforms
   CIRCTComb
   CIRCTHW
   CIRCTOpCountAnalysis
+  CIRCTSCFWhileTripCountAnalysis
   MLIRArithDialect
   MLIRControlFlowDialect
   MLIRControlFlowTransforms

@@ -51,6 +51,7 @@ std::unique_ptr<mlir::Pass> createStripDebugInfoWithPredPass(
 std::unique_ptr<mlir::Pass> createArithStrengthReductionPass();
 std::unique_ptr<mlir::Pass> createIndexSwitchToIfPass();
 std::unique_ptr<mlir::Pass> createIfOpHoistingPass();
+std::unique_ptr<mlir::Pass> createSCFWhileLoopFlatteningPass();
 std::unique_ptr<mlir::Pass> createIndexRemovalPass();
 std::unique_ptr<mlir::Pass> createMaximizeSSAPass();
 std::unique_ptr<mlir::Pass> createInsertMergeBlocksPass();
