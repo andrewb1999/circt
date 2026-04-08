@@ -507,6 +507,16 @@ LogicalResult MachineOpConverter::dispatch() {
       outputAssignment.assignmentInState[state] = {
           stateConvResults[state].outputs[portIndex]};
 
+    // Provide a safe pre-case default so the empty `default:` arm of the
+    // case statement does not leave the output unassigned (which Verilator
+    // would interpret as an inferred latch). Zero is the neutral choice for
+    // integer outputs; aggregate types fall back to today's behaviour.
+    if (auto intTy = dyn_cast<IntegerType>(outputPortType)) {
+      auto zeroDefault = hw::ConstantOp::create(
+          b, machineOp.getLoc(), b.getIntegerAttr(intTy, 0));
+      outputAssignment.defaultValue = zeroDefault;
+    }
+
     outputCaseAssignments.push_back(outputAssignment);
     ++portIndex;
   }
@@ -554,8 +564,16 @@ LogicalResult MachineOpConverter::dispatch() {
 
   // Materialize the case mux.
   llvm::SmallVector<CaseMuxItem, 4> nextStateCaseAssignments;
-  nextStateCaseAssignments.push_back(
-      CaseMuxItem{nextStateWire, stateReg, nextStateFromState});
+  // Default the next-state to the current state (i.e. hold) so that the
+  // empty `default:` arm of the case statement still produces an
+  // assignment. Without this, Verilator infers a latch on `state_next`
+  // whenever the FSM's state count does not tile its enum bit width.
+  CaseMuxItem nextStateItem;
+  nextStateItem.wire = nextStateWire;
+  nextStateItem.select = stateReg;
+  nextStateItem.assignmentInState = nextStateFromState;
+  nextStateItem.defaultValue = stateReg.getResult();
+  nextStateCaseAssignments.push_back(nextStateItem);
   for (auto &[_, caseMuxItem] : variableCaseMuxItems)
     nextStateCaseAssignments.push_back(caseMuxItem);
   nextStateCaseAssignments.append(outputCaseAssignments.begin(),

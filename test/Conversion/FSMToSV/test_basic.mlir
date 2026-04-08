@@ -48,8 +48,13 @@ hw.module @top(in %arg0: i1, in %arg1: i1, in %clk : !seq.clock, in %rst : i1, o
 // CHECK-NEXT:    %3 = comb.and %a0, %a1 : i1
 // CHECK-NEXT:    %4 = comb.mux %3, %0, %1 : !hw.typealias<@fsm_enum_typedecls::@top_state_t, !hw.enum<A, B>>
 // CHECK-NEXT:    %output_0 = sv.reg  : !hw.inout<i8>
+// CHECK-NEXT:    %c0_i8_0 = hw.constant 0 : i8
 // CHECK-NEXT:    %output_1 = sv.reg  : !hw.inout<i8>
+// CHECK-NEXT:    %c0_i8_1 = hw.constant 0 : i8
 // CHECK-NEXT:    sv.alwayscomb {
+// CHECK-NEXT:      sv.bpassign %state_next, %state_reg : !hw.typealias<@fsm_enum_typedecls::@top_state_t, !hw.enum<A, B>>
+// CHECK-NEXT:      sv.bpassign %output_0, %c0_i8_0 : i8
+// CHECK-NEXT:      sv.bpassign %output_1, %c0_i8_1 : i8
 // CHECK-NEXT:      sv.case %state_reg : !hw.typealias<@fsm_enum_typedecls::@top_state_t, !hw.enum<A, B>>
 // CHECK-NEXT:      case A: {
 // CHECK-NEXT:        sv.bpassign %state_next, %1 : !hw.typealias<@fsm_enum_typedecls::@top_state_t, !hw.enum<A, B>>
@@ -95,7 +100,9 @@ fsm.machine @top(%a0: i1, %arg1: i1) -> (i8, i8) attributes {initialState = "A",
 // CHECK-LABEL:   hw.module @FSM(in %in0 : i1, in %in1 : i1, out out0 : i16, in %clk : !seq.clock, in %rst : i1)
 // CHECK:       %[[CNT_ADD_1:.*]] = comb.add %cnt_reg, %c1_i16 : i16
 // CHECK:       sv.alwayscomb {
+// CHECK-NEXT:    sv.bpassign %state_next, %state_reg : !hw.typealias<@fsm_enum_typedecls::@FSM_state_t, !hw.enum<A, B>>
 // CHECK-NEXT:    sv.bpassign %cnt_next, %cnt_reg : i16
+// CHECK-NEXT:    sv.bpassign %output_0, %{{.*}} : i16
 // CHECK-NEXT:    sv.case %state_reg : !hw.typealias<@fsm_enum_typedecls::@FSM_state_t, !hw.enum<A, B>>
 // CHECK-NEXT:    case A: {
 // CHECK-NEXT:      sv.bpassign %state_next, %[[B:.*]] : !hw.typealias<@fsm_enum_typedecls::@FSM_state_t, !hw.enum<A, B>>
@@ -198,6 +205,7 @@ module {
 // Test the usage of operations defined inside `transition` region but outside `guard region`
 // CHECK-LABEL:  hw.module @OpsInTransition(in %clk : !seq.clock, in %rst : i1) attributes {emit.fragments = [@FSM_ENUM_TYPEDEFS]} {
 // CHECK:   sv.alwayscomb {
+// CHECK-NEXT:     sv.bpassign %[[STATE_NEXT:.*]], %{{.*}} : !hw.typealias<@fsm_enum_typedecls::@OpsInTransition_state_t, !hw.enum<State1, State2>>
 // CHECK-NEXT:     sv.case %[[R:.*]] : !hw.typealias<@fsm_enum_typedecls::@OpsInTransition_state_t, !hw.enum<State1, State2>>
 // CHECK-NEXT:     case State1: {
 // CHECK-NEXT:       sv.bpassign %[[STATE_NEXT:.*]], %[[B:.*]] : !hw.typealias<@fsm_enum_typedecls::@OpsInTransition_state_t, !hw.enum<State1, State2>>
