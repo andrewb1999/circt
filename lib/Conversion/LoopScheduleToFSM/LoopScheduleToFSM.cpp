@@ -62,6 +62,41 @@ static Value createZeroConstant(OpBuilder &builder, Location loc, Type type) {
   llvm_unreachable("unsupported type for zero constant");
 }
 
+/// Returns the per-op cycle latency stamped by SCFToLoopSchedule
+/// (`loopschedule.cycle_latency`), defaulting to 1 if absent.
+static unsigned getOpCycleLatency(Operation *op) {
+  if (auto attr = op->getAttrOfType<IntegerAttr>("loopschedule.cycle_latency"))
+    return (unsigned)attr.getInt();
+  return 1;
+}
+
+/// Recursively compute the latency contribution of a region of LoopSchedule
+/// ops. Direct children contribute their own cycle_latency at offset 0; each
+/// `loopschedule.delay` child contributes `delay.latency + region body
+/// latency`. The result is `max(over body ops) issueCycle + opCycleLatency`.
+static unsigned computeRegionCycleLatency(Block &block) {
+  unsigned maxLat = 0;
+  for (Operation &op : block) {
+    if (isa<LoopScheduleRegisterOp>(op))
+      continue;
+    if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(op))
+      continue;
+    if (auto delayOp = dyn_cast<LoopScheduleDelayOp>(&op)) {
+      unsigned childLat = computeRegionCycleLatency(delayOp.getBodyBlock());
+      maxLat = std::max(maxLat,
+                        (unsigned)delayOp.getLatency() + std::max(childLat, 1u));
+      continue;
+    }
+    maxLat = std::max(maxLat, getOpCycleLatency(&op));
+  }
+  return std::max(maxLat, 1u);
+}
+
+/// Top-level latency of a step.
+static unsigned computeStepLatency(LoopScheduleStepOp step) {
+  return computeRegionCycleLatency(step.getBodyBlock());
+}
+
 /// Tracks the hw.module ports for a memref function argument.
 struct MemPortMapping {
   Value rdData;  // input: read data from memory
@@ -127,7 +162,8 @@ private:
   ///   post_active_0..C-1
   fsm::MachineOp createSequentialFSM(OpBuilder &builder, Location loc,
                                       StringRef fsmName, unsigned numSteps,
-                                      ArrayRef<unsigned> waitStepIndices);
+                                      ArrayRef<unsigned> waitStepIndices,
+                                      ArrayRef<unsigned> stepLatencies = {});
 
   /// Create linear run-once FSM for sequencing top-level function steps.
   /// stepChildKind[i]: -1 = leaf, 0 = sequential child, 1 = pipeline child.
@@ -145,9 +181,13 @@ private:
       hw::HWModuleOp &outModule,
       SmallVectorImpl<Value> &capturedVals);
 
-  /// Lower step body ops, gating store wrEn with wrEnGate.
+  /// Lower step body ops, gating store wrEn with the per-issue-cycle active
+  /// signal. `cycleGates[c]` is the i1 high in cycle `c` of the enclosing
+  /// step. For single-cycle steps the array has one entry equal to the
+  /// step's overall active signal.
   LogicalResult lowerStepBody(Block *stepBody, OpBuilder &builder,
-                              IRMapping &mapping, Value wrEnGate,
+                              IRMapping &mapping,
+                              ArrayRef<Value> cycleGates,
                               DenseMap<Value, MemPortMapping> &memPorts);
 
   /// Lower a pipeline as a child of a sequential loop (no FSM needed).
@@ -251,20 +291,40 @@ handleStore(LoopScheduleStoreOp storeOp, OpBuilder &builder,
 // Step body lowering
 //===----------------------------------------------------------------------===//
 
-LogicalResult LoopScheduleToFSMPass::lowerStepBody(Block *stepBody,
-                                                    OpBuilder &builder,
-                                                    IRMapping &mapping,
-                                                    Value wrEnGate,
-                                                    DenseMap<Value, MemPortMapping> &memPorts) {
-  for (auto &op : *stepBody) {
+/// Recursive worker that lowers ops in a step or delay body. `baseCycle` is
+/// the issue cycle of the immediately enclosing region (0 for the step body,
+/// `delay.latency + parent base` for nested delays).
+static LogicalResult
+lowerRegionBody(Block *body, OpBuilder &builder, IRMapping &mapping,
+                ArrayRef<Value> cycleGates, unsigned baseCycle,
+                DenseMap<Value, MemPortMapping> &memPorts) {
+  auto pickGate = [&](unsigned c) -> Value {
+    assert(c < cycleGates.size() &&
+           "issue cycle exceeds enclosing step latency");
+    return cycleGates[c];
+  };
+  for (auto &op : *body) {
     if (isa<LoopScheduleRegisterOp>(&op))
       continue;
-    // Skip nested sequential/pipeline ops — handled separately.
     if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
       continue;
 
+    if (auto delayOp = dyn_cast<LoopScheduleDelayOp>(&op)) {
+      unsigned childBase = baseCycle + (unsigned)delayOp.getLatency();
+      if (failed(lowerRegionBody(&delayOp.getBodyBlock(), builder, mapping,
+                                 cycleGates, childBase, memPorts)))
+        return failure();
+      // Map the delay op's external results to the cloned register operands.
+      auto regOp = delayOp.getRegisterOp();
+      for (auto [res, regVal] :
+           llvm::zip(delayOp.getResults(), regOp.getOperands()))
+        mapping.map(res, mapping.lookup(regVal));
+      continue;
+    }
+
     if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-      if (failed(handleStore(storeOp, builder, mapping, wrEnGate, memPorts)))
+      if (failed(handleStore(storeOp, builder, mapping, pickGate(baseCycle),
+                              memPorts)))
         return failure();
       continue;
     }
@@ -278,6 +338,13 @@ LogicalResult LoopScheduleToFSMPass::lowerStepBody(Block *stepBody,
     builder.clone(op, mapping);
   }
   return success();
+}
+
+LogicalResult LoopScheduleToFSMPass::lowerStepBody(
+    Block *stepBody, OpBuilder &builder, IRMapping &mapping,
+    ArrayRef<Value> cycleGates,
+    DenseMap<Value, MemPortMapping> &memPorts) {
+  return lowerRegionBody(stepBody, builder, mapping, cycleGates, 0, memPorts);
 }
 
 //===----------------------------------------------------------------------===//
@@ -385,7 +452,7 @@ collectReferencedConstants(LoopScheduleSequentialOp seqOp) {
 
 fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     OpBuilder &builder, Location loc, StringRef fsmName, unsigned numSteps,
-    ArrayRef<unsigned> waitStepIndices) {
+    ArrayRef<unsigned> waitStepIndices, ArrayRef<unsigned> stepLatencies) {
   auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
 
@@ -403,6 +470,29 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
 
   unsigned numWaits = waitStepIndices.size();
 
+  // Normalize stepLatencies — default 1 per step.
+  SmallVector<unsigned> stepLats(numSteps, 1);
+  for (unsigned i = 0; i < numSteps && i < stepLatencies.size(); ++i)
+    stepLats[i] = std::max(stepLatencies[i], 1u);
+  // Wait steps must be single-cycle: their step body launches a child whose
+  // latency is variable, so the bucket merger is forbidden from coalescing
+  // additional ops into them. Enforce as a contract.
+  for (unsigned i = 0; i < numSteps; ++i)
+    assert((stepWaitIdx[i] < 0 || stepLats[i] == 1) &&
+           "wait step must have latency 1");
+
+  // Compute the per-step base index in the "step_cycle" output region. Steps
+  // with latency > 1 contribute L_i outputs; single-cycle steps contribute 0
+  // (their per-cycle gate is the step_active_i output).
+  SmallVector<int> cycleOutBase(numSteps, -1);
+  unsigned totalCycleOuts = 0;
+  for (unsigned i = 0; i < numSteps; ++i) {
+    if (stepLats[i] > 1) {
+      cycleOutBase[i] = (int)totalCycleOuts;
+      totalCycleOuts += stepLats[i];
+    }
+  }
+
   // Determine which state's exit advances iter_arg: the FSM's last cycle
   // before transitioning back to COND. That's POST_<last> if the last step
   // is a wait, otherwise STEP_<last>.
@@ -417,13 +507,16 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
 
   // Outputs: done, first_iter, iter_advance,
   //          step_active_0..N-1,
-  //          child_start_0..C-1, child_active_0..C-1, post_active_0..C-1.
+  //          child_start_0..C-1, child_active_0..C-1, post_active_0..C-1,
+  //          step_cycle_<i>_<c>... (one per multi-cycle step's sub-cycle).
   // child_start_j  : 1-cycle pulse in STEP_<wait_step_j>; drives child start.
   // child_active_j : high while child j is producing on the wires
   //                  (in STEP_<wait_step_j> launch AND throughout WAIT_<...>).
   //                  Used to mux child j's mem ports out of the parent module.
   // post_active_j  : high in POST_<wait_step_j> (parent's post-child phase).
-  unsigned numOutputs = 3 + numSteps + 3 * numWaits;
+  // step_cycle_<i>_<c> : high in the c-th sub-state of STEP_<i>; only emitted
+  //                      for steps with latency > 1.
+  unsigned numOutputs = 3 + numSteps + 3 * numWaits + totalCycleOuts;
   SmallVector<Type> outTypes(numOutputs, i1);
 
   auto funcType = FunctionType::get(ctx, inputTypes, outTypes);
@@ -454,6 +547,13 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   for (unsigned j = 0; j < numWaits; ++j)
     resNames.push_back(
         builder.getStringAttr("post_active_" + std::to_string(j)));
+  for (unsigned i = 0; i < numSteps; ++i) {
+    if (cycleOutBase[i] < 0)
+      continue;
+    for (unsigned c = 0; c < stepLats[i]; ++c)
+      resNames.push_back(builder.getStringAttr(
+          "step_cycle_" + std::to_string(i) + "_" + std::to_string(c)));
+  }
   machine.setResNamesAttr(builder.getArrayAttr(resNames));
 
   OpBuilder fb(ctx);
@@ -469,9 +569,11 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   //   activeChild   : index into waitStepIndices for child_start (-1 = none)
   //   activeLive    : index into waitStepIndices for child_active (-1 = none)
   //   activePost    : index into waitStepIndices for post_active (-1 = none)
+  //   cycleStep, cycleIdx : if cycleStep >= 0 drives step_cycle_<cycleStep>_<cycleIdx>
   auto buildOut = [&](Value done, bool iterAdv, int activeStep,
                       int activeChild, int activeLive,
-                      int activePost) -> SmallVector<Value> {
+                      int activePost, int cycleStep = -1,
+                      int cycleIdx = -1) -> SmallVector<Value> {
     SmallVector<Value> v;
     v.push_back(done);
     v.push_back(fiVar);
@@ -484,6 +586,15 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
       v.push_back((int)j == activeLive ? trueVal : falseVal);
     for (unsigned j = 0; j < numWaits; ++j)
       v.push_back((int)j == activePost ? trueVal : falseVal);
+    // Per-cycle outputs (multi-cycle steps only).
+    for (unsigned i = 0; i < numSteps; ++i) {
+      if (cycleOutBase[i] < 0)
+        continue;
+      for (unsigned c = 0; c < stepLats[i]; ++c) {
+        bool on = ((int)i == cycleStep) && ((int)c == cycleIdx);
+        v.push_back(on ? trueVal : falseVal);
+      }
+    }
     return v;
   };
 
@@ -526,9 +637,10 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     bool isLast = (i + 1 == numSteps);
     std::string stepName = "STEP_" + std::to_string(i);
     std::string nextStepName = isLast ? "COND" : "STEP_" + std::to_string(i + 1);
+    unsigned L = stepLats[i];
 
-    // STEP_i
-    {
+    if (isWait || L == 1) {
+      // Single-cycle path (legacy shape — keep STEP_<i> name).
       auto st = fsm::StateOp::create(fb, loc, stepName);
       Block *ob = st.ensureOutput(fb);
       ob->getTerminator()->erase();
@@ -543,8 +655,8 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
                      /*activeChild=*/stepWaitIdx[i],
                      /*activeLive=*/stepWaitIdx[i], /*activePost=*/-1));
       } else {
-        // Regular step. iter_advance only when this is the last state of
-        // the trip (last step and not a wait — wait advances in POST).
+        // Regular single-cycle step. iter_advance only when this is the
+        // last state of the trip.
         bool iterAdv = isLast;
         fsm::OutputOp::create(
             fb, loc,
@@ -560,8 +672,36 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
       } else {
         fsm::TransitionOp::create(fb, loc, StringRef(nextStepName));
       }
+      fb.setInsertionPointToEnd(&machine.getBody().front());
+    } else {
+      // Multi-cycle expansion: emit L sequential sub-states. The first is
+      // named STEP_<i> (the entry — preserves backward-compat for tests
+      // that match this name). The rest are STEP_<i>_c<c> for c = 1..L-1.
+      for (unsigned c = 0; c < L; ++c) {
+        std::string subName =
+            (c == 0) ? stepName
+                     : (stepName + "_c" + std::to_string(c));
+        std::string nextSub = (c + 1 < L)
+                                  ? (stepName + "_c" + std::to_string(c + 1))
+                                  : nextStepName;
+        bool isLastSub = (c + 1 == L);
+        bool iterAdv = isLast && isLastSub;
+        auto st = fsm::StateOp::create(fb, loc, subName);
+        Block *ob = st.ensureOutput(fb);
+        ob->getTerminator()->erase();
+        fb.setInsertionPointToEnd(ob);
+        fsm::OutputOp::create(
+            fb, loc,
+            buildOut(falseVal, iterAdv, /*activeStep=*/(int)i,
+                     /*activeChild=*/-1, /*activeLive=*/-1,
+                     /*activePost=*/-1, /*cycleStep=*/(int)i,
+                     /*cycleIdx=*/(int)c));
+        Block *tb = &st.getTransitions().front();
+        fb.setInsertionPointToEnd(tb);
+        fsm::TransitionOp::create(fb, loc, StringRef(nextSub));
+        fb.setInsertionPointToEnd(&machine.getBody().front());
+      }
     }
-    fb.setInsertionPointToEnd(&machine.getBody().front());
 
     if (!isWait)
       continue;
@@ -1055,10 +1195,34 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   }
   unsigned numWaits = waitStepIndices.size();
 
+  // --- Compute per-step latencies ---
+  // Multi-cycle steps arise when SCFToLoopSchedule's bucket merger coalesces
+  // overlapping start times into a single step containing one or more
+  // loopschedule.delay regions and/or stamps multi-cycle operator latencies.
+  SmallVector<unsigned> stepLatencies(numSteps, 1);
+  for (unsigned i = 0; i < numSteps; ++i) {
+    if (stepWaitIdx[i] >= 0) {
+      // Wait steps must be 1 (the bucket merger refuses to merge into them).
+      stepLatencies[i] = 1;
+      continue;
+    }
+    stepLatencies[i] = computeStepLatency(steps[i]);
+  }
+  // Per-step base index in the FSM's appended cycle-output region.
+  SmallVector<int> stepCycleOutBase(numSteps, -1);
+  unsigned totalCycleOuts = 0;
+  for (unsigned i = 0; i < numSteps; ++i) {
+    if (stepLatencies[i] > 1) {
+      stepCycleOutBase[i] = (int)totalCycleOuts;
+      totalCycleOuts += stepLatencies[i];
+    }
+  }
+
   // --- Create FSM machine ---
   std::string fsmName = node.prefix + "_fsm";
   builder.setInsertionPointToEnd(moduleOp.getBody());
-  (void)createSequentialFSM(builder, loc, fsmName, numSteps, waitStepIndices);
+  (void)createSequentialFSM(builder, loc, fsmName, numSteps, waitStepIndices,
+                            stepLatencies);
 
   // --- Create FSM instance with backedges ---
   hw.setInsertionPointToEnd(hwBody);
@@ -1081,8 +1245,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
   // Result types: done, first_iter, iter_advance,
   //               step_active_0..N-1, child_start_0..C-1,
-  //               child_active_0..C-1, post_active_0..C-1.
-  unsigned numFsmResults = 3 + numSteps + 3 * numWaits;
+  //               child_active_0..C-1, post_active_0..C-1,
+  //               step_cycle_<i>_<c>...
+  unsigned numFsmResults = 3 + numSteps + 3 * numWaits + totalCycleOuts;
   SmallVector<Type> resTys(numFsmResults, i1);
   auto inst = fsm::HWInstanceOp::create(
       hw, loc, resTys, hw.getStringAttr(fsmName + "_inst"),
@@ -1103,6 +1268,20 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   SmallVector<Value> fsmPostActives(numWaits);
   for (unsigned j = 0; j < numWaits; ++j)
     fsmPostActives[j] = inst.getResult(3 + numSteps + 2 * numWaits + j);
+  // Per-step per-cycle gates. For single-cycle steps the gate vector contains
+  // just the step's overall step_active signal; for multi-cycle steps it
+  // contains the L_i dedicated step_cycle_<i>_<c> outputs.
+  unsigned cycleOutOffset = 3 + numSteps + 3 * numWaits;
+  SmallVector<SmallVector<Value>> fsmStepCycleGates(numSteps);
+  for (unsigned i = 0; i < numSteps; ++i) {
+    if (stepCycleOutBase[i] < 0) {
+      fsmStepCycleGates[i].push_back(fsmStepActives[i]);
+    } else {
+      for (unsigned c = 0; c < stepLatencies[i]; ++c)
+        fsmStepCycleGates[i].push_back(
+            inst.getResult(cycleOutOffset + (unsigned)stepCycleOutBase[i] + c));
+    }
+  }
 
   // Clock enable for iter_arg registers: advance exactly once per loop trip,
   // on the FSM's last cycle before COND. first_iter forces the init load on
@@ -1318,10 +1497,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         hw.clone(op, localMapping);
       }
     } else {
-      // Regular step (no child). Gate stores with this step's per-step
-      // active signal so the store fires only in its STEP_i state.
+      // Regular step (no child). Gate stores per issue cycle: ops directly
+      // in the step body get cycleGates[0]; ops nested inside delay regions
+      // get cycleGates[delay.latency].
       if (failed(lowerStepBody(body, hw, localMapping,
-                               fsmStepActives[stepIdx], localMemPorts)))
+                               fsmStepCycleGates[stepIdx], localMemPorts)))
         return failure();
     }
 
@@ -2450,9 +2630,12 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
       }
 
     } else {
-      // Leaf step: lower body with step_running as wrEn gate.
+      // Leaf step: lower body with step_running as wrEn gate. The function-
+      // level FSM doesn't support multi-cycle steps, so a single gate is
+      // used for the entire body.
+      Value oneGate = stepRunningSignals[i];
       if (failed(lowerStepBody(&topSteps[i].getBodyBlock(), builder, mapping,
-                               stepRunningSignals[i], perStepPorts[i])))
+                               ArrayRef<Value>(oneGate), perStepPorts[i])))
         return failure();
     }
 

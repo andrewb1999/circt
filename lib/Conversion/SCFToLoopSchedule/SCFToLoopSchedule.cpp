@@ -1457,6 +1457,15 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
       }
       auto *newOp = builder.clone(*op, valueMap);
       dependenceAnalysis->replaceOp(op, newOp);
+      // Stamp per-op cycle latency so backends know how many cycles a
+      // multi-cycle operator (e.g. iterative multiplier) consumes within
+      // its step. Only stamped when > 1 to keep IR tidy.
+      if (auto opr = problem.getLinkedOperatorType(op)) {
+        unsigned lat = problem.getLatency(*opr).value_or(1);
+        if (lat > 1)
+          newOp->setAttr("loopschedule.cycle_latency",
+                         builder.getI64IntegerAttr(lat));
+      }
       if (predicateMap.contains(op)) {
         if (!newOp->getResults().empty())
           builder.create<LoopScheduleYieldOp>(op->getLoc(),
@@ -1549,6 +1558,12 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
         for (auto *op : delayOps) {
           auto *newOp = builder.clone(*op, valueMap);
           dependenceAnalysis->replaceOp(op, newOp);
+          if (auto opr = problem.getLinkedOperatorType(op)) {
+            unsigned lat = problem.getLatency(*opr).value_or(1);
+            if (lat > 1)
+              newOp->setAttr("loopschedule.cycle_latency",
+                             builder.getI64IntegerAttr(lat));
+          }
           delayOldToNew[op] = newOp;
           // Update valueMap so subsequent in-delay ops see this clone.
           for (auto [orig, clone] :
