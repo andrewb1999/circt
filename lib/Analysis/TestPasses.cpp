@@ -14,6 +14,7 @@
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Analysis/FIRRTLInstanceInfo.h"
 #include "circt/Analysis/OpCountAnalysis.h"
+#include "circt/Analysis/SCFWhileTripCountAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "circt/Dialect/HW/HWInstanceGraph.h"
@@ -23,6 +24,7 @@
 #include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
@@ -146,6 +148,40 @@ void TestSchedulingAnalysisPass::runOnOperation() {
           op->setAttr("dependence", UnitAttr::get(context));
       }
     });
+  });
+}
+
+//===----------------------------------------------------------------------===//
+// SCFWhileTripCountAnalysis
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct TestSCFWhileTripCountPass
+    : public PassWrapper<TestSCFWhileTripCountPass,
+                         OperationPass<func::FuncOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestSCFWhileTripCountPass)
+
+  void runOnOperation() override;
+  StringRef getArgument() const override {
+    return "test-scf-while-trip-count";
+  }
+  StringRef getDescription() const override {
+    return "Run the scf.while constant trip count analysis and emit results "
+           "as remarks";
+  }
+};
+} // namespace
+
+void TestSCFWhileTripCountPass::runOnOperation() {
+  getOperation().walk([&](scf::WhileOp whileOp) {
+    auto tc = getSCFWhileConstantTripCount(whileOp);
+    if (tc) {
+      llvm::SmallString<16> buf;
+      tc->toStringUnsigned(buf);
+      whileOp.emitRemark() << "trip_count = " << buf;
+    } else {
+      whileOp.emitRemark() << "trip_count = none";
+    }
   });
 }
 
@@ -343,6 +379,9 @@ void registerAnalysisTestPasses() {
   });
   registerPass([]() -> std::unique_ptr<Pass> {
     return std::make_unique<TestSchedulingAnalysisPass>();
+  });
+  registerPass([]() -> std::unique_ptr<Pass> {
+    return std::make_unique<TestSCFWhileTripCountPass>();
   });
   registerPass([]() -> std::unique_ptr<Pass> {
     return std::make_unique<TestDebugAnalysisPass>();

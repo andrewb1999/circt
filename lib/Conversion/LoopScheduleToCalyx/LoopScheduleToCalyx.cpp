@@ -85,9 +85,9 @@ public:
 
   Block *getBodyBlock() override { return getOperation().getBodyBlock(); }
 
-  // The LoopSchedule cond region was removed; this calyx path is left
-  // broken (its tests are XFAIL'd) but we still need to satisfy the
-  // calyx::WhileOpInterface base class API. Return the body block as a stub.
+  // The LoopSchedule cond region was removed; condition evaluation is now
+  // part of the body's first step. This accessor returns the body block to
+  // satisfy the calyx::WhileOpInterface base class API.
   Block *getConditionBlock() override { return getOperation().getBodyBlock(); }
 
   Value getConditionValue() override {
@@ -155,6 +155,8 @@ public:
     assert(condRegs.contains(loop));
     return condRegs[loop];
   }
+
+  bool hasCondReg(LoopInterface loop) { return condRegs.contains(loop); }
 
   void setCondGroup(LoopInterface loop, calyx::StaticGroupOp group) {
     condGroups[loop] = group;
@@ -1074,12 +1076,6 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     getState<ComponentLoweringState>().addLoopIterReg(loop, reg, arg.index());
 
     arg.value().replaceAllUsesWith(reg.getOut());
-
-    // NOTE: this calyx path is left broken after the LoopSchedule cond
-    // region was removed (the body block now carries the iter args).
-    loop.getBodyBlock()
-        ->getArgument(arg.index())
-        .replaceAllUsesWith(loop.getInits()[arg.index()]);
   }
 
   /// Create iter args initial value assignment group(s), one per register.
@@ -1560,45 +1556,26 @@ class BuildConditionChecks : public calyx::FuncOpPartialLoweringPattern {
       getState<ComponentLoweringState>().addLoopInitGroup(LoopWrapper(loop),
                                                           initGroup);
 
-      // Create cond group
-      auto groupName = getState<ComponentLoweringState>().getUniqueName("cond");
-      auto condGroup = calyx::createStaticGroup(
-          rewriter, getState<ComponentLoweringState>().getComponentOp(),
-          loop->getLoc(), groupName, 1);
-      getState<ComponentLoweringState>().setCondGroup(loop, condGroup);
-
+      // After the LoopSchedule cond-region refactor, `condValue` is the
+      // terminator's `condition(%c)` operand — a regular phase result. We
+      // prime `cond_reg` with a constant based on the loop bound (matching
+      // the pipelined-stallable path). This guarantees we enter the loop
+      // iff the trip count is non-zero. The steady-state write of
+      // `cond_reg` is handled by BuildIntermediateRegs + BuildPhaseGroups,
+      // which reuse `cond_reg` as the phase register for the condition
+      // value — so there is no separate `cond_0` group.
+      (void)condValue;
+      auto bound = loop.getBound();
+      bool enterLoop = !bound.has_value() || *bound != 0;
       rewriter.setInsertionPointToEnd(initGroup.getBodyBlock());
-      rewriter.create<calyx::AssignOp>(loop.getLoc(), condReg.getIn(),
-                                       condValue);
       auto one =
           calyx::createConstant(loop.getLoc(), rewriter, getComponent(), 1, 1);
-      rewriter.create<calyx::AssignOp>(loop.getLoc(), condReg.getWriteEn(),
-                                       one);
-
-      auto term =
-          cast<LoopScheduleTerminatorOp>(loop.getBodyBlock()->getTerminator());
-
-      auto termArg = term.getIterArgs()[0];
-      auto phase = termArg.getDefiningOp<PhaseInterface>();
-      auto result = cast<OpResult>(termArg);
-      auto *phaseReg = phase.getBodyBlock().getTerminator();
-      auto newIterArg = phaseReg->getOpOperand(result.getResultNumber()).get();
-      // NOTE: this calyx path is left broken after the LoopSchedule cond
-      // region was removed; previously it cloned the cond block ops here.
-      // Tests targeting this path are XFAIL'd.
-      Value newCondValue = loop.getConditionValue();
-      (void)newIterArg;
-
-      rewriter.setInsertionPointToEnd(condGroup.getBodyBlock());
-      assert(newCondValue != nullptr);
+      auto zero =
+          calyx::createConstant(loop.getLoc(), rewriter, getComponent(), 1, 0);
       rewriter.create<calyx::AssignOp>(loop.getLoc(), condReg.getIn(),
-                                       newCondValue);
+                                       enterLoop ? one : zero);
       rewriter.create<calyx::AssignOp>(loop.getLoc(), condReg.getWriteEn(),
                                        one);
-
-      // Add condition eval to first phase
-      getState<ComponentLoweringState>().addBlockSchedulable(
-          &phase.getBodyBlock(), condGroup);
 
       return;
     });
@@ -1852,22 +1829,49 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
 
         unsigned i = operand.getOperandNumber();
         // Iter args are created in BuildWhileGroups, so just mark the iter arg
-        // register as the appropriate pipeline register.
+        // register as the appropriate pipeline register. A phase result that
+        // feeds the terminator's `condition` operand is treated the same way,
+        // reusing the loop's pre-created `cond_reg` instead of allocating a
+        // fresh i1 phase register.
         Value phaseResult = phase->getResult(i);
-        bool isIterArg = false;
+        bool reusedReg = false;
         for (auto &use : phaseResult.getUses()) {
-          if (auto term = dyn_cast<LoopScheduleTerminatorOp>(use.getOwner())) {
-            if (use.getOperandNumber() < term.getIterArgs().size()) {
-              LoopWrapper loop(dyn_cast<LoopInterface>(phase->getParentOp()));
-              auto reg = getState<ComponentLoweringState>().getLoopIterReg(
-                  loop, use.getOperandNumber());
-              getState<ComponentLoweringState>().addPhaseReg(phase, reg, i);
-              regMap[phaseResult] = reg;
-              isIterArg = true;
-            }
+          auto term = dyn_cast<LoopScheduleTerminatorOp>(use.getOwner());
+          if (!term)
+            continue;
+          // Terminator operand layout is [condition (1 operand),
+          // iter_args..., results...].
+          constexpr unsigned kConditionIdx = 0;
+          constexpr unsigned kIterArgsBegin = 1;
+          unsigned absIdx = use.getOperandNumber();
+          LoopWrapper loop(dyn_cast<LoopInterface>(phase->getParentOp()));
+
+          if (absIdx == kConditionIdx &&
+              getState<ComponentLoweringState>().hasCondReg(
+                  loop.getOperation())) {
+            // Reuse cond_reg as this phase result's register. BuildPhaseGroups
+            // will emit the `cond_reg.in = <cmpi>.out` writer group.
+            auto reg = getState<ComponentLoweringState>().getCondReg(
+                loop.getOperation());
+            getState<ComponentLoweringState>().addPhaseReg(phase, reg, i);
+            regMap[phaseResult] = reg;
+            reusedReg = true;
+            break;
           }
+
+          if (absIdx < kIterArgsBegin)
+            continue;
+          unsigned iterArgIdx = absIdx - kIterArgsBegin;
+          if (iterArgIdx >= term.getIterArgs().size())
+            continue;
+          auto reg = getState<ComponentLoweringState>().getLoopIterReg(
+              loop, iterArgIdx);
+          getState<ComponentLoweringState>().addPhaseReg(phase, reg, i);
+          regMap[phaseResult] = reg;
+          reusedReg = true;
+          break;
         }
-        if (isIterArg)
+        if (reusedReg)
           continue;
 
         if (!isa<LoopSchedulePipelineOp>(phase->getParentOp()) &&
@@ -2588,7 +2592,7 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
       for (auto res : ifOp->getResults()) {
         assert(res.getUses().empty());
       }
-      yieldOp->erase();
+      rewriter.eraseOp(yieldOp);
       return WalkResult::advance();
     });
 
