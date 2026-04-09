@@ -43,14 +43,41 @@ using namespace circt::loopschedule;
 
 namespace {
 
-/// Compute the number of bits needed to address a memref.
-static unsigned getAddrWidth(MemRefType memType) {
-  int64_t numElements = 1;
-  for (int64_t dim : memType.getShape())
-    numElements *= dim;
-  if (numElements <= 1)
-    return 1;
-  return llvm::Log2_64_Ceil(numElements);
+/// Per-dim address widths for a memref. Each dim contributes
+/// `max(1, ceil_log2(dim_size))` so that even size-1 dims have a valid
+/// 1-bit signal on the loop hw.module ports. The hlmem itself uses
+/// `seq::HLMemType::getAddressTypes()` (without the floor of 1), so a
+/// width-fixup may be needed at the hlmem boundary.
+static SmallVector<unsigned> getDimAddrWidths(MemRefType memType) {
+  SmallVector<unsigned> widths;
+  for (int64_t dim : memType.getShape()) {
+    unsigned w = (dim <= 1) ? 1u : llvm::Log2_64_Ceil(dim);
+    widths.push_back(std::max(1u, w));
+  }
+  return widths;
+}
+
+/// Number of address signals for a memref's loop-module port set.
+/// 0-rank memrefs collapse to 0 address ports (loads/stores still work
+/// because there are no indices to drive).
+static unsigned getNumAddrPorts(MemRefType memType) {
+  return (unsigned)memType.getShape().size();
+}
+
+/// Resize an integer Value to a target bit-width via truncation or
+/// zero-extension. Width-equal Values pass through.
+static Value resizeIntTo(OpBuilder &builder, Location loc, Value v,
+                         unsigned targetWidth) {
+  auto srcWidth = cast<IntegerType>(v.getType()).getWidth();
+  if (srcWidth == targetWidth)
+    return v;
+  auto targetType = IntegerType::get(builder.getContext(), targetWidth);
+  if (srcWidth > targetWidth)
+    return comb::ExtractOp::create(builder, loc, targetType, v, 0);
+  // Zero-extend.
+  auto padType = IntegerType::get(builder.getContext(), targetWidth - srcWidth);
+  Value zero = hw::ConstantOp::create(builder, loc, padType, 0);
+  return comb::ConcatOp::create(builder, loc, ValueRange{zero, v});
 }
 
 /// Create a zero constant of the given type.
@@ -98,11 +125,12 @@ static unsigned computeStepLatency(LoopScheduleStepOp step) {
 }
 
 /// Tracks the hw.module ports for a memref function argument.
+/// `addrs` carries one address Value per memref dim (empty for 0-rank).
 struct MemPortMapping {
-  Value rdData;  // input: read data from memory
-  Value addr;    // will be set: address output
-  Value wrData;  // will be set: write data output
-  Value wrEn;    // will be set: write enable output
+  Value rdData;             // input: read data from memory
+  SmallVector<Value> addrs; // will be set: per-dim address outputs
+  Value wrData;             // will be set: write data output
+  Value wrEn;               // will be set: write enable output
 };
 
 /// Information about a memref argument for threading through loop modules.
@@ -214,8 +242,8 @@ private:
 
   /// Backedge info for a local hlmem (memref.alloc).
   struct HLMemBackedges {
-    Value allocResult; // original memref.alloc result
-    Backedge addrBE;   // shared address for read and write
+    Value allocResult;          // original memref.alloc result
+    SmallVector<Backedge> addrBEs; // one per memref dim (in hlmem's widths)
     Backedge wrDataBE;
     Backedge wrEnBE;
   };
@@ -225,63 +253,57 @@ private:
 // Load/store helpers
 //===----------------------------------------------------------------------===//
 
-/// Look up a memref's port mapping and compute the address (extending or
-/// extracting to the memref's address width). Returns the resolved port
-/// mapping by reference.
+/// Resolve the per-dim address values for a memref access. Looks up the
+/// memref's port mapping, walks the access's indices, and width-fixes each
+/// to the corresponding entry in `getDimAddrWidths(memType)`. Stores the
+/// resulting addresses into `portsOut->addrs`.
 static LogicalResult
-prepareMemAccess(Operation *op, Value memref, Value indexVal,
+prepareMemAccess(Operation *op, Value memref, ValueRange indexVals,
                  OpBuilder &builder, IRMapping &mapping,
                  DenseMap<Value, MemPortMapping> &memPorts,
-                 MemPortMapping *&portsOut, Value &addrOut) {
+                 MemPortMapping *&portsOut) {
   auto it = memPorts.find(memref);
   if (it == memPorts.end())
     return op->emitError("unmapped memref");
   portsOut = &it->second;
   auto memType = cast<MemRefType>(memref.getType());
-  unsigned addrWidth = getAddrWidth(memType);
-  Value addr = mapping.lookup(indexVal);
-  if (cast<IntegerType>(addr.getType()).getWidth() != addrWidth) {
-    auto addrType = IntegerType::get(builder.getContext(), addrWidth);
-    addr = comb::ExtractOp::create(builder, op->getLoc(), addrType, addr, 0);
+  auto widths = getDimAddrWidths(memType);
+  if (indexVals.size() != widths.size())
+    return op->emitError("loopschedule access index count (")
+           << indexVals.size() << ") does not match memref rank ("
+           << widths.size() << ")";
+  portsOut->addrs.resize(widths.size());
+  for (auto [d, idx] : llvm::enumerate(indexVals)) {
+    Value addr = mapping.lookup(idx);
+    portsOut->addrs[d] = resizeIntTo(builder, op->getLoc(), addr, widths[d]);
   }
-  addrOut = addr;
   return success();
 }
 
-/// Lower a loopschedule.load: set the read address on the memory port
+/// Lower a loopschedule.load: drive the read addresses on the memory port
 /// mapping and map the load result to the port's read data.
 static LogicalResult
 handleLoad(LoopScheduleLoadOp loadOp, OpBuilder &builder, IRMapping &mapping,
            DenseMap<Value, MemPortMapping> &memPorts) {
-  if (loadOp.getIndices().size() != 1)
-    return loadOp.emitError("multi-dimensional memref not yet supported");
   MemPortMapping *ports = nullptr;
-  Value addr;
-  if (failed(prepareMemAccess(loadOp, loadOp.getMemRef(),
-                              loadOp.getIndices()[0], builder, mapping,
-                              memPorts, ports, addr)))
+  if (failed(prepareMemAccess(loadOp, loadOp.getMemRef(), loadOp.getIndices(),
+                              builder, mapping, memPorts, ports)))
     return failure();
-  ports->addr = addr;
   mapping.map(loadOp.getResult(), ports->rdData);
   return success();
 }
 
-/// Lower a loopschedule.store: set address, write data, and write enable
-/// (gated by wrEnGate) on the memory port mapping.
+/// Lower a loopschedule.store: drive the addresses, write data, and write
+/// enable (gated by wrEnGate) on the memory port mapping.
 static LogicalResult
 handleStore(LoopScheduleStoreOp storeOp, OpBuilder &builder,
             IRMapping &mapping, Value wrEnGate,
             DenseMap<Value, MemPortMapping> &memPorts) {
-  if (storeOp.getIndices().size() != 1)
-    return storeOp.emitError("multi-dimensional memref not yet supported");
   assert(wrEnGate && "handleStore requires a wrEnGate");
   MemPortMapping *ports = nullptr;
-  Value addr;
-  if (failed(prepareMemAccess(storeOp, storeOp.getMemRef(),
-                              storeOp.getIndices()[0], builder, mapping,
-                              memPorts, ports, addr)))
+  if (failed(prepareMemAccess(storeOp, storeOp.getMemRef(), storeOp.getIndices(),
+                              builder, mapping, memPorts, ports)))
     return failure();
-  ports->addr = addr;
   ports->wrData = mapping.lookup(storeOp.getValue());
   ports->wrEn = wrEnGate;
   return success();
@@ -987,12 +1009,18 @@ static hw::HWModuleOp createLoopModule(
   }
 
   for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
-    unsigned addrWidth = getAddrWidth(memInfo.memType);
-    Type addrType = IntegerType::get(ctx, addrWidth);
+    auto widths = getDimAddrWidths(memInfo.memType);
     Type dataType = memInfo.memType.getElementType();
     std::string baseName = "mem" + std::to_string(i);
-    ports.push_back({{builder.getStringAttr(baseName + "_addr"), addrType,
-                       hw::ModulePort::Direction::Output}});
+    bool isOneDim = widths.size() == 1;
+    for (auto [d, w] : llvm::enumerate(widths)) {
+      std::string addrName =
+          isOneDim ? baseName + "_addr"
+                   : baseName + "_addr_" + std::to_string(d);
+      ports.push_back({{builder.getStringAttr(addrName),
+                         IntegerType::get(ctx, w),
+                         hw::ModulePort::Direction::Output}});
+    }
     ports.push_back({{builder.getStringAttr(baseName + "_wr_data"), dataType,
                        hw::ModulePort::Direction::Output}});
     ports.push_back({{builder.getStringAttr(baseName + "_wr_en"),
@@ -1016,7 +1044,7 @@ static hw::HWModuleOp createLoopModule(
   for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
     MemPortMapping mp;
     mp.rdData = hwBody->getArgument(argIdx++);
-    mp.addr = Value();
+    mp.addrs.assign(getNumAddrPorts(memInfo.memType), Value());
     mp.wrData = Value();
     mp.wrEn = Value();
     localMemPortMap[memInfo.originalArg] = mp;
@@ -1042,19 +1070,22 @@ static void buildLoopModuleOutput(
     outputs.push_back(v);
 
   for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
-    unsigned addrWidth = getAddrWidth(memInfo.memType);
-    Type addrType = IntegerType::get(ctx, addrWidth);
+    auto widths = getDimAddrWidths(memInfo.memType);
     Type dataType = memInfo.memType.getElementType();
     auto it = localMemPortMap.find(memInfo.originalArg);
-    if (it != localMemPortMap.end() && it->second.addr)
-      outputs.push_back(it->second.addr);
-    else
-      outputs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
-    if (it != localMemPortMap.end() && it->second.wrData)
+    bool hasMapping = it != localMemPortMap.end();
+    for (auto [d, w] : llvm::enumerate(widths)) {
+      Type addrType = IntegerType::get(ctx, w);
+      if (hasMapping && d < it->second.addrs.size() && it->second.addrs[d])
+        outputs.push_back(it->second.addrs[d]);
+      else
+        outputs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
+    }
+    if (hasMapping && it->second.wrData)
       outputs.push_back(it->second.wrData);
     else
       outputs.push_back(hw::ConstantOp::create(builder, loc, dataType, 0));
-    if (it != localMemPortMap.end() && it->second.wrEn)
+    if (hasMapping && it->second.wrEn)
       outputs.push_back(it->second.wrEn);
     else
       outputs.push_back(
@@ -1078,12 +1109,15 @@ static void mergeStepMemPorts(
   auto i1 = builder.getI1Type();
 
   for (auto &memInfo : memrefArgs) {
-    unsigned addrWidth = getAddrWidth(memInfo.memType);
-    Type addrType = IntegerType::get(ctx, addrWidth);
+    auto widths = getDimAddrWidths(memInfo.memType);
     Type dataType = memInfo.memType.getElementType();
 
-    // Start with zero defaults.
-    Value addr = hw::ConstantOp::create(builder, loc, addrType, 0);
+    // Start with zero defaults: one per dim, plus wrData/wrEn.
+    SmallVector<Value> addrs;
+    for (unsigned w : widths) {
+      Type addrType = IntegerType::get(ctx, w);
+      addrs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
+    }
     Value wrData = hw::ConstantOp::create(builder, loc, dataType, 0);
     Value wrEn = hw::ConstantOp::create(builder, loc, i1, 0);
 
@@ -1093,23 +1127,28 @@ static void mergeStepMemPorts(
       if (it == perStepPorts[i].end())
         continue;
       auto &ports = it->second;
-      Value stepAddr = ports.addr ? ports.addr
-          : hw::ConstantOp::create(builder, loc, addrType, 0);
+      for (auto [d, w] : llvm::enumerate(widths)) {
+        Type addrType = IntegerType::get(ctx, w);
+        Value stepAddr = (d < ports.addrs.size() && ports.addrs[d])
+            ? ports.addrs[d]
+            : hw::ConstantOp::create(builder, loc, addrType, 0);
+        addrs[d] = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
+                                        stepAddr, addrs[d]);
+      }
       Value stepWrData = ports.wrData ? ports.wrData
           : hw::ConstantOp::create(builder, loc, dataType, 0);
       Value stepWrEn = ports.wrEn ? ports.wrEn
           : hw::ConstantOp::create(builder, loc, i1, 0);
-      addr = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
-                                  stepAddr, addr);
       wrData = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
                                     stepWrData, wrData);
       wrEn = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
                                   stepWrEn, wrEn);
     }
 
-    mergedPorts[memInfo.originalArg].addr = addr;
-    mergedPorts[memInfo.originalArg].wrData = wrData;
-    mergedPorts[memInfo.originalArg].wrEn = wrEn;
+    auto &merged = mergedPorts[memInfo.originalArg];
+    merged.addrs = std::move(addrs);
+    merged.wrData = wrData;
+    merged.wrEn = wrEn;
   }
 }
 
@@ -1382,23 +1421,28 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       // over what was already there.
       Value childActive = fsmChildActives[waitIdx];
       for (auto &memInfo : memrefArgs) {
-        Value childAddr = childInst.getResult(outIdx++);
+        auto widths = getDimAddrWidths(memInfo.memType);
+        SmallVector<Value> childAddrs;
+        for (unsigned d = 0; d < widths.size(); ++d)
+          childAddrs.push_back(childInst.getResult(outIdx++));
         Value childWrData = childInst.getResult(outIdx++);
         Value childWrEn = childInst.getResult(outIdx++);
 
         auto &ports = localMemPorts[memInfo.originalArg];
-        unsigned addrWidth = getAddrWidth(memInfo.memType);
-        Type addrType = IntegerType::get(ctx, addrWidth);
+        if (ports.addrs.size() != widths.size())
+          ports.addrs.assign(widths.size(), Value());
         Type dataType = memInfo.memType.getElementType();
-        Value myAddr = ports.addr ? ports.addr
-            : hw::ConstantOp::create(hw, loc, addrType, 0);
+        for (auto [d, w] : llvm::enumerate(widths)) {
+          Type addrType = IntegerType::get(ctx, w);
+          Value myAddr = ports.addrs[d] ? ports.addrs[d]
+              : hw::ConstantOp::create(hw, loc, addrType, 0);
+          ports.addrs[d] = comb::MuxOp::create(hw, loc, childActive,
+                                                childAddrs[d], myAddr);
+        }
         Value myWrData = ports.wrData ? ports.wrData
             : hw::ConstantOp::create(hw, loc, dataType, 0);
         Value myWrEn = ports.wrEn ? ports.wrEn
             : hw::ConstantOp::create(hw, loc, i1, 0);
-
-        ports.addr =
-            comb::MuxOp::create(hw, loc, childActive, childAddr, myAddr);
         ports.wrData =
             comb::MuxOp::create(hw, loc, childActive, childWrData, myWrData);
         ports.wrEn =
@@ -1985,18 +2029,24 @@ static hw::HWModuleOp createHWModule(
   for (auto [idx, arg] : llvm::enumerate(funcOp.getArguments())) {
     if (auto memType = dyn_cast<MemRefType>(arg.getType())) {
       std::string baseName = "mem" + std::to_string(idx);
-      unsigned addrWidth = getAddrWidth(memType);
+      auto widths = getDimAddrWidths(memType);
       Type dataType = memType.getElementType();
-      Type addrType = IntegerType::get(ctx, addrWidth);
+      bool isOneDim = widths.size() == 1;
 
       inputIdx++;
       ports.push_back({{builder.getStringAttr(baseName + "_rd_data"), dataType,
                          hw::ModulePort::Direction::Input}});
-            ports.push_back({{builder.getStringAttr(baseName + "_addr"), addrType,
+      for (auto [d, w] : llvm::enumerate(widths)) {
+        std::string addrName =
+            isOneDim ? baseName + "_addr"
+                     : baseName + "_addr_" + std::to_string(d);
+        ports.push_back({{builder.getStringAttr(addrName),
+                           IntegerType::get(ctx, w),
+                           hw::ModulePort::Direction::Output}});
+      }
+      ports.push_back({{builder.getStringAttr(baseName + "_wr_data"), dataType,
                          hw::ModulePort::Direction::Output}});
-            ports.push_back({{builder.getStringAttr(baseName + "_wr_data"), dataType,
-                         hw::ModulePort::Direction::Output}});
-            ports.push_back({{builder.getStringAttr(baseName + "_wr_en"),
+      ports.push_back({{builder.getStringAttr(baseName + "_wr_en"),
                          builder.getI1Type(),
                          hw::ModulePort::Direction::Output}});
     } else {
@@ -2048,10 +2098,10 @@ static hw::HWModuleOp createHWModule(
   Block *hwBody = hwMod.getBodyBlock();
   unsigned hwArgIdx = 0;
   for (auto [idx, arg] : llvm::enumerate(funcOp.getArguments())) {
-    if (isa<MemRefType>(arg.getType())) {
+    if (auto memTy = dyn_cast<MemRefType>(arg.getType())) {
       MemPortMapping mp;
       mp.rdData = hwBody->getArgument(hwArgIdx++);
-      mp.addr = Value();
+      mp.addrs.assign(getNumAddrPorts(memTy), Value());
       mp.wrData = Value();
       mp.wrEn = Value();
       memPortMap[arg] = mp;
@@ -2076,18 +2126,22 @@ static void buildHWOutput(func::FuncOp funcOp, OpBuilder &builder,
     auto memType = dyn_cast<MemRefType>(arg.getType());
     if (!memType)
       continue;
-    Type addrType = IntegerType::get(ctx, getAddrWidth(memType));
+    auto widths = getDimAddrWidths(memType);
     Type dataType = memType.getElementType();
     auto it = memPortMap.find(arg);
-    if (it != memPortMap.end() && it->second.addr)
-      outputs.push_back(it->second.addr);
-    else
-      outputs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
-    if (it != memPortMap.end() && it->second.wrData)
+    bool hasMapping = it != memPortMap.end();
+    for (auto [d, w] : llvm::enumerate(widths)) {
+      Type addrType = IntegerType::get(ctx, w);
+      if (hasMapping && d < it->second.addrs.size() && it->second.addrs[d])
+        outputs.push_back(it->second.addrs[d]);
+      else
+        outputs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
+    }
+    if (hasMapping && it->second.wrData)
       outputs.push_back(it->second.wrData);
     else
       outputs.push_back(hw::ConstantOp::create(builder, loc, dataType, 0));
-    if (it != memPortMap.end() && it->second.wrEn)
+    if (hasMapping && it->second.wrEn)
       outputs.push_back(it->second.wrEn);
     else
       outputs.push_back(
@@ -2303,16 +2357,20 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   SmallVector<HLMemBackedges> hlmemBEs;
   for (auto [i, allocOp] : llvm::enumerate(localAllocs)) {
     auto memType = allocOp.getType();
-    unsigned addrWidth = getAddrWidth(memType);
-    auto addrType = IntegerType::get(ctx, addrWidth);
     auto dataType = memType.getElementType();
 
     std::string name = "local_mem" + std::to_string(i);
     auto hlmem = seq::HLMemOp::create(builder, loc, clk, rst, name,
                                         memType.getShape(), dataType);
 
-    // Shared address backedge for both read and write.
-    Backedge addrBE = funcBB.get(addrType);
+    // Per-dim address backedges using hlmem's exact address types.
+    SmallVector<Backedge> addrBEs;
+    SmallVector<Value> addrVals;
+    for (Type addrTy : hlmem.getHandle().getType().getAddressTypes()) {
+      Backedge be = funcBB.get(addrTy);
+      addrBEs.push_back(be);
+      addrVals.push_back(Value(be));
+    }
     Backedge wrDataBE = funcBB.get(dataType);
     Backedge wrEnBE = funcBB.get(i1);
 
@@ -2322,23 +2380,24 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
         hw::ConstantOp::create(builder, loc, i1, 1));
     auto readPort = seq::ReadPortOp::create(
         builder, loc, hlmem.getHandle(),
-        ValueRange{Value(addrBE)}, notWrEn, /*latency=*/0);
+        ValueRange(addrVals), notWrEn, /*latency=*/0);
 
     // Write port.
     seq::WritePortOp::create(
         builder, loc, hlmem.getHandle(),
-        ValueRange{Value(addrBE)}, Value(wrDataBE), Value(wrEnBE),
+        ValueRange(addrVals), Value(wrDataBE), Value(wrEnBE),
         /*latency=*/1);
 
     // Add to memPortMap.
     MemPortMapping mp;
     mp.rdData = readPort.getReadData();
-    mp.addr = Value();
+    mp.addrs.assign(getNumAddrPorts(memType), Value());
     mp.wrData = Value();
     mp.wrEn = Value();
     memPortMap[allocOp.getResult()] = mp;
 
-    hlmemBEs.push_back({allocOp.getResult(), addrBE, wrDataBE, wrEnBE});
+    hlmemBEs.push_back({allocOp.getResult(), std::move(addrBEs), wrDataBE,
+                        wrEnBE});
   }
 
   // Collect top-level steps.
@@ -2408,22 +2467,31 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
     for (auto result : topSeqOp.getResults())
       mapping.map(result, rootInst.getResult(outIdx++));
     for (auto &memInfo : memrefArgs) {
-      memPortMap[memInfo.originalArg].addr = rootInst.getResult(outIdx++);
-      memPortMap[memInfo.originalArg].wrData = rootInst.getResult(outIdx++);
-      memPortMap[memInfo.originalArg].wrEn = rootInst.getResult(outIdx++);
+      auto &mp = memPortMap[memInfo.originalArg];
+      auto widths = getDimAddrWidths(memInfo.memType);
+      mp.addrs.assign(widths.size(), Value());
+      for (unsigned d = 0; d < widths.size(); ++d)
+        mp.addrs[d] = rootInst.getResult(outIdx++);
+      mp.wrData = rootInst.getResult(outIdx++);
+      mp.wrEn = rootInst.getResult(outIdx++);
     }
 
     // Resolve local hlmem backedges.
     builder.setInsertionPointToEnd(hwBody);
     for (auto &be : hlmemBEs) {
       auto &ports = memPortMap[be.allocResult];
-      unsigned addrWidth = getAddrWidth(
-          cast<MemRefType>(be.allocResult.getType()));
-      auto addrType = IntegerType::get(ctx, addrWidth);
-      auto dataType =
-          cast<MemRefType>(be.allocResult.getType()).getElementType();
-      be.addrBE.setValue(ports.addr ? ports.addr
-          : hw::ConstantOp::create(builder, loc, addrType, 0));
+      auto memTy = cast<MemRefType>(be.allocResult.getType());
+      auto dataType = memTy.getElementType();
+      for (auto [d, beAddr] : llvm::enumerate(be.addrBEs)) {
+        auto hlmemAddrTy = cast<IntegerType>(Value(beAddr).getType());
+        Value src;
+        if (d < ports.addrs.size() && ports.addrs[d])
+          src = resizeIntTo(builder, loc, ports.addrs[d],
+                            hlmemAddrTy.getWidth());
+        else
+          src = hw::ConstantOp::create(builder, loc, hlmemAddrTy, 0);
+        beAddr.setValue(src);
+      }
       be.wrDataBE.setValue(ports.wrData ? ports.wrData
           : hw::ConstantOp::create(builder, loc, dataType, 0));
       be.wrEnBE.setValue(ports.wrEn ? ports.wrEn
@@ -2581,9 +2649,13 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
 
       // Extract child memory outputs into per-step ports.
       for (auto &memInfo : memrefArgs) {
-        perStepPorts[i][memInfo.originalArg].addr = childInst.getResult(outIdx++);
-        perStepPorts[i][memInfo.originalArg].wrData = childInst.getResult(outIdx++);
-        perStepPorts[i][memInfo.originalArg].wrEn = childInst.getResult(outIdx++);
+        auto &mp = perStepPorts[i][memInfo.originalArg];
+        auto widths = getDimAddrWidths(memInfo.memType);
+        mp.addrs.assign(widths.size(), Value());
+        for (unsigned d = 0; d < widths.size(); ++d)
+          mp.addrs[d] = childInst.getResult(outIdx++);
+        mp.wrData = childInst.getResult(outIdx++);
+        mp.wrEn = childInst.getResult(outIdx++);
       }
 
       // Clone post-child ops.
@@ -2668,8 +2740,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
 
   // Copy merged ports to function-level memPortMap.
   for (auto &memInfo : memrefArgs) {
-    memPortMap[memInfo.originalArg].addr =
-        mergedMemPorts[memInfo.originalArg].addr;
+    memPortMap[memInfo.originalArg].addrs =
+        mergedMemPorts[memInfo.originalArg].addrs;
     memPortMap[memInfo.originalArg].wrData =
         mergedMemPorts[memInfo.originalArg].wrData;
     memPortMap[memInfo.originalArg].wrEn =
@@ -2680,13 +2752,18 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   builder.setInsertionPointToEnd(hwBody);
   for (auto &be : hlmemBEs) {
     auto &ports = memPortMap[be.allocResult];
-    unsigned addrWidth = getAddrWidth(
-        cast<MemRefType>(be.allocResult.getType()));
-    auto addrType = IntegerType::get(ctx, addrWidth);
-    auto dataType =
-        cast<MemRefType>(be.allocResult.getType()).getElementType();
-    be.addrBE.setValue(ports.addr ? ports.addr
-        : hw::ConstantOp::create(builder, loc, addrType, 0));
+    auto memTy = cast<MemRefType>(be.allocResult.getType());
+    auto dataType = memTy.getElementType();
+    for (auto [d, beAddr] : llvm::enumerate(be.addrBEs)) {
+      auto hlmemAddrTy = cast<IntegerType>(Value(beAddr).getType());
+      Value src;
+      if (d < ports.addrs.size() && ports.addrs[d])
+        src = resizeIntTo(builder, loc, ports.addrs[d],
+                          hlmemAddrTy.getWidth());
+      else
+        src = hw::ConstantOp::create(builder, loc, hlmemAddrTy, 0);
+      beAddr.setValue(src);
+    }
     be.wrDataBE.setValue(ports.wrData ? ports.wrData
         : hw::ConstantOp::create(builder, loc, dataType, 0));
     be.wrEnBE.setValue(ports.wrEn ? ports.wrEn

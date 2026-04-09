@@ -37,11 +37,13 @@ using namespace circt::loopschedule;
 
 namespace {
 
-/// A group of memory ports sharing a common prefix.
+/// A group of memory ports sharing a common prefix. Only 1-D I/O memories
+/// are supported here — multi-dim memrefs would need a richer testbench
+/// model and are intentionally rejected.
 struct MemPortGroup {
   std::string name;       // e.g. "mem0"
   hw::PortInfo rdData;    // input: read data
-  hw::PortInfo addr;      // output: address
+  hw::PortInfo addr;      // output: address (mem<i>_addr)
   hw::PortInfo wrData;    // output: write data
   hw::PortInfo wrEn;      // output: write enable
   unsigned addrWidth;     // address bits
@@ -73,7 +75,8 @@ static bool isControlPort(StringRef name) {
 
 /// Try to detect memory port groups from DUT ports.
 /// Memory ports follow the naming convention: {name}_rd_data, {name}_addr,
-/// {name}_wr_data, {name}_wr_en.
+/// {name}_wr_data, {name}_wr_en. Only 1-D I/O memories are supported —
+/// a group containing `_addr_<d>` (the multi-dim naming) is rejected.
 static SmallVector<MemPortGroup>
 classifyMemoryPorts(const SmallVector<hw::PortInfo> &dutPorts) {
   // Collect candidate prefixes from _rd_data ports.
@@ -88,6 +91,7 @@ classifyMemoryPorts(const SmallVector<hw::PortInfo> &dutPorts) {
   for (auto &prefix : prefixes) {
     MemPortGroup group;
     group.name = prefix;
+    bool multiDim = false;
 
     for (auto &port : dutPorts) {
       StringRef pname = port.getName();
@@ -99,7 +103,12 @@ classifyMemoryPorts(const SmallVector<hw::PortInfo> &dutPorts) {
         group.wrData = port;
       else if (pname == prefix + "_wr_en")
         group.wrEn = port;
+      else if (pname.starts_with(prefix + "_addr_"))
+        multiDim = true;
     }
+
+    if (multiDim)
+      continue;
 
     // Verify all four ports exist.
     if (group.rdData.getName().empty() || group.addr.getName().empty() ||
