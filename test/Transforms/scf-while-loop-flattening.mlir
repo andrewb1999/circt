@@ -495,3 +495,495 @@ func.func @conv2d(%in: memref<8x8x3xi32>,
   }
   return
 }
+
+// -----
+
+// Linearized address promotion (packed): a 2D loop nest whose inner body
+// loads from memref<12xi32> via the FlattenMemRefs-style chain `i*4 + j`.
+// With i in [0,3) and j in [0,4), the per-iteration delta folds to +1
+// unconditionally and no select is needed for the address iter-arg.
+
+// CHECK-LABEL: func.func @linearized_addr_packed
+// CHECK:         %[[INIT:.*]] = arith.constant 0 : index
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %[[A:.*]] = %[[INIT]]) : (i32, i32, index) -> (i32, i32, index)
+// CHECK:         do {
+// CHECK:         ^bb0(%[[BI:.*]]: i32, %[[BJ:.*]]: i32, %[[BA:.*]]: index):
+// CHECK-NOT:       arith.muli
+// CHECK-NOT:       arith.shli
+// CHECK:           memref.load %{{.*}}[%[[BA]]] : memref<12xi32>
+// CHECK:           %[[ONE:.*]] = arith.constant 1 : index
+// CHECK:           %[[AN:.*]] = arith.addi %[[BA]], %[[ONE]] : index
+// CHECK:           scf.yield %{{.*}}, %{{.*}}, %[[AN]] : i32, i32, index
+// CHECK:         }
+// CHECK-NOT:     scf.while
+func.func @linearized_addr_packed(%m: memref<12xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c3 = arith.constant 3 : i32
+  %c4 = arith.constant 4 : i32
+  %c4i = arith.constant 4 : index
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c3 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c4 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %ii = arith.index_cast %i : i32 to index
+      %ji = arith.index_cast %j : i32 to index
+      %mul = arith.muli %ii, %c4i : index
+      %addr = arith.addi %mul, %ji : index
+      %v = memref.load %m[%addr] : memref<12xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Linearized address promotion with carry: i in [0,3), j in [0,2), but the
+// linearized stride for i is still 4 (so the access skips 2 addresses each
+// time the inner loop wraps). The delta becomes `1 + select(done_j, 2, 0)`.
+
+// CHECK-LABEL: func.func @linearized_addr_carry
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %[[A:.*]] = %{{.*}}) : (i32, i32, index) -> (i32, i32, index)
+// CHECK:         do {
+// CHECK:         ^bb0(%[[BI:.*]]: i32, %[[BJ:.*]]: i32, %[[BA:.*]]: index):
+// CHECK-NOT:       arith.muli
+// CHECK:           memref.load %{{.*}}[%[[BA]]] : memref<12xi32>
+// CHECK:           %[[ONE:.*]] = arith.constant 1 : index
+// CHECK:           %[[A1:.*]] = arith.addi %[[BA]], %[[ONE]] : index
+// CHECK:           %[[TWO:.*]] = arith.constant 2 : index
+// CHECK:           %[[ZERO:.*]] = arith.constant 0 : index
+// CHECK:           %[[SEL:.*]] = arith.select %{{.*}}, %[[TWO]], %[[ZERO]] : index
+// CHECK:           %[[A2:.*]] = arith.addi %[[A1]], %[[SEL]] : index
+// CHECK:           scf.yield %{{.*}}, %{{.*}}, %{{.*}} : i32, i32, index
+// CHECK:         }
+// CHECK-NOT:     scf.while
+func.func @linearized_addr_carry(%m: memref<12xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %c3 = arith.constant 3 : i32
+  %c4i = arith.constant 4 : index
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c3 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c2 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %ii = arith.index_cast %i : i32 to index
+      %ji = arith.index_cast %j : i32 to index
+      %mul = arith.muli %ii, %c4i : index
+      %addr = arith.addi %mul, %ji : index
+      %v = memref.load %m[%addr] : memref<12xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// 3-level perfectly-packed linearization: i*M*K + j*K + k for memref<24xi32>
+// with N=2, M=3, K=4. Both wrap-correction terms cancel exactly, so the
+// address iter-arg increments by +1 every iteration with no selects.
+
+// CHECK-LABEL: func.func @linearized_addr_3d_packed
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %[[A:.*]] = %{{.*}}) : (i32, i32, i32, index) -> (i32, i32, i32, index)
+// CHECK:         do {
+// CHECK:         ^bb0(%[[BI:.*]]: i32, %[[BJ:.*]]: i32, %[[BK:.*]]: i32, %[[BA:.*]]: index):
+// CHECK-NOT:       arith.muli
+// CHECK-NOT:       arith.shli
+// CHECK:           memref.load %{{.*}}[%[[BA]]] : memref<24xi32>
+// CHECK:           %[[ONE:.*]] = arith.constant 1 : index
+// CHECK:           %[[AN:.*]] = arith.addi %[[BA]], %[[ONE]] : index
+// CHECK-NOT:       arith.select %{{.*}}, %{{.*}}, %{{.*}} : index
+// CHECK:           scf.yield %{{.*}}, %{{.*}}, %{{.*}}, %[[AN]] : i32, i32, i32, index
+func.func @linearized_addr_3d_packed(%m: memref<24xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %c3 = arith.constant 3 : i32
+  %c4 = arith.constant 4 : i32
+  %c4i = arith.constant 4 : index
+  %c12i = arith.constant 12 : index
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c2 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c3 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %rk = scf.while (%k = %c0) : (i32) -> i32 {
+        %ck = arith.cmpi slt, %k, %c4 : i32
+        scf.condition(%ck) %k : i32
+      } do {
+      ^bb0(%k: i32):
+        %ii = arith.index_cast %i : i32 to index
+        %ji = arith.index_cast %j : i32 to index
+        %ki = arith.index_cast %k : i32 to index
+        %m1 = arith.muli %ii, %c12i : index
+        %m2 = arith.muli %ji, %c4i : index
+        %s1 = arith.addi %m1, %m2 : index
+        %addr = arith.addi %s1, %ki : index
+        %v = memref.load %m[%addr] : memref<24xi32>
+        %kn = arith.addi %k, %c1 : i32
+        scf.yield %kn : i32
+      }
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// FlattenMemRefs uses arith.shli when the stride is a power of two. The
+// matcher must recognize shli-by-constant as multiplication.
+
+// CHECK-LABEL: func.func @linearized_addr_shli
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %[[A:.*]] = %{{.*}}) : (i32, i32, index) -> (i32, i32, index)
+// CHECK:         do {
+// CHECK:         ^bb0(%[[BI:.*]]: i32, %[[BJ:.*]]: i32, %[[BA:.*]]: index):
+// CHECK-NOT:       arith.shli
+// CHECK-NOT:       arith.muli
+// CHECK:           memref.load %{{.*}}[%[[BA]]] : memref<8xi32>
+// CHECK:           %[[ONE:.*]] = arith.constant 1 : index
+// CHECK:           arith.addi %[[BA]], %[[ONE]] : index
+func.func @linearized_addr_shli(%m: memref<8xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %c4 = arith.constant 4 : i32
+  %c2i = arith.constant 2 : index
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c2 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c4 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %ii = arith.index_cast %i : i32 to index
+      %ji = arith.index_cast %j : i32 to index
+      // i * 4 expressed as (i shl 2)
+      %sh = arith.shli %ii, %c2i : index
+      %addr = arith.addi %sh, %ji : index
+      %v = memref.load %m[%addr] : memref<8xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// A load and a store sharing the same address SSA value should be
+// de-duplicated to a single address iter-arg, not two.
+
+// CHECK-LABEL: func.func @linearized_addr_dedup
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %[[A:.*]] = %{{.*}}) : (i32, i32, index) -> (i32, i32, index)
+// CHECK:         do {
+// CHECK:         ^bb0(%{{.*}}: i32, %{{.*}}: i32, %[[BA:.*]]: index):
+// CHECK:           %[[V:.*]] = memref.load %{{.*}}[%[[BA]]] : memref<12xi32>
+// CHECK:           memref.store %[[V]], %{{.*}}[%[[BA]]] : memref<12xi32>
+func.func @linearized_addr_dedup(%a: memref<12xi32>, %b: memref<12xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c3 = arith.constant 3 : i32
+  %c4 = arith.constant 4 : i32
+  %c4i = arith.constant 4 : index
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c3 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c4 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %ii = arith.index_cast %i : i32 to index
+      %ji = arith.index_cast %j : i32 to index
+      %mul = arith.muli %ii, %c4i : index
+      %addr = arith.addi %mul, %ji : index
+      %v = memref.load %a[%addr] : memref<12xi32>
+      memref.store %v, %b[%addr] : memref<12xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Two distinct linearized addresses each get their own iter-arg.
+// addrA = i*4 + j (row-major); addrB = j*3 + i (transposed).
+
+// CHECK-LABEL: func.func @linearized_addr_two_distinct
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) : (i32, i32, index, index) -> (i32, i32, index, index)
+// CHECK:         do {
+// CHECK:         ^bb0(%[[BI:.*]]: i32, %[[BJ:.*]]: i32, %[[BA:.*]]: index, %[[BB:.*]]: index):
+// CHECK-NOT:       arith.muli
+// CHECK:           memref.load %{{.*}}[%[[BA]]] : memref<12xi32>
+// CHECK:           memref.load %{{.*}}[%[[BB]]] : memref<12xi32>
+func.func @linearized_addr_two_distinct(%a: memref<12xi32>, %b: memref<12xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c3 = arith.constant 3 : i32
+  %c4 = arith.constant 4 : i32
+  %c3i = arith.constant 3 : index
+  %c4i = arith.constant 4 : index
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c3 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c4 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %ii = arith.index_cast %i : i32 to index
+      %ji = arith.index_cast %j : i32 to index
+      %m1 = arith.muli %ii, %c4i : index
+      %addrA = arith.addi %m1, %ji : index
+      %m2 = arith.muli %ji, %c3i : index
+      %addrB = arith.addi %m2, %ii : index
+      %va = memref.load %a[%addrA] : memref<12xi32>
+      %vb = memref.load %b[%addrB] : memref<12xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Non-unit innermost step: j steps by 2 from 0..8. Per-iter base becomes
+// stride[inner]*step[inner] = 1*2 = 2; carry term is 4*1 - 1*8 = -4.
+
+// CHECK-LABEL: func.func @linearized_addr_nonunit_step
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %[[A:.*]] = %{{.*}}) : (i32, i32, index) -> (i32, i32, index)
+// CHECK:         do {
+// CHECK:         ^bb0(%[[BI:.*]]: i32, %[[BJ:.*]]: i32, %[[BA:.*]]: index):
+// CHECK-NOT:       arith.muli
+// CHECK:           memref.load %{{.*}}[%[[BA]]] : memref<12xi32>
+// CHECK:           %[[TWO:.*]] = arith.constant 2 : index
+// CHECK:           %[[A1:.*]] = arith.addi %[[BA]], %[[TWO]] : index
+// CHECK:           %[[NEG4:.*]] = arith.constant -4 : index
+// CHECK:           %[[ZERO:.*]] = arith.constant 0 : index
+// CHECK:           %[[SEL:.*]] = arith.select %{{.*}}, %[[NEG4]], %[[ZERO]] : index
+// CHECK:           %[[A2:.*]] = arith.addi %[[A1]], %[[SEL]] : index
+func.func @linearized_addr_nonunit_step(%m: memref<12xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %c3 = arith.constant 3 : i32
+  %c8 = arith.constant 8 : i32
+  %c4i = arith.constant 4 : index
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c3 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c8 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %ii = arith.index_cast %i : i32 to index
+      %ji = arith.index_cast %j : i32 to index
+      %mul = arith.muli %ii, %c4i : index
+      %addr = arith.addi %mul, %ji : index
+      %v = memref.load %m[%addr] : memref<12xi32>
+      %jn = arith.addi %j, %c2 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Negative case: the address depends on a value loaded from memory, which
+// is not a constant-coefficient linear combination of the IVs. The loop
+// nest must still flatten, and the indirect access keeps its dynamic
+// address. The first load — whose address IS linear in the IVs — is
+// still promoted to an iter-arg.
+
+// CHECK-LABEL: func.func @linearized_addr_dynamic_indirect
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) : (i32, i32, index) -> (i32, i32, index)
+// CHECK:         do {
+// CHECK:         ^bb0(%[[BI:.*]]: i32, %[[BJ:.*]]: i32, %[[BA:.*]]: index):
+// CHECK:           memref.load %{{.*}}[%[[BA]]] : memref<12xi32>
+// CHECK:           memref.load %{{.*}}[%{{.*}}] : memref<16xi32>
+// CHECK-NOT:     scf.while
+func.func @linearized_addr_dynamic_indirect(%idx: memref<12xi32>, %m: memref<16xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c3 = arith.constant 3 : i32
+  %c4 = arith.constant 4 : i32
+  %c4i = arith.constant 4 : index
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c3 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c4 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %ii = arith.index_cast %i : i32 to index
+      %ji = arith.index_cast %j : i32 to index
+      %mul = arith.muli %ii, %c4i : index
+      %lin = arith.addi %mul, %ji : index
+      %perm = memref.load %idx[%lin] : memref<12xi32>
+      %permIdx = arith.index_cast %perm : i32 to index
+      %v = memref.load %m[%permIdx] : memref<16xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Negative case: a bare IV used as an index (after a unit index_cast)
+// must NOT be promoted — the per-level iter-arg already tracks it. The
+// loop still flattens; the load just consumes the cast.
+
+// CHECK-LABEL: func.func @linearized_addr_bare_iv
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) : (i32, i32) -> (i32, i32)
+// CHECK:         do {
+// CHECK:         ^bb0(%[[BI:.*]]: i32, %[[BJ:.*]]: i32):
+// CHECK:           %[[CAST:.*]] = arith.index_cast %[[BJ]] : i32 to index
+// CHECK:           memref.load %{{.*}}[%[[CAST]]] : memref<4xi32>
+// CHECK-NOT:     scf.while
+func.func @linearized_addr_bare_iv(%m: memref<4xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c3 = arith.constant 3 : i32
+  %c4 = arith.constant 4 : i32
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c3 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c4 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %ji = arith.index_cast %j : i32 to index
+      %v = memref.load %m[%ji] : memref<4xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Positive: hls.pipeline (unit attr) on inner loop is preserved on flattened loop.
+
+// CHECK-LABEL: func.func @pipeline_attr_unit
+// CHECK:         scf.while
+// CHECK:         } attributes {hls.pipeline}
+func.func @pipeline_attr_unit() {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c3 = arith.constant 3 : i32
+  %c4 = arith.constant 4 : i32
+  scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c3 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c4 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %s = arith.addi %i, %j : i32
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    } attributes {hls.pipeline}
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Positive: hls.pipeline with explicit II value is preserved on flattened loop.
+
+// CHECK-LABEL: func.func @pipeline_attr_ii
+// CHECK:         scf.while
+// CHECK:         } attributes {hls.pipeline = 2 : i64}
+func.func @pipeline_attr_ii() {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c3 = arith.constant 3 : i32
+  %c4 = arith.constant 4 : i32
+  scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c3 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c4 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %s = arith.addi %i, %j : i32
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    } attributes {hls.pipeline = 2 : i64}
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}

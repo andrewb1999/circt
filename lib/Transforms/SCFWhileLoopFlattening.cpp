@@ -17,12 +17,16 @@
 #include "circt/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include <functional>
 
 namespace circt {
 #define GEN_PASS_DEF_SCFWHILELOOPFLATTENING
@@ -267,6 +271,163 @@ collectPerfectNest(WhileOp outer) {
   return nest;
 }
 
+/// A constant-coefficient linear combination of the nest's IVs:
+///   value == offset + sum_k strides[k] * iv_k
+/// Used to recognize address chains (e.g., the output of FlattenMemRefs)
+/// that can be promoted to a single iter-arg incremented by the odometer.
+struct LinearAddr {
+  int64_t offset;
+  SmallVector<int64_t> strides; // length == nest.size()
+};
+
+/// Try to express `v` as a constant-coefficient linear combination of the
+/// nest's after-region IVs. Recognizes the canonical patterns emitted by
+/// circt's FlattenMemRefs (constants, IV references through arith.index_cast,
+/// addi/subi, and muli/shli with one constant operand).
+static std::optional<LinearAddr> matchLinear(Value v,
+                                             ArrayRef<NestLevel> nest) {
+  LinearAddr out;
+  out.offset = 0;
+  out.strides.assign(nest.size(), 0);
+
+  // Constant.
+  APInt c;
+  if (matchPattern(v, m_ConstantInt(&c))) {
+    out.offset = c.getSExtValue();
+    return out;
+  }
+
+  // Direct IV reference.
+  for (unsigned k = 0, e = nest.size(); k < e; ++k) {
+    if (v == nest[k].ivAfter) {
+      out.strides[k] = 1;
+      return out;
+    }
+  }
+
+  // Transparent index_cast (the bridge between integer-typed loop IVs and
+  // index-typed memref indices).
+  if (auto cast = v.getDefiningOp<arith::IndexCastOp>())
+    return matchLinear(cast.getIn(), nest);
+  if (auto cast = v.getDefiningOp<arith::IndexCastUIOp>())
+    return matchLinear(cast.getIn(), nest);
+
+  if (auto add = v.getDefiningOp<arith::AddIOp>()) {
+    auto a = matchLinear(add.getLhs(), nest);
+    auto b = matchLinear(add.getRhs(), nest);
+    if (!a || !b)
+      return std::nullopt;
+    out.offset = a->offset + b->offset;
+    for (unsigned k = 0, e = nest.size(); k < e; ++k)
+      out.strides[k] = a->strides[k] + b->strides[k];
+    return out;
+  }
+
+  if (auto sub = v.getDefiningOp<arith::SubIOp>()) {
+    auto a = matchLinear(sub.getLhs(), nest);
+    auto b = matchLinear(sub.getRhs(), nest);
+    if (!a || !b)
+      return std::nullopt;
+    out.offset = a->offset - b->offset;
+    for (unsigned k = 0, e = nest.size(); k < e; ++k)
+      out.strides[k] = a->strides[k] - b->strides[k];
+    return out;
+  }
+
+  if (auto mul = v.getDefiningOp<arith::MulIOp>()) {
+    APInt cm;
+    Value other;
+    if (matchPattern(mul.getLhs(), m_ConstantInt(&cm)))
+      other = mul.getRhs();
+    else if (matchPattern(mul.getRhs(), m_ConstantInt(&cm)))
+      other = mul.getLhs();
+    else
+      return std::nullopt;
+    auto a = matchLinear(other, nest);
+    if (!a)
+      return std::nullopt;
+    int64_t k = cm.getSExtValue();
+    out.offset = a->offset * k;
+    for (unsigned j = 0, e = nest.size(); j < e; ++j)
+      out.strides[j] = a->strides[j] * k;
+    return out;
+  }
+
+  if (auto shl = v.getDefiningOp<arith::ShLIOp>()) {
+    APInt cm;
+    if (!matchPattern(shl.getRhs(), m_ConstantInt(&cm)))
+      return std::nullopt;
+    auto a = matchLinear(shl.getLhs(), nest);
+    if (!a)
+      return std::nullopt;
+    int64_t k = int64_t(1) << cm.getSExtValue();
+    out.offset = a->offset * k;
+    for (unsigned j = 0, e = nest.size(); j < e; ++j)
+      out.strides[j] = a->strides[j] * k;
+    return out;
+  }
+
+  return std::nullopt;
+}
+
+/// A memory address inside the innermost body that we plan to promote to a
+/// per-iteration iter-arg of the flattened scf.while.
+struct AddrCandidate {
+  Value root;       // Original SSA value defined inside the inner body.
+  Type type;        // root.getType() — the iter-arg's type.
+  LinearAddr linear;
+};
+
+/// Find values used as memory-op indices inside `inner.getAfterBody()` that
+/// are constant-coefficient linear combinations of the nest's IVs. Returns
+/// one entry per distinct root value (loads/stores sharing an SSA address
+/// value share an iter-arg automatically).
+static SmallVector<AddrCandidate>
+collectAddrCandidates(WhileOp inner, ArrayRef<NestLevel> nest) {
+  SmallVector<AddrCandidate> result;
+  DenseMap<Value, unsigned> seen;
+
+  auto consider = [&](Value idx) {
+    if (seen.contains(idx))
+      return;
+    auto lin = matchLinear(idx, nest);
+    if (!lin)
+      return;
+    // Only promote linear forms whose computation actually does work each
+    // iteration: at least one stride |c_k| > 1 (a real scaled term, e.g.
+    // emitted by FlattenMemRefs) or a nonzero constant offset. Skip pure
+    // constants and trivial unit-coefficient sums of IVs (like a bare
+    // `arith.index_cast %iv` or `%a + %b`), which the existing per-level
+    // iter-args already track.
+    bool anyStride = false;
+    bool genuinelyScaled = false;
+    for (int64_t s : lin->strides) {
+      if (s != 0)
+        anyStride = true;
+      if (s > 1 || s < -1)
+        genuinelyScaled = true;
+    }
+    if (!anyStride)
+      return;
+    if (!genuinelyScaled && lin->offset == 0)
+      return;
+    seen[idx] = result.size();
+    result.push_back({idx, idx.getType(), *lin});
+  };
+
+  inner.getAfterBody()->walk([&](Operation *op) {
+    if (auto load = dyn_cast<memref::LoadOp>(op)) {
+      for (Value idx : load.getIndices())
+        consider(idx);
+    } else if (auto store = dyn_cast<memref::StoreOp>(op)) {
+      for (Value idx : store.getIndices())
+        consider(idx);
+    }
+  });
+
+  return result;
+}
+
 /// Emit the flattened scf.while for a collected perfect nest.
 static void emitFlattenedNest(OpBuilder &builder,
                               ArrayRef<NestLevel> nest) {
@@ -276,27 +437,50 @@ static void emitFlattenedNest(OpBuilder &builder,
   MLIRContext *ctx = builder.getContext();
   Location loc = outer.getLoc();
 
+  // Identify any memory-op address chains in the inner body that are
+  // constant-coefficient linear combinations of the loop IVs. Each such
+  // value will be promoted to a dedicated iter-arg of the flattened while,
+  // updated incrementally from the odometer's done signals (eliminating
+  // the per-iteration mul/add chain that FlattenMemRefs leaves behind).
+  SmallVector<AddrCandidate> candidates = collectAddrCandidates(inner, nest);
+  unsigned M = candidates.size();
+
   builder.setInsertionPoint(outer);
 
-  // --- Inits: one per level. ---
+  // --- Inits: one per level, plus one per address candidate. ---
   SmallVector<Value> inits;
   SmallVector<Type> ivTypes;
-  inits.reserve(N);
-  ivTypes.reserve(N);
+  inits.reserve(N + M);
+  ivTypes.reserve(N + M);
   for (NestLevel lvl : nest) {
     auto cst = builder.create<arith::ConstantOp>(
         loc, lvl.ivType, IntegerAttr::get(lvl.ivType, lvl.lb));
     inits.push_back(cst);
     ivTypes.push_back(lvl.ivType);
   }
+  for (const AddrCandidate &cand : candidates) {
+    int64_t initVal = cand.linear.offset;
+    for (unsigned k = 0; k < N; ++k)
+      initVal += cand.linear.strides[k] * nest[k].lb.getSExtValue();
+    auto cst = builder.create<arith::ConstantOp>(
+        loc, cand.type, IntegerAttr::get(cand.type, initVal));
+    inits.push_back(cst);
+    ivTypes.push_back(cand.type);
+  }
 
   auto flat = builder.create<WhileOp>(loc, ivTypes, inits);
+
+  // Preserve the pipeline attribute from the innermost loop so that
+  // downstream scheduling passes (SCFToLoopSchedule) still recognize
+  // the flattened loop as pipelined.
+  if (auto pipeAttr = inner->getAttr("hls.pipeline"))
+    flat->setAttr("hls.pipeline", pipeAttr);
 
   // --- Before region. ---
   {
     Block *beforeBlock =
         builder.createBlock(&flat.getBefore(), {}, ivTypes,
-                            SmallVector<Location>(N, loc));
+                            SmallVector<Location>(N + M, loc));
     OpBuilder::InsertionGuard g(builder);
     builder.setInsertionPointToStart(beforeBlock);
 
@@ -324,7 +508,7 @@ static void emitFlattenedNest(OpBuilder &builder,
   {
     Block *afterBlock =
         builder.createBlock(&flat.getAfter(), {}, ivTypes,
-                            SmallVector<Location>(N, loc));
+                            SmallVector<Location>(N + M, loc));
     OpBuilder::InsertionGuard g(builder);
     builder.setInsertionPointToStart(afterBlock);
 
@@ -337,19 +521,109 @@ static void emitFlattenedNest(OpBuilder &builder,
     // Clone the innermost body, skipping the IV update addi and the yield.
     Block *innerAfter = inner.getAfterBody();
     arith::AddIOp innerUpdateOp = nest.back().updateOp;
-  Operation *innerUpdate = innerUpdateOp.getOperation();
+    Operation *innerUpdate = innerUpdateOp.getOperation();
     for (Operation &op : innerAfter->without_terminator()) {
       if (&op == innerUpdate)
         continue;
       builder.clone(op, mapping);
     }
 
+    // For each promoted address candidate, replace uses of the cloned arith
+    // chain with the new iter-arg, then erase the now-dead chain (no
+    // canonicalization required to see the optimization). We do this
+    // *before* emitting the odometer update so the only post-clone uses
+    // inside the after region are inside loads and stores (or other body
+    // code that already had the address Value).
+    for (unsigned c = 0; c < M; ++c) {
+      Value clonedRoot = mapping.lookup(candidates[c].root);
+      if (!clonedRoot)
+        continue;
+      // Collect the transitive defining ops of the cloned root that live
+      // inside the new after region, in def-before-use order.
+      SmallVector<Operation *> chain;
+      llvm::SmallPtrSet<Operation *, 8> visited;
+      std::function<void(Value)> collect = [&](Value v) {
+        Operation *def = v.getDefiningOp();
+        if (!def || def->getBlock() != afterBlock)
+          return;
+        if (!visited.insert(def).second)
+          return;
+        for (Value o : def->getOperands())
+          collect(o);
+        chain.push_back(def);
+      };
+      collect(clonedRoot);
+      clonedRoot.replaceAllUsesWith(afterBlock->getArgument(N + c));
+      // Erase use-before-def so each erase only touches an op with no
+      // remaining users.
+      for (auto it = chain.rbegin(), end = chain.rend(); it != end; ++it) {
+        if ((*it)->use_empty())
+          (*it)->erase();
+      }
+    }
+
     // --- Odometer update. ---
+    // Each promoted address has a running value `addrAccum[c]` that starts
+    // from the after-arg and accumulates per-level deltas as we walk from
+    // the innermost level to the outermost. The increment for the innermost
+    // level is unconditional (`stride[N-1] * step[N-1]`); for outer levels
+    // it is gated on the existing odometer's `doneChild` signal — i.e.,
+    // "the level immediately below me wrapped on this iteration".
     SmallVector<Value> ivOut(N);
+    SmallVector<Value> addrAccum(M);
+    for (unsigned c = 0; c < M; ++c)
+      addrAccum[c] = afterBlock->getArgument(N + c);
+
+    // Innermost: unconditional contribution `stride[N-1] * step[N-1]`.
+    {
+      const NestLevel &innerLvl = nest[N - 1];
+      int64_t stepInner = innerLvl.step.getSExtValue();
+      for (unsigned c = 0; c < M; ++c) {
+        int64_t base = candidates[c].linear.strides[N - 1] * stepInner;
+        if (base == 0)
+          continue;
+        Type t = candidates[c].type;
+        auto baseCst = builder.create<arith::ConstantOp>(
+            loc, t, IntegerAttr::get(t, base));
+        addrAccum[c] =
+            builder.create<arith::AddIOp>(loc, addrAccum[c], baseCst);
+      }
+    }
+
     Value doneChild; // done_{k+1}; null before the first iteration.
 
     for (int k = int(N) - 1; k >= 0; --k) {
       const NestLevel &lvl = nest[k];
+
+      // Per-level address contribution for level k (k < N-1): gated on
+      // `doneChild`, which currently holds "level k+1 wrapped". The amount
+      // is `stride[k]*step[k] - stride[k+1]*(ub_norm[k+1]-lb[k+1])`: the
+      // first term is what level k contributes when it advances by step,
+      // the second term reverses the wrap-around of level k+1 that just
+      // reset back to its lb.
+      if (k < int(N) - 1) {
+        const NestLevel &child = nest[k + 1];
+        int64_t childRange =
+            (child.ubNormalized - child.lb).getSExtValue();
+        int64_t stepK = lvl.step.getSExtValue();
+        for (unsigned c = 0; c < M; ++c) {
+          int64_t addendVal =
+              candidates[c].linear.strides[k] * stepK -
+              candidates[c].linear.strides[k + 1] * childRange;
+          if (addendVal == 0)
+            continue;
+          Type t = candidates[c].type;
+          auto addendCst = builder.create<arith::ConstantOp>(
+              loc, t, IntegerAttr::get(t, addendVal));
+          auto zeroCst = builder.create<arith::ConstantOp>(
+              loc, t, IntegerAttr::get(t, 0));
+          Value sel = builder.create<arith::SelectOp>(loc, doneChild,
+                                                      addendCst, zeroCst);
+          addrAccum[c] =
+              builder.create<arith::AddIOp>(loc, addrAccum[c], sel);
+        }
+      }
+
       Value curIv = afterBlock->getArgument(k);
 
       auto stepCst = builder.create<arith::ConstantOp>(
@@ -395,7 +669,9 @@ static void emitFlattenedNest(OpBuilder &builder,
       doneChild = doneHere;
     }
 
-    builder.create<YieldOp>(loc, ivOut);
+    SmallVector<Value> yieldOperands(ivOut.begin(), ivOut.end());
+    yieldOperands.append(addrAccum.begin(), addrAccum.end());
+    builder.create<YieldOp>(loc, yieldOperands);
   }
 
   // Replace the outer while's single result with the flat loop's result[0].
