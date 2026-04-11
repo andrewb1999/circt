@@ -159,6 +159,17 @@ public:
 
   bool hasCondReg(LoopInterface loop) { return condRegs.contains(loop); }
 
+  void setSeqCondValue(LoopInterface loop, Value v) {
+    seqCondValues[loop] = v;
+  }
+
+  std::optional<Value> getSeqCondValue(LoopInterface loop) {
+    auto it = seqCondValues.find(loop);
+    if (it == seqCondValues.end())
+      return std::nullopt;
+    return it->second;
+  }
+
   void setCondGroup(LoopInterface loop, calyx::StaticGroupOp group) {
     condGroups[loop] = group;
   }
@@ -311,6 +322,8 @@ private:
   DenseMap<LoopInterface, Value> loopIterValues;
 
   DenseMap<LoopInterface, calyx::RegisterOp> condRegs;
+
+  DenseMap<LoopInterface, Value> seqCondValues;
 
   DenseMap<LoopInterface, calyx::StaticGroupOp> condGroups;
 
@@ -1550,6 +1563,9 @@ class BuildConditionChecks : public calyx::FuncOpPartialLoweringPattern {
         return;
       }
 
+      // Sequential loops: condition driven by continuous wires, no cond_reg.
+      return;
+
       /// Create condition register.
       auto condValue = loop.getConditionValue();
       std::string name = getState<ComponentLoweringState>()
@@ -1861,10 +1877,23 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
           LoopWrapper loop(dyn_cast<LoopInterface>(phase->getParentOp()));
 
           if (absIdx == kConditionIdx &&
+              !loop.getOperation().isPipelined()) {
+            // Sequential loop: store condition value for continuous assignment.
+            getState<ComponentLoweringState>().setSeqCondValue(
+                loop.getOperation(), value);
+            reusedReg = true;
+            break;
+          }
+
+          if (absIdx == kConditionIdx &&
               getState<ComponentLoweringState>().hasCondReg(
-                  loop.getOperation())) {
+                  loop.getOperation()) &&
+              !loop.getOperation().canStall()) {
             // Reuse cond_reg as this phase result's register. BuildPhaseGroups
             // will emit the `cond_reg.in = <cmpi>.out` writer group.
+            // For stallable pipelines, cond_reg is already written by the incr
+            // group (BuildStallableConditionChecks), so we must NOT reuse it
+            // here — doing so would cause a multiple-assignment conflict.
             auto reg = getState<ComponentLoweringState>().getCondReg(
                 loop.getOperation());
             getState<ComponentLoweringState>().addPhaseReg(phase, reg, i);
@@ -2016,8 +2045,30 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       std::optional<calyx::CombGroupOp> condGroup;
 
       if (!loop.isPipelined()) {
-        condGroup = getState<ComponentLoweringState>()
-                        .findEvaluatingGroup<calyx::CombGroupOp>(condValue);
+        auto seqCond = getState<ComponentLoweringState>()
+                           .getSeqCondValue(loop);
+        if (seqCond) {
+          // Move condition evaluation to top-level continuous assignments.
+          auto evalGroup = getState<ComponentLoweringState>()
+                               .findEvaluatingGroup<calyx::CombGroupOp>(
+                                   *seqCond);
+          if (evalGroup) {
+            auto *wiresBody = getState<ComponentLoweringState>()
+                                  .getComponentOp()
+                                  .getWiresOp()
+                                  .getBodyBlock();
+            for (auto &op : llvm::make_early_inc_range(
+                     evalGroup->getBodyBlock()->getOperations())) {
+              if (op.hasTrait<OpTrait::IsTerminator>())
+                continue;
+              op.moveBefore(wiresBody, wiresBody->begin());
+            }
+            rewriter.eraseOp(*evalGroup);
+          }
+        } else {
+          condGroup = getState<ComponentLoweringState>()
+                          .findEvaluatingGroup<calyx::CombGroupOp>(condValue);
+        }
       }
 
       for (auto phase : bodyBlock->getOps<PhaseInterface>()) {
@@ -2146,6 +2197,13 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       unsigned i = operand.getOperandNumber();
       Value outerVal = operand.get();
       Value value = outerVal;
+
+      // Skip operands with no pipeline register (e.g., sequential loop
+      // condition handled by continuous assignments).
+      if (!pipelineRegisters.count(i)) {
+        phase->getResult(i).replaceAllUsesWith(value);
+        continue;
+      }
 
       // Handle predicated values by replacing value with the
       // equivalent yield operand.
@@ -2935,9 +2993,16 @@ private:
     }
 
     /// Get condition for while loop
-    auto cond = getState<ComponentLoweringState>()
-                    .getCondReg(loopOp.getOperation())
-                    .getOut();
+    Value cond;
+    auto seqCond = getState<ComponentLoweringState>()
+                       .getSeqCondValue(loopOp.getOperation());
+    if (seqCond) {
+      cond = *seqCond;
+    } else {
+      cond = getState<ComponentLoweringState>()
+                 .getCondReg(loopOp.getOperation())
+                 .getOut();
+    }
 
     /// Build WhileOp with condition
     auto whileCtrlOp = rewriter.create<calyx::WhileOp>(loc, cond);
