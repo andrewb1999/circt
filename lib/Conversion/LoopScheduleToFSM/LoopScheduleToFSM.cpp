@@ -2087,16 +2087,46 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
        llvm::zip(pipOp.getResults(), terminatorOp.getResults()))
     mapping.map(result, mapping.lookup(termResult));
 
-  // Pipeline is done when nothing is in flight. Checking `~cond & ~stageCE.back()`
-  // is not enough: for trip counts smaller than the stage depth, the cond flag
-  // drops before any data has reached the last stage, producing a spurious
-  // done pulse. OR all stage clock-enables so we only fire when every stage
-  // has drained.
-  Value anyStageActive = stageCE[0];
-  for (unsigned i = 1; i < stages.size(); ++i)
-    anyStageActive =
-        comb::OrOp::create(hwBuilder, loc, anyStageActive, stageCE[i]);
-  doneSignal = comb::createOrFoldNot(hwBuilder, loc, anyStageActive);
+  // LegUp-style epilogue done signal. Latch the loop-exit event into an
+  // epilogue register, then shift it through a delay chain matching the
+  // pipeline depth. Done fires when the delayed epilogue reaches the end —
+  // exactly when the last valid bit has drained from the tail stage.
+  // Combinational depth: O(1) (single AND of two register outputs).
+  Value notCondValue = comb::createOrFoldNot(hwBuilder, loc, condValue);
+  Value epilogueTrigger =
+      comb::AndOp::create(hwBuilder, loc, active, notCondValue);
+
+  Value notStart = comb::createOrFoldNot(hwBuilder, loc, startSignal);
+  Backedge epilogueBE = bb.get(hwBuilder.getI1Type());
+  Value epilogueHold =
+      comb::AndOp::create(hwBuilder, loc, Value(epilogueBE), notStart);
+  Value epilogueNext =
+      comb::OrOp::create(hwBuilder, loc, epilogueTrigger, epilogueHold);
+  auto epilogueReg = seq::CompRegOp::create(
+      hwBuilder, loc, epilogueNext, clk, rst, falseConst,
+      hwBuilder.getStringAttr(namePrefix + "_epilogue"));
+  epilogueBE.setValue(epilogueReg);
+
+  Value delayedEpilogue = Value(epilogueReg);
+  for (unsigned i = 0; i + 2 < stages.size(); ++i) {
+    Value delayInput =
+        comb::MuxOp::create(hwBuilder, loc, startSignal, falseConst,
+                            delayedEpilogue);
+    delayedEpilogue = seq::CompRegOp::create(
+        hwBuilder, loc, delayInput, clk, rst, falseConst,
+        hwBuilder.getStringAttr(
+            (namePrefix + "_epilogue_delay_" + std::to_string(i)).str()));
+  }
+
+  Value notTailCE = comb::createOrFoldNot(hwBuilder, loc, stageCE.back());
+  Value doneComb =
+      comb::AndOp::create(hwBuilder, loc, delayedEpilogue, notTailCE);
+  Value doneInput =
+      comb::MuxOp::create(hwBuilder, loc, startSignal, falseConst, doneComb);
+  auto doneReg = seq::CompRegOp::create(
+      hwBuilder, loc, doneInput, clk, rst, falseConst,
+      hwBuilder.getStringAttr(namePrefix + "_done"));
+  doneSignal = doneReg;
 
   return success();
 }
@@ -2371,13 +2401,42 @@ LogicalResult LoopScheduleToFSMPass::lowerPipeline(
        llvm::zip(pipOp.getResults(), terminatorOp.getResults()))
     mapping.map(result, mapping.lookup(termResult));
 
-  // See matching comment in lowerPipelineChild: OR all stage CEs to stay
-  // stable during drain for small trip counts.
-  Value anyStageActive = stageCE[0];
-  for (unsigned i = 1; i < stages.size(); ++i)
-    anyStageActive =
-        comb::OrOp::create(hwBuilder, loc, anyStageActive, stageCE[i]);
-  pipelineDone = comb::createOrFoldNot(hwBuilder, loc, anyStageActive);
+  // LegUp-style epilogue done signal — mirrors lowerPipelineChild.
+  Value notCondValue = comb::createOrFoldNot(hwBuilder, loc, condValue);
+  Value epilogueTrigger =
+      comb::AndOp::create(hwBuilder, loc, active, notCondValue);
+
+  Value notStart = comb::createOrFoldNot(hwBuilder, loc, start);
+  Backedge epilogueBE = bb.get(hwBuilder.getI1Type());
+  Value epilogueHold =
+      comb::AndOp::create(hwBuilder, loc, Value(epilogueBE), notStart);
+  Value epilogueNext =
+      comb::OrOp::create(hwBuilder, loc, epilogueTrigger, epilogueHold);
+  auto epilogueReg = seq::CompRegOp::create(
+      hwBuilder, loc, epilogueNext, clk, rst, falseConst,
+      hwBuilder.getStringAttr(namePrefix + "_epilogue"));
+  epilogueBE.setValue(epilogueReg);
+
+  Value delayedEpilogue = Value(epilogueReg);
+  for (unsigned i = 0; i + 2 < stages.size(); ++i) {
+    Value delayInput =
+        comb::MuxOp::create(hwBuilder, loc, start, falseConst,
+                            delayedEpilogue);
+    delayedEpilogue = seq::CompRegOp::create(
+        hwBuilder, loc, delayInput, clk, rst, falseConst,
+        hwBuilder.getStringAttr(
+            (namePrefix + "_epilogue_delay_" + std::to_string(i)).str()));
+  }
+
+  Value notTailCE = comb::createOrFoldNot(hwBuilder, loc, stageCE.back());
+  Value doneComb =
+      comb::AndOp::create(hwBuilder, loc, delayedEpilogue, notTailCE);
+  Value doneInput =
+      comb::MuxOp::create(hwBuilder, loc, start, falseConst, doneComb);
+  auto doneReg = seq::CompRegOp::create(
+      hwBuilder, loc, doneInput, clk, rst, falseConst,
+      hwBuilder.getStringAttr(namePrefix + "_done"));
+  pipelineDone = doneReg;
 
   OpBuilder fsmBuilder(ctx);
   fsmBuilder.setInsertionPointToEnd(&machine.getBody().front());

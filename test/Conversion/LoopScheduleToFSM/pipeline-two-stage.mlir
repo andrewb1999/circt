@@ -13,7 +13,7 @@
 // CHECK: seq.compreg.ce sym @loop0_s0_r1
 // Stage 1 registers
 // CHECK: seq.compreg.ce sym @loop0_s1_r0
-// Pipeline done: NOT(cond) AND NOT(ce_stage_1)
+// Pipeline done: epilogue delay chain + tail check
 // CHECK: comb.and
 // CHECK: hw.output
 
