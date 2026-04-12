@@ -21,6 +21,12 @@
 namespace circt {
 namespace loopschedule {
 
+// Pull in TableGen-generated Options structs (e.g.
+// LoopScheduleTestbenchGenerationOptions) so downstream callers can construct
+// the options-aware pass factory.
+#define GEN_PASS_DECL
+#include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h.inc"
+
 std::unique_ptr<mlir::Pass> createMarkMemoryAccessesPass();
 std::unique_ptr<mlir::Pass> createConstructMemoryDependenciesPass();
 std::unique_ptr<mlir::Pass> createUnrollSubLoopsPass();
@@ -29,6 +35,8 @@ std::unique_ptr<mlir::Pass> createUnrollForLoopSchedulePass();
 std::unique_ptr<mlir::Pass> createPipelineForLoopSchedulePass();
 std::unique_ptr<mlir::Pass> createUnrollMarkedLoopsPass();
 std::unique_ptr<mlir::Pass> createLoopScheduleTestbenchGenerationPass();
+std::unique_ptr<mlir::Pass> createLoopScheduleTestbenchGenerationPass(
+    const LoopScheduleTestbenchGenerationOptions &options);
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION

@@ -25,7 +25,7 @@
 
 namespace circt {
 namespace loopschedule {
-#define GEN_PASS_DECL_LOOPSCHEDULETESTBENCHGENERATION
+// Options struct is brought in by LoopSchedulePasses.h via GEN_PASS_DECL.
 #define GEN_PASS_DEF_LOOPSCHEDULETESTBENCHGENERATION
 #include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h.inc"
 } // namespace loopschedule
@@ -56,6 +56,9 @@ struct LoopScheduleTestbenchGenerationPass
           LoopScheduleTestbenchGenerationPass> {
   using LoopScheduleTestbenchGenerationBase::
       LoopScheduleTestbenchGenerationBase;
+  // Expose the TableGen-generated typedef so out-of-class callers can
+  // construct the pass with options.
+  using Options = ::circt::loopschedule::LoopScheduleTestbenchGenerationOptions;
   void runOnOperation() override;
 
 private:
@@ -652,6 +655,9 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                         });
                   }
 
+                  // Print cycle count so downstream tooling can report it.
+                  sv::FWriteOp::create(builder, loc, fd, "@CYCLES %0d\n",
+                                       ValueRange{ctrVal});
                   // Print end marker.
                   sv::FWriteOp::create(builder, loc, fd, "DONE\n",
                                        ValueRange{});
@@ -706,4 +712,10 @@ void LoopScheduleTestbenchGenerationPass::runOnOperation() {
 std::unique_ptr<mlir::Pass>
 circt::loopschedule::createLoopScheduleTestbenchGenerationPass() {
   return std::make_unique<LoopScheduleTestbenchGenerationPass>();
+}
+
+std::unique_ptr<mlir::Pass>
+circt::loopschedule::createLoopScheduleTestbenchGenerationPass(
+    const LoopScheduleTestbenchGenerationOptions &options) {
+  return std::make_unique<LoopScheduleTestbenchGenerationPass>(options);
 }

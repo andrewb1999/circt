@@ -1152,6 +1152,82 @@ static void mergeStepMemPorts(
   }
 }
 
+/// Merge per-pipeline-stage memory port mappings into a single mapping using
+/// per-stage clock-enable signals. When the pipeline's II is at least the
+/// stage count, each `stageCE[i]` pulses in a distinct cycle within the II
+/// window, so the selectors are mutually exclusive and a priority mux suffices.
+/// `outPorts` keeps the caller-provided `rdData` unchanged and only overwrites
+/// the addrs/wrData/wrEn fields with the muxed values.
+static void muxStageMemPorts(
+    OpBuilder &builder, Location loc,
+    ArrayRef<DenseMap<Value, MemPortMapping>> perStagePorts,
+    ArrayRef<Value> stageCE,
+    DenseMap<Value, MemPortMapping> &outPorts) {
+
+  auto *ctx = builder.getContext();
+  auto i1 = builder.getI1Type();
+
+  // Collect every memref that is accessed by any stage.
+  SmallVector<Value, 4> memrefs;
+  llvm::SmallDenseSet<Value> seen;
+  for (auto &stagePorts : perStagePorts) {
+    for (auto &entry : stagePorts) {
+      if (seen.insert(entry.first).second)
+        memrefs.push_back(entry.first);
+    }
+  }
+
+  for (Value memref : memrefs) {
+    auto memType = cast<MemRefType>(memref.getType());
+    auto widths = getDimAddrWidths(memType);
+    Type dataType = memType.getElementType();
+
+    SmallVector<Value> addrs;
+    for (unsigned w : widths) {
+      Type addrType = IntegerType::get(ctx, w);
+      addrs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
+    }
+    Value wrData = hw::ConstantOp::create(builder, loc, dataType, 0);
+    Value wrEn = hw::ConstantOp::create(builder, loc, i1, 0);
+
+    // Priority mux chain — last stage has lowest priority. Stages that did
+    // not actually touch this memref (no address, no write) contribute
+    // nothing: folding in their zero-address would clobber a concurrent
+    // stage's real address, since in the pipelined steady state every
+    // stageCE is high simultaneously.
+    for (int s = (int)perStagePorts.size() - 1; s >= 0; --s) {
+      auto it = perStagePorts[s].find(memref);
+      if (it == perStagePorts[s].end())
+        continue;
+      const MemPortMapping &ports = it->second;
+      bool hasAddr = llvm::any_of(ports.addrs,
+                                  [](Value v) { return (bool)v; });
+      if (!hasAddr && !ports.wrData && !ports.wrEn)
+        continue;
+      Value gate = stageCE[s];
+      for (auto [d, w] : llvm::enumerate(widths)) {
+        Type addrType = IntegerType::get(ctx, w);
+        Value stageAddr = (d < ports.addrs.size() && ports.addrs[d])
+            ? ports.addrs[d]
+            : hw::ConstantOp::create(builder, loc, addrType, 0);
+        addrs[d] =
+            comb::MuxOp::create(builder, loc, gate, stageAddr, addrs[d]);
+      }
+      if (ports.wrData)
+        wrData = comb::MuxOp::create(builder, loc, gate, ports.wrData, wrData);
+      if (ports.wrEn)
+        wrEn = comb::MuxOp::create(builder, loc, gate, ports.wrEn, wrEn);
+    }
+
+    auto &out = outPorts[memref];
+    out.addrs = std::move(addrs);
+    out.wrData = wrData;
+    out.wrEn = wrEn;
+    // rdData is preserved (it is set by the caller from the module's input
+    // port and shared across all stages).
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // Modular loop lowering (one hw.module per sequential loop)
 //===----------------------------------------------------------------------===//
@@ -1341,6 +1417,43 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     localMapping.map(iterArg, muxed);
   }
 
+  // --- Per-step capture gates ---
+  // Regular (non-wait) steps latch their register-op operands into hardware
+  // registers at the end of the step so that later steps read the correctly-
+  // held value rather than the combinational expression driven off
+  // now-deallocated addresses. For single-cycle regular steps, capture on
+  // step_active_<i>. For multi-cycle regular steps, capture on the last
+  // sub-cycle gate. Wait steps (child sequential / pipeline) capture nothing:
+  // their results come from child modules whose outputs are already
+  // registered.
+  SmallVector<Value> stepCaptureGate(numSteps);
+  for (unsigned i = 0; i < numSteps; ++i) {
+    if (stepWaitIdx[i] >= 0)
+      continue;
+    stepCaptureGate[i] = fsmStepCycleGates[i].back();
+  }
+
+  // Combinational aliases for step-result values, captured BEFORE each step's
+  // capture registers rewrite the mapping. Used for wiring the FSM cond input
+  // and sequential iter_arg register feedback — both of which must see the
+  // current-iteration combinational value, not a one-cycle-lagged register.
+  DenseMap<Value, Value> stepResultComb;
+
+  // Per-step memory port mappings. Each starts with the shared `rdData` from
+  // the module's input port so that loads always read the correct port. Per-
+  // step addrs/wrData/wrEn are merged at the end via a priority mux gated on
+  // each step's "alive" signal — the wait-step memory ops (child launch, child
+  // active, post-child stores) must all see their step as alive, so wait steps
+  // use `child_active_j | post_active_j` as their merge selector instead of
+  // `step_active_i` (which is -1 for wait steps).
+  SmallVector<DenseMap<Value, MemPortMapping>> perStepPorts(numSteps);
+  for (unsigned i = 0; i < numSteps; ++i) {
+    for (auto &memInfo : memrefArgs) {
+      perStepPorts[i][memInfo.originalArg].rdData =
+          localMemPorts[memInfo.originalArg].rdData;
+    }
+  }
+
   // --- Lower step bodies ---
   for (auto [stepIdx, stepOp] : llvm::enumerate(steps)) {
     Block *body = &stepOp.getBodyBlock();
@@ -1365,7 +1478,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           break;
 
         if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-          if (failed(handleLoad(loadOp, hw, localMapping, localMemPorts)))
+          if (failed(handleLoad(loadOp, hw, localMapping,
+                                perStepPorts[stepIdx])))
             return failure();
           continue;
         }
@@ -1373,7 +1487,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
           // Pre-child stores fire only during the child-launch state.
           if (failed(handleStore(storeOp, hw, localMapping, stepChildStart,
-                                  localMemPorts)))
+                                  perStepPorts[stepIdx])))
             return failure();
           continue;
         }
@@ -1398,7 +1512,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       for (Value cap : childCaptured)
         childInputs.push_back(localMapping.lookup(cap));
       for (auto &memInfo : memrefArgs)
-        childInputs.push_back(localMemPorts[memInfo.originalArg].rdData);
+        childInputs.push_back(
+            perStepPorts[stepIdx][memInfo.originalArg].rdData);
 
       auto childInst = hw::InstanceOp::create(
           hw, loc, childModule,
@@ -1414,11 +1529,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       for (auto result : childSeqOp.getResults())
         localMapping.map(result, childInst.getResult(outIdx++));
 
-      // Mux child memory ports against the parent's. Use this child's own
-      // child_active_j predicate so multiple sibling children can priority-
-      // chain on the same memory port without clobbering each other: each
-      // child contributes a `mux(child_active_j, childPort, prev)` layer
-      // over what was already there.
+      // Mux child memory ports into this step's per-step port mapping. Any
+      // pre-child op may have already written a pre-child address into
+      // perStepPorts[stepIdx]; the child's outputs take priority when
+      // child_active_j is high so only the launch cycle's pre-child writes
+      // actually fire while the child is running.
       Value childActive = fsmChildActives[waitIdx];
       for (auto &memInfo : memrefArgs) {
         auto widths = getDimAddrWidths(memInfo.memType);
@@ -1428,7 +1543,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         Value childWrData = childInst.getResult(outIdx++);
         Value childWrEn = childInst.getResult(outIdx++);
 
-        auto &ports = localMemPorts[memInfo.originalArg];
+        auto &ports = perStepPorts[stepIdx][memInfo.originalArg];
         if (ports.addrs.size() != widths.size())
           ports.addrs.assign(widths.size(), Value());
         Type dataType = memInfo.memType.getElementType();
@@ -1464,13 +1579,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
         if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
           if (failed(handleStore(storeOp, hw, localMapping, stepPostActive,
-                                  localMemPorts)))
+                                  perStepPorts[stepIdx])))
             return failure();
           continue;
         }
 
         if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-          if (failed(handleLoad(loadOp, hw, localMapping, localMemPorts)))
+          if (failed(handleLoad(loadOp, hw, localMapping,
+                                perStepPorts[stepIdx])))
             return failure();
           continue;
         }
@@ -1494,7 +1610,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           break;
 
         if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-          if (failed(handleLoad(loadOp, hw, localMapping, localMemPorts)))
+          if (failed(handleLoad(loadOp, hw, localMapping,
+                                perStepPorts[stepIdx])))
             return failure();
           continue;
         }
@@ -1508,7 +1625,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       std::string pipPrefix = node.prefix + "_pip" + std::to_string(pipIdx);
       if (failed(lowerPipelineChild(pipOp, hw, loc, hwBody, localMapping, clk,
                                     rst, stepChildStart, pipPrefix, pipDone,
-                                    localMemPorts)))
+                                    perStepPorts[stepIdx])))
         return failure();
       childDoneBEs[waitIdx].setValue(pipDone);
 
@@ -1527,13 +1644,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
         if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
           if (failed(handleStore(storeOp, hw, localMapping, stepPostActive,
-                                  localMemPorts)))
+                                  perStepPorts[stepIdx])))
             return failure();
           continue;
         }
 
         if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-          if (failed(handleLoad(loadOp, hw, localMapping, localMemPorts)))
+          if (failed(handleLoad(loadOp, hw, localMapping,
+                                perStepPorts[stepIdx])))
             return failure();
           continue;
         }
@@ -1545,27 +1663,70 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       // in the step body get cycleGates[0]; ops nested inside delay regions
       // get cycleGates[delay.latency].
       if (failed(lowerStepBody(body, hw, localMapping,
-                               fsmStepCycleGates[stepIdx], localMemPorts)))
+                               fsmStepCycleGates[stepIdx],
+                               perStepPorts[stepIdx])))
         return failure();
     }
 
-    // Map step results.
+    // Map step results. First save the combinational aliases (keyed on the
+    // stepOp result value), then — if this step has a capture gate — create
+    // per-operand hardware registers and point the mapping at those so
+    // subsequent step bodies read the held value instead of a combinational
+    // expression driven off now-deallocated memory addresses. Wait steps
+    // (childIdx/pipelineIdx >= 0) skip the capture: their register op operands
+    // come from the child instance and are already registered.
     auto regOp = cast<LoopScheduleRegisterOp>(body->getTerminator());
     for (auto [result, regVal] :
-         llvm::zip(stepOp.getResults(), regOp.getOperands()))
-      localMapping.map(result, localMapping.lookup(regVal));
+         llvm::zip(stepOp.getResults(), regOp.getOperands())) {
+      Value combVal = localMapping.lookup(regVal);
+      stepResultComb[result] = combVal;
+      localMapping.map(result, combVal);
+    }
+
+    if (stepCaptureGate[stepIdx]) {
+      hw.setInsertionPointToEnd(hwBody);
+      for (auto [idx, it] : llvm::enumerate(llvm::zip(
+               stepOp.getResults(), regOp.getOperands()))) {
+        auto [result, regVal] = it;
+        Value combVal = stepResultComb[result];
+        Value resetVal = createZeroConstant(hw, loc, combVal.getType());
+        auto regName = hw.getStringAttr(node.prefix + "_step" +
+                                        std::to_string(stepIdx) + "_r" +
+                                        std::to_string(idx));
+        Value reg = seq::CompRegClockEnabledOp::create(
+            hw, loc, combVal, clk, stepCaptureGate[stepIdx], rst, resetVal,
+            regName);
+        localMapping.map(result, reg);
+      }
+    }
 
     // After lowering the first step, the loop's condition value (which the
     // verifier guarantees is produced by the first phase) is now available in
     // the mapping. Wire it into the FSM instance via the condition backedge.
-    if (stepIdx == 0)
-      condBE.setValue(localMapping.lookup(terminatorOp.getCondition()));
+    // Prefer the combinational alias (stepResultComb) over the mapping, which
+    // may now point at the post-step capture register.
+    if (stepIdx == 0) {
+      Value condVal = terminatorOp.getCondition();
+      auto it = stepResultComb.find(condVal);
+      condBE.setValue(it != stepResultComb.end()
+                          ? it->second
+                          : localMapping.lookup(condVal));
+    }
   }
 
   // --- Wire up iter_arg feedback ---
+  // iter_arg registers clock on iter_advance (the last step's last cycle)
+  // which is the SAME posedge the step-capture registers update on. The
+  // captured register sees its own pre-edge value on that posedge, which is
+  // stale by one iteration; always prefer the combinational alias for the
+  // iter_arg D input.
   hw.setInsertionPointToEnd(hwBody);
   for (unsigned i = 0; i < iterArgRegs.size(); ++i) {
-    Value feedback = localMapping.lookup(terminatorOp.getIterArgs()[i]);
+    Value termArg = terminatorOp.getIterArgs()[i];
+    auto combIt = stepResultComb.find(termArg);
+    Value feedback = combIt != stepResultComb.end()
+                         ? combIt->second
+                         : localMapping.lookup(termArg);
     Value init = localMapping.lookup(seqOp.getInits()[i]);
     Value muxed = comb::MuxOp::create(hw, loc, fsmFirstIter, init, feedback);
     iterArgRegs[i].getDefiningOp()->setOperand(0, muxed);
@@ -1585,6 +1746,41 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     }
     if (!mapped)
       resultValues.push_back(localMapping.lookup(termResult));
+  }
+
+  // --- Merge per-step memory ports ---
+  // Build per-step "alive" signals used by the merge priority mux. Regular
+  // steps use their step_active_<i> (high in every sub-state of STEP_<i>).
+  // Wait steps must cover STEP+WAIT+POST, and since `step_active_<i>` is
+  // never driven high for wait steps, we OR together child_active_<j> (which
+  // spans STEP and WAIT for that child) and post_active_<j> (POST state).
+  hw.setInsertionPointToEnd(hwBody);
+  SmallVector<Value> stepMergeSignals(numSteps);
+  for (unsigned i = 0; i < numSteps; ++i) {
+    if (stepWaitIdx[i] >= 0) {
+      unsigned j = (unsigned)stepWaitIdx[i];
+      stepMergeSignals[i] = comb::OrOp::create(
+          hw, loc, fsmChildActives[j], fsmPostActives[j]);
+    } else {
+      stepMergeSignals[i] = fsmStepActives[i];
+    }
+  }
+
+  DenseMap<Value, MemPortMapping> mergedMemPorts;
+  for (auto &memInfo : memrefArgs)
+    mergedMemPorts[memInfo.originalArg].rdData =
+        localMemPorts[memInfo.originalArg].rdData;
+  mergeStepMemPorts(hw, loc, perStepPorts, stepMergeSignals, memrefArgs,
+                    mergedMemPorts);
+
+  // Copy merged ports back into localMemPorts for output construction.
+  for (auto &memInfo : memrefArgs) {
+    localMemPorts[memInfo.originalArg].addrs =
+        mergedMemPorts[memInfo.originalArg].addrs;
+    localMemPorts[memInfo.originalArg].wrData =
+        mergedMemPorts[memInfo.originalArg].wrData;
+    localMemPorts[memInfo.originalArg].wrEn =
+        mergedMemPorts[memInfo.originalArg].wrEn;
   }
 
   // --- Build module output ---
@@ -1700,6 +1896,67 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
                                         rst, falseConst, ceName);
   }
 
+  // Per-stage memory port mappings. Loads/stores in stage `i` accumulate in
+  // `perStagePorts[i]` so that multiple accesses to the same memref across
+  // stages don't clobber each other in a single shared MemPortMapping. After
+  // all stages are lowered we mux them together into `memPorts` using the
+  // stage clock-enables as selectors.
+  SmallVector<DenseMap<Value, MemPortMapping>> perStagePorts(stages.size());
+  for (unsigned s = 0; s < stages.size(); ++s)
+    for (auto &entry : memPorts)
+      perStagePorts[s][entry.first].rdData = entry.second.rdData;
+
+  // Delay chains for cross-stage values. If a value V is produced at stage J
+  // and consumed at stage K > J+1, we must insert (K - J - 1) delay registers
+  // so the consumer sees the correct pipeline iteration rather than whatever
+  // value currently occupies stage J's register (which is overwritten each
+  // cycle in an II=1 pipeline). chain[0] is the direct stage J register;
+  // chain[k] (k >= 1) is a delay register clocked on stageCE[J + k]. Consumer
+  // stage K reads chain[K - J - 1].
+  DenseMap<Value, SmallVector<Value>> delayChain;
+
+  auto resolveForStage = [&](Value origVal,
+                             unsigned consumerStage) -> Value {
+    auto result = dyn_cast<OpResult>(origVal);
+    if (!result)
+      return Value();
+    auto defStage =
+        dyn_cast<LoopSchedulePipelineStageOp>(result.getOwner());
+    if (!defStage)
+      return Value();
+    unsigned J = stages.size();
+    for (unsigned s = 0; s < stages.size(); ++s)
+      if (stages[s] == defStage) {
+        J = s;
+        break;
+      }
+    // Only delay values whose consumer is strictly later than the
+    // stage immediately after the producer. Adjacent stages (K == J+1)
+    // already read the directly-mapped stage J register correctly.
+    if (J == stages.size() || consumerStage <= J + 1)
+      return Value();
+    auto &chain = delayChain[origVal];
+    if (chain.empty())
+      chain.push_back(mapping.lookup(origVal));
+    while (chain.size() < consumerStage - J) {
+      unsigned ceStage = J + chain.size();
+      Value prev = chain.back();
+      Value resetVal = createZeroConstant(hwBuilder, loc, prev.getType());
+      auto regName = hwBuilder.getStringAttr(
+          (namePrefix + "_s" + std::to_string(ceStage) + "_dly_r" +
+           std::to_string(result.getResultNumber()) + "_from_s" +
+           std::to_string(J))
+              .str());
+      OpBuilder::InsertionGuard g(hwBuilder);
+      hwBuilder.setInsertionPointToEnd(hwBody);
+      Value reg = seq::CompRegClockEnabledOp::create(
+          hwBuilder, loc, prev, clk, stageCE[ceStage], rst, resetVal,
+          regName);
+      chain.push_back(reg);
+    }
+    return chain[consumerStage - J - 1];
+  };
+
   for (auto [stageIdx, stageOp] : llvm::enumerate(stages)) {
     Block &body = stageOp.getBodyBlock();
     hwBuilder.setInsertionPointToEnd(hwBody);
@@ -1708,22 +1965,38 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       if (isa<LoopScheduleRegisterOp>(&op))
         continue;
 
+      // Temporarily override the mapping entries for any operands that come
+      // from earlier stages so the clone sees the correctly-delayed version.
+      // Restore the original mappings after lowering this op so later uses
+      // aren't affected.
+      SmallVector<std::pair<Value, Value>> savedMappings;
+      for (Value operand : op.getOperands()) {
+        Value delayed = resolveForStage(operand, stageIdx);
+        if (!delayed)
+          continue;
+        Value current = mapping.lookup(operand);
+        if (delayed != current) {
+          savedMappings.emplace_back(operand, current);
+          mapping.map(operand, delayed);
+        }
+      }
+
+      LogicalResult opResult = success();
       if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-        // Gate the write with the stage's clock enable so the store only
-        // fires on cycles when this stage actually advances.
-        if (failed(handleStore(storeOp, hwBuilder, mapping,
-                                stageCE[stageIdx], memPorts)))
-          return failure();
-        continue;
+        opResult = handleStore(storeOp, hwBuilder, mapping,
+                               stageCE[stageIdx], perStagePorts[stageIdx]);
+      } else if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
+        opResult =
+            handleLoad(loadOp, hwBuilder, mapping, perStagePorts[stageIdx]);
+      } else {
+        hwBuilder.clone(op, mapping);
       }
 
-      if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-        if (failed(handleLoad(loadOp, hwBuilder, mapping, memPorts)))
-          return failure();
-        continue;
-      }
+      for (auto &sm : savedMappings)
+        mapping.map(sm.first, sm.second);
 
-      hwBuilder.clone(op, mapping);
+      if (failed(opResult))
+        return failure();
     }
 
     auto regOp = cast<LoopScheduleRegisterOp>(body.getTerminator());
@@ -1744,7 +2017,11 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     }
 
     for (auto [regIdx, val] : llvm::enumerate(regOp.getOperands())) {
-      Value mappedVal = mapping.lookup(val);
+      // The register's D input should see the delayed view for this stage
+      // as well, in case the register is a direct pass-through of an
+      // earlier stage's value.
+      Value delayed = resolveForStage(val, stageIdx);
+      Value mappedVal = delayed ? delayed : mapping.lookup(val);
       Value resetVal = createZeroConstant(hwBuilder, loc, mappedVal.getType());
       auto regName = hwBuilder.getStringAttr(
           (namePrefix + "_s" + std::to_string(stageIdx) + "_r" +
@@ -1758,16 +2035,51 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     }
   }
 
-  Value notActive = comb::createOrFoldNot(hwBuilder, loc, active);
-  auto firstIterReg = seq::CompRegOp::create(
-      hwBuilder, loc, notActive, clk, rst, trueConst,
-      hwBuilder.getStringAttr(namePrefix + "_first_iter"));
+  hwBuilder.setInsertionPointToEnd(hwBody);
+  muxStageMemPorts(hwBuilder, loc, perStagePorts, stageCE, memPorts);
+
+  // Per-stage first_iter signals. Each stage s's first_iter is 1 on reset,
+  // re-arms to 1 on start, and clears the first time stageCE[s] fires. An
+  // iter_arg whose feedback value is produced at stage s must read its init
+  // value until that stage has fired at least once in this pipeline run — a
+  // single global first_iter flipping on `active` is too early for iter_args
+  // fed by late stages (e.g. a matmul accumulator at the last stage reads a
+  // stale register for cycles 1..N before the stage first writes).
+  SmallVector<Value> firstIterPerStage(stages.size());
+  for (unsigned s = 0; s < stages.size(); ++s) {
+    Backedge be = bb.get(hwBuilder.getI1Type());
+    Value notCE = comb::createOrFoldNot(hwBuilder, loc, stageCE[s]);
+    Value sticky = comb::AndOp::create(hwBuilder, loc, Value(be), notCE);
+    Value nxt = comb::OrOp::create(hwBuilder, loc, startSignal, sticky);
+    auto reg = seq::CompRegOp::create(
+        hwBuilder, loc, nxt, clk, rst, trueConst,
+        hwBuilder.getStringAttr(
+            (namePrefix + "_first_iter_s" + std::to_string(s)).str()));
+    be.setValue(reg);
+    firstIterPerStage[s] = reg;
+  }
 
   for (unsigned i = 0; i < numIterArgs; ++i) {
     Value init = mapping.lookup(pipOp.getInits()[i]);
     Value feedback = mapping.lookup(terminatorOp.getIterArgs()[i]);
-    Value muxed =
-        comb::MuxOp::create(hwBuilder, loc, firstIterReg, init, feedback);
+    // The feedback value is produced at some stage; first_iter must stay
+    // high until that stage has fired at least once. If the feedback isn't
+    // a stage result (shouldn't happen for well-formed pipelines), fall
+    // back to stage 0.
+    unsigned feedbackStage = 0;
+    Value termVal = terminatorOp.getIterArgs()[i];
+    if (auto opResult = dyn_cast<OpResult>(termVal)) {
+      if (auto stage = dyn_cast<LoopSchedulePipelineStageOp>(
+              opResult.getOwner())) {
+        for (unsigned s = 0; s < stages.size(); ++s)
+          if (stages[s] == stage) {
+            feedbackStage = s;
+            break;
+          }
+      }
+    }
+    Value muxed = comb::MuxOp::create(
+        hwBuilder, loc, firstIterPerStage[feedbackStage], init, feedback);
     iterArgBackedges[i].setValue(muxed);
   }
 
@@ -1775,9 +2087,16 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
        llvm::zip(pipOp.getResults(), terminatorOp.getResults()))
     mapping.map(result, mapping.lookup(termResult));
 
-  Value notCond = comb::createOrFoldNot(hwBuilder, loc, condValue);
-  Value notLastCE = comb::createOrFoldNot(hwBuilder, loc, stageCE.back());
-  doneSignal = comb::AndOp::create(hwBuilder, loc, notCond, notLastCE);
+  // Pipeline is done when nothing is in flight. Checking `~cond & ~stageCE.back()`
+  // is not enough: for trip counts smaller than the stage depth, the cond flag
+  // drops before any data has reached the last stage, producing a spurious
+  // done pulse. OR all stage clock-enables so we only fire when every stage
+  // has drained.
+  Value anyStageActive = stageCE[0];
+  for (unsigned i = 1; i < stages.size(); ++i)
+    anyStageActive =
+        comb::OrOp::create(hwBuilder, loc, anyStageActive, stageCE[i]);
+  doneSignal = comb::createOrFoldNot(hwBuilder, loc, anyStageActive);
 
   return success();
 }
@@ -1886,6 +2205,57 @@ LogicalResult LoopScheduleToFSMPass::lowerPipeline(
                                         rst, falseConst, ceName);
   }
 
+  // Per-stage memory port mappings. See note in lowerPipelineChild — multiple
+  // accesses to the same memref across stages must be muxed post-hoc rather
+  // than writing through the same MemPortMapping.
+  SmallVector<DenseMap<Value, MemPortMapping>> perStagePorts(stages.size());
+  for (unsigned s = 0; s < stages.size(); ++s)
+    for (auto &entry : memPortMap)
+      perStagePorts[s][entry.first].rdData = entry.second.rdData;
+
+  // See lowerPipelineChild: auto-insert delay registers for cross-stage
+  // values so stage K reads the correct pipeline iteration of a value
+  // produced at stage J (J + 1 < K).
+  DenseMap<Value, SmallVector<Value>> delayChain;
+  auto resolveForStage = [&](Value origVal,
+                             unsigned consumerStage) -> Value {
+    auto result = dyn_cast<OpResult>(origVal);
+    if (!result)
+      return Value();
+    auto defStage =
+        dyn_cast<LoopSchedulePipelineStageOp>(result.getOwner());
+    if (!defStage)
+      return Value();
+    unsigned J = stages.size();
+    for (unsigned s = 0; s < stages.size(); ++s)
+      if (stages[s] == defStage) {
+        J = s;
+        break;
+      }
+    if (J == stages.size() || consumerStage <= J + 1)
+      return Value();
+    auto &chain = delayChain[origVal];
+    if (chain.empty())
+      chain.push_back(mapping.lookup(origVal));
+    while (chain.size() < consumerStage - J) {
+      unsigned ceStage = J + chain.size();
+      Value prev = chain.back();
+      Value resetVal = createZeroConstant(hwBuilder, loc, prev.getType());
+      auto regName = hwBuilder.getStringAttr(
+          (namePrefix + "_s" + std::to_string(ceStage) + "_dly_r" +
+           std::to_string(result.getResultNumber()) + "_from_s" +
+           std::to_string(J))
+              .str());
+      OpBuilder::InsertionGuard g(hwBuilder);
+      hwBuilder.setInsertionPointToEnd(hwBody);
+      Value reg = seq::CompRegClockEnabledOp::create(
+          hwBuilder, loc, prev, clk, stageCE[ceStage], rst, resetVal,
+          regName);
+      chain.push_back(reg);
+    }
+    return chain[consumerStage - J - 1];
+  };
+
   for (auto [stageIdx, stageOp] : llvm::enumerate(stages)) {
     Block &body = stageOp.getBodyBlock();
     hwBuilder.setInsertionPointToEnd(hwBody);
@@ -1894,22 +2264,34 @@ LogicalResult LoopScheduleToFSMPass::lowerPipeline(
       if (isa<LoopScheduleRegisterOp>(&op))
         continue;
 
+      SmallVector<std::pair<Value, Value>> savedMappings;
+      for (Value operand : op.getOperands()) {
+        Value delayed = resolveForStage(operand, stageIdx);
+        if (!delayed)
+          continue;
+        Value current = mapping.lookup(operand);
+        if (delayed != current) {
+          savedMappings.emplace_back(operand, current);
+          mapping.map(operand, delayed);
+        }
+      }
+
+      LogicalResult opResult = success();
       if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-        // Gate the write with the stage's clock enable so the store only
-        // fires on cycles when this stage actually advances.
-        if (failed(handleStore(storeOp, hwBuilder, mapping,
-                                stageCE[stageIdx], memPortMap)))
-          return failure();
-        continue;
+        opResult = handleStore(storeOp, hwBuilder, mapping,
+                               stageCE[stageIdx], perStagePorts[stageIdx]);
+      } else if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
+        opResult =
+            handleLoad(loadOp, hwBuilder, mapping, perStagePorts[stageIdx]);
+      } else {
+        hwBuilder.clone(op, mapping);
       }
 
-      if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-        if (failed(handleLoad(loadOp, hwBuilder, mapping, memPortMap)))
-          return failure();
-        continue;
-      }
+      for (auto &sm : savedMappings)
+        mapping.map(sm.first, sm.second);
 
-      hwBuilder.clone(op, mapping);
+      if (failed(opResult))
+        return failure();
     }
 
     auto regOp = cast<LoopScheduleRegisterOp>(body.getTerminator());
@@ -1930,7 +2312,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipeline(
     }
 
     for (auto [regIdx, val] : llvm::enumerate(regOp.getOperands())) {
-      Value mappedVal = mapping.lookup(val);
+      Value delayed = resolveForStage(val, stageIdx);
+      Value mappedVal = delayed ? delayed : mapping.lookup(val);
       Value resetVal = createZeroConstant(hwBuilder, loc, mappedVal.getType());
       auto regName = hwBuilder.getStringAttr(
           (namePrefix + "_s" + std::to_string(stageIdx) + "_r" +
@@ -1944,16 +2327,43 @@ LogicalResult LoopScheduleToFSMPass::lowerPipeline(
     }
   }
 
-  Value notActive = comb::createOrFoldNot(hwBuilder, loc, active);
-  auto firstIterReg = seq::CompRegOp::create(
-      hwBuilder, loc, notActive, clk, rst, trueConst,
-      hwBuilder.getStringAttr(namePrefix + "_first_iter"));
+  hwBuilder.setInsertionPointToEnd(hwBody);
+  muxStageMemPorts(hwBuilder, loc, perStagePorts, stageCE, memPortMap);
+
+  // See lowerPipelineChild: per-stage first_iter signals so iter_args fed
+  // by late stages don't read stale registers before those stages first
+  // fire.
+  SmallVector<Value> firstIterPerStage(stages.size());
+  for (unsigned s = 0; s < stages.size(); ++s) {
+    Backedge be = bb.get(hwBuilder.getI1Type());
+    Value notCE = comb::createOrFoldNot(hwBuilder, loc, stageCE[s]);
+    Value sticky = comb::AndOp::create(hwBuilder, loc, Value(be), notCE);
+    Value nxt = comb::OrOp::create(hwBuilder, loc, start, sticky);
+    auto reg = seq::CompRegOp::create(
+        hwBuilder, loc, nxt, clk, rst, trueConst,
+        hwBuilder.getStringAttr(
+            (namePrefix + "_first_iter_s" + std::to_string(s)).str()));
+    be.setValue(reg);
+    firstIterPerStage[s] = reg;
+  }
 
   for (unsigned i = 0; i < numIterArgs; ++i) {
     Value init = mapping.lookup(pipOp.getInits()[i]);
     Value feedback = mapping.lookup(terminatorOp.getIterArgs()[i]);
-    Value muxed =
-        comb::MuxOp::create(hwBuilder, loc, firstIterReg, init, feedback);
+    unsigned feedbackStage = 0;
+    Value termVal = terminatorOp.getIterArgs()[i];
+    if (auto opResult = dyn_cast<OpResult>(termVal)) {
+      if (auto stage = dyn_cast<LoopSchedulePipelineStageOp>(
+              opResult.getOwner())) {
+        for (unsigned s = 0; s < stages.size(); ++s)
+          if (stages[s] == stage) {
+            feedbackStage = s;
+            break;
+          }
+      }
+    }
+    Value muxed = comb::MuxOp::create(
+        hwBuilder, loc, firstIterPerStage[feedbackStage], init, feedback);
     iterArgBackedges[i].setValue(muxed);
   }
 
@@ -1961,9 +2371,13 @@ LogicalResult LoopScheduleToFSMPass::lowerPipeline(
        llvm::zip(pipOp.getResults(), terminatorOp.getResults()))
     mapping.map(result, mapping.lookup(termResult));
 
-  Value notCond = comb::createOrFoldNot(hwBuilder, loc, condValue);
-  Value notLastCE = comb::createOrFoldNot(hwBuilder, loc, stageCE.back());
-  pipelineDone = comb::AndOp::create(hwBuilder, loc, notCond, notLastCE);
+  // See matching comment in lowerPipelineChild: OR all stage CEs to stay
+  // stable during drain for small trip counts.
+  Value anyStageActive = stageCE[0];
+  for (unsigned i = 1; i < stages.size(); ++i)
+    anyStageActive =
+        comb::OrOp::create(hwBuilder, loc, anyStageActive, stageCE[i]);
+  pipelineDone = comb::createOrFoldNot(hwBuilder, loc, anyStageActive);
 
   OpBuilder fsmBuilder(ctx);
   fsmBuilder.setInsertionPointToEnd(&machine.getBody().front());
@@ -2301,26 +2715,20 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   auto loc = funcOp.getLoc();
   OpBuilder builder(ctx);
 
-  // Check if the top-level loop is a pipeline (not nested in sequential).
-  // If so, use the legacy pipeline path. If there's a top-level sequential
-  // (which may contain pipeline children), use the sequential path.
-  bool hasTopLevelSequential = false;
-  bool hasTopLevelPipeline = false;
+  // If the function body contains a bare pipeline (directly at the function
+  // level, not wrapped in a step), fall through to the legacy pipeline path.
+  // Otherwise use the step-based multi-step path, which handles both
+  // sequential children and pipeline children and lets us sequence leaf
+  // steps (e.g. a pre-loop store) alongside loop steps.
+  bool hasBarePipeline = false;
+  bool hasSteps = false;
   for (auto &op : funcOp.getBody().front()) {
-    if (isa<LoopScheduleSequentialOp>(&op))
-      hasTopLevelSequential = true;
     if (isa<LoopSchedulePipelineOp>(&op))
-      hasTopLevelPipeline = true;
-    if (auto step = dyn_cast<LoopScheduleStepOp>(&op)) {
-      for (auto &innerOp : step.getBodyBlock()) {
-        if (isa<LoopScheduleSequentialOp>(&innerOp))
-          hasTopLevelSequential = true;
-        if (isa<LoopSchedulePipelineOp>(&innerOp))
-          hasTopLevelPipeline = true;
-      }
-    }
+      hasBarePipeline = true;
+    if (isa<LoopScheduleStepOp>(&op))
+      hasSteps = true;
   }
-  if (!hasTopLevelSequential && hasTopLevelPipeline)
+  if (hasBarePipeline && !hasSteps)
     return lowerPipelineFunction(funcOp);
 
   // --- Sequential path (supports nesting) ---
@@ -2418,16 +2826,19 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   }
 
   // --- Single-step fast path (preserves existing behavior) ---
+  // Only applies when the single step wraps a sequential loop. Single steps
+  // containing pipelines or just a leaf body fall through to the multi-step
+  // path below, which knows how to sequence them via createFunctionFSM.
+  LoopScheduleSequentialOp topSeqOp;
   if (topSteps.size() == 1) {
-    LoopScheduleSequentialOp topSeqOp;
     for (auto &innerOp : topSteps[0].getBodyBlock()) {
       if (auto seqOp = dyn_cast<LoopScheduleSequentialOp>(&innerOp)) {
         topSeqOp = seqOp;
         break;
       }
     }
-    if (!topSeqOp)
-      return funcOp.emitError("single step has no sequential loop");
+  }
+  if (topSeqOp) {
 
     // Clone ops before the sequential in its parent step.
     for (auto &op : topSteps[0].getBodyBlock().getOperations()) {
@@ -2590,21 +3001,25 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   for (unsigned i = 0; i < numSteps; ++i) {
     builder.setInsertionPointToEnd(hwBody);
 
-    // Clone pre-child ops in this step.
+    // Clone pre-child ops in this step (only when the step has a child loop;
+    // leaf steps are handled entirely by lowerStepBody below, which knows how
+    // to turn loads/stores into port drives).
     Operation *childOp = nullptr;
     if (stepSeqOps[i])
       childOp = stepSeqOps[i].getOperation();
     else if (stepPipOps[i])
       childOp = stepPipOps[i].getOperation();
 
-    for (auto &op : topSteps[i].getBodyBlock().getOperations()) {
-      if (childOp && &op == childOp)
-        break;
-      if (isa<LoopScheduleRegisterOp>(&op))
-        continue;
-      if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
-        break;
-      builder.clone(op, mapping);
+    if (childOp) {
+      for (auto &op : topSteps[i].getBodyBlock().getOperations()) {
+        if (&op == childOp)
+          break;
+        if (isa<LoopScheduleRegisterOp>(&op))
+          continue;
+        if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
+          break;
+        builder.clone(op, mapping);
+      }
     }
 
     if (stepChildKind[i] == 0) {
@@ -2782,11 +3197,229 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
 // Pass entry point
 //===----------------------------------------------------------------------===//
 
+/// Rewrite returned memref.alloc values into plain function arguments so they
+/// appear as regular mem<i> testbench ports instead of becoming internal
+/// seq.hlmem instances. The testbench harness (and the Allo Python driver)
+/// discovers output memories by their port index, so returned allocs must sit
+/// alongside the input memref args in the final hw.module port list.
+static void hoistReturnedAllocsToArgs(func::FuncOp funcOp) {
+  if (funcOp.getBody().empty())
+    return;
+  auto *block = &funcOp.getBody().front();
+  auto returnOp = dyn_cast<func::ReturnOp>(block->getTerminator());
+  if (!returnOp)
+    return;
+  // Collect returned memref allocs and their operand indices.
+  SmallVector<memref::AllocOp> hoisted;
+  SmallVector<unsigned> droppedReturnIdxs;
+  for (auto [idx, retVal] : llvm::enumerate(returnOp.getOperands())) {
+    if (!isa<MemRefType>(retVal.getType()))
+      continue;
+    auto allocOp = retVal.getDefiningOp<memref::AllocOp>();
+    if (!allocOp)
+      continue;
+    hoisted.push_back(allocOp);
+    droppedReturnIdxs.push_back(idx);
+  }
+  if (hoisted.empty())
+    return;
+  // Append a new block argument for each hoisted alloc, replace uses, and
+  // erase the alloc.
+  auto funcType = funcOp.getFunctionType();
+  SmallVector<Type> newInputs(funcType.getInputs().begin(),
+                              funcType.getInputs().end());
+  for (auto allocOp : hoisted) {
+    Type memTy = allocOp.getType();
+    newInputs.push_back(memTy);
+    auto newArg = block->addArgument(memTy, allocOp.getLoc());
+    allocOp.getResult().replaceAllUsesWith(newArg);
+    allocOp.erase();
+  }
+  // Drop returned operands (in descending order so indices stay valid).
+  SmallVector<Value> newReturnOperands(returnOp.getOperands().begin(),
+                                       returnOp.getOperands().end());
+  for (int i = (int)droppedReturnIdxs.size() - 1; i >= 0; --i)
+    newReturnOperands.erase(newReturnOperands.begin() + droppedReturnIdxs[i]);
+  OpBuilder b(returnOp);
+  auto newReturn = func::ReturnOp::create(b, returnOp.getLoc(),
+                                            newReturnOperands);
+  (void)newReturn;
+  returnOp.erase();
+  // Update the function type.
+  SmallVector<Type> newResults(funcType.getResults().begin(),
+                               funcType.getResults().end());
+  for (int i = (int)droppedReturnIdxs.size() - 1; i >= 0; --i)
+    newResults.erase(newResults.begin() + droppedReturnIdxs[i]);
+  funcOp.setType(
+      FunctionType::get(funcOp.getContext(), newInputs, newResults));
+}
+
+/// Flatten multi-dim memref arguments (and local allocs) to 1-D so that the
+/// hw.module / testbench contract only ever deals with a single `mem<i>_addr`
+/// port. Upstream `flatten-memref` only knows about memref.load/store, not
+/// loopschedule.load/store, so we do the rewrite here where we have full
+/// ownership of the operations that actually touch the memref.
+static LogicalResult flattenMultiDimMemrefs(func::FuncOp funcOp) {
+  if (funcOp.getBody().empty())
+    return success();
+  auto *block = &funcOp.getBody().front();
+  auto *ctx = funcOp.getContext();
+
+  SmallVector<Value> toFlatten;
+  for (auto arg : block->getArguments()) {
+    if (auto mt = dyn_cast<MemRefType>(arg.getType()))
+      if (mt.getRank() > 1)
+        toFlatten.push_back(arg);
+  }
+  funcOp.walk([&](memref::AllocOp allocOp) {
+    auto mt = allocOp.getType();
+    if (mt.getRank() > 1)
+      toFlatten.push_back(allocOp.getResult());
+  });
+  if (toFlatten.empty())
+    return success();
+
+  auto linearize = [&](OpBuilder &b, Location loc, ValueRange indices,
+                       ArrayRef<int64_t> shape) -> Value {
+    int64_t total = 1;
+    for (auto d : shape)
+      total *= d;
+    unsigned bits =
+        std::max<unsigned>(1, llvm::Log2_64_Ceil(std::max<int64_t>(total, 2)));
+    Type idxType = IntegerType::get(ctx, bits);
+    Value acc =
+        arith::ConstantOp::create(b, loc, b.getIntegerAttr(idxType, 0));
+    for (size_t i = 0; i < indices.size(); ++i) {
+      int64_t tail = 1;
+      for (size_t j = i + 1; j < shape.size(); ++j)
+        tail *= shape[j];
+      Value idx = indices[i];
+      auto idxTy = cast<IntegerType>(idx.getType());
+      if (idxTy.getWidth() < bits)
+        idx = arith::ExtUIOp::create(b, loc, idxType, idx);
+      else if (idxTy.getWidth() > bits)
+        idx = arith::TruncIOp::create(b, loc, idxType, idx);
+      if (tail > 1) {
+        Value tailConst = arith::ConstantOp::create(
+            b, loc, b.getIntegerAttr(idxType, tail));
+        idx = arith::MulIOp::create(b, loc, idx, tailConst);
+      }
+      acc = arith::AddIOp::create(b, loc, acc, idx);
+    }
+    return acc;
+  };
+
+  for (Value v : toFlatten) {
+    auto oldType = cast<MemRefType>(v.getType());
+    auto shape = oldType.getShape();
+    int64_t total = 1;
+    for (auto d : shape) {
+      if (d == ShapedType::kDynamic)
+        return funcOp.emitError(
+            "cannot flatten memref with dynamic shape for FSM backend");
+      total *= d;
+    }
+    auto newType = MemRefType::get({total}, oldType.getElementType());
+
+    SmallVector<Operation *> users(v.getUsers().begin(), v.getUsers().end());
+    v.setType(newType);
+    for (auto *user : users) {
+      OpBuilder b(user);
+      if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(user)) {
+        Value linear = linearize(b, loadOp.getLoc(), loadOp.getIndices(), shape);
+        auto newLoad = LoopScheduleLoadOp::create(
+            b, loadOp.getLoc(), oldType.getElementType(), v,
+            ValueRange{linear});
+        loadOp.getResult().replaceAllUsesWith(newLoad.getResult());
+        loadOp.erase();
+      } else if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(user)) {
+        Value linear =
+            linearize(b, storeOp.getLoc(), storeOp.getIndices(), shape);
+        LoopScheduleStoreOp::create(b, storeOp.getLoc(),
+                                    storeOp.getValueToStore(), v,
+                                    ValueRange{linear});
+        storeOp.erase();
+      } else {
+        return user->emitError(
+            "unsupported user of multi-dim memref during FSM flatten");
+      }
+    }
+  }
+
+  // Update the function signature: any block args we retyped need to be
+  // reflected in the function type.
+  SmallVector<Type> newInputs;
+  for (auto arg : block->getArguments())
+    newInputs.push_back(arg.getType());
+  funcOp.setType(FunctionType::get(ctx, newInputs,
+                                   funcOp.getFunctionType().getResults()));
+  return success();
+}
+
+/// The function-step lowering assumes at most one pipeline/sequential child per
+/// top-level step (one FSM state, one child instance). When a step holds more
+/// than one independent loop (e.g. back-to-back initializer pipelines), split
+/// each extra child out into its own trailing step so the multi-step FSM can
+/// sequence them. Only top-level steps of a func::FuncOp are normalized;
+/// steps inside a sequential loop are left alone.
+static void splitMultiChildTopLevelSteps(func::FuncOp funcOp) {
+  if (funcOp.getBody().empty())
+    return;
+  auto *block = &funcOp.getBody().front();
+  SmallVector<LoopScheduleStepOp> steps;
+  for (auto &op : *block)
+    if (auto step = dyn_cast<LoopScheduleStepOp>(&op))
+      steps.push_back(step);
+
+  for (auto step : steps) {
+    Block &stepBody = step.getBodyBlock();
+    SmallVector<Operation *> children;
+    for (auto &innerOp : stepBody) {
+      if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&innerOp))
+        children.push_back(&innerOp);
+    }
+    if (children.size() <= 1)
+      continue;
+
+    OpBuilder b(step.getContext());
+    Operation *insertAfter = step.getOperation();
+    for (size_t i = 1; i < children.size(); ++i) {
+      b.setInsertionPointAfter(insertAfter);
+      auto newStep = LoopScheduleStepOp::create(b, children[i]->getLoc(),
+                                                TypeRange{});
+      Block *newBody = &newStep.getBodyBlock();
+      // `LoopScheduleStepOp`'s builder installs an implicit register
+      // terminator in the new body; drop it before moving the child in so we
+      // can re-add an empty register terminator after the child.
+      if (!newBody->empty())
+        newBody->getTerminator()->erase();
+      children[i]->moveBefore(newBody, newBody->end());
+      OpBuilder tb(children[i]->getContext());
+      tb.setInsertionPointToEnd(newBody);
+      LoopScheduleRegisterOp::create(tb, children[i]->getLoc(), ValueRange{});
+      insertAfter = newStep.getOperation();
+    }
+  }
+}
+
 void LoopScheduleToFSMPass::runOnOperation() {
   auto moduleOp = getOperation();
 
   SmallVector<func::FuncOp> funcs;
   moduleOp.walk([&](func::FuncOp f) { funcs.push_back(f); });
+
+  for (auto funcOp : funcs)
+    hoistReturnedAllocsToArgs(funcOp);
+
+  for (auto funcOp : funcs)
+    splitMultiChildTopLevelSteps(funcOp);
+
+  for (auto funcOp : funcs) {
+    if (failed(flattenMultiDimMemrefs(funcOp))) {
+      signalPassFailure();
+      return;
+    }
+  }
 
   for (auto funcOp : funcs) {
     if (failed(lowerFunction(funcOp))) {
