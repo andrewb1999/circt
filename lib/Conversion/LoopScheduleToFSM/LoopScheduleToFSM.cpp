@@ -2980,31 +2980,43 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
 
   unsigned numSteps = topSteps.size();
 
-  // Classify each step: -1 = leaf, 0 = sequential child, 1 = pipeline child.
-  SmallVector<int> stepChildKind(numSteps, -1);
-  SmallVector<LoopScheduleSequentialOp> stepSeqOps(numSteps);
-  SmallVector<LoopSchedulePipelineOp> stepPipOps(numSteps);
+  // Build a flat list of children: one entry per child op across all steps.
+  // A step with two pipelines produces two entries sharing the same stepIdx.
+  // A leaf step (no seq/pipeline children) produces one entry with kind=-1.
+  struct StepChild {
+    unsigned stepIdx;
+    int kind; // -1 leaf, 0 sequential, 1 pipeline
+    LoopScheduleSequentialOp seqOp;
+    LoopSchedulePipelineOp pipOp;
+  };
+  SmallVector<StepChild> entries;
   for (unsigned i = 0; i < numSteps; ++i) {
+    bool any = false;
     for (auto &innerOp : topSteps[i].getBodyBlock()) {
       if (auto seqOp = dyn_cast<LoopScheduleSequentialOp>(&innerOp)) {
-        stepChildKind[i] = 0;
-        stepSeqOps[i] = seqOp;
-        break;
-      }
-      if (auto pipOp = dyn_cast<LoopSchedulePipelineOp>(&innerOp)) {
-        stepChildKind[i] = 1;
-        stepPipOps[i] = pipOp;
-        break;
+        entries.push_back({i, 0, seqOp, {}});
+        any = true;
+      } else if (auto pipOp = dyn_cast<LoopSchedulePipelineOp>(&innerOp)) {
+        entries.push_back({i, 1, {}, pipOp});
+        any = true;
       }
     }
+    if (!any)
+      entries.push_back({i, -1, {}, {}});
   }
 
-  // Count non-leaf steps.
+  // Build a per-entry kind vector for createFunctionFSM. The FSM sees one
+  // state per entry, not per step.
+  SmallVector<int> entryKinds;
+  for (auto &e : entries)
+    entryKinds.push_back(e.kind);
+
+  // Count non-leaf entries.
   unsigned numChildren = 0;
-  SmallVector<int> childIndexForStep(numSteps, -1);
-  for (unsigned i = 0; i < numSteps; ++i) {
-    if (stepChildKind[i] >= 0) {
-      childIndexForStep[i] = numChildren;
+  SmallVector<int> childIndexForEntry(entries.size(), -1);
+  for (unsigned i = 0; i < entries.size(); ++i) {
+    if (entries[i].kind >= 0) {
+      childIndexForEntry[i] = numChildren;
       numChildren++;
     }
   }
@@ -3014,7 +3026,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   std::string fsmName = funcName + "_fsm";
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   builder.setInsertionPointToEnd(moduleOp.getBody());
-  createFunctionFSM(builder, loc, fsmName, stepChildKind);
+  createFunctionFSM(builder, loc, fsmName, entryKinds);
 
   // Instantiate function FSM in HW module body.
   builder.setInsertionPointToEnd(hwBody);
@@ -3029,7 +3041,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
     fsmInputs.push_back(Value(be));
   }
 
-  SmallVector<Type> fsmResultTypes(1 + numChildren + numSteps, i1);
+  unsigned numEntries = entries.size();
+  SmallVector<Type> fsmResultTypes(1 + numChildren + numEntries, i1);
   auto fsmInst = fsm::HWInstanceOp::create(
       builder, loc, fsmResultTypes,
       builder.getStringAttr(fsmName + "_inst"),
@@ -3042,36 +3055,44 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   SmallVector<Value> childStartSignals(numChildren);
   for (unsigned i = 0; i < numChildren; ++i)
     childStartSignals[i] = fsmInst.getResult(fsmOutIdx++);
-  SmallVector<Value> stepRunningSignals(numSteps);
-  for (unsigned i = 0; i < numSteps; ++i)
-    stepRunningSignals[i] = fsmInst.getResult(fsmOutIdx++);
+  SmallVector<Value> entryRunningSignals(numEntries);
+  for (unsigned i = 0; i < numEntries; ++i)
+    entryRunningSignals[i] = fsmInst.getResult(fsmOutIdx++);
 
-  // Per-step memory port mappings. Each starts with shared rdData.
-  SmallVector<DenseMap<Value, MemPortMapping>> perStepPorts(numSteps);
-  for (unsigned i = 0; i < numSteps; ++i) {
+  // Per-entry memory port mappings. Each starts with shared rdData.
+  SmallVector<DenseMap<Value, MemPortMapping>> perEntryPorts(numEntries);
+  for (unsigned i = 0; i < numEntries; ++i) {
     for (auto &memInfo : memrefArgs) {
-      perStepPorts[i][memInfo.originalArg].rdData =
+      perEntryPorts[i][memInfo.originalArg].rdData =
           memPortMap[memInfo.originalArg].rdData;
     }
   }
 
-  // Lower each step.
+  // Track which entries belong to each step for pre/post-child op cloning.
+  // firstEntryForStep[s] = index of first entry belonging to step s.
+  // lastEntryForStep[s]  = index of last entry belonging to step s.
+  SmallVector<unsigned> firstEntryForStep(numSteps, 0);
+  SmallVector<unsigned> lastEntryForStep(numSteps, 0);
+  for (unsigned i = 0; i < numEntries; ++i) {
+    unsigned s = entries[i].stepIdx;
+    if (i == 0 || entries[i - 1].stepIdx != s)
+      firstEntryForStep[s] = i;
+    lastEntryForStep[s] = i;
+  }
+
+  // Lower each entry.
   unsigned loopCounter = 0;
-  for (unsigned i = 0; i < numSteps; ++i) {
+  for (unsigned ei = 0; ei < numEntries; ++ei) {
+    auto &entry = entries[ei];
+    unsigned stepIdx = entry.stepIdx;
     builder.setInsertionPointToEnd(hwBody);
 
-    // Clone pre-child ops in this step (only when the step has a child loop;
-    // leaf steps are handled entirely by lowerStepBody below, which knows how
-    // to turn loads/stores into port drives).
-    Operation *childOp = nullptr;
-    if (stepSeqOps[i])
-      childOp = stepSeqOps[i].getOperation();
-    else if (stepPipOps[i])
-      childOp = stepPipOps[i].getOperation();
-
-    if (childOp) {
-      for (auto &op : topSteps[i].getBodyBlock().getOperations()) {
-        if (&op == childOp)
+    // Clone pre-child ops only for the first entry of this step.
+    if (entry.kind >= 0 && ei == firstEntryForStep[stepIdx]) {
+      Operation *firstChildOp = entry.seqOp ? entry.seqOp.getOperation()
+                                            : entry.pipOp.getOperation();
+      for (auto &op : topSteps[stepIdx].getBodyBlock().getOperations()) {
+        if (&op == firstChildOp)
           break;
         if (isa<LoopScheduleRegisterOp>(&op))
           continue;
@@ -3081,9 +3102,9 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
       }
     }
 
-    if (stepChildKind[i] == 0) {
+    if (entry.kind == 0) {
       // Sequential child: build loop tree and create child module.
-      auto seqOp = stepSeqOps[i];
+      auto seqOp = entry.seqOp;
       std::string prefix = "loop" + std::to_string(loopCounter++);
 
       LoopNode node;
@@ -3101,7 +3122,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
       SmallVector<Value> childInputs;
       childInputs.push_back(clk);
       childInputs.push_back(rst);
-      childInputs.push_back(childStartSignals[childIndexForStep[i]]);
+      childInputs.push_back(childStartSignals[childIndexForEntry[ei]]);
       for (Value cap : childCaptured)
         childInputs.push_back(mapping.lookup(cap));
       for (auto &memInfo : memrefArgs)
@@ -3115,15 +3136,15 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
       // Extract child outputs.
       unsigned outIdx = 0;
       Value childDone = childInst.getResult(outIdx++);
-      childDoneBEs[childIndexForStep[i]].setValue(childDone);
+      childDoneBEs[childIndexForEntry[ei]].setValue(childDone);
 
       // Map seqOp results.
       for (auto result : seqOp.getResults())
         mapping.map(result, childInst.getResult(outIdx++));
 
-      // Extract child memory outputs into per-step ports.
+      // Extract child memory outputs into per-entry ports.
       for (auto &memInfo : memrefArgs) {
-        auto &mp = perStepPorts[i][memInfo.originalArg];
+        auto &mp = perEntryPorts[ei][memInfo.originalArg];
         auto widths = getDimAddrWidths(memInfo.memType);
         mp.addrs.assign(widths.size(), Value());
         for (unsigned d = 0; d < widths.size(); ++d)
@@ -3132,39 +3153,36 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
         mp.wrEn = childInst.getResult(outIdx++);
       }
 
-      // Clone post-child ops.
-      builder.setInsertionPointToEnd(hwBody);
-      bool pastChild = false;
-      for (auto &op : topSteps[i].getBodyBlock().getOperations()) {
-        if (&op == seqOp.getOperation()) {
-          pastChild = true;
-          continue;
-        }
-        if (!pastChild)
-          continue;
-        if (isa<LoopScheduleRegisterOp>(&op))
-          continue;
-        builder.clone(op, mapping);
-      }
-
-    } else if (stepChildKind[i] == 1) {
+    } else if (entry.kind == 1) {
       // Pipeline child: lower inline.
-      auto pipOp = stepPipOps[i];
+      auto pipOp = entry.pipOp;
       std::string pipPrefix = "loop" + std::to_string(loopCounter++);
       Value pipDone;
       if (failed(lowerPipelineChild(pipOp, builder, loc, hwBody, mapping,
                                     clk, rst,
-                                    childStartSignals[childIndexForStep[i]],
+                                    childStartSignals[childIndexForEntry[ei]],
                                     pipPrefix, pipDone,
-                                    perStepPorts[i])))
+                                    perEntryPorts[ei])))
         return failure();
-      childDoneBEs[childIndexForStep[i]].setValue(pipDone);
+      childDoneBEs[childIndexForEntry[ei]].setValue(pipDone);
 
-      // Clone post-child ops.
+    } else {
+      // Leaf step: lower body with entry_running as wrEn gate.
+      Value oneGate = entryRunningSignals[ei];
+      if (failed(lowerStepBody(&topSteps[stepIdx].getBodyBlock(), builder,
+                               mapping, ArrayRef<Value>(oneGate),
+                               perEntryPorts[ei])))
+        return failure();
+    }
+
+    // Clone post-child ops only for the last entry of this step.
+    if (entry.kind >= 0 && ei == lastEntryForStep[stepIdx]) {
+      Operation *lastChildOp = entry.seqOp ? entry.seqOp.getOperation()
+                                           : entry.pipOp.getOperation();
       builder.setInsertionPointToEnd(hwBody);
       bool pastChild = false;
-      for (auto &op : topSteps[i].getBodyBlock().getOperations()) {
-        if (&op == pipOp.getOperation()) {
+      for (auto &op : topSteps[stepIdx].getBodyBlock().getOperations()) {
+        if (&op == lastChildOp) {
           pastChild = true;
           continue;
         }
@@ -3172,44 +3190,39 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
           continue;
         if (isa<LoopScheduleRegisterOp>(&op))
           continue;
+        if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
+          continue;
         builder.clone(op, mapping);
       }
-
-    } else {
-      // Leaf step: lower body with step_running as wrEn gate. The function-
-      // level FSM doesn't support multi-cycle steps, so a single gate is
-      // used for the entire body.
-      Value oneGate = stepRunningSignals[i];
-      if (failed(lowerStepBody(&topSteps[i].getBodyBlock(), builder, mapping,
-                               ArrayRef<Value>(oneGate), perStepPorts[i])))
-        return failure();
     }
 
-    // Register step results for use by subsequent steps.
-    auto stepRegOp = cast<LoopScheduleRegisterOp>(
-        topSteps[i].getBodyBlock().getTerminator());
-    for (auto [stepResult, regOperand] :
-         llvm::zip(topSteps[i].getResults(), stepRegOp.getOperands())) {
-      Value val = mapping.lookup(regOperand);
-      // Create a CE-gated register to hold the result.
-      auto regName = builder.getStringAttr(
-          funcName + "_step" + std::to_string(i) + "_result_" +
-          std::to_string(stepResult.getResultNumber()));
-      Value resetVal = createZeroConstant(builder, loc, val.getType());
-      auto reg = seq::CompRegClockEnabledOp::create(
-          builder, loc, val, clk, stepRunningSignals[i], rst, resetVal,
-          regName);
-      mapping.map(stepResult, reg);
+    // Register step results only after the last entry for this step completes.
+    if (ei == lastEntryForStep[stepIdx]) {
+      auto stepRegOp = cast<LoopScheduleRegisterOp>(
+          topSteps[stepIdx].getBodyBlock().getTerminator());
+      for (auto [stepResult, regOperand] :
+           llvm::zip(topSteps[stepIdx].getResults(),
+                     stepRegOp.getOperands())) {
+        Value val = mapping.lookup(regOperand);
+        auto regName = builder.getStringAttr(
+            funcName + "_step" + std::to_string(stepIdx) + "_result_" +
+            std::to_string(stepResult.getResultNumber()));
+        Value resetVal = createZeroConstant(builder, loc, val.getType());
+        auto reg = seq::CompRegClockEnabledOp::create(
+            builder, loc, val, clk, entryRunningSignals[ei], rst, resetVal,
+            regName);
+        mapping.map(stepResult, reg);
+      }
     }
   }
 
-  // Merge per-step memory ports.
+  // Merge per-entry memory ports.
   builder.setInsertionPointToEnd(hwBody);
   DenseMap<Value, MemPortMapping> mergedMemPorts;
   for (auto &memInfo : memrefArgs)
     mergedMemPorts[memInfo.originalArg].rdData =
         memPortMap[memInfo.originalArg].rdData;
-  mergeStepMemPorts(builder, loc, perStepPorts, stepRunningSignals,
+  mergeStepMemPorts(builder, loc, perEntryPorts, entryRunningSignals,
                     memrefArgs, mergedMemPorts);
 
   // Copy merged ports to function-level memPortMap.
@@ -3415,52 +3428,6 @@ static LogicalResult flattenMultiDimMemrefs(func::FuncOp funcOp) {
   return success();
 }
 
-/// The function-step lowering assumes at most one pipeline/sequential child per
-/// top-level step (one FSM state, one child instance). When a step holds more
-/// than one independent loop (e.g. back-to-back initializer pipelines), split
-/// each extra child out into its own trailing step so the multi-step FSM can
-/// sequence them. Only top-level steps of a func::FuncOp are normalized;
-/// steps inside a sequential loop are left alone.
-static void splitMultiChildTopLevelSteps(func::FuncOp funcOp) {
-  if (funcOp.getBody().empty())
-    return;
-  auto *block = &funcOp.getBody().front();
-  SmallVector<LoopScheduleStepOp> steps;
-  for (auto &op : *block)
-    if (auto step = dyn_cast<LoopScheduleStepOp>(&op))
-      steps.push_back(step);
-
-  for (auto step : steps) {
-    Block &stepBody = step.getBodyBlock();
-    SmallVector<Operation *> children;
-    for (auto &innerOp : stepBody) {
-      if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&innerOp))
-        children.push_back(&innerOp);
-    }
-    if (children.size() <= 1)
-      continue;
-
-    OpBuilder b(step.getContext());
-    Operation *insertAfter = step.getOperation();
-    for (size_t i = 1; i < children.size(); ++i) {
-      b.setInsertionPointAfter(insertAfter);
-      auto newStep = LoopScheduleStepOp::create(b, children[i]->getLoc(),
-                                                TypeRange{});
-      Block *newBody = &newStep.getBodyBlock();
-      // `LoopScheduleStepOp`'s builder installs an implicit register
-      // terminator in the new body; drop it before moving the child in so we
-      // can re-add an empty register terminator after the child.
-      if (!newBody->empty())
-        newBody->getTerminator()->erase();
-      children[i]->moveBefore(newBody, newBody->end());
-      OpBuilder tb(children[i]->getContext());
-      tb.setInsertionPointToEnd(newBody);
-      LoopScheduleRegisterOp::create(tb, children[i]->getLoc(), ValueRange{});
-      insertAfter = newStep.getOperation();
-    }
-  }
-}
-
 void LoopScheduleToFSMPass::runOnOperation() {
   auto moduleOp = getOperation();
 
@@ -3469,9 +3436,6 @@ void LoopScheduleToFSMPass::runOnOperation() {
 
   for (auto funcOp : funcs)
     hoistReturnedAllocsToArgs(funcOp);
-
-  for (auto funcOp : funcs)
-    splitMultiChildTopLevelSteps(funcOp);
 
   for (auto funcOp : funcs) {
     if (failed(flattenMultiDimMemrefs(funcOp))) {
