@@ -137,7 +137,60 @@ struct MemPortMapping {
 struct MemrefArgInfo {
   Value originalArg; // original func::FuncOp argument
   MemRefType memType;
+  bool isLocalMem = false; // true for memref.alloc → seq.hlmem
 };
+
+/// Append hw.module output port declarations for a memref: per-dim address,
+/// write data, and write enable.
+static void appendMemrefOutputPorts(OpBuilder &builder, StringRef baseName,
+                                    MemRefType memType,
+                                    SmallVectorImpl<hw::PortInfo> &ports) {
+  auto *ctx = builder.getContext();
+  auto widths = getDimAddrWidths(memType);
+  Type dataType = memType.getElementType();
+  bool isOneDim = widths.size() == 1;
+  for (auto [d, w] : llvm::enumerate(widths)) {
+    std::string addrName =
+        isOneDim ? (baseName + "_addr").str()
+                 : (baseName + "_addr_" + std::to_string(d)).str();
+    ports.push_back({{builder.getStringAttr(addrName),
+                       IntegerType::get(ctx, w),
+                       hw::ModulePort::Direction::Output}});
+  }
+  ports.push_back({{builder.getStringAttr((baseName + "_wr_data").str()),
+                     dataType, hw::ModulePort::Direction::Output}});
+  ports.push_back({{builder.getStringAttr((baseName + "_wr_en").str()),
+                     builder.getI1Type(), hw::ModulePort::Direction::Output}});
+}
+
+/// Append hw.output values for a memref's output ports (addr, wr_data, wr_en),
+/// falling back to zero constants when the mapping is absent or incomplete.
+static void appendMemrefOutputValues(OpBuilder &builder, Location loc,
+                                     MemRefType memType, Value memKey,
+                                     DenseMap<Value, MemPortMapping> &memPortMap,
+                                     SmallVectorImpl<Value> &outputs) {
+  auto *ctx = builder.getContext();
+  auto widths = getDimAddrWidths(memType);
+  Type dataType = memType.getElementType();
+  auto it = memPortMap.find(memKey);
+  bool has = it != memPortMap.end();
+  for (auto [d, w] : llvm::enumerate(widths)) {
+    Type addrType = IntegerType::get(ctx, w);
+    if (has && d < it->second.addrs.size() && it->second.addrs[d])
+      outputs.push_back(it->second.addrs[d]);
+    else
+      outputs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
+  }
+  if (has && it->second.wrData)
+    outputs.push_back(it->second.wrData);
+  else
+    outputs.push_back(hw::ConstantOp::create(builder, loc, dataType, 0));
+  if (has && it->second.wrEn)
+    outputs.push_back(it->second.wrEn);
+  else
+    outputs.push_back(
+        hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0));
+}
 
 /// Represents one sequential loop in the nesting tree.
 struct LoopNode {
@@ -224,7 +277,8 @@ private:
                                    Block *hwBody, IRMapping &mapping,
                                    Value clk, Value rst, Value startSignal,
                                    StringRef namePrefix, Value &doneSignal,
-                                   DenseMap<Value, MemPortMapping> &memPorts);
+                                   DenseMap<Value, MemPortMapping> &memPorts,
+                                   ArrayRef<MemrefArgInfo> memrefArgs);
 
   /// Map from original func memref args to their hw.module port values.
   DenseMap<Value, MemPortMapping> memPortMap;
@@ -504,11 +558,6 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     }
   }
 
-  // Determine which state's exit advances iter_arg: the FSM's last cycle
-  // before transitioning back to COND. That's POST_<last> if the last step
-  // is a wait, otherwise STEP_<last>.
-  bool lastIsWait = numSteps > 0 && stepWaitIdx[numSteps - 1] >= 0;
-
   // Inputs: start, cond, child_done_0..C-1.
   SmallVector<Type> inputTypes;
   inputTypes.push_back(i1); // start
@@ -642,32 +691,39 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
 
+  // Helper: emit a conditional back-edge transition for the last step's exit.
+  // Instead of unconditionally going to COND, check the condition here and
+  // branch to STEP_0 (continue) or DONE (exit). Saves 1 cycle per iteration.
+  auto emitLastStepTransition = [&](Block *tb) {
+    fb.setInsertionPointToEnd(tb);
+    fsm::TransitionOp::create(
+        fb, loc, StringRef("STEP_0"),
+        [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(1)); },
+        [&]() { fsm::UpdateOp::create(fb, loc, fiVar, falseVal); });
+    fsm::TransitionOp::create(fb, loc, StringRef("DONE"));
+  };
+
   // --- STEP_i (and WAIT_i / POST_i for wait steps) ---
   for (unsigned i = 0; i < numSteps; ++i) {
     bool isWait = stepWaitIdx[i] >= 0;
     bool isLast = (i + 1 == numSteps);
     std::string stepName = "STEP_" + std::to_string(i);
-    std::string nextStepName = isLast ? "COND" : "STEP_" + std::to_string(i + 1);
+    std::string nextStepName =
+        isLast ? "STEP_0" : "STEP_" + std::to_string(i + 1);
     unsigned L = stepLats[i];
 
     if (isWait || L == 1) {
-      // Single-cycle path (legacy shape — keep STEP_<i> name).
       auto st = fsm::StateOp::create(fb, loc, stepName);
       Block *ob = st.ensureOutput(fb);
       ob->getTerminator()->erase();
       fb.setInsertionPointToEnd(ob);
       if (isWait) {
-        // Launch state: drive child_start_j AND child_active_j (the latter
-        // also stays high through WAIT_i so external mem-port muxes can
-        // forward this child's outputs). iter_advance is handled in POST_i.
         fsm::OutputOp::create(
             fb, loc,
             buildOut(falseVal, /*iterAdv=*/false, /*activeStep=*/-1,
                      /*activeChild=*/stepWaitIdx[i],
                      /*activeLive=*/stepWaitIdx[i], /*activePost=*/-1));
       } else {
-        // Regular single-cycle step. iter_advance only when this is the
-        // last state of the trip.
         bool iterAdv = isLast;
         fsm::OutputOp::create(
             fb, loc,
@@ -676,26 +732,26 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
                      /*activePost=*/-1));
       }
       Block *tb = &st.getTransitions().front();
-      fb.setInsertionPointToEnd(tb);
       if (isWait) {
+        fb.setInsertionPointToEnd(tb);
         std::string waitName = "WAIT_" + std::to_string(i);
         fsm::TransitionOp::create(fb, loc, StringRef(waitName));
+      } else if (isLast) {
+        emitLastStepTransition(tb);
       } else {
+        fb.setInsertionPointToEnd(tb);
         fsm::TransitionOp::create(fb, loc, StringRef(nextStepName));
       }
       fb.setInsertionPointToEnd(&machine.getBody().front());
     } else {
-      // Multi-cycle expansion: emit L sequential sub-states. The first is
-      // named STEP_<i> (the entry — preserves backward-compat for tests
-      // that match this name). The rest are STEP_<i>_c<c> for c = 1..L-1.
       for (unsigned c = 0; c < L; ++c) {
         std::string subName =
             (c == 0) ? stepName
                      : (stepName + "_c" + std::to_string(c));
-        std::string nextSub = (c + 1 < L)
-                                  ? (stepName + "_c" + std::to_string(c + 1))
-                                  : nextStepName;
         bool isLastSub = (c + 1 == L);
+        std::string nextSub = isLastSub
+                                  ? nextStepName
+                                  : (stepName + "_c" + std::to_string(c + 1));
         bool iterAdv = isLast && isLastSub;
         auto st = fsm::StateOp::create(fb, loc, subName);
         Block *ob = st.ensureOutput(fb);
@@ -708,8 +764,12 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
                      /*activePost=*/-1, /*cycleStep=*/(int)i,
                      /*cycleIdx=*/(int)c));
         Block *tb = &st.getTransitions().front();
-        fb.setInsertionPointToEnd(tb);
-        fsm::TransitionOp::create(fb, loc, StringRef(nextSub));
+        if (isLast && isLastSub) {
+          emitLastStepTransition(tb);
+        } else {
+          fb.setInsertionPointToEnd(tb);
+          fsm::TransitionOp::create(fb, loc, StringRef(nextSub));
+        }
         fb.setInsertionPointToEnd(&machine.getBody().front());
       }
     }
@@ -726,9 +786,6 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
       Block *ob = st.ensureOutput(fb);
       ob->getTerminator()->erase();
       fb.setInsertionPointToEnd(ob);
-      // WAIT_i: child j is still producing on the wires. Keep
-      // child_active_j high so external mem-port muxes route the child
-      // until it deasserts done.
       fsm::OutputOp::create(
           fb, loc,
           buildOut(falseVal, /*iterAdv=*/false, /*activeStep=*/-1,
@@ -759,13 +816,15 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
                    /*activeChild=*/-1, /*activeLive=*/-1,
                    /*activePost=*/stepWaitIdx[i]));
       Block *tb = &st.getTransitions().front();
-      fb.setInsertionPointToEnd(tb);
-      fsm::TransitionOp::create(fb, loc, StringRef(nextStepName));
+      if (isLast) {
+        emitLastStepTransition(tb);
+      } else {
+        fb.setInsertionPointToEnd(tb);
+        fsm::TransitionOp::create(fb, loc, StringRef(nextStepName));
+      }
     }
     fb.setInsertionPointToEnd(&machine.getBody().front());
   }
-
-  (void)lastIsWait; // documented above for clarity; not otherwise needed.
 
   // --- DONE ---
   {
@@ -997,25 +1056,9 @@ static hw::HWModuleOp createLoopModule(
                        hw::ModulePort::Direction::Output}});
   }
 
-  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
-    auto widths = getDimAddrWidths(memInfo.memType);
-    Type dataType = memInfo.memType.getElementType();
-    std::string baseName = "mem" + std::to_string(i);
-    bool isOneDim = widths.size() == 1;
-    for (auto [d, w] : llvm::enumerate(widths)) {
-      std::string addrName =
-          isOneDim ? baseName + "_addr"
-                   : baseName + "_addr_" + std::to_string(d);
-      ports.push_back({{builder.getStringAttr(addrName),
-                         IntegerType::get(ctx, w),
-                         hw::ModulePort::Direction::Output}});
-    }
-    ports.push_back({{builder.getStringAttr(baseName + "_wr_data"), dataType,
-                       hw::ModulePort::Direction::Output}});
-    ports.push_back({{builder.getStringAttr(baseName + "_wr_en"),
-                       builder.getI1Type(),
-                       hw::ModulePort::Direction::Output}});
-  }
+  for (auto [i, memInfo] : llvm::enumerate(memrefArgs))
+    appendMemrefOutputPorts(builder, "mem" + std::to_string(i),
+                            memInfo.memType, ports);
 
   hw::ModulePortInfo portInfo(ports);
   auto hwMod = hw::HWModuleOp::create(builder, loc,
@@ -1050,7 +1093,6 @@ static void buildLoopModuleOutput(
     Value doneSignal,
     ArrayRef<Value> resultValues) {
 
-  auto *ctx = builder.getContext();
   SmallVector<Value> outputs;
 
   outputs.push_back(doneSignal);
@@ -1058,28 +1100,9 @@ static void buildLoopModuleOutput(
   for (Value v : resultValues)
     outputs.push_back(v);
 
-  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
-    auto widths = getDimAddrWidths(memInfo.memType);
-    Type dataType = memInfo.memType.getElementType();
-    auto it = localMemPortMap.find(memInfo.originalArg);
-    bool hasMapping = it != localMemPortMap.end();
-    for (auto [d, w] : llvm::enumerate(widths)) {
-      Type addrType = IntegerType::get(ctx, w);
-      if (hasMapping && d < it->second.addrs.size() && it->second.addrs[d])
-        outputs.push_back(it->second.addrs[d]);
-      else
-        outputs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
-    }
-    if (hasMapping && it->second.wrData)
-      outputs.push_back(it->second.wrData);
-    else
-      outputs.push_back(hw::ConstantOp::create(builder, loc, dataType, 0));
-    if (hasMapping && it->second.wrEn)
-      outputs.push_back(it->second.wrEn);
-    else
-      outputs.push_back(
-          hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0));
-  }
+  for (auto &memInfo : memrefArgs)
+    appendMemrefOutputValues(builder, loc, memInfo.memType,
+                             memInfo.originalArg, localMemPortMap, outputs);
 
   hw::OutputOp::create(builder, loc, outputs);
 }
@@ -1614,7 +1637,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       std::string pipPrefix = node.prefix + "_pip" + std::to_string(pipIdx);
       if (failed(lowerPipelineChild(pipOp, hw, loc, hwBody, localMapping, clk,
                                     rst, stepChildStart, pipPrefix, pipDone,
-                                    perStepPorts[stepIdx])))
+                                    perStepPorts[stepIdx], memrefArgs)))
         return failure();
       childDoneBEs[waitIdx].setValue(pipDone);
 
@@ -1657,6 +1680,18 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         return failure();
     }
 
+    // Pre-scan for loads from local hlmem memories. These skip the capture
+    // register because the hlmem's latency=1 read port already provides the
+    // 1-cycle delay the scheduler expects.
+    DenseSet<Value> localLoadResults;
+    for (auto &op : *body) {
+      if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
+        for (auto &memInfo : memrefArgs)
+          if (memInfo.originalArg == loadOp.getMemRef() && memInfo.isLocalMem)
+            localLoadResults.insert(loadOp.getResult());
+      }
+    }
+
     // Map step results. First save the combinational aliases (keyed on the
     // stepOp result value), then — if this step has a capture gate — create
     // per-operand hardware registers and point the mapping at those so
@@ -1677,6 +1712,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       for (auto [idx, it] : llvm::enumerate(llvm::zip(
                stepOp.getResults(), regOp.getOperands()))) {
         auto [result, regVal] = it;
+        if (localLoadResults.count(regVal)) {
+          // Local hlmem read (latency=1) already provides the 1-cycle delay.
+          // Keep the combinational mapping — no capture register needed.
+          continue;
+        }
         Value combVal = stepResultComb[result];
         Value resetVal = createZeroConstant(hw, loc, combVal.getType());
         auto regName = hw.getStringAttr(node.prefix + "_step" +
@@ -1788,7 +1828,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     LoopSchedulePipelineOp pipOp, OpBuilder &builder, Location loc,
     Block *hwBody, IRMapping &mapping, Value clk, Value rst,
     Value startSignal, StringRef namePrefix, Value &doneSignal,
-    DenseMap<Value, MemPortMapping> &memPorts) {
+    DenseMap<Value, MemPortMapping> &memPorts,
+    ArrayRef<MemrefArgInfo> memrefArgs) {
 
   auto *ctx = builder.getContext();
 
@@ -1946,9 +1987,22 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     return chain[consumerStage - J - 1];
   };
 
+  // Helper: check whether a memref is backed by a local seq.hlmem.
+  auto isLocalMemref = [&](Value memref) -> bool {
+    for (auto &memInfo : memrefArgs)
+      if (memInfo.originalArg == memref && memInfo.isLocalMem)
+        return true;
+    return false;
+  };
+
   for (auto [stageIdx, stageOp] : llvm::enumerate(stages)) {
     Block &body = stageOp.getBodyBlock();
     hwBuilder.setInsertionPointToEnd(hwBody);
+
+    // Track load results from local hlmem memories. These skip the stage
+    // register because the hlmem's latency=1 read port already provides the
+    // 1-cycle delay the scheduler expects.
+    DenseSet<Value> localLoadResults;
 
     for (auto &op : body.getOperations()) {
       if (isa<LoopScheduleRegisterOp>(&op))
@@ -1975,6 +2029,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
         opResult = handleStore(storeOp, hwBuilder, mapping,
                                stageCE[stageIdx], perStagePorts[stageIdx]);
       } else if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
+        if (isLocalMemref(loadOp.getMemRef()))
+          localLoadResults.insert(loadOp.getResult());
         opResult =
             handleLoad(loadOp, hwBuilder, mapping, perStagePorts[stageIdx]);
       } else {
@@ -2011,6 +2067,14 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // earlier stage's value.
       Value delayed = resolveForStage(val, stageIdx);
       Value mappedVal = delayed ? delayed : mapping.lookup(val);
+
+      if (localLoadResults.count(val)) {
+        // Local hlmem read (latency=1) already provides the 1-cycle delay.
+        // Map the stage result directly to rdData — no extra register.
+        mapping.map(stageOp.getResult(regIdx), mappedVal);
+        continue;
+      }
+
       Value resetVal = createZeroConstant(hwBuilder, loc, mappedVal.getType());
       auto regName = hwBuilder.getStringAttr(
           (namePrefix + "_s" + std::to_string(stageIdx) + "_r" +
@@ -2025,6 +2089,33 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   }
 
   hwBuilder.setInsertionPointToEnd(hwBody);
+
+  // When II < #stages, multiple stageCE signals are high simultaneously in
+  // steady state. The priority mux in muxStageMemPorts silently drops all but
+  // the highest-priority stage's memory access. Reject this case at compile
+  // time rather than miscompiling.
+  if (II < stages.size()) {
+    for (auto &entry : memPorts) {
+      unsigned touchCount = 0;
+      for (unsigned s = 0; s < stages.size(); ++s) {
+        auto it = perStagePorts[s].find(entry.first);
+        if (it == perStagePorts[s].end())
+          continue;
+        const MemPortMapping &ports = it->second;
+        bool hasAddr =
+            llvm::any_of(ports.addrs, [](Value v) { return (bool)v; });
+        if (hasAddr || ports.wrData || ports.wrEn)
+          touchCount++;
+      }
+      if (touchCount > 1)
+        return pipOp.emitError()
+               << "pipeline with II=" << II << " and " << stages.size()
+               << " stages has multiple stages accessing the same memory; "
+               << "the priority mux cannot arbitrate overlapping stage "
+               << "enables (increase II or partition the memory)";
+    }
+  }
+
   muxStageMemPorts(hwBuilder, loc, perStagePorts, stageCE, memPorts);
 
   // Per-stage first_iter signals. Each stage s's first_iter is 1 on reset,
@@ -2138,26 +2229,11 @@ static hw::HWModuleOp createHWModule(
   for (auto [idx, arg] : llvm::enumerate(funcOp.getArguments())) {
     if (auto memType = dyn_cast<MemRefType>(arg.getType())) {
       std::string baseName = "mem" + std::to_string(idx);
-      auto widths = getDimAddrWidths(memType);
       Type dataType = memType.getElementType();
-      bool isOneDim = widths.size() == 1;
-
       inputIdx++;
       ports.push_back({{builder.getStringAttr(baseName + "_rd_data"), dataType,
                          hw::ModulePort::Direction::Input}});
-      for (auto [d, w] : llvm::enumerate(widths)) {
-        std::string addrName =
-            isOneDim ? baseName + "_addr"
-                     : baseName + "_addr_" + std::to_string(d);
-        ports.push_back({{builder.getStringAttr(addrName),
-                           IntegerType::get(ctx, w),
-                           hw::ModulePort::Direction::Output}});
-      }
-      ports.push_back({{builder.getStringAttr(baseName + "_wr_data"), dataType,
-                         hw::ModulePort::Direction::Output}});
-      ports.push_back({{builder.getStringAttr(baseName + "_wr_en"),
-                         builder.getI1Type(),
-                         hw::ModulePort::Direction::Output}});
+      appendMemrefOutputPorts(builder, baseName, memType, ports);
     } else {
       ports.push_back(
           {{builder.getStringAttr("arg" + std::to_string(idx)), arg.getType(),
@@ -2228,33 +2304,13 @@ static void buildHWOutput(func::FuncOp funcOp, OpBuilder &builder,
                           Location loc, Block *hwBody, IRMapping &mapping,
                           DenseMap<Value, MemPortMapping> &memPortMap,
                           Value doneSignal) {
-  auto *ctx = builder.getContext();
   SmallVector<Value> outputs;
 
   for (auto [idx, arg] : llvm::enumerate(funcOp.getArguments())) {
     auto memType = dyn_cast<MemRefType>(arg.getType());
     if (!memType)
       continue;
-    auto widths = getDimAddrWidths(memType);
-    Type dataType = memType.getElementType();
-    auto it = memPortMap.find(arg);
-    bool hasMapping = it != memPortMap.end();
-    for (auto [d, w] : llvm::enumerate(widths)) {
-      Type addrType = IntegerType::get(ctx, w);
-      if (hasMapping && d < it->second.addrs.size() && it->second.addrs[d])
-        outputs.push_back(it->second.addrs[d]);
-      else
-        outputs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
-    }
-    if (hasMapping && it->second.wrData)
-      outputs.push_back(it->second.wrData);
-    else
-      outputs.push_back(hw::ConstantOp::create(builder, loc, dataType, 0));
-    if (hasMapping && it->second.wrEn)
-      outputs.push_back(it->second.wrEn);
-    else
-      outputs.push_back(
-          hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0));
+    appendMemrefOutputValues(builder, loc, memType, arg, memPortMap, outputs);
   }
 
   outputs.push_back(doneSignal);
@@ -2337,7 +2393,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
         hw::ConstantOp::create(builder, loc, i1, 1));
     auto readPort = seq::ReadPortOp::create(
         builder, loc, hlmem.getHandle(),
-        ValueRange(addrVals), notWrEn, /*latency=*/0);
+        ValueRange(addrVals), notWrEn, /*latency=*/1);
 
     // Write port.
     seq::WritePortOp::create(
@@ -2371,7 +2427,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   }
   // Add local allocs to memrefArgs so they're threaded through child modules.
   for (auto allocOp : localAllocs) {
-    memrefArgs.push_back({allocOp.getResult(), allocOp.getType()});
+    memrefArgs.push_back({allocOp.getResult(), allocOp.getType(),
+                          /*isLocalMem=*/true});
   }
 
   // --- Multi-step path ---
@@ -2562,7 +2619,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
                                     clk, rst,
                                     childStartSignals[childIndexForEntry[ei]],
                                     pipPrefix, pipDone,
-                                    perEntryPorts[ei])))
+                                    perEntryPorts[ei], memrefArgs)))
         return failure();
       childDoneBEs[childIndexForEntry[ei]].setValue(pipDone);
 
@@ -2598,12 +2655,28 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
 
     // Register step results only after the last entry for this step completes.
     if (ei == lastEntryForStep[stepIdx]) {
+      // Pre-scan for loads from local hlmem — skip capture for those.
+      DenseSet<Value> localLoadResults;
+      for (auto &op : topSteps[stepIdx].getBodyBlock()) {
+        if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
+          for (auto &memInfo : memrefArgs)
+            if (memInfo.originalArg == loadOp.getMemRef() &&
+                memInfo.isLocalMem)
+              localLoadResults.insert(loadOp.getResult());
+        }
+      }
+
       auto stepRegOp = cast<LoopScheduleRegisterOp>(
           topSteps[stepIdx].getBodyBlock().getTerminator());
       for (auto [stepResult, regOperand] :
            llvm::zip(topSteps[stepIdx].getResults(),
                      stepRegOp.getOperands())) {
         Value val = mapping.lookup(regOperand);
+        if (localLoadResults.count(regOperand)) {
+          // Local hlmem read (latency=1) provides the delay; skip register.
+          mapping.map(stepResult, val);
+          continue;
+        }
         auto regName = builder.getStringAttr(
             funcName + "_step" + std::to_string(stepIdx) + "_result_" +
             std::to_string(stepResult.getResultNumber()));
