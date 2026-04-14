@@ -91,7 +91,7 @@ func.func @invalid_results() {
     %0 = loopschedule.pipeline.stage start = 0 end = 1 {
       loopschedule.register %arg0 : i1
     } : i1
-    // expected-error @+1 {{'loopschedule.terminator' op 'results' must be defined by a 'loopschedule.pipeline.stage' or 'loopschedule.step'}}
+    // expected-error @+1 {{'loopschedule.terminator' op 'results' must be defined by a phase op}}
     loopschedule.terminator condition(%0), iter_args(%0), results(%false) : (i1) -> (i1)
   }
   return

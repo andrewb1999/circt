@@ -422,17 +422,25 @@ def LoopScheduleTerminatorOp : LoopScheduleOp<"terminator",
     The `iter_args` section accepts a variadic list of values which become the
     next iteration's `iter_args`. These may be the results of any phase, and
     their types must match the loop's `iter_args` types.
+
+    The optional `await` section accepts a variadic list of
+    `!loopschedule.handle` values. Before the terminator fires its transition,
+    every listed handle must have completed. This is a shorthand for an
+    iteration-boundary barrier on launched children whose completion value is
+    not otherwise consumed in the body.
   }];
 
   let arguments = (ins
     I1:$condition,
     Variadic<AnyType>:$iter_args,
-    Variadic<AnyType>:$results
+    Variadic<AnyType>:$results,
+    Variadic<HandleType>:$await
   );
 
   let assemblyFormat = [{
     `condition` `(` $condition `)` `,`
     `iter_args` `(` $iter_args `)` `,`
+    (`await` `(` $await^ `)` `,`)?
     `results` `(` $results `)` `:`
     functional-type($iter_args, $results) attr-dict
   }];
@@ -586,14 +594,30 @@ def LoopScheduleAccessOp : LoopScheduleOp<"access",
 }
 
 def LoopScheduleYieldOp : LoopScheduleOp<"yield", [Pure, ReturnLike, Terminator,
-    HasParent<"LoopScheduleIfOp">]> {
-  let summary = "loop schedule if op yield";
+    ParentOneOf<["LoopScheduleIfOp", "LoopScheduleFrameOp",
+                 "LoopScheduleAtOp", "LoopScheduleLaunchOp"]>]> {
+  let summary = "Terminator yielding values to the enclosing region-bearing op";
+  let description = [{
+    Shared terminator op. Used as the terminator of:
+      - `loopschedule.if`'s body region (yields the op's results),
+      - `loopschedule.frame`'s await region (yields values that feed the
+        body region's entry-block args),
+      - `loopschedule.frame`'s body region (yields the frame op's results),
+      - `loopschedule.at`'s body region (yields the at op's results),
+      - `loopschedule.launch`'s body region (yields child loop results,
+        though the launch op's only surface result is a handle).
+
+    The verifier dispatches on the parent op + enclosing region to enforce
+    the right type-matching rule.
+  }];
 
   let arguments = (ins Variadic<AnyType>:$results);
   let builders = [OpBuilder<(ins), [{ /* nothing to do */ }]>];
 
   let assemblyFormat =
       [{  attr-dict ($results^ `:` type($results))? }];
+
+  let hasVerifier = 1;
 }
 
 def LoopScheduleIfOp : LoopScheduleOp<"if",
@@ -628,6 +652,170 @@ def LoopScheduleBufferOp : LoopScheduleOp<"buffer", [Pure, SameOperandsAndResult
 
   let assemblyFormat =
       [{  $input attr-dict `:` type($output) }];
+}
+
+//===----------------------------------------------------------------------===//
+// Frames + handles (new sequential-loop surface).
+//
+// See `LOOPSCHEDULE_FRAMES_HANDLES.md` in the amc-dialect repo root for the
+// full design. This slice adds the ops/type so they round-trip; no emitter
+// or consumer uses them yet.
+//===----------------------------------------------------------------------===//
+
+def LoopScheduleFrameOp : LoopScheduleOp<"frame", [PhaseOpInterface]> {
+  let summary = "Statically-timed window inside a sequential loop.";
+  let description = [{
+    A `loopschedule.frame` op bounds a statically-timed region of work within
+    a sequential loop body. It has two regions:
+
+      - **await region** (first, always present, may be empty-bodied):
+        contains `loopschedule.await` ops that block the frame's start until
+        their handle operands complete. Terminated by `loopschedule.yield`
+        whose operands become the body region's entry-block args.
+      - **body region** (second, after the `do` keyword): statically timed.
+        Contains `loopschedule.at` and `loopschedule.launch` ops. The body's
+        latency is the max of (offset + op latency) across its children, and
+        is compile-time known. Terminated by `loopschedule.yield` whose
+        operands become the frame op's SSA results.
+
+    The assembly syntax mirrors `scf.while`:
+
+        %a, %b = loopschedule.frame -> (i32, i32) {
+          // await region
+          loopschedule.yield
+        } do {
+        ^body:
+          // body region (statically timed)
+          loopschedule.yield %x, %y : i32, i32
+        }
+  }];
+
+  let results = (outs Variadic<AnyType>:$results);
+
+  let regions = (region
+    SizedRegion<1>:$awaitRegion,
+    SizedRegion<1>:$bodyRegion
+  );
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    Block &getAwaitBlock() { return getAwaitRegion().front(); }
+    Block &getBodyBlock() { return getBodyRegion().front(); }
+    LoopScheduleYieldOp getAwaitYield();
+    LoopScheduleYieldOp getBodyYield();
+
+    std::string getRegisterNamePrefix() { return "frame"; }
+    bool isStatic() { return true; }
+    std::optional<uint64_t> getStartTime() { return std::nullopt; }
+  }];
+}
+
+def LoopScheduleAtOp : LoopScheduleOp<"at",
+    [HasParent<"LoopScheduleFrameOp">,
+     SingleBlockImplicitTerminator<"LoopScheduleYieldOp">,
+     NoRegionArguments]> {
+  let summary = "Offset wrapper inside a frame body.";
+  let description = [{
+    Marks that the ops in its single-block body execute `offset` cycles
+    after the enclosing frame body's start. Values yielded by the region's
+    terminator become the `at` op's results, visible to the rest of the
+    frame body.
+
+    `loopschedule.at` may appear only inside a frame's body region. The
+    verifier enforces this (the body region is always the frame's second
+    region).
+  }];
+
+  let arguments = (ins I64Attr:$offset);
+  let results = (outs Variadic<AnyType>:$results);
+
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    Block &getBodyBlock() { return getBody().front(); }
+    LoopScheduleYieldOp getYieldOp();
+  }];
+}
+
+def LoopScheduleLaunchOp : LoopScheduleOp<"launch",
+    [HasParent<"LoopScheduleFrameOp">,
+     SingleBlockImplicitTerminator<"LoopScheduleYieldOp">,
+     NoRegionArguments]> {
+  let summary = "Asynchronously start a variable-latency child loop.";
+  let description = [{
+    Fires the child loop's `start` at `offset` cycles into the enclosing
+    frame body. Returns immediately with a `!loopschedule.handle` SSA value
+    representing completion; a later frame's await region picks up that
+    handle to block until the child is done.
+
+    The body region contains exactly one child loop op
+    (`loopschedule.sequential` or `loopschedule.pipeline`), plus a
+    terminating `loopschedule.yield` forwarding the child's produced values.
+
+    `loopschedule.launch` may appear only inside a frame's body region.
+  }];
+
+  let arguments = (ins I64Attr:$offset);
+  let results = (outs HandleType:$handle);
+
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    Block &getBodyBlock() { return getBody().front(); }
+    LoopScheduleYieldOp getYieldOp();
+  }];
+}
+
+def LoopScheduleAwaitOp : LoopScheduleOp<"await",
+    [HasParent<"LoopScheduleFrameOp">]> {
+  let summary = "Barrier on one or more child-completion handles.";
+  let description = [{
+    Consumes one or more `!loopschedule.handle` operands and (optionally)
+    forwards values produced by the launched children. The enclosing frame's
+    await region as a whole is a barrier: the frame body does not start
+    until every await in the region has completed.
+
+    `loopschedule.await` may appear only inside a frame's await region
+    (the first region of a `loopschedule.frame`). The verifier enforces this.
+  }];
+
+  let arguments = (ins Variadic<HandleType>:$handles);
+  let results = (outs Variadic<AnyType>:$results);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+def LoopScheduleIterArgUpdateOp : LoopScheduleOp<"iter_arg_update",
+    [ParentOneOf<["LoopScheduleAtOp", "LoopSchedulePipelineStageOp"]>,
+     TypesMatchWith<"iter-arg type matches new-value type",
+                    "value", "iterArg",
+                    "$_self">]> {
+  let summary = "Phi-style update of a sequential loop iter-arg.";
+  let description = [{
+    Writes `value` into the iter-arg `iterArg` at the offset of the enclosing
+    `loopschedule.at` region. In the final shape, `iterArg` is expected to be
+    an iter-arg block argument of the surrounding `loopschedule.sequential`
+    op, and this update must appear in the final frame's body (at most once
+    per iter-arg per iteration). This slice only enforces the immediate
+    parent-is-an-`at` constraint; tighter checks come with the emitter.
+  }];
+
+  let arguments = (ins AnyType:$iterArg, AnyType:$value);
+
+  let assemblyFormat = [{
+    $iterArg `=` $value attr-dict `:` type($value)
+  }];
+
+  let hasVerifier = 1;
 }
 
 #endif // CIRCIT_LOOP_SCHEDULE_OPS_TD

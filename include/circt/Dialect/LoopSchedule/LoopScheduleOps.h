@@ -22,6 +22,7 @@
 
 #include "circt/Dialect/LoopSchedule/LoopScheduleAttributes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
+#include "circt/Dialect/LoopSchedule/LoopScheduleTypes.h"
 
 namespace circt {
 namespace loopschedule {

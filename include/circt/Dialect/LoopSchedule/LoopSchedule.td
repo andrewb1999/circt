@@ -23,12 +23,16 @@ def LoopSchedule_Dialect : Dialect {
   let extraClassDeclaration = [{
     /// Register all LoopSchedule attributes.
     void registerAttributes();
+    /// Register all LoopSchedule types.
+    void registerTypes();
   }];
 
   let useDefaultAttributePrinterParser = 1;
+  let useDefaultTypePrinterParser = 1;
 }
 
 include "circt/Dialect/LoopSchedule/LoopScheduleAttributes.td"
+include "circt/Dialect/LoopSchedule/LoopScheduleTypes.td"
 include "circt/Dialect/LoopSchedule/LoopScheduleOps.td"
 
 #endif // CIRCT_LOOPSCHEDULE_DIALECT_TD 

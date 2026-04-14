@@ -426,9 +426,11 @@ LogicalResult LoopScheduleSequentialOp::verify() {
   for (Operation &inner : scheduleBlock) {
     // Verify the schedule block contains only `loopschedule.step` and
     // `loopschedule.terminator` ops.
-    if (!isa<LoopScheduleStepOp, LoopScheduleTerminatorOp>(inner))
-      return emitOpError("stages may only contain 'stg.step' or "
-                         "'stg.terminator' ops, found ")
+    if (!isa<LoopScheduleStepOp, LoopScheduleTerminatorOp,
+             LoopScheduleFrameOp>(inner))
+      return emitOpError("schedule may only contain 'loopschedule.step', "
+                         "'loopschedule.frame', or 'loopschedule.terminator' "
+                         "ops, found ")
              << inner;
   }
 
@@ -635,10 +637,8 @@ LogicalResult LoopScheduleRegisterOp::verify() {
 LogicalResult LoopScheduleTerminatorOp::verify() {
   // Verify the condition operand is defined by a phase op.
   Value cond = getCondition();
-  if (cond.getDefiningOp<LoopSchedulePipelineStageOp>() == nullptr &&
-      cond.getDefiningOp<LoopScheduleStepOp>() == nullptr)
-    return emitOpError("'condition' must be defined by a "
-                       "'loopschedule.pipeline.stage' or 'loopschedule.step'");
+  if (!isa_and_nonnull<PhaseInterface>(cond.getDefiningOp()))
+    return emitOpError("'condition' must be defined by a phase op");
 
   // Verify loop terminates with the same `iter_args` types as the pipeline.
   auto iterArgs = getIterArgs();
@@ -649,13 +649,10 @@ LogicalResult LoopScheduleTerminatorOp::verify() {
            << terminatorArgTypes << ") must match pipeline 'iter_args' types ("
            << loopArgTypes << ")";
 
-  // Verify `iter_args` are defined by a pipeline stage or step.
+  // Verify `iter_args` are defined by a phase.
   for (auto iterArg : iterArgs)
-    if (iterArg.getDefiningOp<LoopSchedulePipelineStageOp>() == nullptr &&
-        iterArg.getDefiningOp<LoopScheduleStepOp>() == nullptr)
-      return emitOpError(
-          "'iter_args' must be defined by a 'loopschedule.pipeline.stage' or "
-          "'loopschedule.step'");
+    if (!isa_and_nonnull<PhaseInterface>(iterArg.getDefiningOp()))
+      return emitOpError("'iter_args' must be defined by a phase op");
 
   // Verify loop terminates with the same result types as the loop.
   auto opResults = getResults();
@@ -666,13 +663,31 @@ LogicalResult LoopScheduleTerminatorOp::verify() {
            << terminatorResultTypes << ") must match loop result types ("
            << loopResultTypes << ")";
 
-  // Verify `results` are defined by a pipeline stage or step.
+  // Verify `results` are defined by a phase.
   for (auto result : opResults)
-    if (result.getDefiningOp<LoopSchedulePipelineStageOp>() == nullptr &&
-        result.getDefiningOp<LoopScheduleStepOp>() == nullptr)
+    if (!isa_and_nonnull<PhaseInterface>(result.getDefiningOp()))
+      return emitOpError("'results' must be defined by a phase op");
+
+  // Verify `await` operands trace back to a `loopschedule.launch` by walking
+  // through `loopschedule.yield` forwarders out of frame body regions.
+  for (Value h : getAwait()) {
+    Value cur = h;
+    while (cur) {
+      Operation *def = cur.getDefiningOp();
+      if (!def)
+        return emitOpError(
+            "'await' operand must be produced by a 'loopschedule.launch'");
+      if (isa<LoopScheduleLaunchOp>(def))
+        break;
+      if (auto frame = dyn_cast<LoopScheduleFrameOp>(def)) {
+        auto yield = frame.getBodyYield();
+        cur = yield.getResults()[cast<OpResult>(cur).getResultNumber()];
+        continue;
+      }
       return emitOpError(
-          "'results' must be defined by a 'loopschedule.pipeline.stage' or "
-          "'loopschedule.step'");
+          "'await' operand must be produced by a 'loopschedule.launch'");
+    }
+  }
 
   return success();
 }
@@ -837,6 +852,407 @@ void LoopScheduleIfOp::build(OpBuilder &odsBuilder, OperationState &odsState,
                                        odsState.location);
 }
 
+//===----------------------------------------------------------------------===//
+// LoopScheduleYieldOp (shared terminator)
+//===----------------------------------------------------------------------===//
+
+LogicalResult LoopScheduleYieldOp::verify() {
+  Operation *parent = (*this)->getParentOp();
+  TypeRange yielded = getResults().getTypes();
+
+  auto typesEqual = [](TypeRange a, TypeRange b) {
+    if (a.size() != b.size())
+      return false;
+    return llvm::equal(a, b);
+  };
+
+  if (auto ifOp = dyn_cast<LoopScheduleIfOp>(parent)) {
+    if (!typesEqual(yielded, ifOp.getResultTypes()))
+      return emitOpError("yielded types must match parent loopschedule.if "
+                         "result types");
+    return success();
+  }
+
+  if (auto atOp = dyn_cast<LoopScheduleAtOp>(parent)) {
+    if (!typesEqual(yielded, atOp.getResultTypes()))
+      return emitOpError("yielded types must match parent loopschedule.at "
+                         "result types");
+    return success();
+  }
+
+  if (isa<LoopScheduleLaunchOp>(parent)) {
+    // Loose at this slice — the launch surface result is a handle; child
+    // yielded types are not plumbed onto the launch op yet.
+    return success();
+  }
+
+  if (auto frameOp = dyn_cast<LoopScheduleFrameOp>(parent)) {
+    Region *region = (*this)->getParentRegion();
+    if (region == &frameOp.getAwaitRegion()) {
+      // Feeds body region's entry-block args.
+      Block &bodyBlock = frameOp.getBodyBlock();
+      if (!typesEqual(yielded, bodyBlock.getArgumentTypes()))
+        return emitOpError("await-region yield types must match frame body "
+                           "block arg types");
+      return success();
+    }
+    if (region == &frameOp.getBodyRegion()) {
+      if (!typesEqual(yielded, frameOp.getResultTypes()))
+        return emitOpError("body-region yield types must match frame op "
+                           "result types");
+      return success();
+    }
+    return emitOpError("unrecognized parent region of loopschedule.frame");
+  }
+
+  return emitOpError("unsupported parent op for loopschedule.yield");
+}
+
+//===----------------------------------------------------------------------===//
+// LoopScheduleFrameOp
+//===----------------------------------------------------------------------===//
+
+ParseResult LoopScheduleFrameOp::parse(OpAsmParser &parser,
+                                       OperationState &result) {
+  // `-> (types)` result list (optional).
+  if (succeeded(parser.parseOptionalArrow())) {
+    if (parser.parseLParen() ||
+        parser.parseTypeList(result.types) ||
+        parser.parseRParen())
+      return failure();
+  }
+
+  // Parse the first region. It may be either the await region (followed by
+  // `do` and a body region), or — if `do` is absent — the body region itself,
+  // in which case we synthesize an empty await region.
+  Region *awaitRegion = result.addRegion();
+  Region *bodyRegion = result.addRegion();
+
+  Region firstRegion;
+  if (parser.parseRegion(firstRegion, /*arguments=*/{}))
+    return failure();
+
+  if (succeeded(parser.parseOptionalKeyword("do"))) {
+    awaitRegion->takeBody(firstRegion);
+
+    // Optional `(%a: T, %b: T, ...)` block-arg list inline with `do`.
+    SmallVector<OpAsmParser::Argument> bodyArgs;
+    if (succeeded(parser.parseOptionalLParen())) {
+      if (failed(parser.parseOptionalRParen())) {
+        if (parser.parseArgumentList(bodyArgs, OpAsmParser::Delimiter::None,
+                                     /*allowType=*/true) ||
+            parser.parseRParen())
+          return failure();
+      }
+    }
+    if (parser.parseRegion(*bodyRegion, bodyArgs))
+      return failure();
+  } else {
+    bodyRegion->takeBody(firstRegion);
+    OpBuilder builder(parser.getBuilder().getContext());
+    builder.createBlock(awaitRegion);
+    builder.create<LoopScheduleYieldOp>(result.location);
+  }
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+  return success();
+}
+
+void LoopScheduleFrameOp::print(OpAsmPrinter &p) {
+  if (!getResultTypes().empty()) {
+    p << " -> (";
+    llvm::interleaveComma(getResultTypes(), p);
+    p << ")";
+  }
+  p << ' ';
+  // Elide the await region if it has a single empty-yield terminator.
+  Block &awaitBlock = getAwaitBlock();
+  bool awaitIsTrivial = awaitBlock.without_terminator().empty() &&
+                        getAwaitYield().getOperands().empty();
+  if (!awaitIsTrivial) {
+    p.printRegion(getAwaitRegion(), /*printEntryBlockArgs=*/false,
+                  /*printBlockTerminators=*/true);
+    p << " do";
+    Block &bodyBlock = getBodyBlock();
+    if (bodyBlock.getNumArguments() > 0) {
+      p << " (";
+      llvm::interleaveComma(bodyBlock.getArguments(), p, [&](BlockArgument arg) {
+        p.printRegionArgument(arg);
+      });
+      p << ")";
+    }
+    p << ' ';
+  }
+  p.printRegion(getBodyRegion(), /*printEntryBlockArgs=*/false,
+                /*printBlockTerminators=*/true);
+  p.printOptionalAttrDict((*this)->getAttrs());
+}
+
+LoopScheduleYieldOp LoopScheduleFrameOp::getAwaitYield() {
+  return cast<LoopScheduleYieldOp>(getAwaitBlock().getTerminator());
+}
+
+LoopScheduleYieldOp LoopScheduleFrameOp::getBodyYield() {
+  return cast<LoopScheduleYieldOp>(getBodyBlock().getTerminator());
+}
+
+LogicalResult LoopScheduleFrameOp::verify() {
+  // Await region: only `loopschedule.await` ops (plus the yield terminator).
+  // Body region: only `loopschedule.at` / `loopschedule.launch` ops (plus
+  // the yield terminator).
+  for (Operation &op : getAwaitBlock().without_terminator()) {
+    if (!isa<LoopScheduleAwaitOp>(op))
+      return emitOpError("await region may contain only loopschedule.await "
+                         "ops, found: ")
+             << op.getName();
+  }
+  for (Operation &op : getBodyBlock().without_terminator()) {
+    if (!isa<LoopScheduleAtOp, LoopScheduleLaunchOp>(op))
+      return emitOpError("body region may contain only loopschedule.at and "
+                         "loopschedule.launch ops, found: ")
+             << op.getName();
+  }
+
+  // Terminator presence is guaranteed by SizedRegion + the yield ops' parent
+  // trait, but double-check here so we can give a clean error.
+  if (getAwaitBlock().empty() ||
+      !isa<LoopScheduleYieldOp>(getAwaitBlock().getTerminator()))
+    return emitOpError("await region must be terminated by loopschedule.yield");
+  if (getBodyBlock().empty() ||
+      !isa<LoopScheduleYieldOp>(getBodyBlock().getTerminator()))
+    return emitOpError("body region must be terminated by loopschedule.yield");
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// LoopScheduleAtOp
+//===----------------------------------------------------------------------===//
+
+ParseResult LoopScheduleAtOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
+  IntegerAttr offset;
+  if (parser.parseAttribute(offset, parser.getBuilder().getIntegerType(64),
+                            "offset", result.attributes))
+    return failure();
+
+  if (succeeded(parser.parseOptionalArrow())) {
+    // `-> (T, U, ...)` for multi-result; `-> T` for a single result.
+    if (succeeded(parser.parseOptionalLParen())) {
+      if (parser.parseTypeList(result.types) || parser.parseRParen())
+        return failure();
+    } else {
+      Type t;
+      if (parser.parseType(t))
+        return failure();
+      result.types.push_back(t);
+    }
+  }
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body, /*arguments=*/{}))
+    return failure();
+
+  LoopScheduleAtOp::ensureTerminator(*body, parser.getBuilder(),
+                                     result.location);
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+  return success();
+}
+
+void LoopScheduleAtOp::print(OpAsmPrinter &p) {
+  p << ' ' << getOffset();
+  bool printBlockTerminators = false;
+  auto rts = getResultTypes();
+  if (!rts.empty()) {
+    p << " -> ";
+    if (rts.size() == 1) {
+      p << rts.front();
+    } else {
+      p << "(";
+      llvm::interleaveComma(rts, p);
+      p << ")";
+    }
+    printBlockTerminators = true;
+  }
+  p << ' ';
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/false,
+                printBlockTerminators);
+  p.printOptionalAttrDict((*this)->getAttrs(), {"offset"});
+}
+
+LoopScheduleYieldOp LoopScheduleAtOp::getYieldOp() {
+  return cast<LoopScheduleYieldOp>(getBodyBlock().getTerminator());
+}
+
+LogicalResult LoopScheduleAtOp::verify() {
+  // Parent trait ensures we're inside a LoopScheduleFrameOp; additionally,
+  // require we're in the frame's *body* region.
+  auto frame = cast<LoopScheduleFrameOp>((*this)->getParentOp());
+  if ((*this)->getParentRegion() != &frame.getBodyRegion())
+    return emitOpError("loopschedule.at must appear in a frame's body region");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// LoopScheduleLaunchOp
+//===----------------------------------------------------------------------===//
+
+ParseResult LoopScheduleLaunchOp::parse(OpAsmParser &parser,
+                                        OperationState &result) {
+  // `at N`
+  if (parser.parseKeyword("at"))
+    return failure();
+  IntegerAttr offset;
+  if (parser.parseAttribute(offset, parser.getBuilder().getIntegerType(64),
+                            "offset", result.attributes))
+    return failure();
+
+  // `: !loopschedule.handle`
+  Type handleTy;
+  if (parser.parseColon() || parser.parseType(handleTy))
+    return failure();
+  result.types.push_back(handleTy);
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body, /*arguments=*/{}))
+    return failure();
+
+  LoopScheduleLaunchOp::ensureTerminator(*body, parser.getBuilder(),
+                                         result.location);
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+  return success();
+}
+
+void LoopScheduleLaunchOp::print(OpAsmPrinter &p) {
+  p << " at " << getOffset() << " : ";
+  p.printType(getHandle().getType());
+  p << ' ';
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/false,
+                /*printBlockTerminators=*/true);
+  p.printOptionalAttrDict((*this)->getAttrs(), {"offset"});
+}
+
+LoopScheduleYieldOp LoopScheduleLaunchOp::getYieldOp() {
+  return cast<LoopScheduleYieldOp>(getBodyBlock().getTerminator());
+}
+
+LogicalResult LoopScheduleLaunchOp::verify() {
+  auto frame = cast<LoopScheduleFrameOp>((*this)->getParentOp());
+  if ((*this)->getParentRegion() != &frame.getBodyRegion())
+    return emitOpError(
+        "loopschedule.launch must appear in a frame's body region");
+
+  // Walk forward through forwarding uses (body-region yields of an enclosing
+  // frame) and count terminal consumers (await ops, or terminator await-list
+  // operands). Exactly one terminal consumer is required.
+  SmallVector<Value, 4> worklist{getHandle()};
+  llvm::SmallPtrSet<Value, 4> seen;
+  unsigned terminalCount = 0;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    for (OpOperand &use : v.getUses()) {
+      Operation *user = use.getOwner();
+      if (isa<LoopScheduleAwaitOp>(user)) {
+        ++terminalCount;
+      } else if (auto term = dyn_cast<LoopScheduleTerminatorOp>(user)) {
+        if (llvm::is_contained(term.getAwait(), use.get()))
+          ++terminalCount;
+        else
+          return emitOpError("handle used in non-await operand of terminator");
+      } else if (auto yield = dyn_cast<LoopScheduleYieldOp>(user)) {
+        auto parentFrame =
+            dyn_cast<LoopScheduleFrameOp>(yield->getParentOp());
+        if (!parentFrame ||
+            yield->getParentRegion() != &parentFrame.getBodyRegion())
+          return emitOpError("handle yielded outside a frame body");
+        worklist.push_back(
+            parentFrame.getResult(use.getOperandNumber()));
+      } else {
+        return emitOpError("handle has illegal use: ") << *user;
+      }
+    }
+  }
+  if (terminalCount == 0)
+    return emitOpError("handle is never awaited");
+  if (terminalCount > 1)
+    return emitOpError("handle is awaited more than once");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// LoopScheduleAwaitOp
+//===----------------------------------------------------------------------===//
+
+ParseResult LoopScheduleAwaitOp::parse(OpAsmParser &parser,
+                                       OperationState &result) {
+  SmallVector<OpAsmParser::UnresolvedOperand> handles;
+  if (parser.parseOperandList(handles))
+    return failure();
+
+  if (succeeded(parser.parseOptionalArrow())) {
+    if (succeeded(parser.parseOptionalLParen())) {
+      if (parser.parseTypeList(result.types) || parser.parseRParen())
+        return failure();
+    } else {
+      Type t;
+      if (parser.parseType(t))
+        return failure();
+      result.types.push_back(t);
+    }
+  }
+
+  if (parser.resolveOperands(
+          handles, HandleType::get(parser.getContext()),
+          result.operands))
+    return failure();
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+  return success();
+}
+
+void LoopScheduleAwaitOp::print(OpAsmPrinter &p) {
+  p << ' ';
+  p.printOperands(getHandles());
+  auto rts = getResultTypes();
+  if (!rts.empty()) {
+    p << " -> ";
+    if (rts.size() == 1) {
+      p << rts.front();
+    } else {
+      p << "(";
+      llvm::interleaveComma(rts, p);
+      p << ")";
+    }
+  }
+  p.printOptionalAttrDict((*this)->getAttrs());
+}
+
+LogicalResult LoopScheduleIterArgUpdateOp::verify() {
+  Operation *op = (*this)->getParentOp();
+  while (op && !isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(op))
+    op = op->getParentOp();
+  if (!op)
+    return emitOpError("must be nested inside a loopschedule.sequential or "
+                       "loopschedule.pipeline op");
+  return success();
+}
+
+LogicalResult LoopScheduleAwaitOp::verify() {
+  auto frame = cast<LoopScheduleFrameOp>((*this)->getParentOp());
+  if ((*this)->getParentRegion() != &frame.getAwaitRegion())
+    return emitOpError(
+        "loopschedule.await must appear in a frame's await region");
+  return success();
+}
+
 #include "circt/Dialect/LoopSchedule/LoopScheduleInterfaces.cpp.inc"
 
 #define GET_OP_CLASSES
@@ -846,6 +1262,7 @@ void LoopScheduleIfOp::build(OpBuilder &odsBuilder, OperationState &odsState,
 
 void LoopScheduleDialect::initialize() {
   registerAttributes();
+  registerTypes();
 
   addOperations<
 #define GET_OP_LIST

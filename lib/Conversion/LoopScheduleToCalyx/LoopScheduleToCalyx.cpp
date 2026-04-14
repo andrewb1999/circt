@@ -2634,7 +2634,9 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
     auto compOp = getState<ComponentLoweringState>().getComponentOp();
     // Build all phases contained in loops
     auto res = funcOp.walk([&](LoopScheduleYieldOp yieldOp) {
-      auto ifOp = cast<LoopScheduleIfOp>(yieldOp.getParentOp());
+      auto ifOp = dyn_cast<LoopScheduleIfOp>(yieldOp->getParentOp());
+      if (!ifOp)
+        return WalkResult::advance();
 
       if (ifOp->getNumResults() > 0) {
         auto groupName =

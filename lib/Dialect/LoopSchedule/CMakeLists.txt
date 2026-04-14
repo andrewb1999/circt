@@ -1,6 +1,7 @@
 add_circt_dialect_library(CIRCTLoopSchedule
   LoopScheduleOps.cpp
   LoopScheduleAttributes.cpp
+  LoopScheduleTypes.cpp
   Utils.cpp
 
   ADDITIONAL_HEADER_DIRS

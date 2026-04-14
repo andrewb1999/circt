@@ -1033,7 +1033,7 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
   // Build the loopschedule.terminator with the condition and iter_args/results.
   builder.setInsertionPointToEnd(&stagesBlock);
   builder.create<LoopScheduleTerminatorOp>(pipelineCondResult, termIterArgs,
-                                           termResults);
+                                           termResults, ValueRange{});
 
   // Replace loop results with pipeline results.
   for (size_t i = 0; i < loop.getNumResults(); ++i)
@@ -1667,7 +1667,7 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
   // first step plus the iter_args and results.
   builder.setInsertionPointToEnd(&scheduleBlock);
   builder.create<LoopScheduleTerminatorOp>(sequentialCondResult, termIterArgs,
-                                           termIterArgs);
+                                           termIterArgs, ValueRange{});
 
   // Replace loop results with sequential results.
   for (size_t i = 0; i < loop.getNumResults(); ++i) {
