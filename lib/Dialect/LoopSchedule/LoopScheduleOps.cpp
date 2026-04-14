@@ -44,20 +44,19 @@ LogicalResult loopschedule::verifyLoop(Operation *op) {
   if (stagesBlock->getOperations().size() < 2)
     return loop.emitOpError("body must contain at least one phase");
 
-  // Verify the loop's condition value is produced by the first phase.
+  // Verify the loop's condition value is produced by some phase in the body.
   auto firstPhaseRange = stagesBlock->getOps<PhaseInterface>();
   if (firstPhaseRange.empty())
     return loop.emitOpError("body must contain at least one phase");
-  Operation *firstPhase = (*firstPhaseRange.begin()).getOperation();
   Value condValue = loop.getConditionValue();
   if (!condValue)
     return loop.emitOpError("missing condition value on terminator");
   if (!condValue.getType().isInteger(1))
     return loop.emitOpError("loop condition must be i1, found ")
            << condValue.getType();
-  if (condValue.getDefiningOp() != firstPhase)
+  if (!isa<PhaseInterface>(condValue.getDefiningOp()))
     return loop.emitOpError(
-        "loop condition must be produced by the first phase of the body");
+        "loop condition must be produced by a phase in the body");
 
   // Verify iter_args are produced by the first phase that uses it
   // and is only used before new value is produced

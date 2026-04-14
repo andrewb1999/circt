@@ -691,16 +691,15 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
 
-  // Helper: emit a conditional back-edge transition for the last step's exit.
-  // Instead of unconditionally going to COND, check the condition here and
-  // branch to STEP_0 (continue) or DONE (exit). Saves 1 cycle per iteration.
+  // Helper: emit the last step's exit transition. We go back to COND so the
+  // condition is evaluated with the UPDATED iter_args (the iter_arg register
+  // latches on the clock edge leaving the last step, which asserts
+  // iter_advance). Checking `cond` directly at the last step instead would
+  // race: the register hasn't updated yet, so cond still reflects the OLD
+  // iter_args — producing one extra spurious iteration.
   auto emitLastStepTransition = [&](Block *tb) {
     fb.setInsertionPointToEnd(tb);
-    fsm::TransitionOp::create(
-        fb, loc, StringRef("STEP_0"),
-        [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(1)); },
-        [&]() { fsm::UpdateOp::create(fb, loc, fiVar, falseVal); });
-    fsm::TransitionOp::create(fb, loc, StringRef("DONE"));
+    fsm::TransitionOp::create(fb, loc, StringRef("COND"));
   };
 
   // --- STEP_i (and WAIT_i / POST_i for wait steps) ---
@@ -1466,6 +1465,17 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     }
   }
 
+  // Determine which step produces the loop condition so we can resolve the
+  // condition backedge after lowering that step.
+  Value condTermVal = terminatorOp.getCondition();
+  unsigned condStepIdx = 0;
+  for (auto [idx, s] : llvm::enumerate(steps)) {
+    if (condTermVal.getDefiningOp() == s.getOperation()) {
+      condStepIdx = idx;
+      break;
+    }
+  }
+
   // --- Lower step bodies ---
   for (auto [stepIdx, stepOp] : llvm::enumerate(steps)) {
     Block *body = &stepOp.getBodyBlock();
@@ -1628,6 +1638,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           continue;
         }
 
+        if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
+          // Pre-pipeline stores fire only during the pipeline-launch state.
+          if (failed(handleStore(storeOp, hw, localMapping, stepChildStart,
+                                  perStepPorts[stepIdx])))
+            return failure();
+          continue;
+        }
+
         hw.clone(op, localMapping);
       }
 
@@ -1680,15 +1698,24 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         return failure();
     }
 
-    // Pre-scan for loads from local hlmem memories. These skip the capture
-    // register because the hlmem's latency=1 read port already provides the
-    // 1-cycle delay the scheduler expects.
-    DenseSet<Value> localLoadResults;
+    // Detect whether this step contains any loads from local hlmem memories.
+    // Local hlmem read ports have latency=1: `rd_data` during cycle N reflects
+    // `rd_addr` from cycle N-1. So during the cycle where step_active_<i> is
+    // high, rd_data is stale (reflecting the prior state's addr). We must
+    // capture rd_data ONE CYCLE LATER, when it correctly reflects the addr
+    // driven during the step. For steps without local loads, the normal gate
+    // works fine (register/combinational ops settle within their cycle).
+    bool stepHasLocalLoad = false;
     for (auto &op : *body) {
       if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-        for (auto &memInfo : memrefArgs)
-          if (memInfo.originalArg == loadOp.getMemRef() && memInfo.isLocalMem)
-            localLoadResults.insert(loadOp.getResult());
+        for (auto &memInfo : memrefArgs) {
+          if (memInfo.originalArg == loadOp.getMemRef() && memInfo.isLocalMem) {
+            stepHasLocalLoad = true;
+            break;
+          }
+        }
+        if (stepHasLocalLoad)
+          break;
       }
     }
 
@@ -1709,37 +1736,41 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
     if (stepCaptureGate[stepIdx]) {
       hw.setInsertionPointToEnd(hwBody);
+      // If this step contains a local hlmem load, delay the capture gate by
+      // one cycle so we latch rd_data when it's valid (the cycle after the
+      // address is applied), not when it's still stale.
+      Value captureGate = stepCaptureGate[stepIdx];
+      if (stepHasLocalLoad) {
+        Value falseConstCap =
+            hw::ConstantOp::create(hw, loc, hw.getI1Type(), 0);
+        captureGate = seq::CompRegOp::create(
+            hw, loc, stepCaptureGate[stepIdx], clk, rst, falseConstCap,
+            hw.getStringAttr(node.prefix + "_step" + std::to_string(stepIdx) +
+                             "_capture_gate_delayed"));
+      }
       for (auto [idx, it] : llvm::enumerate(llvm::zip(
                stepOp.getResults(), regOp.getOperands()))) {
         auto [result, regVal] = it;
-        if (localLoadResults.count(regVal)) {
-          // Local hlmem read (latency=1) already provides the 1-cycle delay.
-          // Keep the combinational mapping — no capture register needed.
-          continue;
-        }
         Value combVal = stepResultComb[result];
         Value resetVal = createZeroConstant(hw, loc, combVal.getType());
         auto regName = hw.getStringAttr(node.prefix + "_step" +
                                         std::to_string(stepIdx) + "_r" +
                                         std::to_string(idx));
         Value reg = seq::CompRegClockEnabledOp::create(
-            hw, loc, combVal, clk, stepCaptureGate[stepIdx], rst, resetVal,
-            regName);
+            hw, loc, combVal, clk, captureGate, rst, resetVal, regName);
         localMapping.map(result, reg);
       }
     }
 
-    // After lowering the first step, the loop's condition value (which the
-    // verifier guarantees is produced by the first phase) is now available in
-    // the mapping. Wire it into the FSM instance via the condition backedge.
-    // Prefer the combinational alias (stepResultComb) over the mapping, which
-    // may now point at the post-step capture register.
-    if (stepIdx == 0) {
-      Value condVal = terminatorOp.getCondition();
-      auto it = stepResultComb.find(condVal);
+    // After lowering the step that produces the loop condition, wire it into
+    // the FSM instance via the condition backedge. Prefer the combinational
+    // alias (stepResultComb) over the mapping, which may now point at the
+    // post-step capture register.
+    if (stepIdx == condStepIdx) {
+      auto it = stepResultComb.find(condTermVal);
       condBE.setValue(it != stepResultComb.end()
                           ? it->second
-                          : localMapping.lookup(condVal));
+                          : localMapping.lookup(condTermVal));
     }
   }
 
@@ -1865,12 +1896,22 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
        llvm::zip(pipOp.getStagesBlock().getArguments(), iterArgBackedges))
     mapping.map(arg, Value(be));
 
-  // The loop condition is produced by the first stage (verifier-enforced),
-  // so it isn't available until that stage's body has been lowered. Stand it
-  // up as a backedge here so the active/CE chain can be built first; resolve
-  // it after lowering stage 0 below.
+  // The loop condition is produced by some stage (guaranteed by the verifier
+  // to be within the first II cycles). Stand it up as a backedge here so the
+  // active/CE chain can be built first; resolve it after lowering the
+  // producing stage below.
   Backedge condValueBE = bb.get(hwBuilder.getI1Type());
   Value condValue = Value(condValueBE);
+
+  // Determine which stage produces the condition.
+  Value condTermVal = terminatorOp.getCondition();
+  unsigned condStageIdx = 0;
+  for (auto [idx, s] : llvm::enumerate(stages)) {
+    if (condTermVal.getDefiningOp() == s.getOperation()) {
+      condStageIdx = idx;
+      break;
+    }
+  }
 
   Backedge activeNextBE = bb.get(hwBuilder.getI1Type());
   auto activeReg = seq::CompRegOp::create(
@@ -2046,13 +2087,12 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
 
     auto regOp = cast<LoopScheduleRegisterOp>(body.getTerminator());
 
-    // Resolve the condition backedge from stage 0's *unregistered* condition
-    // value: the loop's combinational gate should not be delayed by the
-    // pipeline registers. The verifier guarantees the terminator's condition
-    // is one of stage 0's results, which corresponds to the register operand
-    // at the same index.
-    if (stageIdx == 0) {
-      auto condResult = cast<OpResult>(terminatorOp.getCondition());
+    // Resolve the condition backedge from the producing stage's *unregistered*
+    // condition value: the loop's combinational gate should not be delayed by
+    // the pipeline registers. The condition is one of the producing stage's
+    // results, which corresponds to the register operand at the same index.
+    if (stageIdx == condStageIdx) {
+      auto condResult = cast<OpResult>(condTermVal);
       condValueBE.setValue(
           mapping.lookup(regOp.getOperand(condResult.getResultNumber())));
       // Refresh the local condValue handle: BackedgeBuilder's RAUW updates
@@ -2090,13 +2130,15 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
 
   hwBuilder.setInsertionPointToEnd(hwBody);
 
-  // When II < #stages, multiple stageCE signals are high simultaneously in
-  // steady state. The priority mux in muxStageMemPorts silently drops all but
-  // the highest-priority stage's memory access. Reject this case at compile
-  // time rather than miscompiling.
+  // When II < #stages, stageCE signals form a shift-chain: stageCE[s+1] =
+  // CompReg(stageCE[s]). In steady state, stageCE[s] pulses on cycles s,
+  // s+II, s+2*II, ..., so two stages s1 < s2 fire on the SAME cycle only
+  // when (s2 - s1) % II == 0. The muxStageMemPorts priority mux correctly
+  // arbitrates stages that fire on different cycles — it only fails for
+  // stages in the same mod-II class. Reject only genuine collisions.
   if (II < stages.size()) {
     for (auto &entry : memPorts) {
-      unsigned touchCount = 0;
+      SmallVector<SmallVector<unsigned>> classes(II);
       for (unsigned s = 0; s < stages.size(); ++s) {
         auto it = perStagePorts[s].find(entry.first);
         if (it == perStagePorts[s].end())
@@ -2105,14 +2147,16 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
         bool hasAddr =
             llvm::any_of(ports.addrs, [](Value v) { return (bool)v; });
         if (hasAddr || ports.wrData || ports.wrEn)
-          touchCount++;
+          classes[s % II].push_back(s);
       }
-      if (touchCount > 1)
-        return pipOp.emitError()
-               << "pipeline with II=" << II << " and " << stages.size()
-               << " stages has multiple stages accessing the same memory; "
-               << "the priority mux cannot arbitrate overlapping stage "
-               << "enables (increase II or partition the memory)";
+      for (auto &cls : classes) {
+        if (cls.size() > 1)
+          return pipOp.emitError()
+                 << "pipeline with II=" << II << " and " << stages.size()
+                 << " stages has stages " << cls[0] << " and " << cls[1]
+                 << " accessing the same memory on the same cycle "
+                 << "(s1 ≡ s2 mod II); increase II or partition the memory";
+      }
     }
   }
 
