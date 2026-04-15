@@ -58,32 +58,56 @@ LogicalResult loopschedule::verifyLoop(Operation *op) {
     return loop.emitOpError(
         "loop condition must be produced by a phase in the body");
 
-  // Verify iter_args are produced by the first phase that uses it
-  // and is only used before new value is produced
-  for (auto it : llvm::enumerate(loop.getTerminatorIterArgs())) {
-    auto val = it.value();
-    auto i = it.index();
-    if (!isa<PhaseInterface>(val.getDefiningOp()))
-      return loop.emitOpError("New iter_args must be produced by a phase");
-    auto definingPhase = val.getDefiningOp<PhaseInterface>();
+  // Verify exactly one iter_arg_update exists per iter-arg block argument.
+  DenseMap<Value, LoopScheduleIterArgUpdateOp> updates;
+  WalkResult wr = loop.getBodyBlock()->walk(
+      [&](LoopScheduleIterArgUpdateOp u) {
+        auto [it, inserted] = updates.try_emplace(u.getIterArg(), u);
+        if (!inserted) {
+          u.emitOpError("duplicate iter_arg_update for iter-arg");
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+  if (wr.wasInterrupted())
+    return failure();
+  for (BlockArgument ba : loop.getBodyArgs()) {
+    if (!updates.count(ba))
+      return loop.emitOpError("missing iter_arg_update for iter-arg #")
+             << ba.getArgNumber();
+  }
+
+  // Verify iter-arg reads only happen in phases at or before the phase that
+  // hosts the iter-arg's update. This preserves the invariant that a new
+  // iter-arg value is not consumed in the same iteration by phases that
+  // scheduling ordered earlier than the update-hosting phase.
+  for (auto it : llvm::enumerate(loop.getBodyArgs())) {
+    BlockArgument bodyArg = it.value();
+    auto upd = updates.lookup(bodyArg);
+    Operation *updParent = upd->getParentOp();
+    while (updParent && !isa<PhaseInterface>(updParent))
+      updParent = updParent->getParentOp();
+    if (!updParent)
+      continue;
+    auto updPhase = cast<PhaseInterface>(updParent);
     SmallVector<PhaseInterface> validPhases;
     auto phases = loop.getBodyBlock()->getOps<PhaseInterface>();
     llvm::copy_if(phases, std::back_inserter(validPhases),
                   [&](PhaseInterface phase) {
-                    return phase == definingPhase ||
-                           phase->isBeforeInBlock(definingPhase);
+                    return phase == updPhase ||
+                           phase->isBeforeInBlock(updPhase);
                   });
-    if (i >= loop.getBodyArgs().size())
-      return loop.emitOpError(
-          "mismatched number of iter_args between block and terminator");
-    auto bodyArg = loop.getBodyArgs()[i];
     for (auto &use : bodyArg.getUses()) {
       auto *user = use.getOwner();
+      // Skip assignment-target uses: `iter_arg_update %iv = ...` names the
+      // iter-arg slot, not a read of its current value.
+      if (auto u = dyn_cast<LoopScheduleIterArgUpdateOp>(user))
+        if (use.getOperandNumber() == 0)
+          continue;
       bool inValidPhase = false;
-      for (auto phase : validPhases) {
+      for (auto phase : validPhases)
         if (phase->isAncestor(user))
           inValidPhase = true;
-      }
       if (!inValidPhase)
         return loop.emitOpError("Iter arg can only be used before new value is "
                                 "produced, found use in: ");
@@ -639,20 +663,6 @@ LogicalResult LoopScheduleTerminatorOp::verify() {
   Value cond = getCondition();
   if (!isa_and_nonnull<PhaseInterface>(cond.getDefiningOp()))
     return emitOpError("'condition' must be defined by a phase op");
-
-  // Verify loop terminates with the same `iter_args` types as the pipeline.
-  auto iterArgs = getIterArgs();
-  TypeRange terminatorArgTypes = iterArgs.getTypes();
-  TypeRange loopArgTypes = this->getIterArgs().getTypes();
-  if (terminatorArgTypes != loopArgTypes)
-    return emitOpError("'iter_args' types (")
-           << terminatorArgTypes << ") must match pipeline 'iter_args' types ("
-           << loopArgTypes << ")";
-
-  // Verify `iter_args` are defined by a phase.
-  for (auto iterArg : iterArgs)
-    if (!isa_and_nonnull<PhaseInterface>(iterArg.getDefiningOp()))
-      return emitOpError("'iter_args' must be defined by a phase op");
 
   // Verify loop terminates with the same result types as the loop.
   auto opResults = getResults();
@@ -1237,10 +1247,16 @@ void LoopScheduleAwaitOp::print(OpAsmPrinter &p) {
 
 LogicalResult LoopScheduleIterArgUpdateOp::verify() {
   Operation *op = (*this)->getParentOp();
-  while (op && !isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(op))
+  while (op && !isa<LoopInterface>(op))
     op = op->getParentOp();
   if (!op)
     return emitOpError("must be nested inside a loopschedule.sequential or "
+                       "loopschedule.pipeline op");
+  auto loop = cast<LoopInterface>(op);
+  auto bbArg = dyn_cast<BlockArgument>(getIterArg());
+  if (!bbArg || bbArg.getOwner() != loop.getBodyBlock())
+    return emitOpError("'iterArg' must be an iter-arg block argument of the "
+                       "enclosing loopschedule.sequential or "
                        "loopschedule.pipeline op");
   return success();
 }
@@ -1257,6 +1273,68 @@ LogicalResult LoopScheduleAwaitOp::verify() {
 
 #define GET_OP_CLASSES
 #include "circt/Dialect/LoopSchedule/LoopSchedule.cpp.inc"
+
+//===----------------------------------------------------------------------===//
+// iter_arg_update helpers
+//===----------------------------------------------------------------------===//
+
+LoopScheduleIterArgUpdateOp
+circt::loopschedule::getIterArgUpdate(LoopInterface loop,
+                                      BlockArgument iterArgBlockArg) {
+  LoopScheduleIterArgUpdateOp found;
+  loop.getBodyBlock()->walk([&](LoopScheduleIterArgUpdateOp u) {
+    if (u.getIterArg() == iterArgBlockArg) {
+      found = u;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return found;
+}
+
+Value circt::loopschedule::getIterArgNewValue(LoopInterface loop,
+                                              BlockArgument iterArgBlockArg) {
+  if (auto u = getIterArgUpdate(loop, iterArgBlockArg))
+    return u.getValue();
+  return {};
+}
+
+SmallVector<LoopScheduleIterArgUpdateOp>
+circt::loopschedule::getIterArgUpdatesInOrder(LoopInterface loop) {
+  auto bodyArgs = loop.getBodyArgs();
+  SmallVector<LoopScheduleIterArgUpdateOp> result(bodyArgs.size(), {});
+  loop.getBodyBlock()->walk([&](LoopScheduleIterArgUpdateOp u) {
+    auto ba = dyn_cast<BlockArgument>(u.getIterArg());
+    if (!ba || ba.getOwner() != loop.getBodyBlock())
+      return;
+    unsigned idx = ba.getArgNumber();
+    if (idx < result.size())
+      result[idx] = u;
+  });
+  return result;
+}
+
+Value circt::loopschedule::getIterArgPhaseResult(
+    LoopScheduleIterArgUpdateOp u) {
+  Value inside = u.getValue();
+  Operation *parent = u->getParentOp();
+  while (parent &&
+         !isa<LoopScheduleStepOp, LoopSchedulePipelineStageOp>(parent))
+    parent = parent->getParentOp();
+  if (!parent)
+    return inside;
+  Operation *reg = nullptr;
+  if (auto step = dyn_cast<LoopScheduleStepOp>(parent))
+    reg = step.getRegisterOp();
+  else if (auto stage = dyn_cast<LoopSchedulePipelineStageOp>(parent))
+    reg = stage.getRegisterOp();
+  if (!reg)
+    return inside;
+  for (auto it : llvm::enumerate(reg->getOperands()))
+    if (it.value() == inside)
+      return parent->getResult(it.index());
+  return inside;
+}
 
 #include "circt/Dialect/LoopSchedule/LoopScheduleDialect.cpp.inc"
 

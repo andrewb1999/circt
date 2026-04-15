@@ -22,9 +22,10 @@ func.func @delay_basic(%arg0: memref<16xi32>) -> i32 {
         %v = memref.load %arg0[%idx] : memref<16xi32>
         loopschedule.register %v : i32
       } -> i32
+      loopschedule.iter_arg_update %i = %next : i32
       loopschedule.register %next, %d#0, %cond : i32, i32, i1
     } : i32, i32, i1
-    loopschedule.terminator condition(%0#2), iter_args(%0#0), results(%0#1) : (i32) -> i32
+    loopschedule.terminator condition(%0#2), results(%0#1) : i32
   }
   return %r : i32
 }

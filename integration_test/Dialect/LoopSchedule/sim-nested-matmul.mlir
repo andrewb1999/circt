@@ -58,9 +58,11 @@ module {
                   %new_acc = arith.addi %acc, %prod : i32
                   // Advance k
                   %next_k = arith.addi %k, %c1_i2 : i2
+                  loopschedule.iter_arg_update %acc = %new_acc : i32
+                  loopschedule.iter_arg_update %k = %next_k : i2
                   loopschedule.register %next_k, %new_acc, %cond_k : i2, i32, i1
                 } : i2, i32, i1
-                loopschedule.terminator condition(%2#2), iter_args(%2#0, %2#1), results(%2#0, %2#1) : (i2, i32) -> (i2, i32)
+                loopschedule.terminator condition(%2#2), results(%2#0, %2#1) : i2, i32
               }
               // After inner loop: store C[i*2+j] = acc
               %i_ext2 = arith.extui %i : i2 to i4
@@ -70,15 +72,17 @@ module {
               loopschedule.store %inner#1, %arg2[%c_addr : i4] : memref<4xi32>
               // Advance j
               %next_j = arith.addi %j, %c1_i2 : i2
+              loopschedule.iter_arg_update %j = %next_j : i2
               loopschedule.register %next_j, %cond_j : i2, i1
             } : i2, i1
-            loopschedule.terminator condition(%1#1), iter_args(%1#0), results() : (i2) -> ()
+            loopschedule.terminator condition(%1#1), results()
           }
           // Advance i
           %next_i = arith.addi %i, %c1_i2 : i2
+          loopschedule.iter_arg_update %i = %next_i : i2
           loopschedule.register %next_i, %cond_i : i2, i1
         } : i2, i1
-        loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (i2) -> ()
+        loopschedule.terminator condition(%0#1), results()
       }
     }
     return

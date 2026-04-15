@@ -351,6 +351,13 @@ private:
   DenseMap<PhaseInterface, SmallVector<Value>> holdCEInPhase;
 
   DenseMap<LoopScheduleDelayOp, calyx::StaticGroupOp> delayPadGroups;
+
+public:
+  /// Map from the `value` operand of a `loopschedule.iter_arg_update` op to
+  /// the iter-arg register for the enclosing loop. Populated during
+  /// BuildOpGroups (before iter-arg block args get replaced with register
+  /// reads), consumed by BuildIntermediateRegs.
+  DenseMap<Value, calyx::RegisterOp> iterArgNewValueReg;
 };
 
 /// Handles the current state of lowering of a Calyx component. It is mainly
@@ -428,7 +435,8 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                   LoopScheduleIfOp, LoopScheduleBufferOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<FuncOp, LoopScheduleRegisterOp, LoopScheduleDelayOp,
-                             PhaseInterface, ReturnOp>([&](auto) {
+                             LoopScheduleIterArgUpdateOp, PhaseInterface,
+                             ReturnOp>([&](auto) {
                 /// Skip: these special cases will be handled separately.
                 return true;
               })
@@ -1086,6 +1094,11 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      LoopInterface op) const {
   LoopWrapper loop(op);
 
+  /// Collect iter_arg_update ops BEFORE replacing block args with register
+  /// reads below; `getIterArgUpdatesInOrder` relies on the LHS being a block
+  /// argument of the loop body.
+  auto iterArgUpdates = loopschedule::getIterArgUpdatesInOrder(op);
+
   /// Create iteration argument registers.
   /// The iteration argument registers will be referenced:
   /// - In the "before" part of the while loop, calculating the conditional,
@@ -1101,6 +1114,14 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
         createRegister(arg.value().getLoc(), rewriter, getComponent(),
                        arg.value().getType().getIntOrFloatBitWidth(), name);
     getState<ComponentLoweringState>().addLoopIterReg(loop, reg, arg.index());
+
+    // Record each iter_arg_update's `value` operand -> iter-arg reg so the
+    // phase-register builder can reuse this register for the new-value
+    // producer's result (avoiding a redundant phase register).
+    if (arg.index() < iterArgUpdates.size())
+      if (auto upd = iterArgUpdates[arg.index()])
+        getState<ComponentLoweringState>().iterArgNewValueReg[upd.getValue()] =
+            reg;
 
     arg.value().replaceAllUsesWith(reg.getOut());
   }
@@ -1119,9 +1140,11 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   }
 
   /// Update iter arg values at end of loop if needed
-  auto termIterArgs = loop.getOperation().getTerminatorIterArgs();
-  for (auto v : llvm::enumerate(termIterArgs)) {
-    auto arg = v.value();
+  for (auto v : llvm::enumerate(iterArgUpdates)) {
+    auto upd = v.value();
+    if (!upd)
+      continue;
+    auto arg = loopschedule::getIterArgPhaseResult(upd);
     auto idx = v.index();
     auto stepOp = arg.getDefiningOp<LoopScheduleStepOp>();
     if (stepOp) {
@@ -1845,6 +1868,9 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
       if (!phase)
         return WalkResult::advance();
 
+      const auto &iterArgNewValueReg =
+          getState<ComponentLoweringState>().iterArgNewValueReg;
+
       // Create a register for each phase.
       for (auto &operand : op->getOpOperands()) {
         Value value = operand.get();
@@ -1865,14 +1891,31 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
         // fresh i1 phase register.
         Value phaseResult = phase->getResult(i);
         bool reusedReg = false;
+
+        // If this register operand is the `value` of an iter_arg_update,
+        // reuse the loop's iter-arg register recorded by BuildOpGroups.
+        // Check both the raw operand and the if-op-unwrapped `value`.
+        {
+          auto it = iterArgNewValueReg.find(value);
+          if (it == iterArgNewValueReg.end())
+            it = iterArgNewValueReg.find(operand.get());
+          if (it != iterArgNewValueReg.end()) {
+            auto reg = it->second;
+            getState<ComponentLoweringState>().addPhaseReg(phase, reg, i);
+            regMap[phaseResult] = reg;
+            reusedReg = true;
+          }
+        }
+
         for (auto &use : phaseResult.getUses()) {
+          if (reusedReg)
+            break;
           auto term = dyn_cast<LoopScheduleTerminatorOp>(use.getOwner());
           if (!term)
             continue;
           // Terminator operand layout is [condition (1 operand),
           // iter_args..., results...].
           constexpr unsigned kConditionIdx = 0;
-          constexpr unsigned kIterArgsBegin = 1;
           unsigned absIdx = use.getOperandNumber();
           LoopWrapper loop(dyn_cast<LoopInterface>(phase->getParentOp()));
 
@@ -1901,18 +1944,6 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
             reusedReg = true;
             break;
           }
-
-          if (absIdx < kIterArgsBegin)
-            continue;
-          unsigned iterArgIdx = absIdx - kIterArgsBegin;
-          if (iterArgIdx >= term.getIterArgs().size())
-            continue;
-          auto reg = getState<ComponentLoweringState>().getLoopIterReg(
-              loop, iterArgIdx);
-          getState<ComponentLoweringState>().addPhaseReg(phase, reg, i);
-          regMap[phaseResult] = reg;
-          reusedReg = true;
-          break;
         }
         if (reusedReg)
           continue;

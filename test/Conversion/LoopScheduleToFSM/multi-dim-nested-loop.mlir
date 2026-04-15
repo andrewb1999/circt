@@ -22,14 +22,16 @@ module {
               %je = arith.trunci %j : i4 to i3
               loopschedule.store %c0_i32, %arg0[%ie, %je : i3, i3] : memref<8x8xi32>
               %jnext = arith.addi %j, %c1_i4 : i4
+              loopschedule.iter_arg_update %j = %jnext : i4
               loopschedule.register %jnext, %jcond : i4, i1
             } : i4, i1
-            loopschedule.terminator condition(%inner#1), iter_args(%inner#0), results() : (i4) -> ()
+            loopschedule.terminator condition(%inner#1), results()
           }
           %inext = arith.addi %i, %c1_i4 : i4
+          loopschedule.iter_arg_update %i = %inext : i4
           loopschedule.register %inext, %icond : i4, i1
         } : i4, i1
-        loopschedule.terminator condition(%outer#1), iter_args(%outer#0), results() : (i4) -> ()
+        loopschedule.terminator condition(%outer#1), results()
       }
     }
     return

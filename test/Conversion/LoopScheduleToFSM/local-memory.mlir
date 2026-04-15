@@ -14,9 +14,10 @@ module {
           %cond = arith.cmpi ult, %i, %c8_i4 : i4
           loopschedule.store %c42, %alloc[%i : i4] : memref<8xi32>
           %next = arith.addi %i, %c1_i4 : i4
+          loopschedule.iter_arg_update %i = %next : i4
           loopschedule.register %next, %cond : i4, i1
         } : i4, i1
-        loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (i4) -> ()
+        loopschedule.terminator condition(%0#1), results()
       }
     }
     return

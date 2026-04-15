@@ -35,13 +35,15 @@ func.func @pipeline_two_stage(%arg0: i32) -> i32 {
         %cond = arith.cmpi ult, %i, %c10 : index
         %next_i = arith.addi %i, %c1 : index
         %partial = arith.addi %acc, %arg0 : i32
+        loopschedule.iter_arg_update %acc = %partial : i32
+        loopschedule.iter_arg_update %i = %next_i : index
         loopschedule.register %next_i, %partial, %cond : index, i32, i1
       } : index, i32, i1
       // Stage 1: just pass through (accumulate is done in stage 0).
       %2 = loopschedule.pipeline.stage start = 1 end = 2 {
         loopschedule.register %1#1 : i32
       } : i32
-      loopschedule.terminator condition(%1#2), iter_args(%1#0, %1#1), results(%2) : (index, i32) -> (i32)
+      loopschedule.terminator condition(%1#2), results(%2) : i32
     }
     loopschedule.register %0 : i32
   } : i32

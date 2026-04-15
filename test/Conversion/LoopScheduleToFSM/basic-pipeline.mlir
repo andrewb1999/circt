@@ -32,9 +32,11 @@ func.func @pipeline_add(%arg0: i32) -> i32 {
         %cond = arith.cmpi ult, %i, %c10 : index
         %next_i = arith.addi %i, %c1 : index
         %sum = arith.addi %acc, %arg0 : i32
+        loopschedule.iter_arg_update %acc = %sum : i32
+        loopschedule.iter_arg_update %i = %next_i : index
         loopschedule.register %next_i, %sum, %cond : index, i32, i1
       } : index, i32, i1
-      loopschedule.terminator condition(%1#2), iter_args(%1#0, %1#1), results(%1#1) : (index, i32) -> (i32)
+      loopschedule.terminator condition(%1#2), results(%1#1) : i32
     }
     loopschedule.register %0 : i32
   } : i32

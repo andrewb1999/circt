@@ -41,10 +41,6 @@ def LoopOpInterface : OpInterface<"LoopInterface"> {
       "Value",
       "getConditionValue">,
     InterfaceMethod<
-      "",
-      "Operation::operand_range",
-      "getTerminatorIterArgs">,
-    InterfaceMethod<
       "Get the number of times a loop will run, if known statically.",
       "std::optional<uint64_t>",
       "getBound">,

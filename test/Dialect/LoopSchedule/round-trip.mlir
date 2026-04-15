@@ -18,14 +18,16 @@ func.func @test1(%arg0: memref<?xi32>) -> i32 {
       %4 = memref.load %arg0[%arg1] : memref<?xi32>
       // CHECK: loopschedule.register {{.+}} : {{.+}}
       // CHECK-NEXT: } : index, i32, i1
+      loopschedule.iter_arg_update %arg1 = %3 : index
       loopschedule.register %3, %4, %cond : index, i32, i1
     } : index, i32, i1
     %2 = loopschedule.pipeline.stage start = 1 end = 2 {
       %3 = arith.addi %1#1, %arg2 : i32
+      loopschedule.iter_arg_update %arg2 = %3 : i32
       loopschedule.register %3 : i32
     } : i32
-    // CHECK: loopschedule.terminator condition({{.+}}), iter_args({{.+}}), results({{.+}}) : {{.+}}
-    loopschedule.terminator condition(%1#2), iter_args(%1#0, %2), results(%2) : (index, i32) -> i32
+    // CHECK: loopschedule.terminator condition({{.+}}), results({{.+}})
+    loopschedule.terminator condition(%1#2), results(%2) : i32
   }
   return %0 : i32
 }
@@ -45,6 +47,7 @@ func.func @test2(%arg0: memref<?xi32>, %arg1: memref<?xi32>) {
       %4 = arith.addi %arg2, %c1 : index
       %5 = memref.load %arg0[%arg2] : memref<?xi32>
       %6 = arith.cmpi uge, %arg2, %c3 : index
+      loopschedule.iter_arg_update %arg2 = %arg2 : index
       loopschedule.register %arg2, %4, %5, %6, %cond : index, index, i32, i1, i1
     } : index, index, i32, i1, i1
     // CHECK: loopschedule.pipeline.stage start = 1 end = 2 when %0#3
@@ -64,7 +67,7 @@ func.func @test2(%arg0: memref<?xi32>, %arg1: memref<?xi32>) {
       memref.store %3#2, %arg1[%3#1] : memref<?xi32>
       loopschedule.register
     }
-    loopschedule.terminator condition(%0#4), iter_args(%0#0), results() : (index) -> ()
+    loopschedule.terminator condition(%0#4), results()
   }
   return
 }
@@ -89,6 +92,7 @@ func.func @test3(%arg0: memref<?xi32>) {
       %7 = memref.load %1[%c0] : memref<1xi32>
       %8 = memref.load %0[%c0] : memref<1xi32>
       %9 = memref.load %arg0[%arg1] : memref<?xi32>
+      loopschedule.iter_arg_update %arg1 = %5 : index
       loopschedule.register %5, %6, %7, %8, %9, %cond : index, i32, i32, i32, i32, i1
     } : index, i32, i32, i32, i32, i1
     %4 = loopschedule.pipeline.stage start = 1 end = 2 {
@@ -101,7 +105,7 @@ func.func @test3(%arg0: memref<?xi32>) {
       memref.store %4, %0[%c0] : memref<1xi32>
       loopschedule.register
     }
-    loopschedule.terminator condition(%3#5), iter_args(%3#0), results() : (index) -> ()
+    loopschedule.terminator condition(%3#5), results()
   }
   return
 }
@@ -122,6 +126,7 @@ func.func @test4(%arg0: memref<?xi32>, %arg1: memref<?xi32>) {
       %3 = arith.addi %arg2, %c1 : index
       %4 = memref.load %arg1[%arg2] : memref<?xi32>
       %5 = arith.index_cast %4 : i32 to index
+      loopschedule.iter_arg_update %arg2 = %3 : index
       loopschedule.register %3, %5, %cond : index, index, i1
     } : index, index, i1
     %1:2 = loopschedule.pipeline.stage start = 1 end = 2 {
@@ -136,7 +141,7 @@ func.func @test4(%arg0: memref<?xi32>, %arg1: memref<?xi32>) {
       memref.store %2#1, %arg0[%2#0] : memref<?xi32>
       loopschedule.register
     }
-    loopschedule.terminator condition(%0#2), iter_args(%0#0), results() : (index) -> ()
+    loopschedule.terminator condition(%0#2), results()
   }
   return
 }
@@ -161,6 +166,7 @@ func.func @test5(%arg0: memref<?xi32>) {
       %2 = arith.subi %arg1, %c1 : index
       %3 = memref.load %arg0[%2] : memref<?xi32>
       %4 = arith.addi %arg1, %c1 : index
+      loopschedule.iter_arg_update %arg1 = %4 : index
       loopschedule.register %3, %4 : i32, index
     } : i32, index
     loopschedule.pipeline.stage start = 2 end = 3 {
@@ -168,7 +174,7 @@ func.func @test5(%arg0: memref<?xi32>) {
       memref.store %2, %arg0[%c1] : memref<?xi32>
       loopschedule.register
     }
-    loopschedule.terminator condition(%0#1), iter_args(%1#1), results() : (index) -> ()
+    loopschedule.terminator condition(%0#1), results()
   }
   return
 }
@@ -179,9 +185,10 @@ func.func @trip_count_attr() {
   // CHECK: loopschedule.pipeline II = 1 trip_count = 3
   loopschedule.pipeline II = 1 trip_count = 3 iter_args(%arg0 = %false) : (i1) -> () {
     %0:2 = loopschedule.pipeline.stage start = 0 end = 1 {
+      loopschedule.iter_arg_update %arg0 = %arg0 : i1
       loopschedule.register %arg0, %true : i1, i1
     } : i1, i1
-    loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (i1) -> ()
+    loopschedule.terminator condition(%0#1), results()
   }
   return
 }
@@ -196,9 +203,10 @@ func.func @sequential_basic(%arg0: memref<?xi32>) {
     %0:2 = loopschedule.step {
       %cond = arith.cmpi ult, %arg1, %c10 : index
       %next = arith.addi %arg1, %c1 : index
+      loopschedule.iter_arg_update %arg1 = %next : index
       loopschedule.register %next, %cond : index, i1
     } : index, i1
-    loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (index) -> ()
+    loopschedule.terminator condition(%0#1), results()
   }
   return
 }

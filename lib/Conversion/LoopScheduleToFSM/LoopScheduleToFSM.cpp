@@ -369,7 +369,7 @@ lowerRegionBody(Block *body, OpBuilder &builder, IRMapping &mapping,
     return cycleGates[c];
   };
   for (auto &op : *body) {
-    if (isa<LoopScheduleRegisterOp>(&op))
+    if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
       continue;
     if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
       continue;
@@ -1494,7 +1494,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       for (auto &op : *body) {
         if (&op == childSeqOp.getOperation())
           break;
-        if (isa<LoopScheduleRegisterOp>(&op))
+        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
           continue;
         if (isa<LoopScheduleSequentialOp>(&op))
           break;
@@ -1596,7 +1596,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         }
         if (!pastChild)
           continue;
-        if (isa<LoopScheduleRegisterOp>(&op))
+        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
           continue;
 
         if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
@@ -1626,7 +1626,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       for (auto &op : *body) {
         if (&op == pipOp.getOperation())
           break;
-        if (isa<LoopScheduleRegisterOp>(&op))
+        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
           continue;
         if (isa<LoopSchedulePipelineOp>(&op))
           break;
@@ -1669,7 +1669,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         }
         if (!pastChild)
           continue;
-        if (isa<LoopScheduleRegisterOp>(&op))
+        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
           continue;
 
         if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
@@ -1780,9 +1780,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // captured register sees its own pre-edge value on that posedge, which is
   // stale by one iteration; always prefer the combinational alias for the
   // iter_arg D input.
+  auto iterArgUpdates = loopschedule::getIterArgUpdatesInOrder(seqOp);
+  SmallVector<Value> iterArgPhaseResults(iterArgRegs.size());
+  for (unsigned i = 0; i < iterArgRegs.size(); ++i)
+    if (auto u = iterArgUpdates[i])
+      iterArgPhaseResults[i] = loopschedule::getIterArgPhaseResult(u);
   hw.setInsertionPointToEnd(hwBody);
   for (unsigned i = 0; i < iterArgRegs.size(); ++i) {
-    Value termArg = terminatorOp.getIterArgs()[i];
+    Value termArg = iterArgPhaseResults[i];
     auto combIt = stepResultComb.find(termArg);
     Value feedback = combIt != stepResultComb.end()
                          ? combIt->second
@@ -1797,8 +1802,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   for (auto [idx, result] : llvm::enumerate(seqOp.getResults())) {
     Value termResult = terminatorOp.getResults()[idx];
     bool mapped = false;
-    for (unsigned j = 0; j < terminatorOp.getIterArgs().size(); ++j) {
-      if (termResult == terminatorOp.getIterArgs()[j]) {
+    for (unsigned j = 0; j < iterArgPhaseResults.size(); ++j) {
+      if (termResult == iterArgPhaseResults[j]) {
         resultValues.push_back(iterArgRegs[j]);
         mapped = true;
         break;
@@ -2046,7 +2051,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     DenseSet<Value> localLoadResults;
 
     for (auto &op : body.getOperations()) {
-      if (isa<LoopScheduleRegisterOp>(&op))
+      if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
         continue;
 
       // Temporarily override the mapping entries for any operands that come
@@ -2183,15 +2188,18 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     firstIterPerStage[s] = reg;
   }
 
+  auto pipIterArgUpdates = loopschedule::getIterArgUpdatesInOrder(pipOp);
   for (unsigned i = 0; i < numIterArgs; ++i) {
     Value init = mapping.lookup(pipOp.getInits()[i]);
-    Value feedback = mapping.lookup(terminatorOp.getIterArgs()[i]);
+    Value termVal = pipIterArgUpdates[i]
+                        ? loopschedule::getIterArgPhaseResult(pipIterArgUpdates[i])
+                        : Value{};
+    Value feedback = mapping.lookup(termVal);
     // The feedback value is produced at some stage; first_iter must stay
     // high until that stage has fired at least once. If the feedback isn't
     // a stage result (shouldn't happen for well-formed pipelines), fall
     // back to stage 0.
     unsigned feedbackStage = 0;
-    Value termVal = terminatorOp.getIterArgs()[i];
     if (auto opResult = dyn_cast<OpResult>(termVal)) {
       if (auto stage = dyn_cast<LoopSchedulePipelineStageOp>(
               opResult.getOwner())) {
@@ -2595,7 +2603,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
       for (auto &op : topSteps[stepIdx].getBodyBlock().getOperations()) {
         if (&op == firstChildOp)
           break;
-        if (isa<LoopScheduleRegisterOp>(&op))
+        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
           continue;
         if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
           break;
@@ -2689,7 +2697,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
         }
         if (!pastChild)
           continue;
-        if (isa<LoopScheduleRegisterOp>(&op))
+        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
           continue;
         if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
           continue;

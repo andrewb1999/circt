@@ -43,9 +43,10 @@ module {
             loopschedule.store %next, %arg0[%i : i32] : memref<16xi32>
             loopschedule.register
           }
+          loopschedule.iter_arg_update %i = %next : i32
           loopschedule.register %next, %cond : i32, i1
         } : i32, i1
-        loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (i32) -> ()
+        loopschedule.terminator condition(%0#1), results()
       }
     }
     return

@@ -97,7 +97,6 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
       return &getStagesBlock();
     }
     Value getConditionValue();
-    Operation::operand_range getTerminatorIterArgs();
     std::optional<uint64_t> getBound() {
       return getTripCount();
     }
@@ -107,12 +106,6 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
 
     uint64_t getBodyLatency();
     bool canStall();
-  }];
-
-  let extraClassDefinition = [{
-    Operation::operand_range $cppClass::getTerminatorIterArgs() {
-      return cast<LoopScheduleTerminatorOp>(getBodyBlock()->getTerminator()).getIterArgs();
-    }
   }];
 }
 
@@ -259,7 +252,6 @@ def LoopScheduleSequentialOp : LoopScheduleOp<"sequential", [LoopOpInterface]> {
       return &getScheduleBlock();
     }
     Value getConditionValue();
-    Operation::operand_range getTerminatorIterArgs();
     std::optional<uint64_t> getBound() {
       return getTripCount();
     }
@@ -267,12 +259,6 @@ def LoopScheduleSequentialOp : LoopScheduleOp<"sequential", [LoopOpInterface]> {
       return false;
     }
     bool canStall();
-  }];
-
-  let extraClassDefinition = [{
-    Operation::operand_range $cppClass::getTerminatorIterArgs() {
-      return cast<LoopScheduleTerminatorOp>(getBodyBlock()->getTerminator()).getIterArgs();
-    }
   }];
 }
 
@@ -419,10 +405,6 @@ def LoopScheduleTerminatorOp : LoopScheduleOp<"terminator",
     the final phase, and it is up to lowering passes to preserve these values
     until the final phase is complete.
 
-    The `iter_args` section accepts a variadic list of values which become the
-    next iteration's `iter_args`. These may be the results of any phase, and
-    their types must match the loop's `iter_args` types.
-
     The optional `await` section accepts a variadic list of
     `!loopschedule.handle` values. Before the terminator fires its transition,
     every listed handle must have completed. This is a shorthand for an
@@ -432,17 +414,15 @@ def LoopScheduleTerminatorOp : LoopScheduleOp<"terminator",
 
   let arguments = (ins
     I1:$condition,
-    Variadic<AnyType>:$iter_args,
     Variadic<AnyType>:$results,
     Variadic<HandleType>:$await
   );
 
   let assemblyFormat = [{
     `condition` `(` $condition `)` `,`
-    `iter_args` `(` $iter_args `)` `,`
     (`await` `(` $await^ `)` `,`)?
-    `results` `(` $results `)` `:`
-    functional-type($iter_args, $results) attr-dict
+    `results` `(` $results `)`
+    (`:` type($results)^)? attr-dict
   }];
 
   let hasVerifier = 1;
@@ -795,7 +775,8 @@ def LoopScheduleAwaitOp : LoopScheduleOp<"await",
 }
 
 def LoopScheduleIterArgUpdateOp : LoopScheduleOp<"iter_arg_update",
-    [ParentOneOf<["LoopScheduleAtOp", "LoopSchedulePipelineStageOp"]>,
+    [ParentOneOf<["LoopScheduleAtOp", "LoopSchedulePipelineStageOp",
+                  "LoopScheduleStepOp"]>,
      TypesMatchWith<"iter-arg type matches new-value type",
                     "value", "iterArg",
                     "$_self">]> {

@@ -15,9 +15,10 @@ module {
         %0:2 = loopschedule.step {
           %cond = arith.cmpi slt, %i, %c10 : i32
           %next = arith.addi %i, %c1 : i32
+          loopschedule.iter_arg_update %i = %next : i32
           loopschedule.register %next, %cond : i32, i1
         } : i32, i1
-        loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (i32) -> ()
+        loopschedule.terminator condition(%0#1), results()
       }
     }
     return

@@ -136,12 +136,12 @@ func.func @frame_iter_arg_update_in_sequential(%c0: index, %c1: index, %c10: ind
     loopschedule.frame {
       loopschedule.at 0 {
         // CHECK: loopschedule.iter_arg_update %{{.*}} = %{{.*}} : index
-        loopschedule.iter_arg_update %c0 = %0#0 : index
+        loopschedule.iter_arg_update %iv = %0#0 : index
         loopschedule.yield
       }
       loopschedule.yield
     }
-    loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (index) -> ()
+    loopschedule.terminator condition(%0#1), results()
   }
   return
 }
@@ -159,6 +159,7 @@ func.func @sequential_launches_pipeline(%c0: index, %c1: index, %c10: index) {
       %r:2 = loopschedule.at 0 -> (i1, index) {
         %c = arith.cmpi ult, %iv, %c10 : index
         %n = arith.addi %iv, %c1 : index
+        loopschedule.iter_arg_update %iv = %n : index
         loopschedule.yield %c, %n : i1, index
       }
       loopschedule.yield %r#0, %r#1 : i1, index
@@ -173,9 +174,10 @@ func.func @sequential_launches_pipeline(%c0: index, %c1: index, %c10: index) {
           %1:2 = loopschedule.pipeline.stage start = 0 end = 1 {
             %jcond = arith.cmpi ult, %jv, %c10 : index
             %jv_n = arith.addi %jv, %c1 : index
+            loopschedule.iter_arg_update %jv = %jv_n : index
             loopschedule.register %jv_n, %jcond : index, i1
           } : index, i1
-          loopschedule.terminator condition(%1#1), iter_args(%1#0), results() : (index) -> ()
+          loopschedule.terminator condition(%1#1), results()
         }
         loopschedule.yield
       }
@@ -185,8 +187,8 @@ func.func @sequential_launches_pipeline(%c0: index, %c1: index, %c10: index) {
     // The launched pipeline's handle is awaited at the iteration boundary
     // via the terminator's `await(...)` list rather than an empty trailing
     // frame.
-    // CHECK: loopschedule.terminator condition(%{{.*}}), iter_args(%{{.*}}), await(%{{.*}}), results()
-    loopschedule.terminator condition(%cond), iter_args(%iv_next), await(%h), results() : (index) -> ()
+    // CHECK: loopschedule.terminator condition(%{{.*}}), await(%{{.*}}), results()
+    loopschedule.terminator condition(%cond), await(%h), results()
   }
   return
 }
@@ -200,6 +202,7 @@ func.func @sequential_terminator_awaits_two_handles(%c0: index, %c1: index, %c10
       %r:2 = loopschedule.at 0 -> (i1, index) {
         %c = arith.cmpi ult, %iv, %c10 : index
         %n = arith.addi %iv, %c1 : index
+        loopschedule.iter_arg_update %iv = %n : index
         loopschedule.yield %c, %n : i1, index
       }
       loopschedule.yield %r#0, %r#1 : i1, index
@@ -215,8 +218,8 @@ func.func @sequential_terminator_awaits_two_handles(%c0: index, %c1: index, %c10
       loopschedule.yield %hA, %hB : !loopschedule.handle, !loopschedule.handle
     }
 
-    // CHECK: loopschedule.terminator condition(%{{.*}}), iter_args(%{{.*}}), await(%{{.*}}, %{{.*}}), results()
-    loopschedule.terminator condition(%cond), iter_args(%iv_next), await(%hs#0, %hs#1), results() : (index) -> ()
+    // CHECK: loopschedule.terminator condition(%{{.*}}), await(%{{.*}}, %{{.*}}), results()
+    loopschedule.terminator condition(%cond), await(%hs#0, %hs#1), results()
   }
   return
 }
@@ -229,10 +232,10 @@ func.func @iter_arg_update_in_pipeline_stage(%c0: index, %c1: index, %c10: index
       %cond = arith.cmpi ult, %iv, %c10 : index
       %iv_n = arith.addi %iv, %c1 : index
       // CHECK: loopschedule.iter_arg_update %{{.*}} = %{{.*}} : index
-      loopschedule.iter_arg_update %c0 = %iv_n : index
+      loopschedule.iter_arg_update %iv = %iv_n : index
       loopschedule.register %iv_n, %cond : index, i1
     } : index, i1
-    loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (index) -> ()
+    loopschedule.terminator condition(%0#1), results()
   }
   return
 }

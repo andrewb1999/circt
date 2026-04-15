@@ -1021,19 +1021,37 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
   SmallVector<Value> termIterArgs;
   SmallVector<Value> termResults;
 
-  for (auto value : loop.getAfterBody()->getTerminator()->getOperands()) {
+  for (auto it :
+       llvm::enumerate(loop.getAfterBody()->getTerminator()->getOperands())) {
+    unsigned i = it.index();
+    Value value = it.value();
     unsigned lookupTime =
         std::min((unsigned)(stageValueMaps.size() - 1),
                  (unsigned)(pipeTimes[value].first + ii.getInt()));
 
-    termIterArgs.push_back(stageValueMaps[lookupTime].lookup(value));
-    termResults.push_back(stageValueMaps[lookupTime].lookup(value));
+    Value newValue = stageValueMaps[lookupTime].lookup(value);
+    termIterArgs.push_back(newValue);
+    termResults.push_back(newValue);
+
+    // Emit an iter_arg_update inside the stage that produced the new value.
+    // The LHS is the pipeline's iter-arg block argument for position `i`; the
+    // RHS is the register-op operand that corresponds to `newValue` (the
+    // stage result is not visible inside the stage itself).
+    if (auto stage = newValue.getDefiningOp<LoopSchedulePipelineStageOp>()) {
+      auto regOp = stage.getRegisterOp();
+      unsigned resultIdx = cast<OpResult>(newValue).getResultNumber();
+      Value inside = regOp->getOperand(resultIdx);
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(regOp);
+      builder.create<LoopScheduleIterArgUpdateOp>(
+          stage.getLoc(), pipeline.getStagesBlock().getArgument(i), inside);
+    }
   }
 
-  // Build the loopschedule.terminator with the condition and iter_args/results.
+  // Build the loopschedule.terminator with the condition and results.
   builder.setInsertionPointToEnd(&stagesBlock);
-  builder.create<LoopScheduleTerminatorOp>(pipelineCondResult, termIterArgs,
-                                           termResults, ValueRange{});
+  builder.create<LoopScheduleTerminatorOp>(pipelineCondResult, termResults,
+                                           ValueRange{});
 
   // Replace loop results with pipeline results.
   for (size_t i = 0; i < loop.getNumResults(); ++i)
@@ -1660,14 +1678,29 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
   SmallVector<Value> termIterArgs;
   for (int i = 0, vals = anchor->getNumOperands(); i < vals; ++i) {
     auto value = anchor->getOperand(i);
-    termIterArgs.push_back(valueMap.lookup(value));
+    Value newValue = valueMap.lookup(value);
+    termIterArgs.push_back(newValue);
+
+    // Emit an iter_arg_update inside the step that produced the new value.
+    // The LHS is the sequential's iter-arg block argument for position `i`;
+    // the RHS is the register-op operand corresponding to `newValue` (the
+    // step result is not visible inside the step itself).
+    if (auto step = newValue.getDefiningOp<LoopScheduleStepOp>()) {
+      auto regOp = step.getRegisterOp();
+      unsigned resultIdx = cast<OpResult>(newValue).getResultNumber();
+      Value inside = regOp->getOperand(resultIdx);
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(regOp);
+      builder.create<LoopScheduleIterArgUpdateOp>(
+          step.getLoc(), sequential.getScheduleBlock().getArgument(i), inside);
+    }
   }
 
   // Build the loopschedule.terminator with the condition produced by the
-  // first step plus the iter_args and results.
+  // first step plus the loop results.
   builder.setInsertionPointToEnd(&scheduleBlock);
   builder.create<LoopScheduleTerminatorOp>(sequentialCondResult, termIterArgs,
-                                           termIterArgs, ValueRange{});
+                                           ValueRange{});
 
   // Replace loop results with sequential results.
   for (size_t i = 0; i < loop.getNumResults(); ++i) {

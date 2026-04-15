@@ -57,9 +57,11 @@ module {
           loopschedule.store %new_acc, %arg2[%out_idx : i4] : memref<4xi32>
           // Advance.
           %next_flat = arith.addi %flat, %c1_i4 : i4
+          loopschedule.iter_arg_update %acc = %new_acc : i32
+          loopschedule.iter_arg_update %flat = %next_flat : i4
           loopschedule.register %next_flat, %new_acc, %cond : i4, i32, i1
         } : i4, i32, i1
-        loopschedule.terminator condition(%0#2), iter_args(%0#0, %0#1), results() : (i4, i32) -> ()
+        loopschedule.terminator condition(%0#2), results()
       }
     }
     return

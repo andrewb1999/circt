@@ -26,6 +26,7 @@ module {
         %0:2 = loopschedule.step {
           %cond = arith.cmpi slt, %i, %c5_i32 : i32
           %next = arith.addi %i, %c1_i32 : i32
+          loopschedule.iter_arg_update %i = %next : i32
           loopschedule.register %next, %cond : i32, i1
         } : i32, i1
         // Step 1: launch first child loop.
@@ -35,9 +36,10 @@ module {
               %cj = arith.cmpi ult, %j, %c2_i4 : i4
               loopschedule.store %c42_i32, %arg0[%j : i4] : memref<4xi32>
               %nj = arith.addi %j, %c1_i4 : i4
+              loopschedule.iter_arg_update %j = %nj : i4
               loopschedule.register %nj, %cj : i4, i1
             } : i4, i1
-            loopschedule.terminator condition(%1#1), iter_args(%1#0), results() : (i4) -> ()
+            loopschedule.terminator condition(%1#1), results()
           }
           loopschedule.register
         }
@@ -48,13 +50,14 @@ module {
               %ck = arith.cmpi ult, %k, %c2_i4 : i4
               loopschedule.store %c43_i32, %arg1[%k : i4] : memref<4xi32>
               %nk = arith.addi %k, %c1_i4 : i4
+              loopschedule.iter_arg_update %k = %nk : i4
               loopschedule.register %nk, %ck : i4, i1
             } : i4, i1
-            loopschedule.terminator condition(%2#1), iter_args(%2#0), results() : (i4) -> ()
+            loopschedule.terminator condition(%2#1), results()
           }
           loopschedule.register
         }
-        loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (i32) -> ()
+        loopschedule.terminator condition(%0#1), results()
       }
     }
     return

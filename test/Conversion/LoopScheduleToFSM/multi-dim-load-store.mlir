@@ -19,9 +19,10 @@ module {
           %v = loopschedule.load %arg0[%i, %c0_i3 : i2, i3] : memref<4x8xi32>
           loopschedule.store %v, %arg0[%i, %c1_i3 : i2, i3] : memref<4x8xi32>
           %next = arith.addi %i, %c1_i2 : i2
+          loopschedule.iter_arg_update %i = %next : i2
           loopschedule.register %next, %cond : i2, i1
         } : i2, i1
-        loopschedule.terminator condition(%0#1), iter_args(%0#0), results() : (i2) -> ()
+        loopschedule.terminator condition(%0#1), results()
       }
     }
     return
