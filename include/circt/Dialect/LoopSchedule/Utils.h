@@ -14,6 +14,7 @@
 #define MLIR_DIALECT_LOOPSCHEDULE_UTILS_H
 
 #include "circt/Analysis/LoopScheduleDependenceAnalysis.h"
+#include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Scheduling/Problems.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/MLIRContext.h"
@@ -30,6 +31,13 @@ using ResourceMap = llvm::DenseMap<Operation *, SmallVector<std::string>>;
 using ResourceLimits = llvm::StringMap<unsigned>;
 
 Value getMemref(Operation *op);
+
+// Return the `loopschedule.at` ops in `region`'s front block in program
+// order. `region` is typically a frame body or a pipeline's stages region.
+SmallVector<LoopScheduleAtOp> getAtOpsInOrder(mlir::Region &region);
+
+// Return the `loopschedule.launch` ops in a frame body in program order.
+SmallVector<LoopScheduleLaunchOp> getLaunchOpsInOrder(LoopScheduleFrameOp frame);
 
 scheduling::ModuloProblem
 getModuloProblem(mlir::scf::WhileOp whileOp,

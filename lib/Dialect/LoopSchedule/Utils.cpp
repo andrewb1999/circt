@@ -52,6 +52,22 @@ namespace circt {
 
 namespace loopschedule {
 
+SmallVector<LoopScheduleAtOp> getAtOpsInOrder(Region &region) {
+  SmallVector<LoopScheduleAtOp> result;
+  if (region.empty())
+    return result;
+  for (auto at : region.front().getOps<LoopScheduleAtOp>())
+    result.push_back(at);
+  return result;
+}
+
+SmallVector<LoopScheduleLaunchOp> getLaunchOpsInOrder(LoopScheduleFrameOp frame) {
+  SmallVector<LoopScheduleLaunchOp> result;
+  for (auto launch : frame.getBodyBlock().getOps<LoopScheduleLaunchOp>())
+    result.push_back(launch);
+  return result;
+}
+
 Value getMemref(Operation *op) {
   Value memref =
       isa<AffineStoreOp>(*op)     ? cast<AffineStoreOp>(*op).getMemRef()
