@@ -923,23 +923,7 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
     llvm::sort(group,
                [&](Operation *a, Operation *b) { return dom.dominates(a, b); });
     auto stageTypes = registerTypes[startTime];
-    uint64_t largestLatency = 1;
-    if (lastStage) {
-      // Last stage must end after all ops have finished
-      for (auto *op : group) {
-        auto oprType = problem.getLinkedOperatorType(op).value();
-        uint64_t latency = problem.getLatency(oprType).value();
-        if (latency > largestLatency) {
-          largestLatency = latency;
-        }
-      }
-    }
-    uint64_t endTime = startTime + largestLatency;
-
-    // Add the induction variable increment in the first stage.
-    // if (startTime == 0) {
-    //   stageTypes.push_back(lowerBound.getType());
-    // }
+    (void)lastStage;
 
     // Create the stage itself. The pipeline op no longer has a default
     // terminator (we'll create one after all stages are built), so insert at
@@ -947,10 +931,8 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
     builder.setInsertionPointToEnd(&stagesBlock);
     auto startTimeAttr =
         builder.getIntegerAttr(builder.getIntegerType(64), startTime);
-    auto endTimeAttr =
-        builder.getIntegerAttr(builder.getIntegerType(64), endTime);
-    auto stage = builder.create<LoopSchedulePipelineStageOp>(
-        stageTypes, startTimeAttr, endTimeAttr);
+    auto stage = builder.create<LoopScheduleAtOp>(
+        stageTypes, startTimeAttr);
     auto &stageBlock = stage.getBodyBlock();
     auto *stageTerminator = stageBlock.getTerminator();
     builder.setInsertionPointToStart(&stageBlock);
@@ -1037,12 +1019,12 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
     // The LHS is the pipeline's iter-arg block argument for position `i`; the
     // RHS is the register-op operand that corresponds to `newValue` (the
     // stage result is not visible inside the stage itself).
-    if (auto stage = newValue.getDefiningOp<LoopSchedulePipelineStageOp>()) {
-      auto regOp = stage.getRegisterOp();
+    if (auto stage = newValue.getDefiningOp<LoopScheduleAtOp>()) {
+      auto yieldOp = stage.getYieldOp();
       unsigned resultIdx = cast<OpResult>(newValue).getResultNumber();
-      Value inside = regOp->getOperand(resultIdx);
+      Value inside = yieldOp->getOperand(resultIdx);
       OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPoint(regOp);
+      builder.setInsertionPoint(yieldOp);
       builder.create<LoopScheduleIterArgUpdateOp>(
           stage.getLoc(), pipeline.getStagesBlock().getArgument(i), inside);
     }

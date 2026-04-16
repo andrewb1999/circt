@@ -1869,9 +1869,9 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
 
   auto *ctx = builder.getContext();
 
-  SmallVector<LoopSchedulePipelineStageOp> stages;
+  SmallVector<LoopScheduleAtOp> stages;
   for (auto &op : pipOp.getStagesBlock().getOperations())
-    if (auto stageOp = dyn_cast<LoopSchedulePipelineStageOp>(&op))
+    if (auto stageOp = dyn_cast<LoopScheduleAtOp>(&op))
       stages.push_back(stageOp);
 
   if (stages.empty())
@@ -1997,7 +1997,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     if (!result)
       return Value();
     auto defStage =
-        dyn_cast<LoopSchedulePipelineStageOp>(result.getOwner());
+        dyn_cast<LoopScheduleAtOp>(result.getOwner());
     if (!defStage)
       return Value();
     unsigned J = stages.size();
@@ -2051,7 +2051,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     DenseSet<Value> localLoadResults;
 
     for (auto &op : body.getOperations()) {
-      if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
+      if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
         continue;
 
       // Temporarily override the mapping entries for any operands that come
@@ -2090,7 +2090,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
         return failure();
     }
 
-    auto regOp = cast<LoopScheduleRegisterOp>(body.getTerminator());
+    auto regOp = cast<LoopScheduleYieldOp>(body.getTerminator());
 
     // Resolve the condition backedge from the producing stage's *unregistered*
     // condition value: the loop's combinational gate should not be delayed by
@@ -2201,8 +2201,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     // back to stage 0.
     unsigned feedbackStage = 0;
     if (auto opResult = dyn_cast<OpResult>(termVal)) {
-      if (auto stage = dyn_cast<LoopSchedulePipelineStageOp>(
-              opResult.getOwner())) {
+      if (auto stage = dyn_cast<LoopScheduleAtOp>(opResult.getOwner())) {
         for (unsigned s = 0; s < stages.size(); ++s)
           if (stages[s] == stage) {
             feedbackStage = s;

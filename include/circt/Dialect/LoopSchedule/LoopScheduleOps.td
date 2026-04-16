@@ -104,81 +104,7 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
       return true;
     }
 
-    uint64_t getBodyLatency();
     bool canStall();
-  }];
-}
-
-def LoopSchedulePipelineStageOp : LoopScheduleOp<"pipeline.stage",
-    [HasParent<"LoopSchedulePipelineOp">,
-     PhaseOpInterface,
-     SingleBlockImplicitTerminator<"LoopScheduleRegisterOp">]> {
-  let summary = "LoopSchedule dialect pipeline stage.";
-  let description = [{
-    This operation has a single-block region which dictates the operations that
-    may occur concurrently.
-
-    It has a `start` attribute, which indicates the start cycle for this stage.
-
-    It may have an optional `when` predicate, which supports conditional
-    execution for each stage. This is in addition to the `condition` region that
-    controls the execution of the whole pipeline. A stage with a `when`
-    predicate should only execute when the predicate is `true : i1`, and push a
-    bubble through the pipeline otherwise.
-
-    It has a `register` terminator, which passes the concurrently
-    computed values forward to the next stage.
-
-    Any stage may access `inits`. If a stage accesses an `init` after
-    the stage in which it is defined, it is up to lowering passes to preserve
-    this value until the last stage that needs it.
-
-    Other than `inits`, stages may only access SSA values dominating the
-    pipeline or SSA values computed by any previous stage. This ensures the
-    stages capture the coarse-grained schedule of the pipeline and how values
-    feed forward and backward.
-  }];
-
-  let arguments = (ins
-    I64Attr:$start,
-    I64Attr:$end,
-    Optional<I1>:$when
-  );
-
-  let results = (outs
-    Variadic<AnyType>:$results
-  );
-
-  let regions = (region
-    SizedRegion<1>:$body
-  );
-
-  let assemblyFormat = [{
-    `start` `=` $start `end` `=` $end (`when` $when^)? $body (`:` qualified(type($results))^)? attr-dict
-  }];
-
-  let hasVerifier = 1;
-
-  let skipDefaultBuilders = 1;
-  let builders = [
-    OpBuilder<(ins "mlir::TypeRange":$resultTypes, "mlir::IntegerAttr":$start,
-               "mlir::IntegerAttr":$end)>
-  ];
-
-  let extraClassDeclaration = [{
-    Block &getBodyBlock() { return getBody().front(); }
-    unsigned getStageNumber();
-
-    std::string getRegisterNamePrefix() {
-      return "stage_" + std::to_string(getStageNumber());
-    }
-    bool isStatic() {
-      return true;
-    }
-    std::optional<uint64_t> getStartTime() {
-      return getStart();
-    }
-    LoopScheduleRegisterOp getRegisterOp();
   }];
 }
 
@@ -366,8 +292,7 @@ def LoopScheduleDelayOp : LoopScheduleOp<"delay",
 }
 
 def LoopScheduleRegisterOp : LoopScheduleOp<"register",
-    [ParentOneOf<["LoopSchedulePipelineStageOp", "LoopScheduleStepOp",
-                  "LoopScheduleDelayOp"]>, Terminator]> {
+    [ParentOneOf<["LoopScheduleStepOp", "LoopScheduleDelayOp"]>, Terminator]> {
   let summary = "LoopSchedule dialect loop register.";
   let description = [{
     The `loopschedule.register` terminates a pipeline stage and
@@ -693,19 +618,22 @@ def LoopScheduleFrameOp : LoopScheduleOp<"frame", [PhaseOpInterface]> {
 }
 
 def LoopScheduleAtOp : LoopScheduleOp<"at",
-    [HasParent<"LoopScheduleFrameOp">,
+    [ParentOneOf<["LoopScheduleFrameOp", "LoopSchedulePipelineOp"]>,
+     PhaseOpInterface,
      SingleBlockImplicitTerminator<"LoopScheduleYieldOp">,
      NoRegionArguments]> {
-  let summary = "Offset wrapper inside a frame body.";
+  let summary = "Offset wrapper for a phase of work in a frame or pipeline.";
   let description = [{
     Marks that the ops in its single-block body execute `offset` cycles
-    after the enclosing frame body's start. Values yielded by the region's
-    terminator become the `at` op's results, visible to the rest of the
-    frame body.
+    after the enclosing parent's start. Values yielded by the region's
+    terminator become the `at` op's results, visible to later phases.
 
-    `loopschedule.at` may appear only inside a frame's body region. The
-    verifier enforces this (the body region is always the frame's second
-    region).
+    `loopschedule.at` may appear:
+      - inside a `loopschedule.frame`'s body region (statically-timed work
+        within a sequential loop), or
+      - directly inside a `loopschedule.pipeline`'s stages region (a
+        pipeline phase, where `offset` is the absolute cycle within the
+        pipeline body).
   }];
 
   let arguments = (ins I64Attr:$offset);
@@ -716,9 +644,20 @@ def LoopScheduleAtOp : LoopScheduleOp<"at",
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
 
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins "mlir::TypeRange":$resultTypes, "mlir::IntegerAttr":$offset)>
+  ];
+
   let extraClassDeclaration = [{
     Block &getBodyBlock() { return getBody().front(); }
     LoopScheduleYieldOp getYieldOp();
+
+    // PhaseOpInterface
+    bool isStatic() { return true; }
+    std::optional<uint64_t> getStartTime() { return getOffset(); }
+    std::string getRegisterNamePrefix();
+    unsigned getStageNumber();
   }];
 }
 
@@ -775,8 +714,7 @@ def LoopScheduleAwaitOp : LoopScheduleOp<"await",
 }
 
 def LoopScheduleIterArgUpdateOp : LoopScheduleOp<"iter_arg_update",
-    [ParentOneOf<["LoopScheduleAtOp", "LoopSchedulePipelineStageOp",
-                  "LoopScheduleStepOp"]>,
+    [ParentOneOf<["LoopScheduleAtOp", "LoopScheduleStepOp"]>,
      TypesMatchWith<"iter-arg type matches new-value type",
                     "value", "iterArg",
                     "$_self">]> {

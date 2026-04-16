@@ -37,7 +37,7 @@ module {
               %cond_j = arith.cmpi ult, %j, %c2_i2 : i2
               // Inner loop: pipeline with k=0..1, accumulating into acc
               %acc = loopschedule.pipeline II = 1 iter_args(%k = %c0_i2, %pacc = %c0_i32) : (i2, i32) -> i32 {
-                %2:3 = loopschedule.pipeline.stage start = 0 end = 1 {
+                %2:3 = loopschedule.at 0 -> (i2, i32, i1) {
                   %cond_k = arith.cmpi ult, %k, %c2_i2 : i2
                   // a_addr = i*2 + k
                   %i_ext = arith.extui %i : i2 to i4
@@ -57,8 +57,8 @@ module {
                   %next_k = arith.addi %k, %c1_i2 : i2
                   loopschedule.iter_arg_update %pacc = %new_acc : i32
                   loopschedule.iter_arg_update %k = %next_k : i2
-                  loopschedule.register %next_k, %new_acc, %cond_k : i2, i32, i1
-                } : i2, i32, i1
+                  loopschedule.yield %next_k, %new_acc, %cond_k : i2, i32, i1
+                }
                 loopschedule.terminator condition(%2#2), results(%2#1) : i32
               }
               // After inner pipeline: store C[i*2+j] = acc

@@ -34,17 +34,17 @@ func.func @pipeline_ii2(%arg0: i32) -> i32 {
   %c0_i32 = arith.constant 0 : i32
   %step_result = loopschedule.step {
     %0 = loopschedule.pipeline II = 2 iter_args(%i = %c0, %acc = %c0_i32) : (index, i32) -> i32 {
-      %1:3 = loopschedule.pipeline.stage start = 0 end = 2 {
+      %1:3 = loopschedule.at 0 -> (index, i32, i1) {
         %cond = arith.cmpi ult, %i, %c10 : index
         %next_i = arith.addi %i, %c1 : index
         %partial = arith.addi %acc, %arg0 : i32
         loopschedule.iter_arg_update %acc = %partial : i32
         loopschedule.iter_arg_update %i = %next_i : index
-        loopschedule.register %next_i, %partial, %cond : index, i32, i1
-      } : index, i32, i1
-      %2 = loopschedule.pipeline.stage start = 2 end = 4 {
-        loopschedule.register %1#1 : i32
-      } : i32
+        loopschedule.yield %next_i, %partial, %cond : index, i32, i1
+      }
+      %2 = loopschedule.at 2 -> i32 {
+        loopschedule.yield %1#1 : i32
+      }
       loopschedule.terminator condition(%1#2), results(%2) : i32
     }
     loopschedule.register %0 : i32

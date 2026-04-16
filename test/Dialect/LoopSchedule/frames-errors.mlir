@@ -1,8 +1,8 @@
 // RUN: circt-opt %s -split-input-file -verify-diagnostics
 
-// `loopschedule.at` cannot appear outside a frame.
+// `loopschedule.at` cannot appear outside a frame or pipeline.
 func.func @at_outside_frame() {
-  // expected-error @+1 {{op expects parent op 'loopschedule.frame'}}
+  // expected-error @+1 {{op expects parent op to be one of 'loopschedule.frame, loopschedule.pipeline'}}
   loopschedule.at 0 {
     loopschedule.yield
   }

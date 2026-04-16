@@ -84,8 +84,12 @@ LogicalResult loopschedule::verifyLoop(Operation *op) {
   for (auto it : llvm::enumerate(loop.getBodyArgs())) {
     BlockArgument bodyArg = it.value();
     auto upd = updates.lookup(bodyArg);
+    // Walk up to the phase that lives directly in the loop's body block, so
+    // the monotonic ordering check below operates on operations from the same
+    // block as the other phases in `loop.getBodyBlock()`.
     Operation *updParent = upd->getParentOp();
-    while (updParent && !isa<PhaseInterface>(updParent))
+    while (updParent && !(isa<PhaseInterface>(updParent) &&
+                          updParent->getBlock() == loop.getBodyBlock()))
       updParent = updParent->getParentOp();
     if (!updParent)
       continue;
@@ -208,26 +212,28 @@ LogicalResult LoopSchedulePipelineOp::verify() {
 
   std::optional<uint64_t> lastStartTime;
   for (Operation &inner : stagesBlock) {
-    // Verify the stages block contains only `loopschedule.pipeline.stage` and
+    // Verify the stages block contains only `loopschedule.at` or
     // `loopschedule.terminator` ops.
-    if (!isa<LoopSchedulePipelineStageOp, LoopScheduleTerminatorOp>(inner))
-      return emitOpError(
-                 "stages may only contain 'loopschedule.pipeline.stage' or "
-                 "'loopschedule.terminator' ops, found ")
+    if (!isa<LoopScheduleAtOp, LoopScheduleTerminatorOp>(inner))
+      return emitOpError("stages may only contain 'loopschedule.at' or "
+                         "'loopschedule.terminator' ops, found ")
              << inner;
 
-    // Verify the stage start times are monotonically increasing.
-    if (auto stage = dyn_cast<LoopSchedulePipelineStageOp>(inner)) {
+    // Verify the phase start times are monotonically increasing.
+    if (auto phase = dyn_cast<PhaseInterface>(inner)) {
+      auto startTime = phase.getStartTime();
+      if (!startTime.has_value())
+        continue;
       if (!lastStartTime.has_value()) {
-        lastStartTime = stage.getStart();
+        lastStartTime = *startTime;
         continue;
       }
 
-      if (lastStartTime > stage.getStart())
-        return stage.emitOpError("'start' must be after previous 'start' (")
-               << lastStartTime.value() << ')';
+      if (*lastStartTime > *startTime)
+        return phase->emitOpError("start time must be after previous start (")
+               << *lastStartTime << ')';
 
-      lastStartTime = stage.getStart();
+      lastStartTime = *startTime;
     }
   }
 
@@ -262,16 +268,6 @@ void LoopSchedulePipelineOp::build(OpBuilder &builder, OperationState &state,
   // a `condition` operand which only the producer can supply.
 }
 
-uint64_t LoopSchedulePipelineOp::getBodyLatency() {
-  auto stages = this->getStagesBlock().getOps<LoopSchedulePipelineStageOp>();
-  uint64_t bodyLatency = 0;
-  for (auto stage : stages) {
-    if (stage.getEnd() > bodyLatency)
-      bodyLatency = stage.getEnd();
-  }
-  return bodyLatency;
-}
-
 bool LoopSchedulePipelineOp::canStall() {
   auto mightStallRes = this->walk([&](Operation *op) {
     if (auto load = dyn_cast<LoadInterface>(op)) {
@@ -289,91 +285,6 @@ bool LoopSchedulePipelineOp::canStall() {
   });
 
   return mightStallRes.wasInterrupted();
-}
-
-//===----------------------------------------------------------------------===//
-// PipelineStageOp
-//===----------------------------------------------------------------------===//
-
-std::optional<LoopSchedulePipelineStageOp>
-getStageAfter(LoopSchedulePipelineStageOp stage, uint64_t cycles) {
-  auto startTime = stage.getStart();
-  auto desiredTime = startTime + cycles;
-
-  auto *op = stage->getNextNode();
-
-  while (op != nullptr) {
-    if (auto newStage = dyn_cast<LoopSchedulePipelineStageOp>(op)) {
-      if (newStage.getStart() == desiredTime)
-        return newStage;
-    }
-    op = op->getNextNode();
-  }
-
-  return std::nullopt;
-}
-
-LogicalResult LoopSchedulePipelineStageOp::verify() {
-  // auto stage = (*this);
-  // auto *term = stage.getBodyBlock().getTerminator();
-
-  // // Verify results produced by pipelined ops are only used when ready
-  // for (auto res : stage.getResults()) {
-  //   auto num = res.getResultNumber();
-  //   auto &termOperand = term->getOpOperand(num);
-  //   auto *op = termOperand.get().getDefiningOp();
-  //   if (op == nullptr)
-  //     continue;
-  //   if (!isa<memref::LoadOp, arith::MulIOp>(op))
-  //     continue;
-  //   uint64_t cycles = 0;
-  //   if (isa<memref::LoadOp>(op)) {
-  //     cycles = 1;
-  //   } else if (isa<arith::MulIOp>(op)) {
-  //     cycles = 4;
-  //   }
-  //   auto correctStep = getStageAfter(stage, cycles);
-  //   if (!correctStep.has_value())
-  //     continue;
-  //   if (res.isUsedOutsideOfBlock(&correctStep->getBodyBlock()))
-  //     return emitOpError(
-  //         "pipelined ops can only be used the cycle results are ready");
-  // }
-
-  return success();
-}
-
-void LoopSchedulePipelineStageOp::build(OpBuilder &builder,
-                                        OperationState &state,
-                                        TypeRange resultTypes,
-                                        IntegerAttr start, IntegerAttr end) {
-  OpBuilder::InsertionGuard g(builder);
-
-  state.addTypes(resultTypes);
-  state.addAttribute("start", start);
-  state.addAttribute("end", end);
-
-  Region *region = state.addRegion();
-  Block &block = region->emplaceBlock();
-  builder.setInsertionPointToEnd(&block);
-  LoopScheduleRegisterOp::create(builder, builder.getUnknownLoc(),
-                                 ValueRange());
-}
-
-unsigned LoopSchedulePipelineStageOp::getStageNumber() {
-  unsigned number = 0;
-  auto *op = getOperation();
-  auto parent = op->getParentOfType<LoopSchedulePipelineOp>();
-  Operation *stage = &parent.getStagesBlock().front();
-  while (stage != op && stage->getNextNode()) {
-    ++number;
-    stage = stage->getNextNode();
-  }
-  return number;
-}
-
-LoopScheduleRegisterOp LoopSchedulePipelineStageOp::getRegisterOp() {
-  return cast<LoopScheduleRegisterOp>(this->getBodyBlock().getTerminator());
 }
 
 //===----------------------------------------------------------------------===//
@@ -632,19 +543,17 @@ LoopScheduleRegisterOp LoopScheduleDelayOp::getRegisterOp() {
 
 LogicalResult LoopScheduleRegisterOp::verify() {
   // Verify the parent phase terminates with the same types as its result types.
-  // ParentOneOf the immediate parent: pipeline.stage, step, or delay.
+  // ParentOneOf the immediate parent: step or delay.
   TypeRange registerTypes = getOperandTypes();
   TypeRange resultTypes;
   Operation *parent = (*this)->getParentOp();
-  if (auto stage = dyn_cast_or_null<LoopSchedulePipelineStageOp>(parent))
-    resultTypes = stage.getResultTypes();
-  else if (auto step = dyn_cast_or_null<LoopScheduleStepOp>(parent))
+  if (auto step = dyn_cast_or_null<LoopScheduleStepOp>(parent))
     resultTypes = step.getResultTypes();
   else if (auto delay = dyn_cast_or_null<LoopScheduleDelayOp>(parent))
     resultTypes = delay.getResultTypes();
   else
-    return emitOpError("must be inside a 'loopschedule.pipeline.stage', "
-                       "'loopschedule.step', or 'loopschedule.delay'");
+    return emitOpError("must be inside a 'loopschedule.step' or "
+                       "'loopschedule.delay'");
 
   if (registerTypes != resultTypes)
     return emitOpError("operand types (")
@@ -1097,13 +1006,47 @@ LoopScheduleYieldOp LoopScheduleAtOp::getYieldOp() {
   return cast<LoopScheduleYieldOp>(getBodyBlock().getTerminator());
 }
 
+void LoopScheduleAtOp::build(OpBuilder &builder, OperationState &state,
+                             TypeRange resultTypes, IntegerAttr offset) {
+  OpBuilder::InsertionGuard g(builder);
+  state.addTypes(resultTypes);
+  state.addAttribute("offset", offset);
+  Region *region = state.addRegion();
+  Block &block = region->emplaceBlock();
+  builder.setInsertionPointToEnd(&block);
+  LoopScheduleYieldOp::create(builder, builder.getUnknownLoc(), ValueRange());
+}
+
+unsigned LoopScheduleAtOp::getStageNumber() {
+  unsigned number = 0;
+  Block *parentBlock = (*this)->getBlock();
+  for (Operation &op : *parentBlock) {
+    if (&op == getOperation())
+      return number;
+    if (isa<LoopScheduleAtOp>(op))
+      ++number;
+  }
+  return number;
+}
+
+std::string LoopScheduleAtOp::getRegisterNamePrefix() {
+  if (isa<LoopSchedulePipelineOp>((*this)->getParentOp()))
+    return "stage_" + std::to_string(getStageNumber());
+  return "frame_at_" + std::to_string(getStageNumber());
+}
+
 LogicalResult LoopScheduleAtOp::verify() {
-  // Parent trait ensures we're inside a LoopScheduleFrameOp; additionally,
-  // require we're in the frame's *body* region.
-  auto frame = cast<LoopScheduleFrameOp>((*this)->getParentOp());
-  if ((*this)->getParentRegion() != &frame.getBodyRegion())
-    return emitOpError("loopschedule.at must appear in a frame's body region");
-  return success();
+  Operation *parent = (*this)->getParentOp();
+  if (auto frame = dyn_cast<LoopScheduleFrameOp>(parent)) {
+    if ((*this)->getParentRegion() != &frame.getBodyRegion())
+      return emitOpError(
+          "loopschedule.at must appear in a frame's body region");
+    return success();
+  }
+  if (isa<LoopSchedulePipelineOp>(parent))
+    return success();
+  return emitOpError("loopschedule.at must be inside a loopschedule.frame or "
+                     "loopschedule.pipeline");
 }
 
 //===----------------------------------------------------------------------===//
@@ -1318,19 +1261,18 @@ Value circt::loopschedule::getIterArgPhaseResult(
     LoopScheduleIterArgUpdateOp u) {
   Value inside = u.getValue();
   Operation *parent = u->getParentOp();
-  while (parent &&
-         !isa<LoopScheduleStepOp, LoopSchedulePipelineStageOp>(parent))
+  while (parent && !isa<LoopScheduleStepOp, LoopScheduleAtOp>(parent))
     parent = parent->getParentOp();
   if (!parent)
     return inside;
-  Operation *reg = nullptr;
+  Operation *term = nullptr;
   if (auto step = dyn_cast<LoopScheduleStepOp>(parent))
-    reg = step.getRegisterOp();
-  else if (auto stage = dyn_cast<LoopSchedulePipelineStageOp>(parent))
-    reg = stage.getRegisterOp();
-  if (!reg)
+    term = step.getRegisterOp();
+  else if (auto at = dyn_cast<LoopScheduleAtOp>(parent))
+    term = at.getYieldOp();
+  if (!term)
     return inside;
-  for (auto it : llvm::enumerate(reg->getOperands()))
+  for (auto it : llvm::enumerate(term->getOperands()))
     if (it.value() == inside)
       return parent->getResult(it.index());
   return inside;

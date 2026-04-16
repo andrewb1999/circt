@@ -65,6 +65,39 @@ using namespace circt::loopschedule;
 namespace circt {
 namespace loopscheduletocalyx {
 
+/// Compute the body latency of a pipelined loop: the number of cycles
+/// between the start of an iteration and when the last stage's results are
+/// available. This is `max_at_offset + max_op_latency_in_last_at`, where
+/// the last stage's op latency is looked up via the operator library.
+static uint64_t computeBodyLatency(LoopSchedulePipelineOp pipeline,
+                                   analysis::OperatorLibraryAnalysis &ola) {
+  uint64_t maxOffset = 0;
+  LoopScheduleAtOp lastAt;
+  for (auto at : pipeline.getStagesBlock().getOps<LoopScheduleAtOp>()) {
+    if (at.getOffset() >= maxOffset) {
+      maxOffset = at.getOffset();
+      lastAt = at;
+    }
+  }
+
+  uint64_t lastStageLatency = 1;
+  if (lastAt) {
+    for (Operation &op : lastAt.getBodyBlock()) {
+      auto opAttr =
+          op.getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+      if (!opAttr)
+        continue;
+      StringRef name = ola.getOperatorBySymbol(opAttr);
+      if (name.empty())
+        continue;
+      uint64_t lat = ola.getOperatorLatency(name);
+      if (lat > lastStageLatency)
+        lastStageLatency = lat;
+    }
+  }
+  return maxOffset + lastStageLatency;
+}
+
 //===----------------------------------------------------------------------===//
 // Utility types
 //===----------------------------------------------------------------------===//
@@ -697,7 +730,7 @@ LogicalResult BuildOpGroups::buildOpFromOperator(
       op->getAttrOfType<SymbolRefAttr>("loopschedule.operator"));
 
   auto phase = op->getParentOfType<PhaseInterface>();
-  auto isPipeline = isa<LoopSchedulePipelineStageOp>(phase);
+  auto isPipeline = (bool)op->getParentOfType<LoopSchedulePipelineOp>();
   auto latency = operatorLibraryAnalysis.getOperatorLatency(operatorName);
   auto *templateOp =
       operatorLibraryAnalysis.getOperatorTemplateOp(operatorName);
@@ -941,9 +974,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      MulIOp op) const {
   Location loc = op.getLoc();
   Type width = op.getResult().getType(), one = rewriter.getI1Type();
-  auto parent = op->getParentOfType<PhaseInterface>();
-  if (isa<LoopSchedulePipelineStageOp>(parent)) {
-    auto pipeline = op->getParentOfType<LoopSchedulePipelineOp>();
+  if (auto pipeline = op->getParentOfType<LoopSchedulePipelineOp>()) {
     if (pipeline.canStall()) {
       auto mulPipe =
           getState<ComponentLoweringState>()
@@ -989,7 +1020,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      RemUIOp op) const {
   Location loc = op.getLoc();
   Type width = op.getResult().getType(), one = rewriter.getI1Type();
-  if (isa<LoopSchedulePipelineStageOp>(op->getParentOp())) {
+  if (op->getParentOfType<LoopSchedulePipelineOp>()) {
     op.emitError() << "RemUI is not pipelineable";
     return failure();
   }
@@ -1006,7 +1037,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      RemSIOp op) const {
   Location loc = op.getLoc();
   Type width = op.getResult().getType(), one = rewriter.getI1Type();
-  if (isa<LoopSchedulePipelineStageOp>(op->getParentOp())) {
+  if (op->getParentOfType<LoopSchedulePipelineOp>()) {
     op.emitError() << "RemSI is not pipelineable";
     return failure();
   }
@@ -1023,7 +1054,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      DivSIOp op) const {
   Location loc = op.getLoc();
   Type width = op.getResult().getType(), one = rewriter.getI1Type();
-  if (isa<LoopSchedulePipelineStageOp>(op->getParentOp())) {
+  if (op->getParentOfType<LoopSchedulePipelineOp>()) {
     auto divSPipe = getState<ComponentLoweringState>()
                         .getNewLibraryOpInstance<calyx::PipelinedDivSLibOp>(
                             rewriter, loc, {one, one, width, width, width});
@@ -1094,6 +1125,12 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      LoopInterface op) const {
   LoopWrapper loop(op);
 
+  auto operatorLibraryAnalysis =
+      loweringState()
+          .getAnalysisManager()
+          .nest(op->getParentOfType<FuncOp>())
+          .getAnalysis<analysis::OperatorLibraryAnalysis>();
+
   /// Collect iter_arg_update ops BEFORE replacing block args with register
   /// reads below; `getIterArgUpdatesInOrder` relies on the LHS being a block
   /// argument of the loop body.
@@ -1150,9 +1187,11 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     if (stepOp) {
       auto resNum = cast<OpResult>(arg).getResultNumber();
       auto regVal = stepOp.getRegisterOp().getOperand(resNum);
-      auto pipelineStage = regVal.getDefiningOp<LoopSchedulePipelineStageOp>();
-      if (pipelineStage) {
-        auto pipeline = pipelineStage.getParentOp();
+      auto *pipelinePhaseOp = regVal.getDefiningOp();
+      if (pipelinePhaseOp && isa<LoopScheduleAtOp>(pipelinePhaseOp) &&
+          isa<LoopSchedulePipelineOp>(pipelinePhaseOp->getParentOp())) {
+        auto pipeline =
+            cast<LoopSchedulePipelineOp>(pipelinePhaseOp->getParentOp());
         auto pipelineResNum = cast<OpResult>(regVal).getResultNumber();
         auto outerReg = getState<ComponentLoweringState>().getLoopIterReg(
             LoopWrapper{loop}, idx);
@@ -1188,7 +1227,9 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     auto tripCount = pipeline.getTripCount();
     auto bitwidth = tripCount.has_value()
                         ? llvm::Log2_64_Ceil(*tripCount * pipeline.getII() +
-                                             pipeline.getBodyLatency())
+                                             computeBodyLatency(
+                                                 pipeline,
+                                                 operatorLibraryAnalysis))
                         : 32;
     if (bitwidth < 1)
       bitwidth = 1;
@@ -1689,6 +1730,11 @@ class BuildStallableConditionChecks
   LogicalResult
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
+    auto operatorLibraryAnalysis =
+        loweringState()
+            .getAnalysisManager()
+            .nest(funcOp)
+            .getAnalysis<analysis::OperatorLibraryAnalysis>();
     funcOp.walk([&](LoopInterface loop) {
       if (!loop.isPipelined() || !loop.canStall()) {
         return;
@@ -1743,7 +1789,7 @@ class BuildStallableConditionChecks
       rewriter.create<calyx::AssignOp>(loop.getLoc(), ltOp.getLeft(), incrVal);
       auto constant = calyx::createConstant(
           loop.getLoc(), rewriter, getComponent(), bitwidth,
-          bound + pipeline.getBodyLatency() - 1);
+          bound + computeBodyLatency(pipeline, operatorLibraryAnalysis) - 1);
       rewriter.create<calyx::AssignOp>(loop.getLoc(), ltOp.getRight(),
                                        constant);
       rewriter.create<calyx::AssignOp>(loop.getLoc(), condReg.getIn(),
@@ -1861,7 +1907,11 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
     DenseMap<Value, calyx::RegisterOp> regMap;
-    auto res = funcOp.walk([&](LoopScheduleRegisterOp op) {
+    auto res = funcOp.walk([&](Operation *op) {
+      // Process the value-carrying terminators of phase ops: `register`
+      // (step) and `yield` (at).
+      if (!isa<LoopScheduleRegisterOp, LoopScheduleYieldOp>(op))
+        return WalkResult::advance();
       // Condition registers are handled in BuildWhileGroups.
       auto *parent = op->getParentOp();
       auto phase = dyn_cast<PhaseInterface>(parent);
@@ -2345,11 +2395,10 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
     if (auto pipeline = dyn_cast<LoopSchedulePipelineOp>(op); pipeline) {
       assert(pipeline.getTripCount().has_value() &&
              "Unbounded pipelines not currently supported");
-      auto stage = cast<LoopSchedulePipelineStageOp>(phase);
       PatternRewriter::InsertionGuard g(rewriter);
       rewriter.setInsertionPointToEnd(
           getComponent().getWiresOp().getBodyBlock());
-      auto startIter = stage.getStartTime().value();
+      auto startIter = phase.getStartTime().value();
       auto idxValue =
           getState<ComponentLoweringState>().getLoopIterValue(pipeline);
       auto idxType = idxValue.getType();
@@ -2363,17 +2412,17 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
         auto ltOp =
             getState<ComponentLoweringState>()
                 .getNewLibraryOpInstance<calyx::LtLibOp>(
-                    rewriter, stage.getLoc(), {idxType, idxType, i1Type});
+                    rewriter, phase.getLoc(), {idxType, idxType, i1Type});
         guards.push_back(ltOp.getOut());
 
         // Update increment group for upper bound
         rewriter.setInsertionPointToEnd(incrGroup.getBodyBlock());
-        rewriter.create<calyx::AssignOp>(stage.getLoc(), ltOp.getLeft(),
+        rewriter.create<calyx::AssignOp>(phase.getLoc(), ltOp.getLeft(),
                                          idxValue);
         auto endIter = pipeline.getTripCount().value() * pipeline.getII();
-        auto ubConst = calyx::createConstant(stage.getLoc(), rewriter,
+        auto ubConst = calyx::createConstant(phase.getLoc(), rewriter,
                                              getComponent(), bitwidth, endIter);
-        rewriter.create<calyx::AssignOp>(stage.getLoc(), ltOp.getRight(),
+        rewriter.create<calyx::AssignOp>(phase.getLoc(), ltOp.getRight(),
                                          ubConst);
         getState<ComponentLoweringState>().registerEvaluatingGroup(
             ltOp.getOut(), incrGroup);
@@ -2395,13 +2444,13 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
           auto widthType = rewriter.getIntegerType(bitwidth);
           auto counterAdd = getState<ComponentLoweringState>()
                                 .getNewLibraryOpInstance<calyx::AddLibOp>(
-                                    rewriter, stage.getLoc(),
+                                    rewriter, phase.getLoc(),
                                     {widthType, widthType, widthType});
-          rewriter.create<calyx::AssignOp>(stage.getLoc(), counterAdd.getLeft(),
+          rewriter.create<calyx::AssignOp>(phase.getLoc(), counterAdd.getLeft(),
                                            counterReg.getOut());
-          auto one = calyx::createConstant(stage.getLoc(), rewriter,
+          auto one = calyx::createConstant(phase.getLoc(), rewriter,
                                            getComponent(), bitwidth, 1);
-          rewriter.create<calyx::AssignOp>(stage.getLoc(),
+          rewriter.create<calyx::AssignOp>(phase.getLoc(),
                                            counterAdd.getRight(), one);
 
           // II counter init group
@@ -2417,13 +2466,13 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
             rewriter.setInsertionPointToEnd(iiGroup.getBodyBlock());
 
             // Set II counter to zero before loop runs
-            auto zero = calyx::createConstant(stage.getLoc(), rewriter,
+            auto zero = calyx::createConstant(phase.getLoc(), rewriter,
                                               getComponent(), bitwidth, 0);
-            auto oneI1 = calyx::createConstant(stage.getLoc(), rewriter,
+            auto oneI1 = calyx::createConstant(phase.getLoc(), rewriter,
                                                getComponent(), 1, 1);
-            rewriter.create<calyx::AssignOp>(stage.getLoc(), counterReg.getIn(),
+            rewriter.create<calyx::AssignOp>(phase.getLoc(), counterReg.getIn(),
                                              zero);
-            rewriter.create<calyx::AssignOp>(stage.getLoc(),
+            rewriter.create<calyx::AssignOp>(phase.getLoc(),
                                              counterReg.getWriteEn(), oneI1);
           }
 
@@ -2431,29 +2480,29 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
           auto counterEq =
               getState<ComponentLoweringState>()
                   .getNewLibraryOpInstance<calyx::EqLibOp>(
-                      rewriter, stage.getLoc(),
+                      rewriter, phase.getLoc(),
                       {widthType, widthType, rewriter.getI1Type()});
-          rewriter.create<calyx::AssignOp>(stage.getLoc(), counterEq.getLeft(),
+          rewriter.create<calyx::AssignOp>(phase.getLoc(), counterEq.getLeft(),
                                            counterReg.getOut());
           auto iiMinusOne =
-              calyx::createConstant(stage.getLoc(), rewriter, getComponent(),
+              calyx::createConstant(phase.getLoc(), rewriter, getComponent(),
                                     bitwidth, pipeline.getII() - 1);
-          rewriter.create<calyx::AssignOp>(stage.getLoc(), counterEq.getRight(),
+          rewriter.create<calyx::AssignOp>(phase.getLoc(), counterEq.getRight(),
                                            iiMinusOne);
 
           // If eq assign to zero, otherwise assign to add result
-          auto zero = calyx::createConstant(stage.getLoc(), rewriter,
+          auto zero = calyx::createConstant(phase.getLoc(), rewriter,
                                             getComponent(), bitwidth, 0);
-          rewriter.create<calyx::AssignOp>(stage.getLoc(), counterReg.getIn(),
+          rewriter.create<calyx::AssignOp>(phase.getLoc(), counterReg.getIn(),
                                            zero, counterEq.getOut());
-          auto oneI1 = calyx::createConstant(stage.getLoc(), rewriter,
+          auto oneI1 = calyx::createConstant(phase.getLoc(), rewriter,
                                              getComponent(), 1, 1);
-          auto notEq = rewriter.create<comb::XorOp>(stage.getLoc(),
+          auto notEq = rewriter.create<comb::XorOp>(phase.getLoc(),
                                                     counterEq.getOut(), oneI1);
-          rewriter.create<calyx::AssignOp>(stage.getLoc(), counterReg.getIn(),
+          rewriter.create<calyx::AssignOp>(phase.getLoc(), counterReg.getIn(),
                                            counterAdd.getOut(),
                                            notEq.getResult());
-          rewriter.create<calyx::AssignOp>(stage.getLoc(),
+          rewriter.create<calyx::AssignOp>(phase.getLoc(),
                                            counterReg.getWriteEn(), oneI1);
 
           // Add eq result to guard values
@@ -2474,11 +2523,11 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
           auto reg = createRegister(phase.getLoc(), rewriter, getComponent(), 1,
                                     regName);
           rewriter.setInsertionPointToEnd(incrGroup.getBodyBlock());
-          rewriter.create<calyx::AssignOp>(stage.getLoc(), reg.getIn(),
+          rewriter.create<calyx::AssignOp>(phase.getLoc(), reg.getIn(),
                                            prevReg.value().getOut());
-          auto oneI1 = calyx::createConstant(stage.getLoc(), rewriter,
+          auto oneI1 = calyx::createConstant(phase.getLoc(), rewriter,
                                              getComponent(), 1, 1);
-          rewriter.create<calyx::AssignOp>(stage.getLoc(), reg.getWriteEn(),
+          rewriter.create<calyx::AssignOp>(phase.getLoc(), reg.getWriteEn(),
                                            oneI1);
           prevReg = reg;
         }
@@ -2500,14 +2549,14 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       getState<ComponentLoweringState>().setGuardRegister(phase, reg);
       rewriter.setInsertionPointToEnd(guardGroup.getBodyBlock());
       auto zeroI1 =
-          calyx::createConstant(stage.getLoc(), rewriter, getComponent(), 1, 0);
+          calyx::createConstant(phase.getLoc(), rewriter, getComponent(), 1, 0);
       auto oneI1 =
-          calyx::createConstant(stage.getLoc(), rewriter, getComponent(), 1, 1);
+          calyx::createConstant(phase.getLoc(), rewriter, getComponent(), 1, 1);
       // Stages with a start time of zero must have their lower bound guard
       // initialized to 1
-      rewriter.create<calyx::AssignOp>(stage.getLoc(), reg.getIn(),
+      rewriter.create<calyx::AssignOp>(phase.getLoc(), reg.getIn(),
                                        startIter == 0 ? oneI1 : zeroI1);
-      rewriter.create<calyx::AssignOp>(stage.getLoc(), reg.getWriteEn(), oneI1);
+      rewriter.create<calyx::AssignOp>(phase.getLoc(), reg.getWriteEn(), oneI1);
       getState<ComponentLoweringState>().registerEvaluatingGroup(reg.getOut(),
                                                                  incrGroup);
       getState<ComponentLoweringState>().registerEvaluatingGroup(reg.getDone(),
@@ -2518,9 +2567,9 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       rewriter.setInsertionPointToEnd(incrGroup.getBodyBlock());
 
       auto guardVal = calyx::buildCombAndTree(
-          rewriter, getState<ComponentLoweringState>(), stage.getLoc(), guards);
-      rewriter.create<calyx::AssignOp>(stage.getLoc(), reg.getIn(), guardVal);
-      rewriter.create<calyx::AssignOp>(stage.getLoc(), reg.getWriteEn(), oneI1);
+          rewriter, getState<ComponentLoweringState>(), phase.getLoc(), guards);
+      rewriter.create<calyx::AssignOp>(phase.getLoc(), reg.getIn(), guardVal);
+      rewriter.create<calyx::AssignOp>(phase.getLoc(), reg.getWriteEn(), oneI1);
     }
   }
 
@@ -3019,7 +3068,13 @@ private:
       // Can use repeat op instead of while op
       auto pipeline = cast<LoopSchedulePipelineOp>(loopOp.getOperation());
       auto bound = loopOp.getBound().value() * pipeline.getII();
-      auto iterCount = bound + pipeline.getBodyLatency() - 1;
+      auto operatorLibraryAnalysis =
+          loweringState()
+              .getAnalysisManager()
+              .nest(pipeline->getParentOfType<FuncOp>())
+              .getAnalysis<analysis::OperatorLibraryAnalysis>();
+      auto iterCount =
+          bound + computeBodyLatency(pipeline, operatorLibraryAnalysis) - 1;
       auto repeatCtrlOp =
           rewriter.create<calyx::StaticRepeatOp>(loc, iterCount);
       return repeatCtrlOp;

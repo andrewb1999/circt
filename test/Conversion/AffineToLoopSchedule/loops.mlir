@@ -15,7 +15,7 @@ func.func @minimal(%arg0 : memref<10xindex>) {
   // CHECK: loopschedule.register %[[COND_RESULT]]
 
   // First stage.
-  // CHECK: %[[STAGE0:.+]] = loopschedule.pipeline.stage
+  // CHECK: %[[STAGE0:.+]] = loopschedule.at
   // CHECK: %[[ITER_INC:.+]] = arith.addi %[[ITER_ARG]], %[[STEP]]
   // CHECK: loopschedule.register %[[ITER_INC]]
 
@@ -34,19 +34,19 @@ func.func @dot(%arg0: memref<64xi32>, %arg1: memref<64xi32>) -> i32 {
   // LoopSchedule Pipeline boilerplate checked above, just check the stages computations.
 
   // First stage.
-  // CHECK: %[[STAGE0:.+]]:3 = loopschedule.pipeline.stage
+  // CHECK: %[[STAGE0:.+]]:3 = loopschedule.at
   // CHECK-DAG: %[[STAGE0_0:.+]] = memref.load %arg0[%arg2]
   // CHECK-DAG: %[[STAGE0_1:.+]] = memref.load %arg1[%arg2]
   // CHECK-DAG: %[[STAGE0_2:.+]] = arith.addi %arg2, %c1
   // CHECK: loopschedule.register %[[STAGE0_0]], %[[STAGE0_1]], %[[STAGE0_2]]
 
   // Second stage.
-  // CHECK: %[[STAGE1:.+]] = loopschedule.pipeline.stage
+  // CHECK: %[[STAGE1:.+]] = loopschedule.at
   // CHECK-DAG: %[[STAGE1_0:.+]] = arith.muli %[[STAGE0]]#0, %[[STAGE0]]#1 : i32
   // CHECK: loopschedule.register %[[STAGE1_0]]
 
   // Third stage.
-  // CHECK: %[[STAGE2:.+]] = loopschedule.pipeline.stage
+  // CHECK: %[[STAGE2:.+]] = loopschedule.at
   // CHECK-DAG: %[[STAGE2_0:.+]] = arith.addi %arg3, %2
   // CHECK: loopschedule.register %[[STAGE2_0]]
 
@@ -105,19 +105,19 @@ func.func @dot_mul_accumulate(%arg0: memref<64xi32>, %arg1: memref<64xi32>) -> i
 
   // CHECK: loopschedule.pipeline II = 3
   // First stage.
-  // CHECK: %[[STAGE0:.+]]:3 = loopschedule.pipeline.stage
+  // CHECK: %[[STAGE0:.+]]:3 = loopschedule.at
   // CHECK-DAG: %[[STAGE0_0:.+]] = memref.load %arg0[%arg2]
   // CHECK-DAG: %[[STAGE0_1:.+]] = memref.load %arg1[%arg2]
   // CHECK-DAG: %[[STAGE0_2:.+]] = arith.addi %arg2, %c1
   // CHECK: loopschedule.register %[[STAGE0_0]], %[[STAGE0_1]], %[[STAGE0_2]]
 
   // Second stage.
-  // CHECK: %[[STAGE1:.+]] = loopschedule.pipeline.stage
+  // CHECK: %[[STAGE1:.+]] = loopschedule.at
   // CHECK: %[[STAGE1_0:.+]] = arith.muli %[[STAGE0]]#0, %[[STAGE0]]#1 : i32
   // CHECK: loopschedule.register %[[STAGE1_0]]
 
   // Third stage.
-  // CHECK: %[[STAGE2:.+]] = loopschedule.pipeline.stage
+  // CHECK: %[[STAGE2:.+]] = loopschedule.at
   // CHECK: %[[STAGE2_0:.+]] = arith.muli %arg3, %[[STAGE1]]
   // CHECK: loopschedule.register %[[STAGE2_0]]
 
@@ -142,24 +142,24 @@ func.func @dot_shared_mem(%arg0: memref<128xi32>) -> i32 {
 
   // CHECK: loopschedule.pipeline II = 2
   // First stage.
-  // CHECK: %[[STAGE0:.+]]:3 = loopschedule.pipeline.stage
+  // CHECK: %[[STAGE0:.+]]:3 = loopschedule.at
   // CHECK-DAG: %[[STAGE0_0:.+]] = memref.load %arg0[%arg1] : memref<128xi32>
   // CHECK-DAG: %[[STAGE0_1:.+]] = arith.addi %arg1, %c64 : index
   // CHECK-DAG: %[[STAGE0_2:.+]] = arith.addi %arg1, %c1 : index
   // CHECK: loopschedule.register %[[STAGE0_0]], %[[STAGE0_1]], %[[STAGE0_2]]
 
   // Second stage.
-  // CHECK: %[[STAGE1:.+]]:2 = loopschedule.pipeline.stage
+  // CHECK: %[[STAGE1:.+]]:2 = loopschedule.at
   // CHECK: %[[STAGE1_0:.+]] = memref.load %arg0[%[[STAGE0]]#1] : memref<128xi32>
   // CHECK: loopschedule.register %[[STAGE0]]#0, %[[STAGE1_0]]
 
   // Third stage.
-  // CHECK: %[[STAGE2:.+]] = loopschedule.pipeline.stage
+  // CHECK: %[[STAGE2:.+]] = loopschedule.at
   // CHECK: %[[STAGE2_0:.+]] = arith.muli %[[STAGE1]]#0, %[[STAGE1]]#1 : i32
   // CHECK: loopschedule.register %[[STAGE2_0]]
 
   // Fourth stage.
-  // CHECK: %[[STAGE3:.+]] = loopschedule.pipeline.stage
+  // CHECK: %[[STAGE3:.+]] = loopschedule.at
   // CHECK: %[[STAGE3_0:.+]] = arith.addi %arg2, %[[STAGE2]] : i32
   // CHECK: loopschedule.register %[[STAGE3_0]]
 

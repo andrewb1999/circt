@@ -12,14 +12,14 @@ module {
     %c10 = arith.constant 10 : i32
     %c0_acc = arith.constant 0 : i32
     %0 = loopschedule.pipeline II = 1 iter_args(%i = %c0, %acc = %c0_acc) : (i32, i32) -> i32 {
-      %1:3 = loopschedule.pipeline.stage start = 0 end = 1 {
+      %1:3 = loopschedule.at 0 -> (i32, i32, i1) {
         %cond = arith.cmpi ult, %i, %c10 : i32
         %next_i = arith.addi %i, %c1 : i32
         %sum = arith.addi %acc, %arg0 : i32
         loopschedule.iter_arg_update %acc = %sum : i32
         loopschedule.iter_arg_update %i = %next_i : i32
-        loopschedule.register %next_i, %sum, %cond : i32, i32, i1
-      } : i32, i32, i1
+        loopschedule.yield %next_i, %sum, %cond : i32, i32, i1
+      }
       loopschedule.terminator condition(%1#2), results(%1#1) : i32
     }
     return %0 : i32
