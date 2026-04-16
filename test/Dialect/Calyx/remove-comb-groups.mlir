@@ -28,9 +28,7 @@ calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%don
 // CHECK:   calyx.seq {
 // CHECK:     calyx.enable @Cond
 // CHECK:     calyx.if %eq_reg.out {
-// CHECK:       calyx.seq {
-// CHECK:         calyx.enable @A
-// CHECK:       }
+// CHECK:       calyx.enable @A
 // CHECK:     }
 // CHECK:   }
 // CHECK: }
@@ -87,17 +85,19 @@ calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%don
 
 // CHECK: calyx.control {
 // CHECK:   calyx.par {
-// CHECK:     calyx.enable @Cond1
-// CHECK:     calyx.if %eq_reg.out {
-// CHECK:       calyx.seq {
+// CHECK:     calyx.seq {
+// CHECK:       calyx.enable @Cond1
+// CHECK:       calyx.if %eq_reg.out {
 // CHECK:         calyx.enable @A
 // CHECK:       }
 // CHECK:     }
-// CHECK:     calyx.enable @Cond2
-// CHECK:     calyx.while %eq_reg.out {
-// CHECK:       calyx.seq {
-// CHECK:         calyx.enable @A
-// CHECK:         calyx.enable @Cond2
+// CHECK:     calyx.seq {
+// CHECK:       calyx.enable @Cond2
+// CHECK:       calyx.while %eq_reg.out {
+// CHECK:         calyx.seq {
+// CHECK:           calyx.enable @A
+// CHECK:           calyx.enable @Cond2
+// CHECK:         }
 // CHECK:       }
 // CHECK:     }
 // CHECK:   }

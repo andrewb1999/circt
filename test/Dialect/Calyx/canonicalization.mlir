@@ -13,9 +13,7 @@ module attributes {calyx.entrypoint = "main"} {
       }
     }
     // CHECK-LABEL: calyx.control {
-    // CHECK-NEXT:    calyx.seq {
-    // CHECK-NEXT:      calyx.enable @A
-    // CHECK-NEXT:    }
+    // CHECK-NEXT:    calyx.enable @A
     // CHECK-NEXT:  }
     calyx.control {
       calyx.seq {
@@ -42,9 +40,7 @@ module attributes {calyx.entrypoint = "main"} {
       }
     }
     // CHECK-LABEL: calyx.control {
-    // CHECK-NEXT:    calyx.par {
-    // CHECK-NEXT:      calyx.enable @A
-    // CHECK-NEXT:    }
+    // CHECK-NEXT:    calyx.enable @A
     // CHECK-NEXT:  }
     calyx.control {
       calyx.par {
@@ -88,13 +84,9 @@ module attributes {calyx.entrypoint = "main"} {
     // CHECK-LABEL: calyx.control {
     // CHECK-NEXT:    calyx.seq {
     // CHECK-NEXT:      calyx.if %eq.out with @Cond {
-    // CHECK-NEXT:        calyx.seq {
-    // CHECK-NEXT:          calyx.enable @B
-    // CHECK-NEXT:        }
+    // CHECK-NEXT:        calyx.enable @B
     // CHECK-NEXT:      } else {
-    // CHECK-NEXT:        calyx.seq {
-    // CHECK-NEXT:          calyx.enable @C
-    // CHECK-NEXT:        }
+    // CHECK-NEXT:        calyx.enable @C
     // CHECK-NEXT:     }
     // CHECK-NEXT:     calyx.enable @A
     // CHECK-NEXT:   }
@@ -154,13 +146,9 @@ module attributes {calyx.entrypoint = "main"} {
     // CHECK-LABEL: calyx.control {
     // CHECK-NEXT:    calyx.par {
     // CHECK-NEXT:      calyx.if %eq.out with @Cond {
-    // CHECK-NEXT:        calyx.par {
-    // CHECK-NEXT:          calyx.enable @A
-    // CHECK-NEXT:        }
+    // CHECK-NEXT:        calyx.enable @A
     // CHECK-NEXT:      } else {
-    // CHECK-NEXT:        calyx.par {
-    // CHECK-NEXT:          calyx.enable @B
-    // CHECK-NEXT:        }
+    // CHECK-NEXT:        calyx.enable @B
     // CHECK-NEXT:     }
     // CHECK-NEXT:     calyx.enable @C
     // CHECK-NEXT:     calyx.enable @D
@@ -217,19 +205,13 @@ module attributes {calyx.entrypoint = "main"} {
       }
     }
     // CHECK-LABEL: calyx.control {
-    // CHECK-NEXT:    calyx.par {
-    // CHECK-NEXT:      calyx.seq {
-    // CHECK-NEXT:        calyx.if %eq.out with @Cond {
-    // CHECK-NEXT:          calyx.seq {
-    // CHECK-NEXT:            calyx.enable @B
-    // CHECK-NEXT:          }
-    // CHECK-NEXT:        } else {
-    // CHECK-NEXT:          calyx.seq {
-    // CHECK-NEXT:            calyx.enable @C
-    // CHECK-NEXT:          }
-    // CHECK-NEXT:        }
-    // CHECK-NEXT:        calyx.enable @A
+    // CHECK-NEXT:    calyx.seq {
+    // CHECK-NEXT:      calyx.if %eq.out with @Cond {
+    // CHECK-NEXT:        calyx.enable @B
+    // CHECK-NEXT:      } else {
+    // CHECK-NEXT:        calyx.enable @C
     // CHECK-NEXT:      }
+    // CHECK-NEXT:      calyx.enable @A
     // CHECK-NEXT:    }
     // CHECK-NEXT:  }
     calyx.control {
@@ -274,19 +256,13 @@ module attributes {calyx.entrypoint = "main"} {
       }
     }
     // CHECK-LABEL: calyx.control {
-    // CHECK-NEXT:    calyx.par {
-    // CHECK-NEXT:      calyx.static_seq {
-    // CHECK-NEXT:        calyx.static_if %eq.out {
-    // CHECK-NEXT:          calyx.static_seq {
-    // CHECK-NEXT:            calyx.enable @B
-    // CHECK-NEXT:          }
-    // CHECK-NEXT:        } else {
-    // CHECK-NEXT:          calyx.static_seq {
-    // CHECK-NEXT:            calyx.enable @C
-    // CHECK-NEXT:          }
-    // CHECK-NEXT:        }
-    // CHECK-NEXT:        calyx.enable @A
+    // CHECK-NEXT:    calyx.static_seq {
+    // CHECK-NEXT:      calyx.static_if %eq.out {
+    // CHECK-NEXT:        calyx.enable @B
+    // CHECK-NEXT:      } else {
+    // CHECK-NEXT:        calyx.enable @C
     // CHECK-NEXT:      }
+    // CHECK-NEXT:      calyx.enable @A
     // CHECK-NEXT:    }
     // CHECK-NEXT:  }
     calyx.control {
@@ -343,20 +319,14 @@ module attributes {calyx.entrypoint = "main"} {
       }
     }
     // CHECK-LABEL: calyx.control {
-    // CHECK-NEXT:    calyx.seq {
-    // CHECK-NEXT:      calyx.par {
-    // CHECK-NEXT:        calyx.if %eq.out with @Cond {
-    // CHECK-NEXT:          calyx.par {
-    // CHECK-NEXT:            calyx.enable @A
-    // CHECK-NEXT:          }
-    // CHECK-NEXT:        } else {
-    // CHECK-NEXT:          calyx.par {
-    // CHECK-NEXT:            calyx.enable @B
-    // CHECK-NEXT:          }
-    // CHECK-NEXT:        }
-    // CHECK-NEXT:        calyx.enable @C
-    // CHECK-NEXT:        calyx.enable @D
+    // CHECK-NEXT:    calyx.par {
+    // CHECK-NEXT:      calyx.if %eq.out with @Cond {
+    // CHECK-NEXT:        calyx.enable @A
+    // CHECK-NEXT:      } else {
+    // CHECK-NEXT:        calyx.enable @B
     // CHECK-NEXT:      }
+    // CHECK-NEXT:      calyx.enable @C
+    // CHECK-NEXT:      calyx.enable @D
     // CHECK-NEXT:    }
     // CHECK-NEXT:  }
     calyx.control {
@@ -407,20 +377,14 @@ module attributes {calyx.entrypoint = "main"} {
       }
     }
     // CHECK-LABEL: calyx.control {
-    // CHECK-NEXT:    calyx.seq {
-    // CHECK-NEXT:      calyx.static_par {
-    // CHECK-NEXT:        calyx.static_if %eq.out {
-    // CHECK-NEXT:          calyx.static_par {
-    // CHECK-NEXT:            calyx.enable @A
-    // CHECK-NEXT:          }
-    // CHECK-NEXT:        } else {
-    // CHECK-NEXT:          calyx.static_par {
-    // CHECK-NEXT:            calyx.enable @B
-    // CHECK-NEXT:          }
-    // CHECK-NEXT:        }
-    // CHECK-NEXT:        calyx.enable @C
-    // CHECK-NEXT:        calyx.enable @D
+    // CHECK-NEXT:    calyx.static_par {
+    // CHECK-NEXT:      calyx.static_if %eq.out {
+    // CHECK-NEXT:        calyx.enable @A
+    // CHECK-NEXT:      } else {
+    // CHECK-NEXT:        calyx.enable @B
     // CHECK-NEXT:      }
+    // CHECK-NEXT:      calyx.enable @C
+    // CHECK-NEXT:      calyx.enable @D
     // CHECK-NEXT:    }
     // CHECK-NEXT:  }
     calyx.control {
@@ -465,9 +429,7 @@ module attributes {calyx.entrypoint = "main"} {
       }
     }
     // CHECK-LABEL: calyx.control {
-    // CHECK-NEXT:    calyx.seq {
-    // CHECK-NEXT:      calyx.enable @A
-    // CHECK-NEXT:    }
+    // CHECK-NEXT:    calyx.enable @A
     // CHECK-NEXT:  }
     calyx.control {
       calyx.seq {
@@ -502,9 +464,7 @@ module attributes {calyx.entrypoint = "main"} {
       }
     }
     // CHECK-LABEL: calyx.control {
-    // CHECK-NEXT:    calyx.seq {
-    // CHECK-NEXT:      calyx.enable @A
-    // CHECK-NEXT:    }
+    // CHECK-NEXT:    calyx.enable @A
     // CHECK-NEXT:  }
     calyx.control {
       calyx.seq {
@@ -532,9 +492,7 @@ module attributes {calyx.entrypoint = "main"} {
       }
     }
     // CHECK-LABEL: calyx.control {
-    // CHECK-NEXT:    calyx.seq {
-    // CHECK-NEXT:      calyx.enable @A
-    // CHECK-NEXT:    }
+    // CHECK-NEXT:    calyx.enable @A
     // CHECK-NEXT:  }
     calyx.control {
       calyx.seq {
@@ -568,9 +526,7 @@ module attributes {calyx.entrypoint = "main"} {
       }
     }
     // CHECK-LABEL: calyx.control {
-    // CHECK-NEXT:    calyx.seq {
-    // CHECK-NEXT:      calyx.enable @A
-    // CHECK-NEXT:    }
+    // CHECK-NEXT:    calyx.enable @A
     // CHECK-NEXT:  }
     calyx.control {
       calyx.seq {
@@ -596,9 +552,7 @@ module attributes {calyx.entrypoint = "main"} {
       }
     }
     // CHECK-LABEL: calyx.control {
-    // CHECK-NEXT:    calyx.seq {
-    // CHECK-NEXT:      calyx.enable @A
-    // CHECK-NEXT:    }
+    // CHECK-NEXT:    calyx.enable @A
     // CHECK-NEXT:  }
     calyx.control {
       calyx.seq {

@@ -2,12 +2,10 @@
 
 module attributes {calyx.entrypoint = "A"} {
   // CHECK-LABEL: extern "test.v" {
-  // CHECK: primitive prim(in: 32) -> (out: 32);
+  // CHECK-DAG: primitive prim(in: 32) -> (out: 32);
+  // CHECK-DAG: primitive params[WIDTH](in: WIDTH) -> (out: WIDTH);
   // CHECK: }
   hw.module.extern @prim(in %in : i32, out out: i32) attributes {filename = "test.v"}
-  // CHECK-LABEL: extern "test.v" {
-  // CHECK: primitive params[WIDTH](in: WIDTH) -> (out: WIDTH);
-  // CHECK: }
   hw.module.extern @params<WIDTH: i32>(in %in : !hw.int<#hw.param.decl.ref<"WIDTH">>, out out : !hw.int<#hw.param.decl.ref<"WIDTH">>) attributes {filename = "test.v"}
 
   // CHECK-LABEL: component A<"static"=1,>(in_0: 32, in_1: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (out_0: 32, out_1: 32, @done done: 1) {

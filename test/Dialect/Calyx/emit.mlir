@@ -246,7 +246,7 @@ module attributes {calyx.entrypoint = "main"} {
 
 module attributes {calyx.entrypoint = "main"} {
   calyx.component @main(%clk: i1 {clk}, %reset: i1 {reset}, %go: i1 {go}) -> (%out0: i32, %out1: i32, %done: i1 {done}) {
-    // CHECK: cst_0 = std_float_const(0, 32, 4.200000);
+    // CHECK: cst_0 = std_float_const(0, 32, 4.199999809);
     %c42_i32 = hw.constant 42 : i32
     %cst = calyx.constant @cst_0 <4.200000e+00 : f32> : i32
     %true = hw.constant true
@@ -286,7 +286,7 @@ module attributes {calyx.entrypoint = "main"} {
 module attributes {calyx.entrypoint = "main"} {
   // CHECK: import "primitives/float/addFN.futil";
   calyx.component @main(%in0: i32, %clk: i1 {clk}, %reset: i1 {reset}, %go: i1 {go}) -> (%out0: i32, %done: i1 {done}) {
-    // CHECK-DAG: cst_0 = std_float_const(0, 32, 4.200000);
+    // CHECK-DAG: cst_0 = std_float_const(0, 32, 4.199999809);
     %cst = calyx.constant @cst_0 <4.200000e+00 : f32> : i32
     %true = hw.constant true
     %false = hw.constant false
@@ -340,7 +340,7 @@ module attributes {calyx.entrypoint = "main"} {
 module attributes {calyx.entrypoint = "main"} {
   // CHECK: import "primitives/float/mulFN.futil";
   calyx.component @main(%in0: i32, %clk: i1 {clk}, %reset: i1 {reset}, %go: i1 {go}) -> (%out0: i32, %done: i1 {done}) {
-    // CHECK-DAG: cst_0 = std_float_const(0, 32, 4.200000);
+    // CHECK-DAG: cst_0 = std_float_const(0, 32, 4.199999809);
     %cst = calyx.constant @cst_0 <4.200000e+00 : f32> : i32
     %true = hw.constant true
     // CHECK-DAG: mulf_0_reg = std_reg(32);

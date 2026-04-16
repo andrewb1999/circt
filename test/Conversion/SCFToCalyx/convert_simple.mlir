@@ -25,9 +25,7 @@
 // CHECK-NEXT:       }
 // CHECK-NEXT:     }
 // CHECK-NEXT:     calyx.control  {
-// CHECK-NEXT:       calyx.seq  {
-// CHECK-NEXT:         calyx.enable @ret_assign_0
-// CHECK-NEXT:       }
+// CHECK-NEXT:       calyx.enable @ret_assign_0
 // CHECK-NEXT:     }
 // CHECK-NEXT:   } {toplevel}
 // CHECK-NEXT: }
@@ -63,9 +61,7 @@ module {
 // CHECK-NEXT:       }
 // CHECK-NEXT:     }
 // CHECK-NEXT:     calyx.control  {
-// CHECK-NEXT:       calyx.seq  {
-// CHECK-NEXT:         calyx.enable @ret_assign_0
-// CHECK-NEXT:       }
+// CHECK-NEXT:       calyx.enable @ret_assign_0
 // CHECK-NEXT:     }
 // CHECK-NEXT:   } {toplevel}
 // CHECK-NEXT: }
@@ -412,18 +408,16 @@ module {
 // CHECK-DAG:      }
 // CHECK-DAG:    }
 // CHECK-DAG:    calyx.control {
-// CHECK-DAG:      calyx.seq {
-// CHECK-DAG:        calyx.par {
-// CHECK-DAG:          calyx.seq {
-// CHECK-DAG:            calyx.enable @bb0_0
-// CHECK-DAG:            calyx.enable @bb0_1
-// CHECK-DAG:            calyx.enable @bb0_3
-// CHECK-DAG:          }
-// CHECK-DAG:          calyx.seq {
-// CHECK-DAG:            calyx.enable @bb0_4
-// CHECK-DAG:            calyx.enable @bb0_5
-// CHECK-DAG:            calyx.enable @bb0_7
-// CHECK-DAG:          }
+// CHECK-DAG:      calyx.par {
+// CHECK-DAG:        calyx.seq {
+// CHECK-DAG:          calyx.enable @bb0_0
+// CHECK-DAG:          calyx.enable @bb0_1
+// CHECK-DAG:          calyx.enable @bb0_3
+// CHECK-DAG:        }
+// CHECK-DAG:        calyx.seq {
+// CHECK-DAG:          calyx.enable @bb0_4
+// CHECK-DAG:          calyx.enable @bb0_5
+// CHECK-DAG:          calyx.enable @bb0_7
 // CHECK-DAG:        }
 // CHECK-DAG:      }
 // CHECK-DAG:    }

@@ -31,13 +31,9 @@
 // CHECK-NEXT:     calyx.control  {
 // CHECK-NEXT:       calyx.seq  {
 // CHECK-NEXT:         calyx.if %std_slt_0.out with @bb0_0  {
-// CHECK-NEXT:           calyx.seq  {
-// CHECK-NEXT:             calyx.enable @bb1_to_bb3
-// CHECK-NEXT:           }
+// CHECK-NEXT:           calyx.enable @bb1_to_bb3
 // CHECK-NEXT:         } else  {
-// CHECK-NEXT:           calyx.seq  {
-// CHECK-NEXT:             calyx.enable @bb2_to_bb3
-// CHECK-NEXT:           }
+// CHECK-NEXT:           calyx.enable @bb2_to_bb3
 // CHECK-NEXT:         }
 // CHECK-NEXT:         calyx.enable @ret_assign_0
 // CHECK-NEXT:       }
@@ -149,13 +145,9 @@ module {
 // CHECK-NEXT:         calyx.while %std_slt_0.out with @bb0_0  {
 // CHECK-NEXT:           calyx.seq  {
 // CHECK-NEXT:             calyx.if %std_slt_1.out with @bb0_1  {
-// CHECK-NEXT:               calyx.seq  {
-// CHECK-NEXT:                 calyx.enable @bb1_to_bb3
-// CHECK-NEXT:               }
+// CHECK-NEXT:               calyx.enable @bb1_to_bb3
 // CHECK-NEXT:             } else  {
-// CHECK-NEXT:               calyx.seq  {
-// CHECK-NEXT:                 calyx.enable @bb2_to_bb3
-// CHECK-NEXT:               }
+// CHECK-NEXT:               calyx.enable @bb2_to_bb3
 // CHECK-NEXT:             }
 // CHECK-NEXT:             calyx.enable @assign_while_0_latch
 // CHECK-NEXT:           }
@@ -282,13 +274,9 @@ module {
 // CHECK-NEXT:         calyx.while %std_slt_0.out with @bb0_0  {
 // CHECK-NEXT:           calyx.seq  {
 // CHECK-NEXT:             calyx.if %std_slt_1.out with @bb0_1  {
-// CHECK-NEXT:               calyx.seq  {
-// CHECK-NEXT:                 calyx.enable @bb1_to_bb3
-// CHECK-NEXT:               }
+// CHECK-NEXT:               calyx.enable @bb1_to_bb3
 // CHECK-NEXT:             } else  {
-// CHECK-NEXT:               calyx.seq  {
-// CHECK-NEXT:                 calyx.enable @bb2_to_bb3
-// CHECK-NEXT:               }
+// CHECK-NEXT:               calyx.enable @bb2_to_bb3
 // CHECK-NEXT:             }
 // CHECK-NEXT:             calyx.enable @assign_while_0_latch
 // CHECK-NEXT:           }
@@ -358,16 +346,10 @@ module {
 // CHECK-NEXT:       }
 // CHECK-NEXT:     }
 // CHECK-NEXT:     calyx.control  {
-// CHECK-NEXT:       calyx.seq  {
-// CHECK-NEXT:         calyx.if %std_ge_0.out with @bb0_2  {
-// CHECK-NEXT:           calyx.seq  {
-// CHECK-NEXT:             calyx.enable @ret_assign_0
-// CHECK-NEXT:           }
-// CHECK-NEXT:         } else  {
-// CHECK-NEXT:           calyx.seq  {
-// CHECK-NEXT:             calyx.enable @ret_assign_1
-// CHECK-NEXT:           }
-// CHECK-NEXT:         }
+// CHECK-NEXT:       calyx.if %std_ge_0.out with @bb0_2  {
+// CHECK-NEXT:         calyx.enable @ret_assign_0
+// CHECK-NEXT:       } else  {
+// CHECK-NEXT:         calyx.enable @ret_assign_1
 // CHECK-NEXT:       }
 // CHECK-NEXT:     }
 // CHECK-NEXT:   } {toplevel}
@@ -618,13 +600,9 @@ module {
 // CHECK:           calyx.control {
 // CHECK:             calyx.seq {
 // CHECK:               calyx.if %[[VAL_13]] with @bb0_0 {
-// CHECK:                 calyx.seq {
-// CHECK:                   calyx.enable @then_br_0
-// CHECK:                 }
+// CHECK:                 calyx.enable @then_br_0
 // CHECK:               } else {
-// CHECK:                 calyx.seq {
-// CHECK:                   calyx.enable @else_br_0
-// CHECK:                 }
+// CHECK:                 calyx.enable @else_br_0
 // CHECK:               }
 // CHECK:               calyx.enable @ret_assign_0
 // CHECK:             }
@@ -710,19 +688,13 @@ module {
 // CHECK:           calyx.control {
 // CHECK:             calyx.seq {
 // CHECK:               calyx.if %[[VAL_18]] with @bb0_1 {
-// CHECK:                 calyx.seq {
-// CHECK:                   calyx.enable @then_br_1
-// CHECK:                 }
+// CHECK:                 calyx.enable @then_br_1
 // CHECK:               } else {
 // CHECK:                 calyx.seq {
 // CHECK:                   calyx.if %[[VAL_15]] with @bb0_2 {
-// CHECK:                     calyx.seq {
-// CHECK:                       calyx.enable @then_br_0
-// CHECK:                     }
+// CHECK:                     calyx.enable @then_br_0
 // CHECK:                   } else {
-// CHECK:                     calyx.seq {
-// CHECK:                       calyx.enable @else_br_0
-// CHECK:                     }
+// CHECK:                     calyx.enable @else_br_0
 // CHECK:                   }
 // CHECK:                   calyx.enable @else_br_1
 // CHECK:                 }
@@ -799,16 +771,10 @@ module {
 // CHECK:             }
 // CHECK:           }
 // CHECK:           calyx.control {
-// CHECK:             calyx.seq {
-// CHECK:               calyx.if %[[VAL_17]] with @bb0_0 {
-// CHECK:                 calyx.seq {
-// CHECK:                   calyx.enable @bb0_2
-// CHECK:                 }
-// CHECK:               } else {
-// CHECK:                 calyx.seq {
-// CHECK:                   calyx.enable @bb0_3
-// CHECK:                 }
-// CHECK:               }
+// CHECK:             calyx.if %[[VAL_17]] with @bb0_0 {
+// CHECK:               calyx.enable @bb0_2
+// CHECK:             } else {
+// CHECK:               calyx.enable @bb0_3
 // CHECK:             }
 // CHECK:           }
 // CHECK:         }
@@ -885,13 +851,9 @@ module {
 // CHECK:               calyx.enable @bb0_0
 // CHECK:               calyx.enable @bb0_1
 // CHECK:               calyx.if %[[VAL_16]] {
-// CHECK:                 calyx.seq {
-// CHECK:                   calyx.enable @bb0_2
-// CHECK:                 }
+// CHECK:                 calyx.enable @bb0_2
 // CHECK:               } else {
-// CHECK:                 calyx.seq {
-// CHECK:                   calyx.enable @bb0_3
-// CHECK:                 }
+// CHECK:                 calyx.enable @bb0_3
 // CHECK:               }
 // CHECK:             }
 // CHECK:           }

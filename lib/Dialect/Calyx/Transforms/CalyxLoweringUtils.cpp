@@ -599,6 +599,16 @@ std::string CalyxLoweringState::blockName(Block *b) {
   }
 
   std::string blockName = irName(*b);
+  // The cached AsmState only knows blocks that existed when the lowering
+  // state was constructed. Blocks created during lowering (e.g. the sink
+  // block from InlineExecuteRegionOpPattern) print as "INVALIDBLOCK";
+  // build a fresh AsmState so the new block gets a real name.
+  if (blockName == "INVALIDBLOCK") {
+    mlir::AsmState freshState(module);
+    blockName.clear();
+    llvm::raw_string_ostream os(blockName);
+    b->printAsOperand(os, freshState);
+  }
   blockName.erase(std::remove(blockName.begin(), blockName.end(), '^'),
                   blockName.end());
   blockNameMap.insert(std::pair(b, blockName));

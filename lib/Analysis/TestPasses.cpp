@@ -98,6 +98,10 @@ void TestDependenceAnalysisPass::runOnOperation() {
 
       SmallVector<Attribute> comps;
       for (auto comp : dep.dependenceComponents) {
+        // Skip marker components (e.g. the enclosing func) that carry no
+        // concrete loop bounds.
+        if (!comp.lb || !comp.ub)
+          continue;
         SmallVector<Attribute> vector;
         vector.push_back(
             IntegerAttr::get(IntegerType::get(context, 64), *comp.lb));
