@@ -1,4 +1,4 @@
-// RUN: circt-opt --lower-loopschedule-to-fsm %s | FileCheck %s
+// RUN: circt-opt --lower-loopschedule-to-fsm=disable-flatten-memrefs=true %s | FileCheck %s
 
 // Two nested sequential loops over an 8x8 memref. Verify per-dim address
 // ports flow through both the outer and inner loop hw.modules and that the

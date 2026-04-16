@@ -1,4 +1,4 @@
-// RUN: circt-opt --lower-loopschedule-to-fsm %s | FileCheck %s
+// RUN: circt-opt --lower-loopschedule-to-fsm=disable-flatten-memrefs=true %s | FileCheck %s
 
 // Multi-dim memref passed in as a function argument: load + store with two
 // indices. Verify the loop module exposes one address port per dim and the

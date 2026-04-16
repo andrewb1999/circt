@@ -218,6 +218,10 @@ def LoopScheduleToFSM : Pass<"lower-loopschedule-to-fsm", "mlir::ModuleOp"> {
     "hw::HWDialect", "comb::CombDialect", "seq::SeqDialect",
     "mlir::arith::ArithDialect"
   ];
+  let options = [
+    Option<"disableFlattenMemrefs", "disable-flatten-memrefs", "bool", "false",
+            "Skip the internal multi-dim memref flattening step.">
+  ];
 }
 
 //===----------------------------------------------------------------------===//

@@ -1,4 +1,4 @@
-// RUN: circt-opt --lower-loopschedule-to-fsm %s | FileCheck %s
+// RUN: circt-opt --lower-loopschedule-to-fsm=disable-flatten-memrefs=true %s | FileCheck %s
 
 // A locally allocated 3-D memref. Verify a `seq.hlmem` of shape 2x3x4 is
 // emitted, the loop module exposes one address port per dim, and three

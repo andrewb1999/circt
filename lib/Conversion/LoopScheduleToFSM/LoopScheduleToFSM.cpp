@@ -2961,10 +2961,12 @@ void LoopScheduleToFSMPass::runOnOperation() {
   for (auto funcOp : funcs)
     hoistReturnedAllocsToArgs(funcOp);
 
-  for (auto funcOp : funcs) {
-    if (failed(flattenMultiDimMemrefs(funcOp))) {
-      signalPassFailure();
-      return;
+  if (!disableFlattenMemrefs) {
+    for (auto funcOp : funcs) {
+      if (failed(flattenMultiDimMemrefs(funcOp))) {
+        signalPassFailure();
+        return;
+      }
     }
   }
 
