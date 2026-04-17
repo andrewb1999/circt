@@ -1,6 +1,5 @@
 // RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule),lower-loopschedule-to-calyx)" %s | FileCheck %s
 
-// XFAIL: *
 // End-to-end 1-D convolution. Unique among the nested-loop kernels
 // because the inner reduction's ACCUMULATOR is forwarded out via an
 // `await %h -> i32` in the outer loop, and that awaited value is then

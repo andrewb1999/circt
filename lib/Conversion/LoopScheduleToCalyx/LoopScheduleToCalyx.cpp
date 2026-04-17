@@ -72,24 +72,37 @@ static bool isHandleType(mlir::Type type) {
   return isa<loopschedule::HandleType>(type);
 }
 
-/// Walk through any `loopschedule.at` layers wrapping `v` to return the
-/// innermost SSA value that `v` is defined to carry (the at's yield operand
-/// at the matching result index). Stops when `v` is not an at result, or the
-/// yield's operand count doesn't cover the requested index.
+/// Walk through any `loopschedule.at` / `loopschedule.frame` layers wrapping
+/// `v` to return the innermost SSA value that `v` is defined to carry (the
+/// at's yield operand, or the frame's body-yield operand, at the matching
+/// result index). Stops when `v` is not an at/frame result, or the yield's
+/// operand count doesn't cover the requested index.
 ///
-/// Used by the Calyx lowering when it needs to reason about the value a frame
-/// result really carries — for example, to store the actual `arith.cmpi`
-/// behind a sequential's condition, so that the subsequent move to
-/// component-level wires has a legitimate target. Without this, downstream
-/// code would record a cross-region reference to an at-result that becomes
-/// dangling once the surrounding frame/at ops are erased.
+/// Used by the Calyx lowering when it needs to reason about the value a
+/// frame or at result really carries — for example, to store the actual
+/// `arith.cmpi` behind a sequential's condition, or to replace a loop's
+/// external result uses with an iter-arg register's output. Without this,
+/// downstream code would record a cross-region reference to a nested value
+/// that becomes dangling once the surrounding at/frame ops are erased.
 static mlir::Value unwrapThroughAts(mlir::Value v) {
-  while (auto atOp = v.getDefiningOp<loopschedule::LoopScheduleAtOp>()) {
-    auto res = mlir::cast<mlir::OpResult>(v);
-    auto atYield = atOp.getYieldOp();
-    if (res.getResultNumber() >= atYield->getNumOperands())
-      break;
-    v = atYield->getOperand(res.getResultNumber());
+  while (true) {
+    if (auto atOp = v.getDefiningOp<loopschedule::LoopScheduleAtOp>()) {
+      auto res = mlir::cast<mlir::OpResult>(v);
+      auto atYield = atOp.getYieldOp();
+      if (res.getResultNumber() >= atYield->getNumOperands())
+        break;
+      v = atYield->getOperand(res.getResultNumber());
+      continue;
+    }
+    if (auto frameOp = v.getDefiningOp<loopschedule::LoopScheduleFrameOp>()) {
+      auto res = mlir::cast<mlir::OpResult>(v);
+      auto bodyYield = frameOp.getBodyYield();
+      if (res.getResultNumber() >= bodyYield->getNumOperands())
+        break;
+      v = bodyYield->getOperand(res.getResultNumber());
+      continue;
+    }
+    break;
   }
   return v;
 }
@@ -1654,6 +1667,34 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   getState<ComponentLoweringState>().addBlockSchedulable(
       loop.getOperation()->getBlock(), loop);
 
+  /// Replace external uses of the loop's SSA results with the
+  /// corresponding iter-arg register's output. In HW, the iter-arg
+  /// register holds the loop's exit-time value and persists after the
+  /// loop completes; any post-loop consumer should read directly from
+  /// that register. Without this, uses of `inner_seq.getResult(i)` from
+  /// sibling frames (dissolved from await-with-values patterns) become
+  /// cross-region SSA references that later verification rejects.
+  if (auto terminator = dyn_cast<LoopScheduleTerminatorOp>(
+          loop.getBodyBlock()->getTerminator())) {
+    auto termResults = terminator.getResults();
+    for (auto [i, termRes] : llvm::enumerate(termResults)) {
+      if (i >= loop.getOperation()->getNumResults())
+        break;
+      auto &iterArgNewValueReg =
+          getState<ComponentLoweringState>().iterArgNewValueReg;
+      auto it = iterArgNewValueReg.find(termRes);
+      if (it == iterArgNewValueReg.end()) {
+        // Also try an at-unwrapped value.
+        Value unwrapped = unwrapThroughAts(termRes);
+        it = iterArgNewValueReg.find(unwrapped);
+      }
+      if (it != iterArgNewValueReg.end()) {
+        Value loopResult = loop.getOperation()->getResult(i);
+        loopResult.replaceAllUsesWith(it->second.getOut());
+      }
+    }
+  }
+
   return success();
 }
 
@@ -2289,6 +2330,15 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
       auto phase = dyn_cast<PhaseInterface>(parent);
       if (!phase)
         return WalkResult::advance();
+      // Skip the await-region's yield of a frame: it carries scheduling
+      // metadata (the operands forwarded from the await ops to the body
+      // block args), not values that need HW-register materialization.
+      // The body-region's yield is the one that defines the frame's SSA
+      // result register layout.
+      if (auto frame = dyn_cast<LoopScheduleFrameOp>(parent)) {
+        if (op == frame.getAwaitBlock().getTerminator())
+          return WalkResult::advance();
+      }
 
       const auto &iterArgNewValueReg =
           getState<ComponentLoweringState>().iterArgNewValueReg;
