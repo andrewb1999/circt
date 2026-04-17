@@ -141,7 +141,7 @@ public:
 /// A variant of types representing schedulable operations.
 using Schedulable =
     std::variant<calyx::StaticGroupOp, LoopWrapper, PhaseInterface,
-                 LoopScheduleIfOp, LoopScheduleDelayOp>;
+                 LoopScheduleIfOp, LoopScheduleAtOp>;
 
 using PhaseRegister = std::variant<calyx::RegisterOp, Value>;
 
@@ -256,15 +256,15 @@ public:
     return noStallLastCycleWires[loop];
   }
 
-  void addDelayPadGroup(LoopScheduleDelayOp delay,
-                        calyx::StaticGroupOp group) {
-    assert(!delayPadGroups.contains(delay));
-    delayPadGroups[delay] = group;
+  void addAtPadGroup(LoopScheduleAtOp atOp,
+                     calyx::StaticGroupOp group) {
+    assert(!atPadGroups.contains(atOp));
+    atPadGroups[atOp] = group;
   }
 
-  calyx::StaticGroupOp getDelayPadGroup(LoopScheduleDelayOp delay) {
-    assert(delayPadGroups.contains(delay));
-    return delayPadGroups[delay];
+  calyx::StaticGroupOp getAtPadGroup(LoopScheduleAtOp atOp) {
+    assert(atPadGroups.contains(atOp));
+    return atPadGroups[atOp];
   }
 
   void addPhaseDynamicAccess(PhaseInterface phase, Value port,
@@ -383,7 +383,7 @@ private:
 
   DenseMap<PhaseInterface, SmallVector<Value>> holdCEInPhase;
 
-  DenseMap<LoopScheduleDelayOp, calyx::StaticGroupOp> delayPadGroups;
+  DenseMap<LoopScheduleAtOp, calyx::StaticGroupOp> atPadGroups;
 
 public:
   /// Map from the `value` operand of a `loopschedule.iter_arg_update` op to
@@ -467,7 +467,8 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                   LoopInterface, LoopScheduleTerminatorOp, LoopScheduleYieldOp,
                   LoopScheduleIfOp, LoopScheduleBufferOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
-              .template Case<FuncOp, LoopScheduleRegisterOp, LoopScheduleDelayOp,
+              .template Case<FuncOp, LoopScheduleLaunchOp,
+                             LoopScheduleAwaitOp,
                              LoopScheduleIterArgUpdateOp, PhaseInterface,
                              ReturnOp>([&](auto) {
                 /// Skip: these special cases will be handled separately.
@@ -920,7 +921,10 @@ BuildOpGroups::buildOp(PatternRewriter &rewriter,
     return failure();
 
   auto phase = loadOp->getParentOfType<PhaseInterface>();
-  if (isa<LoopScheduleStepOp>(phase))
+  // Only pipeline stages need cross-phase CE holding across the load's
+  // latency; sequential (frame) phases don't span multiple cycles of the
+  // same load.
+  if (!isa<LoopSchedulePipelineOp>(phase->getParentOp()))
     return success();
 
   if (latency > 1) {
@@ -1183,16 +1187,17 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
       continue;
     auto arg = loopschedule::getIterArgPhaseResult(upd);
     auto idx = v.index();
-    auto stepOp = arg.getDefiningOp<LoopScheduleStepOp>();
-    if (stepOp) {
+    auto atOp = arg.getDefiningOp<LoopScheduleAtOp>();
+    // Only frame-child `at` results correspond to outer sequential iter-args.
+    if (atOp && isa<LoopScheduleFrameOp>(atOp->getParentOp())) {
       auto resNum = cast<OpResult>(arg).getResultNumber();
-      auto regVal = stepOp.getRegisterOp().getOperand(resNum);
-      auto *pipelinePhaseOp = regVal.getDefiningOp();
+      auto yieldVal = atOp.getYieldOp().getOperand(resNum);
+      auto *pipelinePhaseOp = yieldVal.getDefiningOp();
       if (pipelinePhaseOp && isa<LoopScheduleAtOp>(pipelinePhaseOp) &&
           isa<LoopSchedulePipelineOp>(pipelinePhaseOp->getParentOp())) {
         auto pipeline =
             cast<LoopSchedulePipelineOp>(pipelinePhaseOp->getParentOp());
-        auto pipelineResNum = cast<OpResult>(regVal).getResultNumber();
+        auto pipelineResNum = cast<OpResult>(yieldVal).getResultNumber();
         auto outerReg = getState<ComponentLoweringState>().getLoopIterReg(
             LoopWrapper{loop}, idx);
         auto pipelineReg = getState<ComponentLoweringState>().getLoopIterReg(
@@ -1209,11 +1214,16 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
             calyx::createConstant(op.getLoc(), rewriter, getComponent(), 1, 1);
         rewriter.create<calyx::AssignOp>(loop.getLoc(), outerReg.getWriteEn(),
                                          oneI1);
-        auto phases = llvm::SmallVector<PhaseInterface>(
+        // Place the copy group inside the last `at` of the last frame so it
+        // fires at the cycle when the nested pipeline has produced its value.
+        auto frames = llvm::SmallVector<PhaseInterface>(
             loop.getBodyBlock()->getOps<PhaseInterface>());
-        auto lastPhase = cast<PhaseInterface>(phases.back());
+        auto lastFrame = cast<LoopScheduleFrameOp>(frames.back());
+        auto ats = llvm::SmallVector<LoopScheduleAtOp>(
+            lastFrame.getBodyBlock().getOps<LoopScheduleAtOp>());
+        auto lastAt = ats.back();
         getState<ComponentLoweringState>().addBlockSchedulable(
-            &lastPhase.getBodyBlock(), iterArgGroup);
+            &lastAt.getBodyBlock(), iterArgGroup);
       }
     }
   }
@@ -1908,9 +1918,9 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
                            PatternRewriter &rewriter) const override {
     DenseMap<Value, calyx::RegisterOp> regMap;
     auto res = funcOp.walk([&](Operation *op) {
-      // Process the value-carrying terminators of phase ops: `register`
-      // (step) and `yield` (at).
-      if (!isa<LoopScheduleRegisterOp, LoopScheduleYieldOp>(op))
+      // Process the value-carrying terminators of phase ops: the `yield`
+      // ops of frames and `at` regions.
+      if (!isa<LoopScheduleYieldOp>(op))
         return WalkResult::advance();
       // Condition registers are handled in BuildWhileGroups.
       auto *parent = op->getParentOp();
@@ -2157,6 +2167,16 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
                 buildPhaseGroups(loop, bodyBlock, phase, condGroup, rewriter)))
           return WalkResult::interrupt();
         condGroup = std::nullopt;
+        // Frames contain `at` children that are the actual per-cycle phases;
+        // process each at as its own phase within the frame's body.
+        if (auto frame = dyn_cast<LoopScheduleFrameOp>(phase.getOperation())) {
+          for (auto at : llvm::SmallVector<LoopScheduleAtOp>(
+                   frame.getBodyBlock().getOps<LoopScheduleAtOp>())) {
+            if (failed(buildPhaseGroups(loop, &frame.getBodyBlock(), at,
+                                        std::nullopt, rewriter)))
+              return WalkResult::interrupt();
+          }
+        }
       }
 
       if (getState<ComponentLoweringState>()
@@ -2192,12 +2212,21 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
     if (res.wasInterrupted())
       return failure();
 
-    // Build groups for all top-level phases, should be only steps
+    // Build groups for all top-level phases (typically frames at the func
+    // level). Also recurse into frame bodies for their at children.
     auto *funcBlock = &funcOp.getBlocks().front();
     for (auto phase : funcOp.getOps<PhaseInterface>()) {
       if (failed(buildPhaseGroups(funcOp, funcBlock, phase, std::nullopt,
                                   rewriter)))
         return failure();
+      if (auto frame = dyn_cast<LoopScheduleFrameOp>(phase.getOperation())) {
+        for (auto at : llvm::SmallVector<LoopScheduleAtOp>(
+                 frame.getBodyBlock().getOps<LoopScheduleAtOp>())) {
+          if (failed(buildPhaseGroups(funcOp, &frame.getBodyBlock(), at,
+                                      std::nullopt, rewriter)))
+            return failure();
+        }
+      }
     }
 
     // Handle return op
@@ -2231,6 +2260,36 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
     // Collect pipeline registers for stage.
     auto pipelineRegisters =
         getState<ComponentLoweringState>().getPhaseRegs(phase);
+
+    // Frames forward values from their child `at` ops' yields. Since at
+    // results share registers with the frame's outer results (via regMap
+    // reuse in BuildIntermediateRegs), no new writer group is needed — just
+    // replace outer uses with the shared register's output and register the
+    // frame as a schedulable so BuildControl emits a static_par wrapping the
+    // ats.
+    if (auto frame = dyn_cast<LoopScheduleFrameOp>(phase.getOperation())) {
+      MutableArrayRef<OpOperand> operands =
+          phase.getBodyBlock().getTerminator()->getOpOperands();
+      for (auto &operand : operands) {
+        unsigned i = operand.getOperandNumber();
+        if (!pipelineRegisters.count(i)) {
+          phase->getResult(i).replaceAllUsesWith(operand.get());
+          continue;
+        }
+        auto reg = pipelineRegisters[i];
+        Value out;
+        if (auto *valuePtr = std::get_if<Value>(&reg)) {
+          out = *valuePtr;
+        } else {
+          out = std::get<calyx::RegisterOp>(reg).getOut();
+        }
+        phase->getResult(i).replaceAllUsesWith(out);
+      }
+      getState<ComponentLoweringState>().addBlockSchedulable(phase->getBlock(),
+                                                             phase);
+      return success();
+    }
+
     // Get the number of pipeline stages in the stages block, excluding the
     // terminator. The verifier guarantees there is at least one stage followed
     // by a terminator.
@@ -2241,8 +2300,19 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
     buildPhaseGuards(op, phase, rewriter);
     buildPhaseStallValues(op, phase, rewriter);
 
-    getState<ComponentLoweringState>().addBlockSchedulable(phase->getBlock(),
-                                                           phase);
+    // Frame-child `at` ops need pad handling (their offset controls the
+    // cycle when they fire). Register them as LoopScheduleAtOp schedulables
+    // so BuildControl emits `static_seq { pad; static_par { body } }` for
+    // offset > 0. Pipeline-stage ats are registered as PhaseInterface so
+    // they get the guard-aware handler.
+    auto atOp = dyn_cast<LoopScheduleAtOp>(phase.getOperation());
+    if (atOp && isa<LoopScheduleFrameOp>(atOp->getParentOp())) {
+      getState<ComponentLoweringState>().addBlockSchedulable(phase->getBlock(),
+                                                             atOp);
+    } else {
+      getState<ComponentLoweringState>().addBlockSchedulable(phase->getBlock(),
+                                                             phase);
+    }
 
     auto addBodyGroup = [&](std::optional<Value> v,
                             calyx::StaticGroupOp group) {
@@ -2757,41 +2827,36 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
   }
 };
 
-/// Walks `loopschedule.delay` ops, registers each as a schedulable in its
-/// enclosing step's body block, creates a static padding group of latency
-/// `delay.latency`, and forwards the delay's results to the inner register
-/// operands so the parent step's terminator can read them.
-class BuildDelayGroups : public calyx::FuncOpPartialLoweringPattern {
+/// Walks frame-child `loopschedule.at` ops with non-zero offset and creates
+/// a static padding group of latency = offset. BuildControl emits
+/// `static_seq { pad; static_par { body } }` so the at's body fires at the
+/// correct cycle within the enclosing frame.
+class BuildAtPadGroups : public calyx::FuncOpPartialLoweringPattern {
   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
 
   LogicalResult
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
     auto compOp = getState<ComponentLoweringState>().getComponentOp();
-    auto res = funcOp.walk([&](LoopScheduleDelayOp delayOp) {
-      auto *registerOp = delayOp.getBody().front().getTerminator();
+    auto res = funcOp.walk([&](LoopScheduleAtOp atOp) {
+      // Only frame-child ats use cycle-offset padding. Pipeline-stage ats
+      // are driven by per-cycle guards instead.
+      if (!isa<LoopScheduleFrameOp>(atOp->getParentOp()))
+        return WalkResult::advance();
 
-      // Forward each delay result to the corresponding register operand so
-      // outside uses see the inner SSA value. This produces a temporarily
-      // invalid IR (cross-region reference) but the surrounding func.func is
-      // erased before verification runs.
-      assert(registerOp->getNumOperands() == delayOp->getNumResults());
-      for (size_t i = 0, e = delayOp->getNumResults(); i < e; ++i)
-        delayOp->getResult(i).replaceAllUsesWith(registerOp->getOperand(i));
+      auto offset = atOp.getOffset();
+      if (offset == 0)
+        return WalkResult::advance();
 
       // Create the padding static group. Empty body — calyx static groups
       // declare implicit done after `latency` cycles, so the body needs no
       // assignments.
       auto groupName =
-          getState<ComponentLoweringState>().getUniqueName("delay_pad");
-      auto padGroup = calyx::createStaticGroup(rewriter, compOp,
-                                               delayOp.getLoc(), groupName,
-                                               delayOp.getLatency());
-      getState<ComponentLoweringState>().addDelayPadGroup(delayOp, padGroup);
-
-      // Register the delay as a schedulable in its parent step's body block.
-      getState<ComponentLoweringState>().addBlockSchedulable(delayOp->getBlock(),
-                                                             delayOp);
+          getState<ComponentLoweringState>().getUniqueName("at_pad");
+      auto padGroup =
+          calyx::createStaticGroup(rewriter, compOp, atOp.getLoc(), groupName,
+                                   offset);
+      getState<ComponentLoweringState>().addAtPadGroup(atOp, padGroup);
       return WalkResult::advance();
     });
 
@@ -2970,24 +3035,32 @@ private:
         rewriter.setInsertionPointAfter(loopParentCtrlOp);
         if (res.failed())
           return loopOp.getOperation()->emitError("Cannot schedule loop body");
-      } else if (auto *delaySchedPtr =
-                     std::get_if<LoopScheduleDelayOp>(&sched)) {
-        auto &delayOp = *delaySchedPtr;
-        // Emit `static_seq { delay_pad; static_par { body } }` so the body
-        // schedulables fire `latency` cycles into the enclosing static par.
-        auto seqOp = rewriter.create<calyx::StaticSeqOp>(delayOp.getLoc());
-        rewriter.setInsertionPointToEnd(seqOp.getBodyBlock());
-        auto padGroup =
-            getState<ComponentLoweringState>().getDelayPadGroup(delayOp);
-        rewriter.create<calyx::EnableOp>(delayOp.getLoc(),
-                                         padGroup.getSymName());
-        auto parOp = rewriter.create<calyx::StaticParOp>(delayOp.getLoc());
-        rewriter.setInsertionPointToEnd(parOp.getBodyBlock());
-        path.insert(&delayOp.getBody().front());
-        auto res = scheduleBasicBlock(rewriter, path, parOp.getBodyBlock(),
-                                      &delayOp.getBody().front());
+      } else if (auto *atSchedPtr = std::get_if<LoopScheduleAtOp>(&sched)) {
+        auto &atOp = *atSchedPtr;
+        auto offset = atOp.getOffset();
+        Block *parBlock;
+        if (offset == 0) {
+          // Offset-0 at: just a static_par of the body schedulables.
+          auto parOp = rewriter.create<calyx::StaticParOp>(atOp.getLoc());
+          parBlock = parOp.getBodyBlock();
+        } else {
+          // Offset-K at: `static_seq { pad_K; static_par { body } }` so the
+          // at's body schedulables fire K cycles into the enclosing frame.
+          auto seqOp = rewriter.create<calyx::StaticSeqOp>(atOp.getLoc());
+          rewriter.setInsertionPointToEnd(seqOp.getBodyBlock());
+          auto padGroup =
+              getState<ComponentLoweringState>().getAtPadGroup(atOp);
+          rewriter.create<calyx::EnableOp>(atOp.getLoc(),
+                                           padGroup.getSymName());
+          auto parOp = rewriter.create<calyx::StaticParOp>(atOp.getLoc());
+          parBlock = parOp.getBodyBlock();
+        }
+        rewriter.setInsertionPointToEnd(parBlock);
+        path.insert(&atOp.getBodyBlock());
+        auto res = scheduleBasicBlock(rewriter, path, parBlock,
+                                      &atOp.getBodyBlock());
         if (res.failed())
-          return delayOp->emitOpError("Failed to schedule delay op block");
+          return atOp->emitOpError("Failed to schedule at op block");
       } else if (auto *ifSchedPtr = std::get_if<LoopScheduleIfOp>(&sched)) {
         auto &ifOp = *ifSchedPtr;
         auto phaseOp = ifOp->getParentOfType<PhaseInterface>();
@@ -3541,9 +3614,9 @@ void LoopScheduleToCalyxPass::runOnOperation() {
   addOncePattern<BuildIfGroups>(loweringPatterns, patternState, funcMap,
                                 *loweringState);
 
-  /// Register `loopschedule.delay` ops as schedulables and create their
-  /// padding groups.
-  addOncePattern<BuildDelayGroups>(loweringPatterns, patternState, funcMap,
+  /// Create padding groups for frame-child `loopschedule.at` ops with
+  /// non-zero offset so they fire at the right cycle within their frame.
+  addOncePattern<BuildAtPadGroups>(loweringPatterns, patternState, funcMap,
                                    *loweringState);
 
   /// This pattern traverses the CFG of the program and generates a control
