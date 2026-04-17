@@ -2098,9 +2098,15 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
 
         assert(phase->getParentOp() != nullptr);
 
-        auto name =
-            SmallString<20>(getState<ComponentLoweringState>().getUniqueName(
-                phase->getParentOp()));
+        // Walk up to the nearest ancestor that had a unique name assigned
+        // (LoopInterface or FuncOp). Intermediate phase parents like frames
+        // do not carry unique names themselves.
+        Operation *nameAnchor = phase->getParentOp();
+        while (nameAnchor && !isa<LoopInterface, FuncOp>(nameAnchor))
+          nameAnchor = nameAnchor->getParentOp();
+        assert(nameAnchor && "no LoopInterface/FuncOp ancestor for phase");
+        auto name = SmallString<20>(
+            getState<ComponentLoweringState>().getUniqueName(nameAnchor));
         name += "_";
         name += phase.getRegisterNamePrefix();
         name += "_register_";

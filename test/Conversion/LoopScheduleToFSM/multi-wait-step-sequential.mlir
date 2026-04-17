@@ -1,11 +1,11 @@
 // RUN: circt-opt --lower-loopschedule-to-fsm %s | FileCheck %s
 
-// A sequential loop whose body has THREE steps:
-//   step 0 — computes the loop condition (regular step)
-//   step 1 — contains a child sequential loop (wait step #0)
-//   step 2 — contains a second child sequential loop (wait step #1)
+// A sequential loop whose body has THREE frames:
+//   frame 0 — computes the loop condition (regular frame)
+//   frame 1 — contains a nested sequential loop (wait frame #0)
+//   frame 2 — contains a second nested sequential loop (wait frame #1)
 //
-// This exercises the unified FSM emission with multiple "wait" steps in a
+// This exercises the unified FSM emission with multiple "wait" frames in a
 // single parent loop: createSequentialFSM must produce two child_start
 // outputs, two child_done inputs, two post_active outputs, and matching
 // WAIT_1/POST_1 and WAIT_2/POST_2 states.
@@ -20,51 +20,70 @@ module {
     %c2_i4 = arith.constant 2 : i4
     %c42_i32 = arith.constant 42 : i32
     %c43_i32 = arith.constant 43 : i32
-    loopschedule.step {
-      loopschedule.sequential trip_count = 5 iter_args(%i = %c0_i32) : (i32) -> () {
-        // Step 0: compute loop condition + iter_arg next.
-        %0:2 = loopschedule.step {
-          %cond = arith.cmpi slt, %i, %c5_i32 : i32
-          %next = arith.addi %i, %c1_i32 : i32
-          loopschedule.iter_arg_update %i = %next : i32
-          loopschedule.register %next, %cond : i32, i1
-        } : i32, i1
-        // Step 1: launch first child loop.
-        loopschedule.step {
-          loopschedule.sequential trip_count = 2 iter_args(%j = %c0_i4) : (i4) -> () {
-            %1:2 = loopschedule.step {
-              %cj = arith.cmpi ult, %j, %c2_i4 : i4
-              loopschedule.store %c42_i32, %arg0[%j : i4] : memref<4xi32>
-              %nj = arith.addi %j, %c1_i4 : i4
-              loopschedule.iter_arg_update %j = %nj : i4
-              loopschedule.register %nj, %cj : i4, i1
-            } : i4, i1
-            loopschedule.terminator condition(%1#1), results()
+    loopschedule.frame {
+      loopschedule.at 0 {
+        loopschedule.sequential trip_count = 5 iter_args(%i = %c0_i32) : (i32) -> () {
+          // Frame 0: compute loop condition + iter_arg next.
+          %cond, %next = loopschedule.frame -> (i1, i32) {
+            %r:2 = loopschedule.at 0 -> (i1, i32) {
+              %c = arith.cmpi slt, %i, %c5_i32 : i32
+              %n = arith.addi %i, %c1_i32 : i32
+              loopschedule.iter_arg_update %i = %n : i32
+              loopschedule.yield %c, %n : i1, i32
+            }
+            loopschedule.yield %r#0, %r#1 : i1, i32
           }
-          loopschedule.register
-        }
-        // Step 2: launch second child loop.
-        loopschedule.step {
-          loopschedule.sequential trip_count = 2 iter_args(%k = %c0_i4) : (i4) -> () {
-            %2:2 = loopschedule.step {
-              %ck = arith.cmpi ult, %k, %c2_i4 : i4
-              loopschedule.store %c43_i32, %arg1[%k : i4] : memref<4xi32>
-              %nk = arith.addi %k, %c1_i4 : i4
-              loopschedule.iter_arg_update %k = %nk : i4
-              loopschedule.register %nk, %ck : i4, i1
-            } : i4, i1
-            loopschedule.terminator condition(%2#1), results()
+          // Frame 1: first nested loop.
+          loopschedule.frame {
+            loopschedule.at 0 {
+              loopschedule.sequential trip_count = 2 iter_args(%j = %c0_i4) : (i4) -> () {
+                %jcond, %jnext = loopschedule.frame -> (i1, i4) {
+                  %r:2 = loopschedule.at 0 -> (i1, i4) {
+                    %cj = arith.cmpi ult, %j, %c2_i4 : i4
+                    loopschedule.store %c42_i32, %arg0[%j : i4] : memref<4xi32>
+                    %nj = arith.addi %j, %c1_i4 : i4
+                    loopschedule.iter_arg_update %j = %nj : i4
+                    loopschedule.yield %cj, %nj : i1, i4
+                  }
+                  loopschedule.yield %r#0, %r#1 : i1, i4
+                }
+                loopschedule.terminator condition(%jcond), results()
+              }
+              loopschedule.yield
+            }
+            loopschedule.yield
           }
-          loopschedule.register
+          // Frame 2: second nested loop.
+          loopschedule.frame {
+            loopschedule.at 0 {
+              loopschedule.sequential trip_count = 2 iter_args(%k = %c0_i4) : (i4) -> () {
+                %kcond, %knext = loopschedule.frame -> (i1, i4) {
+                  %r:2 = loopschedule.at 0 -> (i1, i4) {
+                    %ck = arith.cmpi ult, %k, %c2_i4 : i4
+                    loopschedule.store %c43_i32, %arg1[%k : i4] : memref<4xi32>
+                    %nk = arith.addi %k, %c1_i4 : i4
+                    loopschedule.iter_arg_update %k = %nk : i4
+                    loopschedule.yield %ck, %nk : i1, i4
+                  }
+                  loopschedule.yield %r#0, %r#1 : i1, i4
+                }
+                loopschedule.terminator condition(%kcond), results()
+              }
+              loopschedule.yield
+            }
+            loopschedule.yield
+          }
+          loopschedule.terminator condition(%cond), results()
         }
-        loopschedule.terminator condition(%0#1), results()
+        loopschedule.yield
       }
+      loopschedule.yield
     }
     return
   }
 }
 
-// The parent loop becomes loop0; its body steps 1 and 2 each become a
+// The parent loop becomes loop0; its frames 1 and 2 each become a
 // child module (loop0_loop1, loop0_loop2). The parent FSM (loop0_fsm)
 // must contain BOTH WAIT_1/POST_1 and WAIT_2/POST_2.
 
@@ -80,11 +99,11 @@ module {
 // CHECK-DAG: child_start_1
 // CHECK-DAG: post_active_0
 // CHECK-DAG: post_active_1
-// CHECK-DAG: fsm.state @STEP_0
-// CHECK-DAG: fsm.state @STEP_1
+// CHECK-DAG: fsm.state @FRAME_0
+// CHECK-DAG: fsm.state @FRAME_1
 // CHECK-DAG: fsm.state @WAIT_1
 // CHECK-DAG: fsm.state @POST_1
-// CHECK-DAG: fsm.state @STEP_2
+// CHECK-DAG: fsm.state @FRAME_2
 // CHECK-DAG: fsm.state @WAIT_2
 // CHECK-DAG: fsm.state @POST_2
 

@@ -1699,6 +1699,22 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       return WalkResult::advance();
     });
 
+    // Forward each at's external results from its yield operands, so that
+    // the frame body yield (whose operands reference at results) can be
+    // resolved below. The leaf-frame path already does this inside
+    // lowerFrameBody, but the wait-frame paths lowered their ops directly
+    // into the module — we need to patch the at-result mapping here.
+    for (auto atOp : frameOp.getBodyBlock().getOps<LoopScheduleAtOp>()) {
+      auto atYield = atOp.getYieldOp();
+      for (auto [res, val] :
+           llvm::zip(atOp.getResults(), atYield.getOperands())) {
+        if (localMapping.lookupOrNull(res))
+          continue;
+        if (auto mapped = localMapping.lookupOrNull(val))
+          localMapping.map(res, mapped);
+      }
+    }
+
     // Map frame results. First save the combinational aliases (keyed on the
     // frameOp result value), then — if this frame has a capture gate —
     // create per-operand hardware registers and point the mapping at those
@@ -2719,6 +2735,20 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
               memInfo.isLocalMem)
             localLoadResults.insert(loadOp.getResult());
       });
+
+      // Forward each at's external results from its yield operands so the
+      // frame body yield (whose operands reference at results) resolves.
+      for (auto atOp :
+           topFrames[frameIdx].getBodyBlock().getOps<LoopScheduleAtOp>()) {
+        auto atYield = atOp.getYieldOp();
+        for (auto [res, val] :
+             llvm::zip(atOp.getResults(), atYield.getOperands())) {
+          if (mapping.lookupOrNull(res))
+            continue;
+          if (auto m = mapping.lookupOrNull(val))
+            mapping.map(res, m);
+        }
+      }
 
       auto frameYieldOp = cast<LoopScheduleYieldOp>(
           topFrames[frameIdx].getBodyBlock().getTerminator());

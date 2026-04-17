@@ -12,18 +12,25 @@ module {
     %c1_i3 = arith.constant 1 : i3
     %c-1_i3 = arith.constant -1 : i3
     %alloc = memref.alloc() : memref<2x3x4xi8>
-    loopschedule.step {
-      loopschedule.sequential trip_count = 4
-          iter_args(%i = %c0_i3) : (i3) -> () {
-        %0:2 = loopschedule.step {
-          %cond = arith.cmpi ult, %i, %c-1_i3 : i3
-          loopschedule.store %c42, %alloc[%c0_i1, %c0_i2, %i : i1, i2, i3] : memref<2x3x4xi8>
-          %next = arith.addi %i, %c1_i3 : i3
-          loopschedule.iter_arg_update %i = %next : i3
-          loopschedule.register %next, %cond : i3, i1
-        } : i3, i1
-        loopschedule.terminator condition(%0#1), results()
+    loopschedule.frame {
+      loopschedule.at 0 {
+        loopschedule.sequential trip_count = 4
+            iter_args(%i = %c0_i3) : (i3) -> () {
+          %cond, %next = loopschedule.frame -> (i1, i3) {
+            %r:2 = loopschedule.at 0 -> (i1, i3) {
+              %c = arith.cmpi ult, %i, %c-1_i3 : i3
+              loopschedule.store %c42, %alloc[%c0_i1, %c0_i2, %i : i1, i2, i3] : memref<2x3x4xi8>
+              %n = arith.addi %i, %c1_i3 : i3
+              loopschedule.iter_arg_update %i = %n : i3
+              loopschedule.yield %c, %n : i1, i3
+            }
+            loopschedule.yield %r#0, %r#1 : i1, i3
+          }
+          loopschedule.terminator condition(%cond), results()
+        }
+        loopschedule.yield
       }
+      loopschedule.yield
     }
     return
   }

@@ -9,30 +9,48 @@ module {
     %c0_i4 = arith.constant 0 : i4
     %c1_i4 = arith.constant 1 : i4
     %c-8_i4 = arith.constant -8 : i4
-    loopschedule.step {
-      loopschedule.sequential trip_count = 8
-          iter_args(%i = %c0_i4) : (i4) -> () {
-        %outer:2 = loopschedule.step {
-          %icond = arith.cmpi ult, %i, %c-8_i4 : i4
-          loopschedule.sequential trip_count = 8
-              iter_args(%j = %c0_i4) : (i4) -> () {
-            %inner:2 = loopschedule.step {
-              %jcond = arith.cmpi ult, %j, %c-8_i4 : i4
-              %ie = arith.trunci %i : i4 to i3
-              %je = arith.trunci %j : i4 to i3
-              loopschedule.store %c0_i32, %arg0[%ie, %je : i3, i3] : memref<8x8xi32>
-              %jnext = arith.addi %j, %c1_i4 : i4
-              loopschedule.iter_arg_update %j = %jnext : i4
-              loopschedule.register %jnext, %jcond : i4, i1
-            } : i4, i1
-            loopschedule.terminator condition(%inner#1), results()
+    loopschedule.frame {
+      loopschedule.at 0 {
+        loopschedule.sequential trip_count = 8
+            iter_args(%i = %c0_i4) : (i4) -> () {
+          // Frame 0: compute cond + iter update + a narrow copy of `%i`.
+          %icond, %ie = loopschedule.frame -> (i1, i3) {
+            %r:2 = loopschedule.at 0 -> (i1, i3) {
+              %c = arith.cmpi ult, %i, %c-8_i4 : i4
+              %ie_local = arith.trunci %i : i4 to i3
+              %n = arith.addi %i, %c1_i4 : i4
+              loopschedule.iter_arg_update %i = %n : i4
+              loopschedule.yield %c, %ie_local : i1, i3
+            }
+            loopschedule.yield %r#0, %r#1 : i1, i3
           }
-          %inext = arith.addi %i, %c1_i4 : i4
-          loopschedule.iter_arg_update %i = %inext : i4
-          loopschedule.register %inext, %icond : i4, i1
-        } : i4, i1
-        loopschedule.terminator condition(%outer#1), results()
+          // Frame 1: houses the inner (nested) sequential loop in at 0.
+          loopschedule.frame {
+            loopschedule.at 0 {
+              loopschedule.sequential trip_count = 8
+                  iter_args(%j = %c0_i4) : (i4) -> () {
+                %jcond, %jnext = loopschedule.frame -> (i1, i4) {
+                  %r:2 = loopschedule.at 0 -> (i1, i4) {
+                    %c = arith.cmpi ult, %j, %c-8_i4 : i4
+                    %je = arith.trunci %j : i4 to i3
+                    loopschedule.store %c0_i32, %arg0[%ie, %je : i3, i3] : memref<8x8xi32>
+                    %n = arith.addi %j, %c1_i4 : i4
+                    loopschedule.iter_arg_update %j = %n : i4
+                    loopschedule.yield %c, %n : i1, i4
+                  }
+                  loopschedule.yield %r#0, %r#1 : i1, i4
+                }
+                loopschedule.terminator condition(%jcond), results()
+              }
+              loopschedule.yield
+            }
+            loopschedule.yield
+          }
+          loopschedule.terminator condition(%icond), results()
+        }
+        loopschedule.yield
       }
+      loopschedule.yield
     }
     return
   }

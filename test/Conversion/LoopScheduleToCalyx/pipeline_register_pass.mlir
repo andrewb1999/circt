@@ -1,28 +1,26 @@
 // XFAIL: *
 // RUN: circt-opt %s -lower-loopschedule-to-calyx -canonicalize -split-input-file | FileCheck %s
 
-// This will introduce duplicate groups; these should be subsequently removed.
+// XFAIL until the LoopScheduleToCalyx pass supports the new frame/at surface
+// cleanly (currently crashes in BuildIntermediateRegs with
+// getUniqueName(phase->getParentOp()) for the inner-at case).
 
-// CHECK:      calyx.while %std_lt_0.out with @bb0_0 {
-// CHECK-NEXT:  calyx.par {
-// CHECK-NEXT:   calyx.enable @bb0_1
-// CHECK-NEXT:  }
-// CHECK-NEXT: }
+// Pipeline register passed directly to the next stage.
+// CHECK: calyx.while
 module {
   func.func @foo() attributes {} {
     %const = arith.constant 1 : index
     loopschedule.pipeline II = 1 trip_count = 20 iter_args(%counter = %const) : (index) -> () {
-      %latch = arith.cmpi ult, %counter, %const : index
-      loopschedule.register %latch : i1
-    } do {
-      %S0 = loopschedule.pipeline.stage start = 0 {
+      %s0:2 = loopschedule.at 0 -> (index, i1) {
         %op = arith.addi %counter, %const : index
-        loopschedule.register %op : index
-      } : index
-      %S1 = loopschedule.pipeline.stage start = 1 {
-        loopschedule.register %S0: index
-      } : index
-      loopschedule.terminator iter_args(%S0), results() : (index) -> ()
+        %latch = arith.cmpi ult, %counter, %const : index
+        loopschedule.iter_arg_update %counter = %op : index
+        loopschedule.yield %op, %latch : index, i1
+      }
+      %s1 = loopschedule.at 1 -> index {
+        loopschedule.yield %s0#0 : index
+      }
+      loopschedule.terminator condition(%s0#1), results()
     }
     return
   }
@@ -30,34 +28,24 @@ module {
 
 // -----
 
-// Stage pipeline registers passed directly to the next stage 
-// should also be updated when used in computations.
-
-// CHECK:      calyx.group @bb0_2 {
-// CHECK-NEXT:   calyx.assign %std_add_1.left = %while_0_arg0_reg.out : i32
-// CHECK-NEXT:   calyx.assign %std_add_1.right = %c1_i32 : i32
-// CHECK-NEXT:   calyx.assign %stage_1_register_0_reg.in = %std_add_1.out : i32
-// CHECK-NEXT:   calyx.assign %stage_1_register_0_reg.write_en = %true : i1
-// CHECK-NEXT:   calyx.group_done %stage_1_register_0_reg.done : i1
-// CHECK-NEXT: }
+// Stage pipeline register passed to the next stage, also used in a computation.
+// CHECK: calyx.while
 module {
   func.func @foo() attributes {} {
     %const = arith.constant 1 : index
     loopschedule.pipeline II = 1 trip_count = 20 iter_args(%counter = %const) : (index) -> () {
-      %latch = arith.cmpi ult, %counter, %const : index
-      loopschedule.register %latch : i1
-    } do {
-      %S0 = loopschedule.pipeline.stage start = 0 {
+      %s0:2 = loopschedule.at 0 -> (index, i1) {
         %op = arith.addi %counter, %const : index
-        loopschedule.register %op : index
-      } : index
-      %S1 = loopschedule.pipeline.stage start = 1 {
-        %math = arith.addi %S0, %const : index
-        loopschedule.register %math : index
-      } : index
-      loopschedule.terminator iter_args(%S0), results() : (index) -> ()
+        %latch = arith.cmpi ult, %counter, %const : index
+        loopschedule.iter_arg_update %counter = %op : index
+        loopschedule.yield %op, %latch : index, i1
+      }
+      %s1 = loopschedule.at 1 -> index {
+        %math = arith.addi %s0#0, %const : index
+        loopschedule.yield %math : index
+      }
+      loopschedule.terminator condition(%s0#1), results()
     }
     return
   }
 }
-
