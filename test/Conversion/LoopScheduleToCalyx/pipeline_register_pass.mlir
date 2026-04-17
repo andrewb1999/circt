@@ -1,12 +1,10 @@
-// XFAIL: *
 // RUN: circt-opt %s -lower-loopschedule-to-calyx -canonicalize -split-input-file | FileCheck %s
 
-// XFAIL until the LoopScheduleToCalyx pass supports the new frame/at surface
-// cleanly (currently crashes in BuildIntermediateRegs with
-// getUniqueName(phase->getParentOp()) for the inner-at case).
-
-// Pipeline register passed directly to the next stage.
-// CHECK: calyx.while
+// Pipeline register passed directly to the next stage. The pipeline has a
+// known trip count, so the pass emits `calyx.static_repeat` (not a while
+// loop) wrapping the stages.
+// CHECK-LABEL: calyx.component @foo
+// CHECK: calyx.static_repeat
 module {
   func.func @foo() attributes {} {
     %const = arith.constant 1 : index
@@ -29,7 +27,8 @@ module {
 // -----
 
 // Stage pipeline register passed to the next stage, also used in a computation.
-// CHECK: calyx.while
+// CHECK-LABEL: calyx.component @foo
+// CHECK: calyx.static_repeat
 module {
   func.func @foo() attributes {} {
     %const = arith.constant 1 : index

@@ -20,6 +20,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
+#include "circt/Dialect/LoopSchedule/Utils.h"
 #include "circt/Dialect/SV/SVDialect.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
@@ -64,6 +65,227 @@ using namespace circt::loopschedule;
 
 namespace circt {
 namespace loopscheduletocalyx {
+
+/// Check whether a type is a `!loopschedule.handle`. Handle-typed values are
+/// scheduling metadata with no Calyx/HW representation.
+static bool isHandleType(mlir::Type type) {
+  return isa<loopschedule::HandleType>(type);
+}
+
+/// Pre-process the function to dissolve the new `loopschedule.launch` /
+/// `loopschedule.await` scaffolding introduced by SCFToLoopSchedule's
+/// frame-per-problem emitter. The Calyx pass's existing scheduler was
+/// designed for the pre-frame shape (loops at the function top level, or
+/// nested loops inside an enclosing frame's at 0 body); this pass dissolves
+/// the launch/await wrappers so the existing plumbing keeps working.
+///
+/// Handled patterns (per-function):
+/// - `%h = loopschedule.frame -> (!loopschedule.handle) { %lh =
+///   loopschedule.launch at K { <loop>; yield }; yield %lh }`
+///   becomes the inlined `<loop>` at the position of the frame. The handle
+///   value is recorded in `handleValueMap` keyed to the loop's results. The
+///   frame's `at K` offset is currently required to be 0 (non-zero offsets
+///   at the func level are not produced by SCFToLoopSchedule in practice).
+/// - `loopschedule.frame { loopschedule.await %h; yield } do { yield }`
+///   (empty-body await frame) is erased.
+/// - `%v... = loopschedule.frame -> (T...) { %r... = loopschedule.await %h
+///   -> T...; yield %r... } do (%a: T...) { ... yield %y: T... }`
+///   where the body simply forwards the awaited values — the frame result
+///   is rewired to the launch's stashed values via `handleValueMap` and
+///   the frame is erased.
+///
+/// Returns failure only if an unsupported pattern is encountered.
+static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
+  using namespace mlir;
+  IRRewriter rewriter(funcOp.getContext());
+
+  // handle SSA value -> list of SSA values produced by the launched child.
+  DenseMap<Value, SmallVector<Value>> handleValueMap;
+
+  // Walk top-level ops in the function body in order. We only recognize
+  // frames that appear directly in the function's entry block (the common
+  // case after SCFToLoopSchedule).
+  auto *entryBlock = &funcOp.getFunctionBody().front();
+  SmallVector<LoopScheduleFrameOp> frames;
+  for (auto &op : *entryBlock)
+    if (auto frame = dyn_cast<LoopScheduleFrameOp>(&op))
+      frames.push_back(frame);
+
+  for (auto frame : frames) {
+    // Separate the frame into its await-region content (should only contain
+    // await ops + a yield) and its body-region content (launches/ats + a
+    // yield).
+    Block &awaitBlock = frame.getAwaitBlock();
+    Block &bodyBlock = frame.getBodyBlock();
+
+    // Resolve awaits in the await region: map each await's results to the
+    // stashed launch outputs. Collect the yield's operands and stash them so
+    // they can be forwarded to the body-block entry args.
+    SmallVector<Value> awaitYieldedVals;
+    for (Operation &op :
+         llvm::make_early_inc_range(awaitBlock.getOperations())) {
+      if (auto awaitOp = dyn_cast<LoopScheduleAwaitOp>(&op)) {
+        SmallVector<Value> childVals;
+        for (Value h : awaitOp.getHandles()) {
+          auto it = handleValueMap.find(h);
+          if (it != handleValueMap.end())
+            for (Value v : it->second)
+              childVals.push_back(v);
+        }
+        for (auto [idx, res] : llvm::enumerate(awaitOp.getResults())) {
+          if (idx < childVals.size())
+            res.replaceAllUsesWith(childVals[idx]);
+        }
+        awaitOp.erase();
+      }
+    }
+    if (auto awaitYield =
+            dyn_cast<LoopScheduleYieldOp>(awaitBlock.getTerminator()))
+      awaitYieldedVals.assign(awaitYield.getOperands().begin(),
+                              awaitYield.getOperands().end());
+
+    // Look at the body region. Three shapes:
+    //   (a) body = { launch at K { <loop>; yield }; yield %lh : handle }
+    //       -> move <loop> to be a sibling of the frame, stash results under
+    //          the handle, replace the frame's handle result with %lh's
+    //          mapping (the loop's results, though handles have no use).
+    //   (b) body has no launch and no non-trivial work (just yield) — just
+    //       forward block-arg uses through the await-yielded values and erase
+    //       the frame.
+    //   (c) body forwards block-arg values (mapped from await) to a frame
+    //       result via at ops / yields — rewire directly.
+    //
+    // We pick the simplest cases first.
+    auto launches = loopschedule::getLaunchOpsInOrder(frame);
+    auto bodyYield =
+        cast<LoopScheduleYieldOp>(bodyBlock.getTerminator());
+
+    // Bind body-block entry args to the await-yielded values (the frame's
+    // body block gets its args from the await region's yield).
+    for (auto [arg, val] :
+         llvm::zip(bodyBlock.getArguments(), awaitYieldedVals)) {
+      arg.replaceAllUsesWith(val);
+    }
+
+    if (!launches.empty()) {
+      if (launches.size() != 1)
+        return frame.emitOpError(
+            "dissolveLaunchesAndAwaits: multiple launches per frame are not "
+            "yet supported in the Calyx lowering");
+      auto launch = launches.front();
+      if (launch.getOffset() != 0)
+        return launch.emitOpError(
+            "dissolveLaunchesAndAwaits: launches at non-zero offset are not "
+            "yet supported in the Calyx lowering");
+
+      // Find the single child loop op inside the launch body.
+      Operation *childLoop = nullptr;
+      for (Operation &op : launch.getBodyBlock().getOperations()) {
+        if (isa<LoopScheduleYieldOp>(op))
+          continue;
+        if (childLoop)
+          return launch.emitOpError(
+              "dissolveLaunchesAndAwaits: launch body must contain exactly "
+              "one child op before the yield");
+        childLoop = &op;
+      }
+      if (!childLoop)
+        return launch.emitOpError(
+            "dissolveLaunchesAndAwaits: launch body has no child op");
+      if (!isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(childLoop))
+        return childLoop->emitOpError(
+            "dissolveLaunchesAndAwaits: expected sequential/pipeline child");
+
+      // Move the child loop to immediately before the enclosing frame.
+      childLoop->moveBefore(frame);
+
+      // Stash the child loop's results under the launch's handle so later
+      // awaits can resolve to them.
+      SmallVector<Value> childResults(childLoop->getResults().begin(),
+                                      childLoop->getResults().end());
+      handleValueMap[launch.getHandle()] = childResults;
+
+      // Propagate to the frame's own results if this frame simply yields the
+      // handle (common case). Find the handle's index in the body yield and
+      // rewrite the frame result.
+      for (auto [idx, yVal] :
+           llvm::enumerate(bodyYield.getOperands())) {
+        Value frameResult = frame.getResult(idx);
+        if (isHandleType(frameResult.getType())) {
+          // Stash the frame result as producing the same child values so a
+          // later frame awaiting this frame's result picks them up.
+          if (yVal == launch.getHandle())
+            handleValueMap[frameResult] = childResults;
+        } else {
+          // Non-handle frame results are forwarded directly.
+          if (auto yDef = yVal)
+            frameResult.replaceAllUsesWith(yDef);
+        }
+      }
+
+      // Erase the frame itself. All uses of handle-typed results are
+      // scheduling-only and should be consumed only by awaits; those awaits
+      // were already erased above (if they appeared in earlier frames in
+      // this function) — for later frames, the handleValueMap entry we just
+      // stored will be consumed when we process them.
+    } else {
+      // No launches in the body. Forward frame results from the body yield
+      // directly to non-handle-typed users.
+      for (auto [idx, yVal] :
+           llvm::enumerate(bodyYield.getOperands())) {
+        Value frameResult = frame.getResult(idx);
+        if (isHandleType(frameResult.getType()))
+          continue;
+        frameResult.replaceAllUsesWith(yVal);
+      }
+    }
+
+    // Before erasing the frame, make sure its remaining results have no
+    // uses. Handle-typed results may still have uses if this frame's handle
+    // feeds a frame we haven't processed yet; by construction we process
+    // frames in order, so the consuming await has already been erased above
+    // when we processed the earlier frame. If there is still a use, it's a
+    // real error — but we may have handle-typed uses in a future frame's
+    // await region that we haven't visited yet. Defer erasure in that case.
+    bool hasRemainingUses = false;
+    for (Value r : frame.getResults()) {
+      if (!r.use_empty()) {
+        hasRemainingUses = true;
+        break;
+      }
+    }
+    if (!hasRemainingUses) {
+      frame.erase();
+    } else {
+      // Can't erase yet — but we've moved the loop out of it. Strip the body
+      // so the frame becomes trivially lowerable/removable. In practice
+      // this branch should only trigger for handle-typed results consumed
+      // later, so it's safe to leave the (now-empty) frame; a later
+      // iteration of this loop will handle it once the consumers are gone.
+      // Re-scan: after all frames are processed, do a cleanup pass.
+    }
+  }
+
+  // Cleanup pass: erase any remaining now-empty frames whose results are
+  // all unused or handle-typed with no live consumers.
+  SmallVector<LoopScheduleFrameOp> leftover;
+  for (auto &op : *entryBlock)
+    if (auto f = dyn_cast<LoopScheduleFrameOp>(&op))
+      leftover.push_back(f);
+  for (auto frame : llvm::reverse(leftover)) {
+    bool allDead = true;
+    for (Value r : frame.getResults()) {
+      if (!r.use_empty() && !isHandleType(r.getType())) {
+        allDead = false;
+        break;
+      }
+    }
+    if (allDead)
+      frame.erase();
+  }
+
+  return success();
+}
 
 /// Compute the body latency of a pipelined loop: the number of cycles
 /// between the start of an iteration and when the last stage's results are
@@ -3356,6 +3578,26 @@ class CleanupFuncOps : public calyx::FuncOpPartialLoweringPattern {
                                 PatternRewriter &rewriter) const override {
     auto compOp = functionMapping[funcOp];
     compOp.setName(funcOp.getName());
+
+    // The func body may still contain residual `loopschedule.*` ops (the
+    // pass moves work into the Calyx component but leaves the source
+    // scheduling ops behind). These ops can have SSA operands that point
+    // at values in the component; those are cross-region uses and do not
+    // block erasure. But within the func body, ops may have SSA uses on
+    // other ops also in the func body — in that case the default cascade
+    // erase would fail (`op has no uses` assertion) because MLIR's erase
+    // order isn't deterministic for operand-produced SSA values across
+    // regions within the same op tree.
+    //
+    // Explicitly walk the func body and drop all uses (replace results
+    // with null / poison) before erasing. `dropAllUses()` detaches SSA
+    // users; after that we can drop definitions and erase safely.
+    funcOp.walk<mlir::WalkOrder::PostOrder>([&](mlir::Operation *op) {
+      if (op == funcOp.getOperation())
+        return;
+      op->dropAllUses();
+      op->dropAllReferences();
+    });
     rewriter.eraseOp(funcOp);
     return success();
   }
@@ -3550,6 +3792,22 @@ void LoopScheduleToCalyxPass::runOnOperation() {
   if (failed(setTopLevelFunction(getOperation(), topLevelFunction))) {
     signalPassFailure();
     return;
+  }
+
+  /// Pre-process: dissolve `loopschedule.launch` / `loopschedule.await` /
+  /// enclosing frames into the flat shape the rest of this pass expects.
+  /// Done before `labelEntryPoint` so downstream conversion patterns don't
+  /// see launch/await ops.
+  {
+    auto res = getOperation().walk([&](func::FuncOp funcOp) {
+      if (failed(dissolveLaunchesAndAwaits(funcOp)))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    if (res.wasInterrupted()) {
+      signalPassFailure();
+      return;
+    }
   }
 
   /// Start conversion

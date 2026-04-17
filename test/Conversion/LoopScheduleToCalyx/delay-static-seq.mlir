@@ -1,23 +1,29 @@
 // XFAIL: *
 // RUN: circt-opt --lower-loopschedule-to-calyx %s | FileCheck %s
 
-// Hand-crafted sequential loop whose frame contains an `at 2` region wrapping
-// a store. The Calyx lowering should emit the frame's body as a static_par
-// containing a static_seq { at_pad ; static_par { body } } so the inner
+// Sequential loop whose body-frame contains an `at 2` region wrapping a
+// store. The Calyx lowering should emit the frame's body as a static_par
+// containing a static_seq { at_pad; static_par { body } } so the inner
 // store fires two cycles into the enclosing frame.
 //
-// XFAIL until LoopScheduleToCalyx handles the new frame/at surface — the
-// pass currently crashes in BuildIntermediateRegs with
-// getUniqueName(phase->getParentOp()) when creating a register for an `at`
-// whose parent is a frame (i.e. any sequential-loop body in the new form).
+// The outer sequential loop lives inside a `loopschedule.launch at 0` in a
+// top-level frame (new surface). A trailing `await` frame consumes the
+// launch's handle.
+//
+// Expected-failure rationale: the greedy-pattern canonicalizer run inside
+// the Calyx pass trips on a null operand during an Operation::fold for
+// the at-K offset padding emission (Matchers.h:491 assertion `value`).
+// The other two Calyx tests exercise the launch/await surface and pass;
+// this one specifically tests the at-K pad group path and needs deeper
+// investigation separately.
 
 module {
   func.func @delay_step(%arg0: memref<16xi32>) attributes {top} {
     %c0_i32 = arith.constant 0 : i32
     %c10_i32 = arith.constant 10 : i32
     %c1_i32 = arith.constant 1 : i32
-    loopschedule.frame {
-      loopschedule.at 0 {
+    %h = loopschedule.frame -> (!loopschedule.handle) {
+      %lh = loopschedule.launch at 0 : !loopschedule.handle {
         loopschedule.sequential trip_count = 10 iter_args(%i = %c0_i32) : (i32) -> () {
           %cond, %next = loopschedule.frame -> (i1, i32) {
             %r:2 = loopschedule.at 0 -> (i1, i32) {
@@ -36,6 +42,12 @@ module {
         }
         loopschedule.yield
       }
+      loopschedule.yield %lh : !loopschedule.handle
+    }
+    loopschedule.frame {
+      loopschedule.await %h
+      loopschedule.yield
+    } do {
       loopschedule.yield
     }
     return
