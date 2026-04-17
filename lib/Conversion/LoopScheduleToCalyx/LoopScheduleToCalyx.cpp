@@ -2187,6 +2187,13 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
           value = yieldOp->getOperand(resNum);
         }
 
+        // Skip `!loopschedule.handle`-typed yield operands entirely. These
+        // are scheduling metadata forwarded from launches / frame results
+        // and have no HW representation. Neither the intermediate-reg nor
+        // the iter-arg reuse paths make sense for them.
+        if (isHandleType(value.getType()))
+          continue;
+
         // For a frame's body yield, the operand is typically a
         // `loopschedule.at` result. Downstream code (seq cond wire-moves,
         // iter-arg-update reuse, cond-reg reuse) needs the innermost
