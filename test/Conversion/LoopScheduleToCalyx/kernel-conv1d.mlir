@@ -1,12 +1,20 @@
 // RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule),lower-loopschedule-to-calyx)" %s | FileCheck %s
 
 // XFAIL: *
-// End-to-end 1-D convolution. Fails in BuildIntermediateRegs with
-// `assertion phaseRegs[phase].count(idx) == 0` — a phase register for an
-// accumulator iter-arg is added twice because the outer loop reinitializes
-// the inner accumulator each iteration. Distinct from the frame
-// dynamic-child issue already fixed for gemv/gemm/transpose/outer_product;
-// needs targeted handling of reset-each-outer-iteration accumulators.
+// End-to-end 1-D convolution. Unique among the nested-loop kernels
+// because the inner reduction's ACCUMULATOR is forwarded out via an
+// `await %h -> i32` in the outer loop, and that awaited value is then
+// stored to B[i]. gemv/gemm/transpose/outer_product all communicate
+// inner-loop results through memory side-effects (pure-barrier awaits,
+// no `-> T` on the await); the Calyx dissolve's current move-loop-into-
+// at-0 strategy is fine for those but produces a cross-region SSA
+// dominance violation here, because the awaited value (defined inside
+// the moved inner sequential) would need to be accessible from a
+// sibling frame's await region. BuildIntermediateRegs trips on a
+// duplicate phase-register registration as the downstream fallout of
+// this malformed IR. Needs a restructuring of the dissolve (e.g., move
+// the inner seq into the consuming frame's block, or lift iter-args up
+// a level) to forward SSA values across frames cleanly.
 // CHECK: calyx.component @conv1d
 
 func.func @conv1d(%A: memref<16xi32>, %K: memref<4xi32>, %B: memref<16xi32>) attributes {top} {
