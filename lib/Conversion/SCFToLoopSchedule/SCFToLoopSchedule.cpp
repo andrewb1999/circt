@@ -1216,115 +1216,6 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
     startTimes.push_back(group.first);
   llvm::sort(startTimes);
 
-  // === Bucket merge for multi-cycle frame emission ===
-  //
-  // When `enableDelayMerging` is on, coalesce groups whose start times fall
-  // within an earlier group's running latency into a single multi-cycle
-  // frame. The base group's ops live in the frame's `at 0` body; merged
-  // groups are placed in `at K` bodies where K is the offset within the
-  // frame.
-  //
-  // After the merge, `startGroups[t]` only contains the offset-0 ops for the
-  // bucket whose baseTime is `t`, and `delayOffsetGroups[t]` (only set for
-  // base times of merged buckets) contains a map from offset>0 to the ops
-  // that should appear inside the matching `at K` region.
-  DenseMap<uint32_t, std::map<uint32_t, SmallVector<Operation *>>>
-      delayOffsetGroups;
-  if (enableDelayMerging) {
-    auto opLatency = [&](Operation *op) -> uint32_t {
-      auto opr = problem.getLinkedOperatorType(op);
-      if (!opr)
-        return 1;
-      auto lat = problem.getLatency(*opr);
-      return lat.value_or(1);
-    };
-    auto groupMaxLat = [&](ArrayRef<Operation *> g) -> uint32_t {
-      uint32_t m = 1;
-      for (auto *op : g)
-        m = std::max(m, opLatency(op));
-      return m;
-    };
-    auto groupContainsLoop = [](ArrayRef<Operation *> g) {
-      for (auto *op : g)
-        if (isa<LoopInterface>(op))
-          return true;
-      return false;
-    };
-
-    // Collect ops that produce loop iter_args (operands of the after-body
-    // terminator). These must remain at offset 0 of their bucket so the
-    // existing iter_arg plumbing keeps working.
-    DenseSet<Operation *> iterArgProducers;
-    for (auto &operand : anchor->getOpOperands()) {
-      if (auto *def = operand.get().getDefiningOp())
-        iterArgProducers.insert(def);
-    }
-    auto groupHasIterArgProducer = [&](ArrayRef<Operation *> g) {
-      for (auto *op : g)
-        if (iterArgProducers.count(op))
-          return true;
-      return false;
-    };
-
-    struct StepBucket {
-      uint32_t baseTime;
-      uint32_t latency;
-      std::map<uint32_t, SmallVector<Operation *>> opsByOffset;
-    };
-    SmallVector<StepBucket> buckets;
-    for (auto t : startTimes) {
-      auto &group = startGroups[t];
-      uint32_t lat = groupMaxLat(group);
-      bool merged = false;
-      if (!group.empty() && !groupContainsLoop(group) &&
-          !groupHasIterArgProducer(group)) {
-        for (auto &b : llvm::reverse(buckets)) {
-          auto it0 = b.opsByOffset.find(0);
-          if (it0 != b.opsByOffset.end() && groupContainsLoop(it0->second))
-            continue;
-          if (b.baseTime <= t && t < b.baseTime + b.latency) {
-            uint32_t off = t - b.baseTime;
-            b.opsByOffset[off].append(group.begin(), group.end());
-            uint32_t newLat = off + lat;
-            if (newLat > b.latency)
-              b.latency = newLat;
-            merged = true;
-            break;
-          }
-        }
-      }
-      if (!merged) {
-        StepBucket b;
-        b.baseTime = t;
-        b.latency = lat;
-        b.opsByOffset[0] = group;
-        buckets.push_back(b);
-      }
-    }
-
-    // Rewrite startGroups / startTimes to contain only bucket baseTimes with
-    // their offset-0 ops, and stash offset>0 groups in `delayOffsetGroups`.
-    DenseSet<uint32_t> bucketBases;
-    for (auto &b : buckets)
-      bucketBases.insert(b.baseTime);
-    SmallVector<unsigned> toErase;
-    for (auto &kv : startGroups)
-      if (!bucketBases.count(kv.first))
-        toErase.push_back(kv.first);
-    for (auto t : toErase)
-      startGroups.erase(t);
-    for (auto &b : buckets) {
-      startGroups[b.baseTime] = b.opsByOffset[0];
-      for (auto &kv : b.opsByOffset)
-        if (kv.first != 0)
-          delayOffsetGroups[b.baseTime][kv.first] = kv.second;
-    }
-    startTimes.clear();
-    for (auto &b : buckets)
-      startTimes.push_back(b.baseTime);
-    llvm::sort(startTimes);
-  }
-
   DenseMap<uint32_t, SmallVector<Value>> reregisterValues;
 
   // Track which frame result holds the condition value, set during frame
@@ -1332,133 +1223,391 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
   Value sequentialCondResult;
   Operation *condOp = condValue.getDefiningOp();
   DominanceInfo dom(getOperation());
-  for (auto i : enumerate(startTimes)) {
-    auto startTime = i.value();
-    auto group = startGroups[startTime];
-    OpBuilder::InsertionGuard g(builder);
 
-    auto isLoopTerminator = [loop](Operation *op) {
-      return isa<YieldOp>(op) && op->getParentOp() == loop;
-    };
-
-    // Collect the return types for this stage. Operations whose results are not
-    // exclusively used within this stage are returned.
-    SmallVector<Type> stepTypes;
-    DenseSet<Operation *> opsWithReturns;
-    for (auto *op : group) {
-      bool needsReturn = false;
-      SmallVector<Operation *, 10> users;
-      users.append(op->getUsers().begin(), op->getUsers().end());
-      for (auto res : op->getResults()) {
-        auto predUsers = predicateUse.lookup(res);
-        users.append(predUsers.begin(), predUsers.end());
-      }
-      for (auto *user : users) {
-        auto *userOrAncestor = loop.getAfter().findAncestorOpInRegion(*user);
-        auto startTimeOpt = problem.getStartTime(userOrAncestor);
-        if ((startTimeOpt.has_value() && *startTimeOpt > startTime) ||
-            isLoopTerminator(user)) {
-          needsReturn = true;
-          break;
-        }
-      }
-
-      // The condition op must always be forwarded as a step result: its
-      // consumer is the loopschedule.terminator (not yet created), so the
-      // user-based check above won't detect it.
-      if (op == condOp)
-        needsReturn = true;
-
-      if (needsReturn && !opsWithReturns.contains(op)) {
-        opsWithReturns.insert(op);
-        stepTypes.append(op->getResultTypes().begin(),
-                         op->getResultTypes().end());
-      }
-
-      // Add return types for iter_args that are updated in this step but have
-      // later uses.
-      for (auto &operand : anchor->getOpOperands()) {
-        auto iterArgNum = operand.getOperandNumber();
-        auto iterArg = loop.getAfterArguments()[iterArgNum];
-        if (operand.get().getDefiningOp() == op &&
-            valueHasLaterUse(iterArg, startTime)) {
-          stepTypes.push_back(iterArg.getType());
-        }
-      }
-    }
-
-    // Add return types for values we already know need to be reregistered.
-    for (auto val : reregisterValues[startTime]) {
-      stepTypes.push_back(val.getType());
-    }
-
-    // Delay-region exports: each op in a delay region whose result has any
-    // user with a later original startTime needs its result to escape via
-    // the delay's register AND become a step result. We follow the same
-    // criterion as opsWithReturns above; in-bucket higher-offset uses are a
-    // (harmless) false positive — they'd already get the value via the
-    // delay op's own result through valueMap.
-    SmallVector<Operation *> delayExportOps; // ops whose results escape the step
-    DenseMap<Operation *, unsigned>
-        delayExportFirstStepIdx; // op → first step result index
-    if (delayOffsetGroups.count(startTime)) {
-      for (auto &offsetEntry : delayOffsetGroups[startTime]) {
-        for (auto *op : offsetEntry.second) {
-          bool exports = false;
-          for (auto *user : op->getUsers()) {
-            auto *ua = loop.getAfter().findAncestorOpInRegion(*user);
-            auto ut = problem.getStartTime(ua);
-            if ((ut.has_value() && *ut > startTime) ||
-                isLoopTerminator(user)) {
-              exports = true;
-              break;
+  // === Partition buckets into phases using the SSA-dep rule. ===
+  //
+  // Walk buckets in startTimes order. A new phase starts when the current
+  // bucket (or a recursively-traversed dependent op in the same bucket)
+  // uses the SSA result of any LoopInterface op from an earlier bucket in
+  // the current phase. Otherwise the bucket merges into the current phase.
+  //
+  // This keeps "cmpi + addi + launch" (common in AMC's sequential outer
+  // loops) in one phase and only splits when a later bucket genuinely
+  // consumes a launch's SSA result.
+  SmallVector<SmallVector<unsigned>> phases;
+  {
+    DenseSet<Operation *> loopOpsInCurrentPhase;
+    SmallVector<unsigned> currentPhase;
+    auto bucketDependsOnLoopInPhase = [&](ArrayRef<Operation *> group) {
+      if (loopOpsInCurrentPhase.empty())
+        return false;
+      // Check each op (and its children) in the bucket for any operand that
+      // is a result of a LoopInterface op already in the current phase.
+      for (auto *op : group) {
+        bool dep = false;
+        op->walk([&](Operation *inner) {
+          for (Value operand : inner->getOperands()) {
+            Operation *def = operand.getDefiningOp();
+            if (def && loopOpsInCurrentPhase.count(def)) {
+              dep = true;
+              return WalkResult::interrupt();
             }
           }
-          if (exports) {
-            delayExportFirstStepIdx[op] = stepTypes.size();
-            for (auto t : op->getResultTypes())
-              stepTypes.push_back(t);
-            delayExportOps.push_back(op);
+          return WalkResult::advance();
+        });
+        if (dep)
+          return true;
+      }
+      return false;
+    };
+    for (auto t : startTimes) {
+      auto &group = startGroups[t];
+      bool splitHere = bucketDependsOnLoopInPhase(group) &&
+                       !currentPhase.empty();
+      if (splitHere) {
+        phases.push_back(currentPhase);
+        currentPhase.clear();
+        loopOpsInCurrentPhase.clear();
+      }
+      currentPhase.push_back(t);
+      for (auto *op : group)
+        if (isa<LoopInterface>(op))
+          loopOpsInCurrentPhase.insert(op);
+    }
+    if (!currentPhase.empty())
+      phases.push_back(currentPhase);
+  }
+
+  // Per-frame bookkeeping: for each phase, we track the launch ops we created
+  // (to thread handles via await / terminator-await).
+  SmallVector<SmallVector<LoopScheduleLaunchOp>> phaseLaunches;
+  phaseLaunches.resize(phases.size());
+
+  // Map from bucket start-time to phase index. Lets the SSA-use checks below
+  // distinguish "user in a later phase" (need to forward via await) from
+  // "user in a later bucket within the same phase" (just map to cloned op).
+  DenseMap<uint32_t, size_t> bucketTimeToPhase;
+  for (auto phaseIdx : llvm::seq<size_t>(0, phases.size()))
+    for (auto t : phases[phaseIdx])
+      bucketTimeToPhase[t] = phaseIdx;
+
+  auto isLoopTerminator = [loop](Operation *op) {
+    return isa<YieldOp>(op) && op->getParentOp() == loop;
+  };
+
+  // Compute, for each original nested-loop op `lop`, the set of phase indices
+  // whose static ops consume a result of `lop`. Plus a flag for "consumed by
+  // the loop terminator". Used both to decide whether a forward is needed and
+  // when to emit the corresponding `await`.
+  auto computeLopUserPhases = [&](Operation *lop,
+                                  DenseSet<size_t> &userPhases,
+                                  bool &consumedByTerminator) {
+    userPhases.clear();
+    consumedByTerminator = false;
+    for (auto res : lop->getResults()) {
+      for (auto *user : res.getUsers()) {
+        if (isLoopTerminator(user)) {
+          consumedByTerminator = true;
+          continue;
+        }
+        auto *userOrAncestor = loop.getAfter().findAncestorOpInRegion(*user);
+        auto ut = problem.getStartTime(userOrAncestor);
+        if (!ut.has_value())
+          continue;
+        auto it = bucketTimeToPhase.find(*ut);
+        if (it != bucketTimeToPhase.end())
+          userPhases.insert(it->second);
+      }
+    }
+  };
+
+  // Pending launches: launches whose handle is still live (not yet fully
+  // awaited in a later phase) and whose results may still be needed for SSA
+  // forwards or as a barrier. Each entry tracks:
+  //   - origLoop: the original scf loop op
+  //   - currentHandle: the most-recent SSA handle Value (initially the frame
+  //     result; after being forwarded through subsequent frames, updated to
+  //     that frame's forwarded result)
+  //   - forwards: list of (resultIdx, origValue) pairs for SSA-forwarded
+  //     results. origValue is the original scf loop's result that downstream
+  //     phases want to consume.
+  //   - remainingUserPhases: phase indices (>= the launch's phase) that still
+  //     have a user that hasn't been awaited yet.
+  //   - terminatorPending: true if the loop terminator consumes a result and
+  //     has not yet been serviced.
+  struct PendingLaunch {
+    Operation *origLoop;
+    Value currentHandle;
+    SmallVector<std::pair<unsigned, Value>> forwards;
+    DenseSet<size_t> remainingUserPhases;
+    bool terminatorPending;
+  };
+  SmallVector<PendingLaunch> pendingLaunches;
+
+  // Bodies-per-phase: whether THIS phase's body needs to forward a particular
+  // pending launch's handle as a frame result (so a later phase can await it).
+  // Populated at the start of each phase based on remainingUserPhases.
+  // Tracks per-frame state for one phase; reset each iteration.
+
+  for (auto phaseIdx : llvm::seq<size_t>(0, phases.size())) {
+    auto &bucketTimes = phases[phaseIdx];
+    uint32_t phaseBase = bucketTimes.front();
+
+    // For each bucket we collect the static ops (non-LoopInterface) and the
+    // nested LoopInterface ops separately.
+    struct BucketContent {
+      uint32_t offset; // bucketTime - phaseBase
+      SmallVector<Operation *> staticOps;
+      SmallVector<Operation *> loopOps;
+    };
+    SmallVector<BucketContent> buckets;
+    for (auto t : bucketTimes) {
+      BucketContent bc;
+      bc.offset = t - phaseBase;
+      for (auto *op : startGroups[t]) {
+        if (isa<LoopInterface>(op))
+          bc.loopOps.push_back(op);
+        else
+          bc.staticOps.push_back(op);
+      }
+      buckets.push_back(std::move(bc));
+    }
+
+    // --- Compute frame result types ---
+    //
+    // Contributions, in order:
+    //  1) For each bucket (in offset order), for each static op in that
+    //     bucket: op results that need to escape the frame (used by a later
+    //     phase / loop-terminator / the seq-terminator condition), plus any
+    //     iter-arg values that need to escape.
+    //  2) Reregister values for this phase's base time.
+    //  3) For each launch in any bucket: its handle value if a downstream
+    //     phase will await it.
+
+    // For each bucket, record which ops need export + the index-in-frame of
+    // their first result.
+    struct StaticExport {
+      BucketContent *bucket;
+      Operation *op;
+      unsigned frameFirstIdx;
+    };
+    struct IterArgExport {
+      BucketContent *bucket;
+      Operation *op; // the op producing the iter-arg's new value
+      Value iterArg;
+      unsigned frameIdx;
+    };
+    SmallVector<StaticExport> staticExports;
+    SmallVector<IterArgExport> iterArgExports;
+    // Reregister exports (per-bucket-time).
+    SmallVector<std::pair<uint32_t, Value>> reregExports;
+    // Launches that need to produce a handle as a frame result.
+    SmallVector<unsigned> launchHandleIdx; // bucket-flat index i -> frame result idx
+    SmallVector<Type> stepTypes;
+
+    bool phaseHasCondOp = false;
+    for (auto &bc : buckets) {
+      for (auto *op : bc.staticOps) {
+        bool needsReturn = false;
+        SmallVector<Operation *, 10> users;
+        users.append(op->getUsers().begin(), op->getUsers().end());
+        for (auto res : op->getResults()) {
+          auto predUsers = predicateUse.lookup(res);
+          users.append(predUsers.begin(), predUsers.end());
+        }
+        for (auto *user : users) {
+          auto *userOrAncestor = loop.getAfter().findAncestorOpInRegion(*user);
+          auto startTimeOpt = problem.getStartTime(userOrAncestor);
+          if ((startTimeOpt.has_value() &&
+               *startTimeOpt > phaseBase + bc.offset) ||
+              isLoopTerminator(user)) {
+            needsReturn = true;
+            break;
+          }
+        }
+        if (op == condOp) {
+          needsReturn = true;
+          phaseHasCondOp = true;
+        }
+        if (needsReturn) {
+          StaticExport se{&bc, op, (unsigned)stepTypes.size()};
+          staticExports.push_back(se);
+          stepTypes.append(op->getResultTypes().begin(),
+                           op->getResultTypes().end());
+        }
+
+        // Check iter-arg exports: if this op defines an operand of the loop's
+        // terminator and that iter-arg has a later use, we need to forward
+        // the updated value through the frame.
+        for (auto &operand : anchor->getOpOperands()) {
+          auto iterArgNum = operand.getOperandNumber();
+          auto iterArg = loop.getAfterArguments()[iterArgNum];
+          if (operand.get().getDefiningOp() == op &&
+              valueHasLaterUse(iterArg, phaseBase + bc.offset)) {
+            IterArgExport iae;
+            iae.bucket = &bc;
+            iae.op = op;
+            iae.iterArg = iterArg;
+            iae.frameIdx = stepTypes.size();
+            iterArgExports.push_back(iae);
+            stepTypes.push_back(iterArg.getType());
           }
         }
       }
     }
 
-    bool stepHasCond = llvm::is_contained(group, condOp);
+    // Reregister values are at the bucket-time they come due; anchored to the
+    // frame base.
+    for (auto &bc : buckets) {
+      uint32_t bt = phaseBase + bc.offset;
+      for (auto val : reregisterValues[bt]) {
+        reregExports.emplace_back(bt, val);
+        stepTypes.push_back(val.getType());
+      }
+    }
 
-    // Split the combined step result layout into the at-0 slice and the
-    // per-offset delay export slices. The frame result layout mirrors the
-    // old step layout: at-0 results first, then each offset's exports in
-    // offset order. That way `frame.getResult(i)` stands in for what used
-    // to be `step.getResult(i)` with no index remapping.
-    unsigned at0TypesEnd = stepTypes.size() -
-                           ((delayOffsetGroups.count(startTime))
-                                ? [&] {
-                                    unsigned n = 0;
-                                    for (auto &kv :
-                                         delayOffsetGroups[startTime]) {
-                                      (void)kv.first;
-                                      for (auto *op : kv.second)
-                                        if (delayExportFirstStepIdx.count(op))
-                                          n += op->getNumResults();
-                                    }
-                                    return n;
-                                  }()
-                                : 0u);
+    // Determine which launches need their handle exposed as a frame result.
+    // A launch's handle is exposed if a later phase awaits it.
+    SmallVector<std::pair<BucketContent *, Operation *>>
+        launchesInPhase; // (bucket, original loop op)
+    for (auto &bc : buckets)
+      for (auto *lop : bc.loopOps)
+        launchesInPhase.emplace_back(&bc, lop);
 
-    SmallVector<Type> at0Types(stepTypes.begin(),
-                               stepTypes.begin() + at0TypesEnd);
+    // For each launch in this phase, precompute the set of user phases so we
+    // know whether to export the handle as a frame result. We also need this
+    // when we emit the launch body yield.
+    SmallVector<DenseSet<size_t>> launchUserPhasesInPhase;
+    SmallVector<bool> launchTerminatorConsumedInPhase;
+    for (auto &bc_lop : launchesInPhase) {
+      DenseSet<size_t> userPhases;
+      bool terminatorConsumed = false;
+      computeLopUserPhases(bc_lop.second, userPhases, terminatorConsumed);
+      launchUserPhasesInPhase.push_back(userPhases);
+      launchTerminatorConsumedInPhase.push_back(terminatorConsumed);
+    }
 
-    // Create the frame + at-0 inside its body. The frame's result layout
-    // mirrors what the old step op exported.
+    // Always reserve a frame-result slot for every launch created in this
+    // phase. Each launch's handle must be awaited exactly once downstream;
+    // we materialize it as a frame result so a later phase's await region
+    // (or the sequential terminator's await list) can consume it.
+    SmallVector<std::optional<unsigned>> launchHandleIdxOpt;
+    for (auto [i, bc_lop] : llvm::enumerate(launchesInPhase)) {
+      (void)i, (void)bc_lop;
+      launchHandleIdx.push_back(stepTypes.size());
+      launchHandleIdxOpt.push_back(stepTypes.size());
+      stepTypes.push_back(HandleType::get(builder.getContext()));
+    }
+
+    // For each pending launch (from earlier phases), decide:
+    //   - awaitHere: if it has any SSA user in THIS phase → emit
+    //     `await %h -> (T...)` in the await region. This services the
+    //     launch (consumes the handle).
+    //   - else: forward the handle through this frame as a frame result
+    //     (`forwardHere = true` — unconditionally), so a later phase or
+    //     the sequential terminator's await list can consume it.
+    struct PendingService {
+      size_t pendingIdx; // index into pendingLaunches
+      bool awaitHere;    // emit await here; consumes the launch
+      bool forwardHere;  // forward handle via body yield for future use
+      // Forwards to emit on the await (only if awaitHere):
+      SmallVector<std::pair<unsigned, Value>> forwards;
+      // Frame result index assigned for forward (when forwardHere).
+      std::optional<unsigned> forwardFrameIdx;
+    };
+    // Always await prior-phase launches in the immediately following phase.
+    // This enforces the launch's ordering semantics (the user said: "anything
+    // that depends on [a launch's] results should be put into a second frame
+    // that awaits the loop", and for pure-memref ordering without SSA deps,
+    // the barrier is required for correctness — otherwise launches would run
+    // concurrently). Value forwards (for SSA consumers) are attached to the
+    // await so a single op does both the barrier and the value-forwarding.
+    SmallVector<PendingService> pendingServices;
+    for (auto [pi, pl] : llvm::enumerate(pendingLaunches)) {
+      PendingService ps;
+      ps.pendingIdx = pi;
+      ps.awaitHere = true;
+      ps.forwardHere = false;
+      for (auto &fwd : pl.forwards) {
+        // Forward the value through the await if it has a user in THIS phase.
+        bool useHere = false;
+        for (auto *user : fwd.second.getUsers()) {
+          if (isLoopTerminator(user))
+            continue;
+          auto *userOrAncestor =
+              loop.getAfter().findAncestorOpInRegion(*user);
+          auto ut = problem.getStartTime(userOrAncestor);
+          if (!ut.has_value())
+            continue;
+          auto it = bucketTimeToPhase.find(*ut);
+          if (it != bucketTimeToPhase.end() && it->second == phaseIdx) {
+            useHere = true;
+            break;
+          }
+        }
+        if (useHere)
+          ps.forwards.push_back(fwd);
+      }
+      pendingServices.push_back(ps);
+    }
+
+    // --- Build frame ---
     auto frame = builder.create<LoopScheduleFrameOp>(stepTypes);
+
+    // Await region: emit per-pending-launch awaits. Collect the yielded
+    // values (these become the body block args).
+    SmallVector<Value> awaitYieldValues;
+    SmallVector<Type> bodyBlockArgTypes;
+    // For each PendingService with awaitHere+forwards, track the first
+    // body-block-arg index (so we can map origValues → bodyBlockArgs
+    // after the body block is created).
+    struct ServicedForwardInfo {
+      size_t serviceIdx; // index into pendingServices
+      unsigned firstBodyArgIdx;
+    };
+    SmallVector<ServicedForwardInfo> servicedForwards;
     {
       Block &awaitBlock = frame.getAwaitRegion().emplaceBlock();
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPointToEnd(&awaitBlock);
-      builder.create<LoopScheduleYieldOp>();
+      for (auto [si, ps] : llvm::enumerate(pendingServices)) {
+        if (!ps.awaitHere)
+          continue;
+        auto &pl = pendingLaunches[ps.pendingIdx];
+        SmallVector<Type> forwardTypes;
+        for (auto &fwd : ps.forwards)
+          forwardTypes.push_back(fwd.second.getType());
+        auto awaitOp = builder.create<LoopScheduleAwaitOp>(
+            pl.currentHandle.getLoc(), forwardTypes,
+            ValueRange{pl.currentHandle});
+        if (!ps.forwards.empty()) {
+          ServicedForwardInfo sfi;
+          sfi.serviceIdx = si;
+          sfi.firstBodyArgIdx = bodyBlockArgTypes.size();
+          servicedForwards.push_back(sfi);
+          for (auto r : awaitOp.getResults()) {
+            awaitYieldValues.push_back(r);
+            bodyBlockArgTypes.push_back(r.getType());
+          }
+        }
+      }
+      builder.create<LoopScheduleYieldOp>(awaitYieldValues);
     }
+
+    // Body region with yield placeholder. Add block args up front so body
+    // ops can reference them via valueMap.
     Block &bodyBlock = frame.getBodyRegion().emplaceBlock();
+    for (auto t : bodyBlockArgTypes)
+      bodyBlock.addArgument(t, frame.getLoc());
+    // Map the forwarded original values to the new body block args so
+    // subsequent clones in this phase pick them up.
+    for (auto &sfi : servicedForwards) {
+      auto &ps = pendingServices[sfi.serviceIdx];
+      for (auto [i, fwd] : llvm::enumerate(ps.forwards)) {
+        Value bodyArg = bodyBlock.getArgument(sfi.firstBodyArgIdx + i);
+        valueMap.map(fwd.second, bodyArg);
+      }
+    }
     LoopScheduleYieldOp bodyYield;
     {
       OpBuilder::InsertionGuard g(builder);
@@ -1466,54 +1615,255 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
       bodyYield = builder.create<LoopScheduleYieldOp>();
     }
 
-    // Create at-0 just before the frame body yield and use its implicit
-    // yield as the stand-in for the old step's register terminator.
-    builder.setInsertionPoint(bodyYield);
-    auto at0 = builder.create<LoopScheduleAtOp>(
-        at0Types, builder.getI64IntegerAttr(0));
-    auto &stepBlock = at0.getBodyBlock();
-    auto *stepTerminator = stepBlock.getTerminator();
-    builder.setInsertionPointToStart(&stepBlock);
+    // Body yield operands will be filled as we go. Build up a vector of
+    // values of length stepTypes.size().
+    SmallVector<Value> bodyYieldOperands(stepTypes.size(), Value());
 
-    // Sort the group according to original dominance.
-    llvm::sort(group,
-               [&](Operation *a, Operation *b) { return dom.dominates(a, b); });
+    // Fill in forwarded handles (for pending launches that aren't awaited
+    // here). The handle value lives outside the frame so we can't reference
+    // it inside the body — but we want to forward it as a frame result.
+    // To do that we also need a way to reference the handle inside the body.
+    //
+    // Trick: the await region can also yield handles, which then appear as
+    // body block args. But that would "await" the handle, which is not what
+    // we want for forwarding. Instead we use a separate mechanism: emit an
+    // empty `loopschedule.at 0` whose yield gets the handle via... no, at
+    // ops can't reference outside values that aren't captured through frame
+    // block args either.
+    //
+    // Actually, the frame body is a plain region (not isolated from above),
+    // so inside the body we CAN reference SSA values defined in the
+    // enclosing scope. So we can directly yield `pl.currentHandle` from the
+    // body yield. That's the simplest approach.
+    for (auto &ps : pendingServices) {
+      if (!ps.forwardHere)
+        continue;
+      auto &pl = pendingLaunches[ps.pendingIdx];
+      bodyYieldOperands[*ps.forwardFrameIdx] = pl.currentHandle;
+    }
 
-    SmallVector<std::pair<Value, Value>> newIterArgs;
+    // Emit one `at offset` per bucket with static ops.
+    DenseMap<uint32_t, LoopScheduleAtOp> atByOffset;
 
-    // Move over the operations and add their results to the at-0 yield.
-    SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
-    for (auto *op : group) {
-      unsigned resultIndex = stepTerminator->getNumOperands();
-      OpBuilder::InsertionGuard g(builder);
-      LoopScheduleIfOp ifOp;
-      if (predicateMap.contains(op)) {
-        Value cond = predicateMap.lookup(op);
-        cond = valueMap.lookupOrDefault(cond);
-        ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(),
-                                                op->getResultTypes(), cond);
-        builder.setInsertionPointToStart(&ifOp.getBody().front());
+    // Emit ats in offset order, collecting results.
+    for (auto &bc : buckets) {
+      if (bc.staticOps.empty())
+        continue;
+
+      // Determine this at's result types: union of escaping ops' results and
+      // iter-arg exports and reregister exports that reach from this
+      // bucket's offset.
+      SmallVector<Type> atTypes;
+      // Track per-export the at-result index.
+      struct AtSlot {
+        enum { Static, IterArg, Rereg } kind;
+        unsigned frameIdx;
+        unsigned atIdx;
+        // For Static: StaticExport*, iterArg: IterArgExport*, rereg: pair idx.
+        StaticExport *se = nullptr;
+        IterArgExport *iae = nullptr;
+        Value reregVal;
+      };
+      SmallVector<AtSlot> slots;
+      for (auto &se : staticExports) {
+        if (se.bucket != &bc)
+          continue;
+        AtSlot s;
+        s.kind = AtSlot::Static;
+        s.frameIdx = se.frameFirstIdx;
+        s.atIdx = atTypes.size();
+        s.se = &se;
+        for (auto t : se.op->getResultTypes())
+          atTypes.push_back(t);
+        slots.push_back(s);
       }
-      auto *newOp = builder.clone(*op, valueMap);
-      dependenceAnalysis->replaceOp(op, newOp);
-      // Stamp per-op cycle latency so backends know how many cycles a
-      // multi-cycle operator (e.g. iterative multiplier) consumes within
-      // its frame. Only stamped when > 1 to keep IR tidy.
-      if (auto opr = problem.getLinkedOperatorType(op)) {
+      for (auto &iae : iterArgExports) {
+        if (iae.bucket != &bc)
+          continue;
+        AtSlot s;
+        s.kind = AtSlot::IterArg;
+        s.frameIdx = iae.frameIdx;
+        s.atIdx = atTypes.size();
+        s.iae = &iae;
+        atTypes.push_back(iae.iterArg.getType());
+        slots.push_back(s);
+      }
+      uint32_t bt = phaseBase + bc.offset;
+      for (auto &re : reregExports) {
+        if (re.first != bt)
+          continue;
+        // frame index of this rereg export
+        unsigned rrFrameIdx = 0;
+        // Walk reregExports to find re's frame index.
+        {
+          // reregExports frame indices are assigned after staticExports and
+          // iterArgExports. Compute base = static-exports-count + iter-arg-exports-count,
+          // then index within reregExports.
+          unsigned base = 0;
+          for (auto &s : staticExports)
+            base += s.op->getNumResults();
+          for (auto &iae : iterArgExports)
+            (void)iae, base += 1;
+          unsigned idx = 0;
+          for (auto &re2 : reregExports) {
+            if (&re2 == &re) {
+              rrFrameIdx = base + idx;
+              break;
+            }
+            ++idx;
+          }
+        }
+        AtSlot s;
+        s.kind = AtSlot::Rereg;
+        s.frameIdx = rrFrameIdx;
+        s.atIdx = atTypes.size();
+        s.reregVal = re.second;
+        atTypes.push_back(re.second.getType());
+        slots.push_back(s);
+      }
+
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPoint(bodyYield);
+      auto atOp = builder.create<LoopScheduleAtOp>(
+          atTypes, builder.getI64IntegerAttr(bc.offset));
+      atByOffset[bc.offset] = atOp;
+      auto &atBlock = atOp.getBodyBlock();
+      auto *atTerm = atBlock.getTerminator();
+      builder.setInsertionPointToStart(&atBlock);
+
+      // Sort static ops by dominance.
+      auto staticOps = bc.staticOps;
+      llvm::sort(staticOps, [&](Operation *a, Operation *b) {
+        return dom.dominates(a, b);
+      });
+
+      // Clone each static op.
+      DenseMap<Operation *, Operation *> oldToNew;
+      for (auto *op : staticOps) {
+        OpBuilder::InsertionGuard g2(builder);
+        LoopScheduleIfOp ifOp;
+        if (predicateMap.contains(op)) {
+          Value cond = predicateMap.lookup(op);
+          cond = valueMap.lookupOrDefault(cond);
+          ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(),
+                                                  op->getResultTypes(), cond);
+          builder.setInsertionPointToStart(&ifOp.getBody().front());
+        }
+        auto *newOp = builder.clone(*op, valueMap);
+        dependenceAnalysis->replaceOp(op, newOp);
+        if (auto opr = problem.getLinkedOperatorType(op)) {
+          unsigned lat = problem.getLatency(*opr).value_or(1);
+          if (lat > 1)
+            newOp->setAttr("loopschedule.cycle_latency",
+                           builder.getI64IntegerAttr(lat));
+        }
+        if (predicateMap.contains(op)) {
+          if (!newOp->getResults().empty())
+            builder.create<LoopScheduleYieldOp>(op->getLoc(),
+                                                newOp->getResults());
+          newOp = ifOp;
+        }
+        oldToNew[op] = newOp;
+        // valueMap for in-at references.
+        for (auto result : op->getResults())
+          valueMap.map(result, newOp->getResult(result.getResultNumber()));
+      }
+
+      // Build at yield operands in slot order.
+      SmallVector<Value> atYieldOperands(atTypes.size(), Value());
+      for (auto &s : slots) {
+        if (s.kind == AtSlot::Static) {
+          auto *newOp = oldToNew.lookup(s.se->op);
+          for (unsigned i = 0, e = s.se->op->getNumResults(); i < e; ++i)
+            atYieldOperands[s.atIdx + i] = newOp->getResult(i);
+        } else if (s.kind == AtSlot::IterArg) {
+          Value mapped = valueMap.lookup(s.iae->iterArg);
+          atYieldOperands[s.atIdx] = mapped;
+        } else {
+          atYieldOperands[s.atIdx] = valueMap.lookup(s.reregVal);
+        }
+      }
+      atTerm->setOperands(atYieldOperands);
+
+      // Emit iter_arg_update ops inside the at for any iter-args this at
+      // produces.
+      for (auto &s : slots) {
+        if (s.kind != AtSlot::IterArg)
+          continue;
+        OpBuilder::InsertionGuard ig(builder);
+        builder.setInsertionPoint(atTerm);
+        Value insideAt = atTerm->getOperand(s.atIdx);
+        unsigned argIdx =
+            cast<BlockArgument>(s.iae->iterArg).getArgNumber();
+        builder.create<LoopScheduleIterArgUpdateOp>(
+            atOp.getLoc(), sequential.getScheduleBlock().getArgument(argIdx),
+            insideAt);
+      }
+
+      // Map each static-export's original op result to the at-op result
+      // (visible to later ops in the same phase through valueMap); also use
+      // the frame result for this op below.
+      for (auto &s : slots) {
+        if (s.kind != AtSlot::Static)
+          continue;
+        for (unsigned i = 0, e = s.se->op->getNumResults(); i < e; ++i) {
+          // Update valueMap to point to the at result for intra-phase uses.
+          valueMap.map(s.se->op->getResult(i), atOp.getResult(s.atIdx + i));
+        }
+      }
+      // Reregister values: map to at result within this phase.
+      for (auto &s : slots) {
+        if (s.kind != AtSlot::Rereg)
+          continue;
+        valueMap.map(s.reregVal, atOp.getResult(s.atIdx));
+      }
+
+      // Forward at results to the frame body yield at the matching frameIdx.
+      for (auto &s : slots) {
+        if (s.kind == AtSlot::Static) {
+          for (unsigned i = 0, e = s.se->op->getNumResults(); i < e; ++i)
+            bodyYieldOperands[s.frameIdx + i] = atOp.getResult(s.atIdx + i);
+        } else if (s.kind == AtSlot::IterArg) {
+          bodyYieldOperands[s.frameIdx] = atOp.getResult(s.atIdx);
+        } else {
+          bodyYieldOperands[s.frameIdx] = atOp.getResult(s.atIdx);
+        }
+      }
+    }
+
+    // Emit one `launch at offset` per LoopInterface op in this phase.
+    SmallVector<LoopScheduleLaunchOp> createdLaunches;
+    SmallVector<Operation *> createdLaunchClonedLops;
+    for (auto [launchIdx, bc_lop] : llvm::enumerate(launchesInPhase)) {
+      BucketContent *bc = bc_lop.first;
+      Operation *lop = bc_lop.second;
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPoint(bodyYield);
+      auto launch = builder.create<LoopScheduleLaunchOp>(
+          lop->getLoc(),
+          HandleType::get(builder.getContext()),
+          builder.getI64IntegerAttr(bc->offset));
+      Block &launchBlock = launch.getBody().emplaceBlock();
+      {
+        OpBuilder::InsertionGuard gg(builder);
+        builder.setInsertionPointToEnd(&launchBlock);
+        builder.create<LoopScheduleYieldOp>();
+      }
+      auto *launchYield = launchBlock.getTerminator();
+      builder.setInsertionPointToStart(&launchBlock);
+
+      // Clone the nested loop op into the launch body.
+      auto *newOp = builder.clone(*lop, valueMap);
+      dependenceAnalysis->replaceOp(lop, newOp);
+      if (auto opr = problem.getLinkedOperatorType(lop)) {
         unsigned lat = problem.getLatency(*opr).value_or(1);
         if (lat > 1)
           newOp->setAttr("loopschedule.cycle_latency",
                          builder.getI64IntegerAttr(lat));
       }
-      if (predicateMap.contains(op)) {
-        if (!newOp->getResults().empty())
-          builder.create<LoopScheduleYieldOp>(op->getLoc(),
-                                              newOp->getResults());
-        newOp = ifOp;
-      }
-
+      // Walk nested ops into dependence analysis (as the old path did).
       std::queue<Operation *> oldOps;
-      op->walk([&](Operation *op) { oldOps.push(op); });
+      lop->walk([&](Operation *op) { oldOps.push(op); });
       if (isa<LoopInterface>(newOp)) {
         newOp->walk([&](Operation *op) {
           Operation *oldOp = oldOps.front();
@@ -1521,182 +1871,107 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
           oldOps.pop();
         });
       }
-      if (opsWithReturns.contains(op)) {
-        stepTerminator->insertOperands(resultIndex, newOp->getResults());
-        movedOps.emplace_back(op, newOp, resultIndex);
+
+      // The launch body yield forwards the nested loop's results — this is
+      // required by the dialect docs even though the launch SSA result is
+      // just a handle.
+      if (newOp->getNumResults() > 0) {
+        launchYield->setOperands(newOp->getResults());
       }
 
-      resultIndex = stepTerminator->getNumOperands();
+      // Map same-phase uses directly to the cloned op's results so in-phase
+      // higher-offset ats see them through valueMap.
+      for (auto [orig, clone] :
+           llvm::zip(lop->getResults(), newOp->getResults()))
+        valueMap.map(orig, clone);
 
-      // Handle iter_args with later uses
-      for (auto &operand : anchor->getOpOperands()) {
-        auto iterArgNum = operand.getOperandNumber();
-        auto iterArg = loop.getAfterArguments()[iterArgNum];
-        if (operand.get().getDefiningOp() == op &&
-            valueHasLaterUse(iterArg, startTime)) {
-          auto newIterArg = valueMap.lookup(iterArg);
-          stepTerminator->insertOperands(resultIndex,
-                                         SmallVector<Value>{newIterArg});
-          newIterArgs.emplace_back(iterArg, frame->getResult(resultIndex));
-        }
-      }
-
-      // All further uses in this stage should used the cloned-version of values
-      // So we update the mapping in this stage
-      for (auto result : op->getResults())
-        valueMap.map(result, newOp->getResult(result.getResultNumber()));
-    }
-
-    // Reregister values
-    for (auto val : reregisterValues[startTime]) {
-      unsigned resultIndex = stepTerminator->getNumOperands();
-      stepTerminator->insertOperands(resultIndex, valueMap.lookup(val));
-      auto newValue = frame->getResult(resultIndex);
-      valueMap.map(val, newValue);
-    }
-
-    // Emit additional `loopschedule.at` ops for offsets > 0 in this bucket.
-    // Each offset's ops become an `at K` inside the frame body, with their
-    // results yielded from the at. Ops whose results were marked for export
-    // (delayExportFirstStepIdx) have their at-K results forwarded through
-    // the frame body yield to become frame results.
-    SmallVector<Value> atKExportValues; // in offset-then-op order
-    if (delayOffsetGroups.count(startTime)) {
-      OpBuilder::InsertionGuard guard(builder);
-      // Insert at-K ops at the end of the frame body (just before the
-      // frame body yield).
-      builder.setInsertionPoint(bodyYield);
-      for (auto &offsetEntry : delayOffsetGroups[startTime]) {
-        uint32_t offset = offsetEntry.first;
-        auto &delayOps = offsetEntry.second;
-
-        // Sort by dominance for stable ordering inside the at body.
-        llvm::sort(delayOps, [&](Operation *a, Operation *b) {
-          return dom.dominates(a, b);
-        });
-
-        // Compute at result types: register every cloned op's results
-        // (simple, slightly wasteful but correct).
-        SmallVector<Type> atResultTypes;
-        for (auto *op : delayOps)
-          for (auto t : op->getResultTypes())
-            atResultTypes.push_back(t);
-
-        Location dLoc = delayOps.front()->getLoc();
-        auto atK = builder.create<LoopScheduleAtOp>(
-            dLoc, atResultTypes, builder.getI64IntegerAttr(offset));
-        Block &atKBlock = atK.getBodyBlock();
-        auto *atKYield = atKBlock.getTerminator();
-
-        // Clone delay ops into the at body.
-        OpBuilder::InsertionGuard innerGuard(builder);
-        builder.setInsertionPointToStart(&atKBlock);
-        DenseMap<Operation *, Operation *> delayOldToNew;
-        SmallVector<Value> atKYieldOperands;
-        for (auto *op : delayOps) {
-          auto *newOp = builder.clone(*op, valueMap);
-          dependenceAnalysis->replaceOp(op, newOp);
-          if (auto opr = problem.getLinkedOperatorType(op)) {
-            unsigned lat = problem.getLatency(*opr).value_or(1);
-            if (lat > 1)
-              newOp->setAttr("loopschedule.cycle_latency",
-                             builder.getI64IntegerAttr(lat));
-          }
-          delayOldToNew[op] = newOp;
-          // Update valueMap so subsequent in-at ops see this clone.
-          for (auto [orig, clone] :
-               llvm::zip(op->getResults(), newOp->getResults()))
-            valueMap.map(orig, clone);
-          for (auto r : newOp->getResults())
-            atKYieldOperands.push_back(r);
-        }
-        // Set the at's yield operands.
-        atKYield->setOperands(atKYieldOperands);
-
-        // Map original op results to the at-K op's external results so
-        // later ops in the same frame (in higher-offset at regions) see
-        // the at op result through valueMap.
-        unsigned atResultIdx = 0;
-        for (auto *op : delayOps) {
-          for (auto orig : op->getResults()) {
-            valueMap.map(orig, atK.getResult(atResultIdx++));
-          }
-        }
-
-        // For ops whose results escape this frame, collect the at-K's
-        // result into atKExportValues in the same order used when
-        // computing stepTypes / delayExportFirstStepIdx.
-        for (auto *op : delayOps) {
-          auto it = delayExportFirstStepIdx.find(op);
-          if (it == delayExportFirstStepIdx.end())
-            continue;
-          // Find the at-K op's results corresponding to this op.
-          unsigned firstAtIdx = 0;
-          for (auto *o : delayOps) {
-            if (o == op)
-              break;
-            firstAtIdx += o->getNumResults();
-          }
-          for (unsigned i = 0, e = op->getNumResults(); i < e; ++i) {
-            atKExportValues.push_back(atK.getResult(firstAtIdx + i));
-          }
-        }
+      createdLaunches.push_back(launch);
+      createdLaunchClonedLops.push_back(newOp);
+      phaseLaunches[phaseIdx].push_back(launch);
+      if (launchHandleIdxOpt[launchIdx].has_value()) {
+        bodyYieldOperands[*launchHandleIdxOpt[launchIdx]] = launch.getResult();
       }
     }
 
-    // Finalize the frame body yield: forward at-0 results, then at-K
-    // exports in the order they were collected. This is the layout that
-    // matches stepTypes / the old step result ordering.
-    SmallVector<Value> bodyYieldOperands;
-    bodyYieldOperands.reserve(stepTypes.size());
-    for (auto r : at0.getResults())
-      bodyYieldOperands.push_back(r);
-    for (auto v : atKExportValues)
-      bodyYieldOperands.push_back(v);
     bodyYield->setOperands(bodyYieldOperands);
 
-    // Add the frame results to the value map for the original op.
-    for (auto t : movedOps) {
-      Operation *op = std::get<0>(t);
-      Operation *newOp = std::get<1>(t);
-      unsigned resultIndex = std::get<2>(t);
-      for (size_t i = 0; i < newOp->getNumResults(); ++i) {
-        auto newValue = frame->getResult(resultIndex + i);
-        auto oldValue = op->getResult(i);
-        valueMap.map(oldValue, newValue);
+    // After the frame: update valueMap to point to frame results for exports
+    // that escape the phase (so subsequent phases see frame boundaries).
+    for (auto &se : staticExports) {
+      for (unsigned i = 0, e = se.op->getNumResults(); i < e; ++i) {
+        valueMap.map(se.op->getResult(i), frame->getResult(se.frameFirstIdx + i));
       }
-      // Track the frame result that holds the loop condition.
-      if (stepHasCond && op == condOp) {
+      if (phaseHasCondOp && se.op == condOp) {
         unsigned condResNum = cast<OpResult>(condValue).getResultNumber();
-        sequentialCondResult = frame->getResult(resultIndex + condResNum);
+        sequentialCondResult = frame->getResult(se.frameFirstIdx + condResNum);
+      }
+    }
+    for (auto &iae : iterArgExports) {
+      valueMap.map(iae.iterArg, frame->getResult(iae.frameIdx));
+    }
+    {
+      unsigned base = 0;
+      for (auto &s : staticExports)
+        base += s.op->getNumResults();
+      for (auto &iae : iterArgExports)
+        (void)iae, base += 1;
+      unsigned idx = 0;
+      for (auto &re : reregExports) {
+        valueMap.map(re.second, frame->getResult(base + idx));
+        ++idx;
       }
     }
 
-    // Same for at-K exports: map the original op result to the frame
-    // result so later frames reference the frame boundary.
-    for (auto *op : delayExportOps) {
-      unsigned firstIdx = delayExportFirstStepIdx[op];
-      for (unsigned i = 0, e = op->getNumResults(); i < e; ++i) {
-        valueMap.map(op->getResult(i), frame->getResult(firstIdx + i));
-      }
+    // --- Update pendingLaunches after this frame is built ---
+    //
+    // Build a new pendingLaunches list for the next phase:
+    //   - From prior pendingServices: retain any that are NOT awaited here
+    //     AND still have remaining use (forwarded or not), updating
+    //     currentHandle to the new frame result.
+    //   - Add newly-created launches if they have cross-phase users or
+    //     terminator consumers.
+    SmallVector<PendingLaunch> nextPending;
+    for (auto &ps : pendingServices) {
+      if (ps.awaitHere)
+        continue;
+      auto pl = pendingLaunches[ps.pendingIdx];
+      pl.currentHandle = frame->getResult(*ps.forwardFrameIdx);
+      // Drop this phase from remaining (no op since we only track future
+      // phases).
+      pl.remainingUserPhases.erase(phaseIdx);
+      // Keep the pending launch alive — even without any SSA user, the
+      // handle will be consumed either in a later phase (SSA forward or
+      // void await) or via the sequential terminator's await list.
+      nextPending.push_back(pl);
     }
-
-    // Handle iter_args with later uses
-    for (auto iterArgPair : newIterArgs) {
-      valueMap.map(std::get<0>(iterArgPair), std::get<1>(iterArgPair));
+    for (auto [launchIdx, bc_lop] : llvm::enumerate(launchesInPhase)) {
+      PendingLaunch pl;
+      pl.origLoop = bc_lop.second;
+      pl.currentHandle =
+          frame->getResult(*launchHandleIdxOpt[launchIdx]);
+      // Every result is a candidate forward (only emit in the await if a
+      // downstream phase's user consumes it).
+      for (auto res : bc_lop.second->getResults())
+        pl.forwards.push_back({res.getResultNumber(), res});
+      for (auto p : launchUserPhasesInPhase[launchIdx])
+        if (p > phaseIdx)
+          pl.remainingUserPhases.insert(p);
+      pl.terminatorPending = launchTerminatorConsumedInPhase[launchIdx];
+      nextPending.push_back(pl);
     }
+    pendingLaunches = std::move(nextPending);
 
-    // Add values that need to be reregistered in the future
-    for (auto *op : group) {
-      if (auto load = dyn_cast<LoopScheduleLoadOp>(op)) {
-        if (hasLaterUse(op, startTime + 1)) {
-          reregisterValues[startTime + 1].push_back(load.getResult());
-        }
-      } else if (auto load = dyn_cast<LoadInterface>(op)) {
-        auto latency = load.getLatency();
-        if (hasLaterUse(op, startTime + latency)) {
-          auto resTime = startTime + latency;
-          reregisterValues[resTime].push_back(load.getResult());
+    // Post-phase: compute values to reregister for future bucket times.
+    for (auto &bc : buckets) {
+      uint32_t bt = phaseBase + bc.offset;
+      for (auto *op : bc.staticOps) {
+        if (auto load = dyn_cast<LoopScheduleLoadOp>(op)) {
+          if (hasLaterUse(op, bt + 1))
+            reregisterValues[bt + 1].push_back(load.getResult());
+        } else if (auto load = dyn_cast<LoadInterface>(op)) {
+          auto latency = load.getLatency();
+          if (hasLaterUse(op, bt + latency))
+            reregisterValues[bt + latency].push_back(load.getResult());
         }
       }
     }
@@ -1712,30 +1987,46 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
 
     // Emit an iter_arg_update inside the `at` that produced the new value.
     // The LHS is the sequential's iter-arg block argument for position `i`;
-    // the RHS is the at-op's yield operand corresponding to `newValue` (the
-    // frame/at results are not visible inside the at body itself).
-    if (auto frame = newValue.getDefiningOp<LoopScheduleFrameOp>()) {
-      auto bodyYield = frame.getBodyYield();
+    // the RHS is the at-op's yield operand corresponding to `newValue`.
+    if (auto frameOp = newValue.getDefiningOp<LoopScheduleFrameOp>()) {
+      auto bodyYield = frameOp.getBodyYield();
       unsigned frameResultIdx = cast<OpResult>(newValue).getResultNumber();
       Value insideFrame = bodyYield->getOperand(frameResultIdx);
       if (auto at = insideFrame.getDefiningOp<LoopScheduleAtOp>()) {
         auto atYield = at.getYieldOp();
         unsigned atResultIdx = cast<OpResult>(insideFrame).getResultNumber();
         Value insideAt = atYield->getOperand(atResultIdx);
-        OpBuilder::InsertionGuard guard(builder);
-        builder.setInsertionPoint(atYield);
-        builder.create<LoopScheduleIterArgUpdateOp>(
-            at.getLoc(), sequential.getScheduleBlock().getArgument(i),
-            insideAt);
+        // Avoid duplicates: if an iter_arg_update already exists in this at
+        // for this iter-arg, skip.
+        bool alreadyEmitted = false;
+        at.getBodyBlock().walk([&](LoopScheduleIterArgUpdateOp u) {
+          if (u.getIterArg() ==
+              sequential.getScheduleBlock().getArgument(i)) {
+            alreadyEmitted = true;
+            return WalkResult::interrupt();
+          }
+          return WalkResult::advance();
+        });
+        if (!alreadyEmitted) {
+          OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPoint(atYield);
+          builder.create<LoopScheduleIterArgUpdateOp>(
+              at.getLoc(), sequential.getScheduleBlock().getArgument(i),
+              insideAt);
+        }
       }
     }
   }
 
   // Build the loopschedule.terminator with the condition produced by the
-  // first step plus the loop results.
+  // first step plus the loop results. Any launch handles left "dangling" in
+  // the last phase are awaited at the iteration boundary via await(...).
+  SmallVector<Value> termAwaitHandles;
+  for (auto &pl : pendingLaunches)
+    termAwaitHandles.push_back(pl.currentHandle);
   builder.setInsertionPointToEnd(&scheduleBlock);
   builder.create<LoopScheduleTerminatorOp>(sequentialCondResult, termIterArgs,
-                                           ValueRange{});
+                                           termAwaitHandles);
 
   // Replace loop results with sequential results.
   for (size_t i = 0; i < loop.getNumResults(); ++i) {
@@ -1805,9 +2096,6 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
   }
 
   auto usedByOperation = [&](Operation *op, Operation *maybeUser) {
-    if (isa<MulIOp>(op)) {
-      op->dump();
-    }
     return llvm::any_of(maybeUser->getOperands(), [&](Value operand) {
       if (operand.getDefiningOp() == op)
         return true;
@@ -1821,16 +2109,10 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
   };
 
   auto hasLaterUse = [&](Operation *op, uint32_t resTime) {
-    llvm::errs() << "op: \n";
-    op->dump();
-    llvm::errs() << "==============\n";
-    llvm::errs() << "endTime: " << std::to_string(endTime) << "\n";
     for (uint32_t i = resTime + 1; i <= endTime; ++i) {
-      llvm::errs() << "i: " << std::to_string(i) << "\n";
       if (startGroups.contains(i)) {
         auto startGroup = startGroups[i];
         for (auto *operation : startGroup) {
-          // operation->dump();
           if (usedByOperation(op, operation))
             return true;
           auto wasInterrupted = operation->walk([&](Operation *inner) {
@@ -1843,7 +2125,6 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
         }
       }
     }
-    llvm::errs() << "no later use\n";
     return false;
   };
 
@@ -1882,136 +2163,505 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
 
   DenseMap<uint32_t, SmallVector<Value>> reregisterValues;
 
-  DominanceInfo dom(getOperation());
-  for (auto startTime : startTimes) {
-    auto group = startGroups[startTime];
-    OpBuilder::InsertionGuard g(builder);
+  auto isFuncTerminator = [funcOp](Operation *op) {
+    return isa<func::ReturnOp>(op) && op->getParentOp() == funcOp;
+  };
 
-    // Collect the return types for this stage. Operations whose results are not
-    // used within this stage are returned.
-    auto isFuncTerminator = [funcOp](Operation *op) {
-      return isa<func::ReturnOp>(op) && op->getParentOp() == funcOp;
-    };
-    SmallVector<Type> stepTypes;
-    DenseSet<Operation *> opsWithReturns;
-    for (auto *op : group) {
-      SmallVector<Operation *, 10> users;
-      users.append(op->getUsers().begin(), op->getUsers().end());
-      for (auto res : op->getResults()) {
-        auto predUsers = predicateUse.lookup(res);
-        users.append(predUsers.begin(), predUsers.end());
+  // === Partition buckets into phases using the close-after-launch-bucket
+  // rule. This matches the user-provided target shape for vadd-affine. ===
+  SmallVector<SmallVector<unsigned>> phases;
+  {
+    SmallVector<unsigned> currentPhase;
+    for (auto t : startTimes) {
+      currentPhase.push_back(t);
+      bool hasLaunch = false;
+      for (auto *op : startGroups[t])
+        if (isa<LoopInterface>(op)) {
+          hasLaunch = true;
+          break;
+        }
+      if (hasLaunch) {
+        phases.push_back(currentPhase);
+        currentPhase.clear();
       }
-      for (auto *user : users) {
-        if (opOrParentStartTime(problem, user) > startTime ||
-            isFuncTerminator(user)) {
-          if (!opsWithReturns.contains(op)) {
-            opsWithReturns.insert(op);
-            stepTypes.append(op->getResultTypes().begin(),
-                             op->getResultTypes().end());
+    }
+    if (!currentPhase.empty())
+      phases.push_back(currentPhase);
+  }
+
+  DominanceInfo dom(getOperation());
+
+  // Bucket-time → phase-index map for the in-phase SSA check on launched
+  // loops (mirrors the sequential-level helper at line ~1292).
+  DenseMap<uint32_t, size_t> bucketTimeToPhase;
+  for (auto phaseIdx : llvm::seq<size_t>(0, phases.size()))
+    for (auto t : phases[phaseIdx])
+      bucketTimeToPhase[t] = phaseIdx;
+
+  // For each nested loop op, compute phases whose static ops consume a
+  // result. Also track if the function terminator (return) consumes it.
+  auto computeLopUserPhases = [&](Operation *lop,
+                                  DenseSet<size_t> &userPhases,
+                                  bool &consumedByTerminator) {
+    userPhases.clear();
+    consumedByTerminator = false;
+    for (auto res : lop->getResults()) {
+      for (auto *user : res.getUsers()) {
+        if (isFuncTerminator(user)) {
+          consumedByTerminator = true;
+          continue;
+        }
+        auto userStart = opOrParentStartTime(problem, user);
+        if (userStart < 0)
+          continue;
+        auto it = bucketTimeToPhase.find((uint32_t)userStart);
+        if (it != bucketTimeToPhase.end())
+          userPhases.insert(it->second);
+      }
+    }
+  };
+
+  // Pending launches alive across phases. See sequential version's
+  // PendingLaunch for semantics.
+  struct PendingLaunch {
+    Operation *origLoop;
+    Value currentHandle;
+    SmallVector<std::pair<unsigned, Value>> forwards;
+    DenseSet<size_t> remainingUserPhases;
+    bool terminatorPending;
+  };
+  SmallVector<PendingLaunch> pendingLaunches;
+
+  for (auto phaseIdx : llvm::seq<size_t>(0, phases.size())) {
+    auto &bucketTimes = phases[phaseIdx];
+    uint32_t phaseBase = bucketTimes.front();
+
+    struct BucketContent {
+      uint32_t offset;
+      SmallVector<Operation *> staticOps;
+      SmallVector<Operation *> loopOps;
+    };
+    SmallVector<BucketContent> buckets;
+    for (auto t : bucketTimes) {
+      BucketContent bc;
+      bc.offset = t - phaseBase;
+      for (auto *op : startGroups[t]) {
+        if (isa<LoopInterface>(op))
+          bc.loopOps.push_back(op);
+        else
+          bc.staticOps.push_back(op);
+      }
+      buckets.push_back(std::move(bc));
+    }
+
+    struct StaticExport {
+      BucketContent *bucket;
+      Operation *op;
+      unsigned frameFirstIdx;
+    };
+    SmallVector<StaticExport> staticExports;
+    SmallVector<std::pair<uint32_t, Value>> reregExports;
+    SmallVector<unsigned> launchHandleIdx;
+    SmallVector<Type> stepTypes;
+
+    for (auto &bc : buckets) {
+      for (auto *op : bc.staticOps) {
+        bool needsReturn = false;
+        SmallVector<Operation *, 10> users;
+        users.append(op->getUsers().begin(), op->getUsers().end());
+        for (auto res : op->getResults()) {
+          auto predUsers = predicateUse.lookup(res);
+          users.append(predUsers.begin(), predUsers.end());
+        }
+        for (auto *user : users) {
+          if (opOrParentStartTime(problem, user) > phaseBase + bc.offset ||
+              isFuncTerminator(user)) {
+            needsReturn = true;
+            break;
           }
+        }
+        if (needsReturn) {
+          StaticExport se{&bc, op, (unsigned)stepTypes.size()};
+          staticExports.push_back(se);
+          stepTypes.append(op->getResultTypes().begin(),
+                           op->getResultTypes().end());
         }
       }
     }
-
-    for (auto val : reregisterValues[startTime]) {
-      stepTypes.push_back(val.getType());
+    for (auto &bc : buckets) {
+      uint32_t bt = phaseBase + bc.offset;
+      for (auto val : reregisterValues[bt]) {
+        reregExports.emplace_back(bt, val);
+        stepTypes.push_back(val.getType());
+      }
     }
 
-    // Create the frame + at-0 for this bucket. The frame result layout
-    // mirrors the old step's result layout; at-0 yields the same values.
+    SmallVector<std::pair<BucketContent *, Operation *>> launchesInPhase;
+    for (auto &bc : buckets)
+      for (auto *lop : bc.loopOps)
+        launchesInPhase.emplace_back(&bc, lop);
+
+    // Per-launch user-phase info.
+    SmallVector<DenseSet<size_t>> launchUserPhasesInPhase;
+    SmallVector<bool> launchTerminatorConsumedInPhase;
+    for (auto &bl : launchesInPhase) {
+      DenseSet<size_t> userPhases;
+      bool terminatorConsumed = false;
+      computeLopUserPhases(bl.second, userPhases, terminatorConsumed);
+      launchUserPhasesInPhase.push_back(userPhases);
+      launchTerminatorConsumedInPhase.push_back(terminatorConsumed);
+    }
+
+    // Always reserve a frame-result slot for every launch.
+    SmallVector<std::optional<unsigned>> launchHandleIdxOpt;
+    for (auto &bl : launchesInPhase) {
+      (void)bl;
+      launchHandleIdx.push_back(stepTypes.size());
+      launchHandleIdxOpt.push_back(stepTypes.size());
+      stepTypes.push_back(HandleType::get(builder.getContext()));
+    }
+
+    // Pending-launch services (same as sequential).
+    struct PendingService {
+      size_t pendingIdx;
+      bool awaitHere;
+      bool forwardHere;
+      SmallVector<std::pair<unsigned, Value>> forwards;
+      std::optional<unsigned> forwardFrameIdx;
+    };
+    // Always await prior-phase launches in the immediately following phase
+    // to enforce launch ordering (a launch's body runs asynchronously; the
+    // next frame's await is what prevents the next launch from racing).
+    SmallVector<PendingService> pendingServices;
+    for (auto [pi, pl] : llvm::enumerate(pendingLaunches)) {
+      PendingService ps;
+      ps.pendingIdx = pi;
+      ps.awaitHere = true;
+      ps.forwardHere = false;
+      for (auto &fwd : pl.forwards) {
+        bool useHere = false;
+        for (auto *user : fwd.second.getUsers()) {
+          if (isFuncTerminator(user))
+            continue;
+          auto userStart = opOrParentStartTime(problem, user);
+          if (userStart < 0)
+            continue;
+          auto it = bucketTimeToPhase.find((uint32_t)userStart);
+          if (it != bucketTimeToPhase.end() && it->second == phaseIdx) {
+            useHere = true;
+            break;
+          }
+        }
+        if (useHere)
+          ps.forwards.push_back(fwd);
+      }
+      pendingServices.push_back(ps);
+    }
+
     auto frame = builder.create<LoopScheduleFrameOp>(stepTypes);
+
+    // Await region + body block args.
+    SmallVector<Value> awaitYieldValues;
+    SmallVector<Type> bodyBlockArgTypes;
+    struct ServicedForwardInfo {
+      size_t serviceIdx;
+      unsigned firstBodyArgIdx;
+    };
+    SmallVector<ServicedForwardInfo> servicedForwards;
     {
       Block &awaitBlock = frame.getAwaitRegion().emplaceBlock();
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPointToEnd(&awaitBlock);
-      builder.create<LoopScheduleYieldOp>();
+      for (auto [si, ps] : llvm::enumerate(pendingServices)) {
+        if (!ps.awaitHere)
+          continue;
+        auto &pl = pendingLaunches[ps.pendingIdx];
+        SmallVector<Type> forwardTypes;
+        for (auto &fwd : ps.forwards)
+          forwardTypes.push_back(fwd.second.getType());
+        auto awaitOp = builder.create<LoopScheduleAwaitOp>(
+            pl.currentHandle.getLoc(), forwardTypes,
+            ValueRange{pl.currentHandle});
+        if (!ps.forwards.empty()) {
+          ServicedForwardInfo sfi;
+          sfi.serviceIdx = si;
+          sfi.firstBodyArgIdx = bodyBlockArgTypes.size();
+          servicedForwards.push_back(sfi);
+          for (auto r : awaitOp.getResults()) {
+            awaitYieldValues.push_back(r);
+            bodyBlockArgTypes.push_back(r.getType());
+          }
+        }
+      }
+      builder.create<LoopScheduleYieldOp>(awaitYieldValues);
     }
+
     Block &bodyBlock = frame.getBodyRegion().emplaceBlock();
+    for (auto t : bodyBlockArgTypes)
+      bodyBlock.addArgument(t, frame.getLoc());
+    for (auto &sfi : servicedForwards) {
+      auto &ps = pendingServices[sfi.serviceIdx];
+      for (auto [i, fwd] : llvm::enumerate(ps.forwards)) {
+        Value bodyArg = bodyBlock.getArgument(sfi.firstBodyArgIdx + i);
+        valueMap.map(fwd.second, bodyArg);
+      }
+    }
     LoopScheduleYieldOp bodyYield;
     {
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPointToEnd(&bodyBlock);
       bodyYield = builder.create<LoopScheduleYieldOp>();
     }
-    builder.setInsertionPoint(bodyYield);
-    auto at0 = builder.create<LoopScheduleAtOp>(
-        stepTypes, builder.getI64IntegerAttr(0));
-    auto &stepBlock = at0.getBodyBlock();
-    auto *stepTerminator = stepBlock.getTerminator();
-    builder.setInsertionPointToStart(&stepBlock);
+    SmallVector<Value> bodyYieldOperands(stepTypes.size(), Value());
+    // Forward unserviced pending launches' handles.
+    for (auto &ps : pendingServices) {
+      if (!ps.forwardHere)
+        continue;
+      auto &pl = pendingLaunches[ps.pendingIdx];
+      bodyYieldOperands[*ps.forwardFrameIdx] = pl.currentHandle;
+    }
 
-    // Sort the group according to original dominance.
-    llvm::sort(group,
-               [&](Operation *a, Operation *b) { return dom.dominates(a, b); });
+    for (auto &bc : buckets) {
+      if (bc.staticOps.empty())
+        continue;
 
-    // Move over the operations and add their results to the at-0 yield.
-    SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
-    for (auto *op : group) {
-      unsigned resultIndex = stepTerminator->getNumOperands();
+      struct AtSlot {
+        enum { Static, Rereg } kind;
+        unsigned frameIdx;
+        unsigned atIdx;
+        StaticExport *se = nullptr;
+        Value reregVal;
+      };
+      SmallVector<AtSlot> slots;
+      SmallVector<Type> atTypes;
+      for (auto &se : staticExports) {
+        if (se.bucket != &bc)
+          continue;
+        AtSlot s;
+        s.kind = AtSlot::Static;
+        s.frameIdx = se.frameFirstIdx;
+        s.atIdx = atTypes.size();
+        s.se = &se;
+        for (auto t : se.op->getResultTypes())
+          atTypes.push_back(t);
+        slots.push_back(s);
+      }
+      uint32_t bt = phaseBase + bc.offset;
+      for (auto &re : reregExports) {
+        if (re.first != bt)
+          continue;
+        unsigned rrFrameIdx = 0;
+        unsigned base = 0;
+        for (auto &s : staticExports)
+          base += s.op->getNumResults();
+        unsigned idx = 0;
+        for (auto &re2 : reregExports) {
+          if (&re2 == &re) {
+            rrFrameIdx = base + idx;
+            break;
+          }
+          ++idx;
+        }
+        AtSlot s;
+        s.kind = AtSlot::Rereg;
+        s.frameIdx = rrFrameIdx;
+        s.atIdx = atTypes.size();
+        s.reregVal = re.second;
+        atTypes.push_back(re.second.getType());
+        slots.push_back(s);
+      }
+
       OpBuilder::InsertionGuard g(builder);
-      LoopScheduleIfOp ifOp;
-      if (predicateMap.contains(op)) {
-        Value cond = predicateMap.lookup(op);
-        cond = valueMap.lookupOrDefault(cond);
-        ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(),
-                                                op->getResultTypes(), cond);
-        builder.setInsertionPointToStart(&ifOp.getBody().front());
-      }
-      auto *newOp = builder.clone(*op, valueMap);
-      dependenceAnalysis->replaceOp(op, newOp);
-      if (predicateMap.contains(op)) {
-        if (!newOp->getResults().empty())
-          builder.create<LoopScheduleYieldOp>(op->getLoc(),
-                                              newOp->getResults());
-        newOp = ifOp;
-      }
-      if (opsWithReturns.contains(op)) {
-        stepTerminator->insertOperands(resultIndex, newOp->getResults());
-        movedOps.emplace_back(op, newOp, resultIndex);
-      }
-      // All further uses in this frame should used the cloned-version of
-      // values; update the mapping in this bucket.
-      for (auto result : op->getResults())
-        valueMap.map(result, newOp->getResult(result.getResultNumber()));
-    }
+      builder.setInsertionPoint(bodyYield);
+      auto atOp = builder.create<LoopScheduleAtOp>(
+          atTypes, builder.getI64IntegerAttr(bc.offset));
+      auto &atBlock = atOp.getBodyBlock();
+      auto *atTerm = atBlock.getTerminator();
+      builder.setInsertionPointToStart(&atBlock);
 
-    // Reregister values
-    for (auto val : reregisterValues[startTime]) {
-      unsigned resultIndex = stepTerminator->getNumOperands();
-      stepTerminator->insertOperands(resultIndex, valueMap.lookup(val));
-      auto newValue = frame->getResult(resultIndex);
-      valueMap.map(val, newValue);
-    }
+      auto staticOps = bc.staticOps;
+      llvm::sort(staticOps, [&](Operation *a, Operation *b) {
+        return dom.dominates(a, b);
+      });
 
-    // Forward the at-0 results as the frame's body yield operands so the
-    // frame op exposes the same result layout the old step did.
-    bodyYield->setOperands(at0.getResults());
-
-    // Add the frame results to the value map for the original op.
-    for (auto tuple : movedOps) {
-      Operation *op = std::get<0>(tuple);
-      Operation *newOp = std::get<1>(tuple);
-      unsigned resultIndex = std::get<2>(tuple);
-      for (size_t i = 0; i < newOp->getNumResults(); ++i) {
-        auto newValue = frame->getResult(resultIndex + i);
-        auto oldValue = op->getResult(i);
-        valueMap.map(oldValue, newValue);
-      }
-    }
-
-    // Add values that need to be reregistered in the future
-    for (auto *op : group) {
-      if (auto load = dyn_cast<LoopScheduleLoadOp>(op)) {
-        if (hasLaterUse(op, startTime + 1)) {
-          reregisterValues[startTime + 1].push_back(load.getResult());
+      DenseMap<Operation *, Operation *> oldToNew;
+      for (auto *op : staticOps) {
+        OpBuilder::InsertionGuard g2(builder);
+        LoopScheduleIfOp ifOp;
+        if (predicateMap.contains(op)) {
+          Value cond = predicateMap.lookup(op);
+          cond = valueMap.lookupOrDefault(cond);
+          ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(),
+                                                  op->getResultTypes(), cond);
+          builder.setInsertionPointToStart(&ifOp.getBody().front());
         }
-      } else if (auto load = dyn_cast<LoadInterface>(op)) {
-        auto latency = load.getLatency();
-        if (hasLaterUse(op, startTime + latency)) {
-          auto resTime = startTime + latency;
-          reregisterValues[resTime].push_back(load.getResult());
+        auto *newOp = builder.clone(*op, valueMap);
+        dependenceAnalysis->replaceOp(op, newOp);
+        if (predicateMap.contains(op)) {
+          if (!newOp->getResults().empty())
+            builder.create<LoopScheduleYieldOp>(op->getLoc(),
+                                                newOp->getResults());
+          newOp = ifOp;
+        }
+        oldToNew[op] = newOp;
+        for (auto result : op->getResults())
+          valueMap.map(result, newOp->getResult(result.getResultNumber()));
+      }
+
+      SmallVector<Value> atYieldOperands(atTypes.size(), Value());
+      for (auto &s : slots) {
+        if (s.kind == AtSlot::Static) {
+          auto *newOp = oldToNew.lookup(s.se->op);
+          for (unsigned i = 0, e = s.se->op->getNumResults(); i < e; ++i)
+            atYieldOperands[s.atIdx + i] = newOp->getResult(i);
+        } else {
+          atYieldOperands[s.atIdx] = valueMap.lookup(s.reregVal);
         }
       }
+      atTerm->setOperands(atYieldOperands);
+
+      for (auto &s : slots) {
+        if (s.kind == AtSlot::Static) {
+          for (unsigned i = 0, e = s.se->op->getNumResults(); i < e; ++i)
+            valueMap.map(s.se->op->getResult(i), atOp.getResult(s.atIdx + i));
+        } else {
+          valueMap.map(s.reregVal, atOp.getResult(s.atIdx));
+        }
+      }
+      for (auto &s : slots) {
+        if (s.kind == AtSlot::Static) {
+          for (unsigned i = 0, e = s.se->op->getNumResults(); i < e; ++i)
+            bodyYieldOperands[s.frameIdx + i] = atOp.getResult(s.atIdx + i);
+        } else {
+          bodyYieldOperands[s.frameIdx] = atOp.getResult(s.atIdx);
+        }
+      }
+    }
+
+    for (auto [launchIdx, bl] : llvm::enumerate(launchesInPhase)) {
+      BucketContent *bc = bl.first;
+      Operation *lop = bl.second;
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPoint(bodyYield);
+      auto launch = builder.create<LoopScheduleLaunchOp>(
+          lop->getLoc(),
+          HandleType::get(builder.getContext()),
+          builder.getI64IntegerAttr(bc->offset));
+      Block &launchBlock = launch.getBody().emplaceBlock();
+      {
+        OpBuilder::InsertionGuard gg(builder);
+        builder.setInsertionPointToEnd(&launchBlock);
+        builder.create<LoopScheduleYieldOp>();
+      }
+      auto *launchYield = launchBlock.getTerminator();
+      builder.setInsertionPointToStart(&launchBlock);
+
+      auto *newOp = builder.clone(*lop, valueMap);
+      dependenceAnalysis->replaceOp(lop, newOp);
+
+      std::queue<Operation *> oldOps;
+      lop->walk([&](Operation *op) { oldOps.push(op); });
+      if (isa<LoopInterface>(newOp)) {
+        newOp->walk([&](Operation *op) {
+          Operation *oldOp = oldOps.front();
+          dependenceAnalysis->replaceOp(oldOp, op);
+          oldOps.pop();
+        });
+      }
+
+      // Forward the nested loop's results via the launch body yield
+      // (dialect docs require this even if the launch's own result is just
+      // a handle).
+      if (newOp->getNumResults() > 0)
+        launchYield->setOperands(newOp->getResults());
+
+      for (auto [orig, clone] :
+           llvm::zip(lop->getResults(), newOp->getResults()))
+        valueMap.map(orig, clone);
+
+      bodyYieldOperands[*launchHandleIdxOpt[launchIdx]] = launch.getResult();
+    }
+
+    bodyYield->setOperands(bodyYieldOperands);
+
+    for (auto &se : staticExports) {
+      for (unsigned i = 0, e = se.op->getNumResults(); i < e; ++i)
+        valueMap.map(se.op->getResult(i),
+                     frame->getResult(se.frameFirstIdx + i));
+    }
+    {
+      unsigned base = 0;
+      for (auto &s : staticExports)
+        base += s.op->getNumResults();
+      unsigned idx = 0;
+      for (auto &re : reregExports) {
+        valueMap.map(re.second, frame->getResult(base + idx));
+        ++idx;
+      }
+    }
+
+    // Update pendingLaunches for next phase.
+    SmallVector<PendingLaunch> nextPending;
+    for (auto &ps : pendingServices) {
+      if (ps.awaitHere)
+        continue;
+      auto pl = pendingLaunches[ps.pendingIdx];
+      pl.currentHandle = frame->getResult(*ps.forwardFrameIdx);
+      pl.remainingUserPhases.erase(phaseIdx);
+      nextPending.push_back(pl);
+    }
+    for (auto [launchIdx, bl] : llvm::enumerate(launchesInPhase)) {
+      PendingLaunch pl;
+      pl.origLoop = bl.second;
+      pl.currentHandle = frame->getResult(*launchHandleIdxOpt[launchIdx]);
+      for (auto res : bl.second->getResults())
+        pl.forwards.push_back({res.getResultNumber(), res});
+      for (auto p : launchUserPhasesInPhase[launchIdx])
+        if (p > phaseIdx)
+          pl.remainingUserPhases.insert(p);
+      pl.terminatorPending = launchTerminatorConsumedInPhase[launchIdx];
+      nextPending.push_back(pl);
+    }
+    pendingLaunches = std::move(nextPending);
+
+    for (auto &bc : buckets) {
+      uint32_t bt = phaseBase + bc.offset;
+      for (auto *op : bc.staticOps) {
+        if (auto load = dyn_cast<LoopScheduleLoadOp>(op)) {
+          if (hasLaterUse(op, bt + 1))
+            reregisterValues[bt + 1].push_back(load.getResult());
+        } else if (auto load = dyn_cast<LoadInterface>(op)) {
+          auto latency = load.getLatency();
+          if (hasLaterUse(op, bt + latency))
+            reregisterValues[bt + latency].push_back(load.getResult());
+        }
+      }
+    }
+  }
+
+  // If there are pending launches (their handles live as of the last phase's
+  // frame results), emit a trailing "barrier" frame that awaits them. This
+  // keeps the launch verifier satisfied (every launch must reach an await
+  // terminal) and gives the top-level function a clean completion point.
+  if (!pendingLaunches.empty()) {
+    builder.setInsertionPoint(funcReturn);
+    auto barrier = builder.create<LoopScheduleFrameOp>(TypeRange{});
+    {
+      Block &awaitBlock = barrier.getAwaitRegion().emplaceBlock();
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToEnd(&awaitBlock);
+      SmallVector<Value> handles;
+      for (auto &pl : pendingLaunches)
+        handles.push_back(pl.currentHandle);
+      builder.create<LoopScheduleAwaitOp>(handles.front().getLoc(),
+                                          TypeRange{}, handles);
+      builder.create<LoopScheduleYieldOp>();
+    }
+    {
+      Block &bodyBlock = barrier.getBodyRegion().emplaceBlock();
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToEnd(&bodyBlock);
+      builder.create<LoopScheduleYieldOp>();
     }
   }
 
