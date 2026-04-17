@@ -1,9 +1,12 @@
 // RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule),lower-loopschedule-to-calyx)" %s | FileCheck %s
 
 // XFAIL: *
-// End-to-end 1-D convolution. Same failure as kernel-gemv.mlir: Calyx
-// lowering does not support `!loopschedule.handle` frame results introduced
-// by the inner-loop launch.
+// End-to-end 1-D convolution. Fails in BuildIntermediateRegs with
+// `assertion phaseRegs[phase].count(idx) == 0` — a phase register for an
+// accumulator iter-arg is added twice because the outer loop reinitializes
+// the inner accumulator each iteration. Distinct from the frame
+// dynamic-child issue already fixed for gemv/gemm/transpose/outer_product;
+// needs targeted handling of reset-each-outer-iteration accumulators.
 // CHECK: calyx.component @conv1d
 
 func.func @conv1d(%A: memref<16xi32>, %K: memref<4xi32>, %B: memref<16xi32>) attributes {top} {

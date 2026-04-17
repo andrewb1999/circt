@@ -306,6 +306,124 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
       frame.erase();
   }
 
+  // Second pass: handle NESTED launches (launches inside a frame inside a
+  // LoopInterface's schedule block). These aren't at the function entry
+  // block so the first pass didn't touch them. Moving their child loop out
+  // of the launch into the enclosing frame's `at 0` body restores the
+  // pre-refactor shape (nested loops appear as direct children of an `at
+  // 0` body) that BuildOpGroups/BuildControl already handles via the
+  // LoopWrapper schedulable path.
+  //
+  // The launch op itself is left as a degenerate (empty) shell — the
+  // verifier won't run on intermediate IR within the pass, and its handle
+  // uses are harmless because handle-typed frame results are skipped by
+  // BuildIntermediateRegs. The shell gets cleaned up when the frame is
+  // eventually processed.
+  SmallVector<LoopScheduleFrameOp> nestedFrames;
+  funcOp.walk([&](LoopScheduleFrameOp frame) {
+    if (!isa<func::FuncOp>(frame->getParentOp()))
+      nestedFrames.push_back(frame);
+  });
+  for (auto frame : nestedFrames) {
+    Block &awaitBlock = frame.getAwaitBlock();
+    Block &bodyBlock = frame.getBodyBlock();
+
+    // Resolve awaits in this inner frame's await region from prior
+    // handleValueMap entries (same logic as the entry-block pass).
+    SmallVector<Value> awaitYieldedVals;
+    for (Operation &op :
+         llvm::make_early_inc_range(awaitBlock.getOperations())) {
+      if (auto awaitOp = dyn_cast<LoopScheduleAwaitOp>(&op)) {
+        SmallVector<Value> childVals;
+        for (Value h : awaitOp.getHandles()) {
+          auto it = handleValueMap.find(h);
+          if (it != handleValueMap.end())
+            for (Value v : it->second)
+              childVals.push_back(v);
+        }
+        for (auto [idx, res] : llvm::enumerate(awaitOp.getResults())) {
+          if (idx < childVals.size())
+            res.replaceAllUsesWith(childVals[idx]);
+        }
+        awaitOp.erase();
+      }
+    }
+    if (auto awaitYield =
+            dyn_cast<LoopScheduleYieldOp>(awaitBlock.getTerminator()))
+      awaitYieldedVals.assign(awaitYield.getOperands().begin(),
+                              awaitYield.getOperands().end());
+    for (auto [arg, val] :
+         llvm::zip(bodyBlock.getArguments(), awaitYieldedVals))
+      arg.replaceAllUsesWith(val);
+
+    SmallVector<LoopScheduleLaunchOp> launches(
+        bodyBlock.getOps<LoopScheduleLaunchOp>().begin(),
+        bodyBlock.getOps<LoopScheduleLaunchOp>().end());
+    if (launches.empty())
+      continue;
+
+    // Find (or create) the frame's `at 0` op to hold the moved child loops.
+    LoopScheduleAtOp at0;
+    for (auto at : bodyBlock.getOps<LoopScheduleAtOp>()) {
+      if (at.getOffset() == 0) {
+        at0 = at;
+        break;
+      }
+    }
+    if (!at0) {
+      OpBuilder builder(frame.getContext());
+      builder.setInsertionPointToStart(&bodyBlock);
+      at0 = builder.create<LoopScheduleAtOp>(
+          frame.getLoc(), TypeRange{}, builder.getI64IntegerAttr(0));
+    }
+
+    for (auto launch : launches) {
+      if (launch.getOffset() != 0)
+        return launch.emitOpError(
+            "dissolveLaunchesAndAwaits: inner launches at non-zero offset "
+            "are not yet supported in the Calyx lowering");
+
+      Operation *childLoop = nullptr;
+      for (Operation &op : launch.getBodyBlock().getOperations()) {
+        if (isa<LoopScheduleYieldOp>(op))
+          continue;
+        if (childLoop)
+          return launch.emitOpError(
+              "dissolveLaunchesAndAwaits: inner launch body must contain "
+              "exactly one child op before the yield");
+        childLoop = &op;
+      }
+      if (!childLoop)
+        return launch.emitOpError(
+            "dissolveLaunchesAndAwaits: inner launch body has no child op");
+
+      // Move the child loop to just before at-0's yield. This places it as
+      // a direct child of at-0's body block — the shape BuildOpGroups's
+      // LoopInterface handler already knows how to register as a
+      // LoopWrapper schedulable for the enclosing block.
+      auto *at0Yield = at0.getBodyBlock().getTerminator();
+      childLoop->moveBefore(at0Yield);
+
+      // Stash child results under the launch's handle so any surviving
+      // await references can still resolve them.
+      SmallVector<Value> childResults(childLoop->getResults().begin(),
+                                      childLoop->getResults().end());
+      handleValueMap[launch.getHandle()] = childResults;
+    }
+
+    // Forward handle-typed frame results through handleValueMap so outer
+    // awaits see the same child values.
+    auto bodyYield = cast<LoopScheduleYieldOp>(bodyBlock.getTerminator());
+    for (auto [idx, yVal] : llvm::enumerate(bodyYield.getOperands())) {
+      Value frameResult = frame.getResult(idx);
+      if (!isHandleType(frameResult.getType()))
+        continue;
+      auto it = handleValueMap.find(yVal);
+      if (it != handleValueMap.end())
+        handleValueMap[frameResult] = it->second;
+    }
+  }
+
   return success();
 }
 
@@ -3266,9 +3384,24 @@ private:
           auto ifOp = rewriter.create<calyx::StaticIfOp>(phaseOp.getLoc(), val);
           rewriter.setInsertionPointToEnd(ifOp.getBodyBlock());
         }
+        // A phase body that transitively contains a LoopInterface (e.g. a
+        // nested loop moved into an at body by dissolveLaunchesAndAwaits)
+        // cannot be emitted inside calyx::StaticParOp — static_par rejects
+        // non-static children like calyx.while. Fall back to calyx.seq /
+        // calyx.par in that case so the dynamic child is legal.
+        bool phaseHasDynamicChild = false;
+        phaseOp.getBodyBlock().walk(
+            [&](loopschedule::LoopInterface) {
+              phaseHasDynamicChild = true;
+              return WalkResult::interrupt();
+            });
+
         Block *bodyBlock;
-        if (phaseOp.isStatic()) {
+        if (phaseOp.isStatic() && !phaseHasDynamicChild) {
           auto op = rewriter.create<calyx::StaticParOp>(phaseOp.getLoc());
+          bodyBlock = op.getBodyBlock();
+        } else if (phaseOp.isStatic() && phaseHasDynamicChild) {
+          auto op = rewriter.create<calyx::SeqOp>(phaseOp.getLoc());
           bodyBlock = op.getBodyBlock();
         } else {
           auto op = rewriter.create<calyx::ParOp>(phaseOp.getLoc());
@@ -3320,11 +3453,26 @@ private:
       } else if (auto *atSchedPtr = std::get_if<LoopScheduleAtOp>(&sched)) {
         auto &atOp = *atSchedPtr;
         auto offset = atOp.getOffset();
+
+        // If the at body contains a LoopInterface (moved in by
+        // dissolveLaunchesAndAwaits for nested-loop cases), the at's work
+        // is no longer purely static — use calyx.seq instead of
+        // static_par for the body schedulables.
+        bool atHasDynamicChild = false;
+        atOp.getBodyBlock().walk([&](loopschedule::LoopInterface) {
+          atHasDynamicChild = true;
+          return WalkResult::interrupt();
+        });
+
         Block *parBlock;
         if (offset == 0) {
-          // Offset-0 at: just a static_par of the body schedulables.
-          auto parOp = rewriter.create<calyx::StaticParOp>(atOp.getLoc());
-          parBlock = parOp.getBodyBlock();
+          if (atHasDynamicChild) {
+            auto seqOp = rewriter.create<calyx::SeqOp>(atOp.getLoc());
+            parBlock = seqOp.getBodyBlock();
+          } else {
+            auto parOp = rewriter.create<calyx::StaticParOp>(atOp.getLoc());
+            parBlock = parOp.getBodyBlock();
+          }
         } else {
           // Offset-K at: `static_seq { pad_K; static_par { body } }` so the
           // at's body schedulables fire K cycles into the enclosing frame.
@@ -3334,6 +3482,11 @@ private:
               getState<ComponentLoweringState>().getAtPadGroup(atOp);
           rewriter.create<calyx::EnableOp>(atOp.getLoc(),
                                            padGroup.getSymName());
+          if (atHasDynamicChild) {
+            // Can't nest calyx.seq inside calyx.static_seq; error for now.
+            return atOp->emitOpError(
+                "at-K with dynamic child (nested loop) not yet supported");
+          }
           auto parOp = rewriter.create<calyx::StaticParOp>(atOp.getLoc());
           parBlock = parOp.getBodyBlock();
         }

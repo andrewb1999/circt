@@ -1,6 +1,5 @@
 // RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule),lower-loopschedule-to-calyx)" %s | FileCheck %s
 
-// XFAIL: *
 // End-to-end transpose. Same failure as kernel-gemv.mlir: Calyx lowering
 // does not support `!loopschedule.handle` frame results.
 // CHECK: calyx.component @transpose
