@@ -97,31 +97,31 @@ static unsigned getOpCycleLatency(Operation *op) {
   return 1;
 }
 
-/// Recursively compute the latency contribution of a region of LoopSchedule
-/// ops. Direct children contribute their own cycle_latency at offset 0; each
-/// `loopschedule.delay` child contributes `delay.latency + region body
-/// latency`. The result is `max(over body ops) issueCycle + opCycleLatency`.
-static unsigned computeRegionCycleLatency(Block &block) {
+/// Compute the latency contribution of an `at` body: the max cycle_latency
+/// of any op in the body (nested loops and launches are not expected here).
+/// Returns at least 1.
+static unsigned computeAtBodyLatency(Block &block) {
   unsigned maxLat = 0;
   for (Operation &op : block) {
-    if (isa<LoopScheduleRegisterOp>(op))
+    if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(op))
       continue;
     if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(op))
       continue;
-    if (auto delayOp = dyn_cast<LoopScheduleDelayOp>(&op)) {
-      unsigned childLat = computeRegionCycleLatency(delayOp.getBodyBlock());
-      maxLat = std::max(maxLat,
-                        (unsigned)delayOp.getLatency() + std::max(childLat, 1u));
-      continue;
-    }
     maxLat = std::max(maxLat, getOpCycleLatency(&op));
   }
   return std::max(maxLat, 1u);
 }
 
-/// Top-level latency of a step.
-static unsigned computeStepLatency(LoopScheduleStepOp step) {
-  return computeRegionCycleLatency(step.getBodyBlock());
+/// Top-level latency of a frame: max(at.offset + atBodyLatency) over the
+/// frame body's `at` children. A frame with only a single `at 0` whose body
+/// is all 1-cycle ops has latency 1.
+static unsigned computeFrameLatency(LoopScheduleFrameOp frame) {
+  unsigned maxLat = 0;
+  for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
+    unsigned bodyLat = computeAtBodyLatency(atOp.getBodyBlock());
+    maxLat = std::max(maxLat, (unsigned)atOp.getOffset() + bodyLat);
+  }
+  return std::max(maxLat, 1u);
 }
 
 /// Tracks the hw.module ports for a memref function argument.
@@ -197,16 +197,17 @@ struct LoopNode {
   LoopScheduleSequentialOp seqOp;
   std::string prefix;              // e.g., "loop0", "loop0_loop1"
   std::vector<LoopNode> children;
-  /// For step index i, stepChildIdx[i] = index into children, or -1.
-  SmallVector<int> stepChildIdx;
-  /// For step index i, stepPipelineIdx[i] = index into pipelineChildren, or -1.
-  SmallVector<int> stepPipelineIdx;
+  /// For frame index i, frameChildIdx[i] = index into children, or -1.
+  SmallVector<int> frameChildIdx;
+  /// For frame index i, framePipelineIdx[i] = index into pipelineChildren,
+  /// or -1.
+  SmallVector<int> framePipelineIdx;
   SmallVector<LoopSchedulePipelineOp> pipelineChildren;
   bool isLeaf() const {
     return children.empty() && pipelineChildren.empty();
   }
-  bool hasChild(unsigned stepIdx) const {
-    return stepChildIdx[stepIdx] >= 0 || stepPipelineIdx[stepIdx] >= 0;
+  bool hasChild(unsigned frameIdx) const {
+    return frameChildIdx[frameIdx] >= 0 || framePipelineIdx[frameIdx] >= 0;
   }
 };
 
@@ -225,32 +226,32 @@ private:
 
   /// Create FSM machine for a sequential loop.
   ///
-  /// `waitStepIndices` lists the step indices whose body launches an external
-  /// computation that must be waited on (a child sequential loop, a pipeline
-  /// child, or any future variable-latency op). It must be sorted ascending.
-  /// Each such step gets dedicated child_start/child_done/post_active signals
-  /// and inserts WAIT_<i>/POST_<i> states around STEP_<i>. Steps not in the
-  /// list are "regular" steps that drive step_active_<i> in their STEP_<i>
-  /// state.
+  /// `waitFrameIndices` lists the frame indices whose body launches an
+  /// external computation that must be waited on (a child sequential loop, a
+  /// pipeline child, or any future variable-latency op). It must be sorted
+  /// ascending. Each such frame gets dedicated child_start/child_done/
+  /// post_active signals and inserts WAIT_<i>/POST_<i> states around
+  /// FRAME_<i>. Frames not in the list are "regular" frames that drive
+  /// frame_active_<i> in their FRAME_<i> state.
   ///
   /// Inputs (fixed order):
-  ///   start, cond, child_done_0..C-1            (C = waitStepIndices.size())
+  ///   start, cond, child_done_0..C-1            (C = waitFrameIndices.size())
   ///
   /// Outputs (fixed order):
   ///   done, first_iter, iter_advance,
-  ///   step_active_0..N-1,                       (N = numSteps)
+  ///   frame_active_0..N-1,                      (N = numFrames)
   ///   child_start_0..C-1,
   ///   post_active_0..C-1
   fsm::MachineOp createSequentialFSM(OpBuilder &builder, Location loc,
-                                      StringRef fsmName, unsigned numSteps,
-                                      ArrayRef<unsigned> waitStepIndices,
-                                      ArrayRef<unsigned> stepLatencies = {});
+                                      StringRef fsmName, unsigned numFrames,
+                                      ArrayRef<unsigned> waitFrameIndices,
+                                      ArrayRef<unsigned> frameLatencies = {});
 
-  /// Create linear run-once FSM for sequencing top-level function steps.
-  /// stepChildKind[i]: -1 = leaf, 0 = sequential child, 1 = pipeline child.
+  /// Create linear run-once FSM for sequencing top-level function frames.
+  /// frameChildKind[i]: -1 = leaf, 0 = sequential child, 1 = pipeline child.
   fsm::MachineOp createFunctionFSM(OpBuilder &builder, Location loc,
                                     StringRef fsmName,
-                                    ArrayRef<int> stepChildKind);
+                                    ArrayRef<int> frameChildKind);
 
   /// Recursively lower a loop node as its own hw.module.
   /// Creates the module and populates outModule. capturedVals are the
@@ -262,14 +263,14 @@ private:
       hw::HWModuleOp &outModule,
       SmallVectorImpl<Value> &capturedVals);
 
-  /// Lower step body ops, gating store wrEn with the per-issue-cycle active
+  /// Lower a frame body, gating store wrEn with the per-issue-cycle active
   /// signal. `cycleGates[c]` is the i1 high in cycle `c` of the enclosing
-  /// step. For single-cycle steps the array has one entry equal to the
-  /// step's overall active signal.
-  LogicalResult lowerStepBody(Block *stepBody, OpBuilder &builder,
-                              IRMapping &mapping,
-                              ArrayRef<Value> cycleGates,
-                              DenseMap<Value, MemPortMapping> &memPorts);
+  /// frame. For single-cycle frames the array has one entry equal to the
+  /// frame's overall active signal.
+  LogicalResult lowerFrameBody(Block *frameBody, OpBuilder &builder,
+                               IRMapping &mapping,
+                               ArrayRef<Value> cycleGates,
+                               DenseMap<Value, MemPortMapping> &memPorts);
 
   /// Lower a pipeline as a child of a sequential loop (no FSM needed).
   LogicalResult lowerPipelineChild(LoopSchedulePipelineOp pipOp,
@@ -353,39 +354,29 @@ handleStore(LoopScheduleStoreOp storeOp, OpBuilder &builder,
 }
 
 //===----------------------------------------------------------------------===//
-// Step body lowering
+// Frame body lowering
 //===----------------------------------------------------------------------===//
 
-/// Recursive worker that lowers ops in a step or delay body. `baseCycle` is
-/// the issue cycle of the immediately enclosing region (0 for the step body,
-/// `delay.latency + parent base` for nested delays).
+/// Lower ops inside an `at` body at the given `baseCycle` (the at's offset
+/// within the enclosing frame). Stores are gated on `cycleGates[baseCycle]`;
+/// loads drive their addresses combinationally.
 static LogicalResult
-lowerRegionBody(Block *body, OpBuilder &builder, IRMapping &mapping,
-                ArrayRef<Value> cycleGates, unsigned baseCycle,
-                DenseMap<Value, MemPortMapping> &memPorts) {
+lowerAtBody(Block *body, OpBuilder &builder, IRMapping &mapping,
+            ArrayRef<Value> cycleGates, unsigned baseCycle,
+            DenseMap<Value, MemPortMapping> &memPorts) {
   auto pickGate = [&](unsigned c) -> Value {
     assert(c < cycleGates.size() &&
-           "issue cycle exceeds enclosing step latency");
+           "issue cycle exceeds enclosing frame latency");
     return cycleGates[c];
   };
   for (auto &op : *body) {
-    if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
+    if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
       continue;
+    // Nested sequential/pipeline ops are handled at the frame level by the
+    // wait-frame path in lowerLoopNodeAsModule; they should not be reached
+    // through this leaf path.
     if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
       continue;
-
-    if (auto delayOp = dyn_cast<LoopScheduleDelayOp>(&op)) {
-      unsigned childBase = baseCycle + (unsigned)delayOp.getLatency();
-      if (failed(lowerRegionBody(&delayOp.getBodyBlock(), builder, mapping,
-                                 cycleGates, childBase, memPorts)))
-        return failure();
-      // Map the delay op's external results to the cloned register operands.
-      auto regOp = delayOp.getRegisterOp();
-      for (auto [res, regVal] :
-           llvm::zip(delayOp.getResults(), regOp.getOperands()))
-        mapping.map(res, mapping.lookup(regVal));
-      continue;
-    }
 
     if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
       if (failed(handleStore(storeOp, builder, mapping, pickGate(baseCycle),
@@ -405,11 +396,30 @@ lowerRegionBody(Block *body, OpBuilder &builder, IRMapping &mapping,
   return success();
 }
 
-LogicalResult LoopScheduleToFSMPass::lowerStepBody(
-    Block *stepBody, OpBuilder &builder, IRMapping &mapping,
+LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
+    Block *frameBody, OpBuilder &builder, IRMapping &mapping,
     ArrayRef<Value> cycleGates,
     DenseMap<Value, MemPortMapping> &memPorts) {
-  return lowerRegionBody(stepBody, builder, mapping, cycleGates, 0, memPorts);
+  for (auto &op : *frameBody) {
+    if (isa<LoopScheduleYieldOp>(&op))
+      continue;
+    if (auto atOp = dyn_cast<LoopScheduleAtOp>(&op)) {
+      unsigned offset = (unsigned)atOp.getOffset();
+      if (failed(lowerAtBody(&atOp.getBodyBlock(), builder, mapping, cycleGates,
+                             offset, memPorts)))
+        return failure();
+      // Forward at results to the caller's mapping via the at's yield.
+      auto yieldOp = atOp.getYieldOp();
+      for (auto [res, val] :
+           llvm::zip(atOp.getResults(), yieldOp.getOperands()))
+        mapping.map(res, mapping.lookup(val));
+      continue;
+    }
+    // Frames should only contain `at` children and the terminator yield; but
+    // clone unexpected plain ops defensively.
+    builder.clone(op, mapping);
+  }
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -422,32 +432,43 @@ void LoopScheduleToFSMPass::buildLoopTree(
   node.seqOp = seqOp;
   node.prefix = prefix;
 
-  SmallVector<LoopScheduleStepOp> steps;
+  SmallVector<LoopScheduleFrameOp> frames;
   for (auto &op : seqOp.getScheduleBlock().getOperations())
-    if (auto stepOp = dyn_cast<LoopScheduleStepOp>(&op))
-      steps.push_back(stepOp);
+    if (auto frameOp = dyn_cast<LoopScheduleFrameOp>(&op))
+      frames.push_back(frameOp);
 
-  node.stepChildIdx.resize(steps.size(), -1);
-  node.stepPipelineIdx.resize(steps.size(), -1);
+  node.frameChildIdx.resize(frames.size(), -1);
+  node.framePipelineIdx.resize(frames.size(), -1);
 
-  for (auto [stepIdx, stepOp] : llvm::enumerate(steps)) {
-    for (auto &op : stepOp.getBodyBlock().getOperations()) {
-      if (auto childSeq = dyn_cast<LoopScheduleSequentialOp>(&op)) {
-        unsigned childIdx = node.children.size();
-        node.stepChildIdx[stepIdx] = childIdx;
-        node.children.emplace_back();
-        std::string childPrefix =
-            prefix + "_loop" + std::to_string(loopCounter++);
-        buildLoopTree(childSeq, node.children.back(), childPrefix,
-                      loopCounter);
-        break; // At most one child per step.
+  // Nested seq/pipeline ops live inside the frame's `at` body (typically
+  // `at 0`). Walk the frame body's at children looking for the first
+  // LoopInterface op — at most one per frame (this matches the cardinality
+  // of the old one-child-per-step assumption).
+  for (auto [frameIdx, frameOp] : llvm::enumerate(frames)) {
+    bool found = false;
+    for (auto atOp : frameOp.getBodyBlock().getOps<LoopScheduleAtOp>()) {
+      for (auto &op : atOp.getBodyBlock().getOperations()) {
+        if (auto childSeq = dyn_cast<LoopScheduleSequentialOp>(&op)) {
+          unsigned childIdx = node.children.size();
+          node.frameChildIdx[frameIdx] = childIdx;
+          node.children.emplace_back();
+          std::string childPrefix =
+              prefix + "_loop" + std::to_string(loopCounter++);
+          buildLoopTree(childSeq, node.children.back(), childPrefix,
+                        loopCounter);
+          found = true;
+          break;
+        }
+        if (auto childPip = dyn_cast<LoopSchedulePipelineOp>(&op)) {
+          unsigned pipIdx = node.pipelineChildren.size();
+          node.framePipelineIdx[frameIdx] = pipIdx;
+          node.pipelineChildren.push_back(childPip);
+          found = true;
+          break;
+        }
       }
-      if (auto childPip = dyn_cast<LoopSchedulePipelineOp>(&op)) {
-        unsigned pipIdx = node.pipelineChildren.size();
-        node.stepPipelineIdx[stepIdx] = pipIdx;
-        node.pipelineChildren.push_back(childPip);
-        break; // At most one child per step.
-      }
+      if (found)
+        break;
     }
   }
 }
@@ -516,45 +537,46 @@ collectReferencedConstants(LoopScheduleSequentialOp seqOp) {
 //===----------------------------------------------------------------------===//
 
 fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
-    OpBuilder &builder, Location loc, StringRef fsmName, unsigned numSteps,
-    ArrayRef<unsigned> waitStepIndices, ArrayRef<unsigned> stepLatencies) {
+    OpBuilder &builder, Location loc, StringRef fsmName, unsigned numFrames,
+    ArrayRef<unsigned> waitFrameIndices, ArrayRef<unsigned> frameLatencies) {
   auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
 
-  // For each step, the index into waitStepIndices if it's a wait step, or -1.
-  SmallVector<int> stepWaitIdx(numSteps, -1);
-  for (auto [j, i] : llvm::enumerate(waitStepIndices)) {
-    assert(i < numSteps && "wait step index out of range");
-    assert(stepWaitIdx[i] == -1 && "duplicate wait step index");
-    stepWaitIdx[i] = (int)j;
+  // For each frame, the index into waitFrameIndices if it's a wait frame,
+  // or -1.
+  SmallVector<int> frameWaitIdx(numFrames, -1);
+  for (auto [j, i] : llvm::enumerate(waitFrameIndices)) {
+    assert(i < numFrames && "wait frame index out of range");
+    assert(frameWaitIdx[i] == -1 && "duplicate wait frame index");
+    frameWaitIdx[i] = (int)j;
   }
   // Verify ascending order (caller contract).
-  for (unsigned k = 1; k < waitStepIndices.size(); ++k)
-    assert(waitStepIndices[k - 1] < waitStepIndices[k] &&
-           "waitStepIndices must be sorted ascending");
+  for (unsigned k = 1; k < waitFrameIndices.size(); ++k)
+    assert(waitFrameIndices[k - 1] < waitFrameIndices[k] &&
+           "waitFrameIndices must be sorted ascending");
 
-  unsigned numWaits = waitStepIndices.size();
+  unsigned numWaits = waitFrameIndices.size();
 
-  // Normalize stepLatencies — default 1 per step.
-  SmallVector<unsigned> stepLats(numSteps, 1);
-  for (unsigned i = 0; i < numSteps && i < stepLatencies.size(); ++i)
-    stepLats[i] = std::max(stepLatencies[i], 1u);
-  // Wait steps must be single-cycle: their step body launches a child whose
+  // Normalize frameLatencies — default 1 per frame.
+  SmallVector<unsigned> frameLats(numFrames, 1);
+  for (unsigned i = 0; i < numFrames && i < frameLatencies.size(); ++i)
+    frameLats[i] = std::max(frameLatencies[i], 1u);
+  // Wait frames must be single-cycle: their body launches a child whose
   // latency is variable, so the bucket merger is forbidden from coalescing
   // additional ops into them. Enforce as a contract.
-  for (unsigned i = 0; i < numSteps; ++i)
-    assert((stepWaitIdx[i] < 0 || stepLats[i] == 1) &&
-           "wait step must have latency 1");
+  for (unsigned i = 0; i < numFrames; ++i)
+    assert((frameWaitIdx[i] < 0 || frameLats[i] == 1) &&
+           "wait frame must have latency 1");
 
-  // Compute the per-step base index in the "step_cycle" output region. Steps
-  // with latency > 1 contribute L_i outputs; single-cycle steps contribute 0
-  // (their per-cycle gate is the step_active_i output).
-  SmallVector<int> cycleOutBase(numSteps, -1);
+  // Compute the per-frame base index in the "frame_cycle" output region.
+  // Frames with latency > 1 contribute L_i outputs; single-cycle frames
+  // contribute 0 (their per-cycle gate is the frame_active_i output).
+  SmallVector<int> cycleOutBase(numFrames, -1);
   unsigned totalCycleOuts = 0;
-  for (unsigned i = 0; i < numSteps; ++i) {
-    if (stepLats[i] > 1) {
+  for (unsigned i = 0; i < numFrames; ++i) {
+    if (frameLats[i] > 1) {
       cycleOutBase[i] = (int)totalCycleOuts;
-      totalCycleOuts += stepLats[i];
+      totalCycleOuts += frameLats[i];
     }
   }
 
@@ -566,17 +588,17 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     inputTypes.push_back(i1); // child_done_j
 
   // Outputs: done, first_iter, iter_advance,
-  //          step_active_0..N-1,
+  //          frame_active_0..N-1,
   //          child_start_0..C-1, child_active_0..C-1, post_active_0..C-1,
-  //          step_cycle_<i>_<c>... (one per multi-cycle step's sub-cycle).
-  // child_start_j  : 1-cycle pulse in STEP_<wait_step_j>; drives child start.
+  //          frame_cycle_<i>_<c>... (one per multi-cycle frame's sub-cycle).
+  // child_start_j  : 1-cycle pulse in FRAME_<wait_frame_j>; drives child start.
   // child_active_j : high while child j is producing on the wires
-  //                  (in STEP_<wait_step_j> launch AND throughout WAIT_<...>).
+  //                  (in FRAME_<wait_frame_j> launch AND throughout WAIT_<...>).
   //                  Used to mux child j's mem ports out of the parent module.
-  // post_active_j  : high in POST_<wait_step_j> (parent's post-child phase).
-  // step_cycle_<i>_<c> : high in the c-th sub-state of STEP_<i>; only emitted
-  //                      for steps with latency > 1.
-  unsigned numOutputs = 3 + numSteps + 3 * numWaits + totalCycleOuts;
+  // post_active_j  : high in POST_<wait_frame_j> (parent's post-child phase).
+  // frame_cycle_<i>_<c> : high in the c-th sub-state of FRAME_<i>; only
+  //                       emitted for frames with latency > 1.
+  unsigned numOutputs = 3 + numFrames + 3 * numWaits + totalCycleOuts;
   SmallVector<Type> outTypes(numOutputs, i1);
 
   auto funcType = FunctionType::get(ctx, inputTypes, outTypes);
@@ -595,9 +617,9 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   resNames.push_back(builder.getStringAttr("done"));
   resNames.push_back(builder.getStringAttr("first_iter"));
   resNames.push_back(builder.getStringAttr("iter_advance"));
-  for (unsigned i = 0; i < numSteps; ++i)
+  for (unsigned i = 0; i < numFrames; ++i)
     resNames.push_back(
-        builder.getStringAttr("step_active_" + std::to_string(i)));
+        builder.getStringAttr("frame_active_" + std::to_string(i)));
   for (unsigned j = 0; j < numWaits; ++j)
     resNames.push_back(
         builder.getStringAttr("child_start_" + std::to_string(j)));
@@ -607,12 +629,12 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   for (unsigned j = 0; j < numWaits; ++j)
     resNames.push_back(
         builder.getStringAttr("post_active_" + std::to_string(j)));
-  for (unsigned i = 0; i < numSteps; ++i) {
+  for (unsigned i = 0; i < numFrames; ++i) {
     if (cycleOutBase[i] < 0)
       continue;
-    for (unsigned c = 0; c < stepLats[i]; ++c)
+    for (unsigned c = 0; c < frameLats[i]; ++c)
       resNames.push_back(builder.getStringAttr(
-          "step_cycle_" + std::to_string(i) + "_" + std::to_string(c)));
+          "frame_cycle_" + std::to_string(i) + "_" + std::to_string(c)));
   }
   machine.setResNamesAttr(builder.getArrayAttr(resNames));
 
@@ -625,33 +647,33 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
       fb, loc, i1, fb.getBoolAttr(true), "first_iter");
 
   // Helper: build output vector.
-  //   activeStep    : index of step_active to drive high (-1 = none)
-  //   activeChild   : index into waitStepIndices for child_start (-1 = none)
-  //   activeLive    : index into waitStepIndices for child_active (-1 = none)
-  //   activePost    : index into waitStepIndices for post_active (-1 = none)
-  //   cycleStep, cycleIdx : if cycleStep >= 0 drives step_cycle_<cycleStep>_<cycleIdx>
-  auto buildOut = [&](Value done, bool iterAdv, int activeStep,
+  //   activeFrame   : index of frame_active to drive high (-1 = none)
+  //   activeChild   : index into waitFrameIndices for child_start (-1 = none)
+  //   activeLive    : index into waitFrameIndices for child_active (-1 = none)
+  //   activePost    : index into waitFrameIndices for post_active (-1 = none)
+  //   cycleFrame, cycleIdx : if cycleFrame >= 0 drives frame_cycle_<cycleFrame>_<cycleIdx>
+  auto buildOut = [&](Value done, bool iterAdv, int activeFrame,
                       int activeChild, int activeLive,
-                      int activePost, int cycleStep = -1,
+                      int activePost, int cycleFrame = -1,
                       int cycleIdx = -1) -> SmallVector<Value> {
     SmallVector<Value> v;
     v.push_back(done);
     v.push_back(fiVar);
     v.push_back(iterAdv ? trueVal : falseVal);
-    for (unsigned i = 0; i < numSteps; ++i)
-      v.push_back((int)i == activeStep ? trueVal : falseVal);
+    for (unsigned i = 0; i < numFrames; ++i)
+      v.push_back((int)i == activeFrame ? trueVal : falseVal);
     for (unsigned j = 0; j < numWaits; ++j)
       v.push_back((int)j == activeChild ? trueVal : falseVal);
     for (unsigned j = 0; j < numWaits; ++j)
       v.push_back((int)j == activeLive ? trueVal : falseVal);
     for (unsigned j = 0; j < numWaits; ++j)
       v.push_back((int)j == activePost ? trueVal : falseVal);
-    // Per-cycle outputs (multi-cycle steps only).
-    for (unsigned i = 0; i < numSteps; ++i) {
+    // Per-cycle outputs (multi-cycle frames only).
+    for (unsigned i = 0; i < numFrames; ++i) {
       if (cycleOutBase[i] < 0)
         continue;
-      for (unsigned c = 0; c < stepLats[i]; ++c) {
-        bool on = ((int)i == cycleStep) && ((int)c == cycleIdx);
+      for (unsigned c = 0; c < frameLats[i]; ++c) {
+        bool on = ((int)i == cycleFrame) && ((int)c == cycleIdx);
         v.push_back(on ? trueVal : falseVal);
       }
     }
@@ -684,49 +706,49 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     Block *tb = &st.getTransitions().front();
     fb.setInsertionPointToEnd(tb);
     fsm::TransitionOp::create(
-        fb, loc, StringRef("STEP_0"),
+        fb, loc, StringRef("FRAME_0"),
         [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(1)); },
         [&]() { fsm::UpdateOp::create(fb, loc, fiVar, falseVal); });
     fsm::TransitionOp::create(fb, loc, StringRef("DONE"));
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
 
-  // Helper: emit the last step's exit transition. We go back to COND so the
+  // Helper: emit the last frame's exit transition. We go back to COND so the
   // condition is evaluated with the UPDATED iter_args (the iter_arg register
-  // latches on the clock edge leaving the last step, which asserts
-  // iter_advance). Checking `cond` directly at the last step instead would
+  // latches on the clock edge leaving the last frame, which asserts
+  // iter_advance). Checking `cond` directly at the last frame instead would
   // race: the register hasn't updated yet, so cond still reflects the OLD
   // iter_args — producing one extra spurious iteration.
-  auto emitLastStepTransition = [&](Block *tb) {
+  auto emitLastFrameTransition = [&](Block *tb) {
     fb.setInsertionPointToEnd(tb);
     fsm::TransitionOp::create(fb, loc, StringRef("COND"));
   };
 
-  // --- STEP_i (and WAIT_i / POST_i for wait steps) ---
-  for (unsigned i = 0; i < numSteps; ++i) {
-    bool isWait = stepWaitIdx[i] >= 0;
-    bool isLast = (i + 1 == numSteps);
-    std::string stepName = "STEP_" + std::to_string(i);
-    std::string nextStepName =
-        isLast ? "STEP_0" : "STEP_" + std::to_string(i + 1);
-    unsigned L = stepLats[i];
+  // --- FRAME_i (and WAIT_i / POST_i for wait frames) ---
+  for (unsigned i = 0; i < numFrames; ++i) {
+    bool isWait = frameWaitIdx[i] >= 0;
+    bool isLast = (i + 1 == numFrames);
+    std::string frameName = "FRAME_" + std::to_string(i);
+    std::string nextFrameName =
+        isLast ? "FRAME_0" : "FRAME_" + std::to_string(i + 1);
+    unsigned L = frameLats[i];
 
     if (isWait || L == 1) {
-      auto st = fsm::StateOp::create(fb, loc, stepName);
+      auto st = fsm::StateOp::create(fb, loc, frameName);
       Block *ob = st.ensureOutput(fb);
       ob->getTerminator()->erase();
       fb.setInsertionPointToEnd(ob);
       if (isWait) {
         fsm::OutputOp::create(
             fb, loc,
-            buildOut(falseVal, /*iterAdv=*/false, /*activeStep=*/-1,
-                     /*activeChild=*/stepWaitIdx[i],
-                     /*activeLive=*/stepWaitIdx[i], /*activePost=*/-1));
+            buildOut(falseVal, /*iterAdv=*/false, /*activeFrame=*/-1,
+                     /*activeChild=*/frameWaitIdx[i],
+                     /*activeLive=*/frameWaitIdx[i], /*activePost=*/-1));
       } else {
         bool iterAdv = isLast;
         fsm::OutputOp::create(
             fb, loc,
-            buildOut(falseVal, iterAdv, /*activeStep=*/(int)i,
+            buildOut(falseVal, iterAdv, /*activeFrame=*/(int)i,
                      /*activeChild=*/-1, /*activeLive=*/-1,
                      /*activePost=*/-1));
       }
@@ -736,21 +758,21 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
         std::string waitName = "WAIT_" + std::to_string(i);
         fsm::TransitionOp::create(fb, loc, StringRef(waitName));
       } else if (isLast) {
-        emitLastStepTransition(tb);
+        emitLastFrameTransition(tb);
       } else {
         fb.setInsertionPointToEnd(tb);
-        fsm::TransitionOp::create(fb, loc, StringRef(nextStepName));
+        fsm::TransitionOp::create(fb, loc, StringRef(nextFrameName));
       }
       fb.setInsertionPointToEnd(&machine.getBody().front());
     } else {
       for (unsigned c = 0; c < L; ++c) {
         std::string subName =
-            (c == 0) ? stepName
-                     : (stepName + "_c" + std::to_string(c));
+            (c == 0) ? frameName
+                     : (frameName + "_c" + std::to_string(c));
         bool isLastSub = (c + 1 == L);
         std::string nextSub = isLastSub
-                                  ? nextStepName
-                                  : (stepName + "_c" + std::to_string(c + 1));
+                                  ? nextFrameName
+                                  : (frameName + "_c" + std::to_string(c + 1));
         bool iterAdv = isLast && isLastSub;
         auto st = fsm::StateOp::create(fb, loc, subName);
         Block *ob = st.ensureOutput(fb);
@@ -758,13 +780,13 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
         fb.setInsertionPointToEnd(ob);
         fsm::OutputOp::create(
             fb, loc,
-            buildOut(falseVal, iterAdv, /*activeStep=*/(int)i,
+            buildOut(falseVal, iterAdv, /*activeFrame=*/(int)i,
                      /*activeChild=*/-1, /*activeLive=*/-1,
-                     /*activePost=*/-1, /*cycleStep=*/(int)i,
+                     /*activePost=*/-1, /*cycleFrame=*/(int)i,
                      /*cycleIdx=*/(int)c));
         Block *tb = &st.getTransitions().front();
         if (isLast && isLastSub) {
-          emitLastStepTransition(tb);
+          emitLastFrameTransition(tb);
         } else {
           fb.setInsertionPointToEnd(tb);
           fsm::TransitionOp::create(fb, loc, StringRef(nextSub));
@@ -779,7 +801,7 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     // WAIT_i: wait for child_done_j, then go to POST_i.
     std::string waitName = "WAIT_" + std::to_string(i);
     std::string postName = "POST_" + std::to_string(i);
-    unsigned childDoneArgIdx = 2 + (unsigned)stepWaitIdx[i];
+    unsigned childDoneArgIdx = 2 + (unsigned)frameWaitIdx[i];
     {
       auto st = fsm::StateOp::create(fb, loc, waitName);
       Block *ob = st.ensureOutput(fb);
@@ -787,8 +809,8 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
       fb.setInsertionPointToEnd(ob);
       fsm::OutputOp::create(
           fb, loc,
-          buildOut(falseVal, /*iterAdv=*/false, /*activeStep=*/-1,
-                   /*activeChild=*/-1, /*activeLive=*/stepWaitIdx[i],
+          buildOut(falseVal, /*iterAdv=*/false, /*activeFrame=*/-1,
+                   /*activeChild=*/-1, /*activeLive=*/frameWaitIdx[i],
                    /*activePost=*/-1));
       Block *tb = &st.getTransitions().front();
       fb.setInsertionPointToEnd(tb);
@@ -802,7 +824,7 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     }
     fb.setInsertionPointToEnd(&machine.getBody().front());
 
-    // POST_i: drive post_active_j; iter_advance if this is the last step.
+    // POST_i: drive post_active_j; iter_advance if this is the last frame.
     {
       auto st = fsm::StateOp::create(fb, loc, postName);
       Block *ob = st.ensureOutput(fb);
@@ -811,15 +833,15 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
       bool iterAdv = isLast;
       fsm::OutputOp::create(
           fb, loc,
-          buildOut(falseVal, iterAdv, /*activeStep=*/-1,
+          buildOut(falseVal, iterAdv, /*activeFrame=*/-1,
                    /*activeChild=*/-1, /*activeLive=*/-1,
-                   /*activePost=*/stepWaitIdx[i]));
+                   /*activePost=*/frameWaitIdx[i]));
       Block *tb = &st.getTransitions().front();
       if (isLast) {
-        emitLastStepTransition(tb);
+        emitLastFrameTransition(tb);
       } else {
         fb.setInsertionPointToEnd(tb);
-        fsm::TransitionOp::create(fb, loc, StringRef(nextStepName));
+        fsm::TransitionOp::create(fb, loc, StringRef(nextFrameName));
       }
     }
     fb.setInsertionPointToEnd(&machine.getBody().front());
@@ -847,25 +869,26 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
 
 fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
     OpBuilder &builder, Location loc, StringRef fsmName,
-    ArrayRef<int> stepChildKind) {
+    ArrayRef<int> frameChildKind) {
   auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
-  unsigned numSteps = stepChildKind.size();
+  unsigned numFrames = frameChildKind.size();
 
-  // Count non-leaf steps to determine child_done inputs and child_start outputs.
+  // Count non-leaf frames to determine child_done inputs and child_start
+  // outputs.
   unsigned numChildren = 0;
-  SmallVector<int> childIndexForStep(numSteps, -1);
-  for (unsigned i = 0; i < numSteps; ++i) {
-    if (stepChildKind[i] >= 0) {
-      childIndexForStep[i] = numChildren;
+  SmallVector<int> childIndexForFrame(numFrames, -1);
+  for (unsigned i = 0; i < numFrames; ++i) {
+    if (frameChildKind[i] >= 0) {
+      childIndexForFrame[i] = numChildren;
       numChildren++;
     }
   }
 
   // Inputs: start, child_done_0, ..., child_done_{numChildren-1}
   SmallVector<Type> inputTypes(1 + numChildren, i1);
-  // Outputs: done, child_start_0..N, step_running_0..M
-  SmallVector<Type> outputTypes(1 + numChildren + numSteps, i1);
+  // Outputs: done, child_start_0..N, frame_running_0..M
+  SmallVector<Type> outputTypes(1 + numChildren + numFrames, i1);
 
   auto funcType = FunctionType::get(ctx, inputTypes, outputTypes);
   auto machine =
@@ -885,9 +908,9 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
   for (unsigned i = 0; i < numChildren; ++i)
     resNameAttrs.push_back(
         builder.getStringAttr("child_start_" + std::to_string(i)));
-  for (unsigned i = 0; i < numSteps; ++i)
+  for (unsigned i = 0; i < numFrames; ++i)
     resNameAttrs.push_back(
-        builder.getStringAttr("step_running_" + std::to_string(i)));
+        builder.getStringAttr("frame_running_" + std::to_string(i)));
   machine.setResNamesAttr(builder.getArrayAttr(resNameAttrs));
 
   OpBuilder fb(ctx);
@@ -897,15 +920,16 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
   Value falseVal = hw::ConstantOp::create(fb, loc, i1, 0);
 
   // Helper to build output vector.
-  // out[0] = done, out[1..numChildren] = child_start, out[1+numChildren..] = step_running
+  // out[0] = done, out[1..numChildren] = child_start,
+  // out[1+numChildren..] = frame_running
   auto makeOutput = [&](bool done, int activeChildStart,
-                        int activeStepRunning) -> SmallVector<Value> {
+                        int activeFrameRunning) -> SmallVector<Value> {
     SmallVector<Value> vals;
     vals.push_back(done ? trueVal : falseVal);
     for (unsigned i = 0; i < numChildren; ++i)
       vals.push_back((int)i == activeChildStart ? trueVal : falseVal);
-    for (unsigned i = 0; i < numSteps; ++i)
-      vals.push_back((int)i == activeStepRunning ? trueVal : falseVal);
+    for (unsigned i = 0; i < numFrames; ++i)
+      vals.push_back((int)i == activeFrameRunning ? trueVal : falseVal);
     return vals;
   };
 
@@ -919,33 +943,33 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
     Block *tb = &st.getTransitions().front();
     fb.setInsertionPointToEnd(tb);
     fsm::TransitionOp::create(
-        fb, loc, StringRef("STEP_0"),
+        fb, loc, StringRef("FRAME_0"),
         [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(0)); },
         []() {});
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
 
-  // --- STEP_i and WAIT_i states ---
-  for (unsigned i = 0; i < numSteps; ++i) {
-    std::string stepName = "STEP_" + std::to_string(i);
+  // --- FRAME_i and WAIT_i states ---
+  for (unsigned i = 0; i < numFrames; ++i) {
+    std::string frameName = "FRAME_" + std::to_string(i);
     std::string nextState =
-        (i + 1 < numSteps) ? "STEP_" + std::to_string(i + 1) : "DONE";
-    bool isLeaf = (stepChildKind[i] < 0);
+        (i + 1 < numFrames) ? "FRAME_" + std::to_string(i + 1) : "DONE";
+    bool isLeaf = (frameChildKind[i] < 0);
 
-    // STEP_i
+    // FRAME_i
     {
-      auto st = fsm::StateOp::create(fb, loc, stepName);
+      auto st = fsm::StateOp::create(fb, loc, frameName);
       Block *ob = st.ensureOutput(fb);
       ob->getTerminator()->erase();
       fb.setInsertionPointToEnd(ob);
 
       if (isLeaf) {
-        // Leaf: step_running_i = 1, no child_start
+        // Leaf: frame_running_i = 1, no child_start
         fsm::OutputOp::create(fb, loc, makeOutput(false, -1, i));
       } else {
-        // Non-leaf: child_start_j = 1, step_running_i = 1
+        // Non-leaf: child_start_j = 1, frame_running_i = 1
         fsm::OutputOp::create(fb, loc,
-                               makeOutput(false, childIndexForStep[i], i));
+                               makeOutput(false, childIndexForFrame[i], i));
       }
 
       Block *tb = &st.getTransitions().front();
@@ -969,12 +993,12 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
       Block *ob = st.ensureOutput(fb);
       ob->getTerminator()->erase();
       fb.setInsertionPointToEnd(ob);
-      // step_running_i stays high during WAIT
+      // frame_running_i stays high during WAIT
       fsm::OutputOp::create(fb, loc, makeOutput(false, -1, i));
       Block *tb = &st.getTransitions().front();
       fb.setInsertionPointToEnd(tb);
       // Transition to next on child_done
-      unsigned childDoneArgIdx = 1 + childIndexForStep[i];
+      unsigned childDoneArgIdx = 1 + childIndexForFrame[i];
       fsm::TransitionOp::create(
           fb, loc, StringRef(nextState),
           [&]() {
@@ -1292,63 +1316,63 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     hw.clone(*constOp, localMapping);
   }
 
-  // --- Collect steps ---
-  SmallVector<LoopScheduleStepOp> steps;
+  // --- Collect frames ---
+  SmallVector<LoopScheduleFrameOp> frames;
   for (auto &op : seqOp.getScheduleBlock().getOperations())
-    if (auto stepOp = dyn_cast<LoopScheduleStepOp>(&op))
-      steps.push_back(stepOp);
+    if (auto frameOp = dyn_cast<LoopScheduleFrameOp>(&op))
+      frames.push_back(frameOp);
 
-  if (steps.empty())
-    return seqOp.emitError("sequential loop has no steps");
+  if (frames.empty())
+    return seqOp.emitError("sequential loop has no frames");
 
   auto terminatorOp =
       cast<LoopScheduleTerminatorOp>(seqOp.getScheduleBlock().getTerminator());
 
-  unsigned numSteps = steps.size();
+  unsigned numFrames = frames.size();
 
-  // Collect the step indices that need to wait on an external done signal
+  // Collect the frame indices that need to wait on an external done signal
   // (today: child sequential loops and pipeline children; tomorrow: any
   // variable-latency op). Sorted ascending by construction.
-  SmallVector<unsigned> waitStepIndices;
-  // For each waitStepIndices entry j, stepWaitIdx maps the loop step index
-  // back to j; -1 for "regular" steps.
-  SmallVector<int> stepWaitIdx(numSteps, -1);
-  for (unsigned i = 0; i < numSteps; ++i) {
-    if (node.stepChildIdx[i] >= 0 || node.stepPipelineIdx[i] >= 0) {
-      stepWaitIdx[i] = (int)waitStepIndices.size();
-      waitStepIndices.push_back(i);
+  SmallVector<unsigned> waitFrameIndices;
+  // For each waitFrameIndices entry j, frameWaitIdx maps the loop frame
+  // index back to j; -1 for "regular" frames.
+  SmallVector<int> frameWaitIdx(numFrames, -1);
+  for (unsigned i = 0; i < numFrames; ++i) {
+    if (node.frameChildIdx[i] >= 0 || node.framePipelineIdx[i] >= 0) {
+      frameWaitIdx[i] = (int)waitFrameIndices.size();
+      waitFrameIndices.push_back(i);
     }
   }
-  unsigned numWaits = waitStepIndices.size();
+  unsigned numWaits = waitFrameIndices.size();
 
-  // --- Compute per-step latencies ---
-  // Multi-cycle steps arise when SCFToLoopSchedule's bucket merger coalesces
-  // overlapping start times into a single step containing one or more
-  // loopschedule.delay regions and/or stamps multi-cycle operator latencies.
-  SmallVector<unsigned> stepLatencies(numSteps, 1);
-  for (unsigned i = 0; i < numSteps; ++i) {
-    if (stepWaitIdx[i] >= 0) {
-      // Wait steps must be 1 (the bucket merger refuses to merge into them).
-      stepLatencies[i] = 1;
+  // --- Compute per-frame latencies ---
+  // Multi-cycle frames arise when the scheduler's bucket merger coalesces
+  // overlapping start times into a single frame containing one or more
+  // offset-K `at` regions and/or stamps multi-cycle operator latencies.
+  SmallVector<unsigned> frameLatencies(numFrames, 1);
+  for (unsigned i = 0; i < numFrames; ++i) {
+    if (frameWaitIdx[i] >= 0) {
+      // Wait frames must be 1 (the bucket merger refuses to merge into them).
+      frameLatencies[i] = 1;
       continue;
     }
-    stepLatencies[i] = computeStepLatency(steps[i]);
+    frameLatencies[i] = computeFrameLatency(frames[i]);
   }
-  // Per-step base index in the FSM's appended cycle-output region.
-  SmallVector<int> stepCycleOutBase(numSteps, -1);
+  // Per-frame base index in the FSM's appended cycle-output region.
+  SmallVector<int> frameCycleOutBase(numFrames, -1);
   unsigned totalCycleOuts = 0;
-  for (unsigned i = 0; i < numSteps; ++i) {
-    if (stepLatencies[i] > 1) {
-      stepCycleOutBase[i] = (int)totalCycleOuts;
-      totalCycleOuts += stepLatencies[i];
+  for (unsigned i = 0; i < numFrames; ++i) {
+    if (frameLatencies[i] > 1) {
+      frameCycleOutBase[i] = (int)totalCycleOuts;
+      totalCycleOuts += frameLatencies[i];
     }
   }
 
   // --- Create FSM machine ---
   std::string fsmName = node.prefix + "_fsm";
   builder.setInsertionPointToEnd(moduleOp.getBody());
-  (void)createSequentialFSM(builder, loc, fsmName, numSteps, waitStepIndices,
-                            stepLatencies);
+  (void)createSequentialFSM(builder, loc, fsmName, numFrames, waitFrameIndices,
+                            frameLatencies);
 
   // --- Create FSM instance with backedges ---
   hw.setInsertionPointToEnd(hwBody);
@@ -1370,10 +1394,10 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     instInputs.push_back(Value(be));
 
   // Result types: done, first_iter, iter_advance,
-  //               step_active_0..N-1, child_start_0..C-1,
+  //               frame_active_0..N-1, child_start_0..C-1,
   //               child_active_0..C-1, post_active_0..C-1,
-  //               step_cycle_<i>_<c>...
-  unsigned numFsmResults = 3 + numSteps + 3 * numWaits + totalCycleOuts;
+  //               frame_cycle_<i>_<c>...
+  unsigned numFsmResults = 3 + numFrames + 3 * numWaits + totalCycleOuts;
   SmallVector<Type> resTys(numFsmResults, i1);
   auto inst = fsm::HWInstanceOp::create(
       hw, loc, resTys, hw.getStringAttr(fsmName + "_inst"),
@@ -1382,30 +1406,30 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   Value fsmDone = inst.getResult(0);
   Value fsmFirstIter = inst.getResult(1);
   Value fsmIterAdvance = inst.getResult(2);
-  SmallVector<Value> fsmStepActives(numSteps);
-  for (unsigned i = 0; i < numSteps; ++i)
-    fsmStepActives[i] = inst.getResult(3 + i);
+  SmallVector<Value> fsmFrameActives(numFrames);
+  for (unsigned i = 0; i < numFrames; ++i)
+    fsmFrameActives[i] = inst.getResult(3 + i);
   SmallVector<Value> fsmChildStarts(numWaits);
   for (unsigned j = 0; j < numWaits; ++j)
-    fsmChildStarts[j] = inst.getResult(3 + numSteps + j);
+    fsmChildStarts[j] = inst.getResult(3 + numFrames + j);
   SmallVector<Value> fsmChildActives(numWaits);
   for (unsigned j = 0; j < numWaits; ++j)
-    fsmChildActives[j] = inst.getResult(3 + numSteps + numWaits + j);
+    fsmChildActives[j] = inst.getResult(3 + numFrames + numWaits + j);
   SmallVector<Value> fsmPostActives(numWaits);
   for (unsigned j = 0; j < numWaits; ++j)
-    fsmPostActives[j] = inst.getResult(3 + numSteps + 2 * numWaits + j);
-  // Per-step per-cycle gates. For single-cycle steps the gate vector contains
-  // just the step's overall step_active signal; for multi-cycle steps it
-  // contains the L_i dedicated step_cycle_<i>_<c> outputs.
-  unsigned cycleOutOffset = 3 + numSteps + 3 * numWaits;
-  SmallVector<SmallVector<Value>> fsmStepCycleGates(numSteps);
-  for (unsigned i = 0; i < numSteps; ++i) {
-    if (stepCycleOutBase[i] < 0) {
-      fsmStepCycleGates[i].push_back(fsmStepActives[i]);
+    fsmPostActives[j] = inst.getResult(3 + numFrames + 2 * numWaits + j);
+  // Per-frame per-cycle gates. For single-cycle frames the gate vector
+  // contains just the frame's overall frame_active signal; for multi-cycle
+  // frames it contains the L_i dedicated frame_cycle_<i>_<c> outputs.
+  unsigned cycleOutOffset = 3 + numFrames + 3 * numWaits;
+  SmallVector<SmallVector<Value>> fsmFrameCycleGates(numFrames);
+  for (unsigned i = 0; i < numFrames; ++i) {
+    if (frameCycleOutBase[i] < 0) {
+      fsmFrameCycleGates[i].push_back(fsmFrameActives[i]);
     } else {
-      for (unsigned c = 0; c < stepLatencies[i]; ++c)
-        fsmStepCycleGates[i].push_back(
-            inst.getResult(cycleOutOffset + (unsigned)stepCycleOutBase[i] + c));
+      for (unsigned c = 0; c < frameLatencies[i]; ++c)
+        fsmFrameCycleGates[i].push_back(inst.getResult(
+            cycleOutOffset + (unsigned)frameCycleOutBase[i] + c));
     }
   }
 
@@ -1428,94 +1452,136 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     localMapping.map(iterArg, muxed);
   }
 
-  // --- Per-step capture gates ---
-  // Regular (non-wait) steps latch their register-op operands into hardware
-  // registers at the end of the step so that later steps read the correctly-
-  // held value rather than the combinational expression driven off
-  // now-deallocated addresses. For single-cycle regular steps, capture on
-  // step_active_<i>. For multi-cycle regular steps, capture on the last
-  // sub-cycle gate. Wait steps (child sequential / pipeline) capture nothing:
-  // their results come from child modules whose outputs are already
+  // --- Per-frame capture gates ---
+  // Regular (non-wait) frames latch their yield-op operands into hardware
+  // registers at the end of the frame so that later frames read the
+  // correctly-held value rather than the combinational expression driven off
+  // now-deallocated addresses. For single-cycle regular frames, capture on
+  // frame_active_<i>. For multi-cycle regular frames, capture on the last
+  // sub-cycle gate. Wait frames (child sequential / pipeline) capture
+  // nothing: their results come from child modules whose outputs are already
   // registered.
-  SmallVector<Value> stepCaptureGate(numSteps);
-  for (unsigned i = 0; i < numSteps; ++i) {
-    if (stepWaitIdx[i] >= 0)
+  SmallVector<Value> frameCaptureGate(numFrames);
+  for (unsigned i = 0; i < numFrames; ++i) {
+    if (frameWaitIdx[i] >= 0)
       continue;
-    stepCaptureGate[i] = fsmStepCycleGates[i].back();
+    frameCaptureGate[i] = fsmFrameCycleGates[i].back();
   }
 
-  // Combinational aliases for step-result values, captured BEFORE each step's
-  // capture registers rewrite the mapping. Used for wiring the FSM cond input
-  // and sequential iter_arg register feedback — both of which must see the
-  // current-iteration combinational value, not a one-cycle-lagged register.
-  DenseMap<Value, Value> stepResultComb;
+  // Combinational aliases for frame-result values, captured BEFORE each
+  // frame's capture registers rewrite the mapping. Used for wiring the FSM
+  // cond input and sequential iter_arg register feedback — both of which
+  // must see the current-iteration combinational value, not a one-cycle-
+  // lagged register.
+  DenseMap<Value, Value> frameResultComb;
 
-  // Per-step memory port mappings. Each starts with the shared `rdData` from
-  // the module's input port so that loads always read the correct port. Per-
-  // step addrs/wrData/wrEn are merged at the end via a priority mux gated on
-  // each step's "alive" signal — the wait-step memory ops (child launch, child
-  // active, post-child stores) must all see their step as alive, so wait steps
-  // use `child_active_j | post_active_j` as their merge selector instead of
-  // `step_active_i` (which is -1 for wait steps).
-  SmallVector<DenseMap<Value, MemPortMapping>> perStepPorts(numSteps);
-  for (unsigned i = 0; i < numSteps; ++i) {
+  // Per-frame memory port mappings. Each starts with the shared `rdData`
+  // from the module's input port so that loads always read the correct port.
+  // Per-frame addrs/wrData/wrEn are merged at the end via a priority mux
+  // gated on each frame's "alive" signal — the wait-frame memory ops (child
+  // launch, child active, post-child stores) must all see their frame as
+  // alive, so wait frames use `child_active_j | post_active_j` as their
+  // merge selector instead of `frame_active_i` (which is -1 for wait
+  // frames).
+  SmallVector<DenseMap<Value, MemPortMapping>> perFramePorts(numFrames);
+  for (unsigned i = 0; i < numFrames; ++i) {
     for (auto &memInfo : memrefArgs) {
-      perStepPorts[i][memInfo.originalArg].rdData =
+      perFramePorts[i][memInfo.originalArg].rdData =
           localMemPorts[memInfo.originalArg].rdData;
     }
   }
 
-  // Determine which step produces the loop condition so we can resolve the
-  // condition backedge after lowering that step.
+  // Determine which frame produces the loop condition so we can resolve the
+  // condition backedge after lowering that frame.
   Value condTermVal = terminatorOp.getCondition();
-  unsigned condStepIdx = 0;
-  for (auto [idx, s] : llvm::enumerate(steps)) {
-    if (condTermVal.getDefiningOp() == s.getOperation()) {
-      condStepIdx = idx;
+  unsigned condFrameIdx = 0;
+  for (auto [idx, f] : llvm::enumerate(frames)) {
+    if (condTermVal.getDefiningOp() == f.getOperation()) {
+      condFrameIdx = idx;
       break;
     }
   }
 
-  // --- Lower step bodies ---
-  for (auto [stepIdx, stepOp] : llvm::enumerate(steps)) {
-    Block *body = &stepOp.getBodyBlock();
-    hw.setInsertionPointToEnd(hwBody);
-
-    int childIdx = node.stepChildIdx[stepIdx];
-    int waitIdx = stepWaitIdx[stepIdx];
-    if (childIdx >= 0) {
-      // This step contains a child sequential loop.
-      auto &childNode = node.children[childIdx];
-      auto childSeqOp = childNode.seqOp;
-      Value stepChildStart = fsmChildStarts[waitIdx];
-      Value stepPostActive = fsmPostActives[waitIdx];
-
-      // Lower pre-child ops.
-      for (auto &op : *body) {
-        if (&op == childSeqOp.getOperation())
-          break;
-        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
+  // --- Lower frame bodies ---
+  // Helper: walk through the ops of a frame that contains a child
+  // (seq/pipeline). The child lives inside one of the frame's `at` bodies
+  // (typically `at 0`). Pre-child ops are cloned before the child, post-
+  // child ops after. Pre/post stores are gated on the provided signals.
+  auto lowerFrameWithChild =
+      [&](LoopScheduleFrameOp frame, Operation *childOp, Value preGate,
+          Value postGate, DenseMap<Value, MemPortMapping> &framePorts)
+      -> LogicalResult {
+    for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
+      Block &atBody = atOp.getBodyBlock();
+      // First pass: ops before the child.
+      for (auto &op : atBody) {
+        if (&op == childOp)
+          goto do_child;
+        if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
           continue;
-        if (isa<LoopScheduleSequentialOp>(&op))
-          break;
+        if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
+          continue;
 
         if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-          if (failed(handleLoad(loadOp, hw, localMapping,
-                                perStepPorts[stepIdx])))
+          if (failed(handleLoad(loadOp, hw, localMapping, framePorts)))
             return failure();
           continue;
         }
-
         if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-          // Pre-child stores fire only during the child-launch state.
-          if (failed(handleStore(storeOp, hw, localMapping, stepChildStart,
-                                  perStepPorts[stepIdx])))
+          if (failed(handleStore(storeOp, hw, localMapping, preGate,
+                                 framePorts)))
             return failure();
           continue;
         }
-
         hw.clone(op, localMapping);
       }
+      continue;
+    do_child:
+      // Second pass: ops after the child within the same at.
+      bool pastChild = false;
+      for (auto &op : atBody) {
+        if (&op == childOp) {
+          pastChild = true;
+          continue;
+        }
+        if (!pastChild)
+          continue;
+        if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
+          continue;
+        if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
+          if (failed(handleStore(storeOp, hw, localMapping, postGate,
+                                 framePorts)))
+            return failure();
+          continue;
+        }
+        if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
+          if (failed(handleLoad(loadOp, hw, localMapping, framePorts)))
+            return failure();
+          continue;
+        }
+        hw.clone(op, localMapping);
+      }
+      break;
+    }
+    return success();
+  };
+
+  for (auto [frameIdx, frameOp] : llvm::enumerate(frames)) {
+    hw.setInsertionPointToEnd(hwBody);
+
+    int childIdx = node.frameChildIdx[frameIdx];
+    int waitIdx = frameWaitIdx[frameIdx];
+    if (childIdx >= 0) {
+      // This frame contains a child sequential loop.
+      auto &childNode = node.children[childIdx];
+      auto childSeqOp = childNode.seqOp;
+      Value frameChildStart = fsmChildStarts[waitIdx];
+      Value framePostActive = fsmPostActives[waitIdx];
+
+      if (failed(lowerFrameWithChild(frameOp, childSeqOp.getOperation(),
+                                      frameChildStart, framePostActive,
+                                      perFramePorts[frameIdx])))
+        return failure();
 
       // Recursively create child module.
       hw::HWModuleOp childModule;
@@ -1530,12 +1596,12 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       SmallVector<Value> childInputs;
       childInputs.push_back(clk);
       childInputs.push_back(rst);
-      childInputs.push_back(stepChildStart);
+      childInputs.push_back(frameChildStart);
       for (Value cap : childCaptured)
         childInputs.push_back(localMapping.lookup(cap));
       for (auto &memInfo : memrefArgs)
         childInputs.push_back(
-            perStepPorts[stepIdx][memInfo.originalArg].rdData);
+            perFramePorts[frameIdx][memInfo.originalArg].rdData);
 
       auto childInst = hw::InstanceOp::create(
           hw, loc, childModule,
@@ -1551,9 +1617,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       for (auto result : childSeqOp.getResults())
         localMapping.map(result, childInst.getResult(outIdx++));
 
-      // Mux child memory ports into this step's per-step port mapping. Any
-      // pre-child op may have already written a pre-child address into
-      // perStepPorts[stepIdx]; the child's outputs take priority when
+      // Mux child memory ports into this frame's per-frame port mapping.
+      // Any pre-child op may have already written a pre-child address into
+      // perFramePorts[frameIdx]; the child's outputs take priority when
       // child_active_j is high so only the launch cycle's pre-child writes
       // actually fire while the child is running.
       Value childActive = fsmChildActives[waitIdx];
@@ -1565,7 +1631,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         Value childWrData = childInst.getResult(outIdx++);
         Value childWrEn = childInst.getResult(outIdx++);
 
-        auto &ports = perStepPorts[stepIdx][memInfo.originalArg];
+        auto &ports = perFramePorts[frameIdx][memInfo.originalArg];
         if (ports.addrs.size() != widths.size())
           ports.addrs.assign(widths.size(), Value());
         Type dataType = memInfo.memType.getElementType();
@@ -1585,176 +1651,92 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         ports.wrEn =
             comb::MuxOp::create(hw, loc, childActive, childWrEn, myWrEn);
       }
-
-      // Lower post-child ops with wrEnGate = postActive.
-      hw.setInsertionPointToEnd(hwBody);
-      bool pastChild = false;
-      for (auto &op : *body) {
-        if (&op == childSeqOp.getOperation()) {
-          pastChild = true;
-          continue;
-        }
-        if (!pastChild)
-          continue;
-        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
-          continue;
-
-        if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-          if (failed(handleStore(storeOp, hw, localMapping, stepPostActive,
-                                  perStepPorts[stepIdx])))
-            return failure();
-          continue;
-        }
-
-        if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-          if (failed(handleLoad(loadOp, hw, localMapping,
-                                perStepPorts[stepIdx])))
-            return failure();
-          continue;
-        }
-
-        hw.clone(op, localMapping);
-      }
-    } else if (node.stepPipelineIdx[stepIdx] >= 0) {
-      // This step contains a pipeline child.
-      int pipIdx = node.stepPipelineIdx[stepIdx];
+    } else if (node.framePipelineIdx[frameIdx] >= 0) {
+      // This frame contains a pipeline child.
+      int pipIdx = node.framePipelineIdx[frameIdx];
       auto pipOp = node.pipelineChildren[pipIdx];
-      Value stepChildStart = fsmChildStarts[waitIdx];
-      Value stepPostActive = fsmPostActives[waitIdx];
+      Value frameChildStart = fsmChildStarts[waitIdx];
+      Value framePostActive = fsmPostActives[waitIdx];
 
-      // Lower pre-pipeline ops.
-      for (auto &op : *body) {
-        if (&op == pipOp.getOperation())
-          break;
-        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
-          continue;
-        if (isa<LoopSchedulePipelineOp>(&op))
-          break;
-
-        if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-          if (failed(handleLoad(loadOp, hw, localMapping,
-                                perStepPorts[stepIdx])))
-            return failure();
-          continue;
-        }
-
-        if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-          // Pre-pipeline stores fire only during the pipeline-launch state.
-          if (failed(handleStore(storeOp, hw, localMapping, stepChildStart,
-                                  perStepPorts[stepIdx])))
-            return failure();
-          continue;
-        }
-
-        hw.clone(op, localMapping);
-      }
+      if (failed(lowerFrameWithChild(frameOp, pipOp.getOperation(),
+                                      frameChildStart, framePostActive,
+                                      perFramePorts[frameIdx])))
+        return failure();
 
       // Lower pipeline child (inline in this module).
       hw.setInsertionPointToEnd(hwBody);
       Value pipDone;
       std::string pipPrefix = node.prefix + "_pip" + std::to_string(pipIdx);
       if (failed(lowerPipelineChild(pipOp, hw, loc, hwBody, localMapping, clk,
-                                    rst, stepChildStart, pipPrefix, pipDone,
-                                    perStepPorts[stepIdx], memrefArgs)))
+                                    rst, frameChildStart, pipPrefix, pipDone,
+                                    perFramePorts[frameIdx], memrefArgs)))
         return failure();
       childDoneBEs[waitIdx].setValue(pipDone);
-
-      // Lower post-pipeline ops with wrEnGate = postActive.
-      hw.setInsertionPointToEnd(hwBody);
-      bool pastChild = false;
-      for (auto &op : *body) {
-        if (&op == pipOp.getOperation()) {
-          pastChild = true;
-          continue;
-        }
-        if (!pastChild)
-          continue;
-        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
-          continue;
-
-        if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-          if (failed(handleStore(storeOp, hw, localMapping, stepPostActive,
-                                  perStepPorts[stepIdx])))
-            return failure();
-          continue;
-        }
-
-        if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-          if (failed(handleLoad(loadOp, hw, localMapping,
-                                perStepPorts[stepIdx])))
-            return failure();
-          continue;
-        }
-
-        hw.clone(op, localMapping);
-      }
     } else {
-      // Regular step (no child). Gate stores per issue cycle: ops directly
-      // in the step body get cycleGates[0]; ops nested inside delay regions
-      // get cycleGates[delay.latency].
-      if (failed(lowerStepBody(body, hw, localMapping,
-                               fsmStepCycleGates[stepIdx],
-                               perStepPorts[stepIdx])))
+      // Regular frame (no child). Gate stores per issue cycle: ops in each
+      // `at K` body get cycleGates[K].
+      if (failed(lowerFrameBody(&frameOp.getBodyBlock(), hw, localMapping,
+                                 fsmFrameCycleGates[frameIdx],
+                                 perFramePorts[frameIdx])))
         return failure();
     }
 
-    // Detect whether this step contains any loads from local hlmem memories.
-    // Local hlmem read ports have latency=1: `rd_data` during cycle N reflects
-    // `rd_addr` from cycle N-1. So during the cycle where step_active_<i> is
-    // high, rd_data is stale (reflecting the prior state's addr). We must
-    // capture rd_data ONE CYCLE LATER, when it correctly reflects the addr
-    // driven during the step. For steps without local loads, the normal gate
-    // works fine (register/combinational ops settle within their cycle).
-    bool stepHasLocalLoad = false;
-    for (auto &op : *body) {
-      if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-        for (auto &memInfo : memrefArgs) {
-          if (memInfo.originalArg == loadOp.getMemRef() && memInfo.isLocalMem) {
-            stepHasLocalLoad = true;
-            break;
-          }
+    // Detect whether this frame contains any loads from local hlmem
+    // memories. Local hlmem read ports have latency=1: `rd_data` during
+    // cycle N reflects `rd_addr` from cycle N-1. So during the cycle where
+    // frame_active_<i> is high, rd_data is stale (reflecting the prior
+    // state's addr). We must capture rd_data ONE CYCLE LATER, when it
+    // correctly reflects the addr driven during the frame. For frames
+    // without local loads, the normal gate works fine.
+    bool frameHasLocalLoad = false;
+    frameOp->walk([&](LoopScheduleLoadOp loadOp) {
+      for (auto &memInfo : memrefArgs) {
+        if (memInfo.originalArg == loadOp.getMemRef() && memInfo.isLocalMem) {
+          frameHasLocalLoad = true;
+          return WalkResult::interrupt();
         }
-        if (stepHasLocalLoad)
-          break;
       }
-    }
+      return WalkResult::advance();
+    });
 
-    // Map step results. First save the combinational aliases (keyed on the
-    // stepOp result value), then — if this step has a capture gate — create
-    // per-operand hardware registers and point the mapping at those so
-    // subsequent step bodies read the held value instead of a combinational
-    // expression driven off now-deallocated memory addresses. Wait steps
-    // (childIdx/pipelineIdx >= 0) skip the capture: their register op operands
-    // come from the child instance and are already registered.
-    auto regOp = cast<LoopScheduleRegisterOp>(body->getTerminator());
-    for (auto [result, regVal] :
-         llvm::zip(stepOp.getResults(), regOp.getOperands())) {
-      Value combVal = localMapping.lookup(regVal);
-      stepResultComb[result] = combVal;
+    // Map frame results. First save the combinational aliases (keyed on the
+    // frameOp result value), then — if this frame has a capture gate —
+    // create per-operand hardware registers and point the mapping at those
+    // so subsequent frame bodies read the held value instead of a
+    // combinational expression driven off now-deallocated memory addresses.
+    // Wait frames (childIdx/pipelineIdx >= 0) skip the capture: their yield
+    // operands come from the child instance and are already registered.
+    auto yieldOp = cast<LoopScheduleYieldOp>(
+        frameOp.getBodyBlock().getTerminator());
+    for (auto [result, yVal] :
+         llvm::zip(frameOp.getResults(), yieldOp.getOperands())) {
+      Value combVal = localMapping.lookup(yVal);
+      frameResultComb[result] = combVal;
       localMapping.map(result, combVal);
     }
 
-    if (stepCaptureGate[stepIdx]) {
+    if (frameCaptureGate[frameIdx]) {
       hw.setInsertionPointToEnd(hwBody);
-      // If this step contains a local hlmem load, delay the capture gate by
-      // one cycle so we latch rd_data when it's valid (the cycle after the
-      // address is applied), not when it's still stale.
-      Value captureGate = stepCaptureGate[stepIdx];
-      if (stepHasLocalLoad) {
+      // If this frame contains a local hlmem load, delay the capture gate
+      // by one cycle so we latch rd_data when it's valid (the cycle after
+      // the address is applied), not when it's still stale.
+      Value captureGate = frameCaptureGate[frameIdx];
+      if (frameHasLocalLoad) {
         Value falseConstCap =
             hw::ConstantOp::create(hw, loc, hw.getI1Type(), 0);
         captureGate = seq::CompRegOp::create(
-            hw, loc, stepCaptureGate[stepIdx], clk, rst, falseConstCap,
-            hw.getStringAttr(node.prefix + "_step" + std::to_string(stepIdx) +
+            hw, loc, frameCaptureGate[frameIdx], clk, rst, falseConstCap,
+            hw.getStringAttr(node.prefix + "_frame" +
+                             std::to_string(frameIdx) +
                              "_capture_gate_delayed"));
       }
       for (auto [idx, it] : llvm::enumerate(llvm::zip(
-               stepOp.getResults(), regOp.getOperands()))) {
-        auto [result, regVal] = it;
-        Value combVal = stepResultComb[result];
+               frameOp.getResults(), yieldOp.getOperands()))) {
+        auto [result, yVal] = it;
+        Value combVal = frameResultComb[result];
         Value resetVal = createZeroConstant(hw, loc, combVal.getType());
-        auto regName = hw.getStringAttr(node.prefix + "_step" +
-                                        std::to_string(stepIdx) + "_r" +
+        auto regName = hw.getStringAttr(node.prefix + "_frame" +
+                                        std::to_string(frameIdx) + "_r" +
                                         std::to_string(idx));
         Value reg = seq::CompRegClockEnabledOp::create(
             hw, loc, combVal, clk, captureGate, rst, resetVal, regName);
@@ -1762,21 +1744,21 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       }
     }
 
-    // After lowering the step that produces the loop condition, wire it into
-    // the FSM instance via the condition backedge. Prefer the combinational
-    // alias (stepResultComb) over the mapping, which may now point at the
-    // post-step capture register.
-    if (stepIdx == condStepIdx) {
-      auto it = stepResultComb.find(condTermVal);
-      condBE.setValue(it != stepResultComb.end()
+    // After lowering the frame that produces the loop condition, wire it
+    // into the FSM instance via the condition backedge. Prefer the
+    // combinational alias (frameResultComb) over the mapping, which may now
+    // point at the post-frame capture register.
+    if (frameIdx == condFrameIdx) {
+      auto it = frameResultComb.find(condTermVal);
+      condBE.setValue(it != frameResultComb.end()
                           ? it->second
                           : localMapping.lookup(condTermVal));
     }
   }
 
   // --- Wire up iter_arg feedback ---
-  // iter_arg registers clock on iter_advance (the last step's last cycle)
-  // which is the SAME posedge the step-capture registers update on. The
+  // iter_arg registers clock on iter_advance (the last frame's last cycle)
+  // which is the SAME posedge the frame-capture registers update on. The
   // captured register sees its own pre-edge value on that posedge, which is
   // stale by one iteration; always prefer the combinational alias for the
   // iter_arg D input.
@@ -1788,8 +1770,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   hw.setInsertionPointToEnd(hwBody);
   for (unsigned i = 0; i < iterArgRegs.size(); ++i) {
     Value termArg = iterArgPhaseResults[i];
-    auto combIt = stepResultComb.find(termArg);
-    Value feedback = combIt != stepResultComb.end()
+    auto combIt = frameResultComb.find(termArg);
+    Value feedback = combIt != frameResultComb.end()
                          ? combIt->second
                          : localMapping.lookup(termArg);
     Value init = localMapping.lookup(seqOp.getInits()[i]);
@@ -1813,21 +1795,22 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       resultValues.push_back(localMapping.lookup(termResult));
   }
 
-  // --- Merge per-step memory ports ---
-  // Build per-step "alive" signals used by the merge priority mux. Regular
-  // steps use their step_active_<i> (high in every sub-state of STEP_<i>).
-  // Wait steps must cover STEP+WAIT+POST, and since `step_active_<i>` is
-  // never driven high for wait steps, we OR together child_active_<j> (which
-  // spans STEP and WAIT for that child) and post_active_<j> (POST state).
+  // --- Merge per-frame memory ports ---
+  // Build per-frame "alive" signals used by the merge priority mux. Regular
+  // frames use their frame_active_<i> (high in every sub-state of
+  // FRAME_<i>). Wait frames must cover FRAME+WAIT+POST, and since
+  // `frame_active_<i>` is never driven high for wait frames, we OR together
+  // child_active_<j> (which spans FRAME and WAIT for that child) and
+  // post_active_<j> (POST state).
   hw.setInsertionPointToEnd(hwBody);
-  SmallVector<Value> stepMergeSignals(numSteps);
-  for (unsigned i = 0; i < numSteps; ++i) {
-    if (stepWaitIdx[i] >= 0) {
-      unsigned j = (unsigned)stepWaitIdx[i];
-      stepMergeSignals[i] = comb::OrOp::create(
+  SmallVector<Value> frameMergeSignals(numFrames);
+  for (unsigned i = 0; i < numFrames; ++i) {
+    if (frameWaitIdx[i] >= 0) {
+      unsigned j = (unsigned)frameWaitIdx[i];
+      frameMergeSignals[i] = comb::OrOp::create(
           hw, loc, fsmChildActives[j], fsmPostActives[j]);
     } else {
-      stepMergeSignals[i] = fsmStepActives[i];
+      frameMergeSignals[i] = fsmFrameActives[i];
     }
   }
 
@@ -1835,7 +1818,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   for (auto &memInfo : memrefArgs)
     mergedMemPorts[memInfo.originalArg].rdData =
         localMemPorts[memInfo.originalArg].rdData;
-  mergeStepMemPorts(hw, loc, perStepPorts, stepMergeSignals, memrefArgs,
+  mergeStepMemPorts(hw, loc, perFramePorts, frameMergeSignals, memrefArgs,
                     mergedMemPorts);
 
   // Copy merged ports back into localMemPorts for output construction.
@@ -2405,7 +2388,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   for (auto &op : funcOp.getBody().front()) {
     if (isa<func::ReturnOp>(&op))
       continue;
-    if (isa<LoopScheduleStepOp, LoopScheduleSequentialOp,
+    if (isa<LoopScheduleFrameOp, LoopScheduleSequentialOp,
             LoopSchedulePipelineOp>(&op))
       continue;
     if (auto allocOp = dyn_cast<memref::AllocOp>(&op)) {
@@ -2464,11 +2447,11 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
                         wrEnBE});
   }
 
-  // Collect top-level steps.
-  SmallVector<LoopScheduleStepOp> topSteps;
+  // Collect top-level frames.
+  SmallVector<LoopScheduleFrameOp> topFrames;
   for (auto &op : funcOp.getBody().front())
-    if (auto stepOp = dyn_cast<LoopScheduleStepOp>(&op))
-      topSteps.push_back(stepOp);
+    if (auto frameOp = dyn_cast<LoopScheduleFrameOp>(&op))
+      topFrames.push_back(frameOp);
 
   // Collect memref argument info for threading through modules.
   SmallVector<MemrefArgInfo> memrefArgs;
@@ -2482,31 +2465,35 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
                           /*isLocalMem=*/true});
   }
 
-  // --- Multi-step path ---
-  if (topSteps.empty())
-    return funcOp.emitError("no top-level steps found");
+  // --- Multi-frame path ---
+  if (topFrames.empty())
+    return funcOp.emitError("no top-level frames found");
 
-  unsigned numSteps = topSteps.size();
+  unsigned numFrames = topFrames.size();
 
-  // Build a flat list of children: one entry per child op across all steps.
-  // A step with two pipelines produces two entries sharing the same stepIdx.
-  // A leaf step (no seq/pipeline children) produces one entry with kind=-1.
-  struct StepChild {
-    unsigned stepIdx;
+  // Build a flat list of children: one entry per child op across all frames.
+  // A frame with two pipelines produces two entries sharing the same
+  // frameIdx. A leaf frame (no seq/pipeline children) produces one entry
+  // with kind=-1. Nested seq/pipeline ops live inside the frame's `at`
+  // bodies.
+  struct FrameChild {
+    unsigned frameIdx;
     int kind; // -1 leaf, 0 sequential, 1 pipeline
     LoopScheduleSequentialOp seqOp;
     LoopSchedulePipelineOp pipOp;
   };
-  SmallVector<StepChild> entries;
-  for (unsigned i = 0; i < numSteps; ++i) {
+  SmallVector<FrameChild> entries;
+  for (unsigned i = 0; i < numFrames; ++i) {
     bool any = false;
-    for (auto &innerOp : topSteps[i].getBodyBlock()) {
-      if (auto seqOp = dyn_cast<LoopScheduleSequentialOp>(&innerOp)) {
-        entries.push_back({i, 0, seqOp, {}});
-        any = true;
-      } else if (auto pipOp = dyn_cast<LoopSchedulePipelineOp>(&innerOp)) {
-        entries.push_back({i, 1, {}, pipOp});
-        any = true;
+    for (auto atOp : topFrames[i].getBodyBlock().getOps<LoopScheduleAtOp>()) {
+      for (auto &innerOp : atOp.getBodyBlock()) {
+        if (auto seqOp = dyn_cast<LoopScheduleSequentialOp>(&innerOp)) {
+          entries.push_back({i, 0, seqOp, {}});
+          any = true;
+        } else if (auto pipOp = dyn_cast<LoopSchedulePipelineOp>(&innerOp)) {
+          entries.push_back({i, 1, {}, pipOp});
+          any = true;
+        }
       }
     }
     if (!any)
@@ -2576,38 +2563,68 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
     }
   }
 
-  // Track which entries belong to each step for pre/post-child op cloning.
-  // firstEntryForStep[s] = index of first entry belonging to step s.
-  // lastEntryForStep[s]  = index of last entry belonging to step s.
-  SmallVector<unsigned> firstEntryForStep(numSteps, 0);
-  SmallVector<unsigned> lastEntryForStep(numSteps, 0);
+  // Track which entries belong to each frame for pre/post-child op cloning.
+  // firstEntryForFrame[f] = index of first entry belonging to frame f.
+  // lastEntryForFrame[f]  = index of last entry belonging to frame f.
+  SmallVector<unsigned> firstEntryForFrame(numFrames, 0);
+  SmallVector<unsigned> lastEntryForFrame(numFrames, 0);
   for (unsigned i = 0; i < numEntries; ++i) {
-    unsigned s = entries[i].stepIdx;
-    if (i == 0 || entries[i - 1].stepIdx != s)
-      firstEntryForStep[s] = i;
-    lastEntryForStep[s] = i;
+    unsigned f = entries[i].frameIdx;
+    if (i == 0 || entries[i - 1].frameIdx != f)
+      firstEntryForFrame[f] = i;
+    lastEntryForFrame[f] = i;
   }
+
+  // Helper: walk the at bodies of a top-level frame looking for ops to
+  // clone. Skips `at`/yield/iter_arg_update op scaffolding and the nested
+  // loop ops (which are handled per-entry as children).
+  auto cloneFramePreChild = [&](LoopScheduleFrameOp frame,
+                                Operation *firstChildOp) {
+    for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
+      for (auto &op : atOp.getBodyBlock()) {
+        if (&op == firstChildOp)
+          return;
+        if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
+          continue;
+        if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
+          return;
+        builder.clone(op, mapping);
+      }
+    }
+  };
+
+  auto cloneFramePostChild = [&](LoopScheduleFrameOp frame,
+                                 Operation *lastChildOp) {
+    bool pastChild = false;
+    for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
+      for (auto &op : atOp.getBodyBlock()) {
+        if (&op == lastChildOp) {
+          pastChild = true;
+          continue;
+        }
+        if (!pastChild)
+          continue;
+        if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
+          continue;
+        if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
+          continue;
+        builder.clone(op, mapping);
+      }
+    }
+  };
 
   // Lower each entry.
   unsigned loopCounter = 0;
   for (unsigned ei = 0; ei < numEntries; ++ei) {
     auto &entry = entries[ei];
-    unsigned stepIdx = entry.stepIdx;
+    unsigned frameIdx = entry.frameIdx;
     builder.setInsertionPointToEnd(hwBody);
 
-    // Clone pre-child ops only for the first entry of this step.
-    if (entry.kind >= 0 && ei == firstEntryForStep[stepIdx]) {
+    // Clone pre-child ops only for the first entry of this frame.
+    if (entry.kind >= 0 && ei == firstEntryForFrame[frameIdx]) {
       Operation *firstChildOp = entry.seqOp ? entry.seqOp.getOperation()
                                             : entry.pipOp.getOperation();
-      for (auto &op : topSteps[stepIdx].getBodyBlock().getOperations()) {
-        if (&op == firstChildOp)
-          break;
-        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
-          continue;
-        if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
-          break;
-        builder.clone(op, mapping);
-      }
+      cloneFramePreChild(topFrames[frameIdx], firstChildOp);
     }
 
     if (entry.kind == 0) {
@@ -2675,67 +2692,53 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
       childDoneBEs[childIndexForEntry[ei]].setValue(pipDone);
 
     } else {
-      // Leaf step: lower body with entry_running as wrEn gate.
+      // Leaf frame: lower body with entry_running as wrEn gate.
       Value oneGate = entryRunningSignals[ei];
-      if (failed(lowerStepBody(&topSteps[stepIdx].getBodyBlock(), builder,
-                               mapping, ArrayRef<Value>(oneGate),
-                               perEntryPorts[ei])))
+      if (failed(lowerFrameBody(&topFrames[frameIdx].getBodyBlock(), builder,
+                                mapping, ArrayRef<Value>(oneGate),
+                                perEntryPorts[ei])))
         return failure();
     }
 
-    // Clone post-child ops only for the last entry of this step.
-    if (entry.kind >= 0 && ei == lastEntryForStep[stepIdx]) {
+    // Clone post-child ops only for the last entry of this frame.
+    if (entry.kind >= 0 && ei == lastEntryForFrame[frameIdx]) {
       Operation *lastChildOp = entry.seqOp ? entry.seqOp.getOperation()
                                            : entry.pipOp.getOperation();
       builder.setInsertionPointToEnd(hwBody);
-      bool pastChild = false;
-      for (auto &op : topSteps[stepIdx].getBodyBlock().getOperations()) {
-        if (&op == lastChildOp) {
-          pastChild = true;
-          continue;
-        }
-        if (!pastChild)
-          continue;
-        if (isa<LoopScheduleRegisterOp, LoopScheduleIterArgUpdateOp>(&op))
-          continue;
-        if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
-          continue;
-        builder.clone(op, mapping);
-      }
+      cloneFramePostChild(topFrames[frameIdx], lastChildOp);
     }
 
-    // Register step results only after the last entry for this step completes.
-    if (ei == lastEntryForStep[stepIdx]) {
+    // Register frame results only after the last entry for this frame
+    // completes.
+    if (ei == lastEntryForFrame[frameIdx]) {
       // Pre-scan for loads from local hlmem — skip capture for those.
       DenseSet<Value> localLoadResults;
-      for (auto &op : topSteps[stepIdx].getBodyBlock()) {
-        if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-          for (auto &memInfo : memrefArgs)
-            if (memInfo.originalArg == loadOp.getMemRef() &&
-                memInfo.isLocalMem)
-              localLoadResults.insert(loadOp.getResult());
-        }
-      }
+      topFrames[frameIdx]->walk([&](LoopScheduleLoadOp loadOp) {
+        for (auto &memInfo : memrefArgs)
+          if (memInfo.originalArg == loadOp.getMemRef() &&
+              memInfo.isLocalMem)
+            localLoadResults.insert(loadOp.getResult());
+      });
 
-      auto stepRegOp = cast<LoopScheduleRegisterOp>(
-          topSteps[stepIdx].getBodyBlock().getTerminator());
-      for (auto [stepResult, regOperand] :
-           llvm::zip(topSteps[stepIdx].getResults(),
-                     stepRegOp.getOperands())) {
-        Value val = mapping.lookup(regOperand);
-        if (localLoadResults.count(regOperand)) {
+      auto frameYieldOp = cast<LoopScheduleYieldOp>(
+          topFrames[frameIdx].getBodyBlock().getTerminator());
+      for (auto [frameResult, yOperand] :
+           llvm::zip(topFrames[frameIdx].getResults(),
+                     frameYieldOp.getOperands())) {
+        Value val = mapping.lookup(yOperand);
+        if (localLoadResults.count(yOperand)) {
           // Local hlmem read (latency=1) provides the delay; skip register.
-          mapping.map(stepResult, val);
+          mapping.map(frameResult, val);
           continue;
         }
         auto regName = builder.getStringAttr(
-            funcName + "_step" + std::to_string(stepIdx) + "_result_" +
-            std::to_string(stepResult.getResultNumber()));
+            funcName + "_frame" + std::to_string(frameIdx) + "_result_" +
+            std::to_string(frameResult.getResultNumber()));
         Value resetVal = createZeroConstant(builder, loc, val.getType());
         auto reg = seq::CompRegClockEnabledOp::create(
             builder, loc, val, clk, entryRunningSignals[ei], rst, resetVal,
             regName);
-        mapping.map(stepResult, reg);
+        mapping.map(frameResult, reg);
       }
     }
   }
