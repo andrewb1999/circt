@@ -1326,9 +1326,8 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
 
   DenseMap<uint32_t, SmallVector<Value>> reregisterValues;
 
-  LoopScheduleStepOp lastStep;
-  // Track which step result holds the condition value, set during step
-  // creation below once the condition op's step is lowered.
+  // Track which frame result holds the condition value, set during frame
+  // creation below once the condition op's frame is lowered.
   Value sequentialCondResult;
   Operation *condOp = condValue.getDefiningOp();
   DominanceInfo dom(getOperation());
@@ -1426,9 +1425,52 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
 
     bool stepHasCond = llvm::is_contained(group, condOp);
 
-    // Create the step itself.
-    auto step = builder.create<LoopScheduleStepOp>(stepTypes);
-    auto &stepBlock = step.getBodyBlock();
+    // Split the combined step result layout into the at-0 slice and the
+    // per-offset delay export slices. The frame result layout mirrors the
+    // old step layout: at-0 results first, then each offset's exports in
+    // offset order. That way `frame.getResult(i)` stands in for what used
+    // to be `step.getResult(i)` with no index remapping.
+    unsigned at0TypesEnd = stepTypes.size() -
+                           ((delayOffsetGroups.count(startTime))
+                                ? [&] {
+                                    unsigned n = 0;
+                                    for (auto &kv :
+                                         delayOffsetGroups[startTime]) {
+                                      (void)kv.first;
+                                      for (auto *op : kv.second)
+                                        if (delayExportFirstStepIdx.count(op))
+                                          n += op->getNumResults();
+                                    }
+                                    return n;
+                                  }()
+                                : 0u);
+
+    SmallVector<Type> at0Types(stepTypes.begin(),
+                               stepTypes.begin() + at0TypesEnd);
+
+    // Create the frame + at-0 inside its body. The frame's result layout
+    // mirrors what the old step op exported.
+    auto frame = builder.create<LoopScheduleFrameOp>(stepTypes);
+    {
+      Block &awaitBlock = frame.getAwaitRegion().emplaceBlock();
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToEnd(&awaitBlock);
+      builder.create<LoopScheduleYieldOp>();
+    }
+    Block &bodyBlock = frame.getBodyRegion().emplaceBlock();
+    LoopScheduleYieldOp bodyYield;
+    {
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToEnd(&bodyBlock);
+      bodyYield = builder.create<LoopScheduleYieldOp>();
+    }
+
+    // Create at-0 just before the frame body yield and use its implicit
+    // yield as the stand-in for the old step's register terminator.
+    builder.setInsertionPoint(bodyYield);
+    auto at0 = builder.create<LoopScheduleAtOp>(
+        at0Types, builder.getI64IntegerAttr(0));
+    auto &stepBlock = at0.getBodyBlock();
     auto *stepTerminator = stepBlock.getTerminator();
     builder.setInsertionPointToStart(&stepBlock);
 
@@ -1438,7 +1480,7 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
 
     SmallVector<std::pair<Value, Value>> newIterArgs;
 
-    // Move over the operations and add their results to the terminator.
+    // Move over the operations and add their results to the at-0 yield.
     SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
     for (auto *op : group) {
       unsigned resultIndex = stepTerminator->getNumOperands();
@@ -1455,7 +1497,7 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
       dependenceAnalysis->replaceOp(op, newOp);
       // Stamp per-op cycle latency so backends know how many cycles a
       // multi-cycle operator (e.g. iterative multiplier) consumes within
-      // its step. Only stamped when > 1 to keep IR tidy.
+      // its frame. Only stamped when > 1 to keep IR tidy.
       if (auto opr = problem.getLinkedOperatorType(op)) {
         unsigned lat = problem.getLatency(*opr).value_or(1);
         if (lat > 1)
@@ -1494,7 +1536,7 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
           auto newIterArg = valueMap.lookup(iterArg);
           stepTerminator->insertOperands(resultIndex,
                                          SmallVector<Value>{newIterArg});
-          newIterArgs.emplace_back(iterArg, step->getResult(resultIndex));
+          newIterArgs.emplace_back(iterArg, frame->getResult(resultIndex));
         }
       }
 
@@ -1508,49 +1550,48 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
     for (auto val : reregisterValues[startTime]) {
       unsigned resultIndex = stepTerminator->getNumOperands();
       stepTerminator->insertOperands(resultIndex, valueMap.lookup(val));
-      auto newValue = step->getResult(resultIndex);
+      auto newValue = frame->getResult(resultIndex);
       valueMap.map(val, newValue);
     }
 
-    // Emit delay regions for offsets > 0 in this bucket. Each delay op
-    // wraps the ops scheduled at offset cycles into the step. Every cloned
-    // op's results are registered as delay results so subsequent in-bucket
-    // ops can reference them via valueMap. Ops whose results were marked
-    // for export to the step (delayExportFirstStepIdx) also have their
-    // delay results inserted into the step's terminator.
+    // Emit additional `loopschedule.at` ops for offsets > 0 in this bucket.
+    // Each offset's ops become an `at K` inside the frame body, with their
+    // results yielded from the at. Ops whose results were marked for export
+    // (delayExportFirstStepIdx) have their at-K results forwarded through
+    // the frame body yield to become frame results.
+    SmallVector<Value> atKExportValues; // in offset-then-op order
     if (delayOffsetGroups.count(startTime)) {
       OpBuilder::InsertionGuard guard(builder);
-      // Insert delay ops at the end of the step body (just before the
-      // implicit register terminator).
-      builder.setInsertionPoint(stepTerminator);
+      // Insert at-K ops at the end of the frame body (just before the
+      // frame body yield).
+      builder.setInsertionPoint(bodyYield);
       for (auto &offsetEntry : delayOffsetGroups[startTime]) {
         uint32_t offset = offsetEntry.first;
         auto &delayOps = offsetEntry.second;
 
-        // Sort by dominance for stable ordering inside the delay body.
+        // Sort by dominance for stable ordering inside the at body.
         llvm::sort(delayOps, [&](Operation *a, Operation *b) {
           return dom.dominates(a, b);
         });
 
-        // Compute delay result types: register every cloned op's results
+        // Compute at result types: register every cloned op's results
         // (simple, slightly wasteful but correct).
-        SmallVector<Type> delayResultTypes;
+        SmallVector<Type> atResultTypes;
         for (auto *op : delayOps)
           for (auto t : op->getResultTypes())
-            delayResultTypes.push_back(t);
+            atResultTypes.push_back(t);
 
         Location dLoc = delayOps.front()->getLoc();
-        auto delayOp = LoopScheduleDelayOp::create(builder, dLoc,
-                                                   (uint64_t)offset,
-                                                   delayResultTypes);
-        Block &delayBlock = delayOp.getBodyBlock();
-        auto *delayTerminator = delayBlock.getTerminator();
+        auto atK = builder.create<LoopScheduleAtOp>(
+            dLoc, atResultTypes, builder.getI64IntegerAttr(offset));
+        Block &atKBlock = atK.getBodyBlock();
+        auto *atKYield = atKBlock.getTerminator();
 
-        // Clone delay ops into the delay body.
+        // Clone delay ops into the at body.
         OpBuilder::InsertionGuard innerGuard(builder);
-        builder.setInsertionPointToStart(&delayBlock);
+        builder.setInsertionPointToStart(&atKBlock);
         DenseMap<Operation *, Operation *> delayOldToNew;
-        SmallVector<Value> delayRegOperands;
+        SmallVector<Value> atKYieldOperands;
         for (auto *op : delayOps) {
           auto *newOp = builder.clone(*op, valueMap);
           dependenceAnalysis->replaceOp(op, newOp);
@@ -1561,76 +1602,81 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
                              builder.getI64IntegerAttr(lat));
           }
           delayOldToNew[op] = newOp;
-          // Update valueMap so subsequent in-delay ops see this clone.
+          // Update valueMap so subsequent in-at ops see this clone.
           for (auto [orig, clone] :
                llvm::zip(op->getResults(), newOp->getResults()))
             valueMap.map(orig, clone);
           for (auto r : newOp->getResults())
-            delayRegOperands.push_back(r);
+            atKYieldOperands.push_back(r);
         }
-        // Set the delay's register terminator operands.
-        delayTerminator->setOperands(delayRegOperands);
+        // Set the at's yield operands.
+        atKYield->setOperands(atKYieldOperands);
 
-        // Map original op results to the delay op's external results so
-        // later ops in the same step (in higher-offset delay regions) see
-        // the delay op result through valueMap.
-        unsigned delayResultIdx = 0;
+        // Map original op results to the at-K op's external results so
+        // later ops in the same frame (in higher-offset at regions) see
+        // the at op result through valueMap.
+        unsigned atResultIdx = 0;
         for (auto *op : delayOps) {
           for (auto orig : op->getResults()) {
-            valueMap.map(orig, delayOp.getResult(delayResultIdx++));
+            valueMap.map(orig, atK.getResult(atResultIdx++));
           }
         }
 
-        // For ops whose results escape this step, append the delay's
-        // result to the step terminator at the pre-computed step index.
-        // (We assume the existing iteration order over delayOffsetGroups
-        // matches the order used during stepTypes computation, which it
-        // does because both iterate the std::map in offset order.)
+        // For ops whose results escape this frame, collect the at-K's
+        // result into atKExportValues in the same order used when
+        // computing stepTypes / delayExportFirstStepIdx.
         for (auto *op : delayOps) {
           auto it = delayExportFirstStepIdx.find(op);
           if (it == delayExportFirstStepIdx.end())
             continue;
-          // Find the delay op's results corresponding to this op.
-          unsigned firstDelayIdx = 0;
+          // Find the at-K op's results corresponding to this op.
+          unsigned firstAtIdx = 0;
           for (auto *o : delayOps) {
             if (o == op)
               break;
-            firstDelayIdx += o->getNumResults();
+            firstAtIdx += o->getNumResults();
           }
           for (unsigned i = 0, e = op->getNumResults(); i < e; ++i) {
-            unsigned stepIdx = it->second + i;
-            (void)stepIdx;
-            stepTerminator->insertOperands(
-                stepTerminator->getNumOperands(),
-                delayOp.getResult(firstDelayIdx + i));
+            atKExportValues.push_back(atK.getResult(firstAtIdx + i));
           }
         }
       }
     }
 
-    // Add the step results to the value map for the original op.
+    // Finalize the frame body yield: forward at-0 results, then at-K
+    // exports in the order they were collected. This is the layout that
+    // matches stepTypes / the old step result ordering.
+    SmallVector<Value> bodyYieldOperands;
+    bodyYieldOperands.reserve(stepTypes.size());
+    for (auto r : at0.getResults())
+      bodyYieldOperands.push_back(r);
+    for (auto v : atKExportValues)
+      bodyYieldOperands.push_back(v);
+    bodyYield->setOperands(bodyYieldOperands);
+
+    // Add the frame results to the value map for the original op.
     for (auto t : movedOps) {
       Operation *op = std::get<0>(t);
       Operation *newOp = std::get<1>(t);
       unsigned resultIndex = std::get<2>(t);
       for (size_t i = 0; i < newOp->getNumResults(); ++i) {
-        auto newValue = step->getResult(resultIndex + i);
+        auto newValue = frame->getResult(resultIndex + i);
         auto oldValue = op->getResult(i);
         valueMap.map(oldValue, newValue);
       }
-      // Track the step result that holds the loop condition.
+      // Track the frame result that holds the loop condition.
       if (stepHasCond && op == condOp) {
         unsigned condResNum = cast<OpResult>(condValue).getResultNumber();
-        sequentialCondResult = step->getResult(resultIndex + condResNum);
+        sequentialCondResult = frame->getResult(resultIndex + condResNum);
       }
     }
 
-    // Same for delay-region exports: map the original op result to the
-    // step result so later steps reference the step boundary.
+    // Same for at-K exports: map the original op result to the frame
+    // result so later frames reference the frame boundary.
     for (auto *op : delayExportOps) {
       unsigned firstIdx = delayExportFirstStepIdx[op];
       for (unsigned i = 0, e = op->getNumResults(); i < e; ++i) {
-        valueMap.map(op->getResult(i), step->getResult(firstIdx + i));
+        valueMap.map(op->getResult(i), frame->getResult(firstIdx + i));
       }
     }
 
@@ -1663,18 +1709,24 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
     Value newValue = valueMap.lookup(value);
     termIterArgs.push_back(newValue);
 
-    // Emit an iter_arg_update inside the step that produced the new value.
+    // Emit an iter_arg_update inside the `at` that produced the new value.
     // The LHS is the sequential's iter-arg block argument for position `i`;
-    // the RHS is the register-op operand corresponding to `newValue` (the
-    // step result is not visible inside the step itself).
-    if (auto step = newValue.getDefiningOp<LoopScheduleStepOp>()) {
-      auto regOp = step.getRegisterOp();
-      unsigned resultIdx = cast<OpResult>(newValue).getResultNumber();
-      Value inside = regOp->getOperand(resultIdx);
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPoint(regOp);
-      builder.create<LoopScheduleIterArgUpdateOp>(
-          step.getLoc(), sequential.getScheduleBlock().getArgument(i), inside);
+    // the RHS is the at-op's yield operand corresponding to `newValue` (the
+    // frame/at results are not visible inside the at body itself).
+    if (auto frame = newValue.getDefiningOp<LoopScheduleFrameOp>()) {
+      auto bodyYield = frame.getBodyYield();
+      unsigned frameResultIdx = cast<OpResult>(newValue).getResultNumber();
+      Value insideFrame = bodyYield->getOperand(frameResultIdx);
+      if (auto at = insideFrame.getDefiningOp<LoopScheduleAtOp>()) {
+        auto atYield = at.getYieldOp();
+        unsigned atResultIdx = cast<OpResult>(insideFrame).getResultNumber();
+        Value insideAt = atYield->getOperand(atResultIdx);
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(atYield);
+        builder.create<LoopScheduleIterArgUpdateOp>(
+            at.getLoc(), sequential.getScheduleBlock().getArgument(i),
+            insideAt);
+      }
     }
   }
 
@@ -1864,9 +1916,26 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
       stepTypes.push_back(val.getType());
     }
 
-    // Create the stage itself.
-    auto step = builder.create<LoopScheduleStepOp>(stepTypes);
-    auto &stepBlock = step.getBodyBlock();
+    // Create the frame + at-0 for this bucket. The frame result layout
+    // mirrors the old step's result layout; at-0 yields the same values.
+    auto frame = builder.create<LoopScheduleFrameOp>(stepTypes);
+    {
+      Block &awaitBlock = frame.getAwaitRegion().emplaceBlock();
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToEnd(&awaitBlock);
+      builder.create<LoopScheduleYieldOp>();
+    }
+    Block &bodyBlock = frame.getBodyRegion().emplaceBlock();
+    LoopScheduleYieldOp bodyYield;
+    {
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToEnd(&bodyBlock);
+      bodyYield = builder.create<LoopScheduleYieldOp>();
+    }
+    builder.setInsertionPoint(bodyYield);
+    auto at0 = builder.create<LoopScheduleAtOp>(
+        stepTypes, builder.getI64IntegerAttr(0));
+    auto &stepBlock = at0.getBodyBlock();
     auto *stepTerminator = stepBlock.getTerminator();
     builder.setInsertionPointToStart(&stepBlock);
 
@@ -1874,7 +1943,7 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
     llvm::sort(group,
                [&](Operation *a, Operation *b) { return dom.dominates(a, b); });
 
-    // Move over the operations and add their results to the terminator.
+    // Move over the operations and add their results to the at-0 yield.
     SmallVector<std::tuple<Operation *, Operation *, unsigned>> movedOps;
     for (auto *op : group) {
       unsigned resultIndex = stepTerminator->getNumOperands();
@@ -1899,8 +1968,8 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
         stepTerminator->insertOperands(resultIndex, newOp->getResults());
         movedOps.emplace_back(op, newOp, resultIndex);
       }
-      // All further uses in this step should used the cloned-version of values
-      // So we update the mapping in this stage
+      // All further uses in this frame should used the cloned-version of
+      // values; update the mapping in this bucket.
       for (auto result : op->getResults())
         valueMap.map(result, newOp->getResult(result.getResultNumber()));
     }
@@ -1909,17 +1978,21 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
     for (auto val : reregisterValues[startTime]) {
       unsigned resultIndex = stepTerminator->getNumOperands();
       stepTerminator->insertOperands(resultIndex, valueMap.lookup(val));
-      auto newValue = step->getResult(resultIndex);
+      auto newValue = frame->getResult(resultIndex);
       valueMap.map(val, newValue);
     }
 
-    // Add the stage results to the value map for the original op.
+    // Forward the at-0 results as the frame's body yield operands so the
+    // frame op exposes the same result layout the old step did.
+    bodyYield->setOperands(at0.getResults());
+
+    // Add the frame results to the value map for the original op.
     for (auto tuple : movedOps) {
       Operation *op = std::get<0>(tuple);
       Operation *newOp = std::get<1>(tuple);
       unsigned resultIndex = std::get<2>(tuple);
       for (size_t i = 0; i < newOp->getNumResults(); ++i) {
-        auto newValue = step->getResult(resultIndex + i);
+        auto newValue = frame->getResult(resultIndex + i);
         auto oldValue = op->getResult(i);
         valueMap.map(oldValue, newValue);
       }
@@ -1950,21 +2023,21 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
     returnOp->setOperand(i, newValue);
   }
 
-  std::function<bool(Operation *)> inTopLevelStepOp = [&](Operation *op) {
-    auto parent = op->getParentOfType<LoopScheduleStepOp>();
+  std::function<bool(Operation *)> inTopLevelFrameOp = [&](Operation *op) {
+    auto parent = op->getParentOfType<LoopScheduleFrameOp>();
     if (!parent)
       return false;
 
     if (isa<func::FuncOp>(parent->getParentOp()))
       return true;
 
-    return inTopLevelStepOp(parent);
+    return inTopLevelFrameOp(parent);
   };
 
   // Remove the loop nest from the IR.
   funcOp.getBody().walk<WalkOrder::PostOrder>([&](Operation *op) {
-    if ((isa<LoopScheduleStepOp>(op) && isa<FuncOp>(op->getParentOp())) ||
-        inTopLevelStepOp(op) ||
+    if ((isa<LoopScheduleFrameOp>(op) && isa<FuncOp>(op->getParentOp())) ||
+        inTopLevelFrameOp(op) ||
         isa<func::ReturnOp, memref::AllocaOp, arith::ConstantOp,
             memref::AllocOp, AllocInterface>(op))
       return;
