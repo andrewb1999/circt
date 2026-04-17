@@ -1,6 +1,5 @@
 // RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule),lower-loopschedule-to-fsm)" %s | FileCheck %s
 
-// XFAIL: *
 // End-to-end squared-norm reduction. Same failure mode as kernel-dot.mlir.
 // CHECK: hw.module @sqnorm
 // CHECK: fsm.machine @sqnorm_fsm

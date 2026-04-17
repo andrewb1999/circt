@@ -1,6 +1,5 @@
 // RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule),lower-loopschedule-to-calyx)" %s | FileCheck %s
 
-// XFAIL: *
 // End-to-end squared-norm reduction. Same failure as kernel-dot.mlir.
 // CHECK: calyx.component @sqnorm
 

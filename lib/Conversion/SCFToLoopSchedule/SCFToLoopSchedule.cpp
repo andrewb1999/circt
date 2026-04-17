@@ -2684,24 +2684,79 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
   // keeps the launch verifier satisfied (every launch must reach an await
   // terminal) and gives the top-level function a clean completion point.
   if (!pendingLaunches.empty()) {
+    // Collect per-launch forwards whose original value is consumed by the
+    // func terminator (i.e. returned). These need to flow out of the
+    // barrier frame as frame SSA results so func.return can reach them.
+    struct ReturnForward {
+      size_t pendingIdx;    // index into pendingLaunches
+      unsigned forwardIdx;  // index into pl.forwards
+      Type resultType;
+    };
+    SmallVector<ReturnForward> returnForwards;
+    SmallVector<Type> barrierResultTypes;
+    for (auto [pi, pl] : llvm::enumerate(pendingLaunches)) {
+      for (auto [fi, fwd] : llvm::enumerate(pl.forwards)) {
+        for (auto *user : fwd.second.getUsers()) {
+          if (isFuncTerminator(user)) {
+            returnForwards.push_back({pi, (unsigned)fi, fwd.second.getType()});
+            barrierResultTypes.push_back(fwd.second.getType());
+            break;
+          }
+        }
+      }
+    }
+
     builder.setInsertionPoint(funcReturn);
-    auto barrier = builder.create<LoopScheduleFrameOp>(TypeRange{});
+    auto barrier = builder.create<LoopScheduleFrameOp>(barrierResultTypes);
+
+    // Await region: await each pending launch's handle; for launches with
+    // return-forwards, await with the forward's result type so the value
+    // crosses into the body-block-arg.
     {
       Block &awaitBlock = barrier.getAwaitRegion().emplaceBlock();
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPointToEnd(&awaitBlock);
-      SmallVector<Value> handles;
-      for (auto &pl : pendingLaunches)
-        handles.push_back(pl.currentHandle);
-      builder.create<LoopScheduleAwaitOp>(handles.front().getLoc(),
-                                          TypeRange{}, handles);
-      builder.create<LoopScheduleYieldOp>();
+
+      SmallVector<Value> awaitYieldOperands;
+      // Per-pending-launch: await once; if it has return-forwards, include
+      // their types in the await's result types.
+      for (auto [pi, pl] : llvm::enumerate(pendingLaunches)) {
+        SmallVector<Type> awaitRetTypes;
+        SmallVector<const ReturnForward *> forwardsForThis;
+        for (auto &rf : returnForwards) {
+          if (rf.pendingIdx == pi) {
+            awaitRetTypes.push_back(rf.resultType);
+            forwardsForThis.push_back(&rf);
+          }
+        }
+        auto awaitOp = builder.create<LoopScheduleAwaitOp>(
+            pl.currentHandle.getLoc(), awaitRetTypes,
+            ValueRange{pl.currentHandle});
+        for (auto [i, rf] : llvm::enumerate(forwardsForThis))
+          awaitYieldOperands.push_back(awaitOp.getResult(i));
+      }
+      builder.create<LoopScheduleYieldOp>(funcOp.getLoc(), awaitYieldOperands);
     }
+
+    // Body region: block args come from the await-region yield. The body
+    // forwards them as frame results so func.return can pick them up.
     {
       Block &bodyBlock = barrier.getBodyRegion().emplaceBlock();
+      for (Type t : barrierResultTypes)
+        bodyBlock.addArgument(t, funcOp.getLoc());
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPointToEnd(&bodyBlock);
-      builder.create<LoopScheduleYieldOp>();
+      builder.create<LoopScheduleYieldOp>(
+          funcOp.getLoc(),
+          SmallVector<Value>(bodyBlock.getArguments().begin(),
+                             bodyBlock.getArguments().end()));
+    }
+
+    // Rewrite func.return uses: each return-forwarded original value becomes
+    // the corresponding frame SSA result.
+    for (auto [i, rf] : llvm::enumerate(returnForwards)) {
+      Value origValue = pendingLaunches[rf.pendingIdx].forwards[rf.forwardIdx].second;
+      origValue.replaceAllUsesWith(barrier.getResult(i));
     }
   }
 

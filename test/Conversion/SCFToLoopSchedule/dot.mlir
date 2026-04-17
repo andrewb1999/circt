@@ -1,6 +1,5 @@
 // RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule))" %s | FileCheck %s
 
-// XFAIL: *
 // Reduction kernel: s = sum(A[i] * B[i]) over i, returned as a scalar.
 // Currently fails in SCFToLoopSchedule because the scheduling of a sequential
 // loop whose iter-arg is returned from the function does not forward the

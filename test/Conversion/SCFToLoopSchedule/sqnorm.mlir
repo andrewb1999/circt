@@ -1,6 +1,5 @@
 // RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule))" %s | FileCheck %s
 
-// XFAIL: *
 // Squared L2-norm reduction: s = sum(A[i] * A[i]).
 // Same failure mode as dot.mlir: a sequential loop's reduced iter-arg is
 // returned directly by the function, but the result SSA value ends up
