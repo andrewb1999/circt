@@ -1,4 +1,3 @@
-// XFAIL: *
 // RUN: circt-opt --lower-loopschedule-to-calyx %s | FileCheck %s
 
 // Sequential loop whose body-frame contains an `at 2` region wrapping a
@@ -9,13 +8,6 @@
 // The outer sequential loop lives inside a `loopschedule.launch at 0` in a
 // top-level frame (new surface). A trailing `await` frame consumes the
 // launch's handle.
-//
-// Expected-failure rationale: the greedy-pattern canonicalizer run inside
-// the Calyx pass trips on a null operand during an Operation::fold for
-// the at-K offset padding emission (Matchers.h:491 assertion `value`).
-// The other two Calyx tests exercise the launch/await surface and pass;
-// this one specifically tests the at-K pad group path and needs deeper
-// investigation separately.
 
 module {
   func.func @delay_step(%arg0: memref<16xi32>) attributes {top} {
@@ -56,12 +48,12 @@ module {
 
 // CHECK: calyx.component @delay_step
 // CHECK: calyx.wires
-// A padding static group of latency 2 should exist for the delay region.
-// CHECK-DAG: calyx.static_group latency<2> @delay_pad
+// A padding static group of latency 2 should exist for the `at 2` region.
+// CHECK-DAG: calyx.static_group latency<2> @at_pad
 // CHECK: calyx.control
 // The frame body should contain a static_seq enabling the pad followed by a
-// static_par for the delay's inner schedulables.
+// static_par for the at-2's inner schedulables.
 // CHECK: calyx.static_par
 // CHECK: calyx.static_seq
-// CHECK: calyx.enable @delay_pad
+// CHECK: calyx.enable @at_pad
 // CHECK: calyx.static_par

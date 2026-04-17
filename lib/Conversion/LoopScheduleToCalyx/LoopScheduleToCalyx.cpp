@@ -72,6 +72,28 @@ static bool isHandleType(mlir::Type type) {
   return isa<loopschedule::HandleType>(type);
 }
 
+/// Walk through any `loopschedule.at` layers wrapping `v` to return the
+/// innermost SSA value that `v` is defined to carry (the at's yield operand
+/// at the matching result index). Stops when `v` is not an at result, or the
+/// yield's operand count doesn't cover the requested index.
+///
+/// Used by the Calyx lowering when it needs to reason about the value a frame
+/// result really carries — for example, to store the actual `arith.cmpi`
+/// behind a sequential's condition, so that the subsequent move to
+/// component-level wires has a legitimate target. Without this, downstream
+/// code would record a cross-region reference to an at-result that becomes
+/// dangling once the surrounding frame/at ops are erased.
+static mlir::Value unwrapThroughAts(mlir::Value v) {
+  while (auto atOp = v.getDefiningOp<loopschedule::LoopScheduleAtOp>()) {
+    auto res = mlir::cast<mlir::OpResult>(v);
+    auto atYield = atOp.getYieldOp();
+    if (res.getResultNumber() >= atYield->getNumOperands())
+      break;
+    v = atYield->getOperand(res.getResultNumber());
+  }
+  return v;
+}
+
 /// Pre-process the function to dissolve the new `loopschedule.launch` /
 /// `loopschedule.await` scaffolding introduced by SCFToLoopSchedule's
 /// frame-per-problem emitter. The Calyx pass's existing scheduler was
@@ -2165,6 +2187,14 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
           value = yieldOp->getOperand(resNum);
         }
 
+        // For a frame's body yield, the operand is typically a
+        // `loopschedule.at` result. Downstream code (seq cond wire-moves,
+        // iter-arg-update reuse, cond-reg reuse) needs the innermost
+        // computation value, not the at result — otherwise we record a
+        // cross-region reference that becomes dangling once the surrounding
+        // at/frame are erased.
+        Value unwrapped = unwrapThroughAts(value);
+
         unsigned i = operand.getOperandNumber();
         // Iter args are created in BuildWhileGroups, so just mark the iter arg
         // register as the appropriate pipeline register. A phase result that
@@ -2176,11 +2206,14 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
 
         // If this register operand is the `value` of an iter_arg_update,
         // reuse the loop's iter-arg register recorded by BuildOpGroups.
-        // Check both the raw operand and the if-op-unwrapped `value`.
+        // Check both the raw operand and the if-op-unwrapped `value` and the
+        // at-unwrapped value.
         {
           auto it = iterArgNewValueReg.find(value);
           if (it == iterArgNewValueReg.end())
             it = iterArgNewValueReg.find(operand.get());
+          if (it == iterArgNewValueReg.end())
+            it = iterArgNewValueReg.find(unwrapped);
           if (it != iterArgNewValueReg.end()) {
             auto reg = it->second;
             getState<ComponentLoweringState>().addPhaseReg(phase, reg, i);
@@ -2204,8 +2237,11 @@ class BuildIntermediateRegs : public calyx::FuncOpPartialLoweringPattern {
           if (absIdx == kConditionIdx &&
               !loop.getOperation().isPipelined()) {
             // Sequential loop: store condition value for continuous assignment.
+            // Use the at-unwrapped value so the cmpi result stored here is
+            // reachable at the Calyx component level after the subsequent
+            // moveBefore(wiresBody, ...) in BuildPhaseGroups.
             getState<ComponentLoweringState>().setSeqCondValue(
-                loop.getOperation(), value);
+                loop.getOperation(), unwrapped);
             reusedReg = true;
             break;
           }
@@ -2501,7 +2537,18 @@ class BuildPhaseGroups : public calyx::FuncOpPartialLoweringPattern {
       for (auto &operand : operands) {
         unsigned i = operand.getOperandNumber();
         if (!pipelineRegisters.count(i)) {
-          phase->getResult(i).replaceAllUsesWith(operand.get());
+          // Unwrap through nested at ops so the replacement's target is the
+          // innermost computation value rather than a cross-region at-result.
+          // Skip replacement entirely if the unwrapped value is still defined
+          // inside a region the frame result's users can't see (e.g.,
+          // handle-typed, or the unwrap bottomed out before escaping the at
+          // body) — leaving the SSA edge for LateSSAReplacement to resolve.
+          Value target = unwrapThroughAts(operand.get());
+          if (target.getDefiningOp() &&
+              target.getDefiningOp()->getParentOp() != phase->getParentOp() &&
+              !isa<BlockArgument>(target))
+            continue;
+          phase->getResult(i).replaceAllUsesWith(target);
           continue;
         }
         auto reg = pipelineRegisters[i];
