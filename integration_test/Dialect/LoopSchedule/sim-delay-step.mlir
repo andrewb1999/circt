@@ -34,20 +34,27 @@ module {
     %c0_i32 = arith.constant 0 : i32
     %c10_i32 = arith.constant 10 : i32
     %c1_i32 = arith.constant 1 : i32
-    loopschedule.step {
-      loopschedule.sequential trip_count = 10 iter_args(%i = %c0_i32) : (i32) -> () {
-        %0:2 = loopschedule.step {
-          %cond = arith.cmpi slt, %i, %c10_i32 : i32
-          %next = arith.addi %i, %c1_i32 : i32
-          loopschedule.delay 2 {
-            loopschedule.store %next, %arg0[%i : i32] : memref<16xi32>
-            loopschedule.register
+    loopschedule.frame {
+      loopschedule.at 0 {
+        loopschedule.sequential trip_count = 10 iter_args(%i = %c0_i32) : (i32) -> () {
+          %cond, %next = loopschedule.frame -> (i1, i32) {
+            %r:2 = loopschedule.at 0 -> (i1, i32) {
+              %c = arith.cmpi slt, %i, %c10_i32 : i32
+              %n = arith.addi %i, %c1_i32 : i32
+              loopschedule.iter_arg_update %i = %n : i32
+              loopschedule.yield %c, %n : i1, i32
+            }
+            loopschedule.at 2 {
+              loopschedule.store %r#1, %arg0[%i : i32] : memref<16xi32>
+              loopschedule.yield
+            }
+            loopschedule.yield %r#0, %r#1 : i1, i32
           }
-          loopschedule.iter_arg_update %i = %next : i32
-          loopschedule.register %next, %cond : i32, i1
-        } : i32, i1
-        loopschedule.terminator condition(%0#1), results()
+          loopschedule.terminator condition(%cond), results()
+        }
+        loopschedule.yield
       }
+      loopschedule.yield
     }
     return
   }

@@ -31,38 +31,45 @@ module {
     %c8_i4 = arith.constant 8 : i4
     %c1_i4 = arith.constant 1 : i4
     %c2_i4 = arith.constant 2 : i4
-    loopschedule.step {
-      loopschedule.sequential trip_count = 8 iter_args(%flat = %c0_i4, %acc = %c0_i32) : (i4, i32) -> () {
-        %0:3 = loopschedule.step {
-          %cond = arith.cmpi ult, %flat, %c8_i4 : i4
-          // Decode flat index.
-          %out_idx = arith.shrui %flat, %c1_i4 : i4
-          %k = arith.andi %flat, %c1_i4 : i4
-          %row = arith.shrui %out_idx, %c1_i4 : i4
-          %col = arith.andi %out_idx, %c1_i4 : i4
-          // A_addr = row*2 + k, B_addr = k*2 + col.
-          %row2 = arith.muli %row, %c2_i4 : i4
-          %a_addr = arith.addi %row2, %k : i4
-          %k2 = arith.muli %k, %c2_i4 : i4
-          %b_addr = arith.addi %k2, %col : i4
-          // Load A[a_addr] and B[b_addr], compute product.
-          %a_val = loopschedule.load %arg0[%a_addr : i4] : memref<4xi32>
-          %b_val = loopschedule.load %arg1[%b_addr : i4] : memref<4xi32>
-          %prod = arith.muli %a_val, %b_val : i32
-          // Accumulate: k=0 starts fresh, k=1 adds to previous.
-          %is_k0 = arith.cmpi eq, %k, %c0_i4 : i4
-          %sum = arith.addi %acc, %prod : i32
-          %new_acc = arith.select %is_k0, %prod, %sum : i32
-          // Store result to C[out_idx] (intermediate on k=0, final on k=1).
-          loopschedule.store %new_acc, %arg2[%out_idx : i4] : memref<4xi32>
-          // Advance.
-          %next_flat = arith.addi %flat, %c1_i4 : i4
-          loopschedule.iter_arg_update %acc = %new_acc : i32
-          loopschedule.iter_arg_update %flat = %next_flat : i4
-          loopschedule.register %next_flat, %new_acc, %cond : i4, i32, i1
-        } : i4, i32, i1
-        loopschedule.terminator condition(%0#2), results()
+    loopschedule.frame {
+      loopschedule.at 0 {
+        loopschedule.sequential trip_count = 8 iter_args(%flat = %c0_i4, %acc = %c0_i32) : (i4, i32) -> () {
+          %cond, %next_flat, %new_acc = loopschedule.frame -> (i1, i4, i32) {
+            %r:3 = loopschedule.at 0 -> (i1, i4, i32) {
+              %c = arith.cmpi ult, %flat, %c8_i4 : i4
+              // Decode flat index.
+              %out_idx = arith.shrui %flat, %c1_i4 : i4
+              %k = arith.andi %flat, %c1_i4 : i4
+              %row = arith.shrui %out_idx, %c1_i4 : i4
+              %col = arith.andi %out_idx, %c1_i4 : i4
+              // A_addr = row*2 + k, B_addr = k*2 + col.
+              %row2 = arith.muli %row, %c2_i4 : i4
+              %a_addr = arith.addi %row2, %k : i4
+              %k2 = arith.muli %k, %c2_i4 : i4
+              %b_addr = arith.addi %k2, %col : i4
+              // Load A[a_addr] and B[b_addr], compute product.
+              %a_val = loopschedule.load %arg0[%a_addr : i4] : memref<4xi32>
+              %b_val = loopschedule.load %arg1[%b_addr : i4] : memref<4xi32>
+              %prod = arith.muli %a_val, %b_val : i32
+              // Accumulate: k=0 starts fresh, k=1 adds to previous.
+              %is_k0 = arith.cmpi eq, %k, %c0_i4 : i4
+              %sum = arith.addi %acc, %prod : i32
+              %na = arith.select %is_k0, %prod, %sum : i32
+              // Store result to C[out_idx] (intermediate on k=0, final on k=1).
+              loopschedule.store %na, %arg2[%out_idx : i4] : memref<4xi32>
+              // Advance.
+              %nf = arith.addi %flat, %c1_i4 : i4
+              loopschedule.iter_arg_update %acc = %na : i32
+              loopschedule.iter_arg_update %flat = %nf : i4
+              loopschedule.yield %c, %nf, %na : i1, i4, i32
+            }
+            loopschedule.yield %r#0, %r#1, %r#2 : i1, i4, i32
+          }
+          loopschedule.terminator condition(%cond), results()
+        }
+        loopschedule.yield
       }
+      loopschedule.yield
     }
     return
   }
