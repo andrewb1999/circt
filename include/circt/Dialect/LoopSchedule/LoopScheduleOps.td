@@ -188,131 +188,6 @@ def LoopScheduleSequentialOp : LoopScheduleOp<"sequential", [LoopOpInterface]> {
   }];
 }
 
-def LoopScheduleStepOp : LoopScheduleOp<"step",
-    [ParentOneOf<["LoopScheduleSequentialOp", "mlir::func::FuncOp"]>,
-     SingleBlockImplicitTerminator<"LoopScheduleRegisterOp">,
-     PhaseOpInterface]> {
-  let summary = "LoopSchedule dialect schedule step.";
-  let description = [{
-    This operation has a single-block region which dictates the operations that
-    must start concurrently.
-
-    It may have an optional `when` predicate, which supports conditional
-    execution for each step. A step with a `when` predicate should only 
-    execute when the predicate is `true : i1`, and continue onto the next
-    step otherwise.
-
-    It has a `register` terminator, which passes the concurrently
-    computed values forward to a future step.
-  }];
-
-  let arguments = (ins
-    Optional<I1>:$when
-  );
-
-  let results = (outs
-    Variadic<AnyType>:$results
-  );
-
-  let regions = (region
-    SizedRegion<1>:$body
-  );
-
-  let assemblyFormat = [{
-    (`when` $when^)? $body (`:` qualified(type($results))^)? attr-dict
-  }];
-
-  let hasVerifier = 1;
-
-  let skipDefaultBuilders = 1;
-  let builders = [
-    OpBuilder<(ins "mlir::TypeRange":$resultTypes)>
-  ];
-
-  let extraClassDeclaration = [{
-    Block &getBodyBlock() { return getBody().front(); }
-    unsigned getStepNumber();
-
-    std::string getRegisterNamePrefix() {
-      return "step_" + std::to_string(getStepNumber());
-    }
-    bool isStatic() {
-      return false;
-    }
-    std::optional<uint64_t> getStartTime() {
-      return std::nullopt;
-    }
-    LoopScheduleRegisterOp getRegisterOp();
-  }];
-}
-
-def LoopScheduleDelayOp : LoopScheduleOp<"delay",
-    [ParentOneOf<["LoopScheduleStepOp", "LoopScheduleDelayOp"]>,
-     SingleBlockImplicitTerminator<"LoopScheduleRegisterOp">]> {
-  let summary = "Delays the start of its body by `latency` cycles within "
-                "the enclosing step.";
-  let description = [{
-    The `loopschedule.delay` operation models a sub-step start-time offset.
-    Operations in its single-block body are scheduled to begin executing
-    `latency` cycles after the start of the enclosing `loopschedule.step`.
-    Values referenced by ops outside the delay region are passed out via
-    its terminating `loopschedule.register`.
-
-    A delay op contributes `latency + max(child end cycles)` cycles to its
-    enclosing step's total latency. Multiple delay ops in the same step
-    body run concurrently with each other and with the step's offset-0 ops
-    (the enclosing step is conceptually a static-par).
-  }];
-
-  let arguments = (ins I64Attr:$latency);
-
-  let results = (outs
-    Variadic<AnyType>:$results
-  );
-
-  let regions = (region
-    SizedRegion<1>:$body
-  );
-
-  let assemblyFormat = [{
-    $latency $body (`->` qualified(type($results))^)? attr-dict
-  }];
-
-  let hasVerifier = 1;
-
-  let skipDefaultBuilders = 1;
-  let builders = [
-    OpBuilder<(ins "uint64_t":$latency, "mlir::TypeRange":$resultTypes)>
-  ];
-
-  let extraClassDeclaration = [{
-    Block &getBodyBlock() { return getBody().front(); }
-    LoopScheduleRegisterOp getRegisterOp();
-  }];
-}
-
-def LoopScheduleRegisterOp : LoopScheduleOp<"register",
-    [ParentOneOf<["LoopScheduleStepOp", "LoopScheduleDelayOp"]>, Terminator]> {
-  let summary = "LoopSchedule dialect loop register.";
-  let description = [{
-    The `loopschedule.register` terminates a pipeline stage and
-    "registers" the values specified as operands. These values become the
-    results of the stage.
-  }];
-
-  let arguments = (ins
-    Variadic<AnyType>:$operands
-  );
-
-  let assemblyFormat = [{
-    $operands (`:` qualified(type($operands))^)? attr-dict
-  }];
-
-  let builders = [OpBuilder<(ins), [{ return; }]>];
-
-  let hasVerifier = 1;
-}
-
 def LoopScheduleTerminatorOp : LoopScheduleOp<"terminator",
     [ParentOneOf<["LoopSchedulePipelineOp", "LoopScheduleSequentialOp"]>, Terminator, AttrSizedOperandSegments]> {
   let summary = "LoopSchedule dialect terminator.";
@@ -714,7 +589,7 @@ def LoopScheduleAwaitOp : LoopScheduleOp<"await",
 }
 
 def LoopScheduleIterArgUpdateOp : LoopScheduleOp<"iter_arg_update",
-    [ParentOneOf<["LoopScheduleAtOp", "LoopScheduleStepOp"]>,
+    [HasParent<"LoopScheduleAtOp">,
      TypesMatchWith<"iter-arg type matches new-value type",
                     "value", "iterArg",
                     "$_self">]> {

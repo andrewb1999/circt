@@ -42,8 +42,8 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::func::FuncOp"
             "Whether to prioritize lower II over cycle time.">,
     Option<"enableDelayMerging", "enable-delay-merging", "bool", "false",
             "Coalesce overlapping start times within sequential loops into a "
-            "single multi-cycle loopschedule.step, wrapping later-offset ops "
-            "in loopschedule.delay regions.">
+            "single multi-cycle loopschedule.frame, placing later-offset ops "
+            "in 'at K' regions.">
   ];
 }
 

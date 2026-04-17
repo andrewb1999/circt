@@ -1216,17 +1216,18 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
     startTimes.push_back(group.first);
   llvm::sort(startTimes);
 
-  // === Bucket merge for loopschedule.delay emission ===
+  // === Bucket merge for multi-cycle frame emission ===
   //
   // When `enableDelayMerging` is on, coalesce groups whose start times fall
-  // within an earlier group's running latency into a single multi-cycle step.
-  // The base group's ops live at offset 0 inside the step body; merged groups
-  // are wrapped in a `loopschedule.delay` region with latency = offset.
+  // within an earlier group's running latency into a single multi-cycle
+  // frame. The base group's ops live in the frame's `at 0` body; merged
+  // groups are placed in `at K` bodies where K is the offset within the
+  // frame.
   //
   // After the merge, `startGroups[t]` only contains the offset-0 ops for the
   // bucket whose baseTime is `t`, and `delayOffsetGroups[t]` (only set for
   // base times of merged buckets) contains a map from offset>0 to the ops
-  // that should appear inside that delay region.
+  // that should appear inside the matching `at K` region.
   DenseMap<uint32_t, std::map<uint32_t, SmallVector<Operation *>>>
       delayOffsetGroups;
   if (enableDelayMerging) {

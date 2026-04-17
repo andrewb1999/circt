@@ -181,15 +181,18 @@ func.func @terminator_await_not_from_launch(%h: !loopschedule.handle,
 // Duplicate iter_arg_update for the same iter-arg is an error.
 func.func @duplicate_iter_arg_update(%c0: index, %c1: index, %c10: index) {
   loopschedule.sequential iter_args(%iv = %c0) : (index) -> () {
-    %0:2 = loopschedule.step {
-      %cond = arith.cmpi ult, %iv, %c10 : index
-      %n = arith.addi %iv, %c1 : index
-      loopschedule.iter_arg_update %iv = %n : index
-      // expected-error @+1 {{duplicate iter_arg_update for iter-arg}}
-      loopschedule.iter_arg_update %iv = %iv : index
-      loopschedule.register %n, %cond : index, i1
-    } : index, i1
-    loopschedule.terminator condition(%0#1), results()
+    %cond, %n = loopschedule.frame -> (i1, index) {
+      %r:2 = loopschedule.at 0 -> (i1, index) {
+        %c = arith.cmpi ult, %iv, %c10 : index
+        %m = arith.addi %iv, %c1 : index
+        loopschedule.iter_arg_update %iv = %m : index
+        // expected-error @+1 {{duplicate iter_arg_update for iter-arg}}
+        loopschedule.iter_arg_update %iv = %iv : index
+        loopschedule.yield %c, %m : i1, index
+      }
+      loopschedule.yield %r#0, %r#1 : i1, index
+    }
+    loopschedule.terminator condition(%cond), results()
   }
   return
 }
@@ -199,15 +202,18 @@ func.func @duplicate_iter_arg_update(%c0: index, %c1: index, %c10: index) {
 // iter_arg_update LHS must be an iter-arg block argument of the enclosing loop.
 func.func @iter_arg_update_wrong_lhs(%c0: index, %c1: index, %c10: index) {
   loopschedule.sequential iter_args(%iv = %c0) : (index) -> () {
-    %0:2 = loopschedule.step {
-      %cond = arith.cmpi ult, %iv, %c10 : index
-      %n = arith.addi %iv, %c1 : index
-      loopschedule.iter_arg_update %iv = %n : index
-      // expected-error @+1 {{'iterArg' must be an iter-arg block argument of the enclosing loopschedule.sequential or loopschedule.pipeline op}}
-      loopschedule.iter_arg_update %c0 = %n : index
-      loopschedule.register %n, %cond : index, i1
-    } : index, i1
-    loopschedule.terminator condition(%0#1), results()
+    %cond, %n = loopschedule.frame -> (i1, index) {
+      %r:2 = loopschedule.at 0 -> (i1, index) {
+        %c = arith.cmpi ult, %iv, %c10 : index
+        %m = arith.addi %iv, %c1 : index
+        loopschedule.iter_arg_update %iv = %m : index
+        // expected-error @+1 {{'iterArg' must be an iter-arg block argument of the enclosing loopschedule.sequential or loopschedule.pipeline op}}
+        loopschedule.iter_arg_update %c0 = %m : index
+        loopschedule.yield %c, %m : i1, index
+      }
+      loopschedule.yield %r#0, %r#1 : i1, index
+    }
+    loopschedule.terminator condition(%cond), results()
   }
   return
 }

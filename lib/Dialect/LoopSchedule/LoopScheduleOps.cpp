@@ -359,13 +359,11 @@ LogicalResult LoopScheduleSequentialOp::verify() {
   Block &scheduleBlock = getSchedule().front();
 
   for (Operation &inner : scheduleBlock) {
-    // Verify the schedule block contains only `loopschedule.step` and
+    // Verify the schedule block contains only `loopschedule.frame` and
     // `loopschedule.terminator` ops.
-    if (!isa<LoopScheduleStepOp, LoopScheduleTerminatorOp,
-             LoopScheduleFrameOp>(inner))
-      return emitOpError("schedule may only contain 'loopschedule.step', "
-                         "'loopschedule.frame', or 'loopschedule.terminator' "
-                         "ops, found ")
+    if (!isa<LoopScheduleTerminatorOp, LoopScheduleFrameOp>(inner))
+      return emitOpError("schedule may only contain 'loopschedule.frame' or "
+                         "'loopschedule.terminator' ops, found ")
              << inner;
   }
 
@@ -416,151 +414,6 @@ bool LoopScheduleSequentialOp::canStall() {
   });
 
   return mightStallRes.wasInterrupted();
-}
-
-//===----------------------------------------------------------------------===//
-// LoopScheduleStepOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult LoopScheduleStepOp::verify() {
-  // Verify results produced by sequential op are only used in next step or
-  // terminator
-  auto step = *this;
-  auto *term = step.getBodyBlock().getTerminator();
-  auto *next = step->getNextNode();
-  if (auto nextStep = dyn_cast<LoopScheduleStepOp>(next)) {
-    for (auto res : step.getResults()) {
-      auto num = res.getResultNumber();
-      auto &termOperand = term->getOpOperand(num);
-      if (!isa_and_nonnull<memref::LoadOp>(termOperand.get().getDefiningOp()))
-        continue;
-
-      for (auto *user : res.getUsers()) {
-        auto *ancestor = nextStep.getBodyBlock().findAncestorOpInBlock(*user);
-        if (ancestor == nullptr)
-          return emitOpError("load results can only be used in next step (must "
-                             "be reregistered if used later in schedule)");
-      }
-    }
-  }
-
-  // Verify that result types match register types
-  auto regOp = step.getRegisterOp();
-  auto regOpTypes = regOp.getOperandTypes();
-  auto stepResTypes = step.getResultTypes();
-
-  for (auto p : llvm::zip(regOpTypes, stepResTypes)) {
-    if (std::get<0>(p) != std::get<1>(p)) {
-      return emitOpError("step op results do not match register op types");
-    }
-  }
-
-  return success();
-}
-
-void LoopScheduleStepOp::build(OpBuilder &builder, OperationState &state,
-                               TypeRange resultTypes) {
-  OpBuilder::InsertionGuard g(builder);
-
-  state.addTypes(resultTypes);
-
-  Region *region = state.addRegion();
-  Block &block = region->emplaceBlock();
-  builder.setInsertionPointToEnd(&block);
-  builder.create<LoopScheduleRegisterOp>(builder.getUnknownLoc(), ValueRange());
-}
-
-unsigned LoopScheduleStepOp::getStepNumber() {
-  unsigned number = 0;
-  auto *op = getOperation();
-  Operation *step;
-  if (auto parent = op->getParentOfType<LoopScheduleSequentialOp>(); parent)
-    step = &parent.getScheduleBlock().front();
-  else if (auto parent = op->getParentOfType<func::FuncOp>(); parent)
-    step = &parent.getBody().front().front();
-  else {
-    op->emitOpError("not inside a function or LoopScheduleSequentialOp");
-    return -1;
-  }
-
-  while (step != op && step->getNextNode()) {
-    ++number;
-    step = step->getNextNode();
-  }
-  return number;
-}
-
-LoopScheduleRegisterOp LoopScheduleStepOp::getRegisterOp() {
-  return cast<LoopScheduleRegisterOp>(this->getBodyBlock().getTerminator());
-}
-
-//===----------------------------------------------------------------------===//
-// LoopScheduleDelayOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult LoopScheduleDelayOp::verify() {
-  if (getLatency() < 1)
-    return emitOpError("latency must be >= 1 (use plain ops for offset 0)");
-
-  // Verify that result types match register types.
-  auto regOp = getRegisterOp();
-  auto regOpTypes = regOp.getOperandTypes();
-  auto delayResTypes = getResultTypes();
-
-  if (regOpTypes.size() != delayResTypes.size())
-    return emitOpError("number of results (")
-           << delayResTypes.size()
-           << ") must match number of register operands (" << regOpTypes.size()
-           << ")";
-  for (auto p : llvm::zip(regOpTypes, delayResTypes)) {
-    if (std::get<0>(p) != std::get<1>(p))
-      return emitOpError("delay op result types do not match register op types");
-  }
-  return success();
-}
-
-void LoopScheduleDelayOp::build(OpBuilder &builder, OperationState &state,
-                                uint64_t latency, TypeRange resultTypes) {
-  OpBuilder::InsertionGuard g(builder);
-
-  state.addAttribute(getLatencyAttrName(state.name),
-                     builder.getI64IntegerAttr(latency));
-  state.addTypes(resultTypes);
-
-  Region *region = state.addRegion();
-  Block &block = region->emplaceBlock();
-  builder.setInsertionPointToEnd(&block);
-  builder.create<LoopScheduleRegisterOp>(builder.getUnknownLoc(), ValueRange());
-}
-
-LoopScheduleRegisterOp LoopScheduleDelayOp::getRegisterOp() {
-  return cast<LoopScheduleRegisterOp>(this->getBodyBlock().getTerminator());
-}
-
-//===----------------------------------------------------------------------===//
-// LoopScheduleRegisterOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult LoopScheduleRegisterOp::verify() {
-  // Verify the parent phase terminates with the same types as its result types.
-  // ParentOneOf the immediate parent: step or delay.
-  TypeRange registerTypes = getOperandTypes();
-  TypeRange resultTypes;
-  Operation *parent = (*this)->getParentOp();
-  if (auto step = dyn_cast_or_null<LoopScheduleStepOp>(parent))
-    resultTypes = step.getResultTypes();
-  else if (auto delay = dyn_cast_or_null<LoopScheduleDelayOp>(parent))
-    resultTypes = delay.getResultTypes();
-  else
-    return emitOpError("must be inside a 'loopschedule.step' or "
-                       "'loopschedule.delay'");
-
-  if (registerTypes != resultTypes)
-    return emitOpError("operand types (")
-           << registerTypes << ") must match result types (" << resultTypes
-           << ")";
-
-  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -1261,17 +1114,12 @@ Value circt::loopschedule::getIterArgPhaseResult(
     LoopScheduleIterArgUpdateOp u) {
   Value inside = u.getValue();
   Operation *parent = u->getParentOp();
-  while (parent && !isa<LoopScheduleStepOp, LoopScheduleAtOp>(parent))
+  while (parent && !isa<LoopScheduleAtOp>(parent))
     parent = parent->getParentOp();
   if (!parent)
     return inside;
-  Operation *term = nullptr;
-  if (auto step = dyn_cast<LoopScheduleStepOp>(parent))
-    term = step.getRegisterOp();
-  else if (auto at = dyn_cast<LoopScheduleAtOp>(parent))
-    term = at.getYieldOp();
-  if (!term)
-    return inside;
+  auto at = cast<LoopScheduleAtOp>(parent);
+  Operation *term = at.getYieldOp();
   for (auto it : llvm::enumerate(term->getOperands()))
     if (it.value() == inside)
       return parent->getResult(it.index());

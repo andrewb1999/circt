@@ -193,20 +193,3 @@ func.func @trip_count_attr() {
   return
 }
 
-// CHECK-LABEL: func.func @sequential_basic
-func.func @sequential_basic(%arg0: memref<?xi32>) {
-  %c0 = arith.constant 0 : index
-  %c1 = arith.constant 1 : index
-  %c10 = arith.constant 10 : index
-  // CHECK: loopschedule.sequential trip_count = 10
-  loopschedule.sequential trip_count = 10 iter_args(%arg1 = %c0) : (index) -> () {
-    %0:2 = loopschedule.step {
-      %cond = arith.cmpi ult, %arg1, %c10 : index
-      %next = arith.addi %arg1, %c1 : index
-      loopschedule.iter_arg_update %arg1 = %next : index
-      loopschedule.register %next, %cond : index, i1
-    } : index, i1
-    loopschedule.terminator condition(%0#1), results()
-  }
-  return
-}

@@ -124,32 +124,8 @@ func.func @frame_overlap(%arg0: i32) -> (i32, i32) {
   return %pair#1, %r : i32, i32
 }
 
-// Case 5: iter_arg_update inside an `at` region nested in a sequential loop.
-// CHECK-LABEL: func.func @frame_iter_arg_update_in_sequential
-func.func @frame_iter_arg_update_in_sequential(%c0: index, %c1: index, %c10: index) {
-  loopschedule.sequential iter_args(%iv = %c0) : (index) -> () {
-    %0:2 = loopschedule.step {
-      %cond = arith.cmpi ult, %iv, %c10 : index
-      %iv_n = arith.addi %iv, %c1 : index
-      loopschedule.register %iv_n, %cond : index, i1
-    } : index, i1
-    loopschedule.frame {
-      loopschedule.at 0 {
-        // CHECK: loopschedule.iter_arg_update %{{.*}} = %{{.*}} : index
-        loopschedule.iter_arg_update %iv = %0#0 : index
-        loopschedule.yield
-      }
-      loopschedule.yield
-    }
-    loopschedule.terminator condition(%0#1), results()
-  }
-  return
-}
-
 // Case 6: sequential outer loop that launches a nested pipeline via
 // frame/launch, then awaits its completion handle in a later frame.
-// The outer loop's condition and next iter-arg are produced by a frame
-// (no `loopschedule.step`).
 // CHECK-LABEL: func.func @sequential_launches_pipeline
 func.func @sequential_launches_pipeline(%c0: index, %c1: index, %c10: index) {
   // CHECK: loopschedule.sequential
