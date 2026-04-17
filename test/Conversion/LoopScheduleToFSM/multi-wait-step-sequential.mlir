@@ -2,10 +2,10 @@
 
 // A sequential loop whose body has THREE frames:
 //   frame 0 — computes the loop condition (regular frame)
-//   frame 1 — contains a nested sequential loop (wait frame #0)
-//   frame 2 — contains a second nested sequential loop (wait frame #1)
+//   frame 1 — launches a nested sequential loop (wait frame #0)
+//   frame 2 — launches a second nested sequential loop (wait frame #1)
 //
-// This exercises the unified FSM emission with multiple "wait" frames in a
+// Exercises the unified FSM emission with multiple "wait" frames in a
 // single parent loop: createSequentialFSM must produce two child_start
 // outputs, two child_done inputs, two post_active outputs, and matching
 // WAIT_1/POST_1 and WAIT_2/POST_2 states.
@@ -20,8 +20,8 @@ module {
     %c2_i4 = arith.constant 2 : i4
     %c42_i32 = arith.constant 42 : i32
     %c43_i32 = arith.constant 43 : i32
-    loopschedule.frame {
-      loopschedule.at 0 {
+    %hwrap = loopschedule.frame -> (!loopschedule.handle) {
+      %louter = loopschedule.launch at 0 : !loopschedule.handle {
         loopschedule.sequential trip_count = 5 iter_args(%i = %c0_i32) : (i32) -> () {
           // Frame 0: compute loop condition + iter_arg next.
           %cond, %next = loopschedule.frame -> (i1, i32) {
@@ -33,9 +33,9 @@ module {
             }
             loopschedule.yield %r#0, %r#1 : i1, i32
           }
-          // Frame 1: first nested loop.
-          loopschedule.frame {
-            loopschedule.at 0 {
+          // Frame 1: first nested loop via launch.
+          %h1 = loopschedule.frame -> (!loopschedule.handle) {
+            %l1 = loopschedule.launch at 0 : !loopschedule.handle {
               loopschedule.sequential trip_count = 2 iter_args(%j = %c0_i4) : (i4) -> () {
                 %jcond, %jnext = loopschedule.frame -> (i1, i4) {
                   %r:2 = loopschedule.at 0 -> (i1, i4) {
@@ -51,11 +51,14 @@ module {
               }
               loopschedule.yield
             }
-            loopschedule.yield
+            loopschedule.yield %l1 : !loopschedule.handle
           }
-          // Frame 2: second nested loop.
-          loopschedule.frame {
-            loopschedule.at 0 {
+          // Frame 2: second nested loop via launch.
+          %h2 = loopschedule.frame -> (!loopschedule.handle) {
+            loopschedule.await %h1
+            loopschedule.yield
+          } do {
+            %l2 = loopschedule.launch at 0 : !loopschedule.handle {
               loopschedule.sequential trip_count = 2 iter_args(%k = %c0_i4) : (i4) -> () {
                 %kcond, %knext = loopschedule.frame -> (i1, i4) {
                   %r:2 = loopschedule.at 0 -> (i1, i4) {
@@ -71,12 +74,18 @@ module {
               }
               loopschedule.yield
             }
-            loopschedule.yield
+            loopschedule.yield %l2 : !loopschedule.handle
           }
-          loopschedule.terminator condition(%cond), results()
+          loopschedule.terminator condition(%cond), await(%h2), results()
         }
         loopschedule.yield
       }
+      loopschedule.yield %louter : !loopschedule.handle
+    }
+    loopschedule.frame {
+      loopschedule.await %hwrap
+      loopschedule.yield
+    } do {
       loopschedule.yield
     }
     return

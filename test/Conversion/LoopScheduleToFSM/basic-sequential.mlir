@@ -1,13 +1,14 @@
 // RUN: circt-opt --lower-loopschedule-to-fsm %s | FileCheck %s
 
 // A simple sequential loop that counts from 0 to 10.
+// The loop is wrapped in a top-level frame via `launch` (new shape).
 module {
   func.func @count() attributes {top} {
     %c0 = arith.constant 0 : i32
     %c10 = arith.constant 10 : i32
     %c1 = arith.constant 1 : i32
-    loopschedule.frame {
-      loopschedule.at 0 {
+    %h = loopschedule.frame -> (!loopschedule.handle) {
+      %lh = loopschedule.launch at 0 : !loopschedule.handle {
         loopschedule.sequential trip_count = 10 iter_args(%i = %c0) : (i32) -> () {
           %cond, %next = loopschedule.frame -> (i1, i32) {
             %r:2 = loopschedule.at 0 -> (i1, i32) {
@@ -22,6 +23,12 @@ module {
         }
         loopschedule.yield
       }
+      loopschedule.yield %lh : !loopschedule.handle
+    }
+    loopschedule.frame {
+      loopschedule.await %h
+      loopschedule.yield
+    } do {
       loopschedule.yield
     }
     return

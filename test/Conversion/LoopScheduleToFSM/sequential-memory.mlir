@@ -8,8 +8,8 @@ module {
     %c1_i6 = arith.constant 1 : i6
     %c0_i6 = arith.constant 0 : i6
     %c32_i6 = arith.constant 32 : i6
-    loopschedule.frame {
-      loopschedule.at 0 {
+    %h = loopschedule.frame -> (!loopschedule.handle) {
+      %lh = loopschedule.launch at 0 : !loopschedule.handle {
         loopschedule.sequential trip_count = 32 iter_args(%i = %c0_i6) : (i6) -> () {
           %cond, %next = loopschedule.frame -> (i1, i6) {
             %r:2 = loopschedule.at 0 -> (i1, i6) {
@@ -25,6 +25,12 @@ module {
         }
         loopschedule.yield
       }
+      loopschedule.yield %lh : !loopschedule.handle
+    }
+    loopschedule.frame {
+      loopschedule.await %h
+      loopschedule.yield
+    } do {
       loopschedule.yield
     }
     return

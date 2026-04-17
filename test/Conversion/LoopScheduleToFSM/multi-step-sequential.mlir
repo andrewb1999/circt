@@ -1,6 +1,6 @@
 // RUN: circt-opt --lower-loopschedule-to-fsm %s | FileCheck %s
 
-// Two top-level frames, each containing a sequential loop.
+// Two top-level frames, each containing a launched sequential loop.
 // First loop initializes memory, second loop reads/modifies it.
 module {
   func.func @two_loops(%arg0: memref<8xi32>) attributes {top} {
@@ -9,8 +9,8 @@ module {
     %c1_i4 = arith.constant 1 : i4
     %c0_i4 = arith.constant 0 : i4
     %c8_i4 = arith.constant -8 : i4
-    loopschedule.frame {
-      loopschedule.at 0 {
+    %h1 = loopschedule.frame -> (!loopschedule.handle) {
+      %lh = loopschedule.launch at 0 : !loopschedule.handle {
         loopschedule.sequential trip_count = 8 iter_args(%i = %c0_i4) : (i4) -> () {
           %cond, %next = loopschedule.frame -> (i1, i4) {
             %r:2 = loopschedule.at 0 -> (i1, i4) {
@@ -26,10 +26,13 @@ module {
         }
         loopschedule.yield
       }
-      loopschedule.yield
+      loopschedule.yield %lh : !loopschedule.handle
     }
-    loopschedule.frame {
-      loopschedule.at 0 {
+    %h2 = loopschedule.frame -> (!loopschedule.handle) {
+      loopschedule.await %h1
+      loopschedule.yield
+    } do {
+      %lh = loopschedule.launch at 0 : !loopschedule.handle {
         loopschedule.sequential trip_count = 8 iter_args(%j = %c0_i4) : (i4) -> () {
           %cond, %next = loopschedule.frame -> (i1, i4) {
             %r:2 = loopschedule.at 0 -> (i1, i4) {
@@ -47,6 +50,12 @@ module {
         }
         loopschedule.yield
       }
+      loopschedule.yield %lh : !loopschedule.handle
+    }
+    loopschedule.frame {
+      loopschedule.await %h2
+      loopschedule.yield
+    } do {
       loopschedule.yield
     }
     return

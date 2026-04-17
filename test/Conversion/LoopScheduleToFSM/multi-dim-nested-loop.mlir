@@ -9,8 +9,8 @@ module {
     %c0_i4 = arith.constant 0 : i4
     %c1_i4 = arith.constant 1 : i4
     %c-8_i4 = arith.constant -8 : i4
-    loopschedule.frame {
-      loopschedule.at 0 {
+    %houter = loopschedule.frame -> (!loopschedule.handle) {
+      %lo = loopschedule.launch at 0 : !loopschedule.handle {
         loopschedule.sequential trip_count = 8
             iter_args(%i = %c0_i4) : (i4) -> () {
           // Frame 0: compute cond + iter update + a narrow copy of `%i`.
@@ -24,9 +24,9 @@ module {
             }
             loopschedule.yield %r#0, %r#1 : i1, i3
           }
-          // Frame 1: houses the inner (nested) sequential loop in at 0.
-          loopschedule.frame {
-            loopschedule.at 0 {
+          // Frame 1: launches the inner (nested) sequential loop.
+          %hinner = loopschedule.frame -> (!loopschedule.handle) {
+            %li = loopschedule.launch at 0 : !loopschedule.handle {
               loopschedule.sequential trip_count = 8
                   iter_args(%j = %c0_i4) : (i4) -> () {
                 %jcond, %jnext = loopschedule.frame -> (i1, i4) {
@@ -44,12 +44,18 @@ module {
               }
               loopschedule.yield
             }
-            loopschedule.yield
+            loopschedule.yield %li : !loopschedule.handle
           }
-          loopschedule.terminator condition(%icond), results()
+          loopschedule.terminator condition(%icond), await(%hinner), results()
         }
         loopschedule.yield
       }
+      loopschedule.yield %lo : !loopschedule.handle
+    }
+    loopschedule.frame {
+      loopschedule.await %houter
+      loopschedule.yield
+    } do {
       loopschedule.yield
     }
     return

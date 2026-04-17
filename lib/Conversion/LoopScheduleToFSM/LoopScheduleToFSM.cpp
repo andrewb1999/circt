@@ -18,6 +18,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
+#include "circt/Dialect/LoopSchedule/Utils.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
@@ -78,6 +79,13 @@ static Value resizeIntTo(OpBuilder &builder, Location loc, Value v,
   auto padType = IntegerType::get(builder.getContext(), targetWidth - srcWidth);
   Value zero = hw::ConstantOp::create(builder, loc, padType, 0);
   return comb::ConcatOp::create(builder, loc, ValueRange{zero, v});
+}
+
+/// Check whether a type is a `!loopschedule.handle`. Handle-typed values are
+/// scheduling metadata with no HW representation: they are not registered,
+/// captured, or forwarded as module outputs.
+static bool isHandleType(Type type) {
+  return isa<loopschedule::HandleType>(type);
 }
 
 /// Create a zero constant of the given type.
@@ -440,35 +448,38 @@ void LoopScheduleToFSMPass::buildLoopTree(
   node.frameChildIdx.resize(frames.size(), -1);
   node.framePipelineIdx.resize(frames.size(), -1);
 
-  // Nested seq/pipeline ops live inside the frame's `at` body (typically
-  // `at 0`). Walk the frame body's at children looking for the first
-  // LoopInterface op — at most one per frame (this matches the cardinality
-  // of the old one-child-per-step assumption).
+  // Nested LoopInterface ops (seq/pipeline) are wrapped in
+  // `loopschedule.launch` siblings of `at` ops inside the frame body. Each
+  // launch contains exactly one child LoopInterface plus a yield. We
+  // currently support at most one launch per frame (MVP).
   for (auto [frameIdx, frameOp] : llvm::enumerate(frames)) {
-    bool found = false;
-    for (auto atOp : frameOp.getBodyBlock().getOps<LoopScheduleAtOp>()) {
-      for (auto &op : atOp.getBodyBlock().getOperations()) {
-        if (auto childSeq = dyn_cast<LoopScheduleSequentialOp>(&op)) {
-          unsigned childIdx = node.children.size();
-          node.frameChildIdx[frameIdx] = childIdx;
-          node.children.emplace_back();
-          std::string childPrefix =
-              prefix + "_loop" + std::to_string(loopCounter++);
-          buildLoopTree(childSeq, node.children.back(), childPrefix,
-                        loopCounter);
-          found = true;
-          break;
-        }
-        if (auto childPip = dyn_cast<LoopSchedulePipelineOp>(&op)) {
-          unsigned pipIdx = node.pipelineChildren.size();
-          node.framePipelineIdx[frameIdx] = pipIdx;
-          node.pipelineChildren.push_back(childPip);
-          found = true;
-          break;
-        }
-      }
-      if (found)
-        break;
+    auto launches = loopschedule::getLaunchOpsInOrder(frameOp);
+    if (launches.empty())
+      continue;
+    // MVP: take the first launch. Multi-launch frames are handled by the
+    // top-level func path; a nested sequential with multiple concurrent
+    // launches in one frame is rare and not required for the MVP.
+    auto launch = launches.front();
+    Operation *child = nullptr;
+    for (auto &op : launch.getBodyBlock().getOperations()) {
+      if (isa<LoopScheduleYieldOp>(op))
+        continue;
+      child = &op;
+      break;
+    }
+    if (!child)
+      continue;
+    if (auto childSeq = dyn_cast<LoopScheduleSequentialOp>(child)) {
+      unsigned childIdx = node.children.size();
+      node.frameChildIdx[frameIdx] = childIdx;
+      node.children.emplace_back();
+      std::string childPrefix =
+          prefix + "_loop" + std::to_string(loopCounter++);
+      buildLoopTree(childSeq, node.children.back(), childPrefix, loopCounter);
+    } else if (auto childPip = dyn_cast<LoopSchedulePipelineOp>(child)) {
+      unsigned pipIdx = node.pipelineChildren.size();
+      node.framePipelineIdx[frameIdx] = pipIdx;
+      node.pipelineChildren.push_back(childPip);
     }
   }
 }
@@ -1503,25 +1514,22 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   }
 
   // --- Lower frame bodies ---
-  // Helper: walk through the ops of a frame that contains a child
-  // (seq/pipeline). The child lives inside one of the frame's `at` bodies
-  // (typically `at 0`). Pre-child ops are cloned before the child, post-
-  // child ops after. Pre/post stores are gated on the provided signals.
+  // Helper: lower the non-launch ops of a wait frame (frame containing a
+  // launch). `at` ops in the same frame execute concurrently with the
+  // launched child, gated on `preGate` (the launch-cycle signal). The
+  // launch op itself is handled separately by the caller. `postGate` is
+  // retained for API symmetry but is not currently applied: this emitter
+  // does not place post-launch ops inside a wait frame's body (post-wait
+  // work lives in a subsequent frame).
   auto lowerFrameWithChild =
-      [&](LoopScheduleFrameOp frame, Operation *childOp, Value preGate,
-          Value postGate, DenseMap<Value, MemPortMapping> &framePorts)
+      [&](LoopScheduleFrameOp frame, Value preGate,
+          Value /*postGate*/, DenseMap<Value, MemPortMapping> &framePorts)
       -> LogicalResult {
     for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
       Block &atBody = atOp.getBodyBlock();
-      // First pass: ops before the child.
       for (auto &op : atBody) {
-        if (&op == childOp)
-          goto do_child;
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
           continue;
-        if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
-          continue;
-
         if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
           if (failed(handleLoad(loadOp, hw, localMapping, framePorts)))
             return failure();
@@ -1535,39 +1543,53 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         }
         hw.clone(op, localMapping);
       }
-      continue;
-    do_child:
-      // Second pass: ops after the child within the same at.
-      bool pastChild = false;
-      for (auto &op : atBody) {
-        if (&op == childOp) {
-          pastChild = true;
-          continue;
-        }
-        if (!pastChild)
-          continue;
-        if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
-          continue;
-        if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-          if (failed(handleStore(storeOp, hw, localMapping, postGate,
-                                 framePorts)))
-            return failure();
-          continue;
-        }
-        if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-          if (failed(handleLoad(loadOp, hw, localMapping, framePorts)))
-            return failure();
-          continue;
-        }
-        hw.clone(op, localMapping);
-      }
-      break;
     }
     return success();
   };
 
+  // Map from handle SSA values to the SmallVector of SSA Values produced by
+  // the corresponding launched child (after the child instance has been
+  // created). Used to resolve `loopschedule.await` operands in later frames.
+  DenseMap<Value, SmallVector<Value>> handleValueMap;
+
+  // Helper: process a frame's await region. For each `loopschedule.await`
+  // op, map its results to the stashed child outputs from `handleValueMap`.
+  // Then forward the await-region's yield operands to the body-region
+  // entry-block arguments.
+  auto processAwaitRegion = [&](LoopScheduleFrameOp frame) {
+    for (auto &op : frame.getAwaitBlock().getOperations()) {
+      if (auto awaitOp = dyn_cast<LoopScheduleAwaitOp>(&op)) {
+        // Gather stashed child values across all handle operands.
+        SmallVector<Value> childVals;
+        for (Value h : awaitOp.getHandles()) {
+          auto it = handleValueMap.find(h);
+          if (it != handleValueMap.end())
+            for (Value v : it->second)
+              childVals.push_back(v);
+        }
+        for (auto [idx, res] : llvm::enumerate(awaitOp.getResults())) {
+          if (idx < childVals.size())
+            localMapping.map(res, childVals[idx]);
+        }
+      }
+    }
+    // Forward yield operands to body-block entry args.
+    auto awaitYield = frame.getAwaitYield();
+    Block &body = frame.getBodyBlock();
+    for (auto [arg, val] :
+         llvm::zip(body.getArguments(), awaitYield.getOperands())) {
+      if (auto mapped = localMapping.lookupOrNull(val))
+        localMapping.map(arg, mapped);
+      else
+        localMapping.map(arg, val);
+    }
+  };
+
   for (auto [frameIdx, frameOp] : llvm::enumerate(frames)) {
     hw.setInsertionPointToEnd(hwBody);
+
+    // Resolve any awaits in the await region before lowering the body.
+    processAwaitRegion(frameOp);
 
     int childIdx = node.frameChildIdx[frameIdx];
     int waitIdx = frameWaitIdx[frameIdx];
@@ -1578,7 +1600,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       Value frameChildStart = fsmChildStarts[waitIdx];
       Value framePostActive = fsmPostActives[waitIdx];
 
-      if (failed(lowerFrameWithChild(frameOp, childSeqOp.getOperation(),
+      if (failed(lowerFrameWithChild(frameOp,
                                       frameChildStart, framePostActive,
                                       perFramePorts[frameIdx])))
         return failure();
@@ -1614,8 +1636,21 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       childDoneBEs[waitIdx].setValue(childDone);
 
       // Map child sequential op results.
-      for (auto result : childSeqOp.getResults())
-        localMapping.map(result, childInst.getResult(outIdx++));
+      SmallVector<Value> childResultVals;
+      for (auto result : childSeqOp.getResults()) {
+        Value v = childInst.getResult(outIdx++);
+        localMapping.map(result, v);
+        childResultVals.push_back(v);
+      }
+
+      // Stash child's SSA outputs under the launch's handle for any later
+      // await-with-value.
+      {
+        auto launches = loopschedule::getLaunchOpsInOrder(frameOp);
+        if (!launches.empty())
+          handleValueMap[launches.front().getHandle()] =
+              std::move(childResultVals);
+      }
 
       // Mux child memory ports into this frame's per-frame port mapping.
       // Any pre-child op may have already written a pre-child address into
@@ -1658,7 +1693,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       Value frameChildStart = fsmChildStarts[waitIdx];
       Value framePostActive = fsmPostActives[waitIdx];
 
-      if (failed(lowerFrameWithChild(frameOp, pipOp.getOperation(),
+      if (failed(lowerFrameWithChild(frameOp,
                                       frameChildStart, framePostActive,
                                       perFramePorts[frameIdx])))
         return failure();
@@ -1672,6 +1707,16 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                                     perFramePorts[frameIdx], memrefArgs)))
         return failure();
       childDoneBEs[waitIdx].setValue(pipDone);
+
+      // Stash pipeline's results under the launch's handle (for any future
+      // await-with-value in a later frame).
+      auto launch =
+          loopschedule::getLaunchOpsInOrder(frameOp).front();
+      SmallVector<Value> pipResults;
+      for (Value r : pipOp.getResults())
+        if (auto m = localMapping.lookupOrNull(r))
+          pipResults.push_back(m);
+      handleValueMap[launch.getHandle()] = std::move(pipResults);
     } else {
       // Regular frame (no child). Gate stores per issue cycle: ops in each
       // `at K` body get cycleGates[K].
@@ -1722,10 +1767,23 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     // combinational expression driven off now-deallocated memory addresses.
     // Wait frames (childIdx/pipelineIdx >= 0) skip the capture: their yield
     // operands come from the child instance and are already registered.
+    // Handle-typed results are skipped entirely: they are scheduling
+    // metadata with no HW representation.
     auto yieldOp = cast<LoopScheduleYieldOp>(
         frameOp.getBodyBlock().getTerminator());
+    // Propagate handle-typed yields so later frames' awaits can resolve.
     for (auto [result, yVal] :
          llvm::zip(frameOp.getResults(), yieldOp.getOperands())) {
+      if (!isHandleType(result.getType()))
+        continue;
+      auto it = handleValueMap.find(yVal);
+      if (it != handleValueMap.end())
+        handleValueMap[result] = it->second;
+    }
+    for (auto [result, yVal] :
+         llvm::zip(frameOp.getResults(), yieldOp.getOperands())) {
+      if (isHandleType(result.getType()))
+        continue;
       Value combVal = localMapping.lookup(yVal);
       frameResultComb[result] = combVal;
       localMapping.map(result, combVal);
@@ -1749,6 +1807,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       for (auto [idx, it] : llvm::enumerate(llvm::zip(
                frameOp.getResults(), yieldOp.getOperands()))) {
         auto [result, yVal] = it;
+        if (isHandleType(result.getType()))
+          continue;
         Value combVal = frameResultComb[result];
         Value resetVal = createZeroConstant(hw, loc, combVal.getType());
         auto regName = hw.getStringAttr(node.prefix + "_frame" +
@@ -2310,6 +2370,8 @@ static hw::HWModuleOp createHWModule(
                      hw::ModulePort::Direction::Output}});
   
   for (auto [idx, retType] : llvm::enumerate(funcOp.getResultTypes())) {
+    if (isHandleType(retType))
+      continue;
     ports.push_back(
         {{builder.getStringAttr("result" + std::to_string(idx)), retType,
           hw::ModulePort::Direction::Output}});
@@ -2368,6 +2430,8 @@ static void buildHWOutput(func::FuncOp funcOp, OpBuilder &builder,
   auto returnOp =
       cast<func::ReturnOp>(funcOp.getBody().front().getTerminator());
   for (auto retVal : returnOp.getOperands()) {
+    if (isHandleType(retVal.getType()))
+      continue;
     if (auto mapped = mapping.lookupOrNull(retVal))
       outputs.push_back(mapped);
     else
@@ -2488,32 +2552,48 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   unsigned numFrames = topFrames.size();
 
   // Build a flat list of children: one entry per child op across all frames.
-  // A frame with two pipelines produces two entries sharing the same
-  // frameIdx. A leaf frame (no seq/pipeline children) produces one entry
-  // with kind=-1. Nested seq/pipeline ops live inside the frame's `at`
-  // bodies.
+  // Each frame's launch ops are inspected; each launch contains exactly one
+  // nested LoopInterface. A frame with multiple launches produces multiple
+  // entries sharing the same frameIdx. A leaf frame (no launches) produces
+  // one entry with kind=-1.
   struct FrameChild {
     unsigned frameIdx;
     int kind; // -1 leaf, 0 sequential, 1 pipeline
     LoopScheduleSequentialOp seqOp;
     LoopSchedulePipelineOp pipOp;
+    LoopScheduleLaunchOp launchOp; // non-null for kind != -1
   };
   SmallVector<FrameChild> entries;
   for (unsigned i = 0; i < numFrames; ++i) {
-    bool any = false;
-    for (auto atOp : topFrames[i].getBodyBlock().getOps<LoopScheduleAtOp>()) {
-      for (auto &innerOp : atOp.getBodyBlock()) {
-        if (auto seqOp = dyn_cast<LoopScheduleSequentialOp>(&innerOp)) {
-          entries.push_back({i, 0, seqOp, {}});
-          any = true;
-        } else if (auto pipOp = dyn_cast<LoopSchedulePipelineOp>(&innerOp)) {
-          entries.push_back({i, 1, {}, pipOp});
-          any = true;
-        }
+    auto launches = loopschedule::getLaunchOpsInOrder(topFrames[i]);
+    if (launches.empty()) {
+      FrameChild fc;
+      fc.frameIdx = i;
+      fc.kind = -1;
+      entries.push_back(fc);
+      continue;
+    }
+    for (auto launch : launches) {
+      Operation *child = nullptr;
+      for (auto &op : launch.getBodyBlock().getOperations()) {
+        if (isa<LoopScheduleYieldOp>(op))
+          continue;
+        child = &op;
+        break;
+      }
+      FrameChild fc;
+      fc.frameIdx = i;
+      fc.launchOp = launch;
+      if (auto seqOp = dyn_cast_or_null<LoopScheduleSequentialOp>(child)) {
+        fc.kind = 0;
+        fc.seqOp = seqOp;
+        entries.push_back(fc);
+      } else if (auto pipOp = dyn_cast_or_null<LoopSchedulePipelineOp>(child)) {
+        fc.kind = 1;
+        fc.pipOp = pipOp;
+        entries.push_back(fc);
       }
     }
-    if (!any)
-      entries.push_back({i, -1, {}, {}});
   }
 
   // Build a per-entry kind vector for createFunctionFSM. The FSM sees one
@@ -2591,38 +2671,46 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
     lastEntryForFrame[f] = i;
   }
 
-  // Helper: walk the at bodies of a top-level frame looking for ops to
-  // clone. Skips `at`/yield/iter_arg_update op scaffolding and the nested
-  // loop ops (which are handled per-entry as children).
-  auto cloneFramePreChild = [&](LoopScheduleFrameOp frame,
-                                Operation *firstChildOp) {
-    for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
-      for (auto &op : atOp.getBodyBlock()) {
-        if (&op == firstChildOp)
-          return;
-        if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
-          continue;
-        if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
-          return;
-        builder.clone(op, mapping);
+  // Map from handle SSA values to the child's output SSA values. Used to
+  // resolve `loopschedule.await` ops in later frames.
+  DenseMap<Value, SmallVector<Value>> funcHandleValueMap;
+
+  // Helper: for a frame, walk its await region and map await results +
+  // body-entry args. Should be called before the frame's body work runs.
+  auto processFuncAwaitRegion = [&](LoopScheduleFrameOp frame) {
+    for (auto &op : frame.getAwaitBlock().getOperations()) {
+      if (auto awaitOp = dyn_cast<LoopScheduleAwaitOp>(&op)) {
+        SmallVector<Value> childVals;
+        for (Value h : awaitOp.getHandles()) {
+          auto it = funcHandleValueMap.find(h);
+          if (it != funcHandleValueMap.end())
+            for (Value v : it->second)
+              childVals.push_back(v);
+        }
+        for (auto [idx, res] : llvm::enumerate(awaitOp.getResults())) {
+          if (idx < childVals.size())
+            mapping.map(res, childVals[idx]);
+        }
       }
+    }
+    auto awaitYield = frame.getAwaitYield();
+    Block &body = frame.getBodyBlock();
+    for (auto [arg, val] :
+         llvm::zip(body.getArguments(), awaitYield.getOperands())) {
+      if (auto mapped = mapping.lookupOrNull(val))
+        mapping.map(arg, mapped);
+      else
+        mapping.map(arg, val);
     }
   };
 
-  auto cloneFramePostChild = [&](LoopScheduleFrameOp frame,
-                                 Operation *lastChildOp) {
-    bool pastChild = false;
+  // Helper: clone the non-launch `at` body ops of a frame. Launches are
+  // handled per-entry as children; `at` ops contain static work that
+  // coexists with the launch in the same frame.
+  auto cloneFrameAtBodies = [&](LoopScheduleFrameOp frame) {
     for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
       for (auto &op : atOp.getBodyBlock()) {
-        if (&op == lastChildOp) {
-          pastChild = true;
-          continue;
-        }
-        if (!pastChild)
-          continue;
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
-          continue;
-        if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
           continue;
         builder.clone(op, mapping);
       }
@@ -2636,11 +2724,15 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
     unsigned frameIdx = entry.frameIdx;
     builder.setInsertionPointToEnd(hwBody);
 
-    // Clone pre-child ops only for the first entry of this frame.
-    if (entry.kind >= 0 && ei == firstEntryForFrame[frameIdx]) {
-      Operation *firstChildOp = entry.seqOp ? entry.seqOp.getOperation()
-                                            : entry.pipOp.getOperation();
-      cloneFramePreChild(topFrames[frameIdx], firstChildOp);
+    // On first entry of this frame, process its await region (map await
+    // results from stashed handle-value map, then forward to body entry
+    // args). For non-leaf frames, also clone static `at` body ops that
+    // coexist with the launch. Leaf frames defer this to lowerFrameBody
+    // below.
+    if (ei == firstEntryForFrame[frameIdx]) {
+      processFuncAwaitRegion(topFrames[frameIdx]);
+      if (entry.kind >= 0)
+        cloneFrameAtBodies(topFrames[frameIdx]);
     }
 
     if (entry.kind == 0) {
@@ -2680,8 +2772,15 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
       childDoneBEs[childIndexForEntry[ei]].setValue(childDone);
 
       // Map seqOp results.
-      for (auto result : seqOp.getResults())
-        mapping.map(result, childInst.getResult(outIdx++));
+      SmallVector<Value> childResultVals;
+      for (auto result : seqOp.getResults()) {
+        Value v = childInst.getResult(outIdx++);
+        mapping.map(result, v);
+        childResultVals.push_back(v);
+      }
+      if (entry.launchOp)
+        funcHandleValueMap[entry.launchOp.getHandle()] =
+            std::move(childResultVals);
 
       // Extract child memory outputs into per-entry ports.
       for (auto &memInfo : memrefArgs) {
@@ -2707,6 +2806,14 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
         return failure();
       childDoneBEs[childIndexForEntry[ei]].setValue(pipDone);
 
+      if (entry.launchOp) {
+        SmallVector<Value> pipResults;
+        for (Value r : pipOp.getResults())
+          if (auto m = mapping.lookupOrNull(r))
+            pipResults.push_back(m);
+        funcHandleValueMap[entry.launchOp.getHandle()] = std::move(pipResults);
+      }
+
     } else {
       // Leaf frame: lower body with entry_running as wrEn gate.
       Value oneGate = entryRunningSignals[ei];
@@ -2714,14 +2821,6 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
                                 mapping, ArrayRef<Value>(oneGate),
                                 perEntryPorts[ei])))
         return failure();
-    }
-
-    // Clone post-child ops only for the last entry of this frame.
-    if (entry.kind >= 0 && ei == lastEntryForFrame[frameIdx]) {
-      Operation *lastChildOp = entry.seqOp ? entry.seqOp.getOperation()
-                                           : entry.pipOp.getOperation();
-      builder.setInsertionPointToEnd(hwBody);
-      cloneFramePostChild(topFrames[frameIdx], lastChildOp);
     }
 
     // Register frame results only after the last entry for this frame
@@ -2752,9 +2851,24 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
 
       auto frameYieldOp = cast<LoopScheduleYieldOp>(
           topFrames[frameIdx].getBodyBlock().getTerminator());
+      // First: forward handle-typed frame results to any stashed values so
+      // later frames that await on the frame's result can resolve the
+      // underlying child's SSA outputs.
       for (auto [frameResult, yOperand] :
            llvm::zip(topFrames[frameIdx].getResults(),
                      frameYieldOp.getOperands())) {
+        if (!isHandleType(frameResult.getType()))
+          continue;
+        auto it = funcHandleValueMap.find(yOperand);
+        if (it != funcHandleValueMap.end())
+          funcHandleValueMap[frameResult] = it->second;
+      }
+      for (auto [frameResult, yOperand] :
+           llvm::zip(topFrames[frameIdx].getResults(),
+                     frameYieldOp.getOperands())) {
+        // Handles have no HW representation; skip entirely.
+        if (isHandleType(frameResult.getType()))
+          continue;
         Value val = mapping.lookup(yOperand);
         if (localLoadResults.count(yOperand)) {
           // Local hlmem read (latency=1) provides the delay; skip register.
