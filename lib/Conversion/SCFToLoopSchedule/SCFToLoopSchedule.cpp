@@ -1895,6 +1895,27 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
 
     bodyYield->setOperands(bodyYieldOperands);
 
+    // Reorder frame body children by offset so ats/launches appear in
+    // monotonically non-decreasing order. The emitter produced them in two
+    // batches (ats first, then launches); stable-sort by offset here so the
+    // frame verifier's monotonic-offset invariant holds.
+    {
+      SmallVector<Operation *> children;
+      for (Operation &op : bodyBlock.without_terminator())
+        children.push_back(&op);
+      std::stable_sort(children.begin(), children.end(),
+                       [](Operation *a, Operation *b) {
+                         auto off = [](Operation *op) -> uint64_t {
+                           if (auto at = dyn_cast<LoopScheduleAtOp>(op))
+                             return at.getOffset();
+                           return cast<LoopScheduleLaunchOp>(op).getOffset();
+                         };
+                         return off(a) < off(b);
+                       });
+      for (Operation *op : children)
+        op->moveBefore(bodyYield);
+    }
+
     // After the frame: update valueMap to point to frame results for exports
     // that escape the phase (so subsequent phases see frame boundaries).
     for (auto &se : staticExports) {
@@ -2583,6 +2604,25 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
     }
 
     bodyYield->setOperands(bodyYieldOperands);
+
+    // Reorder at/launch children by offset to satisfy the frame op's
+    // monotonic-offset verifier invariant (see sequential-emitter sort).
+    {
+      SmallVector<Operation *> children;
+      for (Operation &op : bodyBlock.without_terminator())
+        children.push_back(&op);
+      std::stable_sort(children.begin(), children.end(),
+                       [](Operation *a, Operation *b) {
+                         auto off = [](Operation *op) -> uint64_t {
+                           if (auto at = dyn_cast<LoopScheduleAtOp>(op))
+                             return at.getOffset();
+                           return cast<LoopScheduleLaunchOp>(op).getOffset();
+                         };
+                         return off(a) < off(b);
+                       });
+      for (Operation *op : children)
+        op->moveBefore(bodyYield);
+    }
 
     for (auto &se : staticExports) {
       for (unsigned i = 0, e = se.op->getNumResults(); i < e; ++i)

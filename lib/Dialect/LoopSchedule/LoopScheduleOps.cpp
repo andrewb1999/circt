@@ -779,11 +779,19 @@ LogicalResult LoopScheduleFrameOp::verify() {
                          "ops, found: ")
              << op.getName();
   }
+  std::optional<uint64_t> lastOffset;
   for (Operation &op : getBodyBlock().without_terminator()) {
     if (!isa<LoopScheduleAtOp, LoopScheduleLaunchOp>(op))
       return emitOpError("body region may contain only loopschedule.at and "
                          "loopschedule.launch ops, found: ")
              << op.getName();
+    uint64_t offset = isa<LoopScheduleAtOp>(op)
+                          ? cast<LoopScheduleAtOp>(op).getOffset()
+                          : cast<LoopScheduleLaunchOp>(op).getOffset();
+    if (lastOffset.has_value() && offset < *lastOffset)
+      return op.emitOpError("offset must be >= previous child's offset (")
+             << *lastOffset << ")";
+    lastOffset = offset;
   }
 
   // Terminator presence is guaranteed by SizedRegion + the yield ops' parent

@@ -217,3 +217,38 @@ func.func @iter_arg_update_wrong_lhs(%c0: index, %c1: index, %c10: index) {
   }
   return
 }
+
+// -----
+
+// Frame body children (at + launch) must appear in non-decreasing offset
+// order; an `at 0` placed after an `at 2` is a verifier error.
+func.func @frame_body_non_monotonic_ats(%arg0: i32) -> i32 {
+  %r = loopschedule.frame -> (i32) {
+    %a = loopschedule.at 2 -> i32 {
+      loopschedule.yield %arg0 : i32
+    }
+    // expected-error @+1 {{op offset must be >= previous child's offset (2)}}
+    %b = loopschedule.at 0 -> i32 {
+      loopschedule.yield %arg0 : i32
+    }
+    loopschedule.yield %a : i32
+  }
+  return %r : i32
+}
+
+// -----
+
+// Monotonic invariant applies to launches too.
+func.func @frame_body_non_monotonic_launches() {
+  loopschedule.frame {
+    %h1 = loopschedule.launch at 3 : !loopschedule.handle {
+      loopschedule.yield
+    }
+    // expected-error @+1 {{op offset must be >= previous child's offset (3)}}
+    %h2 = loopschedule.launch at 1 : !loopschedule.handle {
+      loopschedule.yield
+    }
+    loopschedule.yield
+  }
+  return
+}
