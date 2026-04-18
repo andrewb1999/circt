@@ -45,8 +45,10 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
   auto operatorOps = libraryOp.getBodyBlock()->getOps<oplib::OperatorOp>();
 
   for (auto operatorOp : operatorOps) {
-    auto matchOp =
-        cast<oplib::CalyxMatchOp>(operatorOp.getBodyBlock()->getTerminator());
+    auto calyxMatches = operatorOp.getBodyBlock()->getOps<oplib::CalyxMatchOp>();
+    if (calyxMatches.empty())
+      continue;
+    auto matchOp = *calyxMatches.begin();
 
     auto targetOp =
         cast<oplib::TargetOp>(operatorOp.lookupSymbol(matchOp.getTarget()));

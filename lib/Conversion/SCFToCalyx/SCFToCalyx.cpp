@@ -3160,7 +3160,8 @@ void SCFToCalyxPass::runOnOperation() {
   /// Eliminate any unused combinational groups. This is done before
   /// calyx::RewriteMemoryAccesses to avoid inferring slice components for
   /// groups that will be removed.
-  addGreedyPattern<calyx::EliminateUnusedCombGroups>(loweringPatterns);
+  addGreedyPattern<calyx::EliminateUnusedCombGroups>(loweringPatterns,
+                                                     *loweringState);
 
   /// This pattern rewrites accesses to memories which are too wide due to
   /// index types being converted to a fixed-width integer type.

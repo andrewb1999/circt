@@ -62,8 +62,8 @@ def LibraryOp : OpLibOp<"library", [IsolatedFromAbove, SingleBlock,
   let hasVerifier = 1;
 }
 
-def OperatorOp : OpLibOp<"operator", [IsolatedFromAbove, 
-                                         SingleBlock,
+def OperatorOp : OpLibOp<"operator", [IsolatedFromAbove,
+                                         SingleBlock, NoTerminator,
                                          NoRegionArguments,
                                          Symbol, SymbolTable,
                                          HasParent<"LibraryOp">]> {
@@ -195,14 +195,59 @@ def OperationOp : OpLibOp<"operation", [HasParent<"TargetOp">]> {
   }];
 }
 
-def CalyxMatchOp : OpLibOp<"calyx_match", 
-    [Terminator, SymbolTable,
+def CalyxMatchOp : OpLibOp<"calyx_match",
+    [SymbolTable,
      HasParent<"OperatorOp">,
      NoRegionArguments,
      SingleBlock,
      DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "OpLib dialect Target operation";
   let description = [{
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$target,
+                       TypeAttrOf<FunctionType>:$targetType);
+
+  let results = (outs);
+  let regions = (region SizedRegion<1>:$body);
+
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins "mlir::FlatSymbolRefAttr":$target,
+                   "mlir::TypeAttr":$targetType), [{
+      Region* region = $_state.addRegion();
+      region->push_back(new Block());
+      $_state.addAttribute($_builder.getStringAttr("target"), target);
+      $_state.addAttribute($_builder.getStringAttr("targetType"), targetType);
+    }]>
+  ];
+
+  let extraClassDeclaration = [{
+    static bool isOptionalSymbol() { return false; }
+
+    // Convenience
+    ::mlir::Block *getBodyBlock() {
+      return &getBody().getBlocks().front();
+    }
+  }];
+
+  let assemblyFormat = [{
+    `(` $target `:` $targetType `)` `produce` attr-dict-with-keyword $body
+  }];
+  let hasVerifier = 1;
+}
+
+def HwMatchOp : OpLibOp<"hw_match",
+    [HasParent<"OperatorOp">,
+     NoRegionArguments,
+     SingleBlock,
+     DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "OpLib dialect HW match operation";
+  let description = [{
+    The `oplib.hw_match` op describes how a logical operator lowers to
+    an HW-dialect primitive (typically an `hw.instance` of an
+    `hw.module.extern`). The body yields the logical ports (clock,
+    reset, clock-enable, inputs, outputs) via `oplib.yield`.
   }];
 
   let arguments = (ins FlatSymbolRefAttr:$target,
@@ -250,9 +295,9 @@ def OutputOp : OpLibOp<"output", [Terminator,
 }
 
 def YieldOp : OpLibOp<"yield", [Terminator,
-                                   ReturnLike, 
+                                   ReturnLike,
                                    AttrSizedOperandSegments,
-                                   ParentOneOf<["CalyxMatchOp"]>]> {
+                                   ParentOneOf<["CalyxMatchOp", "HwMatchOp"]>]> {
   let summary = "OpLib dialect Yield operation";
   let description = [{
     The `oplib.output` operation.

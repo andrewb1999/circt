@@ -862,10 +862,15 @@ struct MultipleGroupDonePattern : mlir::OpRewritePattern<calyx::GroupOp> {
 /// considered an error. In these cases, the program will be invalidated when
 /// the Calyx verifiers execute.
 struct EliminateUnusedCombGroups : mlir::OpRewritePattern<calyx::CombGroupOp> {
-  using mlir::OpRewritePattern<calyx::CombGroupOp>::OpRewritePattern;
+  EliminateUnusedCombGroups(MLIRContext *context,
+                            calyx::CalyxLoweringState &cls)
+      : mlir::OpRewritePattern<calyx::CombGroupOp>(context), cls(cls) {}
 
   LogicalResult matchAndRewrite(calyx::CombGroupOp combGroupOp,
                                 PatternRewriter &rewriter) const override;
+
+private:
+  calyx::CalyxLoweringState &cls;
 };
 
 /// Removes duplicate EnableOps in parallel operations.

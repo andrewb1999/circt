@@ -759,11 +759,13 @@ MultipleGroupDonePattern::matchAndRewrite(calyx::GroupOp groupOp,
 LogicalResult
 EliminateUnusedCombGroups::matchAndRewrite(calyx::CombGroupOp combGroupOp,
                                            PatternRewriter &rewriter) const {
-  auto control =
-      combGroupOp->getParentOfType<calyx::ComponentOp>().getControlOp();
+  auto component = combGroupOp->getParentOfType<calyx::ComponentOp>();
+  auto control = component.getControlOp();
   if (!SymbolTable::symbolKnownUseEmpty(combGroupOp.getSymNameAttr(), control))
     return failure();
 
+  if (auto *state = cls.getState(component))
+    state->removeEvaluatingGroup(combGroupOp);
   rewriter.eraseOp(combGroupOp);
   return success();
 }

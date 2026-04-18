@@ -2,6 +2,8 @@
 
 hw.module.extern @ext_fmult(in %clk : i1 {calyx.clk}, in %left : i32 {calyx.data}, in %right : i32 {calyx.data}, in %ce : i1, out result : i32 {calyx.stable, calyx.data}) attributes {filename = "fmult.sv", verilogName = "fmult"}
 
+hw.module.extern @ext_muli(in %clk : i1, in %reset : i1, in %ce : i1, in %din0 : i32, in %din1 : i32, out dout : i32) attributes {filename = "muli.sv", verilogName = "muli"}
+
 // CHECK-LABEL: @lib0
 
 // CHECK-LABEL: oplib.operator @fmult latency<4>, incDelay<5.000000e-01>, outDelay<5.000000e-01>
@@ -21,6 +23,11 @@ hw.module.extern @ext_fmult(in %clk : i1 {calyx.clk}, in %left : i32 {calyx.data
 // CHECK-NEXT: oplib.yield ins(%[[VAL_11]], %[[VAL_12]] : i32, i32), outs(%[[VAL_13]] : i32)
 
 // CHECK-LABEL: oplib.operator @trunci latency<0>
+
+// CHECK-LABEL: oplib.operator @muli latency<4>, incDelay<5.000000e-01>, outDelay<5.000000e-01>
+// CHECK:      oplib.calyx_match(@target0 : (i32, i32) -> i32) produce
+// CHECK:      oplib.hw_match(@target0 : (i32, i32) -> i32) produce
+// CHECK:      oplib.yield clk(%{{.+}} : i1), ce(%{{.+}} : i1), reset(%{{.+}} : i1), ins(%{{.+}}, %{{.+}} : i32, i32), outs(%{{.+}} : i32)
 
 oplib.library @lib0 {
   oplib.operator @fmult latency<4>, incDelay<0.5>, outDelay<0.5> {
@@ -61,6 +68,21 @@ oplib.library @lib0 {
     oplib.calyx_match(@target0 : (i32, i32) -> i1) produce {
       %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i32, i32, i1
       oplib.yield ins(%eq.left, %eq.right : i32, i32), outs(%eq.out : i1)
+    }
+  }
+  oplib.operator @muli latency<4>, incDelay<0.5>, outDelay<0.5> {
+    oplib.target @target0(%l: i32, %r: i32) -> i32 {
+      %o = oplib.operation "muli" in "arith"(%l, %r : i32, i32) : i32
+      oplib.output %o : i32
+    }
+    oplib.calyx_match(@target0 : (i32, i32) -> i32) produce {
+      %l, %r, %o = calyx.std_add @mul : i32, i32, i32
+      oplib.yield ins(%l, %r : i32, i32), outs(%o : i32)
+    }
+    oplib.hw_match(@target0 : (i32, i32) -> i32) produce {
+      %c0 = hw.constant 0 : i1
+      %c0_i32 = hw.constant 0 : i32
+      oplib.yield clk(%c0 : i1), ce(%c0 : i1), reset(%c0 : i1), ins(%c0_i32, %c0_i32 : i32, i32), outs(%c0_i32 : i32)
     }
   }
 }

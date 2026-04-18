@@ -42,13 +42,19 @@ LogicalResult LibraryOp::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult OperatorOp::verify() {
-  if (!getBodyBlock()->mightHaveTerminator()) {
-    return emitOpError("body block does not have terminator");
+  unsigned numMatches = 0;
+  for (auto &op : getBodyBlock()->getOperations()) {
+    if (isa<CalyxMatchOp, HwMatchOp>(op)) {
+      ++numMatches;
+      continue;
+    }
+    if (isa<TargetOp>(op))
+      continue;
+    return op.emitOpError(
+        "operator body may only contain target ops and match ops");
   }
-  auto *term = getBodyRegion().front().getTerminator();
-  if (!isa<CalyxMatchOp>(term)) {
-    return emitOpError("region terminator must be supported match op");
-  }
+  if (numMatches == 0)
+    return emitOpError("must contain at least one match op");
 
   if (getIncDelay().has_value() != getOutDelay().has_value()) {
     return emitOpError(
@@ -142,70 +148,90 @@ void TargetOp::build(OpBuilder &builder, OperationState &state,
 }
 
 //===----------------------------------------------------------------------===//
-// CalyxMatchOp
+// CalyxMatchOp / HwMatchOp shared helpers
 //===----------------------------------------------------------------------===//
 
-LogicalResult
-CalyxMatchOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  StringRef targetName = getTarget();
-  Type type = getTargetType();
-
-  // Try to find the referenced target.
+static LogicalResult verifyMatchSymbolUse(Operation *op, StringRef targetName,
+                                          FunctionType type,
+                                          SymbolTableCollection &symbolTable) {
   auto fn = symbolTable.lookupSymbolIn<TargetOp>(
-      this->getParentOp<OperatorOp>(),
-      StringAttr::get(getContext(), targetName));
+      op->getParentOfType<OperatorOp>(),
+      StringAttr::get(op->getContext(), targetName));
   if (!fn)
-    return emitOpError() << "reference to undefined target '" << targetName
-                         << "'";
+    return op->emitOpError()
+           << "reference to undefined target '" << targetName << "'";
 
-  // Check that the referenced function has the correct type.
   if (fn.getFunctionType() != type)
-    return emitOpError("reference to target with mismatched type");
+    return op->emitOpError("reference to target with mismatched type");
 
   return success();
 }
 
-LogicalResult CalyxMatchOp::verify() {
-  if (!getBodyBlock()->mightHaveTerminator()) {
-    return emitOpError("must be terminated by a YieldOp");
-  }
+static LogicalResult verifyMatchBody(Operation *op, Block *body,
+                                     FunctionType targetType) {
+  if (!body->mightHaveTerminator())
+    return op->emitOpError("must be terminated by a YieldOp");
 
-  auto yieldOp = cast<oplib::YieldOp>(getBodyBlock()->getTerminator());
+  auto yieldOp = dyn_cast<oplib::YieldOp>(body->getTerminator());
+  if (!yieldOp)
+    return op->emitOpError("must be terminated by a YieldOp");
 
   auto inputTypes = yieldOp.getInputs().getTypes();
   auto outputTypes = yieldOp.getOutputs().getTypes();
 
-  if (inputTypes.size() != getTargetType().getNumInputs()) {
-    return emitOpError("yielded different number of inputs than expected"
-                       " by target type");
-  }
+  if (inputTypes.size() != targetType.getNumInputs())
+    return op->emitOpError("yielded different number of inputs than expected"
+                           " by target type");
 
-  if (outputTypes.size() != getTargetType().getNumResults()) {
-    return emitOpError("yielded different number of outputs than expected"
-                       " by target type");
-  }
+  if (outputTypes.size() != targetType.getNumResults())
+    return op->emitOpError("yielded different number of outputs than expected"
+                           " by target type");
 
   for (auto iv : llvm::enumerate(inputTypes)) {
     auto i = iv.index();
     auto type = iv.value();
     if (type.getIntOrFloatBitWidth() !=
-        getTargetType().getInput(i).getIntOrFloatBitWidth()) {
-      return emitOpError(
+        targetType.getInput(i).getIntOrFloatBitWidth())
+      return op->emitOpError(
           "yield input type does not have same bitwidth as target type");
-    }
   }
 
   for (auto iv : llvm::enumerate(outputTypes)) {
     auto i = iv.index();
     auto type = iv.value();
     if (type.getIntOrFloatBitWidth() !=
-        getTargetType().getResult(i).getIntOrFloatBitWidth()) {
-      return emitOpError(
+        targetType.getResult(i).getIntOrFloatBitWidth())
+      return op->emitOpError(
           "yield output type does not have same bitwidth as target type");
-    }
   }
 
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// CalyxMatchOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+CalyxMatchOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  return verifyMatchSymbolUse(*this, getTarget(), getTargetType(), symbolTable);
+}
+
+LogicalResult CalyxMatchOp::verify() {
+  return verifyMatchBody(*this, getBodyBlock(), getTargetType());
+}
+
+//===----------------------------------------------------------------------===//
+// HwMatchOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+HwMatchOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  return verifyMatchSymbolUse(*this, getTarget(), getTargetType(), symbolTable);
+}
+
+LogicalResult HwMatchOp::verify() {
+  return verifyMatchBody(*this, getBodyBlock(), getTargetType());
 }
 
 //===----------------------------------------------------------------------===//
