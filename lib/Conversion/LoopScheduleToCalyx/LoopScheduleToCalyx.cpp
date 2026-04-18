@@ -203,59 +203,74 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
     }
 
     if (!launches.empty()) {
-      if (launches.size() != 1)
-        return frame.emitOpError(
-            "dissolveLaunchesAndAwaits: multiple launches per frame are not "
-            "yet supported in the Calyx lowering");
-      auto launch = launches.front();
-      if (launch.getOffset() != 0)
-        return launch.emitOpError(
-            "dissolveLaunchesAndAwaits: launches at non-zero offset are not "
-            "yet supported in the Calyx lowering");
+      // Per-launch: extract the single child loop, move it before the frame,
+      // and stash the child's results under the launch's handle. Multiple
+      // launches in one frame (scheduler-parallel) are sequentialized in the
+      // order they appeared; downstream passes can parallelize later if the
+      // dependence graph allows.
+      SmallVector<std::pair<LoopScheduleLaunchOp, SmallVector<Value>>>
+          launchResults;
+      for (auto launch : launches) {
+        // Non-zero offset is honored implicitly via block-order placement:
+        // frame-body at-ops (preserved below via inline) land before the
+        // dissolved launch's child loop in the entry block, matching the
+        // scheduler's intended execution order.
 
-      // Find the single child loop op inside the launch body.
-      Operation *childLoop = nullptr;
-      for (Operation &op : launch.getBodyBlock().getOperations()) {
-        if (isa<LoopScheduleYieldOp>(op))
-          continue;
-        if (childLoop)
+        Operation *childLoop = nullptr;
+        for (Operation &op : launch.getBodyBlock().getOperations()) {
+          if (isa<LoopScheduleYieldOp>(op))
+            continue;
+          if (childLoop)
+            return launch.emitOpError(
+                "dissolveLaunchesAndAwaits: launch body must contain "
+                "exactly one child op before the yield");
+          childLoop = &op;
+        }
+        if (!childLoop)
           return launch.emitOpError(
-              "dissolveLaunchesAndAwaits: launch body must contain exactly "
-              "one child op before the yield");
-        childLoop = &op;
+              "dissolveLaunchesAndAwaits: launch body has no child op");
+        if (!isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(childLoop))
+          return childLoop->emitOpError(
+              "dissolveLaunchesAndAwaits: expected sequential/pipeline "
+              "child");
+
+        childLoop->moveBefore(frame);
+        SmallVector<Value> childResults(childLoop->getResults().begin(),
+                                        childLoop->getResults().end());
+        handleValueMap[launch.getHandle()] = childResults;
+        launchResults.push_back({launch, std::move(childResults)});
       }
-      if (!childLoop)
-        return launch.emitOpError(
-            "dissolveLaunchesAndAwaits: launch body has no child op");
-      if (!isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(childLoop))
-        return childLoop->emitOpError(
-            "dissolveLaunchesAndAwaits: expected sequential/pipeline child");
 
-      // Move the child loop to immediately before the enclosing frame.
-      childLoop->moveBefore(frame);
-
-      // Stash the child loop's results under the launch's handle so later
-      // awaits can resolve to them.
-      SmallVector<Value> childResults(childLoop->getResults().begin(),
-                                      childLoop->getResults().end());
-      handleValueMap[launch.getHandle()] = childResults;
-
-      // Propagate to the frame's own results if this frame simply yields the
-      // handle (common case). Find the handle's index in the body yield and
-      // rewrite the frame result.
+      // Propagate to the frame's own results: for handle-typed results,
+      // forward to the child's result vector keyed on the matching launch
+      // handle. Non-handle results are forwarded directly from the body
+      // yield.
       for (auto [idx, yVal] :
            llvm::enumerate(bodyYield.getOperands())) {
         Value frameResult = frame.getResult(idx);
         if (isHandleType(frameResult.getType())) {
-          // Stash the frame result as producing the same child values so a
-          // later frame awaiting this frame's result picks them up.
-          if (yVal == launch.getHandle())
-            handleValueMap[frameResult] = childResults;
+          for (auto &lr : launchResults) {
+            if (yVal == lr.first.getHandle()) {
+              handleValueMap[frameResult] = lr.second;
+              break;
+            }
+          }
         } else {
-          // Non-handle frame results are forwarded directly.
           if (auto yDef = yVal)
             frameResult.replaceAllUsesWith(yDef);
         }
+      }
+
+      // Inline non-launch body ops (e.g. at-ops computing frame-level
+      // scalars used by the launched loop) as siblings of the frame so
+      // they survive the frame erasure below. The block order — at-ops
+      // first, then the dissolved launch's child loop — matches the
+      // scheduler's intended execution order for launches at offset > 0.
+      for (Operation &op :
+           llvm::make_early_inc_range(bodyBlock.getOperations())) {
+        if (isa<LoopScheduleYieldOp, LoopScheduleLaunchOp>(op))
+          continue;
+        op.moveBefore(frame);
       }
 
       // Erase the frame itself. All uses of handle-typed results are
@@ -272,6 +287,16 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
         if (isHandleType(frameResult.getType()))
           continue;
         frameResult.replaceAllUsesWith(yVal);
+      }
+
+      // Inline body ops (non-yield) as siblings of the frame so they survive
+      // the frame erasure below. Block-arg uses have already been forwarded
+      // to the await-yielded values above, so the moved ops are well-formed.
+      for (Operation &op :
+           llvm::make_early_inc_range(bodyBlock.getOperations())) {
+        if (isa<LoopScheduleYieldOp>(op))
+          continue;
+        op.moveBefore(frame);
       }
     }
 

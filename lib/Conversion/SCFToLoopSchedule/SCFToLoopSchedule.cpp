@@ -1417,10 +1417,14 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
         }
         for (auto *user : users) {
           auto *userOrAncestor = loop.getAfter().findAncestorOpInRegion(*user);
-          auto startTimeOpt = problem.getStartTime(userOrAncestor);
-          if ((startTimeOpt.has_value() &&
-               *startTimeOpt > phaseBase + bc.offset) ||
-              isLoopTerminator(user)) {
+          if (!userOrAncestor)
+            continue;
+          // The user (or its ancestor in the loop body) is inside this at's
+          // region iff it's among the ops being cloned into this at.
+          // Anything else — sibling launches at the same offset, ats at
+          // later offsets, the loop terminator — escapes the at boundary
+          // and must be reached via a yielded export.
+          if (!llvm::is_contained(bc.staticOps, userOrAncestor)) {
             needsReturn = true;
             break;
           }
@@ -2295,8 +2299,14 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
           users.append(predUsers.begin(), predUsers.end());
         }
         for (auto *user : users) {
-          if (opOrParentStartTime(problem, user) > phaseBase + bc.offset ||
-              isFuncTerminator(user)) {
+          auto *userOrAncestor =
+              funcOp.getBody().findAncestorOpInRegion(*user);
+          if (!userOrAncestor)
+            continue;
+          // The user (or its ancestor in the func body) is inside this at's
+          // region iff it's among the ops being cloned into this at.
+          // Anything else escapes the at boundary and must be yielded.
+          if (!llvm::is_contained(bc.staticOps, userOrAncestor)) {
             needsReturn = true;
             break;
           }
