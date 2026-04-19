@@ -45,16 +45,22 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
   auto operatorOps = libraryOp.getBodyBlock()->getOps<oplib::OperatorOp>();
 
   for (auto operatorOp : operatorOps) {
-    auto calyxMatches = operatorOp.getBodyBlock()->getOps<oplib::CalyxMatchOp>();
-    if (calyxMatches.empty())
+    // The signature / matching info lives on the OperatorOp's TargetOp +
+    // OperationOp; the calyx_match body is only needed for downstream
+    // Calyx lowering. Operators without a calyx_match are still tracked
+    // here so their latency/signature drives scheduling — LoopScheduleToCalyx
+    // is responsible for falling back to its TypeSwitch path when the
+    // operator has no calyx_match template.
+    auto targetOps = operatorOp.getBodyBlock()->getOps<oplib::TargetOp>();
+    if (targetOps.empty())
       continue;
-    auto matchOp = *calyxMatches.begin();
-
-    auto targetOp =
-        cast<oplib::TargetOp>(operatorOp.lookupSymbol(matchOp.getTarget()));
-
+    auto targetOp = *targetOps.begin();
+    if (targetOp.getBodyBlock()->empty())
+      continue;
     auto operationOp =
-        cast<oplib::OperationOp>(targetOp.getBodyBlock()->front());
+        dyn_cast<oplib::OperationOp>(targetOp.getBodyBlock()->front());
+    if (!operationOp)
+      continue;
 
     std::string name = operationOp.getDialectName().str() + "." +
                        operationOp.getOpName().str();
@@ -64,7 +70,7 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
 
     operatorStruct.incDelay = operatorOp.getIncDelay();
     operatorStruct.outDelay = operatorOp.getOutDelay();
-    operatorStruct.templateOp = &matchOp.getBodyBlock()->front();
+    operatorStruct.templateOp = nullptr; // populated only when calyx_match exists
     operatorStruct.opToMatch = operationOp;
 
     if (operationOp.getOpDict().has_value()) {
@@ -75,43 +81,49 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
       }
     }
 
-    auto yieldOp =
-        cast<oplib::YieldOp>(matchOp.getBodyBlock()->getTerminator());
+    auto calyxMatches = operatorOp.getBodyBlock()->getOps<oplib::CalyxMatchOp>();
+    if (!calyxMatches.empty()) {
+      auto matchOp = *calyxMatches.begin();
+      operatorStruct.templateOp = &matchOp.getBodyBlock()->front();
 
-    if (yieldOp.getClock() != nullptr) {
-      auto clockResultNum =
-          cast<OpResult>(yieldOp.getClock()).getResultNumber();
-      operatorStruct.clock = clockResultNum;
-    }
+      auto yieldOp =
+          cast<oplib::YieldOp>(matchOp.getBodyBlock()->getTerminator());
 
-    if (yieldOp.getReset() != nullptr) {
-      auto resetResultNum =
-          cast<OpResult>(yieldOp.getReset()).getResultNumber();
-      operatorStruct.reset = resetResultNum;
-    }
+      if (yieldOp.getClock() != nullptr) {
+        auto clockResultNum =
+            cast<OpResult>(yieldOp.getClock()).getResultNumber();
+        operatorStruct.clock = clockResultNum;
+      }
 
-    if (yieldOp.getClockEnable() != nullptr) {
-      auto ceResultNum =
-          cast<OpResult>(yieldOp.getClockEnable()).getResultNumber();
-      operatorStruct.ce = ceResultNum;
-    }
+      if (yieldOp.getReset() != nullptr) {
+        auto resetResultNum =
+            cast<OpResult>(yieldOp.getReset()).getResultNumber();
+        operatorStruct.reset = resetResultNum;
+      }
 
-    for (auto iv : llvm::enumerate(yieldOp.getInputs())) {
-      auto i = iv.index();
-      auto input = iv.value();
-      assert(input.getDefiningOp() == &matchOp.getBodyBlock()->front() &&
-             "matchOp can only contain one calyx cell");
-      auto opResultNum = cast<OpResult>(input).getResultNumber();
-      operatorStruct.operandToCellResultMapping[i] = opResultNum;
-    }
+      if (yieldOp.getClockEnable() != nullptr) {
+        auto ceResultNum =
+            cast<OpResult>(yieldOp.getClockEnable()).getResultNumber();
+        operatorStruct.ce = ceResultNum;
+      }
 
-    for (auto iv : llvm::enumerate(yieldOp.getOutputs())) {
-      auto i = iv.index();
-      auto output = iv.value();
-      assert(output.getDefiningOp() == &matchOp.getBodyBlock()->front() &&
-             "matchOp can only contain one calyx cell");
-      auto opResultNum = cast<OpResult>(output).getResultNumber();
-      operatorStruct.resultToCellResultMapping[i] = opResultNum;
+      for (auto iv : llvm::enumerate(yieldOp.getInputs())) {
+        auto i = iv.index();
+        auto input = iv.value();
+        assert(input.getDefiningOp() == &matchOp.getBodyBlock()->front() &&
+               "matchOp can only contain one calyx cell");
+        auto opResultNum = cast<OpResult>(input).getResultNumber();
+        operatorStruct.operandToCellResultMapping[i] = opResultNum;
+      }
+
+      for (auto iv : llvm::enumerate(yieldOp.getOutputs())) {
+        auto i = iv.index();
+        auto output = iv.value();
+        assert(output.getDefiningOp() == &matchOp.getBodyBlock()->front() &&
+               "matchOp can only contain one calyx cell");
+        auto opResultNum = cast<OpResult>(output).getResultNumber();
+        operatorStruct.resultToCellResultMapping[i] = opResultNum;
+      }
     }
 
     auto operatorName = operatorOp.getSymName();
@@ -214,7 +226,7 @@ OperatorLibraryAnalysis::getOperatorIncomingDelay(StringRef operatorName) {
   if (!operatorStruct.incDelay.has_value())
     return std::nullopt;
 
-  return operatorStruct.incDelay.value().convertToFloat();
+  return (float)operatorStruct.incDelay.value().convertToDouble();
 }
 
 std::optional<float>
@@ -224,7 +236,7 @@ OperatorLibraryAnalysis::getOperatorOutgoingDelay(StringRef operatorName) {
   if (!operatorStruct.outDelay.has_value())
     return std::nullopt;
 
-  return operatorStruct.outDelay.value().convertToFloat();
+  return (float)operatorStruct.outDelay.value().convertToDouble();
 }
 
 std::optional<unsigned>

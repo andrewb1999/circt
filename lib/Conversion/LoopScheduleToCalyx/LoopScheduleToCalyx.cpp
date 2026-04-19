@@ -839,13 +839,23 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
       if (op->hasAttrOfType<SymbolRefAttr>("loopschedule.operator")) {
         auto chosenOperator =
             op->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
-        auto res = buildOpFromOperator(rewriter, op, operatorLibraryAnalysis);
-        if (res.succeeded()) {
-          return WalkResult::advance();
+        // The operator may carry only an hw_match (for the FSM flow) and
+        // intentionally have no calyx_match — in that case the analysis
+        // exposes a null templateOp and we fall through to the default
+        // TypeSwitch-based Calyx lowering below.
+        StringRef operatorName =
+            operatorLibraryAnalysis.getOperatorBySymbol(chosenOperator);
+        if (operatorLibraryAnalysis.getOperatorTemplateOp(operatorName) !=
+            nullptr) {
+          auto res =
+              buildOpFromOperator(rewriter, op, operatorLibraryAnalysis);
+          if (res.succeeded()) {
+            return WalkResult::advance();
+          }
+          op->emitOpError("Operation matched operator ")
+              << chosenOperator.getLeafReference() << " but failed to build.";
+          return WalkResult::interrupt();
         }
-        op->emitOpError("Operation matched operator ")
-            << chosenOperator.getLeafReference() << " but failed to build.";
-        return WalkResult::interrupt();
       }
 
       opBuiltSuccessfully &=

@@ -50,8 +50,16 @@ LogicalResult OperatorOp::verify() {
     }
     if (isa<TargetOp>(op))
       continue;
+    // Allow hoisted constants. The OperatorOp body is IsolatedFromAbove,
+    // so constant-folding canonicalization patterns may legitimately
+    // hoist constant placeholders out of the match-op bodies; rejecting
+    // them here breaks any downstream pass pipeline that includes
+    // canonicalize after operator-allocation.
+    if (op.hasTrait<OpTrait::ConstantLike>())
+      continue;
     return op.emitOpError(
-        "operator body may only contain target ops and match ops");
+        "operator body may only contain target ops, match ops, and hoisted "
+        "constants");
   }
   if (numMatches == 0)
     return emitOpError("must contain at least one match op");
