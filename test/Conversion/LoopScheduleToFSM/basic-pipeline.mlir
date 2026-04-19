@@ -1,4 +1,4 @@
-// RUN: circt-opt --lower-loopschedule-to-fsm %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation,lower-loopschedule-to-fsm)" %s | FileCheck %s
 
 // Simple single-stage II=1 pipeline: accumulates arg0 for 10 iterations.
 // Wrapped in a frame whose launch hosts the pipeline — the new shape.

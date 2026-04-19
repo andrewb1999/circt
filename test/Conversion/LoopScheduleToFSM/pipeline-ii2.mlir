@@ -1,4 +1,4 @@
-// RUN: circt-opt --lower-loopschedule-to-fsm %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation,lower-loopschedule-to-fsm)" %s | FileCheck %s
 
 // Two-stage pipeline with II=2. CE fires every other cycle.
 // CHECK-LABEL: hw.module @pipeline_ii2

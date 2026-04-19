@@ -81,6 +81,10 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
       }
     }
 
+    auto hwMatches = operatorOp.getBodyBlock()->getOps<oplib::HwMatchOp>();
+    if (!hwMatches.empty())
+      operatorStruct.hwMatchOp = *hwMatches.begin();
+
     auto calyxMatches = operatorOp.getBodyBlock()->getOps<oplib::CalyxMatchOp>();
     if (!calyxMatches.empty()) {
       auto matchOp = *calyxMatches.begin();
@@ -136,6 +140,11 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
 Operation *
 OperatorLibraryAnalysis::getOperatorTemplateOp(StringRef operatorName) {
   return operatorMap.at(operatorName).templateOp;
+}
+
+circt::oplib::HwMatchOp
+OperatorLibraryAnalysis::getHwMatchOp(StringRef operatorName) {
+  return operatorMap.at(operatorName).hwMatchOp;
 }
 
 static bool allAttributesMatch(Operation *op, Operator &operatorStruct) {

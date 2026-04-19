@@ -1,4 +1,4 @@
-// RUN: circt-opt --lower-loopschedule-to-fsm %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation,lower-loopschedule-to-fsm)" %s | FileCheck %s
 
 // Two-stage II=1 pipeline with traveling CE.
 // Stage 0: increment counter and compute partial

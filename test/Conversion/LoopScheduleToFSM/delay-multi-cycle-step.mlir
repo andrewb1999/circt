@@ -1,4 +1,4 @@
-// RUN: circt-opt --lower-loopschedule-to-fsm %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation,lower-loopschedule-to-fsm)" %s | FileCheck %s
 
 // Hand-crafted sequential loop whose first frame has latency 3 (an `at 2`
 // store inside the frame body). The FSM should expand FRAME_0 into 3

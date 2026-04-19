@@ -1,4 +1,4 @@
-// RUN: circt-opt --lower-loopschedule-to-fsm %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation,lower-loopschedule-to-fsm)" %s | FileCheck %s
 
 // A sequential loop whose body has THREE frames:
 //   frame 0 — computes the loop condition (regular frame)

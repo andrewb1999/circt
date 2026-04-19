@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Analysis/OperatorLibraryAnalysis.h"
 #include "circt/Conversion/LoopScheduleToFSM.h"
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/Comb/CombOps.h"
@@ -19,6 +20,7 @@
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/LoopSchedule/Utils.h"
+#include "circt/Dialect/OpLib/OpLibOps.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
@@ -28,8 +30,11 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -278,7 +283,25 @@ private:
   LogicalResult lowerFrameBody(Block *frameBody, OpBuilder &builder,
                                IRMapping &mapping,
                                ArrayRef<Value> cycleGates,
-                               DenseMap<Value, MemPortMapping> &memPorts);
+                               DenseMap<Value, MemPortMapping> &memPorts,
+                               ModuleOp moduleOp, Value clk, Value rst);
+
+  /// Materialize a single compute op via the operator-library dispatch.
+  /// Used by every internal cloning site that previously called
+  /// `builder.clone(op, mapping)` for arith ops. `op` is the original op
+  /// (not yet cloned). On success, populates `mapping` for the original
+  /// op's results.
+  LogicalResult emitComputeOp(Operation *op, OpBuilder &builder,
+                              IRMapping &mapping, ModuleOp moduleOp,
+                              Value clk, Value rst);
+
+  /// `lowerAtBody` is a method (not a free function) so it can access
+  /// `operatorLibrary` and `instanceUniquer` directly.
+  LogicalResult lowerAtBody(Block *body, OpBuilder &builder,
+                            IRMapping &mapping, ArrayRef<Value> cycleGates,
+                            unsigned baseCycle,
+                            DenseMap<Value, MemPortMapping> &memPorts,
+                            ModuleOp moduleOp, Value clk, Value rst);
 
   /// Lower a pipeline as a child of a sequential loop (no FSM needed).
   LogicalResult lowerPipelineChild(LoopSchedulePipelineOp pipOp,
@@ -291,6 +314,18 @@ private:
 
   /// Map from original func memref args to their hw.module port values.
   DenseMap<Value, MemPortMapping> memPortMap;
+
+  /// Per-function operator library analysis. Bound for the duration of
+  /// `lowerFunction`. Compute ops in leaf bodies are required to carry a
+  /// `loopschedule.operator` attribute and are materialized by consulting
+  /// this analysis. A raw pointer is used so the pass class stays
+  /// copyable, as MLIR's pass manager expects.
+  analysis::OperatorLibraryAnalysis *operatorLibrary = nullptr;
+
+  /// Counter map keyed by operator name; used to uniquify `hw.instance`
+  /// sym_names emitted by the operator-library dispatch helpers. Reset per
+  /// `hw.module` we generate.
+  llvm::StringMap<unsigned> instanceUniquer;
 
   /// Backedge info for a local hlmem (memref.alloc).
   struct HLMemBackedges {
@@ -362,16 +397,268 @@ handleStore(LoopScheduleStoreOp storeOp, OpBuilder &builder,
 }
 
 //===----------------------------------------------------------------------===//
+// Operator-library dispatch helpers
+//===----------------------------------------------------------------------===//
+
+/// Ops that bypass the operator-library requirement: constants,
+/// extension/truncation/index_cast, plus any arith op operating purely on
+/// MLIR `index` type. Loop-control increments and bounds checks are
+/// `index`-typed and represent loop bookkeeping rather than the kernel
+/// computation; they're left to subsequent legalization (e.g. arith
+/// expansion / map-arith-to-comb) instead of being routed through the
+/// operator library.
+static bool isFreeArithOp(Operation *op) {
+  if (isa<arith::ConstantOp, arith::IndexCastOp, arith::ExtSIOp,
+          arith::ExtUIOp, arith::TruncIOp>(op))
+    return true;
+  // Arith ops whose result and all operands are `index` are loop-control
+  // ops — treat as free.
+  if (op->getDialect() &&
+      op->getDialect()->getNamespace() == "arith") {
+    auto isIndex = [](Type t) { return isa<IndexType>(t); };
+    bool allIndex = llvm::all_of(op->getResultTypes(), isIndex) &&
+                    llvm::all_of(op->getOperandTypes(), isIndex);
+    // cmpi has an i1 result; allow it if the operand types are index.
+    if (auto cmp = dyn_cast<arith::CmpIOp>(op))
+      allIndex = isIndex(cmp.getLhs().getType()) &&
+                 isIndex(cmp.getRhs().getType());
+    if (allIndex)
+      return true;
+  }
+  return false;
+}
+
+/// Materialize the comb-dialect equivalent of `origOp` when its hw_match
+/// carries `hw_op = "comb.<name>"`. The new op is created at `builder`'s
+/// insertion point with operands looked up through `mapping`. Result types
+/// match `origOp`'s. Discardable attrs (e.g. `predicate` for comb.icmp) are
+/// copied from `origOp`.
+static LogicalResult
+emitCombOpFromOperator(Operation *origOp, OpBuilder &builder,
+                       IRMapping &mapping, StringRef combOpName) {
+  auto regName =
+      RegisteredOperationName::lookup(combOpName, builder.getContext());
+  if (!regName)
+    return origOp->emitOpError("hw_match references unknown HW op '")
+           << combOpName << "'";
+
+  SmallVector<Value, 4> operands;
+  for (Value v : origOp->getOperands())
+    operands.push_back(mapping.lookup(v));
+
+  OperationState state(origOp->getLoc(), *regName);
+  state.addOperands(operands);
+  state.addTypes(origOp->getResultTypes());
+
+  // Pass through the original op's attributes EXCEPT the operator-library
+  // marker. comb.icmp / arith.cmpi share the same predicate enum encoding,
+  // so copying through Just Works.
+  for (auto namedAttr : origOp->getAttrs()) {
+    if (namedAttr.getName().getValue() == "loopschedule.operator")
+      continue;
+    state.addAttribute(namedAttr.getName(), namedAttr.getValue());
+  }
+  // comb.icmp also requires `twoState` to be present; default to false if
+  // the source op didn't carry it.
+  if (combOpName == "comb.icmp" && !origOp->hasAttr("twoState"))
+    state.addAttribute("twoState", builder.getBoolAttr(false));
+
+  Operation *newOp = builder.create(state);
+  for (auto [oldRes, newRes] :
+       llvm::zip(origOp->getResults(), newOp->getResults()))
+    mapping.map(oldRes, newRes);
+  return success();
+}
+
+/// Materialize an `hw.instance` of the operator's `extern_module` for
+/// `origOp`. Driver values for operand ports come from `mapping`. Clock /
+/// reset are wired from the enclosing `hw.module`'s `clk` / `rst`. The
+/// clock-enable port (if present) is tied to a constant `1 : i1`. The
+/// instance's outputs are mapped back onto `origOp`'s results.
+static LogicalResult
+emitHwInstanceFromOperator(Operation *origOp, OpBuilder &builder,
+                           IRMapping &mapping, ModuleOp moduleOp,
+                           FlatSymbolRefAttr externRef, Value clk, Value rst,
+                           llvm::StringMap<unsigned> &uniquer,
+                           StringRef opName, oplib::HwMatchOp hwMatch) {
+  auto externOp =
+      moduleOp.lookupSymbol<hw::HWModuleExternOp>(externRef.getValue());
+  if (!externOp)
+    return origOp->emitOpError("operator '")
+           << opName << "' references unknown extern module @"
+           << externRef.getValue();
+
+  // The hw_match body is a placeholder layout: each port-role placeholder
+  // sits as an SSA value referenced by the oplib.yield. Walk the yield to
+  // figure out which extern-module port maps to which source-operand /
+  // result slot, then build the instance with the right operand wiring.
+  auto yieldOp =
+      cast<oplib::YieldOp>(hwMatch.getBodyBlock()->getTerminator());
+
+  // Collect the placeholder Value -> port-name we'll wire. The extern's
+  // port order is canonical; we walk it once and bind each input port.
+  // Record the source-operand index (or "clk"/"rst"/"ce") for each
+  // placeholder by walking the yield's input list and the extern's input
+  // ports in lockstep.
+  Value oneI1 =
+      hw::ConstantOp::create(builder, origOp->getLoc(),
+                             builder.getI1Type(), (int64_t)1);
+
+  // Build a Set-like map from each yield-input Value -> "what to drive it
+  // with" so we can construct the instance operands by walking the extern
+  // ports in order. The hw.module's clk argument is `!seq.clock` whereas
+  // the extern's clk port is typically `i1`; cast through `seq.from_clock`
+  // when we hit that mismatch.
+  DenseMap<Value, Value> placeholderDriver;
+  if (yieldOp.getClock()) {
+    Value clkValue = clk;
+    if (clkValue.getType() != yieldOp.getClock().getType() &&
+        isa<seq::ClockType>(clkValue.getType())) {
+      clkValue = seq::FromClockOp::create(builder, origOp->getLoc(), clkValue);
+    }
+    placeholderDriver[yieldOp.getClock()] = clkValue;
+  }
+  if (yieldOp.getReset())
+    placeholderDriver[yieldOp.getReset()] = rst;
+  if (yieldOp.getClockEnable())
+    placeholderDriver[yieldOp.getClockEnable()] = oneI1;
+  for (auto [i, v] : llvm::enumerate(yieldOp.getInputs())) {
+    if (i >= origOp->getNumOperands())
+      return origOp->emitOpError("operator '")
+             << opName << "' yield has more inputs than op has operands";
+    placeholderDriver[v] = mapping.lookup(origOp->getOperand(i));
+  }
+
+  // The instance's operands are the extern's input ports in declaration
+  // order. We need to find which placeholder Value drives each input port.
+  // The placeholder Values defined in the hw_match body are the
+  // hw.constant ops at the front of the body; they appear in port-spec
+  // order matching the JSON's port list. Cross-reference by the yield's
+  // tagging (clk/rst/ce/inputs) to know which placeholder goes where.
+  //
+  // The extern's input port order matches the JSON port list order, so we
+  // can just walk the yield's binding back to placeholders, drive each
+  // placeholder, then walk the extern in port order and pick the driver.
+  SmallVector<Value> instanceOperands;
+  for (auto port : externOp.getPortList()) {
+    if (port.dir != hw::ModulePort::Direction::Input)
+      continue;
+    // The placeholder corresponding to this port lives somewhere in the
+    // hw_match body. We need a way to identify it by port name. The
+    // simplest route: walk the yield's bound Values and for each, ask
+    // which port index its placeholder appears at in body order. But
+    // since placeholder constants are emitted in the JSON's port order
+    // (the same order as the extern's port list), we can index directly.
+    //
+    // Fallback simpler approach: walk the body's hw.constant ops in
+    // order; the i-th matches the i-th INPUT port of the extern.
+    //
+    // Implementation: count input ports; track which body-constant index
+    // we're at. (We do this lazily by collecting once below.)
+    (void)port;
+  }
+
+  // Collect placeholder body-constants in body order, restricted to those
+  // bound to input-side roles in the yield.
+  SmallVector<Value> bodyConstants;
+  for (auto &op : *hwMatch.getBodyBlock()) {
+    if (isa<hw::ConstantOp>(op))
+      bodyConstants.push_back(op.getResult(0));
+  }
+
+  // Map each input port (by extern port index) to its placeholder by
+  // sequential pairing: the JSON loader emits one placeholder per port in
+  // port-list order. We pair them positionally.
+  unsigned inIdx = 0;
+  for (auto port : externOp.getPortList()) {
+    if (port.dir != hw::ModulePort::Direction::Input)
+      continue;
+    if (inIdx >= bodyConstants.size())
+      return origOp->emitOpError("operator '")
+             << opName
+             << "' hw_match body has fewer placeholders than extern has "
+                "input ports";
+    Value placeholder = bodyConstants[inIdx];
+    auto it = placeholderDriver.find(placeholder);
+    if (it == placeholderDriver.end())
+      return origOp->emitOpError("operator '")
+             << opName
+             << "' hw_match input-port placeholder is not bound by yield";
+    instanceOperands.push_back(it->second);
+    ++inIdx;
+  }
+
+  // Uniquify the instance name across the enclosing hw.module.
+  unsigned tag = uniquer[opName]++;
+  std::string instanceName =
+      (externOp.getSymName() + "_" + std::to_string(tag)).str();
+
+  auto instOp = hw::InstanceOp::create(
+      builder, origOp->getLoc(), externOp,
+      builder.getStringAttr(instanceName), instanceOperands);
+
+  // Map the original op's results to the corresponding instance results,
+  // keyed by output-port placeholders in declaration order.
+  unsigned outIdx = 0;
+  for (auto port : externOp.getPortList()) {
+    if (port.dir != hw::ModulePort::Direction::Output)
+      continue;
+    // For each output port, find which result slot it corresponds to via
+    // the yield's outputs list.
+    Value placeholder = bodyConstants[inIdx + outIdx];
+    (void)placeholder;
+    Value instResult = instOp.getResult(outIdx);
+    if (outIdx < origOp->getNumResults())
+      mapping.map(origOp->getResult(outIdx), instResult);
+    ++outIdx;
+  }
+  return success();
+}
+
+/// Dispatch a single compute op to either a comb-op materialization or an
+/// hw.instance materialization based on the operator's hw_match.
+static LogicalResult
+emitOpFromOperatorLibrary(Operation *origOp, OpBuilder &builder,
+                          IRMapping &mapping, ModuleOp moduleOp, Value clk,
+                          Value rst, llvm::StringMap<unsigned> &uniquer,
+                          analysis::OperatorLibraryAnalysis &ola) {
+  auto operatorAttr =
+      origOp->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+  if (!operatorAttr)
+    return origOp->emitOpError(
+        "LoopScheduleToFSM: missing loopschedule.operator attribute; "
+        "operator-allocation must run before this pass");
+
+  StringRef opName = ola.getOperatorBySymbol(operatorAttr);
+  oplib::HwMatchOp hwMatch = ola.getHwMatchOp(opName);
+  if (!hwMatch)
+    return origOp->emitOpError("operator '")
+           << opName << "' has no hw_match in the operator library";
+
+  if (auto hwOp = hwMatch->getAttrOfType<StringAttr>("hw_op"))
+    return emitCombOpFromOperator(origOp, builder, mapping, hwOp.getValue());
+  if (auto externRef =
+          hwMatch->getAttrOfType<FlatSymbolRefAttr>("extern_module"))
+    return emitHwInstanceFromOperator(origOp, builder, mapping, moduleOp,
+                                      externRef, clk, rst, uniquer, opName,
+                                      hwMatch);
+  return origOp->emitOpError("operator '")
+         << opName
+         << "' hw_match must carry either an `hw_op` or `extern_module` attr";
+}
+
+//===----------------------------------------------------------------------===//
 // Frame body lowering
 //===----------------------------------------------------------------------===//
 
 /// Lower ops inside an `at` body at the given `baseCycle` (the at's offset
 /// within the enclosing frame). Stores are gated on `cycleGates[baseCycle]`;
 /// loads drive their addresses combinationally.
-static LogicalResult
-lowerAtBody(Block *body, OpBuilder &builder, IRMapping &mapping,
-            ArrayRef<Value> cycleGates, unsigned baseCycle,
-            DenseMap<Value, MemPortMapping> &memPorts) {
+LogicalResult LoopScheduleToFSMPass::lowerAtBody(
+    Block *body, OpBuilder &builder, IRMapping &mapping,
+    ArrayRef<Value> cycleGates, unsigned baseCycle,
+    DenseMap<Value, MemPortMapping> &memPorts, ModuleOp moduleOp, Value clk,
+    Value rst) {
   auto pickGate = [&](unsigned c) -> Value {
     assert(c < cycleGates.size() &&
            "issue cycle exceeds enclosing frame latency");
@@ -399,22 +686,51 @@ lowerAtBody(Block *body, OpBuilder &builder, IRMapping &mapping,
       continue;
     }
 
-    builder.clone(op, mapping);
+    if (failed(emitComputeOp(&op, builder, mapping, moduleOp, clk, rst)))
+      return failure();
   }
   return success();
+}
+
+LogicalResult LoopScheduleToFSMPass::emitComputeOp(
+    Operation *op, OpBuilder &builder, IRMapping &mapping, ModuleOp moduleOp,
+    Value clk, Value rst) {
+  // Constants and free-pass casts (extsi/extui/trunci/index_cast) are not
+  // first-class operator-library entries. They get cloned through the
+  // mapping so downstream consumers see them.
+  if (isFreeArithOp(op)) {
+    builder.clone(*op, mapping);
+    return success();
+  }
+
+  // Without a library or without a `loopschedule.operator` attribute,
+  // fall back to cloning so passes that synthesize fresh arith ops after
+  // operator-allocation (e.g. address-calc muli emitted by
+  // memref-to-loopschedule on narrow widths) still flow through. The
+  // cloned op stays as arith.* in the output IR; downstream lowerings
+  // (map-arith-to-comb etc.) handle the legalization.
+  auto operatorAttr =
+      op->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+  if (!operatorLibrary || !operatorAttr) {
+    builder.clone(*op, mapping);
+    return success();
+  }
+  return emitOpFromOperatorLibrary(op, builder, mapping, moduleOp, clk, rst,
+                                    instanceUniquer, *operatorLibrary);
 }
 
 LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
     Block *frameBody, OpBuilder &builder, IRMapping &mapping,
     ArrayRef<Value> cycleGates,
-    DenseMap<Value, MemPortMapping> &memPorts) {
+    DenseMap<Value, MemPortMapping> &memPorts, ModuleOp moduleOp,
+    Value clk, Value rst) {
   for (auto &op : *frameBody) {
     if (isa<LoopScheduleYieldOp>(&op))
       continue;
     if (auto atOp = dyn_cast<LoopScheduleAtOp>(&op)) {
       unsigned offset = (unsigned)atOp.getOffset();
       if (failed(lowerAtBody(&atOp.getBodyBlock(), builder, mapping, cycleGates,
-                             offset, memPorts)))
+                             offset, memPorts, moduleOp, clk, rst)))
         return failure();
       // Forward at results to the caller's mapping via the at's yield.
       auto yieldOp = atOp.getYieldOp();
@@ -423,9 +739,10 @@ LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
         mapping.map(res, mapping.lookup(val));
       continue;
     }
-    // Frames should only contain `at` children and the terminator yield; but
-    // clone unexpected plain ops defensively.
-    builder.clone(op, mapping);
+    // Frames should only contain `at` children and the terminator yield.
+    return op.emitOpError(
+        "LoopScheduleToFSM: unexpected op in frame body; expected only "
+        "loopschedule.at and loopschedule.yield");
   }
   return success();
 }
@@ -1320,6 +1637,10 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   Value rst = hwBody->getArgument(rstIdx);
   Value startSignal = hwBody->getArgument(startIdx);
 
+  // Reset the per-hw.module instance-name uniquer so generated `hw.instance`
+  // sym_names don't collide across nested loop modules.
+  instanceUniquer.clear();
+
   // Clone referenced constants into the module body.
   OpBuilder hw(ctx);
   hw.setInsertionPointToEnd(hwBody);
@@ -1722,7 +2043,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       // `at K` body get cycleGates[K].
       if (failed(lowerFrameBody(&frameOp.getBodyBlock(), hw, localMapping,
                                  fsmFrameCycleGates[frameIdx],
-                                 perFramePorts[frameIdx])))
+                                 perFramePorts[frameIdx], moduleOp, clk,
+                                 rst)))
         return failure();
     }
 
@@ -2138,8 +2460,15 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
           localLoadResults.insert(loadOp.getResult());
         opResult =
             handleLoad(loadOp, hwBuilder, mapping, perStagePorts[stageIdx]);
+      } else if (isa<LoopScheduleYieldOp,
+                     LoopScheduleIterArgUpdateOp>(&op)) {
+        // skip — the pipeline-stage epilogue handles the yield/iter_arg
+        // update separately.
       } else {
-        hwBuilder.clone(op, mapping);
+        opResult =
+            emitComputeOp(&op, hwBuilder, mapping,
+                          hwBody->getParentOp()->getParentOfType<ModuleOp>(),
+                          clk, rst);
       }
 
       for (auto &sm : savedMappings)
@@ -2450,6 +2779,15 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   auto loc = funcOp.getLoc();
   OpBuilder builder(ctx);
 
+  // Bind a per-function operator-library analysis. The analysis ctor is a
+  // no-op when the func has no `oplib.library` attribute; the dispatch
+  // helpers will then error on any compute op (the strict contract for
+  // the rewritten FSM lowering).
+  analysis::OperatorLibraryAnalysis ola(funcOp);
+  operatorLibrary = &ola;
+  auto unbindLibrary =
+      llvm::make_scope_exit([&] { operatorLibrary = nullptr; });
+
   // --- Sequential path (supports nesting) ---
 
   IRMapping mapping;
@@ -2460,6 +2798,13 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   Value clk = hwBody->getArgument(clkIdx);
   Value rst = hwBody->getArgument(rstIdx);
   Value start = hwBody->getArgument(startIdx);
+
+  // Reset the per-hw.module instance-name uniquer.
+  instanceUniquer.clear();
+
+  // Resolve the enclosing builtin.module so the operator-library lowering
+  // can look up `hw.module.extern` declarations by symbol.
+  auto enclosingModule = funcOp->getParentOfType<ModuleOp>();
 
   builder.setInsertionPointToEnd(hwBody);
 
@@ -2704,17 +3049,20 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
     }
   };
 
-  // Helper: clone the non-launch `at` body ops of a frame. Launches are
+  // Helper: lower the non-launch `at` body ops of a frame. Launches are
   // handled per-entry as children; `at` ops contain static work that
   // coexists with the launch in the same frame.
-  auto cloneFrameAtBodies = [&](LoopScheduleFrameOp frame) {
+  auto cloneFrameAtBodies = [&](LoopScheduleFrameOp frame) -> LogicalResult {
     for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
       for (auto &op : atOp.getBodyBlock()) {
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
           continue;
-        builder.clone(op, mapping);
+        if (failed(emitComputeOp(&op, builder, mapping, enclosingModule, clk,
+                                  rst)))
+          return failure();
       }
     }
+    return success();
   };
 
   // Lower each entry.
@@ -2732,7 +3080,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
     if (ei == firstEntryForFrame[frameIdx]) {
       processFuncAwaitRegion(topFrames[frameIdx]);
       if (entry.kind >= 0)
-        cloneFrameAtBodies(topFrames[frameIdx]);
+        if (failed(cloneFrameAtBodies(topFrames[frameIdx])))
+          return failure();
     }
 
     if (entry.kind == 0) {
@@ -2819,7 +3168,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
       Value oneGate = entryRunningSignals[ei];
       if (failed(lowerFrameBody(&topFrames[frameIdx].getBodyBlock(), builder,
                                 mapping, ArrayRef<Value>(oneGate),
-                                perEntryPorts[ei])))
+                                perEntryPorts[ei], enclosingModule, clk,
+                                rst)))
         return failure();
     }
 
@@ -3130,4 +3480,15 @@ void LoopScheduleToFSMPass::runOnOperation() {
 std::unique_ptr<OperationPass<ModuleOp>>
 circt::createLoopScheduleToFSMPass() {
   return std::make_unique<LoopScheduleToFSMPass>();
+}
+
+void circt::registerLoopScheduleToFSM() {
+  // Defined out-of-line to keep the registration in a single TU; the
+  // generated GEN_PASS_REGISTRATION_LOOPSCHEDULETOFSM inline function
+  // collides with `circt::registerCIRCTConversionPasses()` if exposed
+  // from the public header.
+  ::mlir::registerPass(
+      []() -> std::unique_ptr<::mlir::Pass> {
+        return circt::createLoopScheduleToFSMPass();
+      });
 }

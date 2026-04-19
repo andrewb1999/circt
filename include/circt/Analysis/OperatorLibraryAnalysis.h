@@ -15,6 +15,7 @@
 #define CIRCT_ANALYSIS_OPERATOR_LIBRARY_ANALYSIS_H
 
 #include "circt/Dialect/Calyx/CalyxOps.h"
+#include "circt/Dialect/OpLib/OpLibOps.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -49,6 +50,13 @@ struct Operator {
   std::optional<unsigned> reset;
 
   SmallVector<mlir::NamedAttribute> attrs;
+
+  // Optional `oplib.hw_match` body for this operator. Null when the
+  // operator has no hw_match. The FSM lowering pass reads this op's
+  // discardable attributes (e.g. `hw_op = "comb.add"` for the comb-op
+  // form, `extern_module = @<symbol>` for the extern-instance form) to
+  // decide how to materialize the operator in HW.
+  oplib::HwMatchOp hwMatchOp;
 };
 
 using PotentialOperatorsMap = std::map<StringRef, SmallVector<StringRef>>;
@@ -80,6 +88,9 @@ struct OperatorLibraryAnalysis {
 
   unsigned getCellResultForResultNum(StringRef operatorName,
                                      unsigned resultNum);
+
+  // Returns the operator's `oplib.hw_match` op, or null if absent.
+  oplib::HwMatchOp getHwMatchOp(StringRef operatorName);
 
 private:
   PotentialOperatorsMap potentialOperatorsMap;

@@ -1,4 +1,4 @@
-// RUN: circt-opt --lower-loopschedule-to-fsm=disable-flatten-memrefs=true %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation,lower-loopschedule-to-fsm{disable-flatten-memrefs=true})" %s | FileCheck %s
 
 // Multi-dim memref passed in as a function argument: load + store with two
 // indices. Verify the loop module exposes one address port per dim and the
