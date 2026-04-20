@@ -3,7 +3,8 @@
 // Straight memref-to-memref copy: B[i] = A[i].
 // CHECK-LABEL: func.func @copy
 // CHECK: loopschedule.frame -> (!loopschedule.handle)
-// CHECK: loopschedule.launch at 0
+// CHECK: loopschedule.at 0 -> !loopschedule.handle
+// CHECK:   loopschedule.launch : !loopschedule.handle
 // CHECK: loopschedule.sequential
 // CHECK: loopschedule.load %{{.+}}[%{{.+}} : i64] : memref<16xi32>
 // CHECK: loopschedule.store %{{.+}}, %{{.+}}[%{{.+}} : i64] : memref<16xi32>

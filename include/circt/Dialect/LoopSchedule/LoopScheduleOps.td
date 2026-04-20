@@ -161,6 +161,7 @@ def LoopScheduleSequentialOp : LoopScheduleOp<"sequential", [LoopOpInterface]> {
   let hasCustomAssemblyFormat = 1;
 
   let hasVerifier = 1;
+  let hasCanonicalizer = 1;
 
   let skipDefaultBuilders = 1;
   let builders = [
@@ -537,13 +538,14 @@ def LoopScheduleAtOp : LoopScheduleOp<"at",
 }
 
 def LoopScheduleLaunchOp : LoopScheduleOp<"launch",
-    [HasParent<"LoopScheduleFrameOp">,
+    [HasParent<"LoopScheduleAtOp">,
      SingleBlockImplicitTerminator<"LoopScheduleYieldOp">,
      NoRegionArguments]> {
   let summary = "Asynchronously start a variable-latency child loop.";
   let description = [{
-    Fires the child loop's `start` at `offset` cycles into the enclosing
-    frame body. Returns immediately with a `!loopschedule.handle` SSA value
+    Fires the child loop's `start` when the enclosing `loopschedule.at` is
+    entered (i.e. at the at's offset relative to the surrounding frame or
+    pipeline). Returns immediately with a `!loopschedule.handle` SSA value
     representing completion; a later frame's await region picks up that
     handle to block until the child is done.
 
@@ -551,10 +553,10 @@ def LoopScheduleLaunchOp : LoopScheduleOp<"launch",
     (`loopschedule.sequential` or `loopschedule.pipeline`), plus a
     terminating `loopschedule.yield` forwarding the child's produced values.
 
-    `loopschedule.launch` may appear only inside a frame's body region.
+    `loopschedule.launch` may appear only inside a `loopschedule.at` body.
+    Multiple launches may share an `at`; they all start at the at's offset.
   }];
 
-  let arguments = (ins I64Attr:$offset);
   let results = (outs HandleType:$handle);
 
   let regions = (region SizedRegion<1>:$body);

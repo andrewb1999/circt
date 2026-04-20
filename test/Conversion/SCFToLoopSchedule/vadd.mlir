@@ -3,7 +3,8 @@
 // Element-wise vector add: C[i] = A[i] + B[i].
 // CHECK-LABEL: func.func @vadd
 // CHECK: loopschedule.frame -> (!loopschedule.handle)
-// CHECK: loopschedule.launch at 0 : !loopschedule.handle
+// CHECK: loopschedule.at 0 -> !loopschedule.handle
+// CHECK:   loopschedule.launch : !loopschedule.handle
 // CHECK: loopschedule.sequential iter_args
 // CHECK-DAG: loopschedule.at 0
 // CHECK-DAG: loopschedule.at 2

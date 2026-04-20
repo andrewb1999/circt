@@ -4,7 +4,8 @@
 // handle is awaited by the outer sequential's terminator.
 // CHECK-LABEL: func.func @gemv
 // CHECK: loopschedule.sequential
-// CHECK: loopschedule.launch at 0 : !loopschedule.handle
+// CHECK: loopschedule.at 0 -> !loopschedule.handle
+// CHECK:   loopschedule.launch : !loopschedule.handle
 // CHECK: loopschedule.sequential
 // CHECK: loopschedule.load %{{.+}}[%{{.+}}, %{{.+}} : i64, i64] : memref<4x4xi32>
 // CHECK: loopschedule.terminator condition(%{{.+}}), await(%{{.+}}), results(%{{.+}}) : i32

@@ -1835,7 +1835,10 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
       }
     }
 
-    // Emit one `launch at offset` per LoopInterface op in this phase.
+    // For each LoopInterface op in this phase: create a wrapping `at`
+    // (offset = launch's original offset) that contains a single `launch`
+    // which contains the nested loop. The at yields the launch's handle so
+    // the handle is phase-defined for downstream consumers.
     SmallVector<LoopScheduleLaunchOp> createdLaunches;
     SmallVector<Operation *> createdLaunchClonedLops;
     for (auto [launchIdx, bc_lop] : llvm::enumerate(launchesInPhase)) {
@@ -1843,10 +1846,18 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
       Operation *lop = bc_lop.second;
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPoint(bodyYield);
-      auto launch = builder.create<LoopScheduleLaunchOp>(
-          lop->getLoc(),
-          HandleType::get(builder.getContext()),
+
+      // Wrapping at: single handle result, offset = launch offset.
+      SmallVector<Type> atResultTypes{HandleType::get(builder.getContext())};
+      auto atOp = builder.create<LoopScheduleAtOp>(
+          lop->getLoc(), TypeRange(atResultTypes),
           builder.getI64IntegerAttr(bc->offset));
+      Block &atBlock = atOp.getBody().front();
+      builder.setInsertionPointToStart(&atBlock);
+
+      // Launch inside the at.
+      auto launch = builder.create<LoopScheduleLaunchOp>(
+          lop->getLoc(), HandleType::get(builder.getContext()));
       Block &launchBlock = launch.getBody().emplaceBlock();
       {
         OpBuilder::InsertionGuard gg(builder);
@@ -1854,9 +1865,9 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
         builder.create<LoopScheduleYieldOp>();
       }
       auto *launchYield = launchBlock.getTerminator();
-      builder.setInsertionPointToStart(&launchBlock);
 
       // Clone the nested loop op into the launch body.
+      builder.setInsertionPointToStart(&launchBlock);
       auto *newOp = builder.clone(*lop, valueMap);
       dependenceAnalysis->replaceOp(lop, newOp);
       if (auto opr = problem.getLinkedOperatorType(lop)) {
@@ -1876,11 +1887,16 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
         });
       }
 
-      // The launch body yield forwards the nested loop's results — this is
-      // required by the dialect docs even though the launch SSA result is
-      // just a handle.
-      if (newOp->getNumResults() > 0) {
+      // Launch body yield forwards the nested loop's results (required by
+      // the dialect docs even though the launch SSA result is just a handle).
+      if (newOp->getNumResults() > 0)
         launchYield->setOperands(newOp->getResults());
+
+      // At yields the launch's handle as its sole result.
+      {
+        OpBuilder::InsertionGuard gg(builder);
+        auto *atYield = atBlock.getTerminator();
+        atYield->setOperands(ValueRange{launch.getResult()});
       }
 
       // Map same-phase uses directly to the cloned op's results so in-phase
@@ -1893,28 +1909,25 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
       createdLaunchClonedLops.push_back(newOp);
       phaseLaunches[phaseIdx].push_back(launch);
       if (launchHandleIdxOpt[launchIdx].has_value()) {
-        bodyYieldOperands[*launchHandleIdxOpt[launchIdx]] = launch.getResult();
+        // Frame yields the at's handle result (phase-defined) rather than
+        // the raw launch handle.
+        bodyYieldOperands[*launchHandleIdxOpt[launchIdx]] = atOp.getResult(0);
       }
     }
 
     bodyYield->setOperands(bodyYieldOperands);
 
-    // Reorder frame body children by offset so ats/launches appear in
-    // monotonically non-decreasing order. The emitter produced them in two
-    // batches (ats first, then launches); stable-sort by offset here so the
-    // frame verifier's monotonic-offset invariant holds.
+    // Reorder frame body at-ops by offset so they appear in monotonically
+    // non-decreasing order (the frame verifier requires this). Launches
+    // now live inside at-ops, so only at-ops are direct frame-body children.
     {
       SmallVector<Operation *> children;
       for (Operation &op : bodyBlock.without_terminator())
         children.push_back(&op);
       std::stable_sort(children.begin(), children.end(),
                        [](Operation *a, Operation *b) {
-                         auto off = [](Operation *op) -> uint64_t {
-                           if (auto at = dyn_cast<LoopScheduleAtOp>(op))
-                             return at.getOffset();
-                           return cast<LoopScheduleLaunchOp>(op).getOffset();
-                         };
-                         return off(a) < off(b);
+                         return cast<LoopScheduleAtOp>(a).getOffset() <
+                                cast<LoopScheduleAtOp>(b).getOffset();
                        });
       for (Operation *op : children)
         op->moveBefore(bodyYield);
@@ -2005,6 +2018,11 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
   // Collect iter args and results from the induction variable increment and any
   // mapped values that were originally yielded.
   SmallVector<Value> termIterArgs;
+  // Tracks which iter-args received an `iter_arg_update`; any remaining
+  // indices represent pass-through iter-args (the new value is the iter-arg
+  // itself) that still need a no-op update somewhere in the body so the
+  // loopschedule.sequential verifier is satisfied.
+  SmallVector<bool> iterArgUpdated(anchor->getNumOperands(), false);
   for (int i = 0, vals = anchor->getNumOperands(); i < vals; ++i) {
     auto value = anchor->getOperand(i);
     Value newValue = valueMap.lookup(value);
@@ -2039,7 +2057,47 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
               at.getLoc(), sequential.getScheduleBlock().getArgument(i),
               insideAt);
         }
+        iterArgUpdated[i] = true;
       }
+    }
+  }
+
+  // Pass-through iter-args: the anchor yields the iter-arg unchanged. The
+  // verifier still requires one iter_arg_update per iter-arg, so emit a
+  // no-op update (LHS = RHS = the iter-arg itself) in any `at` that lives
+  // in the schedule block.
+  auto findAnyAtInSchedule = [&]() -> LoopScheduleAtOp {
+    for (auto &op : scheduleBlock) {
+      if (auto at = dyn_cast<LoopScheduleAtOp>(op))
+        return at;
+      if (auto frame = dyn_cast<LoopScheduleFrameOp>(op)) {
+        for (auto &inner : frame.getBodyBlock())
+          if (auto at = dyn_cast<LoopScheduleAtOp>(inner))
+            return at;
+      }
+    }
+    return nullptr;
+  };
+  for (int i = 0, vals = anchor->getNumOperands(); i < vals; ++i) {
+    if (iterArgUpdated[i])
+      continue;
+    Value iterArg = sequential.getScheduleBlock().getArgument(i);
+    auto hostAt = findAnyAtInSchedule();
+    if (!hostAt)
+      continue;
+    bool alreadyEmitted = false;
+    hostAt.getBodyBlock().walk([&](LoopScheduleIterArgUpdateOp u) {
+      if (u.getIterArg() == iterArg) {
+        alreadyEmitted = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (!alreadyEmitted) {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(hostAt.getYieldOp());
+      builder.create<LoopScheduleIterArgUpdateOp>(hostAt.getLoc(), iterArg,
+                                                  iterArg);
     }
   }
 
@@ -2574,10 +2632,17 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
       Operation *lop = bl.second;
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPoint(bodyYield);
-      auto launch = builder.create<LoopScheduleLaunchOp>(
-          lop->getLoc(),
-          HandleType::get(builder.getContext()),
+
+      // Wrapping at: single handle result, offset = launch offset.
+      SmallVector<Type> atResultTypes{HandleType::get(builder.getContext())};
+      auto atOp = builder.create<LoopScheduleAtOp>(
+          lop->getLoc(), TypeRange(atResultTypes),
           builder.getI64IntegerAttr(bc->offset));
+      Block &atBlock = atOp.getBody().front();
+      builder.setInsertionPointToStart(&atBlock);
+
+      auto launch = builder.create<LoopScheduleLaunchOp>(
+          lop->getLoc(), HandleType::get(builder.getContext()));
       Block &launchBlock = launch.getBody().emplaceBlock();
       {
         OpBuilder::InsertionGuard gg(builder);
@@ -2606,29 +2671,31 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
       if (newOp->getNumResults() > 0)
         launchYield->setOperands(newOp->getResults());
 
+      {
+        OpBuilder::InsertionGuard gg(builder);
+        auto *atYield = atBlock.getTerminator();
+        atYield->setOperands(ValueRange{launch.getResult()});
+      }
+
       for (auto [orig, clone] :
            llvm::zip(lop->getResults(), newOp->getResults()))
         valueMap.map(orig, clone);
 
-      bodyYieldOperands[*launchHandleIdxOpt[launchIdx]] = launch.getResult();
+      bodyYieldOperands[*launchHandleIdxOpt[launchIdx]] = atOp.getResult(0);
     }
 
     bodyYield->setOperands(bodyYieldOperands);
 
-    // Reorder at/launch children by offset to satisfy the frame op's
-    // monotonic-offset verifier invariant (see sequential-emitter sort).
+    // Reorder at children by offset to satisfy the frame op's
+    // monotonic-offset verifier invariant.
     {
       SmallVector<Operation *> children;
       for (Operation &op : bodyBlock.without_terminator())
         children.push_back(&op);
       std::stable_sort(children.begin(), children.end(),
                        [](Operation *a, Operation *b) {
-                         auto off = [](Operation *op) -> uint64_t {
-                           if (auto at = dyn_cast<LoopScheduleAtOp>(op))
-                             return at.getOffset();
-                           return cast<LoopScheduleLaunchOp>(op).getOffset();
-                         };
-                         return off(a) < off(b);
+                         return cast<LoopScheduleAtOp>(a).getOffset() <
+                                cast<LoopScheduleAtOp>(b).getOffset();
                        });
       for (Operation *op : children)
         op->moveBefore(bodyYield);

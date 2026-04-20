@@ -3,7 +3,8 @@
 // Scalar-memref product: B[i] = a * A[i]. Multi-cycle muli.
 // CHECK-LABEL: func.func @scale
 // CHECK: loopschedule.frame -> (!loopschedule.handle)
-// CHECK: loopschedule.launch at 0
+// CHECK: loopschedule.at 0 -> !loopschedule.handle
+// CHECK:   loopschedule.launch : !loopschedule.handle
 // CHECK-DAG: loopschedule.at 0
 // CHECK-DAG: loopschedule.at 1
 // CHECK: arith.muli {{.*}} {loopschedule.cycle_latency

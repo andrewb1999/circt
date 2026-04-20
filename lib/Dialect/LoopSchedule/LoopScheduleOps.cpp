@@ -108,6 +108,11 @@ LogicalResult loopschedule::verifyLoop(Operation *op) {
       if (auto u = dyn_cast<LoopScheduleIterArgUpdateOp>(user))
         if (use.getOperandNumber() == 0)
           continue;
+      // The loop terminator reads iter-args as part of naming the iteration
+      // boundary (particularly for pass-through iter-args that are returned
+      // unchanged). This use is always safe.
+      if (isa<LoopScheduleTerminatorOp>(user))
+        continue;
       bool inValidPhase = false;
       for (auto phase : validPhases)
         if (phase->isAncestor(user))
@@ -416,6 +421,114 @@ bool LoopScheduleSequentialOp::canStall() {
   return mightStallRes.wasInterrupted();
 }
 
+namespace {
+/// Drops iter-args the loop carries through iterations unchanged
+/// (terminator yields the iter-arg block argument at the same position as
+/// its init). Pass-through iter-args are loop-invariant: external uses of
+/// the corresponding loop result can reference the original init, and
+/// internal uses of the iter-arg block argument can reference the init
+/// directly (the sequential op is not IsolatedFromAbove).
+struct ElideSequentialPassThroughIterArgs
+    : public OpRewritePattern<LoopScheduleSequentialOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(LoopScheduleSequentialOp op,
+                                PatternRewriter &rewriter) const override {
+    Block *body = op.getBodyBlock();
+    auto term = cast<LoopScheduleTerminatorOp>(body->getTerminator());
+    ValueRange termResults = term.getResults();
+    unsigned n = termResults.size();
+    if (n == 0 || n != op.getBodyArgs().size())
+      return failure();
+
+    SmallVector<bool> isPassThrough(n, false);
+    SmallVector<unsigned> keep;
+    keep.reserve(n);
+    bool any = false;
+    for (unsigned i = 0; i < n; ++i) {
+      auto ba = dyn_cast<BlockArgument>(termResults[i]);
+      if (ba && ba.getOwner() == body && ba.getArgNumber() == i) {
+        isPassThrough[i] = true;
+        any = true;
+      } else {
+        keep.push_back(i);
+      }
+    }
+    if (!any)
+      return failure();
+
+    // Erase any self-update iter_arg_update ops on passthrough block args;
+    // they become no-ops once the iter-arg is elided.
+    SmallVector<LoopScheduleIterArgUpdateOp> selfUpdates;
+    body->walk([&](LoopScheduleIterArgUpdateOp u) {
+      if (auto ba = dyn_cast<BlockArgument>(u.getIterArg()))
+        if (ba.getOwner() == body && isPassThrough[ba.getArgNumber()])
+          selfUpdates.push_back(u);
+    });
+    for (auto u : selfUpdates)
+      rewriter.eraseOp(u);
+
+    SmallVector<Type> newResultTypes;
+    SmallVector<Value> newInits;
+    newResultTypes.reserve(keep.size());
+    newInits.reserve(keep.size());
+    for (unsigned i : keep) {
+      newResultTypes.push_back(op.getResultTypes()[i]);
+      newInits.push_back(op.getInits()[i]);
+    }
+
+    std::optional<IntegerAttr> tripCountOpt;
+    if (auto tc = op.getTripCountAttr())
+      tripCountOpt = tc;
+    auto newOp = rewriter.create<LoopScheduleSequentialOp>(
+        op.getLoc(), newResultTypes, tripCountOpt, newInits);
+    Block *newBody = newOp.getBodyBlock();
+
+    // Rebuild the terminator with passthrough positions dropped. The new
+    // op's body is empty; we'll merge the old body into it below.
+    SmallVector<Value> newTermResults;
+    newTermResults.reserve(keep.size());
+    for (unsigned i : keep)
+      newTermResults.push_back(termResults[i]);
+    rewriter.setInsertionPoint(term);
+    rewriter.create<LoopScheduleTerminatorOp>(
+        term.getLoc(), term.getCondition(), newTermResults, term.getAwait());
+    rewriter.eraseOp(term);
+
+    // Build replacement values for the old body's block args:
+    //   passthrough -> corresponding init (loop-invariant, dominates newOp)
+    //   kept        -> new body's block argument at the new index
+    SmallVector<Value> argReplacements(n);
+    unsigned newArgIdx = 0;
+    for (unsigned i = 0; i < n; ++i) {
+      if (isPassThrough[i])
+        argReplacements[i] = op.getInits()[i];
+      else
+        argReplacements[i] = newBody->getArgument(newArgIdx++);
+    }
+
+    rewriter.mergeBlocks(body, newBody, argReplacements);
+
+    // Replace the old op's results: kept positions come from newOp's
+    // results, passthrough positions come from the original inits.
+    SmallVector<Value> opReplacements(n);
+    unsigned newResIdx = 0;
+    for (unsigned i = 0; i < n; ++i) {
+      if (isPassThrough[i])
+        opReplacements[i] = op.getInits()[i];
+      else
+        opReplacements[i] = newOp.getResult(newResIdx++);
+    }
+    rewriter.replaceOp(op, opReplacements);
+    return success();
+  }
+};
+} // namespace
+
+void LoopScheduleSequentialOp::getCanonicalizationPatterns(
+    RewritePatternSet &results, MLIRContext *context) {
+  results.add<ElideSequentialPassThroughIterArgs>(context);
+}
+
 //===----------------------------------------------------------------------===//
 // LoopScheduleTerminatorOp
 //===----------------------------------------------------------------------===//
@@ -435,13 +548,25 @@ LogicalResult LoopScheduleTerminatorOp::verify() {
            << terminatorResultTypes << ") must match loop result types ("
            << loopResultTypes << ")";
 
-  // Verify `results` are defined by a phase.
-  for (auto result : opResults)
-    if (!isa_and_nonnull<PhaseInterface>(result.getDefiningOp()))
-      return emitOpError("'results' must be defined by a phase op");
+  // Verify `results` are defined by a phase, OR are iter-arg block arguments
+  // of the enclosing loop (the pass-through case — the iter-arg is carried
+  // through iterations without modification and will be canonicalized away
+  // if the op has other iter-args; if it's the only iter-arg, it's
+  // semantically loop-invariant state the loop returns as-is).
+  auto loop = cast<LoopInterface>((*this)->getParentOp());
+  Block *bodyBlock = loop.getBodyBlock();
+  for (auto result : opResults) {
+    if (isa_and_nonnull<PhaseInterface>(result.getDefiningOp()))
+      continue;
+    if (auto ba = dyn_cast<BlockArgument>(result))
+      if (ba.getOwner() == bodyBlock)
+        continue;
+    return emitOpError("'results' must be defined by a phase op or be an "
+                       "iter-arg of the enclosing loop");
+  }
 
   // Verify `await` operands trace back to a `loopschedule.launch` by walking
-  // through `loopschedule.yield` forwarders out of frame body regions.
+  // through `loopschedule.yield` forwarders out of frame and at body regions.
   for (Value h : getAwait()) {
     Value cur = h;
     while (cur) {
@@ -454,6 +579,11 @@ LogicalResult LoopScheduleTerminatorOp::verify() {
       if (auto frame = dyn_cast<LoopScheduleFrameOp>(def)) {
         auto yield = frame.getBodyYield();
         cur = yield.getResults()[cast<OpResult>(cur).getResultNumber()];
+        continue;
+      }
+      if (auto at = dyn_cast<LoopScheduleAtOp>(def)) {
+        auto *yield = at.getBodyBlock().getTerminator();
+        cur = yield->getOperand(cast<OpResult>(cur).getResultNumber());
         continue;
       }
       return emitOpError(
@@ -781,15 +911,13 @@ LogicalResult LoopScheduleFrameOp::verify() {
   }
   std::optional<uint64_t> lastOffset;
   for (Operation &op : getBodyBlock().without_terminator()) {
-    if (!isa<LoopScheduleAtOp, LoopScheduleLaunchOp>(op))
-      return emitOpError("body region may contain only loopschedule.at and "
-                         "loopschedule.launch ops, found: ")
+    if (!isa<LoopScheduleAtOp>(op))
+      return emitOpError(
+                 "body region may contain only loopschedule.at ops, found: ")
              << op.getName();
-    uint64_t offset = isa<LoopScheduleAtOp>(op)
-                          ? cast<LoopScheduleAtOp>(op).getOffset()
-                          : cast<LoopScheduleLaunchOp>(op).getOffset();
+    uint64_t offset = cast<LoopScheduleAtOp>(op).getOffset();
     if (lastOffset.has_value() && offset < *lastOffset)
-      return op.emitOpError("offset must be >= previous child's offset (")
+      return op.emitOpError("offset must be >= previous at's offset (")
              << *lastOffset << ")";
     lastOffset = offset;
   }
@@ -916,14 +1044,6 @@ LogicalResult LoopScheduleAtOp::verify() {
 
 ParseResult LoopScheduleLaunchOp::parse(OpAsmParser &parser,
                                         OperationState &result) {
-  // `at N`
-  if (parser.parseKeyword("at"))
-    return failure();
-  IntegerAttr offset;
-  if (parser.parseAttribute(offset, parser.getBuilder().getIntegerType(64),
-                            "offset", result.attributes))
-    return failure();
-
   // `: !loopschedule.handle`
   Type handleTy;
   if (parser.parseColon() || parser.parseType(handleTy))
@@ -943,12 +1063,12 @@ ParseResult LoopScheduleLaunchOp::parse(OpAsmParser &parser,
 }
 
 void LoopScheduleLaunchOp::print(OpAsmPrinter &p) {
-  p << " at " << getOffset() << " : ";
+  p << " : ";
   p.printType(getHandle().getType());
   p << ' ';
   p.printRegion(getBody(), /*printEntryBlockArgs=*/false,
                 /*printBlockTerminators=*/true);
-  p.printOptionalAttrDict((*this)->getAttrs(), {"offset"});
+  p.printOptionalAttrDict((*this)->getAttrs());
 }
 
 LoopScheduleYieldOp LoopScheduleLaunchOp::getYieldOp() {
@@ -956,14 +1076,9 @@ LoopScheduleYieldOp LoopScheduleLaunchOp::getYieldOp() {
 }
 
 LogicalResult LoopScheduleLaunchOp::verify() {
-  auto frame = cast<LoopScheduleFrameOp>((*this)->getParentOp());
-  if ((*this)->getParentRegion() != &frame.getBodyRegion())
-    return emitOpError(
-        "loopschedule.launch must appear in a frame's body region");
-
-  // Walk forward through forwarding uses (body-region yields of an enclosing
-  // frame) and count terminal consumers (await ops, or terminator await-list
-  // operands). Exactly one terminal consumer is required.
+  // Parent must be an `at` op (enforced structurally by HasParent trait), and
+  // the handle must flow — via at-yield + frame-yield forwarding — to exactly
+  // one terminal consumer (an await op or a terminator's await list).
   SmallVector<Value, 4> worklist{getHandle()};
   llvm::SmallPtrSet<Value, 4> seen;
   unsigned terminalCount = 0;
@@ -981,13 +1096,16 @@ LogicalResult LoopScheduleLaunchOp::verify() {
         else
           return emitOpError("handle used in non-await operand of terminator");
       } else if (auto yield = dyn_cast<LoopScheduleYieldOp>(user)) {
-        auto parentFrame =
-            dyn_cast<LoopScheduleFrameOp>(yield->getParentOp());
-        if (!parentFrame ||
-            yield->getParentRegion() != &parentFrame.getBodyRegion())
-          return emitOpError("handle yielded outside a frame body");
-        worklist.push_back(
-            parentFrame.getResult(use.getOperandNumber()));
+        Operation *yieldParent = yield->getParentOp();
+        if (auto at = dyn_cast<LoopScheduleAtOp>(yieldParent)) {
+          worklist.push_back(at.getResult(use.getOperandNumber()));
+        } else if (auto frame = dyn_cast<LoopScheduleFrameOp>(yieldParent)) {
+          if (yield->getParentRegion() != &frame.getBodyRegion())
+            return emitOpError("handle yielded outside a frame body");
+          worklist.push_back(frame.getResult(use.getOperandNumber()));
+        } else {
+          return emitOpError("handle yielded outside an at or frame body");
+        }
       } else {
         return emitOpError("handle has illegal use: ") << *user;
       }

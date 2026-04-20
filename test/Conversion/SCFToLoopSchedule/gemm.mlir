@@ -4,9 +4,11 @@
 // own launch+sequential. Checks the triple-nested launch/await structure.
 // CHECK-LABEL: func.func @gemm
 // CHECK: loopschedule.sequential
-// CHECK: loopschedule.launch at 0 : !loopschedule.handle
+// CHECK: loopschedule.at 0 -> !loopschedule.handle
+// CHECK:   loopschedule.launch : !loopschedule.handle
 // CHECK: loopschedule.sequential
-// CHECK: loopschedule.launch at 0 : !loopschedule.handle
+// CHECK: loopschedule.at 0 -> !loopschedule.handle
+// CHECK:   loopschedule.launch : !loopschedule.handle
 // CHECK: loopschedule.sequential
 // CHECK: loopschedule.load %{{.+}}[%{{.+}}, %{{.+}} : i64, i64] : memref<4x4xi32>
 

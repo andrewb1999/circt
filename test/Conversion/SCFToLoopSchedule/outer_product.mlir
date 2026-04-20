@@ -3,7 +3,8 @@
 // Outer product: C[i,j] = x[i] * y[j]. Two 1-D reads, one 2-D write.
 // CHECK-LABEL: func.func @outer_product
 // CHECK: loopschedule.sequential
-// CHECK: loopschedule.launch at 0 : !loopschedule.handle
+// CHECK: loopschedule.at 0 -> !loopschedule.handle
+// CHECK:   loopschedule.launch : !loopschedule.handle
 // CHECK: loopschedule.sequential
 // CHECK: arith.muli {{.*}} {loopschedule.cycle_latency
 // CHECK: loopschedule.store %{{.+}}, %{{.+}}[%{{.+}}, %{{.+}} : i64, i64] : memref<4x4xi32>

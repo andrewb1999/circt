@@ -4,7 +4,8 @@
 // Inner reduction iter-arg, result awaited and stored by outer loop frame.
 // CHECK-LABEL: func.func @conv1d
 // CHECK: loopschedule.sequential
-// CHECK: loopschedule.launch at 0 : !loopschedule.handle
+// CHECK: loopschedule.at 0 -> !loopschedule.handle
+// CHECK:   loopschedule.launch : !loopschedule.handle
 // CHECK: loopschedule.sequential
 // CHECK: loopschedule.await %{{.+}} -> i32
 // CHECK: loopschedule.store

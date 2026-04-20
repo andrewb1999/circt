@@ -137,9 +137,79 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
   // handle SSA value -> list of SSA values produced by the launched child.
   DenseMap<Value, SmallVector<Value>> handleValueMap;
 
-  // Walk top-level ops in the function body in order. We only recognize
-  // frames that appear directly in the function's entry block (the common
-  // case after SCFToLoopSchedule).
+  // ==== Normalization ====================================================
+  // After the dialect refactor, launches live inside their parent `at` op
+  // (which carries the offset). But the rest of this pass (unchanged) was
+  // written against the pre-refactor shape where launches are direct
+  // children of the frame body, peer to normal at-ops. Rather than
+  // restructure every downstream walker, normalize the new shape back to
+  // the old one here:
+  //
+  //   at K { launch { child_loop; yield }; yield %lh }
+  // becomes
+  //   at K { yield }         (erased if now empty)
+  //   launch { child_loop; yield }
+  //
+  // i.e. lift the launch out to be a peer of the at in the frame body.
+  // Handle uses of the at's result (which yielded the launch handle) are
+  // rewired to the launch's handle directly. For top-level frames, this
+  // is all we need. For nested frames (inside a pipeline/sequential), we
+  // handle launches separately below (they stay inside their parent at).
+  {
+    SmallVector<LoopScheduleFrameOp> allFrames;
+    funcOp.walk([&](LoopScheduleFrameOp f) {
+      if (isa<func::FuncOp>(f->getParentOp()))
+        allFrames.push_back(f);
+    });
+    for (auto frame : allFrames) {
+      Block &bodyBlock = frame.getBodyBlock();
+      SmallVector<std::pair<LoopScheduleAtOp, LoopScheduleLaunchOp>>
+          atLaunchPairs;
+      for (auto at : llvm::to_vector(bodyBlock.getOps<LoopScheduleAtOp>())) {
+        for (auto launch : llvm::to_vector(
+                 at.getBodyBlock().getOps<LoopScheduleLaunchOp>())) {
+          atLaunchPairs.push_back({at, launch});
+        }
+      }
+      for (auto [at, launch] : atLaunchPairs) {
+        // Move launch to be a peer of the at, just before it. The at's
+        // yield can still reference launch.handle via cross-region SSA
+        // (the launch now dominates the at), so we don't have to rebuild
+        // the yield or change the at's result types.
+        launch->moveBefore(at);
+        // If the at now contains only its yield (i.e. the at was purely
+        // a launch wrapper), erase it — but first rewire any uses of
+        // at.getResult() that came from the launch's handle directly
+        // to launch.getHandle(), since after erase the at's result
+        // ceases to exist.
+        bool atEmpty = true;
+        for (Operation &inner : at.getBodyBlock().getOperations()) {
+          if (!isa<LoopScheduleYieldOp>(inner)) {
+            atEmpty = false;
+            break;
+          }
+        }
+        if (atEmpty) {
+          auto *atYield = at.getBodyBlock().getTerminator();
+          for (auto [i, yOp] : llvm::enumerate(atYield->getOperands())) {
+            if (yOp == launch.getHandle())
+              at.getResult(i).replaceAllUsesWith(launch.getHandle());
+          }
+          atYield->setOperands(ValueRange{});
+          for (Value r : at.getResults())
+            if (!r.use_empty())
+              r.dropAllUses();
+          at.erase();
+        }
+        // For ats that retain non-launch work alongside the launch:
+        // leave the at-yield's operands intact (they reference the
+        // now-dominating launch.handle), so yield-operand / result-type
+        // arity stays consistent for downstream phase walkers.
+      }
+    }
+  }
+
+  // ==== Original top-level pass (pre-refactor logic) =====================
   auto *entryBlock = &funcOp.getFunctionBody().front();
   SmallVector<LoopScheduleFrameOp> frames;
   for (auto &op : *entryBlock)
@@ -147,15 +217,9 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
       frames.push_back(frame);
 
   for (auto frame : frames) {
-    // Separate the frame into its await-region content (should only contain
-    // await ops + a yield) and its body-region content (launches/ats + a
-    // yield).
     Block &awaitBlock = frame.getAwaitBlock();
     Block &bodyBlock = frame.getBodyBlock();
 
-    // Resolve awaits in the await region: map each await's results to the
-    // stashed launch outputs. Collect the yield's operands and stash them so
-    // they can be forwarded to the body-block entry args.
     SmallVector<Value> awaitYieldedVals;
     for (Operation &op :
          llvm::make_early_inc_range(awaitBlock.getOperations())) {
@@ -179,43 +243,22 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
       awaitYieldedVals.assign(awaitYield.getOperands().begin(),
                               awaitYield.getOperands().end());
 
-    // Look at the body region. Three shapes:
-    //   (a) body = { launch at K { <loop>; yield }; yield %lh : handle }
-    //       -> move <loop> to be a sibling of the frame, stash results under
-    //          the handle, replace the frame's handle result with %lh's
-    //          mapping (the loop's results, though handles have no use).
-    //   (b) body has no launch and no non-trivial work (just yield) — just
-    //       forward block-arg uses through the await-yielded values and erase
-    //       the frame.
-    //   (c) body forwards block-arg values (mapped from await) to a frame
-    //       result via at ops / yields — rewire directly.
-    //
-    // We pick the simplest cases first.
-    auto launches = loopschedule::getLaunchOpsInOrder(frame);
+    // Launches are now direct children of the frame body (after
+    // normalization).
+    SmallVector<LoopScheduleLaunchOp> launches(
+        bodyBlock.getOps<LoopScheduleLaunchOp>().begin(),
+        bodyBlock.getOps<LoopScheduleLaunchOp>().end());
     auto bodyYield =
         cast<LoopScheduleYieldOp>(bodyBlock.getTerminator());
 
-    // Bind body-block entry args to the await-yielded values (the frame's
-    // body block gets its args from the await region's yield).
     for (auto [arg, val] :
-         llvm::zip(bodyBlock.getArguments(), awaitYieldedVals)) {
+         llvm::zip(bodyBlock.getArguments(), awaitYieldedVals))
       arg.replaceAllUsesWith(val);
-    }
 
     if (!launches.empty()) {
-      // Per-launch: extract the single child loop, move it before the frame,
-      // and stash the child's results under the launch's handle. Multiple
-      // launches in one frame (scheduler-parallel) are sequentialized in the
-      // order they appeared; downstream passes can parallelize later if the
-      // dependence graph allows.
       SmallVector<std::pair<LoopScheduleLaunchOp, SmallVector<Value>>>
           launchResults;
       for (auto launch : launches) {
-        // Non-zero offset is honored implicitly via block-order placement:
-        // frame-body at-ops (preserved below via inline) land before the
-        // dissolved launch's child loop in the entry block, matching the
-        // scheduler's intended execution order.
-
         Operation *childLoop = nullptr;
         for (Operation &op : launch.getBodyBlock().getOperations()) {
           if (isa<LoopScheduleYieldOp>(op))
@@ -241,12 +284,7 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
         launchResults.push_back({launch, std::move(childResults)});
       }
 
-      // Propagate to the frame's own results: for handle-typed results,
-      // forward to the child's result vector keyed on the matching launch
-      // handle. Non-handle results are forwarded directly from the body
-      // yield.
-      for (auto [idx, yVal] :
-           llvm::enumerate(bodyYield.getOperands())) {
+      for (auto [idx, yVal] : llvm::enumerate(bodyYield.getOperands())) {
         Value frameResult = frame.getResult(idx);
         if (isHandleType(frameResult.getType())) {
           for (auto &lr : launchResults) {
@@ -261,37 +299,20 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
         }
       }
 
-      // Inline non-launch body ops (e.g. at-ops computing frame-level
-      // scalars used by the launched loop) as siblings of the frame so
-      // they survive the frame erasure below. The block order — at-ops
-      // first, then the dissolved launch's child loop — matches the
-      // scheduler's intended execution order for launches at offset > 0.
       for (Operation &op :
            llvm::make_early_inc_range(bodyBlock.getOperations())) {
         if (isa<LoopScheduleYieldOp, LoopScheduleLaunchOp>(op))
           continue;
         op.moveBefore(frame);
       }
-
-      // Erase the frame itself. All uses of handle-typed results are
-      // scheduling-only and should be consumed only by awaits; those awaits
-      // were already erased above (if they appeared in earlier frames in
-      // this function) — for later frames, the handleValueMap entry we just
-      // stored will be consumed when we process them.
     } else {
-      // No launches in the body. Forward frame results from the body yield
-      // directly to non-handle-typed users.
-      for (auto [idx, yVal] :
-           llvm::enumerate(bodyYield.getOperands())) {
+      for (auto [idx, yVal] : llvm::enumerate(bodyYield.getOperands())) {
         Value frameResult = frame.getResult(idx);
         if (isHandleType(frameResult.getType()))
           continue;
         frameResult.replaceAllUsesWith(yVal);
       }
 
-      // Inline body ops (non-yield) as siblings of the frame so they survive
-      // the frame erasure below. Block-arg uses have already been forwarded
-      // to the await-yielded values above, so the moved ops are well-formed.
       for (Operation &op :
            llvm::make_early_inc_range(bodyBlock.getOperations())) {
         if (isa<LoopScheduleYieldOp>(op))
@@ -300,13 +321,6 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
       }
     }
 
-    // Before erasing the frame, make sure its remaining results have no
-    // uses. Handle-typed results may still have uses if this frame's handle
-    // feeds a frame we haven't processed yet; by construction we process
-    // frames in order, so the consuming await has already been erased above
-    // when we processed the earlier frame. If there is still a use, it's a
-    // real error — but we may have handle-typed uses in a future frame's
-    // await region that we haven't visited yet. Defer erasure in that case.
     bool hasRemainingUses = false;
     for (Value r : frame.getResults()) {
       if (!r.use_empty()) {
@@ -316,18 +330,9 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
     }
     if (!hasRemainingUses) {
       frame.erase();
-    } else {
-      // Can't erase yet — but we've moved the loop out of it. Strip the body
-      // so the frame becomes trivially lowerable/removable. In practice
-      // this branch should only trigger for handle-typed results consumed
-      // later, so it's safe to leave the (now-empty) frame; a later
-      // iteration of this loop will handle it once the consumers are gone.
-      // Re-scan: after all frames are processed, do a cleanup pass.
     }
   }
 
-  // Cleanup pass: erase any remaining now-empty frames whose results are
-  // all unused or handle-typed with no live consumers.
   SmallVector<LoopScheduleFrameOp> leftover;
   for (auto &op : *entryBlock)
     if (auto f = dyn_cast<LoopScheduleFrameOp>(&op))
@@ -344,19 +349,12 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
       frame.erase();
   }
 
-  // Second pass: handle NESTED launches (launches inside a frame inside a
-  // LoopInterface's schedule block). These aren't at the function entry
-  // block so the first pass didn't touch them. Moving their child loop out
-  // of the launch into the enclosing frame's `at 0` body restores the
-  // pre-refactor shape (nested loops appear as direct children of an `at
-  // 0` body) that BuildOpGroups/BuildControl already handles via the
-  // LoopWrapper schedulable path.
-  //
-  // The launch op itself is left as a degenerate (empty) shell — the
-  // verifier won't run on intermediate IR within the pass, and its handle
-  // uses are harmless because handle-typed frame results are skipped by
-  // BuildIntermediateRegs. The shell gets cleaned up when the frame is
-  // eventually processed.
+  // ==== Nested-frame pass (inside a pipeline/sequential) =================
+  // After my dialect refactor, launches inside nested frames live inside
+  // their parent `at` op. For each nested launch: lift the child loop to
+  // be an inline op of the parent at (just before the at's yield). Erase
+  // the empty launch shell. The at remains as a phase wrapper at its
+  // offset — Calyx's LoopWrapper already handles at-bodied loops.
   SmallVector<LoopScheduleFrameOp> nestedFrames;
   funcOp.walk([&](LoopScheduleFrameOp frame) {
     if (!isa<func::FuncOp>(frame->getParentOp()))
@@ -366,8 +364,6 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
     Block &awaitBlock = frame.getAwaitBlock();
     Block &bodyBlock = frame.getBodyBlock();
 
-    // Resolve awaits in this inner frame's await region from prior
-    // handleValueMap entries (same logic as the entry-block pass).
     SmallVector<Value> awaitYieldedVals;
     for (Operation &op :
          llvm::make_early_inc_range(awaitBlock.getOperations())) {
@@ -394,33 +390,14 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
          llvm::zip(bodyBlock.getArguments(), awaitYieldedVals))
       arg.replaceAllUsesWith(val);
 
-    SmallVector<LoopScheduleLaunchOp> launches(
-        bodyBlock.getOps<LoopScheduleLaunchOp>().begin(),
-        bodyBlock.getOps<LoopScheduleLaunchOp>().end());
+    SmallVector<LoopScheduleLaunchOp> launches;
+    for (auto at : bodyBlock.getOps<LoopScheduleAtOp>())
+      for (auto launch : at.getBodyBlock().getOps<LoopScheduleLaunchOp>())
+        launches.push_back(launch);
     if (launches.empty())
       continue;
 
-    // Find (or create) the frame's `at 0` op to hold the moved child loops.
-    LoopScheduleAtOp at0;
-    for (auto at : bodyBlock.getOps<LoopScheduleAtOp>()) {
-      if (at.getOffset() == 0) {
-        at0 = at;
-        break;
-      }
-    }
-    if (!at0) {
-      OpBuilder builder(frame.getContext());
-      builder.setInsertionPointToStart(&bodyBlock);
-      at0 = builder.create<LoopScheduleAtOp>(
-          frame.getLoc(), TypeRange{}, builder.getI64IntegerAttr(0));
-    }
-
     for (auto launch : launches) {
-      if (launch.getOffset() != 0)
-        return launch.emitOpError(
-            "dissolveLaunchesAndAwaits: inner launches at non-zero offset "
-            "are not yet supported in the Calyx lowering");
-
       Operation *childLoop = nullptr;
       for (Operation &op : launch.getBodyBlock().getOperations()) {
         if (isa<LoopScheduleYieldOp>(op))
@@ -435,22 +412,28 @@ static LogicalResult dissolveLaunchesAndAwaits(func::FuncOp funcOp) {
         return launch.emitOpError(
             "dissolveLaunchesAndAwaits: inner launch body has no child op");
 
-      // Move the child loop to just before at-0's yield. This places it as
-      // a direct child of at-0's body block — the shape BuildOpGroups's
-      // LoopInterface handler already knows how to register as a
-      // LoopWrapper schedulable for the enclosing block.
-      auto *at0Yield = at0.getBodyBlock().getTerminator();
-      childLoop->moveBefore(at0Yield);
+      auto parentAt = cast<LoopScheduleAtOp>(launch->getParentOp());
+      auto *atYield = parentAt.getBodyBlock().getTerminator();
+      childLoop->moveBefore(atYield);
 
-      // Stash child results under the launch's handle so any surviving
-      // await references can still resolve them.
+      // Stash childResults for later await resolution.
       SmallVector<Value> childResults(childLoop->getResults().begin(),
                                       childLoop->getResults().end());
       handleValueMap[launch.getHandle()] = childResults;
+      for (auto [i, yOp] : llvm::enumerate(atYield->getOperands())) {
+        if (yOp == launch.getHandle()) {
+          Value r = parentAt.getResult(i);
+          handleValueMap[r] = childResults;
+        }
+      }
+      // Leave the empty launch shell in place (it's kept alive by
+      // at-yield's reference to launch.handle). Clearing operands or
+      // erasing would break yield-operand / result-type arity for
+      // downstream phase walkers (BuildStallMap etc.). The shell has no
+      // semantic effect and is harmless during subsequent Calyx lowering.
+      launch.getBodyBlock().getTerminator()->setOperands(ValueRange{});
     }
 
-    // Forward handle-typed frame results through handleValueMap so outer
-    // awaits see the same child values.
     auto bodyYield = cast<LoopScheduleYieldOp>(bodyBlock.getTerminator());
     for (auto [idx, yVal] : llvm::enumerate(bodyYield.getOperands())) {
       Value frameResult = frame.getResult(idx);
@@ -3541,10 +3524,10 @@ private:
         auto &atOp = *atSchedPtr;
         auto offset = atOp.getOffset();
 
-        // If the at body contains a LoopInterface (moved in by
-        // dissolveLaunchesAndAwaits for nested-loop cases), the at's work
-        // is no longer purely static — use calyx.seq instead of
-        // static_par for the body schedulables.
+        // If the at body contains a LoopInterface that will lower as a
+        // dynamic calyx.while (i.e., it can't be fully-static via
+        // static_repeat), the at's work is non-static and we need a
+        // calyx.seq container to accommodate the dynamic child.
         bool atHasDynamicChild = false;
         atOp.getBodyBlock().walk([&](loopschedule::LoopInterface) {
           atHasDynamicChild = true;
@@ -3561,21 +3544,30 @@ private:
             parBlock = parOp.getBodyBlock();
           }
         } else {
-          // Offset-K at: `static_seq { pad_K; static_par { body } }` so the
-          // at's body schedulables fire K cycles into the enclosing frame.
-          auto seqOp = rewriter.create<calyx::StaticSeqOp>(atOp.getLoc());
-          rewriter.setInsertionPointToEnd(seqOp.getBodyBlock());
+          // Offset-K at: sequence a pad group (so the body fires K cycles
+          // into the enclosing frame) before the body.
+          //   - Purely-static body: `static_seq { pad_K; static_par { body } }`
+          //   - Dynamic body (nested loop): `seq { pad_K; seq { body } }`
+          //     StaticSeq can't contain dynamic control, so fall back to
+          //     regular seq. The pad group is still a static group, but
+          //     seq can enable both static and dynamic children.
           auto padGroup =
               getState<ComponentLoweringState>().getAtPadGroup(atOp);
-          rewriter.create<calyx::EnableOp>(atOp.getLoc(),
-                                           padGroup.getSymName());
           if (atHasDynamicChild) {
-            // Can't nest calyx.seq inside calyx.static_seq; error for now.
-            return atOp->emitOpError(
-                "at-K with dynamic child (nested loop) not yet supported");
+            auto seqOp = rewriter.create<calyx::SeqOp>(atOp.getLoc());
+            rewriter.setInsertionPointToEnd(seqOp.getBodyBlock());
+            rewriter.create<calyx::EnableOp>(atOp.getLoc(),
+                                             padGroup.getSymName());
+            auto innerSeq = rewriter.create<calyx::SeqOp>(atOp.getLoc());
+            parBlock = innerSeq.getBodyBlock();
+          } else {
+            auto seqOp = rewriter.create<calyx::StaticSeqOp>(atOp.getLoc());
+            rewriter.setInsertionPointToEnd(seqOp.getBodyBlock());
+            rewriter.create<calyx::EnableOp>(atOp.getLoc(),
+                                             padGroup.getSymName());
+            auto parOp = rewriter.create<calyx::StaticParOp>(atOp.getLoc());
+            parBlock = parOp.getBodyBlock();
           }
-          auto parOp = rewriter.create<calyx::StaticParOp>(atOp.getLoc());
-          parBlock = parOp.getBodyBlock();
         }
         rewriter.setInsertionPointToEnd(parBlock);
         path.insert(&atOp.getBodyBlock());
@@ -3674,6 +3666,7 @@ private:
           rewriter.create<calyx::StaticRepeatOp>(loc, iterCount);
       return repeatCtrlOp;
     }
+
 
     /// Get condition for while loop
     Value cond;

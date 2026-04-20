@@ -3,7 +3,8 @@
 // Matrix transpose: B[j,i] = A[i,j]. 2-D swapped indices on the store.
 // CHECK-LABEL: func.func @transpose
 // CHECK: loopschedule.sequential
-// CHECK: loopschedule.launch at 0 : !loopschedule.handle
+// CHECK: loopschedule.at 0 -> !loopschedule.handle
+// CHECK:   loopschedule.launch : !loopschedule.handle
 // CHECK: loopschedule.sequential
 // CHECK: loopschedule.load %{{.+}}[%{{.+}}, %{{.+}} : i64, i64] : memref<4x4xi32>
 // CHECK: loopschedule.store %{{.+}}, %{{.+}}[%{{.+}}, %{{.+}} : i64, i64] : memref<4x4xi32>

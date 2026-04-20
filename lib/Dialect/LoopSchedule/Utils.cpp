@@ -63,8 +63,15 @@ SmallVector<LoopScheduleAtOp> getAtOpsInOrder(Region &region) {
 
 SmallVector<LoopScheduleLaunchOp> getLaunchOpsInOrder(LoopScheduleFrameOp frame) {
   SmallVector<LoopScheduleLaunchOp> result;
+  // In the post-normalization shape consumed by dissolveLaunchesAndAwaits,
+  // launches are peers of at-ops directly in the frame body.
   for (auto launch : frame.getBodyBlock().getOps<LoopScheduleLaunchOp>())
     result.push_back(launch);
+  // Also walk ats (the new-shape case, in case normalization hasn't
+  // run yet): launches may live inside their parent at.
+  for (auto at : frame.getBodyBlock().getOps<LoopScheduleAtOp>())
+    for (auto launch : at.getBodyBlock().getOps<LoopScheduleLaunchOp>())
+      result.push_back(launch);
   return result;
 }
 

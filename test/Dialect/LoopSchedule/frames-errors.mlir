@@ -20,11 +20,16 @@ func.func @await_outside_frame(%h: !loopschedule.handle) {
 
 // -----
 
-// `loopschedule.launch` cannot appear outside a frame.
+// `loopschedule.launch` cannot appear outside an at (and therefore outside
+// a frame/pipeline transitively). The enclosing `at` is what the verifier
+// rejects when it lives outside a frame.
 func.func @launch_outside_frame() {
-  // expected-error @+1 {{op expects parent op 'loopschedule.frame'}}
-  %h = loopschedule.launch at 0 : !loopschedule.handle {
-    loopschedule.yield
+  // expected-error @+1 {{op expects parent op to be one of 'loopschedule.frame, loopschedule.pipeline'}}
+  %h = loopschedule.at 0 -> !loopschedule.handle {
+    %h_launch = loopschedule.launch : !loopschedule.handle {
+      loopschedule.yield
+    }
+    loopschedule.yield %h_launch : !loopschedule.handle
   }
   return
 }
@@ -49,7 +54,7 @@ func.func @at_in_await_region() {
 
 // `loopschedule.await` is illegal inside a frame's body region.
 func.func @await_in_body_region(%h: !loopschedule.handle) {
-  // expected-error @+1 {{body region may contain only loopschedule.at and loopschedule.launch ops}}
+  // expected-error @+1 {{body region may contain only loopschedule.at ops}}
   loopschedule.frame {
     loopschedule.yield
   } do {
@@ -112,9 +117,12 @@ func.func @iter_arg_update_outside_loop(%iv: index, %c1: index) {
 // frame but never consumed is an error.
 func.func @handle_never_awaited() {
   loopschedule.frame -> (!loopschedule.handle) {
-    // expected-error @+1 {{handle is never awaited}}
-    %h = loopschedule.launch at 0 : !loopschedule.handle {
-      loopschedule.yield
+    %h = loopschedule.at 0 -> !loopschedule.handle {
+      // expected-error @+1 {{handle is never awaited}}
+      %h_launch = loopschedule.launch : !loopschedule.handle {
+        loopschedule.yield
+      }
+      loopschedule.yield %h_launch : !loopschedule.handle
     }
     loopschedule.yield %h : !loopschedule.handle
   }
@@ -137,9 +145,12 @@ func.func @handle_awaited_twice(%c0: index, %c1: index, %c10: index) {
       loopschedule.yield %r#0, %r#1 : i1, index
     }
     %h = loopschedule.frame -> (!loopschedule.handle) {
-      // expected-error @+1 {{handle is awaited more than once}}
-      %hp = loopschedule.launch at 0 : !loopschedule.handle {
-        loopschedule.yield
+      %hp = loopschedule.at 0 -> !loopschedule.handle {
+        // expected-error @+1 {{handle is awaited more than once}}
+        %hp_launch = loopschedule.launch : !loopschedule.handle {
+          loopschedule.yield
+        }
+        loopschedule.yield %hp_launch : !loopschedule.handle
       }
       loopschedule.yield %hp : !loopschedule.handle
     }
@@ -227,7 +238,7 @@ func.func @frame_body_non_monotonic_ats(%arg0: i32) -> i32 {
     %a = loopschedule.at 2 -> i32 {
       loopschedule.yield %arg0 : i32
     }
-    // expected-error @+1 {{op offset must be >= previous child's offset (2)}}
+    // expected-error @+1 {{op offset must be >= previous at's offset (2)}}
     %b = loopschedule.at 0 -> i32 {
       loopschedule.yield %arg0 : i32
     }
@@ -241,12 +252,18 @@ func.func @frame_body_non_monotonic_ats(%arg0: i32) -> i32 {
 // Monotonic invariant applies to launches too.
 func.func @frame_body_non_monotonic_launches() {
   loopschedule.frame {
-    %h1 = loopschedule.launch at 3 : !loopschedule.handle {
-      loopschedule.yield
+    %h1 = loopschedule.at 3 -> !loopschedule.handle {
+      %h1_launch = loopschedule.launch : !loopschedule.handle {
+        loopschedule.yield
+      }
+      loopschedule.yield %h1_launch : !loopschedule.handle
     }
-    // expected-error @+1 {{op offset must be >= previous child's offset (3)}}
-    %h2 = loopschedule.launch at 1 : !loopschedule.handle {
-      loopschedule.yield
+    // expected-error @+1 {{op offset must be >= previous at's offset (3)}}
+    %h2 = loopschedule.at 1 -> !loopschedule.handle {
+      %h2_launch = loopschedule.launch : !loopschedule.handle {
+        loopschedule.yield
+      }
+      loopschedule.yield %h2_launch : !loopschedule.handle
     }
     loopschedule.yield
   }

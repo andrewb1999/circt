@@ -46,9 +46,13 @@ func.func @frame_launch_await(%arg0: i32) -> i32 {
   // CHECK: loopschedule.frame -> (!loopschedule.handle) {
   // CHECK-NOT: do
   %h = loopschedule.frame -> (!loopschedule.handle) {
-    // CHECK: loopschedule.launch at 0 : !loopschedule.handle
-    %hr = loopschedule.launch at 0 : !loopschedule.handle {
-      loopschedule.yield
+    // CHECK: loopschedule.at 0 -> !loopschedule.handle
+    // CHECK:   loopschedule.launch : !loopschedule.handle
+    %hr = loopschedule.at 0 -> !loopschedule.handle {
+      %hr_launch = loopschedule.launch : !loopschedule.handle {
+        loopschedule.yield
+      }
+      loopschedule.yield %hr_launch : !loopschedule.handle
     }
     loopschedule.yield %hr : !loopschedule.handle
   }
@@ -74,13 +78,21 @@ func.func @frame_launch_await(%arg0: i32) -> i32 {
 // CHECK-LABEL: func.func @frame_two_launches
 func.func @frame_two_launches() -> (i32, i32) {
   %hs:2 = loopschedule.frame -> (!loopschedule.handle, !loopschedule.handle) {
-    // CHECK: loopschedule.launch at 0 : !loopschedule.handle
-    %hA = loopschedule.launch at 0 : !loopschedule.handle {
-      loopschedule.yield
+    // CHECK: loopschedule.at 0 -> !loopschedule.handle
+    // CHECK:   loopschedule.launch : !loopschedule.handle
+    %hA = loopschedule.at 0 -> !loopschedule.handle {
+      %hA_launch = loopschedule.launch : !loopschedule.handle {
+        loopschedule.yield
+      }
+      loopschedule.yield %hA_launch : !loopschedule.handle
     }
-    // CHECK: loopschedule.launch at 0 : !loopschedule.handle
-    %hB = loopschedule.launch at 0 : !loopschedule.handle {
-      loopschedule.yield
+    // CHECK: loopschedule.at 0 -> !loopschedule.handle
+    // CHECK:   loopschedule.launch : !loopschedule.handle
+    %hB = loopschedule.at 0 -> !loopschedule.handle {
+      %hB_launch = loopschedule.launch : !loopschedule.handle {
+        loopschedule.yield
+      }
+      loopschedule.yield %hB_launch : !loopschedule.handle
     }
     loopschedule.yield %hA, %hB : !loopschedule.handle, !loopschedule.handle
   }
@@ -102,8 +114,11 @@ func.func @frame_two_launches() -> (i32, i32) {
 // CHECK-LABEL: func.func @frame_overlap
 func.func @frame_overlap(%arg0: i32) -> (i32, i32) {
   %pair:2 = loopschedule.frame -> (!loopschedule.handle, i32) {
-    %hA = loopschedule.launch at 0 : !loopschedule.handle {
-      loopschedule.yield
+    %hA = loopschedule.at 0 -> !loopschedule.handle {
+      %hA_launch = loopschedule.launch : !loopschedule.handle {
+        loopschedule.yield
+      }
+      loopschedule.yield %hA_launch : !loopschedule.handle
     }
     %w2 = loopschedule.at 2 -> i32 {
       %x = arith.addi %arg0, %arg0 : i32
@@ -143,19 +158,23 @@ func.func @sequential_launches_pipeline(%c0: index, %c1: index, %c10: index) {
 
     // CHECK: loopschedule.frame -> (!loopschedule.handle)
     %h = loopschedule.frame -> (!loopschedule.handle) {
-      // CHECK: loopschedule.launch at 0 : !loopschedule.handle
-      %hp = loopschedule.launch at 0 : !loopschedule.handle {
-        // CHECK: loopschedule.pipeline
-        loopschedule.pipeline II = 1 iter_args(%jv = %c0) : (index) -> () {
-          %1:2 = loopschedule.at 0 -> (index, i1) {
-            %jcond = arith.cmpi ult, %jv, %c10 : index
-            %jv_n = arith.addi %jv, %c1 : index
-            loopschedule.iter_arg_update %jv = %jv_n : index
-            loopschedule.yield %jv_n, %jcond : index, i1
+      // CHECK: loopschedule.at 0 -> !loopschedule.handle
+      // CHECK:   loopschedule.launch : !loopschedule.handle
+      %hp = loopschedule.at 0 -> !loopschedule.handle {
+        %hp_launch = loopschedule.launch : !loopschedule.handle {
+          // CHECK: loopschedule.pipeline
+          loopschedule.pipeline II = 1 iter_args(%jv = %c0) : (index) -> () {
+            %1:2 = loopschedule.at 0 -> (index, i1) {
+              %jcond = arith.cmpi ult, %jv, %c10 : index
+              %jv_n = arith.addi %jv, %c1 : index
+              loopschedule.iter_arg_update %jv = %jv_n : index
+              loopschedule.yield %jv_n, %jcond : index, i1
+            }
+            loopschedule.terminator condition(%1#1), results()
           }
-          loopschedule.terminator condition(%1#1), results()
+          loopschedule.yield
         }
-        loopschedule.yield
+        loopschedule.yield %hp_launch : !loopschedule.handle
       }
       loopschedule.yield %hp : !loopschedule.handle
     }
@@ -185,11 +204,17 @@ func.func @sequential_terminator_awaits_two_handles(%c0: index, %c1: index, %c10
     }
 
     %hs:2 = loopschedule.frame -> (!loopschedule.handle, !loopschedule.handle) {
-      %hA = loopschedule.launch at 0 : !loopschedule.handle {
-        loopschedule.yield
+      %hA = loopschedule.at 0 -> !loopschedule.handle {
+        %hA_launch = loopschedule.launch : !loopschedule.handle {
+          loopschedule.yield
+        }
+        loopschedule.yield %hA_launch : !loopschedule.handle
       }
-      %hB = loopschedule.launch at 0 : !loopschedule.handle {
-        loopschedule.yield
+      %hB = loopschedule.at 0 -> !loopschedule.handle {
+        %hB_launch = loopschedule.launch : !loopschedule.handle {
+          loopschedule.yield
+        }
+        loopschedule.yield %hB_launch : !loopschedule.handle
       }
       loopschedule.yield %hA, %hB : !loopschedule.handle, !loopschedule.handle
     }

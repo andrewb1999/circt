@@ -30,7 +30,7 @@ oplib.library @lib0 {
       %o = oplib.operation "addi" in "arith"(%l, %r : i32, i32) : i32
       oplib.output %o : i32
     }
-    // expected-error @+1 {{operator body may only contain target ops and match ops}}
+    // expected-error @+1 {{operator body may only contain target ops, match ops, and hoisted constants}}
     func.return
   }
 }

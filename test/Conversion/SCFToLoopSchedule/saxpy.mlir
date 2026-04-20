@@ -4,7 +4,8 @@
 // the multi-cycle mul is an operator with `cycle_latency`.
 // CHECK-LABEL: func.func @saxpy
 // CHECK: loopschedule.frame -> (!loopschedule.handle)
-// CHECK: loopschedule.launch at 0 : !loopschedule.handle
+// CHECK: loopschedule.at 0 -> !loopschedule.handle
+// CHECK:   loopschedule.launch : !loopschedule.handle
 // CHECK: loopschedule.sequential
 // CHECK-DAG: arith.muli {{.*}} {loopschedule.cycle_latency
 // CHECK: loopschedule.store
