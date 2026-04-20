@@ -1,8 +1,4 @@
 // RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm)" %s | FileCheck %s
-// XFAIL: *
-// XFAIL reason: LoopScheduleToFSM pass needs updating to consume the new
-// launch-inside-at dialect shape (AMC Category A refactor). Tracking issue:
-// port FSM pass to the new shape analogous to LoopScheduleToCalyx.
 
 
 // A sequential loop whose body has THREE frames:
@@ -41,21 +37,24 @@ module {
             }
             // Frame 1: first nested loop via launch.
             %h1 = loopschedule.frame -> (!loopschedule.handle) {
-              %l1 = loopschedule.launch at 0 : !loopschedule.handle {
-                loopschedule.sequential trip_count = 2 iter_args(%j = %c0_i4) : (i4) -> () {
-                  %jcond, %jnext = loopschedule.frame -> (i1, i4) {
-                    %r:2 = loopschedule.at 0 -> (i1, i4) {
-                      %cj = arith.cmpi ult, %j, %c2_i4 : i4
-                      loopschedule.store %c42_i32, %arg0[%j : i4] : memref<4xi32>
-                      %nj = arith.addi %j, %c1_i4 : i4
-                      loopschedule.iter_arg_update %j = %nj : i4
-                      loopschedule.yield %cj, %nj : i1, i4
+              %l1 = loopschedule.at 0 -> !loopschedule.handle {
+                %l1_launch = loopschedule.launch : !loopschedule.handle {
+                  loopschedule.sequential trip_count = 2 iter_args(%j = %c0_i4) : (i4) -> () {
+                    %jcond, %jnext = loopschedule.frame -> (i1, i4) {
+                      %r:2 = loopschedule.at 0 -> (i1, i4) {
+                        %cj = arith.cmpi ult, %j, %c2_i4 : i4
+                        loopschedule.store %c42_i32, %arg0[%j : i4] : memref<4xi32>
+                        %nj = arith.addi %j, %c1_i4 : i4
+                        loopschedule.iter_arg_update %j = %nj : i4
+                        loopschedule.yield %cj, %nj : i1, i4
+                      }
+                      loopschedule.yield %r#0, %r#1 : i1, i4
                     }
-                    loopschedule.yield %r#0, %r#1 : i1, i4
+                    loopschedule.terminator condition(%jcond), results()
                   }
-                  loopschedule.terminator condition(%jcond), results()
+                  loopschedule.yield
                 }
-                loopschedule.yield
+                loopschedule.yield %l1_launch : !loopschedule.handle
               }
               loopschedule.yield %l1 : !loopschedule.handle
             }
@@ -64,21 +63,24 @@ module {
               loopschedule.await %h1
               loopschedule.yield
             } do {
-              %l2 = loopschedule.launch at 0 : !loopschedule.handle {
-                loopschedule.sequential trip_count = 2 iter_args(%k = %c0_i4) : (i4) -> () {
-                  %kcond, %knext = loopschedule.frame -> (i1, i4) {
-                    %r:2 = loopschedule.at 0 -> (i1, i4) {
-                      %ck = arith.cmpi ult, %k, %c2_i4 : i4
-                      loopschedule.store %c43_i32, %arg1[%k : i4] : memref<4xi32>
-                      %nk = arith.addi %k, %c1_i4 : i4
-                      loopschedule.iter_arg_update %k = %nk : i4
-                      loopschedule.yield %ck, %nk : i1, i4
+              %l2 = loopschedule.at 0 -> !loopschedule.handle {
+                %l2_launch = loopschedule.launch : !loopschedule.handle {
+                  loopschedule.sequential trip_count = 2 iter_args(%k = %c0_i4) : (i4) -> () {
+                    %kcond, %knext = loopschedule.frame -> (i1, i4) {
+                      %r:2 = loopschedule.at 0 -> (i1, i4) {
+                        %ck = arith.cmpi ult, %k, %c2_i4 : i4
+                        loopschedule.store %c43_i32, %arg1[%k : i4] : memref<4xi32>
+                        %nk = arith.addi %k, %c1_i4 : i4
+                        loopschedule.iter_arg_update %k = %nk : i4
+                        loopschedule.yield %ck, %nk : i1, i4
+                      }
+                      loopschedule.yield %r#0, %r#1 : i1, i4
                     }
-                    loopschedule.yield %r#0, %r#1 : i1, i4
+                    loopschedule.terminator condition(%kcond), results()
                   }
-                  loopschedule.terminator condition(%kcond), results()
+                  loopschedule.yield
                 }
-                loopschedule.yield
+                loopschedule.yield %l2_launch : !loopschedule.handle
               }
               loopschedule.yield %l2 : !loopschedule.handle
             }

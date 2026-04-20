@@ -1,8 +1,4 @@
 // RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm)" %s | FileCheck %s
-// XFAIL: *
-// XFAIL reason: LoopScheduleToFSM pass needs updating to consume the new
-// launch-inside-at dialect shape (AMC Category A refactor). Tracking issue:
-// port FSM pass to the new shape analogous to LoopScheduleToCalyx.
 
 
 // Two-stage II=1 pipeline with traveling CE.

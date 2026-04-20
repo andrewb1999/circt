@@ -672,6 +672,11 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
     // through this leaf path.
     if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
       continue;
+    // Launches inside ats are lowered via the frame-entry path (a launch's
+    // offset is its parent at's offset; the launch itself becomes an FSM
+    // child_start assertion), not here.
+    if (isa<LoopScheduleLaunchOp>(&op))
+      continue;
 
     if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
       if (failed(handleStore(storeOp, builder, mapping, pickGate(baseCycle),
@@ -1848,8 +1853,18 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       -> LogicalResult {
     for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
       Block &atBody = atOp.getBodyBlock();
+      // Skip launch-holder ats; their child loop is lowered as a module.
+      bool isLaunchHolder = false;
+      for (auto &op : atBody)
+        if (isa<LoopScheduleLaunchOp>(&op)) {
+          isLaunchHolder = true;
+          break;
+        }
+      if (isLaunchHolder)
+        continue;
       for (auto &op : atBody) {
-        if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
+        if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp,
+                LoopScheduleLaunchOp>(&op))
           continue;
         if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
           if (failed(handleLoad(loadOp, hw, localMapping, framePorts)))
@@ -1965,12 +1980,22 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       }
 
       // Stash child's SSA outputs under the launch's handle for any later
-      // await-with-value.
+      // await-with-value. Also propagate through the enclosing at's result(s)
+      // so await-by-at-handle / await-by-frame-handle resolve.
       {
         auto launches = loopschedule::getLaunchOpsInOrder(frameOp);
-        if (!launches.empty())
-          handleValueMap[launches.front().getHandle()] =
-              std::move(childResultVals);
+        if (!launches.empty()) {
+          auto launch = launches.front();
+          if (auto launchAt = launch->getParentOfType<LoopScheduleAtOp>()) {
+            auto atYield = launchAt.getYieldOp();
+            for (auto [atRes, yOperand] :
+                 llvm::zip(launchAt.getResults(), atYield.getOperands())) {
+              if (yOperand == launch.getHandle())
+                handleValueMap[atRes] = childResultVals;
+            }
+          }
+          handleValueMap[launch.getHandle()] = std::move(childResultVals);
+        }
       }
 
       // Mux child memory ports into this frame's per-frame port mapping.
@@ -2030,13 +2055,22 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       childDoneBEs[waitIdx].setValue(pipDone);
 
       // Stash pipeline's results under the launch's handle (for any future
-      // await-with-value in a later frame).
+      // await-with-value in a later frame). Also propagate through the
+      // enclosing at's result(s).
       auto launch =
           loopschedule::getLaunchOpsInOrder(frameOp).front();
       SmallVector<Value> pipResults;
       for (Value r : pipOp.getResults())
         if (auto m = localMapping.lookupOrNull(r))
           pipResults.push_back(m);
+      if (auto launchAt = launch->getParentOfType<LoopScheduleAtOp>()) {
+        auto atYield = launchAt.getYieldOp();
+        for (auto [atRes, yOperand] :
+             llvm::zip(launchAt.getResults(), atYield.getOperands())) {
+          if (yOperand == launch.getHandle())
+            handleValueMap[atRes] = pipResults;
+        }
+      }
       handleValueMap[launch.getHandle()] = std::move(pipResults);
     } else {
       // Regular frame (no child). Gate stores per issue cycle: ops in each
@@ -3050,12 +3084,23 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   };
 
   // Helper: lower the non-launch `at` body ops of a frame. Launches are
-  // handled per-entry as children; `at` ops contain static work that
-  // coexists with the launch in the same frame.
+  // handled per-entry as children; `at` ops that carry real compute coexist
+  // with launch-holder ats in the same frame. A launch-holder at is one
+  // whose body is just a launch (+ yield); those are skipped entirely.
   auto cloneFrameAtBodies = [&](LoopScheduleFrameOp frame) -> LogicalResult {
     for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
+      bool isLaunchHolder = false;
       for (auto &op : atOp.getBodyBlock()) {
-        if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
+        if (isa<LoopScheduleLaunchOp>(&op)) {
+          isLaunchHolder = true;
+          break;
+        }
+      }
+      if (isLaunchHolder)
+        continue;
+      for (auto &op : atOp.getBodyBlock()) {
+        if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp,
+                LoopScheduleLaunchOp>(&op))
           continue;
         if (failed(emitComputeOp(&op, builder, mapping, enclosingModule, clk,
                                   rst)))
@@ -3127,9 +3172,22 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
         mapping.map(result, v);
         childResultVals.push_back(v);
       }
-      if (entry.launchOp)
+      if (entry.launchOp) {
+        // Propagate child results through the enclosing at's result(s), so a
+        // later frame's await-by-handle (which traces through at→frame yield)
+        // can resolve the underlying SSA values.
+        if (auto launchAt =
+                entry.launchOp->getParentOfType<LoopScheduleAtOp>()) {
+          auto atYield = launchAt.getYieldOp();
+          for (auto [atRes, yOperand] :
+               llvm::zip(launchAt.getResults(), atYield.getOperands())) {
+            if (yOperand == entry.launchOp.getHandle())
+              funcHandleValueMap[atRes] = childResultVals;
+          }
+        }
         funcHandleValueMap[entry.launchOp.getHandle()] =
             std::move(childResultVals);
+      }
 
       // Extract child memory outputs into per-entry ports.
       for (auto &memInfo : memrefArgs) {
@@ -3160,6 +3218,17 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
         for (Value r : pipOp.getResults())
           if (auto m = mapping.lookupOrNull(r))
             pipResults.push_back(m);
+        // Propagate pipeline results through the enclosing at's result(s) so a
+        // later frame's await-by-handle resolves through at→frame yield.
+        if (auto launchAt =
+                entry.launchOp->getParentOfType<LoopScheduleAtOp>()) {
+          auto atYield = launchAt.getYieldOp();
+          for (auto [atRes, yOperand] :
+               llvm::zip(launchAt.getResults(), atYield.getOperands())) {
+            if (yOperand == entry.launchOp.getHandle())
+              funcHandleValueMap[atRes] = pipResults;
+          }
+        }
         funcHandleValueMap[entry.launchOp.getHandle()] = std::move(pipResults);
       }
 

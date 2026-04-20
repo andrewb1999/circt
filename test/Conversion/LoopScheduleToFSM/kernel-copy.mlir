@@ -1,8 +1,4 @@
 // RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule),lower-loopschedule-to-fsm)" %s | FileCheck %s
-// XFAIL: *
-// XFAIL reason: LoopScheduleToFSM pass needs updating to consume the new
-// launch-inside-at dialect shape (AMC Category A refactor). Tracking issue:
-// port FSM pass to the new shape analogous to LoopScheduleToCalyx.
 
 
 // End-to-end memref copy.
