@@ -1498,6 +1498,15 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
       SmallVector<std::pair<unsigned, Value>> forwards;
       // Frame result index assigned for forward (when forwardHere).
       std::optional<unsigned> forwardFrameIdx;
+      // Parallel to `forwards`: whether each forwarded value needs to
+      // escape this frame as a frame-result (because it's used by a
+      // later phase or by the sequential terminator). Set at the same
+      // time `forwards` is populated.
+      SmallVector<bool> forwardExportAsFrameResult;
+      // Parallel to `forwards`: allocated stepTypes slot when the
+      // forward is exported. Only populated for entries where
+      // forwardExportAsFrameResult[i] == true.
+      SmallVector<std::optional<unsigned>> forwardExportFrameIdx;
     };
     // Always await prior-phase launches in the immediately following phase.
     // This enforces the launch's ordering semantics (the user said: "anything
@@ -1513,26 +1522,57 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
       ps.awaitHere = true;
       ps.forwardHere = false;
       for (auto &fwd : pl.forwards) {
-        // Forward the value through the await if it has a user in THIS phase.
-        bool useHere = false;
+        // Classify each user of the forwarded value:
+        //   - useInThisPhase: consumed by ops scheduled in THIS phase →
+        //     await here so the body can see the value via a bodyArg.
+        //   - useOutsideThisPhase: consumed by a LATER phase or by the
+        //     sequential terminator → await here AND expose the value
+        //     as a frame result so scheduleBlock-scope consumers can
+        //     reference it without a cross-region SSA link into the
+        //     launch body.
+        bool useInThisPhase = false;
+        bool useOutsideThisPhase = false;
         for (auto *user : fwd.second.getUsers()) {
-          if (isLoopTerminator(user))
+          if (isLoopTerminator(user)) {
+            useOutsideThisPhase = true;
             continue;
+          }
           auto *userOrAncestor =
               loop.getAfter().findAncestorOpInRegion(*user);
+          if (!userOrAncestor)
+            continue;
           auto ut = problem.getStartTime(userOrAncestor);
           if (!ut.has_value())
             continue;
           auto it = bucketTimeToPhase.find(*ut);
-          if (it != bucketTimeToPhase.end() && it->second == phaseIdx) {
-            useHere = true;
-            break;
-          }
+          if (it == bucketTimeToPhase.end())
+            continue;
+          if (it->second == phaseIdx)
+            useInThisPhase = true;
+          else if (it->second > phaseIdx)
+            useOutsideThisPhase = true;
         }
-        if (useHere)
-          ps.forwards.push_back(fwd);
+        if (!useInThisPhase && !useOutsideThisPhase)
+          continue;
+        ps.forwards.push_back(fwd);
+        ps.forwardExportAsFrameResult.push_back(useOutsideThisPhase);
+        ps.forwardExportFrameIdx.push_back(std::nullopt);
       }
       pendingServices.push_back(ps);
+    }
+
+    // Reserve frame-result slots for forwards that need to escape this
+    // frame. Must happen before `LoopScheduleFrameOp` is created so
+    // stepTypes includes those slots in the frame's result type list.
+    for (auto &ps : pendingServices) {
+      if (!ps.awaitHere)
+        continue;
+      for (auto [idx, fwd] : llvm::enumerate(ps.forwards)) {
+        if (!ps.forwardExportAsFrameResult[idx])
+          continue;
+        ps.forwardExportFrameIdx[idx] = stepTypes.size();
+        stepTypes.push_back(fwd.second.getType());
+      }
     }
 
     // --- Build frame ---
@@ -1624,6 +1664,22 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
         continue;
       auto &pl = pendingLaunches[ps.pendingIdx];
       bodyYieldOperands[*ps.forwardFrameIdx] = pl.currentHandle;
+    }
+
+    // For forwarded values that need to escape the frame (used by
+    // later phases or the sequential terminator), wire the await's
+    // body-block arg into the corresponding frame-result slot. The
+    // same bodyArg remains valueMap'd to the original value for in-
+    // phase consumers; post-frame we override the mapping to the
+    // frame result so scheduleBlock-scope references resolve cleanly.
+    for (auto &sfi : servicedForwards) {
+      auto &ps = pendingServices[sfi.serviceIdx];
+      for (auto [i, fwd] : llvm::enumerate(ps.forwards)) {
+        if (!ps.forwardExportAsFrameResult[i])
+          continue;
+        Value bodyArg = bodyBlock.getArgument(sfi.firstBodyArgIdx + i);
+        bodyYieldOperands[*ps.forwardExportFrameIdx[i]] = bodyArg;
+      }
     }
 
     // Emit one `at offset` per bucket with static ops.
@@ -1926,6 +1982,20 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
     }
     for (auto &iae : iterArgExports) {
       valueMap.map(iae.iterArg, frame->getResult(iae.frameIdx));
+    }
+    // Post-frame: rewire the valueMap for forwarded launch values that
+    // were exported as frame results, so scheduleBlock-scope consumers
+    // (later phases and the sequential terminator) see the frame
+    // result instead of a bodyArg that's trapped inside this frame.
+    for (auto &ps : pendingServices) {
+      if (!ps.awaitHere)
+        continue;
+      for (auto [idx, fwd] : llvm::enumerate(ps.forwards)) {
+        if (!ps.forwardExportAsFrameResult[idx])
+          continue;
+        valueMap.map(fwd.second,
+                     frame->getResult(*ps.forwardExportFrameIdx[idx]));
+      }
     }
     {
       unsigned base = 0;
