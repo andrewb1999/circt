@@ -2266,9 +2266,15 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
           unsigned outIdx = 0;
           Value childDone = childInst.getResult(outIdx++);
-          childDoneBEs[waitIdx].setValue(latchDone(
-              childDone, slotChildStart,
-              childNode.prefix + "_done_latch"));
+          // The latch is only needed when multiple launches in this
+          // frame may finish at different cycles — a single-launch
+          // frame's WAIT_i samples done on the same cycle the raw
+          // signal fires and doesn't risk missing it.
+          Value feedDone = (slots.size() > 1)
+              ? latchDone(childDone, slotChildStart,
+                          childNode.prefix + "_done_latch")
+              : childDone;
+          childDoneBEs[waitIdx].setValue(feedDone);
 
           SmallVector<Value> childResultVals;
           for (auto result : childSeqOp.getResults()) {
@@ -2430,9 +2436,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
               }
             }
           }
-          childDoneBEs[waitIdx].setValue(
-              latchDone(pipDone, slotChildStart,
-                        pipPrefix + "_done_latch"));
+          // Latch only when this frame runs multiple launches
+          // concurrently; for a single-launch frame WAIT_i catches
+          // pip_done directly without the extra FF.
+          Value feedPipDone = (slots.size() > 1)
+              ? latchDone(pipDone, slotChildStart,
+                          pipPrefix + "_done_latch")
+              : pipDone;
+          childDoneBEs[waitIdx].setValue(feedPipDone);
 
           // Stash pipeline's results under the launch's handle (for any
           // future await-with-value in a later frame). Also propagate through
