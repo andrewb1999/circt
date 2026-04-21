@@ -1224,55 +1224,35 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
   Operation *condOp = condValue.getDefiningOp();
   DominanceInfo dom(getOperation());
 
-  // === Partition buckets into phases using the SSA-dep rule. ===
+  // === Partition buckets into phases using the close-after-launch-bucket
+  // rule. ===
   //
-  // Walk buckets in startTimes order. A new phase starts when the current
-  // bucket (or a recursively-traversed dependent op in the same bucket)
-  // uses the SSA result of any LoopInterface op from an earlier bucket in
-  // the current phase. Otherwise the bucket merges into the current phase.
+  // Walk buckets in startTimes order. A bucket containing a LoopInterface
+  // op (launch) closes the current phase. This guarantees that sibling
+  // launches at different start times land in separate frames, so the
+  // second frame can await the first's handle — the only way to
+  // correctly order two launches that have a memref dependency but no
+  // SSA one (e.g. doitgen's q body: accumulator writes sum, copyback
+  // reads sum, with no SSA link between the two launches).
   //
-  // This keeps "cmpi + addi + launch" (common in AMC's sequential outer
-  // loops) in one phase and only splits when a later bucket genuinely
-  // consumes a launch's SSA result.
+  // This matches the function-level partitioner (see below); the previous
+  // SSA-dep-only rule was unsound for memref dependencies and allowed
+  // peer-launches inside a single frame with no barrier between them.
   SmallVector<SmallVector<unsigned>> phases;
   {
-    DenseSet<Operation *> loopOpsInCurrentPhase;
     SmallVector<unsigned> currentPhase;
-    auto bucketDependsOnLoopInPhase = [&](ArrayRef<Operation *> group) {
-      if (loopOpsInCurrentPhase.empty())
-        return false;
-      // Check each op (and its children) in the bucket for any operand that
-      // is a result of a LoopInterface op already in the current phase.
-      for (auto *op : group) {
-        bool dep = false;
-        op->walk([&](Operation *inner) {
-          for (Value operand : inner->getOperands()) {
-            Operation *def = operand.getDefiningOp();
-            if (def && loopOpsInCurrentPhase.count(def)) {
-              dep = true;
-              return WalkResult::interrupt();
-            }
-          }
-          return WalkResult::advance();
-        });
-        if (dep)
-          return true;
-      }
-      return false;
-    };
     for (auto t : startTimes) {
-      auto &group = startGroups[t];
-      bool splitHere = bucketDependsOnLoopInPhase(group) &&
-                       !currentPhase.empty();
-      if (splitHere) {
+      currentPhase.push_back(t);
+      bool hasLaunch = false;
+      for (auto *op : startGroups[t])
+        if (isa<LoopInterface>(op)) {
+          hasLaunch = true;
+          break;
+        }
+      if (hasLaunch) {
         phases.push_back(currentPhase);
         currentPhase.clear();
-        loopOpsInCurrentPhase.clear();
       }
-      currentPhase.push_back(t);
-      for (auto *op : group)
-        if (isa<LoopInterface>(op))
-          loopOpsInCurrentPhase.insert(op);
     }
     if (!currentPhase.empty())
       phases.push_back(currentPhase);

@@ -1,14 +1,18 @@
 // RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule))" %s | FileCheck %s
 
-// y[i] += A[i,j] * x[j] nested gemv. Inner loop becomes a launch whose
-// handle is awaited by the outer sequential's terminator.
+// y[i] += A[i,j] * x[j] nested gemv. Inner loop becomes a launch;
+// under the close-after-launch-bucket partitioner, the inner launch and
+// the outer i++ land in separate frames with an explicit `await`
+// between them, so the outer terminator does not need an await list.
 // CHECK-LABEL: func.func @gemv
 // CHECK: loopschedule.sequential
 // CHECK: loopschedule.at 0 -> !loopschedule.handle
 // CHECK:   loopschedule.launch : !loopschedule.handle
 // CHECK: loopschedule.sequential
 // CHECK: loopschedule.load %{{.+}}[%{{.+}}, %{{.+}} : i64, i64] : memref<4x4xi32>
-// CHECK: loopschedule.terminator condition(%{{.+}}), await(%{{.+}}), results(%{{.+}}) : i32
+// CHECK: loopschedule.frame
+// CHECK:   loopschedule.await
+// CHECK: loopschedule.terminator condition(%{{.+}}), results(%{{.+}}) : i32
 
 func.func @gemv(%A: memref<4x4xi32>, %x: memref<4xi32>, %y: memref<4xi32>) attributes {top} {
   %c0 = arith.constant 0 : i32
