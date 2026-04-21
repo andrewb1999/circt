@@ -2574,6 +2574,49 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // stage K reads chain[K - J - 1].
   DenseMap<Value, SmallVector<Value>> delayChain;
 
+  // If an at-op's yielded value is produced by an operator-library op with
+  // non-zero cycle latency L, the op's hw.instance wrapper delays the
+  // result by L cycles internally. The stage-J register captured at
+  // stage-J's cycle latches the wrapper's output at cycle J (undefined
+  // for a cycle-(J-L) input); the schedule really means the result is
+  // ready at stage J+L. Compute that "ready stage" here so stage-register
+  // creation can skip the latent-op result and resolveForStage sizes the
+  // delay chain from J+L rather than J.
+  auto getOpLatency = [this](Operation *def) -> unsigned {
+    if (!def)
+      return 0;
+    if (auto attr =
+            def->getAttrOfType<IntegerAttr>("loopschedule.cycle_latency"))
+      return (unsigned)attr.getInt();
+    // Fall back to the operator-library latency for ops tagged with
+    // `loopschedule.operator = @...`. Covers pipelined arith ops
+    // (e.g. i32_muli_l4) whose cycle_latency isn't stamped directly
+    // on the arith op but is declared on the oplib.operator entry.
+    if (!operatorLibrary)
+      return 0;
+    auto operatorAttr =
+        def->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+    if (!operatorAttr)
+      return 0;
+    StringRef opName = operatorLibrary->getOperatorBySymbol(operatorAttr);
+    if (opName.empty())
+      return 0;
+    return operatorLibrary->getOperatorLatency(opName);
+  };
+  auto getYieldLatency = [&](Value origVal) -> unsigned {
+    auto result = dyn_cast<OpResult>(origVal);
+    if (!result)
+      return 0;
+    auto atOp = dyn_cast<LoopScheduleAtOp>(result.getOwner());
+    if (!atOp)
+      return 0;
+    auto yieldOp = atOp.getYieldOp();
+    unsigned idx = result.getResultNumber();
+    if (idx >= yieldOp.getNumOperands())
+      return 0;
+    return getOpLatency(yieldOp.getOperand(idx).getDefiningOp());
+  };
+
   auto resolveForStage = [&](Value origVal,
                              unsigned consumerStage) -> Value {
     auto result = dyn_cast<OpResult>(origVal);
@@ -2589,16 +2632,26 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
         J = s;
         break;
       }
+    // Effective "ready stage" for this value accounts for any internal
+    // operator latency: the result is only logically valid at `J+L`.
+    unsigned L = getYieldLatency(origVal);
+    unsigned readyStage = J + L;
     // Only delay values whose consumer is strictly later than the
-    // stage immediately after the producer. Adjacent stages (K == J+1)
-    // already read the directly-mapped stage J register correctly.
-    if (J == stages.size() || consumerStage <= J + 1)
+    // stage immediately after the ready point. Consumers at stage
+    // readyStage read the wrapper output / stage register directly;
+    // consumers at readyStage+1 also read it directly (the stage-J
+    // register IS the "ready-stage output" minus one cycle for non-
+    // latent values). The delay chain materializes additional
+    // registers only for further-out stages.
+    if (J == stages.size() || consumerStage <= readyStage + 1)
       return Value();
     auto &chain = delayChain[origVal];
     if (chain.empty())
       chain.push_back(mapping.lookup(origVal));
-    while (chain.size() < consumerStage - J) {
-      unsigned ceStage = J + chain.size();
+    while (chain.size() < consumerStage - readyStage) {
+      unsigned ceStage = readyStage + chain.size();
+      if (ceStage >= stages.size())
+        break;
       Value prev = chain.back();
       Value resetVal = createZeroConstant(hwBuilder, loc, prev.getType());
       auto regName = hwBuilder.getStringAttr(
@@ -2613,7 +2666,10 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
           regName);
       chain.push_back(reg);
     }
-    return chain[consumerStage - J - 1];
+    unsigned idx = consumerStage - readyStage - 1;
+    if (idx >= chain.size())
+      idx = chain.size() - 1;
+    return chain[idx];
   };
 
   // Helper: check whether a memref is backed by a local seq.hlmem.
@@ -2722,6 +2778,19 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       if (localLoadResults.count(val)) {
         // Local hlmem read (latency=1) already provides the 1-cycle delay.
         // Map the stage result directly to rdData — no extra register.
+        mapping.map(stageOp.getResult(regIdx), mappedVal);
+        continue;
+      }
+
+      // A latent operator-library op (e.g. multi-cycle multiplier) has
+      // its own internal pipeline: wrapper.OUTPUT at cycle T is the
+      // result of inputs dispatched at cycle T-L. Capturing that output
+      // at stage-J's cycle J would latch the wrapper output for a
+      // cycle-(J-L) input (undefined for iter 0). Skip the stage
+      // register here; `resolveForStage` uses `readyStage = J+L` so
+      // stage-J+L consumers read the wrapper output directly and
+      // further stages pick it up via delay registers.
+      if (getOpLatency(val.getDefiningOp()) > 0) {
         mapping.map(stageOp.getResult(regIdx), mappedVal);
         continue;
       }
