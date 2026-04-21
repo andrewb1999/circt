@@ -848,9 +848,19 @@ void LoopScheduleToFSMPass::buildLoopTree(
     auto launches = loopschedule::getLaunchOpsInOrder(frameOp);
     if (launches.empty())
       continue;
-    // MVP: take the first launch. Multi-launch frames are handled by the
-    // top-level func path; a nested sequential with multiple concurrent
-    // launches in one frame is rare and not required for the MVP.
+    // MVP: one launch per frame in a nested sequential. The top-level
+    // func path handles multi-launch frames (each launch becomes its
+    // own FSM entry); extending that to nested sequentials requires
+    // per-launch FSM state chaining + per-launch memory-port merging.
+    // Flag extras instead of silently dropping them so affected kernels
+    // are discoverable (e.g. doitgen's sum-accumulate + copyback pair).
+    if (launches.size() > 1)
+      seqOp.emitWarning()
+          << "LoopScheduleToFSM: frame " << frameIdx << " of sequential has "
+          << launches.size()
+          << " launches; nested-sequential multi-launch frames are not yet "
+             "supported, only the first launch will be lowered and the "
+             "rest are dropped (tracked as Bucket 3)";
     auto launch = launches.front();
     Operation *child = nullptr;
     for (auto &op : launch.getBodyBlock().getOperations()) {
