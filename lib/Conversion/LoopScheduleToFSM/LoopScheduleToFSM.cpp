@@ -262,21 +262,33 @@ static void appendPortOutputValues(OpBuilder &builder, Location loc,
 }
 
 /// Represents one sequential loop in the nesting tree.
+///
+/// A frame can contain multiple launches (e.g. doitgen's q-frame runs an
+/// accumulator pipeline at at-0 and a copyback pipeline at at-1). Each
+/// launch gets its own wait slot that the FSM chains: the frame cannot
+/// advance until every slot's child has reported done. Slots run in
+/// at-offset order within the frame.
 struct LoopNode {
   LoopScheduleSequentialOp seqOp;
   std::string prefix;              // e.g., "loop0", "loop0_loop1"
   std::vector<LoopNode> children;
-  /// For frame index i, frameChildIdx[i] = index into children, or -1.
-  SmallVector<int> frameChildIdx;
-  /// For frame index i, framePipelineIdx[i] = index into pipelineChildren,
-  /// or -1.
-  SmallVector<int> framePipelineIdx;
   SmallVector<LoopSchedulePipelineOp> pipelineChildren;
+  /// Per-frame list of launch slots, in at-offset order. Each slot
+  /// carries either a sequential-child index (childIdx >= 0, pipIdx ==
+  /// -1) or a pipeline-child index (pipIdx >= 0, childIdx == -1).
+  struct LaunchSlot {
+    int childIdx = -1;
+    int pipIdx = -1;
+  };
+  SmallVector<SmallVector<LaunchSlot>> frameLaunches;
   bool isLeaf() const {
     return children.empty() && pipelineChildren.empty();
   }
   bool hasChild(unsigned frameIdx) const {
-    return frameChildIdx[frameIdx] >= 0 || framePipelineIdx[frameIdx] >= 0;
+    return !frameLaunches[frameIdx].empty();
+  }
+  unsigned numLaunches(unsigned frameIdx) const {
+    return frameLaunches[frameIdx].size();
   }
 };
 
@@ -837,51 +849,42 @@ void LoopScheduleToFSMPass::buildLoopTree(
     if (auto frameOp = dyn_cast<LoopScheduleFrameOp>(&op))
       frames.push_back(frameOp);
 
-  node.frameChildIdx.resize(frames.size(), -1);
-  node.framePipelineIdx.resize(frames.size(), -1);
+  node.frameLaunches.resize(frames.size());
 
   // Nested LoopInterface ops (seq/pipeline) are wrapped in
   // `loopschedule.launch` siblings of `at` ops inside the frame body. Each
-  // launch contains exactly one child LoopInterface plus a yield. We
-  // currently support at most one launch per frame (MVP).
+  // launch contains exactly one child LoopInterface plus a yield. A frame
+  // may hold multiple launches (e.g. doitgen's q-frame: an accumulator
+  // pipeline at at-0 and a copyback pipeline at at-1); the FSM chains
+  // them in at-offset order and waits for each to report done before
+  // starting the next.
   for (auto [frameIdx, frameOp] : llvm::enumerate(frames)) {
     auto launches = loopschedule::getLaunchOpsInOrder(frameOp);
-    if (launches.empty())
-      continue;
-    // MVP: one launch per frame in a nested sequential. The top-level
-    // func path handles multi-launch frames (each launch becomes its
-    // own FSM entry); extending that to nested sequentials requires
-    // per-launch FSM state chaining + per-launch memory-port merging.
-    // Flag extras instead of silently dropping them so affected kernels
-    // are discoverable (e.g. doitgen's sum-accumulate + copyback pair).
-    if (launches.size() > 1)
-      seqOp.emitWarning()
-          << "LoopScheduleToFSM: frame " << frameIdx << " of sequential has "
-          << launches.size()
-          << " launches; nested-sequential multi-launch frames are not yet "
-             "supported, only the first launch will be lowered and the "
-             "rest are dropped (tracked as Bucket 3)";
-    auto launch = launches.front();
-    Operation *child = nullptr;
-    for (auto &op : launch.getBodyBlock().getOperations()) {
-      if (isa<LoopScheduleYieldOp>(op))
+    for (auto launch : launches) {
+      Operation *child = nullptr;
+      for (auto &op : launch.getBodyBlock().getOperations()) {
+        if (isa<LoopScheduleYieldOp>(op))
+          continue;
+        child = &op;
+        break;
+      }
+      if (!child)
         continue;
-      child = &op;
-      break;
-    }
-    if (!child)
-      continue;
-    if (auto childSeq = dyn_cast<LoopScheduleSequentialOp>(child)) {
-      unsigned childIdx = node.children.size();
-      node.frameChildIdx[frameIdx] = childIdx;
-      node.children.emplace_back();
-      std::string childPrefix =
-          prefix + "_loop" + std::to_string(loopCounter++);
-      buildLoopTree(childSeq, node.children.back(), childPrefix, loopCounter);
-    } else if (auto childPip = dyn_cast<LoopSchedulePipelineOp>(child)) {
-      unsigned pipIdx = node.pipelineChildren.size();
-      node.framePipelineIdx[frameIdx] = pipIdx;
-      node.pipelineChildren.push_back(childPip);
+      LoopNode::LaunchSlot slot;
+      if (auto childSeq = dyn_cast<LoopScheduleSequentialOp>(child)) {
+        slot.childIdx = (int)node.children.size();
+        node.children.emplace_back();
+        std::string childPrefix =
+            prefix + "_loop" + std::to_string(loopCounter++);
+        buildLoopTree(childSeq, node.children.back(), childPrefix,
+                       loopCounter);
+      } else if (auto childPip = dyn_cast<LoopSchedulePipelineOp>(child)) {
+        slot.pipIdx = (int)node.pipelineChildren.size();
+        node.pipelineChildren.push_back(childPip);
+      } else {
+        continue;
+      }
+      node.frameLaunches[frameIdx].push_back(slot);
     }
   }
 }
@@ -965,18 +968,21 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
 
-  // For each frame, the index into waitFrameIndices if it's a wait frame,
-  // or -1.
-  SmallVector<int> frameWaitIdx(numFrames, -1);
+  // Per-frame list of global wait-slot indices. A frame can hold multiple
+  // launches (e.g. doitgen's q-frame runs an accumulator pipeline and a
+  // copyback pipeline in the same frame); duplicate entries for the same
+  // frame index in `waitFrameIndices` represent launches in at-offset
+  // order.
+  SmallVector<SmallVector<int>> frameWaitIdx(numFrames);
   for (auto [j, i] : llvm::enumerate(waitFrameIndices)) {
     assert(i < numFrames && "wait frame index out of range");
-    assert(frameWaitIdx[i] == -1 && "duplicate wait frame index");
-    frameWaitIdx[i] = (int)j;
+    frameWaitIdx[i].push_back((int)j);
   }
-  // Verify ascending order (caller contract).
+  // Verify non-descending order (launches of the same frame appear in
+  // at-offset order; distinct frames remain ordered).
   for (unsigned k = 1; k < waitFrameIndices.size(); ++k)
-    assert(waitFrameIndices[k - 1] < waitFrameIndices[k] &&
-           "waitFrameIndices must be sorted ascending");
+    assert(waitFrameIndices[k - 1] <= waitFrameIndices[k] &&
+           "waitFrameIndices must be sorted non-descending");
 
   unsigned numWaits = waitFrameIndices.size();
 
@@ -988,7 +994,7 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   // latency is variable, so the bucket merger is forbidden from coalescing
   // additional ops into them. Enforce as a contract.
   for (unsigned i = 0; i < numFrames; ++i)
-    assert((frameWaitIdx[i] < 0 || frameLats[i] == 1) &&
+    assert((frameWaitIdx[i].empty() || frameLats[i] == 1) &&
            "wait frame must have latency 1");
 
   // Compute the per-frame base index in the "frame_cycle" output region.
@@ -1103,6 +1109,26 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     return v;
   };
 
+  // State-name helpers. A frame with W launches generates W
+  // FRAME_i_<s> / WAIT_i_<s> / POST_i_<s> triples chained in at-offset
+  // order; the LAST POST transitions to the next frame (or COND). A
+  // frame with zero launches keeps its single FRAME_i state.
+  auto frameStateName = [&](unsigned i, unsigned slot) -> std::string {
+    if (frameWaitIdx[i].size() <= 1)
+      return "FRAME_" + std::to_string(i);
+    return "FRAME_" + std::to_string(i) + "_" + std::to_string(slot);
+  };
+  auto waitStateName = [&](unsigned i, unsigned slot) -> std::string {
+    if (frameWaitIdx[i].size() <= 1)
+      return "WAIT_" + std::to_string(i);
+    return "WAIT_" + std::to_string(i) + "_" + std::to_string(slot);
+  };
+  auto postStateName = [&](unsigned i, unsigned slot) -> std::string {
+    if (frameWaitIdx[i].size() <= 1)
+      return "POST_" + std::to_string(i);
+    return "POST_" + std::to_string(i) + "_" + std::to_string(slot);
+  };
+
   // --- IDLE ---
   {
     auto st = fsm::StateOp::create(fb, loc, "IDLE");
@@ -1129,7 +1155,7 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     Block *tb = &st.getTransitions().front();
     fb.setInsertionPointToEnd(tb);
     fsm::TransitionOp::create(
-        fb, loc, StringRef("FRAME_0"),
+        fb, loc, StringRef(frameStateName(0, 0)),
         [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(1)); },
         [&]() { fsm::UpdateOp::create(fb, loc, fiVar, falseVal); });
     fsm::TransitionOp::create(fb, loc, StringRef("DONE"));
@@ -1147,47 +1173,116 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     fsm::TransitionOp::create(fb, loc, StringRef("COND"));
   };
 
-  // --- FRAME_i (and WAIT_i / POST_i for wait frames) ---
+  // Transition target that leaves the current frame: either the first
+  // state of the next frame, or COND if this was the last frame.
+  auto leaveFrameTarget = [&](unsigned i) -> std::string {
+    if (i + 1 == numFrames)
+      return "FRAME_0"; // unused — last frame goes to COND via
+                          // emitLastFrameTransition
+    return frameStateName(i + 1, 0);
+  };
+
+  // --- FRAME_i (+ chained WAIT/POST states for each launch slot) ---
   for (unsigned i = 0; i < numFrames; ++i) {
-    bool isWait = frameWaitIdx[i] >= 0;
+    bool isWait = !frameWaitIdx[i].empty();
     bool isLast = (i + 1 == numFrames);
-    std::string frameName = "FRAME_" + std::to_string(i);
-    std::string nextFrameName =
-        isLast ? "FRAME_0" : "FRAME_" + std::to_string(i + 1);
     unsigned L = frameLats[i];
 
-    if (isWait || L == 1) {
-      auto st = fsm::StateOp::create(fb, loc, frameName);
-      Block *ob = st.ensureOutput(fb);
-      ob->getTerminator()->erase();
-      fb.setInsertionPointToEnd(ob);
-      if (isWait) {
+    if (isWait) {
+      // Emit FRAME_i_<s> / WAIT_i_<s> / POST_i_<s> for each launch
+      // slot s, chained in at-offset order. iter_advance fires in the
+      // LAST POST of the last frame only.
+      for (unsigned s = 0; s < frameWaitIdx[i].size(); ++s) {
+        bool isLastSlot = (s + 1 == frameWaitIdx[i].size());
+        int waitIdx = frameWaitIdx[i][s];
+        std::string fName = frameStateName(i, s);
+        std::string wName = waitStateName(i, s);
+        std::string pName = postStateName(i, s);
+        std::string nextAfterPost =
+            isLastSlot ? (isLast ? std::string("COND")
+                                  : leaveFrameTarget(i))
+                       : frameStateName(i, s + 1);
+
+        // FRAME_i_<s>: 1-cycle pulse that fires child_start for this slot.
+        auto fSt = fsm::StateOp::create(fb, loc, fName);
+        Block *fOb = fSt.ensureOutput(fb);
+        fOb->getTerminator()->erase();
+        fb.setInsertionPointToEnd(fOb);
         fsm::OutputOp::create(
             fb, loc,
             buildOut(falseVal, /*iterAdv=*/false, /*activeFrame=*/-1,
-                     /*activeChild=*/frameWaitIdx[i],
-                     /*activeLive=*/frameWaitIdx[i], /*activePost=*/-1));
-      } else {
-        bool iterAdv = isLast;
+                     /*activeChild=*/waitIdx, /*activeLive=*/waitIdx,
+                     /*activePost=*/-1));
+        Block *fTb = &fSt.getTransitions().front();
+        fb.setInsertionPointToEnd(fTb);
+        fsm::TransitionOp::create(fb, loc, StringRef(wName));
+        fb.setInsertionPointToEnd(&machine.getBody().front());
+
+        // WAIT_i_<s>: hold until child_done_<waitIdx> fires.
+        auto wSt = fsm::StateOp::create(fb, loc, wName);
+        Block *wOb = wSt.ensureOutput(fb);
+        wOb->getTerminator()->erase();
+        fb.setInsertionPointToEnd(wOb);
         fsm::OutputOp::create(
             fb, loc,
-            buildOut(falseVal, iterAdv, /*activeFrame=*/(int)i,
-                     /*activeChild=*/-1, /*activeLive=*/-1,
+            buildOut(falseVal, /*iterAdv=*/false, /*activeFrame=*/-1,
+                     /*activeChild=*/-1, /*activeLive=*/waitIdx,
                      /*activePost=*/-1));
+        Block *wTb = &wSt.getTransitions().front();
+        fb.setInsertionPointToEnd(wTb);
+        unsigned childDoneArgIdx = 2 + (unsigned)waitIdx;
+        fsm::TransitionOp::create(
+            fb, loc, StringRef(pName),
+            [&]() {
+              fsm::ReturnOp::create(fb, loc,
+                                    machine.getArgument(childDoneArgIdx));
+            },
+            []() {});
+        fb.setInsertionPointToEnd(&machine.getBody().front());
+
+        // POST_i_<s>: 1-cycle settle; iter_advance pulses only in the
+        // very last slot's POST of the last frame.
+        bool pIterAdv = isLast && isLastSlot;
+        auto pSt = fsm::StateOp::create(fb, loc, pName);
+        Block *pOb = pSt.ensureOutput(fb);
+        pOb->getTerminator()->erase();
+        fb.setInsertionPointToEnd(pOb);
+        fsm::OutputOp::create(
+            fb, loc,
+            buildOut(falseVal, pIterAdv, /*activeFrame=*/-1,
+                     /*activeChild=*/-1, /*activeLive=*/-1,
+                     /*activePost=*/waitIdx));
+        Block *pTb = &pSt.getTransitions().front();
+        fb.setInsertionPointToEnd(pTb);
+        if (isLastSlot && isLast) {
+          emitLastFrameTransition(pTb);
+        } else {
+          fsm::TransitionOp::create(fb, loc, StringRef(nextAfterPost));
+        }
+        fb.setInsertionPointToEnd(&machine.getBody().front());
       }
+    } else if (L == 1) {
+      auto st = fsm::StateOp::create(fb, loc, frameStateName(i, 0));
+      Block *ob = st.ensureOutput(fb);
+      ob->getTerminator()->erase();
+      fb.setInsertionPointToEnd(ob);
+      bool iterAdv = isLast;
+      fsm::OutputOp::create(
+          fb, loc,
+          buildOut(falseVal, iterAdv, /*activeFrame=*/(int)i,
+                   /*activeChild=*/-1, /*activeLive=*/-1,
+                   /*activePost=*/-1));
       Block *tb = &st.getTransitions().front();
-      if (isWait) {
-        fb.setInsertionPointToEnd(tb);
-        std::string waitName = "WAIT_" + std::to_string(i);
-        fsm::TransitionOp::create(fb, loc, StringRef(waitName));
-      } else if (isLast) {
+      if (isLast) {
         emitLastFrameTransition(tb);
       } else {
         fb.setInsertionPointToEnd(tb);
-        fsm::TransitionOp::create(fb, loc, StringRef(nextFrameName));
+        fsm::TransitionOp::create(fb, loc, StringRef(leaveFrameTarget(i)));
       }
       fb.setInsertionPointToEnd(&machine.getBody().front());
     } else {
+      std::string frameName = frameStateName(i, 0);
+      std::string nextFrameName = leaveFrameTarget(i);
       for (unsigned c = 0; c < L; ++c) {
         std::string subName =
             (c == 0) ? frameName
@@ -1217,57 +1312,6 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
         fb.setInsertionPointToEnd(&machine.getBody().front());
       }
     }
-
-    if (!isWait)
-      continue;
-
-    // WAIT_i: wait for child_done_j, then go to POST_i.
-    std::string waitName = "WAIT_" + std::to_string(i);
-    std::string postName = "POST_" + std::to_string(i);
-    unsigned childDoneArgIdx = 2 + (unsigned)frameWaitIdx[i];
-    {
-      auto st = fsm::StateOp::create(fb, loc, waitName);
-      Block *ob = st.ensureOutput(fb);
-      ob->getTerminator()->erase();
-      fb.setInsertionPointToEnd(ob);
-      fsm::OutputOp::create(
-          fb, loc,
-          buildOut(falseVal, /*iterAdv=*/false, /*activeFrame=*/-1,
-                   /*activeChild=*/-1, /*activeLive=*/frameWaitIdx[i],
-                   /*activePost=*/-1));
-      Block *tb = &st.getTransitions().front();
-      fb.setInsertionPointToEnd(tb);
-      fsm::TransitionOp::create(
-          fb, loc, StringRef(postName),
-          [&]() {
-            fsm::ReturnOp::create(fb, loc,
-                                  machine.getArgument(childDoneArgIdx));
-          },
-          []() {});
-    }
-    fb.setInsertionPointToEnd(&machine.getBody().front());
-
-    // POST_i: drive post_active_j; iter_advance if this is the last frame.
-    {
-      auto st = fsm::StateOp::create(fb, loc, postName);
-      Block *ob = st.ensureOutput(fb);
-      ob->getTerminator()->erase();
-      fb.setInsertionPointToEnd(ob);
-      bool iterAdv = isLast;
-      fsm::OutputOp::create(
-          fb, loc,
-          buildOut(falseVal, iterAdv, /*activeFrame=*/-1,
-                   /*activeChild=*/-1, /*activeLive=*/-1,
-                   /*activePost=*/frameWaitIdx[i]));
-      Block *tb = &st.getTransitions().front();
-      if (isLast) {
-        emitLastFrameTransition(tb);
-      } else {
-        fb.setInsertionPointToEnd(tb);
-        fsm::TransitionOp::create(fb, loc, StringRef(nextFrameName));
-      }
-    }
-    fb.setInsertionPointToEnd(&machine.getBody().front());
   }
 
   // --- DONE ---
@@ -1802,16 +1846,15 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
   unsigned numFrames = frames.size();
 
-  // Collect the frame indices that need to wait on an external done signal
-  // (today: child sequential loops and pipeline children; tomorrow: any
-  // variable-latency op). Sorted ascending by construction.
+  // Collect the global wait slots — one per launch across all frames,
+  // emitted in (frame, at-offset) order. A frame that holds multiple
+  // launches contributes multiple entries referring back to the same
+  // frame index; `frameWaitIdx[i]` lists those global wait indices.
   SmallVector<unsigned> waitFrameIndices;
-  // For each waitFrameIndices entry j, frameWaitIdx maps the loop frame
-  // index back to j; -1 for "regular" frames.
-  SmallVector<int> frameWaitIdx(numFrames, -1);
+  SmallVector<SmallVector<int>> frameWaitIdx(numFrames);
   for (unsigned i = 0; i < numFrames; ++i) {
-    if (node.frameChildIdx[i] >= 0 || node.framePipelineIdx[i] >= 0) {
-      frameWaitIdx[i] = (int)waitFrameIndices.size();
+    for (unsigned s = 0; s < node.numLaunches(i); ++s) {
+      frameWaitIdx[i].push_back((int)waitFrameIndices.size());
       waitFrameIndices.push_back(i);
     }
   }
@@ -1823,7 +1866,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // offset-K `at` regions and/or stamps multi-cycle operator latencies.
   SmallVector<unsigned> frameLatencies(numFrames, 1);
   for (unsigned i = 0; i < numFrames; ++i) {
-    if (frameWaitIdx[i] >= 0) {
+    if (!frameWaitIdx[i].empty()) {
       // Wait frames must be 1 (the bucket merger refuses to merge into them).
       frameLatencies[i] = 1;
       continue;
@@ -1935,7 +1978,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // registered.
   SmallVector<Value> frameCaptureGate(numFrames);
   for (unsigned i = 0; i < numFrames; ++i) {
-    if (frameWaitIdx[i] >= 0)
+    if (!frameWaitIdx[i].empty())
       continue;
     frameCaptureGate[i] = fsmFrameCycleGates[i].back();
   }
@@ -2087,172 +2130,247 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     // Resolve any awaits in the await region before lowering the body.
     processAwaitRegion(frameOp);
 
-    int childIdx = node.frameChildIdx[frameIdx];
-    int waitIdx = frameWaitIdx[frameIdx];
-    if (childIdx >= 0) {
-      // This frame contains a child sequential loop.
-      auto &childNode = node.children[childIdx];
-      auto childSeqOp = childNode.seqOp;
-      Value frameChildStart = fsmChildStarts[waitIdx];
-      Value framePostActive = fsmPostActives[waitIdx];
-
+    auto &slots = node.frameLaunches[frameIdx];
+    if (!slots.empty()) {
+      // Run non-launch-holder at-body ops once for the whole frame (they
+      // don't depend on which slot is currently running).
+      Value firstSlotStart = fsmChildStarts[frameWaitIdx[frameIdx].front()];
+      Value framePostActive =
+          fsmPostActives[frameWaitIdx[frameIdx].back()];
       if (failed(lowerFrameWithChild(frameOp,
-                                      frameChildStart, framePostActive,
+                                      firstSlotStart, framePostActive,
                                       perFramePorts[frameIdx])))
         return failure();
 
-      // Recursively create child module.
-      hw::HWModuleOp childModule;
-      SmallVector<Value> childCaptured;
-      if (failed(lowerLoopNodeAsModule(childNode, builder, loc, funcOp,
-                                       memrefArgs, localMapping,
-                                       childModule, childCaptured)))
-        return failure();
+      auto launches = loopschedule::getLaunchOpsInOrder(frameOp);
+      assert(launches.size() == slots.size() &&
+             "LoopNode launch slots must match frame's launch count");
+      for (auto [slotIdx, slot] : llvm::enumerate(slots)) {
+        int waitIdx = frameWaitIdx[frameIdx][slotIdx];
+        Value slotChildStart = fsmChildStarts[waitIdx];
+        Value slotChildActive = fsmChildActives[waitIdx];
+        auto launchOp = launches[slotIdx];
 
-      // Instantiate child module.
-      hw.setInsertionPointToEnd(hwBody);
-      SmallVector<Value> childInputs;
-      childInputs.push_back(clk);
-      childInputs.push_back(rst);
-      childInputs.push_back(frameChildStart);
-      for (Value cap : childCaptured)
-        childInputs.push_back(localMapping.lookup(cap));
-      for (auto &memInfo : memrefArgs) {
-        bool hasRdInput = memInfo.isAmcPort ? memInfo.isRead : true;
-        if (hasRdInput)
-          childInputs.push_back(
-              perFramePorts[frameIdx][memInfo.originalArg].rdData);
-      }
+        if (slot.childIdx >= 0) {
+          auto &childNode = node.children[slot.childIdx];
+          auto childSeqOp = childNode.seqOp;
+          // Recursively create child module.
+          hw::HWModuleOp childModule;
+          SmallVector<Value> childCaptured;
+          if (failed(lowerLoopNodeAsModule(childNode, builder, loc, funcOp,
+                                            memrefArgs, localMapping,
+                                            childModule, childCaptured)))
+            return failure();
 
-      auto childInst = hw::InstanceOp::create(
-          hw, loc, childModule,
-          hw.getStringAttr(childNode.prefix + "_inst"),
-          childInputs, nullptr);
+          // Instantiate child module.
+          hw.setInsertionPointToEnd(hwBody);
+          SmallVector<Value> childInputs;
+          childInputs.push_back(clk);
+          childInputs.push_back(rst);
+          childInputs.push_back(slotChildStart);
+          for (Value cap : childCaptured)
+            childInputs.push_back(localMapping.lookup(cap));
+          for (auto &memInfo : memrefArgs) {
+            bool hasRdInput =
+                memInfo.isAmcPort ? memInfo.isRead : true;
+            if (hasRdInput)
+              childInputs.push_back(
+                  perFramePorts[frameIdx][memInfo.originalArg].rdData);
+          }
 
-      // Extract child outputs: done, results..., (addr, wrData, wrEn) per mem...
-      unsigned outIdx = 0;
-      Value childDone = childInst.getResult(outIdx++);
-      childDoneBEs[waitIdx].setValue(childDone);
+          auto childInst = hw::InstanceOp::create(
+              hw, loc, childModule,
+              hw.getStringAttr(childNode.prefix + "_inst"),
+              childInputs, nullptr);
 
-      // Map child sequential op results.
-      SmallVector<Value> childResultVals;
-      for (auto result : childSeqOp.getResults()) {
-        Value v = childInst.getResult(outIdx++);
-        localMapping.map(result, v);
-        childResultVals.push_back(v);
-      }
+          unsigned outIdx = 0;
+          Value childDone = childInst.getResult(outIdx++);
+          childDoneBEs[waitIdx].setValue(childDone);
 
-      // Stash child's SSA outputs under the launch's handle for any later
-      // await-with-value. Also propagate through the enclosing at's result(s)
-      // so await-by-at-handle / await-by-frame-handle resolve.
-      {
-        auto launches = loopschedule::getLaunchOpsInOrder(frameOp);
-        if (!launches.empty()) {
-          auto launch = launches.front();
-          if (auto launchAt = launch->getParentOfType<LoopScheduleAtOp>()) {
+          SmallVector<Value> childResultVals;
+          for (auto result : childSeqOp.getResults()) {
+            Value v = childInst.getResult(outIdx++);
+            localMapping.map(result, v);
+            childResultVals.push_back(v);
+          }
+          if (auto launchAt =
+                  launchOp->getParentOfType<LoopScheduleAtOp>()) {
             auto atYield = launchAt.getYieldOp();
             for (auto [atRes, yOperand] :
                  llvm::zip(launchAt.getResults(), atYield.getOperands())) {
-              if (yOperand == launch.getHandle())
+              if (yOperand == launchOp.getHandle())
                 handleValueMap[atRes] = childResultVals;
             }
           }
-          handleValueMap[launch.getHandle()] = std::move(childResultVals);
+          handleValueMap[launchOp.getHandle()] = std::move(childResultVals);
+
+          // Mux this child's memory drives into perFramePorts[frameIdx]
+          // under slotChildActive. Multiple launches in the same frame
+          // mux through cascading under each slot's active signal.
+          for (auto &memInfo : memrefArgs) {
+            auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
+            SmallVector<Value> childAddrs;
+            for (unsigned d = 0; d < widths.size(); ++d)
+              childAddrs.push_back(childInst.getResult(outIdx++));
+            Value childRdEn = memInfo.requiresRdEn
+                                  ? childInst.getResult(outIdx++)
+                                  : Value();
+            bool emitWrite =
+                memInfo.isAmcPort ? memInfo.isWrite : true;
+            Value childWrData, childWrEn;
+            if (emitWrite) {
+              childWrData = childInst.getResult(outIdx++);
+              childWrEn = childInst.getResult(outIdx++);
+            }
+
+            auto &ports =
+                perFramePorts[frameIdx][memInfo.originalArg];
+            if (ports.addrs.size() != widths.size())
+              ports.addrs.assign(widths.size(), Value());
+            Type dataType = memInfo.elementType;
+            for (auto [d, w] : llvm::enumerate(widths)) {
+              Type addrType = IntegerType::get(ctx, w);
+              Value myAddr =
+                  ports.addrs[d] ? ports.addrs[d]
+                                 : hw::ConstantOp::create(hw, loc,
+                                                          addrType, 0);
+              ports.addrs[d] =
+                  comb::MuxOp::create(hw, loc, slotChildActive,
+                                       childAddrs[d], myAddr);
+            }
+            if (memInfo.requiresRdEn) {
+              Value myRdEn =
+                  ports.rdEn ? ports.rdEn
+                             : hw::ConstantOp::create(hw, loc, i1, 0);
+              ports.rdEn = comb::MuxOp::create(hw, loc, slotChildActive,
+                                                childRdEn, myRdEn);
+            }
+            if (emitWrite) {
+              Value myWrData =
+                  ports.wrData ? ports.wrData
+                               : hw::ConstantOp::create(hw, loc,
+                                                        dataType, 0);
+              Value myWrEn =
+                  ports.wrEn ? ports.wrEn
+                             : hw::ConstantOp::create(hw, loc, i1, 0);
+              ports.wrData = comb::MuxOp::create(hw, loc, slotChildActive,
+                                                   childWrData, myWrData);
+              ports.wrEn = comb::MuxOp::create(hw, loc, slotChildActive,
+                                                childWrEn, myWrEn);
+            }
+          }
+        } else if (slot.pipIdx >= 0) {
+          int pipIdx = slot.pipIdx;
+          auto pipOp = node.pipelineChildren[pipIdx];
+          Value frameChildStart = slotChildStart;
+          bool multiSlot = slots.size() > 1;
+
+          // Lower pipeline child (inline in this module). For multi-launch
+          // frames the pipeline needs a private mem-port mapping so its
+          // muxStageMemPorts (which starts fresh from zero for every
+          // memref it touches) doesn't clobber the drives a prior slot
+          // has already composed into perFramePorts[frameIdx]; we then
+          // mux its drives into perFramePorts under slotChildActive. For
+          // single-launch frames the old direct-write path is
+          // equivalent and avoids an extra mux layer.
+          hw.setInsertionPointToEnd(hwBody);
+          Value pipDone;
+          std::string pipPrefix =
+              node.prefix + "_pip" + std::to_string(pipIdx);
+          if (!multiSlot) {
+            if (failed(lowerPipelineChild(pipOp, hw, loc, hwBody, localMapping,
+                                           clk, rst, frameChildStart,
+                                           pipPrefix, pipDone,
+                                           perFramePorts[frameIdx],
+                                           memrefArgs)))
+              return failure();
+          } else {
+            DenseMap<Value, MemPortMapping> slotPorts;
+            for (auto &memInfo : memrefArgs)
+              slotPorts[memInfo.originalArg].rdData =
+                  perFramePorts[frameIdx][memInfo.originalArg].rdData;
+            if (failed(lowerPipelineChild(pipOp, hw, loc, hwBody, localMapping,
+                                           clk, rst, frameChildStart,
+                                           pipPrefix, pipDone, slotPorts,
+                                           memrefArgs)))
+              return failure();
+            for (auto &memInfo : memrefArgs) {
+              auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
+              auto &slotP = slotPorts[memInfo.originalArg];
+              auto &outP = perFramePorts[frameIdx][memInfo.originalArg];
+              if (outP.addrs.size() != widths.size())
+                outP.addrs.assign(widths.size(), Value());
+              Type dataType = memInfo.elementType;
+              for (auto [d, w] : llvm::enumerate(widths)) {
+                Type addrType = IntegerType::get(ctx, w);
+                Value slotAddr =
+                    (d < slotP.addrs.size() && slotP.addrs[d])
+                        ? slotP.addrs[d]
+                        : hw::ConstantOp::create(hw, loc, addrType, 0);
+                Value myAddr =
+                    outP.addrs[d]
+                        ? outP.addrs[d]
+                        : hw::ConstantOp::create(hw, loc, addrType, 0);
+                outP.addrs[d] = comb::MuxOp::create(hw, loc, slotChildActive,
+                                                      slotAddr, myAddr);
+              }
+              if (memInfo.requiresRdEn) {
+                Value slotRdEn =
+                    slotP.rdEn ? slotP.rdEn
+                               : hw::ConstantOp::create(hw, loc, i1, 0);
+                Value myRdEn =
+                    outP.rdEn ? outP.rdEn
+                              : hw::ConstantOp::create(hw, loc, i1, 0);
+                outP.rdEn = comb::MuxOp::create(hw, loc, slotChildActive,
+                                                  slotRdEn, myRdEn);
+              }
+              bool emitWrite = memInfo.isAmcPort ? memInfo.isWrite : true;
+              if (emitWrite) {
+                Value slotWrData =
+                    slotP.wrData
+                        ? slotP.wrData
+                        : hw::ConstantOp::create(hw, loc, dataType, 0);
+                Value slotWrEn =
+                    slotP.wrEn ? slotP.wrEn
+                               : hw::ConstantOp::create(hw, loc, i1, 0);
+                Value myWrData =
+                    outP.wrData
+                        ? outP.wrData
+                        : hw::ConstantOp::create(hw, loc, dataType, 0);
+                Value myWrEn =
+                    outP.wrEn ? outP.wrEn
+                              : hw::ConstantOp::create(hw, loc, i1, 0);
+                outP.wrData = comb::MuxOp::create(hw, loc, slotChildActive,
+                                                    slotWrData, myWrData);
+                outP.wrEn = comb::MuxOp::create(hw, loc, slotChildActive,
+                                                  slotWrEn, myWrEn);
+              }
+            }
+          }
+          childDoneBEs[waitIdx].setValue(pipDone);
+
+          // Stash pipeline's results under the launch's handle (for any
+          // future await-with-value in a later frame). Also propagate through
+          // the enclosing at's result(s).
+          SmallVector<Value> pipResults;
+          for (Value r : pipOp.getResults())
+            if (auto m = localMapping.lookupOrNull(r))
+              pipResults.push_back(m);
+          if (auto launchAt =
+                  launchOp->getParentOfType<LoopScheduleAtOp>()) {
+            auto atYield = launchAt.getYieldOp();
+            for (auto [atRes, yOperand] :
+                 llvm::zip(launchAt.getResults(), atYield.getOperands())) {
+              if (yOperand == launchOp.getHandle())
+                handleValueMap[atRes] = pipResults;
+            }
+          }
+          handleValueMap[launchOp.getHandle()] = std::move(pipResults);
         }
       }
-
-      // Mux child memory ports into this frame's per-frame port mapping.
-      // Any pre-child op may have already written a pre-child address into
-      // perFramePorts[frameIdx]; the child's outputs take priority when
-      // child_active_j is high so only the launch cycle's pre-child writes
-      // actually fire while the child is running.
-      Value childActive = fsmChildActives[waitIdx];
-      for (auto &memInfo : memrefArgs) {
-        auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
-        SmallVector<Value> childAddrs;
-        for (unsigned d = 0; d < widths.size(); ++d)
-          childAddrs.push_back(childInst.getResult(outIdx++));
-        Value childRdEn = memInfo.requiresRdEn
-                              ? childInst.getResult(outIdx++)
-                              : Value();
-        bool emitWrite = memInfo.isAmcPort ? memInfo.isWrite : true;
-        Value childWrData, childWrEn;
-        if (emitWrite) {
-          childWrData = childInst.getResult(outIdx++);
-          childWrEn = childInst.getResult(outIdx++);
-        }
-
-        auto &ports = perFramePorts[frameIdx][memInfo.originalArg];
-        if (ports.addrs.size() != widths.size())
-          ports.addrs.assign(widths.size(), Value());
-        Type dataType = memInfo.elementType;
-        for (auto [d, w] : llvm::enumerate(widths)) {
-          Type addrType = IntegerType::get(ctx, w);
-          Value myAddr = ports.addrs[d] ? ports.addrs[d]
-              : hw::ConstantOp::create(hw, loc, addrType, 0);
-          ports.addrs[d] = comb::MuxOp::create(hw, loc, childActive,
-                                                childAddrs[d], myAddr);
-        }
-        if (memInfo.requiresRdEn) {
-          Value myRdEn = ports.rdEn ? ports.rdEn
-              : hw::ConstantOp::create(hw, loc, i1, 0);
-          ports.rdEn =
-              comb::MuxOp::create(hw, loc, childActive, childRdEn, myRdEn);
-        }
-        if (emitWrite) {
-          Value myWrData = ports.wrData ? ports.wrData
-              : hw::ConstantOp::create(hw, loc, dataType, 0);
-          Value myWrEn = ports.wrEn ? ports.wrEn
-              : hw::ConstantOp::create(hw, loc, i1, 0);
-          ports.wrData =
-              comb::MuxOp::create(hw, loc, childActive, childWrData, myWrData);
-          ports.wrEn =
-              comb::MuxOp::create(hw, loc, childActive, childWrEn, myWrEn);
-        }
-      }
-    } else if (node.framePipelineIdx[frameIdx] >= 0) {
-      // This frame contains a pipeline child.
-      int pipIdx = node.framePipelineIdx[frameIdx];
-      auto pipOp = node.pipelineChildren[pipIdx];
-      Value frameChildStart = fsmChildStarts[waitIdx];
-      Value framePostActive = fsmPostActives[waitIdx];
-
-      if (failed(lowerFrameWithChild(frameOp,
-                                      frameChildStart, framePostActive,
-                                      perFramePorts[frameIdx])))
-        return failure();
-
-      // Lower pipeline child (inline in this module).
-      hw.setInsertionPointToEnd(hwBody);
-      Value pipDone;
-      std::string pipPrefix = node.prefix + "_pip" + std::to_string(pipIdx);
-      if (failed(lowerPipelineChild(pipOp, hw, loc, hwBody, localMapping, clk,
-                                    rst, frameChildStart, pipPrefix, pipDone,
-                                    perFramePorts[frameIdx], memrefArgs)))
-        return failure();
-      childDoneBEs[waitIdx].setValue(pipDone);
-
-      // Stash pipeline's results under the launch's handle (for any future
-      // await-with-value in a later frame). Also propagate through the
-      // enclosing at's result(s).
-      auto launch =
-          loopschedule::getLaunchOpsInOrder(frameOp).front();
-      SmallVector<Value> pipResults;
-      for (Value r : pipOp.getResults())
-        if (auto m = localMapping.lookupOrNull(r))
-          pipResults.push_back(m);
-      if (auto launchAt = launch->getParentOfType<LoopScheduleAtOp>()) {
-        auto atYield = launchAt.getYieldOp();
-        for (auto [atRes, yOperand] :
-             llvm::zip(launchAt.getResults(), atYield.getOperands())) {
-          if (yOperand == launch.getHandle())
-            handleValueMap[atRes] = pipResults;
-        }
-      }
-      handleValueMap[launch.getHandle()] = std::move(pipResults);
     } else {
-      // Regular frame (no child). Gate stores per issue cycle: ops in each
-      // `at K` body get cycleGates[K].
+      // Regular frame (no child/pipeline launches). Gate stores per issue
+      // cycle: ops in each `at K` body get cycleGates[K].
       if (failed(lowerFrameBody(&frameOp.getBodyBlock(), hw, localMapping,
                                  fsmFrameCycleGates[frameIdx],
                                  perFramePorts[frameIdx], moduleOp, clk,
@@ -2415,10 +2533,19 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   hw.setInsertionPointToEnd(hwBody);
   SmallVector<Value> frameMergeSignals(numFrames);
   for (unsigned i = 0; i < numFrames; ++i) {
-    if (frameWaitIdx[i] >= 0) {
-      unsigned j = (unsigned)frameWaitIdx[i];
-      frameMergeSignals[i] = comb::OrOp::create(
-          hw, loc, fsmChildActives[j], fsmPostActives[j]);
+    if (!frameWaitIdx[i].empty()) {
+      // OR together child_active and post_active of every slot in this
+      // wait-frame so the merge mux sees the frame as alive across all
+      // launches.
+      Value aliveSoFar;
+      for (int j : frameWaitIdx[i]) {
+        Value slotAlive = comb::OrOp::create(
+            hw, loc, fsmChildActives[(unsigned)j], fsmPostActives[(unsigned)j]);
+        aliveSoFar = aliveSoFar ? comb::OrOp::create(hw, loc, aliveSoFar,
+                                                      slotAlive)
+                                : slotAlive;
+      }
+      frameMergeSignals[i] = aliveSoFar;
     } else {
       frameMergeSignals[i] = fsmFrameActives[i];
     }
