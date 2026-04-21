@@ -1096,6 +1096,12 @@ ParseResult CaseOp::parse(OpAsmParser &parser, OperationState &result) {
     auto caseRegion = std::make_unique<Region>();
     if (parser.parseColon() || parser.parseRegion(*caseRegion))
       return failure();
+    // The region verifier requires each case to have exactly one block; an
+    // empty `{}` parses into a region with zero blocks, so materialize an
+    // empty block here. Mirrors the same fix in `parseCaseRegions` for
+    // `sv.generate.case`.
+    if (caseRegion->empty())
+      caseRegion->push_back(new Block());
     result.addRegion(std::move(caseRegion));
   }
 
