@@ -3333,12 +3333,16 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   // handled per-entry as children; `at` ops that carry real compute coexist
   // with launch-holder ats in the same frame. A launch-holder at is one
   // whose body is just a launch (+ yield); those are skipped entirely.
-  auto cloneFrameAtBodies = [&](LoopScheduleFrameOp frame) -> LogicalResult {
-    // Gating for static stores/loads emitted in this frame's at-bodies is
-    // tied high — the top-level func has no FSM above it, so the op
-    // always fires when the frame is active.
-    Value preGate =
-        hw::ConstantOp::create(builder, loc, builder.getI1Type(), 1);
+  // Collected static-store drives from `cloneFrameAtBodies`. Each entry's
+  // `wrEn` is already gated by the owning frame's 1-cycle header pulse
+  // (see caller). After `mergeStepMemPorts` runs, these drives get
+  // priority-composed into `memPortMap` so a static store coexisting
+  // with a launch in the same frame takes priority during its single
+  // firing cycle (and leaves the pipeline's drives untouched otherwise).
+  SmallVector<std::pair<Value, MemPortMapping>> staticDrives;
+
+  auto cloneFrameAtBodies = [&](LoopScheduleFrameOp frame,
+                                 Value preGate) -> LogicalResult {
     for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
       bool isLaunchHolder = false;
       for (auto &op : atOp.getBodyBlock()) {
@@ -3357,11 +3361,20 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
         // their memref operands get rewritten to the memPortMap ports
         // instead of leaking into the cloned output as dangling
         // references to the (about-to-be-erased) func-op's block args.
+        // We drive into a temporary MemPortMapping so the static drive
+        // survives the later `mergeStepMemPorts` overwrite and can be
+        // priority-composed with the merged ports.
         if (auto storeOp =
                 dyn_cast<loopschedule::HWStoreLoweringInterface>(&op)) {
+          DenseMap<Value, MemPortMapping> localPorts;
+          for (auto &memInfo : memrefArgs)
+            localPorts[memInfo.originalArg].rdData =
+                memPortMap[memInfo.originalArg].rdData;
           if (failed(handleHWStore(storeOp, builder, mapping, preGate,
-                                      memPortMap)))
+                                      localPorts)))
             return failure();
+          Value target = storeOp.getMemoryValue();
+          staticDrives.emplace_back(target, std::move(localPorts[target]));
           continue;
         }
         if (auto loadOp =
@@ -3404,9 +3417,16 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
     // below.
     if (ei == firstEntryForFrame[frameIdx]) {
       processFuncAwaitRegion(topFrames[frameIdx]);
-      if (entry.kind >= 0)
-        if (failed(cloneFrameAtBodies(topFrames[frameIdx])))
+      if (entry.kind >= 0) {
+        // Static at-body stores need a 1-cycle gate that matches the
+        // FRAME_i state (before WAIT_i), so they fire exactly once per
+        // frame entry and don't contend with the launched child's
+        // memory writes during the rest of frame i. `child_start_i` is
+        // exactly that pulse — high only during FRAME_i.
+        Value headerGate = childStartSignals[childIndexForEntry[ei]];
+        if (failed(cloneFrameAtBodies(topFrames[frameIdx], headerGate)))
           return failure();
+      }
     }
 
     if (entry.kind == 0) {
@@ -3602,6 +3622,41 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
         memPortMap[memInfo.originalArg].rdData;
   mergeStepMemPorts(builder, loc, perEntryPorts, entryRunningSignals,
                     memrefArgs, mergedMemPorts);
+
+  // Priority-compose any static at-body store drives (collected by
+  // `cloneFrameAtBodies`) over the merged entry drives. Each static
+  // drive's wrEn is already gated by its owning frame's header pulse,
+  // so the static fires during that one cycle and the child's drives
+  // take over for the rest of the frame.
+  for (auto &[memVal, staticMp] : staticDrives) {
+    auto &merged = mergedMemPorts[memVal];
+    Value sGate = staticMp.wrEn;
+    if (!sGate)
+      continue;
+    if (merged.wrEn) {
+      merged.wrEn = comb::OrOp::create(builder, loc, sGate, merged.wrEn);
+    } else {
+      merged.wrEn = sGate;
+    }
+    if (staticMp.wrData) {
+      if (merged.wrData)
+        merged.wrData = comb::MuxOp::create(builder, loc, sGate,
+                                              staticMp.wrData, merged.wrData);
+      else
+        merged.wrData = staticMp.wrData;
+    }
+    for (auto [d, sAddr] : llvm::enumerate(staticMp.addrs)) {
+      if (!sAddr)
+        continue;
+      if (d >= merged.addrs.size())
+        merged.addrs.resize(d + 1);
+      if (merged.addrs[d])
+        merged.addrs[d] = comb::MuxOp::create(builder, loc, sGate, sAddr,
+                                                merged.addrs[d]);
+      else
+        merged.addrs[d] = sAddr;
+    }
+  }
 
   // Copy merged ports to function-level memPortMap.
   for (auto &memInfo : memrefArgs) {
