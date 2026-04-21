@@ -18,6 +18,7 @@
 #include "circt/Dialect/FSM/FSMOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Dialect/LoopSchedule/HWMemoryLoweringState.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/LoopSchedule/Utils.h"
 #include "circt/Dialect/OpLib/OpLibOps.h"
@@ -144,25 +145,61 @@ struct MemPortMapping {
   SmallVector<Value> addrs; // will be set: per-dim address outputs
   Value wrData;             // will be set: write data output
   Value wrEn;               // will be set: write enable output
+  // Optional read-enable output. Set by loads whose
+  // HWLoadLoweringInterface::requiresReadEnable() is true (e.g. AMC
+  // ports). Null means tie-high (memref case).
+  Value rdEn;
 };
 
-/// Information about a memref argument for threading through loop modules.
-struct MemrefArgInfo {
-  Value originalArg; // original func::FuncOp argument
-  MemRefType memType;
-  bool isLocalMem = false; // true for memref.alloc → seq.hlmem
+/// Information about a memory-backed value (memref argument, local
+/// memref.alloc, or amc.instance port) that gets threaded through loop
+/// hw.modules. `isAmcPort` distinguishes memref-backed entries (whose
+/// loop ports include implicit wr_data / wr_en outputs) from amc-port
+/// entries (whose loop ports only include the directional signals the
+/// port actually needs).
+struct PortArgInfo {
+  Value originalArg;
+  // Unified metadata (populated for both memref and amc-port cases).
+  SmallVector<int64_t> shape;
+  Type elementType;
+  SmallVector<unsigned> addrWidths;
+  bool isRead = true;
+  bool isWrite = true;
+  bool requiresRdEn = false;
+  unsigned latency = 1;
+  // Memref-specific.
+  MemRefType memType;        // null for amc ports
+  bool isLocalMem = false;   // true for memref.alloc → seq.hlmem
+  // Amc-port-specific.
+  bool isAmcPort = false;
 };
 
-/// Append hw.module output port declarations for a memref: per-dim address,
-/// write data, and write enable.
-static void appendMemrefOutputPorts(OpBuilder &builder, StringRef baseName,
-                                    MemRefType memType,
-                                    SmallVectorImpl<hw::PortInfo> &ports) {
+/// Build a PortArgInfo for a memref-backed value (function argument or
+/// local alloc). Amc-port entries are built inline by the instance walk.
+static PortArgInfo makePortArgInfoFromMemref(Value arg, MemRefType memType,
+                                              bool isLocalMem) {
+  PortArgInfo info;
+  info.originalArg = arg;
+  info.memType = memType;
+  info.isLocalMem = isLocalMem;
+  info.shape.assign(memType.getShape().begin(), memType.getShape().end());
+  info.elementType = memType.getElementType();
+  info.addrWidths = getDimAddrWidths(memType);
+  return info;
+}
+
+/// Append hw.module output port declarations for a port-arg (memref or amc
+/// port). Memref entries emit per-dim addresses + wr_data + wr_en
+/// unconditionally (matches the legacy always-maybe-writable shape). Amc
+/// entries emit only the directional signals the port actually carries:
+/// addresses always; rd_en output if `requiresRdEn`; wr_data/wr_en
+/// outputs only if writable.
+static void appendPortOutputPorts(OpBuilder &builder, StringRef baseName,
+                                   const PortArgInfo &info,
+                                   SmallVectorImpl<hw::PortInfo> &ports) {
   auto *ctx = builder.getContext();
-  auto widths = getDimAddrWidths(memType);
-  Type dataType = memType.getElementType();
-  bool isOneDim = widths.size() == 1;
-  for (auto [d, w] : llvm::enumerate(widths)) {
+  bool isOneDim = info.addrWidths.size() == 1;
+  for (auto [d, w] : llvm::enumerate(info.addrWidths)) {
     std::string addrName =
         isOneDim ? (baseName + "_addr").str()
                  : (baseName + "_addr_" + std::to_string(d)).str();
@@ -170,39 +207,58 @@ static void appendMemrefOutputPorts(OpBuilder &builder, StringRef baseName,
                        IntegerType::get(ctx, w),
                        hw::ModulePort::Direction::Output}});
   }
-  ports.push_back({{builder.getStringAttr((baseName + "_wr_data").str()),
-                     dataType, hw::ModulePort::Direction::Output}});
-  ports.push_back({{builder.getStringAttr((baseName + "_wr_en").str()),
-                     builder.getI1Type(), hw::ModulePort::Direction::Output}});
+  if (info.requiresRdEn) {
+    ports.push_back({{builder.getStringAttr((baseName + "_rd_en").str()),
+                       builder.getI1Type(),
+                       hw::ModulePort::Direction::Output}});
+  }
+  bool emitWrite = info.isAmcPort ? info.isWrite : true;
+  if (emitWrite) {
+    ports.push_back({{builder.getStringAttr((baseName + "_wr_data").str()),
+                       info.elementType,
+                       hw::ModulePort::Direction::Output}});
+    ports.push_back({{builder.getStringAttr((baseName + "_wr_en").str()),
+                       builder.getI1Type(),
+                       hw::ModulePort::Direction::Output}});
+  }
 }
 
-/// Append hw.output values for a memref's output ports (addr, wr_data, wr_en),
-/// falling back to zero constants when the mapping is absent or incomplete.
-static void appendMemrefOutputValues(OpBuilder &builder, Location loc,
-                                     MemRefType memType, Value memKey,
-                                     DenseMap<Value, MemPortMapping> &memPortMap,
-                                     SmallVectorImpl<Value> &outputs) {
+/// Append hw.output values for a port-arg's output ports (addr, optional
+/// rd_en, wr_data, wr_en), falling back to safe defaults when the mapping
+/// is absent or incomplete.
+static void appendPortOutputValues(OpBuilder &builder, Location loc,
+                                    const PortArgInfo &info, Value memKey,
+                                    DenseMap<Value, MemPortMapping> &memPortMap,
+                                    SmallVectorImpl<Value> &outputs) {
   auto *ctx = builder.getContext();
-  auto widths = getDimAddrWidths(memType);
-  Type dataType = memType.getElementType();
+  Type i1 = builder.getI1Type();
   auto it = memPortMap.find(memKey);
   bool has = it != memPortMap.end();
-  for (auto [d, w] : llvm::enumerate(widths)) {
+  for (auto [d, w] : llvm::enumerate(info.addrWidths)) {
     Type addrType = IntegerType::get(ctx, w);
     if (has && d < it->second.addrs.size() && it->second.addrs[d])
       outputs.push_back(it->second.addrs[d]);
     else
       outputs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
   }
-  if (has && it->second.wrData)
-    outputs.push_back(it->second.wrData);
-  else
-    outputs.push_back(hw::ConstantOp::create(builder, loc, dataType, 0));
-  if (has && it->second.wrEn)
-    outputs.push_back(it->second.wrEn);
-  else
-    outputs.push_back(
-        hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0));
+  if (info.requiresRdEn) {
+    if (has && it->second.rdEn)
+      outputs.push_back(it->second.rdEn);
+    else
+      outputs.push_back(hw::ConstantOp::create(builder, loc, i1, 0));
+  }
+  bool emitWrite = info.isAmcPort ? info.isWrite : true;
+  if (emitWrite) {
+    if (has && it->second.wrData)
+      outputs.push_back(it->second.wrData);
+    else
+      outputs.push_back(
+          hw::ConstantOp::create(builder, loc, info.elementType, 0));
+    if (has && it->second.wrEn)
+      outputs.push_back(it->second.wrEn);
+    else
+      outputs.push_back(hw::ConstantOp::create(builder, loc, i1, 0));
+  }
 }
 
 /// Represents one sequential loop in the nesting tree.
@@ -271,7 +327,7 @@ private:
   /// external values the caller must wire as inputs when instantiating.
   LogicalResult lowerLoopNodeAsModule(
       const LoopNode &node, OpBuilder &builder, Location loc,
-      func::FuncOp funcOp, ArrayRef<MemrefArgInfo> memrefArgs,
+      func::FuncOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
       IRMapping &parentMapping,
       hw::HWModuleOp &outModule,
       SmallVectorImpl<Value> &capturedVals);
@@ -310,7 +366,7 @@ private:
                                    Value clk, Value rst, Value startSignal,
                                    StringRef namePrefix, Value &doneSignal,
                                    DenseMap<Value, MemPortMapping> &memPorts,
-                                   ArrayRef<MemrefArgInfo> memrefArgs);
+                                   ArrayRef<PortArgInfo> memrefArgs);
 
   /// Map from original func memref args to their hw.module port values.
   DenseMap<Value, MemPortMapping> memPortMap;
@@ -340,58 +396,71 @@ private:
 // Load/store helpers
 //===----------------------------------------------------------------------===//
 
-/// Resolve the per-dim address values for a memref access. Looks up the
-/// memref's port mapping, walks the access's indices, and width-fixes each
-/// to the corresponding entry in `getDimAddrWidths(memType)`. Stores the
+/// Resolve the per-dim address values for a memory access, given the
+/// address bit widths the memory expects. Looks up the port mapping,
+/// walks the access's indices, and width-fixes each. Stores the
 /// resulting addresses into `portsOut->addrs`.
 static LogicalResult
-prepareMemAccess(Operation *op, Value memref, ValueRange indexVals,
-                 OpBuilder &builder, IRMapping &mapping,
+prepareHWAccess(Operation *op, Value memValue, ValueRange indexVals,
+                 ArrayRef<unsigned> addrWidths, OpBuilder &builder,
+                 IRMapping &mapping,
                  DenseMap<Value, MemPortMapping> &memPorts,
                  MemPortMapping *&portsOut) {
-  auto it = memPorts.find(memref);
+  auto it = memPorts.find(memValue);
   if (it == memPorts.end())
-    return op->emitError("unmapped memref");
+    return op->emitError("unmapped memory");
   portsOut = &it->second;
-  auto memType = cast<MemRefType>(memref.getType());
-  auto widths = getDimAddrWidths(memType);
-  if (indexVals.size() != widths.size())
-    return op->emitError("loopschedule access index count (")
-           << indexVals.size() << ") does not match memref rank ("
-           << widths.size() << ")";
-  portsOut->addrs.resize(widths.size());
+  if (indexVals.size() != addrWidths.size())
+    return op->emitError("memory access index count (")
+           << indexVals.size() << ") does not match memory rank ("
+           << addrWidths.size() << ")";
+  portsOut->addrs.resize(addrWidths.size());
   for (auto [d, idx] : llvm::enumerate(indexVals)) {
     Value addr = mapping.lookup(idx);
-    portsOut->addrs[d] = resizeIntTo(builder, op->getLoc(), addr, widths[d]);
+    portsOut->addrs[d] = resizeIntTo(builder, op->getLoc(), addr, addrWidths[d]);
   }
   return success();
 }
 
-/// Lower a loopschedule.load: drive the read addresses on the memory port
-/// mapping and map the load result to the port's read data.
+/// Lower any `HWLoadLoweringInterface` op: drive the read addresses on
+/// the memory port mapping and map the load result to the port's read
+/// data. If the op requires an explicit read-enable, drive it from
+/// `rdEnGate`; otherwise leave rdEn untouched (memref ports are
+/// implicitly always-on).
 static LogicalResult
-handleLoad(LoopScheduleLoadOp loadOp, OpBuilder &builder, IRMapping &mapping,
-           DenseMap<Value, MemPortMapping> &memPorts) {
+handleHWLoad(loopschedule::HWLoadLoweringInterface loadOp, OpBuilder &builder,
+             IRMapping &mapping,
+             DenseMap<Value, MemPortMapping> &memPorts,
+             Value rdEnGate = nullptr) {
+  SmallVector<unsigned> widths = loadOp.getAddrWidths();
   MemPortMapping *ports = nullptr;
-  if (failed(prepareMemAccess(loadOp, loadOp.getMemRef(), loadOp.getIndices(),
-                              builder, mapping, memPorts, ports)))
+  if (failed(prepareHWAccess(loadOp, loadOp.getMemoryValue(),
+                              loadOp.getIndices(), widths, builder, mapping,
+                              memPorts, ports)))
     return failure();
+  if (loadOp.requiresReadEnable()) {
+    assert(rdEnGate && "HW load requires an explicit read-enable gate");
+    ports->rdEn = rdEnGate;
+  }
   mapping.map(loadOp.getResult(), ports->rdData);
   return success();
 }
 
-/// Lower a loopschedule.store: drive the addresses, write data, and write
-/// enable (gated by wrEnGate) on the memory port mapping.
+/// Lower any `HWStoreLoweringInterface` op: drive the addresses, write
+/// data, and write enable (gated by `wrEnGate`) on the memory port
+/// mapping.
 static LogicalResult
-handleStore(LoopScheduleStoreOp storeOp, OpBuilder &builder,
-            IRMapping &mapping, Value wrEnGate,
-            DenseMap<Value, MemPortMapping> &memPorts) {
-  assert(wrEnGate && "handleStore requires a wrEnGate");
+handleHWStore(loopschedule::HWStoreLoweringInterface storeOp,
+               OpBuilder &builder, IRMapping &mapping, Value wrEnGate,
+               DenseMap<Value, MemPortMapping> &memPorts) {
+  assert(wrEnGate && "handleHWStore requires a wrEnGate");
+  SmallVector<unsigned> widths = storeOp.getAddrWidths();
   MemPortMapping *ports = nullptr;
-  if (failed(prepareMemAccess(storeOp, storeOp.getMemRef(), storeOp.getIndices(),
-                              builder, mapping, memPorts, ports)))
+  if (failed(prepareHWAccess(storeOp, storeOp.getMemoryValue(),
+                              storeOp.getIndices(), widths, builder, mapping,
+                              memPorts, ports)))
     return failure();
-  ports->wrData = mapping.lookup(storeOp.getValue());
+  ports->wrData = mapping.lookup(storeOp.getValueToStore());
   ports->wrEn = wrEnGate;
   return success();
 }
@@ -678,15 +747,16 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
     if (isa<LoopScheduleLaunchOp>(&op))
       continue;
 
-    if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-      if (failed(handleStore(storeOp, builder, mapping, pickGate(baseCycle),
-                              memPorts)))
+    if (auto storeOp = dyn_cast<loopschedule::HWStoreLoweringInterface>(&op)) {
+      if (failed(handleHWStore(storeOp, builder, mapping,
+                                 pickGate(baseCycle), memPorts)))
         return failure();
       continue;
     }
 
-    if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-      if (failed(handleLoad(loadOp, builder, mapping, memPorts)))
+    if (auto loadOp = dyn_cast<loopschedule::HWLoadLoweringInterface>(&op)) {
+      if (failed(handleHWLoad(loadOp, builder, mapping, memPorts,
+                                pickGate(baseCycle))))
         return failure();
       continue;
     }
@@ -818,6 +888,16 @@ collectCapturedValues(LoopScheduleSequentialOp seqOp) {
   auto processOperand = [&](Value operand) {
     if (isa<MemRefType>(operand.getType()))
       return;
+    // Amc port-like values (results of an `amc.instance` or downstream port
+    // composition ops) are threaded via `memrefArgs`, just like memrefs —
+    // skip them so they don't also try to come in as plain scalar captures
+    // (which would fail to resolve in the caller's `mapping`).
+    if (isa<loopschedule::HandleType>(operand.getType()))
+      return;
+    if (auto *defOp = operand.getDefiningOp())
+      if (defOp->getDialect() &&
+          defOp->getDialect()->getNamespace() == "amc")
+        return;
     // Skip values defined inside the seqOp.
     if (operand.getParentRegion() &&
         seqOp->isAncestor(operand.getParentRegion()->getParentOp()))
@@ -1367,7 +1447,7 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
 static hw::HWModuleOp createLoopModule(
     OpBuilder &builder, Location loc, StringRef moduleName,
     ArrayRef<Value> capturedValues,
-    ArrayRef<MemrefArgInfo> memrefArgs,
+    ArrayRef<PortArgInfo> memrefArgs,
     ArrayRef<Type> resultTypes,
     IRMapping &capturedMapping,
     DenseMap<Value, MemPortMapping> &localMemPortMap,
@@ -1397,9 +1477,12 @@ static hw::HWModuleOp createLoopModule(
   }
 
   for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
-    Type dataType = memInfo.memType.getElementType();
+    bool hasRdInput = memInfo.isAmcPort ? memInfo.isRead : true;
+    if (!hasRdInput)
+      continue;
     std::string baseName = "mem" + std::to_string(i);
-    ports.push_back({{builder.getStringAttr(baseName + "_rd_data"), dataType,
+    ports.push_back({{builder.getStringAttr(baseName + "_rd_data"),
+                       memInfo.elementType,
                        hw::ModulePort::Direction::Input}});
     inputIdx++;
   }
@@ -1413,8 +1496,7 @@ static hw::HWModuleOp createLoopModule(
   }
 
   for (auto [i, memInfo] : llvm::enumerate(memrefArgs))
-    appendMemrefOutputPorts(builder, "mem" + std::to_string(i),
-                            memInfo.memType, ports);
+    appendPortOutputPorts(builder, "mem" + std::to_string(i), memInfo, ports);
 
   hw::ModulePortInfo portInfo(ports);
   auto hwMod = hw::HWModuleOp::create(builder, loc,
@@ -1431,8 +1513,10 @@ static hw::HWModuleOp createLoopModule(
 
   for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
     MemPortMapping mp;
-    mp.rdData = hwBody->getArgument(argIdx++);
-    mp.addrs.assign(getNumAddrPorts(memInfo.memType), Value());
+    bool hasRdInput = memInfo.isAmcPort ? memInfo.isRead : true;
+    if (hasRdInput)
+      mp.rdData = hwBody->getArgument(argIdx++);
+    mp.addrs.assign(memInfo.addrWidths.size(), Value());
     mp.wrData = Value();
     mp.wrEn = Value();
     localMemPortMap[memInfo.originalArg] = mp;
@@ -1445,7 +1529,7 @@ static hw::HWModuleOp createLoopModule(
 static void buildLoopModuleOutput(
     OpBuilder &builder, Location loc,
     DenseMap<Value, MemPortMapping> &localMemPortMap,
-    ArrayRef<MemrefArgInfo> memrefArgs,
+    ArrayRef<PortArgInfo> memrefArgs,
     Value doneSignal,
     ArrayRef<Value> resultValues) {
 
@@ -1457,8 +1541,8 @@ static void buildLoopModuleOutput(
     outputs.push_back(v);
 
   for (auto &memInfo : memrefArgs)
-    appendMemrefOutputValues(builder, loc, memInfo.memType,
-                             memInfo.originalArg, localMemPortMap, outputs);
+    appendPortOutputValues(builder, loc, memInfo, memInfo.originalArg,
+                           localMemPortMap, outputs);
 
   hw::OutputOp::create(builder, loc, outputs);
 }
@@ -1470,24 +1554,26 @@ static void mergeStepMemPorts(
     OpBuilder &builder, Location loc,
     ArrayRef<DenseMap<Value, MemPortMapping>> perStepPorts,
     ArrayRef<Value> stepRunningSignals,
-    ArrayRef<MemrefArgInfo> memrefArgs,
+    ArrayRef<PortArgInfo> memrefArgs,
     DenseMap<Value, MemPortMapping> &mergedPorts) {
 
   auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
 
   for (auto &memInfo : memrefArgs) {
-    auto widths = getDimAddrWidths(memInfo.memType);
-    Type dataType = memInfo.memType.getElementType();
+    Type dataType = memInfo.elementType;
 
-    // Start with zero defaults: one per dim, plus wrData/wrEn.
+    // Start with zero defaults: one per dim, plus wrData/wrEn/(rdEn).
     SmallVector<Value> addrs;
-    for (unsigned w : widths) {
+    for (unsigned w : memInfo.addrWidths) {
       Type addrType = IntegerType::get(ctx, w);
       addrs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
     }
     Value wrData = hw::ConstantOp::create(builder, loc, dataType, 0);
     Value wrEn = hw::ConstantOp::create(builder, loc, i1, 0);
+    Value rdEn = memInfo.requiresRdEn
+                     ? hw::ConstantOp::create(builder, loc, i1, 0)
+                     : Value();
 
     // Build priority mux chain (last step has lowest priority).
     for (int i = perStepPorts.size() - 1; i >= 0; --i) {
@@ -1495,7 +1581,7 @@ static void mergeStepMemPorts(
       if (it == perStepPorts[i].end())
         continue;
       auto &ports = it->second;
-      for (auto [d, w] : llvm::enumerate(widths)) {
+      for (auto [d, w] : llvm::enumerate(memInfo.addrWidths)) {
         Type addrType = IntegerType::get(ctx, w);
         Value stepAddr = (d < ports.addrs.size() && ports.addrs[d])
             ? ports.addrs[d]
@@ -1511,12 +1597,20 @@ static void mergeStepMemPorts(
                                     stepWrData, wrData);
       wrEn = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
                                   stepWrEn, wrEn);
+      if (memInfo.requiresRdEn) {
+        Value stepRdEn = ports.rdEn ? ports.rdEn
+            : hw::ConstantOp::create(builder, loc, i1, 0);
+        rdEn = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
+                                    stepRdEn, rdEn);
+      }
     }
 
     auto &merged = mergedPorts[memInfo.originalArg];
     merged.addrs = std::move(addrs);
     merged.wrData = wrData;
     merged.wrEn = wrEn;
+    if (memInfo.requiresRdEn)
+      merged.rdEn = rdEn;
   }
 }
 
@@ -1546,9 +1640,34 @@ static void muxStageMemPorts(
   }
 
   for (Value memref : memrefs) {
-    auto memType = cast<MemRefType>(memref.getType());
-    auto widths = getDimAddrWidths(memType);
-    Type dataType = memType.getElementType();
+    // Derive per-dim addr widths, element type, and read-enable need from
+    // the stage ports themselves rather than the memref type — the latter
+    // does not exist for amc port-typed values.
+    SmallVector<unsigned> widths;
+    Type dataType;
+    bool needsRdEn = false;
+    for (auto &stagePorts : perStagePorts) {
+      auto it = stagePorts.find(memref);
+      if (it == stagePorts.end())
+        continue;
+      const MemPortMapping &ports = it->second;
+      if (widths.empty() && !ports.addrs.empty()) {
+        for (Value a : ports.addrs)
+          if (a)
+            widths.push_back(cast<IntegerType>(a.getType()).getWidth());
+      }
+      if (!dataType) {
+        if (ports.wrData)
+          dataType = ports.wrData.getType();
+        else if (ports.rdData)
+          dataType = ports.rdData.getType();
+      }
+      if (ports.rdEn)
+        needsRdEn = true;
+    }
+    if (widths.empty() || !dataType)
+      continue; // nothing to mux for this memref (probably read-only with
+                // data-type already known to caller — not our concern).
 
     SmallVector<Value> addrs;
     for (unsigned w : widths) {
@@ -1557,6 +1676,8 @@ static void muxStageMemPorts(
     }
     Value wrData = hw::ConstantOp::create(builder, loc, dataType, 0);
     Value wrEn = hw::ConstantOp::create(builder, loc, i1, 0);
+    Value rdEn = needsRdEn ? hw::ConstantOp::create(builder, loc, i1, 0)
+                           : Value();
 
     // Priority mux chain — last stage has lowest priority. Stages that did
     // not actually touch this memref (no address, no write) contribute
@@ -1570,7 +1691,7 @@ static void muxStageMemPorts(
       const MemPortMapping &ports = it->second;
       bool hasAddr = llvm::any_of(ports.addrs,
                                   [](Value v) { return (bool)v; });
-      if (!hasAddr && !ports.wrData && !ports.wrEn)
+      if (!hasAddr && !ports.wrData && !ports.wrEn && !ports.rdEn)
         continue;
       Value gate = stageCE[s];
       for (auto [d, w] : llvm::enumerate(widths)) {
@@ -1585,12 +1706,16 @@ static void muxStageMemPorts(
         wrData = comb::MuxOp::create(builder, loc, gate, ports.wrData, wrData);
       if (ports.wrEn)
         wrEn = comb::MuxOp::create(builder, loc, gate, ports.wrEn, wrEn);
+      if (needsRdEn && ports.rdEn)
+        rdEn = comb::MuxOp::create(builder, loc, gate, ports.rdEn, rdEn);
     }
 
     auto &out = outPorts[memref];
     out.addrs = std::move(addrs);
     out.wrData = wrData;
     out.wrEn = wrEn;
+    if (needsRdEn)
+      out.rdEn = rdEn;
     // rdData is preserved (it is set by the caller from the module's input
     // port and shared across all stages).
   }
@@ -1602,7 +1727,7 @@ static void muxStageMemPorts(
 
 LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     const LoopNode &node, OpBuilder &builder, Location loc,
-    func::FuncOp funcOp, ArrayRef<MemrefArgInfo> memrefArgs,
+    func::FuncOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
     IRMapping &parentMapping,
     hw::HWModuleOp &outModule,
     SmallVectorImpl<Value> &capturedVals) {
@@ -1866,18 +1991,34 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp,
                 LoopScheduleLaunchOp>(&op))
           continue;
-        if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-          if (failed(handleLoad(loadOp, hw, localMapping, framePorts)))
+        if (auto loadOp =
+                dyn_cast<loopschedule::HWLoadLoweringInterface>(&op)) {
+          if (failed(handleHWLoad(loadOp, hw, localMapping, framePorts,
+                                     preGate)))
             return failure();
           continue;
         }
-        if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-          if (failed(handleStore(storeOp, hw, localMapping, preGate,
-                                 framePorts)))
+        if (auto storeOp =
+                dyn_cast<loopschedule::HWStoreLoweringInterface>(&op)) {
+          if (failed(handleHWStore(storeOp, hw, localMapping, preGate,
+                                      framePorts)))
             return failure();
           continue;
         }
         hw.clone(op, localMapping);
+      }
+      // Map this at-op's external results from its yield operands *now*,
+      // so subsequent at-ops in the same frame (which are processed in
+      // order) can use those results. Without this, a later at-op that
+      // reads `%prev_at#k` would clone into hw with a dangling operand
+      // because the at-result hadn't been bound yet.
+      auto atYield = atOp.getYieldOp();
+      for (auto [res, val] :
+           llvm::zip(atOp.getResults(), atYield.getOperands())) {
+        if (localMapping.lookupOrNull(res))
+          continue;
+        if (auto mapped = localMapping.lookupOrNull(val))
+          localMapping.map(res, mapped);
       }
     }
     return success();
@@ -1903,9 +2044,18 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
             for (Value v : it->second)
               childVals.push_back(v);
         }
+        // Child values may include iter-arg passthrough results that the
+        // downstream consumer doesn't want (e.g. a pipeline with
+        // `results(counter_next, accumulator)` is followed by
+        // `await … -> i32` that only picks up the accumulator). Right-align
+        // the await's result list to the tail of the child-value list so
+        // those leading iter-arg values fall off.
+        unsigned offset = childVals.size() > awaitOp.getNumResults()
+                               ? childVals.size() - awaitOp.getNumResults()
+                               : 0;
         for (auto [idx, res] : llvm::enumerate(awaitOp.getResults())) {
-          if (idx < childVals.size())
-            localMapping.map(res, childVals[idx]);
+          if (offset + idx < childVals.size())
+            localMapping.map(res, childVals[offset + idx]);
         }
       }
     }
@@ -1957,9 +2107,12 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       childInputs.push_back(frameChildStart);
       for (Value cap : childCaptured)
         childInputs.push_back(localMapping.lookup(cap));
-      for (auto &memInfo : memrefArgs)
-        childInputs.push_back(
-            perFramePorts[frameIdx][memInfo.originalArg].rdData);
+      for (auto &memInfo : memrefArgs) {
+        bool hasRdInput = memInfo.isAmcPort ? memInfo.isRead : true;
+        if (hasRdInput)
+          childInputs.push_back(
+              perFramePorts[frameIdx][memInfo.originalArg].rdData);
+      }
 
       auto childInst = hw::InstanceOp::create(
           hw, loc, childModule,
@@ -2005,17 +2158,24 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       // actually fire while the child is running.
       Value childActive = fsmChildActives[waitIdx];
       for (auto &memInfo : memrefArgs) {
-        auto widths = getDimAddrWidths(memInfo.memType);
+        auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
         SmallVector<Value> childAddrs;
         for (unsigned d = 0; d < widths.size(); ++d)
           childAddrs.push_back(childInst.getResult(outIdx++));
-        Value childWrData = childInst.getResult(outIdx++);
-        Value childWrEn = childInst.getResult(outIdx++);
+        Value childRdEn = memInfo.requiresRdEn
+                              ? childInst.getResult(outIdx++)
+                              : Value();
+        bool emitWrite = memInfo.isAmcPort ? memInfo.isWrite : true;
+        Value childWrData, childWrEn;
+        if (emitWrite) {
+          childWrData = childInst.getResult(outIdx++);
+          childWrEn = childInst.getResult(outIdx++);
+        }
 
         auto &ports = perFramePorts[frameIdx][memInfo.originalArg];
         if (ports.addrs.size() != widths.size())
           ports.addrs.assign(widths.size(), Value());
-        Type dataType = memInfo.memType.getElementType();
+        Type dataType = memInfo.elementType;
         for (auto [d, w] : llvm::enumerate(widths)) {
           Type addrType = IntegerType::get(ctx, w);
           Value myAddr = ports.addrs[d] ? ports.addrs[d]
@@ -2023,14 +2183,22 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           ports.addrs[d] = comb::MuxOp::create(hw, loc, childActive,
                                                 childAddrs[d], myAddr);
         }
-        Value myWrData = ports.wrData ? ports.wrData
-            : hw::ConstantOp::create(hw, loc, dataType, 0);
-        Value myWrEn = ports.wrEn ? ports.wrEn
-            : hw::ConstantOp::create(hw, loc, i1, 0);
-        ports.wrData =
-            comb::MuxOp::create(hw, loc, childActive, childWrData, myWrData);
-        ports.wrEn =
-            comb::MuxOp::create(hw, loc, childActive, childWrEn, myWrEn);
+        if (memInfo.requiresRdEn) {
+          Value myRdEn = ports.rdEn ? ports.rdEn
+              : hw::ConstantOp::create(hw, loc, i1, 0);
+          ports.rdEn =
+              comb::MuxOp::create(hw, loc, childActive, childRdEn, myRdEn);
+        }
+        if (emitWrite) {
+          Value myWrData = ports.wrData ? ports.wrData
+              : hw::ConstantOp::create(hw, loc, dataType, 0);
+          Value myWrEn = ports.wrEn ? ports.wrEn
+              : hw::ConstantOp::create(hw, loc, i1, 0);
+          ports.wrData =
+              comb::MuxOp::create(hw, loc, childActive, childWrData, myWrData);
+          ports.wrEn =
+              comb::MuxOp::create(hw, loc, childActive, childWrEn, myWrEn);
+        }
       }
     } else if (node.framePipelineIdx[frameIdx] >= 0) {
       // This frame contains a pipeline child.
@@ -2280,7 +2448,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     Block *hwBody, IRMapping &mapping, Value clk, Value rst,
     Value startSignal, StringRef namePrefix, Value &doneSignal,
     DenseMap<Value, MemPortMapping> &memPorts,
-    ArrayRef<MemrefArgInfo> memrefArgs) {
+    ArrayRef<PortArgInfo> memrefArgs) {
 
   auto *ctx = builder.getContext();
 
@@ -2486,14 +2654,30 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       }
 
       LogicalResult opResult = success();
-      if (auto storeOp = dyn_cast<LoopScheduleStoreOp>(&op)) {
-        opResult = handleStore(storeOp, hwBuilder, mapping,
-                               stageCE[stageIdx], perStagePorts[stageIdx]);
-      } else if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(&op)) {
-        if (isLocalMemref(loadOp.getMemRef()))
+      if (auto storeOp =
+              dyn_cast<loopschedule::HWStoreLoweringInterface>(&op)) {
+        opResult = handleHWStore(storeOp, hwBuilder, mapping,
+                                    stageCE[stageIdx],
+                                    perStagePorts[stageIdx]);
+      } else if (auto loadOp =
+                     dyn_cast<loopschedule::HWLoadLoweringInterface>(&op)) {
+        // Local-memref latency correction still keys off the concrete
+        // LoopScheduleLoadOp since isLocalMemref checks the memref arg
+        // table. Cast separately to preserve that behavior.
+        if (auto ls = dyn_cast<LoopScheduleLoadOp>(&op))
+          if (isLocalMemref(ls.getMemRef()))
+            localLoadResults.insert(ls.getResult());
+        // Amc-style ports (with explicit rd_en) carry their own read
+        // latency via the backing memory module's `seq.read` — the
+        // result Value already reflects the delayed read, so skip the
+        // extra pipeline-stage register below. Without this, an amc.load
+        // result would double-register (once in the memory, once in the
+        // stage) and all downstream consumers see iteration N-1's value.
+        if (loadOp.requiresReadEnable() && loadOp.getReadLatency() > 0)
           localLoadResults.insert(loadOp.getResult());
         opResult =
-            handleLoad(loadOp, hwBuilder, mapping, perStagePorts[stageIdx]);
+            handleHWLoad(loadOp, hwBuilder, mapping,
+                           perStagePorts[stageIdx], stageCE[stageIdx]);
       } else if (isa<LoopScheduleYieldOp,
                      LoopScheduleIterArgUpdateOp>(&op)) {
         // skip — the pipeline-stage epilogue handles the yield/iter_arg
@@ -2706,7 +2890,9 @@ static hw::HWModuleOp createHWModule(
       inputIdx++;
       ports.push_back({{builder.getStringAttr(baseName + "_rd_data"), dataType,
                          hw::ModulePort::Direction::Input}});
-      appendMemrefOutputPorts(builder, baseName, memType, ports);
+      PortArgInfo info = makePortArgInfoFromMemref(arg, memType,
+                                                    /*isLocalMem=*/false);
+      appendPortOutputPorts(builder, baseName, info, ports);
     } else {
       ports.push_back(
           {{builder.getStringAttr("arg" + std::to_string(idx)), arg.getType(),
@@ -2785,7 +2971,9 @@ static void buildHWOutput(func::FuncOp funcOp, OpBuilder &builder,
     auto memType = dyn_cast<MemRefType>(arg.getType());
     if (!memType)
       continue;
-    appendMemrefOutputValues(builder, loc, memType, arg, memPortMap, outputs);
+    PortArgInfo info = makePortArgInfoFromMemref(arg, memType,
+                                                  /*isLocalMem=*/false);
+    appendPortOutputValues(builder, loc, info, arg, memPortMap, outputs);
   }
 
   outputs.push_back(doneSignal);
@@ -2842,8 +3030,11 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
 
   builder.setInsertionPointToEnd(hwBody);
 
-  // Clone non-loopschedule ops (constants, etc.), skipping allocs.
+  // Clone non-loopschedule ops (constants, etc.), skipping allocs and
+  // memory-instance-lowering ops (each emits its own hw.instance /
+  // primitives below).
   SmallVector<memref::AllocOp> localAllocs;
+  SmallVector<loopschedule::HWMemoryInstanceLoweringInterface> instanceOps;
   for (auto &op : funcOp.getBody().front()) {
     if (isa<func::ReturnOp>(&op))
       continue;
@@ -2852,6 +3043,11 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
       continue;
     if (auto allocOp = dyn_cast<memref::AllocOp>(&op)) {
       localAllocs.push_back(allocOp);
+      continue;
+    }
+    if (auto instOp =
+            dyn_cast<loopschedule::HWMemoryInstanceLoweringInterface>(&op)) {
+      instanceOps.push_back(instOp);
       continue;
     }
     builder.clone(op, mapping);
@@ -2906,22 +3102,67 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
                         wrEnBE});
   }
 
+  // Lower each memory-instance op (e.g. amc.instance). Each op owns the
+  // creation of its hw.instance and registers per-port signal bundles.
+  SymbolTable modSymTab(enclosingModule);
+  loopschedule::HWMemoryLoweringState memInstState(clk, rst, funcBB,
+                                                    modSymTab);
+  for (auto instOp : instanceOps) {
+    if (failed(instOp.lowerToHW(builder, memInstState)))
+      return failure();
+  }
+  // Merge the per-port signal bundles into the pass's unified
+  // MemPortMapping table: rdData is driven by the instance, address /
+  // write-data / write-enable / read-enable are left for loads and stores
+  // to populate, and the instance's input backedges will be resolved
+  // against the final drives at end-of-lowering.
+  for (auto &[portValue, signals] : memInstState.portMap) {
+    MemPortMapping mp;
+    mp.rdData = signals.rdData;
+    mp.addrs.assign(signals.addrs.size(), Value());
+    memPortMap[portValue] = mp;
+  }
+
   // Collect top-level frames.
   SmallVector<LoopScheduleFrameOp> topFrames;
   for (auto &op : funcOp.getBody().front())
     if (auto frameOp = dyn_cast<LoopScheduleFrameOp>(&op))
       topFrames.push_back(frameOp);
 
-  // Collect memref argument info for threading through modules.
-  SmallVector<MemrefArgInfo> memrefArgs;
+  // Collect port-arg info for threading through child modules: memref
+  // function arguments, local memref allocs, and amc.instance ports.
+  SmallVector<PortArgInfo> memrefArgs;
   for (auto arg : funcOp.getArguments()) {
     if (auto memType = dyn_cast<MemRefType>(arg.getType()))
-      memrefArgs.push_back({arg, memType});
+      memrefArgs.push_back(
+          makePortArgInfoFromMemref(arg, memType, /*isLocalMem=*/false));
   }
-  // Add local allocs to memrefArgs so they're threaded through child modules.
   for (auto allocOp : localAllocs) {
-    memrefArgs.push_back({allocOp.getResult(), allocOp.getType(),
-                          /*isLocalMem=*/true});
+    memrefArgs.push_back(makePortArgInfoFromMemref(allocOp.getResult(),
+                                                    allocOp.getType(),
+                                                    /*isLocalMem=*/true));
+  }
+  // Ports registered by each amc.instance (via HWMemoryInstanceLoweringInterface).
+  for (auto &[portValue, signals] : memInstState.portMap) {
+    PortArgInfo info;
+    info.originalArg = portValue;
+    info.isAmcPort = true;
+    info.latency = signals.latency;
+    // Each signal bundle carries addr Values whose types give us widths;
+    // shape is informational (not used once addrWidths is set).
+    info.addrWidths.reserve(signals.addrs.size());
+    for (Value a : signals.addrs)
+      info.addrWidths.push_back(cast<IntegerType>(a.getType()).getWidth());
+    info.isRead = signals.rdData != Value();
+    info.isWrite = signals.wrEn != Value();
+    info.requiresRdEn = signals.rdEn != Value();
+    // Element type is whatever the instance publishes as rdData or wrData;
+    // at least one of them is present for a useful port.
+    if (info.isRead)
+      info.elementType = signals.rdData.getType();
+    else if (info.isWrite)
+      info.elementType = signals.wrData.getType();
+    memrefArgs.push_back(std::move(info));
   }
 
   // --- Multi-frame path ---
@@ -3066,9 +3307,14 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
             for (Value v : it->second)
               childVals.push_back(v);
         }
+        // Right-align: see the twin `processAwaitRegion` in the
+        // sequential path for the rationale.
+        unsigned offset = childVals.size() > awaitOp.getNumResults()
+                               ? childVals.size() - awaitOp.getNumResults()
+                               : 0;
         for (auto [idx, res] : llvm::enumerate(awaitOp.getResults())) {
-          if (idx < childVals.size())
-            mapping.map(res, childVals[idx]);
+          if (offset + idx < childVals.size())
+            mapping.map(res, childVals[offset + idx]);
         }
       }
     }
@@ -3088,6 +3334,11 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   // with launch-holder ats in the same frame. A launch-holder at is one
   // whose body is just a launch (+ yield); those are skipped entirely.
   auto cloneFrameAtBodies = [&](LoopScheduleFrameOp frame) -> LogicalResult {
+    // Gating for static stores/loads emitted in this frame's at-bodies is
+    // tied high — the top-level func has no FSM above it, so the op
+    // always fires when the frame is active.
+    Value preGate =
+        hw::ConstantOp::create(builder, loc, builder.getI1Type(), 1);
     for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
       bool isLaunchHolder = false;
       for (auto &op : atOp.getBodyBlock()) {
@@ -3102,9 +3353,38 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp,
                 LoopScheduleLaunchOp>(&op))
           continue;
+        // Memory ops must flow through the HW store/load interface so
+        // their memref operands get rewritten to the memPortMap ports
+        // instead of leaking into the cloned output as dangling
+        // references to the (about-to-be-erased) func-op's block args.
+        if (auto storeOp =
+                dyn_cast<loopschedule::HWStoreLoweringInterface>(&op)) {
+          if (failed(handleHWStore(storeOp, builder, mapping, preGate,
+                                      memPortMap)))
+            return failure();
+          continue;
+        }
+        if (auto loadOp =
+                dyn_cast<loopschedule::HWLoadLoweringInterface>(&op)) {
+          if (failed(handleHWLoad(loadOp, builder, mapping, memPortMap,
+                                     preGate)))
+            return failure();
+          continue;
+        }
         if (failed(emitComputeOp(&op, builder, mapping, enclosingModule, clk,
                                   rst)))
           return failure();
+      }
+      // Eagerly map this at-op's external results so later at-ops in the
+      // same frame (e.g. a pipeline-launch-holder at a later offset)
+      // can resolve any operands that reference them.
+      auto atYield = atOp.getYieldOp();
+      for (auto [res, val] :
+           llvm::zip(atOp.getResults(), atYield.getOperands())) {
+        if (mapping.lookupOrNull(res))
+          continue;
+        if (auto mapped = mapping.lookupOrNull(val))
+          mapping.map(res, mapped);
       }
     }
     return success();
@@ -3152,8 +3432,11 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
       childInputs.push_back(childStartSignals[childIndexForEntry[ei]]);
       for (Value cap : childCaptured)
         childInputs.push_back(mapping.lookup(cap));
-      for (auto &memInfo : memrefArgs)
-        childInputs.push_back(memPortMap[memInfo.originalArg].rdData);
+      for (auto &memInfo : memrefArgs) {
+        bool hasRdInput = memInfo.isAmcPort ? memInfo.isRead : true;
+        if (hasRdInput)
+          childInputs.push_back(memPortMap[memInfo.originalArg].rdData);
+      }
 
       auto childInst = hw::InstanceOp::create(
           builder, loc, childModule,
@@ -3192,12 +3475,17 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
       // Extract child memory outputs into per-entry ports.
       for (auto &memInfo : memrefArgs) {
         auto &mp = perEntryPorts[ei][memInfo.originalArg];
-        auto widths = getDimAddrWidths(memInfo.memType);
+        auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
         mp.addrs.assign(widths.size(), Value());
         for (unsigned d = 0; d < widths.size(); ++d)
           mp.addrs[d] = childInst.getResult(outIdx++);
-        mp.wrData = childInst.getResult(outIdx++);
-        mp.wrEn = childInst.getResult(outIdx++);
+        if (memInfo.requiresRdEn)
+          mp.rdEn = childInst.getResult(outIdx++);
+        bool emitWrite = memInfo.isAmcPort ? memInfo.isWrite : true;
+        if (emitWrite) {
+          mp.wrData = childInst.getResult(outIdx++);
+          mp.wrEn = childInst.getResult(outIdx++);
+        }
       }
 
     } else if (entry.kind == 1) {
@@ -3345,6 +3633,50 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
         : hw::ConstantOp::create(builder, loc, dataType, 0));
     be.wrEnBE.setValue(ports.wrEn ? ports.wrEn
         : hw::ConstantOp::create(builder, loc, i1, 0));
+  }
+
+  // Resolve memory-instance backedges (per-port addr / rdEn / wrData /
+  // wrEn inputs on the hw.instance) against the final drives accumulated
+  // in `memPortMap`. Unset slots tie to safe defaults (read-enable
+  // defaults high; addr / write-data / write-enable default to zero).
+  for (auto &pb : memInstState.pendingBackedges) {
+    auto it = memPortMap.find(pb.portValue);
+    Value resolved;
+    Type beTy = Value(pb.be).getType();
+    auto makeZero = [&]() {
+      return hw::ConstantOp::create(builder, loc, beTy, 0);
+    };
+    auto makeOne = [&]() {
+      return hw::ConstantOp::create(builder, loc, beTy, 1);
+    };
+    using Kind = loopschedule::PortBackedge::Kind;
+    switch (pb.kind) {
+    case Kind::Addr: {
+      if (it != memPortMap.end() && pb.addrIdx < it->second.addrs.size() &&
+          it->second.addrs[pb.addrIdx]) {
+        resolved = resizeIntTo(builder, loc, it->second.addrs[pb.addrIdx],
+                                cast<IntegerType>(beTy).getWidth());
+      } else {
+        resolved = makeZero();
+      }
+      break;
+    }
+    case Kind::RdEn:
+      resolved = (it != memPortMap.end() && it->second.rdEn)
+                     ? it->second.rdEn
+                     : makeOne();
+      break;
+    case Kind::WrData:
+      resolved = (it != memPortMap.end() && it->second.wrData)
+                     ? it->second.wrData
+                     : makeZero();
+      break;
+    case Kind::WrEn:
+      resolved = (it != memPortMap.end() && it->second.wrEn) ? it->second.wrEn
+                                                             : makeZero();
+      break;
+    }
+    pb.be.setValue(resolved);
   }
 
   // Build hw.output.
