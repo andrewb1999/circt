@@ -22,6 +22,7 @@ include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "circt/Dialect/LoopSchedule/LoopSchedule.td"
 include "circt/Dialect/LoopSchedule/LoopScheduleInterfaces.td"
+include "circt/Dialect/LoopSchedule/LoopScheduleLoweringInterfaces.td"
 
 class LoopScheduleOp<string mnemonic, list<Trait> traits = []> :
   Op<LoopSchedule_Dialect, mnemonic, traits>;
@@ -232,7 +233,10 @@ def LoopScheduleTerminatorOp : LoopScheduleOp<"terminator",
 def LoopScheduleLoadOp : LoopScheduleOp<"load",
      [TypesMatchWith<"result type matches element type of 'memref'",
                      "memref", "result",
-                     "::llvm::cast<MemRefType>($_self).getElementType()">
+                     "::llvm::cast<MemRefType>($_self).getElementType()">,
+      DeclareOpInterfaceMethods<HWLoadLoweringInterface,
+          ["getMemoryValue", "getAddrWidths", "getReadLatency",
+           "requiresReadEnable"]>
       ]> {
   let summary = "load operation";
   let description = [{
@@ -261,7 +265,10 @@ def LoopScheduleLoadOp : LoopScheduleOp<"load",
 def LoopScheduleStoreOp : LoopScheduleOp<"store",
      [TypesMatchWith<"type of 'value' matches element type of 'memref'",
                      "memref", "value",
-                     "::llvm::cast<MemRefType>($_self).getElementType()">
+                     "::llvm::cast<MemRefType>($_self).getElementType()">,
+      DeclareOpInterfaceMethods<HWStoreLoweringInterface,
+          ["getMemoryValue", "getValueToStore", "getAddrWidths",
+           "getWriteLatency"]>
       ]> {
   let summary = "store operation";
   let description = [{
@@ -280,8 +287,6 @@ def LoopScheduleStoreOp : LoopScheduleOp<"store",
     }]>];
 
   let extraClassDeclaration = [{
-      Value getValueToStore() { return getOperand(0); }
-
       Value getMemRef() { return getOperand(1); }
       void setMemRef(Value value) { setOperand(1, value); }
       MemRefType getMemRefType() {

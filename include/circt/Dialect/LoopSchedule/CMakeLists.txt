@@ -11,6 +11,12 @@ mlir_tablegen(LoopScheduleInterfaces.cpp.inc -gen-op-interface-defs)
 add_public_tablegen_target(CIRCTLoopScheduleInterfacesIncGen)
 add_dependencies(circt-headers CIRCTLoopScheduleInterfacesIncGen)
 
+set(LLVM_TARGET_DEFINITIONS LoopScheduleLoweringInterfaces.td)
+mlir_tablegen(LoopScheduleLoweringInterfaces.h.inc -gen-op-interface-decls)
+mlir_tablegen(LoopScheduleLoweringInterfaces.cpp.inc -gen-op-interface-defs)
+add_public_tablegen_target(CIRCTLoopScheduleLoweringInterfacesIncGen)
+add_dependencies(circt-headers CIRCTLoopScheduleLoweringInterfacesIncGen)
+
 set(LLVM_TARGET_DEFINITIONS LoopSchedule.td)
 mlir_tablegen(LoopScheduleAttributes.h.inc -gen-attrdef-decls)
 mlir_tablegen(LoopScheduleAttributes.cpp.inc -gen-attrdef-defs)

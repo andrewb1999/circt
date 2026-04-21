@@ -29,10 +29,16 @@ namespace loopschedule {
 
 LogicalResult verifyLoop(Operation *op);
 
+/// Forward declaration; defined in HWMemoryLoweringState.h. Consumers of
+/// the HWMemoryInstanceLoweringInterface::lowerToHW method include that
+/// header directly in their .cpp.
+class HWMemoryLoweringState;
+
 } // namespace loopschedule
 } // namespace circt
 
 #include "circt/Dialect/LoopSchedule/LoopScheduleInterfaces.h.inc"
+#include "circt/Dialect/LoopSchedule/LoopScheduleLoweringInterfaces.h.inc"
 
 #define GET_OP_CLASSES
 #include "circt/Dialect/LoopSchedule/LoopSchedule.h.inc"

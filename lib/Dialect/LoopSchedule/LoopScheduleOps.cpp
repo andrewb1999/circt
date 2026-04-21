@@ -606,6 +606,22 @@ LogicalResult LoopScheduleLoadOp::verify() {
   return success();
 }
 
+/// Per-dim address widths for a memref load: ceil_log2(dim_size), minimum 1.
+static SmallVector<unsigned> addrWidthsForMemref(MemRefType memTy) {
+  SmallVector<unsigned> widths;
+  widths.reserve(memTy.getRank());
+  for (int64_t d : memTy.getShape())
+    widths.push_back(d <= 1 ? 1u : (unsigned)llvm::Log2_64_Ceil((uint64_t)d));
+  return widths;
+}
+
+Value LoopScheduleLoadOp::getMemoryValue() { return getMemRef(); }
+SmallVector<unsigned> LoopScheduleLoadOp::getAddrWidths() {
+  return addrWidthsForMemref(getMemRefType());
+}
+unsigned LoopScheduleLoadOp::getReadLatency() { return 1; }
+bool LoopScheduleLoadOp::requiresReadEnable() { return false; }
+
 //===----------------------------------------------------------------------===//
 // StoreOp
 //===----------------------------------------------------------------------===//
@@ -616,6 +632,13 @@ LogicalResult LoopScheduleStoreOp::verify() {
 
   return success();
 }
+
+Value LoopScheduleStoreOp::getMemoryValue() { return getMemRef(); }
+Value LoopScheduleStoreOp::getValueToStore() { return getOperand(0); }
+SmallVector<unsigned> LoopScheduleStoreOp::getAddrWidths() {
+  return addrWidthsForMemref(getMemRefType());
+}
+unsigned LoopScheduleStoreOp::getWriteLatency() { return 1; }
 
 //===----------------------------------------------------------------------===//
 // DependenciesOp
@@ -1192,6 +1215,7 @@ LogicalResult LoopScheduleAwaitOp::verify() {
 }
 
 #include "circt/Dialect/LoopSchedule/LoopScheduleInterfaces.cpp.inc"
+#include "circt/Dialect/LoopSchedule/LoopScheduleLoweringInterfaces.cpp.inc"
 
 #define GET_OP_CLASSES
 #include "circt/Dialect/LoopSchedule/LoopSchedule.cpp.inc"

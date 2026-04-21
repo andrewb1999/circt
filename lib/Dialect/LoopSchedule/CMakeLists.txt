@@ -17,6 +17,8 @@ add_circt_dialect_library(CIRCTLoopSchedule
   MLIRArithDialect
   MLIRLoopScheduleIncGen
   CIRCTLoopScheduleAttributesIncGen
+  CIRCTLoopScheduleInterfacesIncGen
+  CIRCTLoopScheduleLoweringInterfacesIncGen
 )
 
 add_subdirectory(Transforms)
