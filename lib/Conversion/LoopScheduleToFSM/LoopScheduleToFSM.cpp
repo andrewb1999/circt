@@ -275,10 +275,13 @@ struct LoopNode {
   SmallVector<LoopSchedulePipelineOp> pipelineChildren;
   /// Per-frame list of launch slots, in at-offset order. Each slot
   /// carries either a sequential-child index (childIdx >= 0, pipIdx ==
-  /// -1) or a pipeline-child index (pipIdx >= 0, childIdx == -1).
+  /// -1) or a pipeline-child index (pipIdx >= 0, childIdx == -1), plus
+  /// the at-offset (cycle within the frame) at which its child_start
+  /// pulse fires.
   struct LaunchSlot {
     int childIdx = -1;
     int pipIdx = -1;
+    unsigned atOffset = 0;
   };
   SmallVector<SmallVector<LaunchSlot>> frameLaunches;
   bool isLeaf() const {
@@ -324,9 +327,10 @@ private:
   ///   child_start_0..C-1,
   ///   post_active_0..C-1
   fsm::MachineOp createSequentialFSM(OpBuilder &builder, Location loc,
-                                      StringRef fsmName, unsigned numFrames,
-                                      ArrayRef<unsigned> waitFrameIndices,
-                                      ArrayRef<unsigned> frameLatencies = {});
+                                     StringRef fsmName, unsigned numFrames,
+                                     ArrayRef<unsigned> waitFrameIndices,
+                                     ArrayRef<unsigned> launchAtOffsets,
+                                     ArrayRef<unsigned> frameLatencies);
 
   /// Create linear run-once FSM for sequencing top-level function frames.
   /// frameChildKind[i]: -1 = leaf, 0 = sequential child, 1 = pipeline child.
@@ -852,12 +856,13 @@ void LoopScheduleToFSMPass::buildLoopTree(
   node.frameLaunches.resize(frames.size());
 
   // Nested LoopInterface ops (seq/pipeline) are wrapped in
-  // `loopschedule.launch` siblings of `at` ops inside the frame body. Each
-  // launch contains exactly one child LoopInterface plus a yield. A frame
-  // may hold multiple launches (e.g. doitgen's q-frame: an accumulator
-  // pipeline at at-0 and a copyback pipeline at at-1); the FSM chains
-  // them in at-offset order and waits for each to report done before
-  // starting the next.
+  // `loopschedule.launch` siblings of `at` ops inside the frame body.
+  // Each launch contains exactly one child LoopInterface plus a yield.
+  // Launches at different at-offsets run concurrently: each launch's
+  // child_start pulse fires at FRAME_i_<atOffset>, and the frame's
+  // single WAIT state waits for the AND of all latched child_dones.
+  // Multiple launches at the same at-offset also run concurrently,
+  // firing their start pulses in the same cycle.
   for (auto [frameIdx, frameOp] : llvm::enumerate(frames)) {
     auto launches = loopschedule::getLaunchOpsInOrder(frameOp);
     for (auto launch : launches) {
@@ -884,6 +889,8 @@ void LoopScheduleToFSMPass::buildLoopTree(
       } else {
         continue;
       }
+      if (auto launchAt = launch->getParentOfType<LoopScheduleAtOp>())
+        slot.atOffset = (unsigned)launchAt.getOffset();
       node.frameLaunches[frameIdx].push_back(slot);
     }
   }
@@ -964,38 +971,43 @@ collectReferencedConstants(LoopScheduleSequentialOp seqOp) {
 
 fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     OpBuilder &builder, Location loc, StringRef fsmName, unsigned numFrames,
-    ArrayRef<unsigned> waitFrameIndices, ArrayRef<unsigned> frameLatencies) {
+    ArrayRef<unsigned> waitFrameIndices,
+    ArrayRef<unsigned> launchAtOffsets,
+    ArrayRef<unsigned> frameLatencies) {
   auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
 
   // Per-frame list of global wait-slot indices. A frame can hold multiple
-  // launches (e.g. doitgen's q-frame runs an accumulator pipeline and a
-  // copyback pipeline in the same frame); duplicate entries for the same
-  // frame index in `waitFrameIndices` represent launches in at-offset
-  // order.
+  // launches; `waitFrameIndices` has one entry per launch and multiple
+  // entries for the same frame index represent launches that run
+  // concurrently at their respective `launchAtOffsets[j]` cycle.
   SmallVector<SmallVector<int>> frameWaitIdx(numFrames);
   for (auto [j, i] : llvm::enumerate(waitFrameIndices)) {
     assert(i < numFrames && "wait frame index out of range");
     frameWaitIdx[i].push_back((int)j);
   }
-  // Verify non-descending order (launches of the same frame appear in
-  // at-offset order; distinct frames remain ordered).
+  // Verify non-descending frame order; within a frame, launches may
+  // appear at arbitrary at-offsets (ordering is by at-offset inside the
+  // per-frame state chain).
   for (unsigned k = 1; k < waitFrameIndices.size(); ++k)
     assert(waitFrameIndices[k - 1] <= waitFrameIndices[k] &&
            "waitFrameIndices must be sorted non-descending");
+  assert(launchAtOffsets.size() == waitFrameIndices.size() &&
+         "launchAtOffsets must have one entry per launch");
 
   unsigned numWaits = waitFrameIndices.size();
 
-  // Normalize frameLatencies — default 1 per frame.
+  // Normalize frameLatencies — default 1 per frame. Extend each
+  // wait-frame's latency so it covers the latest launch's at-offset
+  // (child_start pulses at FRAME_i_<atOffset>, which must exist).
   SmallVector<unsigned> frameLats(numFrames, 1);
   for (unsigned i = 0; i < numFrames && i < frameLatencies.size(); ++i)
     frameLats[i] = std::max(frameLatencies[i], 1u);
-  // Wait frames must be single-cycle: their body launches a child whose
-  // latency is variable, so the bucket merger is forbidden from coalescing
-  // additional ops into them. Enforce as a contract.
-  for (unsigned i = 0; i < numFrames; ++i)
-    assert((frameWaitIdx[i].empty() || frameLats[i] == 1) &&
-           "wait frame must have latency 1");
+  for (unsigned i = 0; i < numFrames; ++i) {
+    for (int j : frameWaitIdx[i])
+      frameLats[i] = std::max(frameLats[i],
+                              launchAtOffsets[(unsigned)j] + 1);
+  }
 
   // Compute the per-frame base index in the "frame_cycle" output region.
   // Frames with latency > 1 contribute L_i outputs; single-cycle frames
@@ -1075,16 +1087,21 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   auto fiVar = fsm::VariableOp::create(
       fb, loc, i1, fb.getBoolAttr(true), "first_iter");
 
-  // Helper: build output vector.
-  //   activeFrame   : index of frame_active to drive high (-1 = none)
-  //   activeChild   : index into waitFrameIndices for child_start (-1 = none)
-  //   activeLive    : index into waitFrameIndices for child_active (-1 = none)
-  //   activePost    : index into waitFrameIndices for post_active (-1 = none)
-  //   cycleFrame, cycleIdx : if cycleFrame >= 0 drives frame_cycle_<cycleFrame>_<cycleIdx>
-  auto buildOut = [&](Value done, bool iterAdv, int activeFrame,
-                      int activeChild, int activeLive,
-                      int activePost, int cycleFrame = -1,
-                      int cycleIdx = -1) -> SmallVector<Value> {
+  // Helper: build output vector. Each of the launch-indexed argument lists
+  // (child_start, child_active, post_active) selects which global launch
+  // indices should be driven high in this state.
+  //   activeFrame         : index of frame_active to drive high (-1 = none)
+  //   activeChildStarts   : launch indices whose child_start pulses
+  //   activeLive          : launch indices whose child_active is high
+  //   activePosts         : launch indices whose post_active is high
+  //   cycleFrame, cycleIdx: if cycleFrame >= 0 drives
+  //                         frame_cycle_<cycleFrame>_<cycleIdx>
+  auto buildOutSets = [&](Value done, bool iterAdv, int activeFrame,
+                          ArrayRef<unsigned> activeChildStarts,
+                          ArrayRef<unsigned> activeLive,
+                          ArrayRef<unsigned> activePosts,
+                          int cycleFrame = -1,
+                          int cycleIdx = -1) -> SmallVector<Value> {
     SmallVector<Value> v;
     v.push_back(done);
     v.push_back(fiVar);
@@ -1092,12 +1109,12 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     for (unsigned i = 0; i < numFrames; ++i)
       v.push_back((int)i == activeFrame ? trueVal : falseVal);
     for (unsigned j = 0; j < numWaits; ++j)
-      v.push_back((int)j == activeChild ? trueVal : falseVal);
+      v.push_back(llvm::is_contained(activeChildStarts, j) ? trueVal
+                                                           : falseVal);
     for (unsigned j = 0; j < numWaits; ++j)
-      v.push_back((int)j == activeLive ? trueVal : falseVal);
+      v.push_back(llvm::is_contained(activeLive, j) ? trueVal : falseVal);
     for (unsigned j = 0; j < numWaits; ++j)
-      v.push_back((int)j == activePost ? trueVal : falseVal);
-    // Per-cycle outputs (multi-cycle frames only).
+      v.push_back(llvm::is_contained(activePosts, j) ? trueVal : falseVal);
     for (unsigned i = 0; i < numFrames; ++i) {
       if (cycleOutBase[i] < 0)
         continue;
@@ -1108,25 +1125,33 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     }
     return v;
   };
+  // Convenience single-index wrapper (negative = empty).
+  auto buildOut = [&](Value done, bool iterAdv, int activeFrame,
+                      int activeChild, int activeLive,
+                      int activePost, int cycleFrame = -1,
+                      int cycleIdx = -1) -> SmallVector<Value> {
+    SmallVector<unsigned> starts, lives, posts;
+    if (activeChild >= 0) starts.push_back((unsigned)activeChild);
+    if (activeLive >= 0)  lives.push_back((unsigned)activeLive);
+    if (activePost >= 0)  posts.push_back((unsigned)activePost);
+    return buildOutSets(done, iterAdv, activeFrame, starts, lives, posts,
+                        cycleFrame, cycleIdx);
+  };
 
-  // State-name helpers. A frame with W launches generates W
-  // FRAME_i_<s> / WAIT_i_<s> / POST_i_<s> triples chained in at-offset
-  // order; the LAST POST transitions to the next frame (or COND). A
-  // frame with zero launches keeps its single FRAME_i state.
-  auto frameStateName = [&](unsigned i, unsigned slot) -> std::string {
-    if (frameWaitIdx[i].size() <= 1)
+  // State-name helpers. Every frame has L_i cycle states plus (if it
+  // has launches) a single shared WAIT_i and POST_i. Single-cycle
+  // frames name their sole cycle state FRAME_i (no suffix); multi-cycle
+  // frames use FRAME_i_<c>.
+  auto frameStateName = [&](unsigned i, unsigned c) -> std::string {
+    if (frameLats[i] <= 1)
       return "FRAME_" + std::to_string(i);
-    return "FRAME_" + std::to_string(i) + "_" + std::to_string(slot);
+    return "FRAME_" + std::to_string(i) + "_" + std::to_string(c);
   };
-  auto waitStateName = [&](unsigned i, unsigned slot) -> std::string {
-    if (frameWaitIdx[i].size() <= 1)
-      return "WAIT_" + std::to_string(i);
-    return "WAIT_" + std::to_string(i) + "_" + std::to_string(slot);
+  auto waitStateName = [&](unsigned i) -> std::string {
+    return "WAIT_" + std::to_string(i);
   };
-  auto postStateName = [&](unsigned i, unsigned slot) -> std::string {
-    if (frameWaitIdx[i].size() <= 1)
-      return "POST_" + std::to_string(i);
-    return "POST_" + std::to_string(i) + "_" + std::to_string(slot);
+  auto postStateName = [&](unsigned i) -> std::string {
+    return "POST_" + std::to_string(i);
   };
 
   // --- IDLE ---
@@ -1173,144 +1198,156 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     fsm::TransitionOp::create(fb, loc, StringRef("COND"));
   };
 
-  // Transition target that leaves the current frame: either the first
-  // state of the next frame, or COND if this was the last frame.
-  auto leaveFrameTarget = [&](unsigned i) -> std::string {
-    if (i + 1 == numFrames)
-      return "FRAME_0"; // unused — last frame goes to COND via
-                          // emitLastFrameTransition
-    return frameStateName(i + 1, 0);
-  };
-
-  // --- FRAME_i (+ chained WAIT/POST states for each launch slot) ---
+  // --- FRAME_i cycle states (+ WAIT_i/POST_i for frames with launches) ---
+  //
+  // Every frame emits L_i sequential states FRAME_i_0 → FRAME_i_1 →
+  // ... → FRAME_i_{L-1}. At cycle c:
+  //   - any launch j with atOffset == c pulses child_start_j
+  //   - any launch j with atOffset <= c has child_active_j high
+  //   - static at-K ops use frame_cycle_i_K as their gate
+  //
+  // If the frame has launches, the last cycle state transitions to a
+  // single WAIT_i (guarded on the AND of all latched child_dones in
+  // this frame — latching is done in the hardware wrapper), then
+  // POST_i (1-cycle settle). Otherwise the last cycle state transitions
+  // directly to the next frame (or COND for the last frame).
+  //
+  // iter_advance fires in POST_i of the last frame (if it has
+  // launches) or the last cycle state of the last frame (if it
+  // doesn't).
+  //
+  // Multiple launches in the same frame run concurrently: each fires
+  // its start pulse at its own atOffset, and the single WAIT waits for
+  // all of them to finish. Launches at the same atOffset fire in the
+  // same cycle.
   for (unsigned i = 0; i < numFrames; ++i) {
-    bool isWait = !frameWaitIdx[i].empty();
     bool isLast = (i + 1 == numFrames);
     unsigned L = frameLats[i];
+    bool frameHasLaunch = !frameWaitIdx[i].empty();
 
-    if (isWait) {
-      // Emit FRAME_i_<s> / WAIT_i_<s> / POST_i_<s> for each launch
-      // slot s, chained in at-offset order. iter_advance fires in the
-      // LAST POST of the last frame only.
-      for (unsigned s = 0; s < frameWaitIdx[i].size(); ++s) {
-        bool isLastSlot = (s + 1 == frameWaitIdx[i].size());
-        int waitIdx = frameWaitIdx[i][s];
-        std::string fName = frameStateName(i, s);
-        std::string wName = waitStateName(i, s);
-        std::string pName = postStateName(i, s);
-        std::string nextAfterPost =
-            isLastSlot ? (isLast ? std::string("COND")
-                                  : leaveFrameTarget(i))
-                       : frameStateName(i, s + 1);
+    // Precompute per-cycle start/live lists for this frame.
+    // frameWaitIdx[i] holds global launch indices for launches in frame i;
+    // launchAtOffsets[j] is the at-offset for launch j.
+    SmallVector<SmallVector<unsigned>> startsPerCycle(L);
+    SmallVector<SmallVector<unsigned>> livesPerCycle(L);
+    for (int j : frameWaitIdx[i]) {
+      unsigned o = launchAtOffsets[(unsigned)j];
+      if (o < L)
+        startsPerCycle[o].push_back((unsigned)j);
+      for (unsigned c = o; c < L; ++c)
+        livesPerCycle[c].push_back((unsigned)j);
+    }
+    SmallVector<unsigned> allLaunches;
+    for (int j : frameWaitIdx[i])
+      allLaunches.push_back((unsigned)j);
 
-        // FRAME_i_<s>: 1-cycle pulse that fires child_start for this slot.
-        auto fSt = fsm::StateOp::create(fb, loc, fName);
-        Block *fOb = fSt.ensureOutput(fb);
-        fOb->getTerminator()->erase();
-        fb.setInsertionPointToEnd(fOb);
-        fsm::OutputOp::create(
-            fb, loc,
-            buildOut(falseVal, /*iterAdv=*/false, /*activeFrame=*/-1,
-                     /*activeChild=*/waitIdx, /*activeLive=*/waitIdx,
-                     /*activePost=*/-1));
-        Block *fTb = &fSt.getTransitions().front();
-        fb.setInsertionPointToEnd(fTb);
-        fsm::TransitionOp::create(fb, loc, StringRef(wName));
-        fb.setInsertionPointToEnd(&machine.getBody().front());
+    std::string leaveTargetName =
+        isLast ? std::string("COND") : frameStateName(i + 1, 0);
 
-        // WAIT_i_<s>: hold until child_done_<waitIdx> fires.
-        auto wSt = fsm::StateOp::create(fb, loc, wName);
-        Block *wOb = wSt.ensureOutput(fb);
-        wOb->getTerminator()->erase();
-        fb.setInsertionPointToEnd(wOb);
-        fsm::OutputOp::create(
-            fb, loc,
-            buildOut(falseVal, /*iterAdv=*/false, /*activeFrame=*/-1,
-                     /*activeChild=*/-1, /*activeLive=*/waitIdx,
-                     /*activePost=*/-1));
-        Block *wTb = &wSt.getTransitions().front();
-        fb.setInsertionPointToEnd(wTb);
-        unsigned childDoneArgIdx = 2 + (unsigned)waitIdx;
-        fsm::TransitionOp::create(
-            fb, loc, StringRef(pName),
-            [&]() {
-              fsm::ReturnOp::create(fb, loc,
-                                    machine.getArgument(childDoneArgIdx));
-            },
-            []() {});
-        fb.setInsertionPointToEnd(&machine.getBody().front());
+    // Emit L cycle states.
+    for (unsigned c = 0; c < L; ++c) {
+      bool isLastCycle = (c + 1 == L);
+      std::string stateName = frameStateName(i, c);
+      // iter_advance fires in the LAST cycle of the LAST frame only
+      // when the frame has no launches. If the frame has launches,
+      // iter_advance fires in POST_i instead (so the iter_arg register
+      // latches the final frame result produced via the await region).
+      bool iterAdv = isLast && isLastCycle && !frameHasLaunch;
 
-        // POST_i_<s>: 1-cycle settle; iter_advance pulses only in the
-        // very last slot's POST of the last frame.
-        bool pIterAdv = isLast && isLastSlot;
-        auto pSt = fsm::StateOp::create(fb, loc, pName);
-        Block *pOb = pSt.ensureOutput(fb);
-        pOb->getTerminator()->erase();
-        fb.setInsertionPointToEnd(pOb);
-        fsm::OutputOp::create(
-            fb, loc,
-            buildOut(falseVal, pIterAdv, /*activeFrame=*/-1,
-                     /*activeChild=*/-1, /*activeLive=*/-1,
-                     /*activePost=*/waitIdx));
-        Block *pTb = &pSt.getTransitions().front();
-        fb.setInsertionPointToEnd(pTb);
-        if (isLastSlot && isLast) {
-          emitLastFrameTransition(pTb);
-        } else {
-          fsm::TransitionOp::create(fb, loc, StringRef(nextAfterPost));
-        }
-        fb.setInsertionPointToEnd(&machine.getBody().front());
-      }
-    } else if (L == 1) {
-      auto st = fsm::StateOp::create(fb, loc, frameStateName(i, 0));
+      auto st = fsm::StateOp::create(fb, loc, stateName);
       Block *ob = st.ensureOutput(fb);
       ob->getTerminator()->erase();
       fb.setInsertionPointToEnd(ob);
-      bool iterAdv = isLast;
+      // Wait frames keep frame_active_i low during their cycle states
+      // (legacy behavior: for wait frames, "active" is expressed via
+      // child_active_j spanning from the launch's at-offset through
+      // WAIT_i). Non-wait frames drive frame_active_i high.
+      int activeFrameIdx = frameHasLaunch ? -1 : (int)i;
       fsm::OutputOp::create(
           fb, loc,
-          buildOut(falseVal, iterAdv, /*activeFrame=*/(int)i,
-                   /*activeChild=*/-1, /*activeLive=*/-1,
-                   /*activePost=*/-1));
+          buildOutSets(falseVal, iterAdv, /*activeFrame=*/activeFrameIdx,
+                       /*activeChildStarts=*/startsPerCycle[c],
+                       /*activeLive=*/livesPerCycle[c],
+                       /*activePosts=*/{},
+                       /*cycleFrame=*/cycleOutBase[i] >= 0 ? (int)i : -1,
+                       /*cycleIdx=*/cycleOutBase[i] >= 0 ? (int)c : -1));
       Block *tb = &st.getTransitions().front();
+      fb.setInsertionPointToEnd(tb);
+      if (!isLastCycle) {
+        fsm::TransitionOp::create(fb, loc,
+                                  StringRef(frameStateName(i, c + 1)));
+      } else if (frameHasLaunch) {
+        fsm::TransitionOp::create(fb, loc, StringRef(waitStateName(i)));
+      } else if (isLast) {
+        emitLastFrameTransition(tb);
+      } else {
+        fsm::TransitionOp::create(fb, loc, StringRef(leaveTargetName));
+      }
+      fb.setInsertionPointToEnd(&machine.getBody().front());
+    }
+
+    if (!frameHasLaunch)
+      continue;
+
+    // WAIT_i: hold while any launch is still running. child_active_j
+    // stays high for every launch in this frame. Transition guard: AND
+    // of all (hardware-latched) child_dones for launches in this
+    // frame. The wrapper feeds a latched signal into child_done_<j> so
+    // that a launch which finished early still reports done while WAIT
+    // is sampling.
+    {
+      auto wSt = fsm::StateOp::create(fb, loc, waitStateName(i));
+      Block *ob = wSt.ensureOutput(fb);
+      ob->getTerminator()->erase();
+      fb.setInsertionPointToEnd(ob);
+      fsm::OutputOp::create(
+          fb, loc,
+          buildOutSets(falseVal, /*iterAdv=*/false, /*activeFrame=*/-1,
+                       /*activeChildStarts=*/{},
+                       /*activeLive=*/allLaunches,
+                       /*activePosts=*/{}));
+      Block *tb = &wSt.getTransitions().front();
+      fb.setInsertionPointToEnd(tb);
+      fsm::TransitionOp::create(
+          fb, loc, StringRef(postStateName(i)),
+          [&]() {
+            // AND of child_done_<j> for every launch in this frame.
+            Value guard;
+            for (int j : frameWaitIdx[i]) {
+              Value done = machine.getArgument(2 + (unsigned)j);
+              guard = guard ? comb::AndOp::create(fb, loc, guard, done)
+                            : done;
+            }
+            fsm::ReturnOp::create(fb, loc, guard);
+          },
+          []() {});
+      fb.setInsertionPointToEnd(&machine.getBody().front());
+    }
+
+    // POST_i: 1-cycle settle where post_active goes high for every
+    // launch in this frame. iter_advance pulses in POST_i of the last
+    // frame (the cycle where the iter_arg register actually latches
+    // the next iteration's value).
+    {
+      bool pIterAdv = isLast;
+      auto pSt = fsm::StateOp::create(fb, loc, postStateName(i));
+      Block *ob = pSt.ensureOutput(fb);
+      ob->getTerminator()->erase();
+      fb.setInsertionPointToEnd(ob);
+      fsm::OutputOp::create(
+          fb, loc,
+          buildOutSets(falseVal, pIterAdv, /*activeFrame=*/-1,
+                       /*activeChildStarts=*/{},
+                       /*activeLive=*/{},
+                       /*activePosts=*/allLaunches));
+      Block *tb = &pSt.getTransitions().front();
+      fb.setInsertionPointToEnd(tb);
       if (isLast) {
         emitLastFrameTransition(tb);
       } else {
-        fb.setInsertionPointToEnd(tb);
-        fsm::TransitionOp::create(fb, loc, StringRef(leaveFrameTarget(i)));
+        fsm::TransitionOp::create(fb, loc, StringRef(leaveTargetName));
       }
       fb.setInsertionPointToEnd(&machine.getBody().front());
-    } else {
-      std::string frameName = frameStateName(i, 0);
-      std::string nextFrameName = leaveFrameTarget(i);
-      for (unsigned c = 0; c < L; ++c) {
-        std::string subName =
-            (c == 0) ? frameName
-                     : (frameName + "_c" + std::to_string(c));
-        bool isLastSub = (c + 1 == L);
-        std::string nextSub = isLastSub
-                                  ? nextFrameName
-                                  : (frameName + "_c" + std::to_string(c + 1));
-        bool iterAdv = isLast && isLastSub;
-        auto st = fsm::StateOp::create(fb, loc, subName);
-        Block *ob = st.ensureOutput(fb);
-        ob->getTerminator()->erase();
-        fb.setInsertionPointToEnd(ob);
-        fsm::OutputOp::create(
-            fb, loc,
-            buildOut(falseVal, iterAdv, /*activeFrame=*/(int)i,
-                     /*activeChild=*/-1, /*activeLive=*/-1,
-                     /*activePost=*/-1, /*cycleFrame=*/(int)i,
-                     /*cycleIdx=*/(int)c));
-        Block *tb = &st.getTransitions().front();
-        if (isLast && isLastSub) {
-          emitLastFrameTransition(tb);
-        } else {
-          fb.setInsertionPointToEnd(tb);
-          fsm::TransitionOp::create(fb, loc, StringRef(nextSub));
-        }
-        fb.setInsertionPointToEnd(&machine.getBody().front());
-      }
     }
   }
 
@@ -1847,31 +1884,32 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   unsigned numFrames = frames.size();
 
   // Collect the global wait slots — one per launch across all frames,
-  // emitted in (frame, at-offset) order. A frame that holds multiple
-  // launches contributes multiple entries referring back to the same
-  // frame index; `frameWaitIdx[i]` lists those global wait indices.
+  // emitted in (frame, at-offset) order. `frameWaitIdx[i]` lists the
+  // global wait indices for frame i's launches; `launchAtOffsets[j]`
+  // carries launch j's at-offset (= cycle within its frame where
+  // child_start pulses).
   SmallVector<unsigned> waitFrameIndices;
+  SmallVector<unsigned> launchAtOffsets;
   SmallVector<SmallVector<int>> frameWaitIdx(numFrames);
   for (unsigned i = 0; i < numFrames; ++i) {
-    for (unsigned s = 0; s < node.numLaunches(i); ++s) {
+    for (auto &slot : node.frameLaunches[i]) {
       frameWaitIdx[i].push_back((int)waitFrameIndices.size());
       waitFrameIndices.push_back(i);
+      launchAtOffsets.push_back(slot.atOffset);
     }
   }
   unsigned numWaits = waitFrameIndices.size();
 
   // --- Compute per-frame latencies ---
-  // Multi-cycle frames arise when the scheduler's bucket merger coalesces
-  // overlapping start times into a single frame containing one or more
-  // offset-K `at` regions and/or stamps multi-cycle operator latencies.
+  // A frame's latency is max(computed latency from its body, max launch
+  // at-offset + 1). Frames with no launches use the body-derived
+  // latency; frames with launches extend to cover their latest launch.
   SmallVector<unsigned> frameLatencies(numFrames, 1);
   for (unsigned i = 0; i < numFrames; ++i) {
-    if (!frameWaitIdx[i].empty()) {
-      // Wait frames must be 1 (the bucket merger refuses to merge into them).
-      frameLatencies[i] = 1;
-      continue;
-    }
     frameLatencies[i] = computeFrameLatency(frames[i]);
+    for (int j : frameWaitIdx[i])
+      frameLatencies[i] = std::max(frameLatencies[i],
+                                    launchAtOffsets[(unsigned)j] + 1);
   }
   // Per-frame base index in the FSM's appended cycle-output region.
   SmallVector<int> frameCycleOutBase(numFrames, -1);
@@ -1887,7 +1925,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   std::string fsmName = node.prefix + "_fsm";
   builder.setInsertionPointToEnd(moduleOp.getBody());
   (void)createSequentialFSM(builder, loc, fsmName, numFrames, waitFrameIndices,
-                            frameLatencies);
+                            launchAtOffsets, frameLatencies);
 
   // --- Create FSM instance with backedges ---
   hw.setInsertionPointToEnd(hwBody);
@@ -1933,6 +1971,49 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   SmallVector<Value> fsmPostActives(numWaits);
   for (unsigned j = 0; j < numWaits; ++j)
     fsmPostActives[j] = inst.getResult(3 + numFrames + 2 * numWaits + j);
+
+  // SR-latch every raw child_done so concurrent launches that finish at
+  // different cycles all contribute to the WAIT_i AND guard. The latch
+  // sets on the raw done (covers both level-held pip_done and
+  // 1-cycle-pulse sequential-child done) and resets on the launch's
+  // own child_start (next iteration). The wrapper returns a
+  // combinational OR of rawDone with the held register, so WAIT_i
+  // still sees "done" on the SAME cycle rawDone fires — matching
+  // pre-latch timing for single-launch frames while still covering
+  // the race case where a concurrent launch finishes early.
+  //
+  // Register creation is pinned to the module body (hwBody), not the
+  // wandering hw.setInsertionPoint during per-frame lowering.
+  auto latchDone = [&](Value rawDone, Value childStart,
+                       StringRef name) -> Value {
+    // Signals:
+    //   fed       = (rawDone | reg) & ~childStart     -- combinational
+    //   reg_next  = fed
+    // The AND-with-~childStart is the crucial reset: when a new
+    // iteration begins, childStart pulses and fed goes 0 in that
+    // cycle even if rawDone is still held high from the previous
+    // iteration (e.g. pip_done, which resets one cycle after
+    // child_start fires). Without this reset the register would
+    // never clear between iterations for pipelines whose done is a
+    // held level, causing WAIT_i to transition immediately on the
+    // next iteration.
+    OpBuilder savedBuilder(hw.getContext());
+    savedBuilder.setInsertionPointToEnd(hwBody);
+    Value falseConstHere =
+        hw::ConstantOp::create(savedBuilder, loc, i1, 0);
+    Backedge nextBE = bb.get(i1);
+    auto reg = seq::CompRegOp::create(savedBuilder, loc, Value(nextBE), clk,
+                                       rst, falseConstHere,
+                                       savedBuilder.getStringAttr(name));
+    Value notStart =
+        comb::createOrFoldNot(savedBuilder, loc, childStart);
+    Value rawOrReg =
+        comb::OrOp::create(savedBuilder, loc, rawDone, reg);
+    Value fed =
+        comb::AndOp::create(savedBuilder, loc, rawOrReg, notStart);
+    nextBE.setValue(fed);
+    return fed;
+  };
   // Per-frame per-cycle gates. For single-cycle frames the gate vector
   // contains just the frame's overall frame_active signal; for multi-cycle
   // frames it contains the L_i dedicated frame_cycle_<i>_<c> outputs.
@@ -2185,7 +2266,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
           unsigned outIdx = 0;
           Value childDone = childInst.getResult(outIdx++);
-          childDoneBEs[waitIdx].setValue(childDone);
+          childDoneBEs[waitIdx].setValue(latchDone(
+              childDone, slotChildStart,
+              childNode.prefix + "_done_latch"));
 
           SmallVector<Value> childResultVals;
           for (auto result : childSeqOp.getResults()) {
@@ -2347,7 +2430,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
               }
             }
           }
-          childDoneBEs[waitIdx].setValue(pipDone);
+          childDoneBEs[waitIdx].setValue(
+              latchDone(pipDone, slotChildStart,
+                        pipPrefix + "_done_latch"));
 
           // Stash pipeline's results under the launch's handle (for any
           // future await-with-value in a later frame). Also propagate through

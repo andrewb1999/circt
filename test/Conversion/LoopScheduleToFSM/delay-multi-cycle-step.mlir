@@ -47,10 +47,10 @@ module {
 }
 
 // CHECK: fsm.machine @loop0_fsm
-// First sub-state keeps the frame name as the entry.
-// CHECK-DAG: fsm.state @FRAME_0
-// CHECK-DAG: fsm.state @FRAME_0_c1
-// CHECK-DAG: fsm.state @FRAME_0_c2
+// Multi-cycle frames expand into FRAME_<i>_<c> sub-states.
+// CHECK-DAG: fsm.state @FRAME_0_0
+// CHECK-DAG: fsm.state @FRAME_0_1
+// CHECK-DAG: fsm.state @FRAME_0_2
 // Result names should expose the per-cycle gates.
 // CHECK-DAG: frame_cycle_0_0
 // CHECK-DAG: frame_cycle_0_1
