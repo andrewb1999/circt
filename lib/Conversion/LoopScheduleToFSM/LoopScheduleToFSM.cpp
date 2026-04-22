@@ -749,35 +749,41 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
            "issue cycle exceeds enclosing frame latency");
     return cycleGates[c];
   };
+  // Recursive body-processor: handles ops including nested
+  // `loopschedule.if` by AND'ing the condition into the store/load
+  // gates for body ops. See the pipeline-stage counterpart in
+  // lowerPipelineChild for the same pattern.
+  std::function<LogicalResult(Operation *, Value)> processOp =
+      [&](Operation *inner, Value gate) -> LogicalResult {
+    if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(inner))
+      return success();
+    if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp,
+            LoopScheduleLaunchOp>(inner))
+      return success();
+    if (auto ifOp = dyn_cast<LoopScheduleIfOp>(inner)) {
+      Value cond = mapping.lookup(ifOp.getCond());
+      Value innerGate = comb::AndOp::create(builder, inner->getLoc(),
+                                              gate, cond);
+      for (auto &nested : ifOp.getBody().front()) {
+        if (auto yieldOp = dyn_cast<LoopScheduleYieldOp>(&nested)) {
+          for (auto [res, val] :
+               llvm::zip(ifOp.getResults(), yieldOp.getOperands()))
+            mapping.map(res, mapping.lookup(val));
+          continue;
+        }
+        if (failed(processOp(&nested, innerGate)))
+          return failure();
+      }
+      return success();
+    }
+    if (auto storeOp = dyn_cast<HWStoreLoweringInterface>(inner))
+      return handleHWStore(storeOp, builder, mapping, gate, memPorts);
+    if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner))
+      return handleHWLoad(loadOp, builder, mapping, memPorts, gate);
+    return emitComputeOp(inner, builder, mapping, moduleOp, clk, rst);
+  };
   for (auto &op : *body) {
-    if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(&op))
-      continue;
-    // Nested sequential/pipeline ops are handled at the frame level by the
-    // wait-frame path in lowerLoopNodeAsModule; they should not be reached
-    // through this leaf path.
-    if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(&op))
-      continue;
-    // Launches inside ats are lowered via the frame-entry path (a launch's
-    // offset is its parent at's offset; the launch itself becomes an FSM
-    // child_start assertion), not here.
-    if (isa<LoopScheduleLaunchOp>(&op))
-      continue;
-
-    if (auto storeOp = dyn_cast<loopschedule::HWStoreLoweringInterface>(&op)) {
-      if (failed(handleHWStore(storeOp, builder, mapping,
-                                 pickGate(baseCycle), memPorts)))
-        return failure();
-      continue;
-    }
-
-    if (auto loadOp = dyn_cast<loopschedule::HWLoadLoweringInterface>(&op)) {
-      if (failed(handleHWLoad(loadOp, builder, mapping, memPorts,
-                                pickGate(baseCycle))))
-        return failure();
-      continue;
-    }
-
-    if (failed(emitComputeOp(&op, builder, mapping, moduleOp, clk, rst)))
+    if (failed(processOp(&op, pickGate(baseCycle))))
       return failure();
   }
   return success();
@@ -3037,40 +3043,51 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       }
 
       LogicalResult opResult = success();
-      if (auto storeOp =
-              dyn_cast<loopschedule::HWStoreLoweringInterface>(&op)) {
-        opResult = handleHWStore(storeOp, hwBuilder, mapping,
-                                    stageCE[stageIdx],
-                                    perStagePorts[stageIdx]);
-      } else if (auto loadOp =
-                     dyn_cast<loopschedule::HWLoadLoweringInterface>(&op)) {
-        // Local-memref latency correction still keys off the concrete
-        // LoopScheduleLoadOp since isLocalMemref checks the memref arg
-        // table. Cast separately to preserve that behavior.
-        if (auto ls = dyn_cast<LoopScheduleLoadOp>(&op))
-          if (isLocalMemref(ls.getMemRef()))
-            localLoadResults.insert(ls.getResult());
-        // Amc-style ports (with explicit rd_en) carry their own read
-        // latency via the backing memory module's `seq.read` — the
-        // result Value already reflects the delayed read, so skip the
-        // extra pipeline-stage register below. Without this, an amc.load
-        // result would double-register (once in the memory, once in the
-        // stage) and all downstream consumers see iteration N-1's value.
-        if (loadOp.requiresReadEnable() && loadOp.getReadLatency() > 0)
-          localLoadResults.insert(loadOp.getResult());
-        opResult =
-            handleHWLoad(loadOp, hwBuilder, mapping,
-                           perStagePorts[stageIdx], stageCE[stageIdx]);
-      } else if (isa<LoopScheduleYieldOp,
-                     LoopScheduleIterArgUpdateOp>(&op)) {
-        // skip — the pipeline-stage epilogue handles the yield/iter_arg
-        // update separately.
-      } else {
-        opResult =
-            emitComputeOp(&op, hwBuilder, mapping,
-                          hwBody->getParentOp()->getParentOfType<ModuleOp>(),
-                          clk, rst);
-      }
+      // Recursive body-processor: handles ops inside the current pipeline
+      // stage, including nested `loopschedule.if`. The `gate` argument is
+      // what a store's `wr_en` (and a load's `rd_en`) gets gated by —
+      // `stageCE[stageIdx]` at the top level, AND'd with the condition
+      // when we descend into an if body. If-region results are forwarded
+      // unconditionally via `mapping` (the hardware treats the body's
+      // computation as always happening; the predication only affects
+      // when effects reach memory).
+      std::function<LogicalResult(Operation *, Value)> processOp =
+          [&](Operation *inner, Value gate) -> LogicalResult {
+        if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(inner))
+          return success();
+        if (auto ifOp = dyn_cast<LoopScheduleIfOp>(inner)) {
+          Value cond = mapping.lookup(ifOp.getCond());
+          Value innerGate =
+              comb::AndOp::create(hwBuilder, loc, gate, cond);
+          for (auto &nested : ifOp.getBody().front()) {
+            if (auto yieldOp = dyn_cast<LoopScheduleYieldOp>(&nested)) {
+              for (auto [res, val] :
+                   llvm::zip(ifOp.getResults(), yieldOp.getOperands()))
+                mapping.map(res, mapping.lookup(val));
+              continue;
+            }
+            if (failed(processOp(&nested, innerGate)))
+              return failure();
+          }
+          return success();
+        }
+        if (auto storeOp = dyn_cast<HWStoreLoweringInterface>(inner))
+          return handleHWStore(storeOp, hwBuilder, mapping, gate,
+                                  perStagePorts[stageIdx]);
+        if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner)) {
+          if (auto ls = dyn_cast<LoopScheduleLoadOp>(inner))
+            if (isLocalMemref(ls.getMemRef()))
+              localLoadResults.insert(ls.getResult());
+          if (loadOp.requiresReadEnable() && loadOp.getReadLatency() > 0)
+            localLoadResults.insert(loadOp.getResult());
+          return handleHWLoad(loadOp, hwBuilder, mapping,
+                                 perStagePorts[stageIdx], gate);
+        }
+        return emitComputeOp(
+            inner, hwBuilder, mapping,
+            hwBody->getParentOp()->getParentOfType<ModuleOp>(), clk, rst);
+      };
+      opResult = processOp(&op, stageCE[stageIdx]);
 
       for (auto &sm : savedMappings)
         mapping.map(sm.first, sm.second);
