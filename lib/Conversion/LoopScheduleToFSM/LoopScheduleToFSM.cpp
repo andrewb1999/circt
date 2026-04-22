@@ -2586,11 +2586,25 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // captured register sees its own pre-edge value on that posedge, which is
   // stale by one iteration; always prefer the combinational alias for the
   // iter_arg D input.
+  //
+  // The feedback source is the sequential's terminator-result operand for
+  // each iter-arg index — that's by definition the value the loop returns
+  // at iteration-end and therefore the value the next iteration should
+  // start from. Relying on `getIterArgPhaseResult(iterArgUpdates[i])`
+  // instead is fragile: when tmp flows across loop levels via the
+  // frame-await chain (e.g. test_conv's k-level tmp updated by the
+  // launched l-pipeline), the scheduler emits a verifier-satisfying no-op
+  // `iter_arg_update %argN = %argN` which makes the phase-result logic
+  // point the iter-arg register back at itself and lose the real update.
   auto iterArgUpdates = loopschedule::getIterArgUpdatesInOrder(seqOp);
   SmallVector<Value> iterArgPhaseResults(iterArgRegs.size());
-  for (unsigned i = 0; i < iterArgRegs.size(); ++i)
-    if (auto u = iterArgUpdates[i])
+  for (unsigned i = 0; i < iterArgRegs.size(); ++i) {
+    Value termResult = terminatorOp.getResults()[i];
+    if (termResult)
+      iterArgPhaseResults[i] = termResult;
+    else if (auto u = iterArgUpdates[i])
       iterArgPhaseResults[i] = loopschedule::getIterArgPhaseResult(u);
+  }
   hw.setInsertionPointToEnd(hwBody);
   for (unsigned i = 0; i < iterArgRegs.size(); ++i) {
     Value termArg = iterArgPhaseResults[i];
