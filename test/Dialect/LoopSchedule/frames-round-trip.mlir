@@ -50,6 +50,7 @@ func.func @frame_launch_await(%arg0: i32) -> i32 {
     // CHECK:   loopschedule.launch : !loopschedule.handle
     %hr = loopschedule.at 0 -> !loopschedule.handle {
       %hr_launch = loopschedule.launch : !loopschedule.handle {
+        %dummy = arith.constant 0 : i32
         loopschedule.yield
       }
       loopschedule.yield %hr_launch : !loopschedule.handle
@@ -82,6 +83,7 @@ func.func @frame_two_launches() -> (i32, i32) {
     // CHECK:   loopschedule.launch : !loopschedule.handle
     %hA = loopschedule.at 0 -> !loopschedule.handle {
       %hA_launch = loopschedule.launch : !loopschedule.handle {
+        %dummy = arith.constant 0 : i32
         loopschedule.yield
       }
       loopschedule.yield %hA_launch : !loopschedule.handle
@@ -90,6 +92,7 @@ func.func @frame_two_launches() -> (i32, i32) {
     // CHECK:   loopschedule.launch : !loopschedule.handle
     %hB = loopschedule.at 0 -> !loopschedule.handle {
       %hB_launch = loopschedule.launch : !loopschedule.handle {
+        %dummy = arith.constant 0 : i32
         loopschedule.yield
       }
       loopschedule.yield %hB_launch : !loopschedule.handle
@@ -116,6 +119,7 @@ func.func @frame_overlap(%arg0: i32) -> (i32, i32) {
   %pair:2 = loopschedule.frame -> (!loopschedule.handle, i32) {
     %hA = loopschedule.at 0 -> !loopschedule.handle {
       %hA_launch = loopschedule.launch : !loopschedule.handle {
+        %dummy = arith.constant 0 : i32
         loopschedule.yield
       }
       loopschedule.yield %hA_launch : !loopschedule.handle
@@ -206,12 +210,14 @@ func.func @sequential_terminator_awaits_two_handles(%c0: index, %c1: index, %c10
     %hs:2 = loopschedule.frame -> (!loopschedule.handle, !loopschedule.handle) {
       %hA = loopschedule.at 0 -> !loopschedule.handle {
         %hA_launch = loopschedule.launch : !loopschedule.handle {
+          %dummy = arith.constant 0 : i32
           loopschedule.yield
         }
         loopschedule.yield %hA_launch : !loopschedule.handle
       }
       %hB = loopschedule.at 0 -> !loopschedule.handle {
         %hB_launch = loopschedule.launch : !loopschedule.handle {
+          %dummy = arith.constant 0 : i32
           loopschedule.yield
         }
         loopschedule.yield %hB_launch : !loopschedule.handle

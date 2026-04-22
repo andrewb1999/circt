@@ -27,6 +27,7 @@ func.func @launch_outside_frame() {
   // expected-error @+1 {{op expects parent op to be one of 'loopschedule.frame, loopschedule.pipeline'}}
   %h = loopschedule.at 0 -> !loopschedule.handle {
     %h_launch = loopschedule.launch : !loopschedule.handle {
+      %dummy = arith.constant 0 : i32
       loopschedule.yield
     }
     loopschedule.yield %h_launch : !loopschedule.handle
@@ -120,6 +121,7 @@ func.func @handle_never_awaited() {
     %h = loopschedule.at 0 -> !loopschedule.handle {
       // expected-error @+1 {{handle is never awaited}}
       %h_launch = loopschedule.launch : !loopschedule.handle {
+        %dummy = arith.constant 0 : i32
         loopschedule.yield
       }
       loopschedule.yield %h_launch : !loopschedule.handle
@@ -148,6 +150,7 @@ func.func @handle_awaited_twice(%c0: index, %c1: index, %c10: index) {
       %hp = loopschedule.at 0 -> !loopschedule.handle {
         // expected-error @+1 {{handle is awaited more than once}}
         %hp_launch = loopschedule.launch : !loopschedule.handle {
+          %dummy = arith.constant 0 : i32
           loopschedule.yield
         }
         loopschedule.yield %hp_launch : !loopschedule.handle
@@ -254,6 +257,7 @@ func.func @frame_body_non_monotonic_launches() {
   loopschedule.frame {
     %h1 = loopschedule.at 3 -> !loopschedule.handle {
       %h1_launch = loopschedule.launch : !loopschedule.handle {
+        %dummy = arith.constant 0 : i32
         loopschedule.yield
       }
       loopschedule.yield %h1_launch : !loopschedule.handle
@@ -261,6 +265,7 @@ func.func @frame_body_non_monotonic_launches() {
     // expected-error @+1 {{op offset must be >= previous at's offset (3)}}
     %h2 = loopschedule.at 1 -> !loopschedule.handle {
       %h2_launch = loopschedule.launch : !loopschedule.handle {
+        %dummy = arith.constant 0 : i32
         loopschedule.yield
       }
       loopschedule.yield %h2_launch : !loopschedule.handle

@@ -1099,11 +1099,28 @@ LoopScheduleYieldOp LoopScheduleLaunchOp::getYieldOp() {
 }
 
 LogicalResult LoopScheduleLaunchOp::verify() {
-  // Parent must be an `at` op (enforced structurally by HasParent trait), and
-  // the handle must flow — via at-yield + frame-yield forwarding — to exactly
-  // one terminal consumer:
-  //   * `loopschedule.await` or a terminator's await list (frame-level form),
-  //     OR
+  // Body: exactly one non-terminator op, plus the trailing
+  // `loopschedule.yield`. That single payload op can have its own nested
+  // regions / inner ops — the constraint is one op at the *top* level of
+  // the launch body. This keeps each handle tied to a single underlying
+  // done signal, which downstream lowerings (e.g. the FSM backend's
+  // stall logic) can read without having to join multiple done wires.
+  auto &block = getBodyBlock();
+  unsigned nonTerminatorCount = 0;
+  for (auto &op : block) {
+    if (isa<LoopScheduleYieldOp>(op))
+      continue;
+    ++nonTerminatorCount;
+  }
+  if (nonTerminatorCount != 1)
+    return emitOpError(
+        "body must contain exactly one non-terminator op (found ")
+           << nonTerminatorCount << ")";
+
+  // The handle must flow — via at-yield + frame-yield forwarding — to
+  // exactly one terminal consumer:
+  //   * `loopschedule.await` or a terminator's await list (frame-level
+  //     form), OR
   //   * `loopschedule.expect` in a later at-stage of the same pipeline
   //     (pipeline-level form).
   SmallVector<Value, 4> worklist{getHandle()};

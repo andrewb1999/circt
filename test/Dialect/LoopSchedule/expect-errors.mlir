@@ -53,7 +53,36 @@ func.func @type_mismatch(%A: memref<16xi32>, %idx: index) -> i64 {
 
 // -----
 
-// Case 3: expect on a handle that isn't produced by a loopschedule.launch.
+// Case 3: launch body contains more than one non-terminator op.
+func.func @launch_multiple_ops(%A: memref<16xi32>, %idx: index) -> i32 {
+  %c0 = arith.constant 0 : i4
+  %c15 = arith.constant 15 : i4
+  %c1 = arith.constant 1 : i4
+  %out = loopschedule.pipeline II = 1 trip_count = 1 iter_args(%iv = %c0) : (i4) -> i32 {
+    %h = loopschedule.at 0 -> !loopschedule.handle {
+      // expected-error @+1 {{body must contain exactly one non-terminator op (found 2)}}
+      %launched = loopschedule.launch : !loopschedule.handle {
+        %a = memref.load %A[%idx] : memref<16xi32>
+        %b = arith.addi %a, %a : i32
+        loopschedule.yield %b : i32
+      }
+      loopschedule.yield %launched : !loopschedule.handle
+    }
+    %v, %done = loopschedule.at 1 -> (i32, i1) {
+      %val = loopschedule.expect %h : i32
+      %cond = arith.cmpi slt, %iv, %c15 : i4
+      %n = arith.addi %iv, %c1 : i4
+      loopschedule.iter_arg_update %iv = %n : i4
+      loopschedule.yield %val, %cond : i32, i1
+    }
+    loopschedule.terminator condition(%done), results(%v) : i32
+  }
+  return %out : i32
+}
+
+// -----
+
+// Case 4: expect on a handle that isn't produced by a loopschedule.launch.
 func.func @handle_not_from_launch(%h: !loopschedule.handle) -> i32 {
   %c0 = arith.constant 0 : i4
   %c15 = arith.constant 15 : i4
