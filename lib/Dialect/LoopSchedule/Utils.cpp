@@ -909,5 +909,188 @@ void addPredicateDependencies(Operation *op, Region &body,
   }
 }
 
+void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp) {
+  SmallVector<LoopScheduleExpectOp> expects;
+  pipOp.walk([&](LoopScheduleExpectOp e) { expects.push_back(e); });
+
+  // Collect per-expect metadata before mutating IR. A single at-stage
+  // can simultaneously be an issueStage for one expect and a destStage
+  // for another (nested dynamic chains, or same-stage launch + expect),
+  // so we combine all stage-level edits (handle-slot retype + forward-
+  // slot drop) and rebuild each distinct stage at most once.
+  struct PerExpect {
+    LoopScheduleExpectOp expect;
+    LoopScheduleLaunchOp launch;
+    Operation *payload = nullptr;
+    LoopScheduleAtOp issueStage;
+    LoopScheduleAtOp destStage;
+    unsigned issueSlot = ~0u; // issueStage at-yield slot holding handle
+    unsigned destSlot = ~0u;  // destStage at-yield slot holding expect result
+  };
+  SmallVector<PerExpect> per;
+  per.reserve(expects.size());
+  for (auto expect : expects) {
+    PerExpect pe;
+    pe.expect = expect;
+    pe.launch = expect.getLaunchOp();
+    if (!pe.launch)
+      continue;
+    for (Operation &op : pe.launch.getBody().front()) {
+      if (isa<LoopScheduleYieldOp>(op))
+        continue;
+      pe.payload = &op;
+      break;
+    }
+    if (!pe.payload)
+      continue;
+    pe.issueStage = pe.launch->getParentOfType<LoopScheduleAtOp>();
+    pe.destStage = expect->getParentOfType<LoopScheduleAtOp>();
+    if (!pe.issueStage || !pe.destStage)
+      continue;
+    for (auto [i, operand] :
+         llvm::enumerate(pe.issueStage.getYieldOp()->getOperands())) {
+      if (operand == pe.launch.getHandle()) {
+        pe.issueSlot = i;
+        break;
+      }
+    }
+    for (auto [i, operand] :
+         llvm::enumerate(pe.destStage.getYieldOp()->getOperands())) {
+      if (operand == expect.getResult(0)) {
+        pe.destSlot = i;
+        break;
+      }
+    }
+    per.push_back(pe);
+  }
+
+  // Hoist payloads, RAUW expect → payload, and patch the issueStage
+  // yield operand back to the payload's value. These edits are safe
+  // before any stage rebuild because they only touch operands, not
+  // result types.
+  for (auto &pe : per) {
+    pe.payload->moveBefore(pe.launch);
+    pe.expect.getResult(0).replaceAllUsesWith(pe.payload->getResult(0));
+    if (pe.issueSlot != ~0u)
+      pe.issueStage.getYieldOp()->setOperand(pe.issueSlot,
+                                             pe.payload->getResult(0));
+  }
+
+  // Now erase launches and expects; after the RAUW above, no one uses
+  // launch.getHandle() or expect.getResult() anymore.
+  for (auto &pe : per) {
+    pe.expect.erase();
+    pe.launch.erase();
+  }
+
+  // Collect per-stage edit lists: slots whose type changes (issue-side
+  // handle → payload value) and slots that get dropped (dest-side
+  // forwarding slot). A stage may have both; a stage with neither stays
+  // untouched.
+  struct StageEdits {
+    SmallVector<unsigned> retypeSlots;
+    SmallVector<unsigned> dropSlots;
+    // For each dropped slot, the replacement value cross-stage users
+    // should consume. For issueStage-that-is-also-destStage, this is
+    // the issueStage's own (soon-to-be-rebuilt) value slot — we resolve
+    // it after the rebuild via a lookup.
+    SmallVector<std::pair<unsigned, std::pair<LoopScheduleAtOp, unsigned>>>
+        dropRedirects;
+  };
+  DenseMap<LoopScheduleAtOp, StageEdits> edits;
+  SmallVector<LoopScheduleAtOp> stagesInOrder;
+  auto ensure = [&](LoopScheduleAtOp s) -> StageEdits & {
+    auto it = edits.find(s);
+    if (it != edits.end())
+      return it->second;
+    stagesInOrder.push_back(s);
+    return edits[s];
+  };
+  for (auto &pe : per) {
+    if (pe.issueSlot != ~0u)
+      ensure(pe.issueStage).retypeSlots.push_back(pe.issueSlot);
+    if (pe.destSlot != ~0u) {
+      auto &e = ensure(pe.destStage);
+      e.dropSlots.push_back(pe.destSlot);
+      e.dropRedirects.push_back({pe.destSlot, {pe.issueStage, pe.issueSlot}});
+    }
+  }
+
+  // Rebuild each stage in document order so that when an earlier stage
+  // (an issueStage) is rebuilt first, later stages' cross-stage refs
+  // still resolve via the RAUW we do at rebuild time.
+  DenseMap<LoopScheduleAtOp, LoopScheduleAtOp> replacement;
+  SmallVector<LoopScheduleAtOp> docOrder;
+  pipOp.walk([&](LoopScheduleAtOp s) {
+    if (edits.count(s))
+      docOrder.push_back(s);
+  });
+
+  for (auto oldStage : docOrder) {
+    auto &e = edits[oldStage];
+    auto yield = oldStage.getYieldOp();
+
+    // Compute the new result-type list: keep existing types, swap
+    // retype slots to the current yield operand's type, then strip
+    // dropped slots.
+    SmallVector<Type> newTypes(oldStage.getResultTypes());
+    for (unsigned slot : e.retypeSlots)
+      newTypes[slot] = yield->getOperand(slot).getType();
+
+    llvm::SmallDenseSet<unsigned> dropSet(e.dropSlots.begin(),
+                                          e.dropSlots.end());
+    SmallVector<Type> finalTypes;
+    SmallVector<unsigned> keptSlots;
+    for (unsigned i = 0, end = newTypes.size(); i < end; ++i) {
+      if (dropSet.count(i))
+        continue;
+      finalTypes.push_back(newTypes[i]);
+      keptSlots.push_back(i);
+    }
+
+    // Drop yield operands (highest index first).
+    SmallVector<unsigned> sortedDrops(e.dropSlots.begin(), e.dropSlots.end());
+    llvm::sort(sortedDrops, std::greater<unsigned>());
+    for (unsigned slot : sortedDrops)
+      yield->eraseOperand(slot);
+
+    // Nothing actually changed? Skip the rebuild.
+    bool noChange = finalTypes == SmallVector<Type>(oldStage.getResultTypes());
+    if (noChange) {
+      replacement[oldStage] = oldStage;
+      continue;
+    }
+
+    OpBuilder rebuild(oldStage);
+    auto newStage = rebuild.create<LoopScheduleAtOp>(
+        oldStage.getLoc(), finalTypes, oldStage.getOffsetAttr());
+    newStage.getBody().takeBody(oldStage.getBody());
+    // Redirect kept-slot users directly; for dropped slots, redirect to
+    // the issueStage's (possibly already rebuilt) value slot.
+    for (auto [newIdx, oldIdx] : llvm::enumerate(keptSlots))
+      oldStage.getResult(oldIdx).replaceAllUsesWith(newStage.getResult(newIdx));
+    for (auto &rd : e.dropRedirects) {
+      unsigned droppedSlot = rd.first;
+      auto [issueStage, issueSlot] = rd.second;
+      if (issueSlot == ~0u)
+        continue;
+      // The issueStage may have been rebuilt already; look up its
+      // replacement. Self-cycle (issueStage == oldStage) resolves to
+      // newStage.
+      LoopScheduleAtOp resolvedIssue;
+      if (issueStage == oldStage)
+        resolvedIssue = newStage;
+      else
+        resolvedIssue = replacement.lookup(issueStage);
+      if (!resolvedIssue)
+        resolvedIssue = issueStage; // untouched stage
+      oldStage.getResult(droppedSlot)
+          .replaceAllUsesWith(resolvedIssue.getResult(issueSlot));
+    }
+    replacement[oldStage] = newStage;
+    oldStage.erase();
+  }
+}
+
 } // namespace loopschedule
 } // namespace circt

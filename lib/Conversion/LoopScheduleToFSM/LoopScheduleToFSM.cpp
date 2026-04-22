@@ -2717,12 +2717,21 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 // Pipeline child lowering (for pipelines nested inside sequential loops)
 //===----------------------------------------------------------------------===//
 
+/// Inline each `loopschedule.launch` + `loopschedule.expect` pair in a
+/// pipeline body so the FSM lowering sees the same shape it had pre-
+/// Phase 2 (the scheduler wraps dynamic ops; the FSM unwraps them here).
+/// The launch's single body op is moved to the launch's position, the
+/// launch + its inner yield are erased, and the expect is replaced by
 LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     LoopSchedulePipelineOp pipOp, OpBuilder &builder, Location loc,
     Block *hwBody, IRMapping &mapping, Value clk, Value rst,
     Value startSignal, StringRef namePrefix, Value &doneSignal,
     DenseMap<Value, MemPortMapping> &memPorts,
     ArrayRef<PortArgInfo> memrefArgs) {
+  // Unwrap launch/expect pairs introduced by the scheduler for
+  // dynamic-latency ops. Step 1 of Phase 3B: no stall yet, just make the
+  // wrap transparent.
+  inlineLaunchExpectPairs(pipOp);
 
   auto *ctx = builder.getContext();
 

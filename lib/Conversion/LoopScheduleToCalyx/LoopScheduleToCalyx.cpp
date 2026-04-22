@@ -4081,6 +4081,14 @@ void LoopScheduleToCalyxPass::runOnOperation() {
     return;
   }
 
+  /// Pre-process: unwrap `loopschedule.launch` / `loopschedule.expect`
+  /// pairs that the SCFToLoopSchedule scheduler emits around dynamic-latency
+  /// ops. Calyx lowering has its own per-group done signaling and doesn't
+  /// consume handles, so inline them transparently before any other
+  /// pre-processing runs.
+  getOperation().walk(
+      [&](LoopSchedulePipelineOp pipOp) { inlineLaunchExpectPairs(pipOp); });
+
   /// Pre-process: dissolve `loopschedule.launch` / `loopschedule.await` /
   /// enclosing frames into the flat shape the rest of this pass expects.
   /// Done before `labelEntryPoint` so downstream conversion patterns don't

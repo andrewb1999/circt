@@ -39,6 +39,16 @@ SmallVector<LoopScheduleAtOp> getAtOpsInOrder(mlir::Region &region);
 // Return the `loopschedule.launch` ops in a frame body in program order.
 SmallVector<LoopScheduleLaunchOp> getLaunchOpsInOrder(LoopScheduleFrameOp frame);
 
+// Unwrap every `loopschedule.launch` / `loopschedule.expect` pair inside
+// `pipOp`: hoist the launch body's single payload op back into the launch's
+// parent at-stage, forward the expect's uses to the payload's result, and
+// rebuild the issue stage with payload-typed results where it previously held
+// handle-typed results. After this call the pipeline is launch/expect-free
+// and semantically equivalent to the pre-wrap IR (dynamic stall info is
+// discarded). Lowerings that cannot consume handles (Calyx) or that don't yet
+// implement pipeline stalling (FSM, transitionally) call this at the start.
+void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp);
+
 scheduling::ModuloProblem
 getModuloProblem(mlir::scf::WhileOp whileOp,
                  analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
