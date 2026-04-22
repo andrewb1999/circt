@@ -2597,11 +2597,17 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // `iter_arg_update %argN = %argN` which makes the phase-result logic
   // point the iter-arg register back at itself and lose the real update.
   auto iterArgUpdates = loopschedule::getIterArgUpdatesInOrder(seqOp);
+  auto termResults = terminatorOp.getResults();
   SmallVector<Value> iterArgPhaseResults(iterArgRegs.size());
   for (unsigned i = 0; i < iterArgRegs.size(); ++i) {
-    Value termResult = terminatorOp.getResults()[i];
-    if (termResult)
-      iterArgPhaseResults[i] = termResult;
+    // Prefer the terminator-result operand at this iter-arg index — that's
+    // the value the loop returns at iteration-end, which is exactly what
+    // the next iteration's iter-arg should hold. BUT not every iter-arg
+    // is externally visible: a loop with empty `results()` still carries
+    // iter-args for internal counters. For those (i >= termResults.size())
+    // fall back to the iter_arg_update's phase result.
+    if (i < termResults.size() && termResults[i])
+      iterArgPhaseResults[i] = termResults[i];
     else if (auto u = iterArgUpdates[i])
       iterArgPhaseResults[i] = loopschedule::getIterArgPhaseResult(u);
   }
