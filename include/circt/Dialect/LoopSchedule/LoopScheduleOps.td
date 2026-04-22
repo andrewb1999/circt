@@ -546,17 +546,26 @@ def LoopScheduleLaunchOp : LoopScheduleOp<"launch",
     [HasParent<"LoopScheduleAtOp">,
      SingleBlockImplicitTerminator<"LoopScheduleYieldOp">,
      NoRegionArguments]> {
-  let summary = "Asynchronously start a variable-latency child loop.";
+  let summary = "Issue a variable-latency op or child loop.";
   let description = [{
-    Fires the child loop's `start` when the enclosing `loopschedule.at` is
-    entered (i.e. at the at's offset relative to the surrounding frame or
-    pipeline). Returns immediately with a `!loopschedule.handle` SSA value
-    representing completion; a later frame's await region picks up that
-    handle to block until the child is done.
+    Fires when the enclosing `loopschedule.at` is entered (at the at's
+    offset relative to the surrounding frame or pipeline). Returns
+    immediately with a `!loopschedule.handle` SSA value representing
+    completion; a later frame's `loopschedule.await`, or — for in-pipeline
+    dynamic-latency ops — a later-stage `loopschedule.expect`, picks up
+    that handle to block until the launched work is done.
 
-    The body region contains exactly one child loop op
-    (`loopschedule.sequential` or `loopschedule.pipeline`), plus a
-    terminating `loopschedule.yield` forwarding the child's produced values.
+    Two forms of launch body:
+      - Frame-level: the body contains exactly one child loop op
+        (`loopschedule.sequential` or `loopschedule.pipeline`), plus a
+        terminating `loopschedule.yield` forwarding the child's values.
+        The handle is consumed by `loopschedule.await` in a later frame.
+      - Pipeline-level: the body contains a dynamic-latency op (e.g. an
+        `amc.load` on a dynamic port), plus a terminating
+        `loopschedule.yield` forwarding that op's results. The handle is
+        consumed by `loopschedule.expect` in a later `loopschedule.at`
+        stage of the same pipeline — the stage scheduled exactly
+        `latency(op)` cycles after the launch's at-stage.
 
     `loopschedule.launch` may appear only inside a `loopschedule.at` body.
     Multiple launches may share an `at`; they all start at the at's offset.
@@ -572,6 +581,48 @@ def LoopScheduleLaunchOp : LoopScheduleOp<"launch",
   let extraClassDeclaration = [{
     Block &getBodyBlock() { return getBody().front(); }
     LoopScheduleYieldOp getYieldOp();
+  }];
+}
+
+def LoopScheduleExpectOp : LoopScheduleOp<"expect",
+    [HasParent<"LoopScheduleAtOp">]> {
+  let summary = "Consume a pipeline-scoped launch handle at the cycle its "
+                "result is expected to be ready.";
+  let description = [{
+    Marks the cycle (the enclosing `loopschedule.at`'s offset) at which the
+    pipeline expects the handle's underlying dynamic-latency op to have
+    completed. The op takes a `!loopschedule.handle` produced by a
+    `loopschedule.launch` in an earlier stage of the *same* pipeline, and
+    yields SSA values matching the launch's body-level
+    `loopschedule.yield` types.
+
+    Consumers in the expect's stage use the expect's results directly;
+    later stages pick them up through the pipeline's normal stage-register
+    chain. Downstream FSM lowering uses the expect's stage and handle to
+    gate pipeline stage-enables on the launch's completion signal — if the
+    signal is not asserted by the expect's cycle, the whole pipeline
+    stalls until it is.
+
+    The expect's stage must sit exactly `latency(op)` cycles after the
+    launch's stage, where `latency(op)` is the nominal latency the
+    scheduler assigned to the wrapped op. (Enforced structurally by the
+    scheduler; not checked here.)
+  }];
+
+  let arguments = (ins HandleType:$handle);
+  let results = (outs Variadic<AnyType>:$results);
+
+  let assemblyFormat = [{
+    $handle attr-dict (`:` type($results)^)?
+  }];
+
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    /// The `loopschedule.launch` that produced the consumed handle, or
+    /// null if the handle is not produced by a launch in the same
+    /// pipeline.
+    LoopScheduleLaunchOp getLaunchOp();
   }];
 }
 

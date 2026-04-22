@@ -1101,7 +1101,11 @@ LoopScheduleYieldOp LoopScheduleLaunchOp::getYieldOp() {
 LogicalResult LoopScheduleLaunchOp::verify() {
   // Parent must be an `at` op (enforced structurally by HasParent trait), and
   // the handle must flow — via at-yield + frame-yield forwarding — to exactly
-  // one terminal consumer (an await op or a terminator's await list).
+  // one terminal consumer:
+  //   * `loopschedule.await` or a terminator's await list (frame-level form),
+  //     OR
+  //   * `loopschedule.expect` in a later at-stage of the same pipeline
+  //     (pipeline-level form).
   SmallVector<Value, 4> worklist{getHandle()};
   llvm::SmallPtrSet<Value, 4> seen;
   unsigned terminalCount = 0;
@@ -1112,6 +1116,8 @@ LogicalResult LoopScheduleLaunchOp::verify() {
     for (OpOperand &use : v.getUses()) {
       Operation *user = use.getOwner();
       if (isa<LoopScheduleAwaitOp>(user)) {
+        ++terminalCount;
+      } else if (isa<LoopScheduleExpectOp>(user)) {
         ++terminalCount;
       } else if (auto term = dyn_cast<LoopScheduleTerminatorOp>(user)) {
         if (llvm::is_contained(term.getAwait(), use.get()))
@@ -1138,6 +1144,90 @@ LogicalResult LoopScheduleLaunchOp::verify() {
     return emitOpError("handle is never awaited");
   if (terminalCount > 1)
     return emitOpError("handle is awaited more than once");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// LoopScheduleExpectOp
+//===----------------------------------------------------------------------===//
+
+LoopScheduleLaunchOp LoopScheduleExpectOp::getLaunchOp() {
+  // Trace the handle back through at-yield / frame-yield forwarding until
+  // we hit the defining launch, or give up.
+  Value v = getHandle();
+  while (v) {
+    if (auto launch = v.getDefiningOp<LoopScheduleLaunchOp>())
+      return launch;
+    auto blockArg = dyn_cast<BlockArgument>(v);
+    if (blockArg)
+      return {};
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      return {};
+    // Thread back through at / frame results: find the yield producing
+    // the result at v's index.
+    if (auto at = dyn_cast<LoopScheduleAtOp>(def)) {
+      unsigned resultIdx = cast<OpResult>(v).getResultNumber();
+      auto yield = at.getYieldOp();
+      if (resultIdx >= yield->getNumOperands())
+        return {};
+      v = yield->getOperand(resultIdx);
+      continue;
+    }
+    if (auto frame = dyn_cast<LoopScheduleFrameOp>(def)) {
+      unsigned resultIdx = cast<OpResult>(v).getResultNumber();
+      auto yieldOp = frame.getBodyYield();
+      if (!yieldOp || resultIdx >= yieldOp->getNumOperands())
+        return {};
+      v = yieldOp->getOperand(resultIdx);
+      continue;
+    }
+    return {};
+  }
+  return {};
+}
+
+LogicalResult LoopScheduleExpectOp::verify() {
+  // The handle must originate from a `loopschedule.launch` in the same
+  // `loopschedule.pipeline`, at an earlier stage.
+  auto launch = getLaunchOp();
+  if (!launch)
+    return emitOpError("handle must originate from a `loopschedule.launch`");
+
+  auto expectPipeline =
+      getOperation()->getParentOfType<LoopSchedulePipelineOp>();
+  auto launchPipeline =
+      launch->getParentOfType<LoopSchedulePipelineOp>();
+  if (!expectPipeline || expectPipeline != launchPipeline)
+    return emitOpError(
+        "expect and its launch must live in the same `loopschedule.pipeline`");
+
+  auto launchAt = launch->getParentOfType<LoopScheduleAtOp>();
+  auto expectAt = getOperation()->getParentOfType<LoopScheduleAtOp>();
+  if (!launchAt || !expectAt)
+    return emitOpError("expect and its launch must each be inside an "
+                       "`loopschedule.at`");
+  if (launchAt.getOffset() >= expectAt.getOffset())
+    return emitOpError(
+        "expect's `at` offset (")
+           << expectAt.getOffset()
+           << ") must be strictly greater than the launch's `at` offset ("
+           << launchAt.getOffset() << ")";
+
+  // Result types must match the launch's body-level yield operand types
+  // one-for-one.
+  auto launchYield = launch.getYieldOp();
+  if (launchYield->getNumOperands() != getNumResults())
+    return emitOpError("has ")
+           << getNumResults() << " result(s), launch yields "
+           << launchYield->getNumOperands();
+  for (auto [i, expectTy, yieldOpnd] : llvm::enumerate(
+           getResultTypes(), launchYield->getOperandTypes())) {
+    if (expectTy != yieldOpnd)
+      return emitOpError("result #")
+             << (unsigned)i << " type " << expectTy
+             << " does not match launch yield operand type " << yieldOpnd;
+  }
   return success();
 }
 
