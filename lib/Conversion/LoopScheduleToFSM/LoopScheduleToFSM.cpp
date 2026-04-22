@@ -513,188 +513,130 @@ static bool isFreeArithOp(Operation *op) {
   return false;
 }
 
-/// Materialize the comb-dialect equivalent of `origOp` when its hw_match
-/// carries `hw_op = "comb.<name>"`. The new op is created at `builder`'s
-/// insertion point with operands looked up through `mapping`. Result types
-/// match `origOp`'s. Discardable attrs (e.g. `predicate` for comb.icmp) are
-/// copied from `origOp`.
+/// Clone the real comb op living inside `origOp`'s hw_match body.
+/// Operands are remapped: the body's block args correspond positionally
+/// to the target function's inputs, i.e. `origOp->getOperand(i)`.
 static LogicalResult
 emitCombOpFromOperator(Operation *origOp, OpBuilder &builder,
-                       IRMapping &mapping, StringRef combOpName) {
-  auto regName =
-      RegisteredOperationName::lookup(combOpName, builder.getContext());
-  if (!regName)
-    return origOp->emitOpError("hw_match references unknown HW op '")
-           << combOpName << "'";
-
-  SmallVector<Value, 4> operands;
-  for (Value v : origOp->getOperands())
-    operands.push_back(mapping.lookup(v));
-
-  OperationState state(origOp->getLoc(), *regName);
-  state.addOperands(operands);
-  state.addTypes(origOp->getResultTypes());
-
-  // Pass through the original op's attributes EXCEPT the operator-library
-  // marker. comb.icmp / arith.cmpi share the same predicate enum encoding,
-  // so copying through Just Works.
-  for (auto namedAttr : origOp->getAttrs()) {
-    if (namedAttr.getName().getValue() == "loopschedule.operator")
+                       IRMapping &mapping, oplib::HwMatchOp hwMatch) {
+  Block *body = hwMatch.getBodyBlock();
+  Operation *templateOp = nullptr;
+  for (auto &op : *body) {
+    if (isa<oplib::HwReturnOp>(op))
       continue;
-    state.addAttribute(namedAttr.getName(), namedAttr.getValue());
+    templateOp = &op;
+    break;
   }
-  // comb.icmp also requires `twoState` to be present; default to false if
-  // the source op didn't carry it.
-  if (combOpName == "comb.icmp" && !origOp->hasAttr("twoState"))
-    state.addAttribute("twoState", builder.getBoolAttr(false));
+  if (!templateOp)
+    return origOp->emitOpError(
+        "comb-op hw_match body is missing its template op");
 
-  Operation *newOp = builder.create(state);
+  // Map body block args -> origOp operands.
+  IRMapping bodyMap;
+  for (auto [arg, operand] :
+       llvm::zip(body->getArguments(), origOp->getOperands())) {
+    bodyMap.map(arg, mapping.lookup(operand));
+  }
+  Operation *newOp = builder.clone(*templateOp, bodyMap);
   for (auto [oldRes, newRes] :
        llvm::zip(origOp->getResults(), newOp->getResults()))
     mapping.map(oldRes, newRes);
   return success();
 }
 
-/// Materialize an `hw.instance` of the operator's `extern_module` for
-/// `origOp`. Driver values for operand ports come from `mapping`. Clock /
-/// reset are wired from the enclosing `hw.module`'s `clk` / `rst`. The
-/// clock-enable port (if present) is tied to a constant `1 : i1`. The
-/// instance's outputs are mapped back onto `origOp`'s results.
+/// Materialize an `hw.instance` of the operator's extern for `origOp` by
+/// cloning the `oplib.hw_instance` op inside `templateInst` and
+/// substituting its operands. Clock / reset are wired from the enclosing
+/// `hw.module`'s `clk` / `rst`. The clock-enable port (if present) is
+/// tied to a constant `1 : i1`. Per-operand / per-result routing uses
+/// the extern's `oplib.clock` / `oplib.reset` / `oplib.enable` /
+/// `oplib.operand = N` / `oplib.result = N` per-port attrs stamped by
+/// `OperatorLibraryLoader::makePortAttrDict`.
 static LogicalResult
 emitHwInstanceFromOperator(Operation *origOp, OpBuilder &builder,
                            IRMapping &mapping, ModuleOp moduleOp,
-                           FlatSymbolRefAttr externRef, Value clk, Value rst,
-                           llvm::StringMap<unsigned> &uniquer,
-                           StringRef opName, oplib::HwMatchOp hwMatch) {
-  auto externOp =
-      moduleOp.lookupSymbol<hw::HWModuleExternOp>(externRef.getValue());
+                           oplib::HwInstanceOp templateInst, Value clk,
+                           Value rst, llvm::StringMap<unsigned> &uniquer,
+                           StringRef opName) {
+  auto externOp = moduleOp.lookupSymbol<hw::HWModuleExternOp>(
+      templateInst.getModuleNameAttr().getValue());
   if (!externOp)
     return origOp->emitOpError("operator '")
            << opName << "' references unknown extern module @"
-           << externRef.getValue();
+           << templateInst.getModuleName();
 
-  // The hw_match body is a placeholder layout: each port-role placeholder
-  // sits as an SSA value referenced by the oplib.yield. Walk the yield to
-  // figure out which extern-module port maps to which source-operand /
-  // result slot, then build the instance with the right operand wiring.
-  auto yieldOp =
-      cast<oplib::YieldOp>(hwMatch.getBodyBlock()->getTerminator());
+  auto inputAttrs = externOp.getAllInputAttrs();
+  auto outputAttrs = externOp.getAllOutputAttrs();
 
-  // Collect the placeholder Value -> port-name we'll wire. The extern's
-  // port order is canonical; we walk it once and bind each input port.
-  // Record the source-operand index (or "clk"/"rst"/"ce") for each
-  // placeholder by walking the yield's input list and the extern's input
-  // ports in lockstep.
-  Value oneI1 =
-      hw::ConstantOp::create(builder, origOp->getLoc(),
-                             builder.getI1Type(), (int64_t)1);
+  Value oneI1 = hw::ConstantOp::create(builder, origOp->getLoc(),
+                                       builder.getI1Type(), (int64_t)1);
+  Value clkValue = clk;
 
-  // Build a Set-like map from each yield-input Value -> "what to drive it
-  // with" so we can construct the instance operands by walking the extern
-  // ports in order. The hw.module's clk argument is `!seq.clock` whereas
-  // the extern's clk port is typically `i1`; cast through `seq.from_clock`
-  // when we hit that mismatch.
-  DenseMap<Value, Value> placeholderDriver;
-  if (yieldOp.getClock()) {
-    Value clkValue = clk;
-    if (clkValue.getType() != yieldOp.getClock().getType() &&
-        isa<seq::ClockType>(clkValue.getType())) {
-      clkValue = seq::FromClockOp::create(builder, origOp->getLoc(), clkValue);
-    }
-    placeholderDriver[yieldOp.getClock()] = clkValue;
-  }
-  if (yieldOp.getReset())
-    placeholderDriver[yieldOp.getReset()] = rst;
-  if (yieldOp.getClockEnable())
-    placeholderDriver[yieldOp.getClockEnable()] = oneI1;
-  for (auto [i, v] : llvm::enumerate(yieldOp.getInputs())) {
-    if (i >= origOp->getNumOperands())
-      return origOp->emitOpError("operator '")
-             << opName << "' yield has more inputs than op has operands";
-    placeholderDriver[v] = mapping.lookup(origOp->getOperand(i));
-  }
-
-  // The instance's operands are the extern's input ports in declaration
-  // order. We need to find which placeholder Value drives each input port.
-  // The placeholder Values defined in the hw_match body are the
-  // hw.constant ops at the front of the body; they appear in port-spec
-  // order matching the JSON's port list. Cross-reference by the yield's
-  // tagging (clk/rst/ce/inputs) to know which placeholder goes where.
-  //
-  // The extern's input port order matches the JSON port list order, so we
-  // can just walk the yield's binding back to placeholders, drive each
-  // placeholder, then walk the extern in port order and pick the driver.
   SmallVector<Value> instanceOperands;
-  for (auto port : externOp.getPortList()) {
-    if (port.dir != hw::ModulePort::Direction::Input)
-      continue;
-    // The placeholder corresponding to this port lives somewhere in the
-    // hw_match body. We need a way to identify it by port name. The
-    // simplest route: walk the yield's bound Values and for each, ask
-    // which port index its placeholder appears at in body order. But
-    // since placeholder constants are emitted in the JSON's port order
-    // (the same order as the extern's port list), we can index directly.
-    //
-    // Fallback simpler approach: walk the body's hw.constant ops in
-    // order; the i-th matches the i-th INPUT port of the extern.
-    //
-    // Implementation: count input ports; track which body-constant index
-    // we're at. (We do this lazily by collecting once below.)
-    (void)port;
-  }
-
-  // Collect placeholder body-constants in body order, restricted to those
-  // bound to input-side roles in the yield.
-  SmallVector<Value> bodyConstants;
-  for (auto &op : *hwMatch.getBodyBlock()) {
-    if (isa<hw::ConstantOp>(op))
-      bodyConstants.push_back(op.getResult(0));
-  }
-
-  // Map each input port (by extern port index) to its placeholder by
-  // sequential pairing: the JSON loader emits one placeholder per port in
-  // port-list order. We pair them positionally.
   unsigned inIdx = 0;
   for (auto port : externOp.getPortList()) {
     if (port.dir != hw::ModulePort::Direction::Input)
       continue;
-    if (inIdx >= bodyConstants.size())
+    DictionaryAttr portAttrs =
+        inIdx < inputAttrs.size()
+            ? dyn_cast_or_null<DictionaryAttr>(inputAttrs[inIdx])
+            : DictionaryAttr();
+    Value driver;
+    if (portAttrs && portAttrs.get("oplib.clock")) {
+      if (clkValue.getType() != port.type &&
+          isa<seq::ClockType>(clkValue.getType()))
+        clkValue = seq::FromClockOp::create(builder, origOp->getLoc(), clk);
+      driver = clkValue;
+    } else if (portAttrs && portAttrs.get("oplib.reset")) {
+      driver = rst;
+    } else if (portAttrs && portAttrs.get("oplib.enable")) {
+      driver = oneI1;
+    } else if (portAttrs) {
+      if (auto opIdxAttr =
+              dyn_cast_or_null<IntegerAttr>(portAttrs.get("oplib.operand"))) {
+        unsigned j = opIdxAttr.getInt();
+        if (j >= origOp->getNumOperands())
+          return origOp->emitOpError("operator '")
+                 << opName << "' extern port operand index " << j
+                 << " exceeds op operand count";
+        driver = mapping.lookup(origOp->getOperand(j));
+      }
+    }
+    if (!driver)
       return origOp->emitOpError("operator '")
-             << opName
-             << "' hw_match body has fewer placeholders than extern has "
-                "input ports";
-    Value placeholder = bodyConstants[inIdx];
-    auto it = placeholderDriver.find(placeholder);
-    if (it == placeholderDriver.end())
-      return origOp->emitOpError("operator '")
-             << opName
-             << "' hw_match input-port placeholder is not bound by yield";
-    instanceOperands.push_back(it->second);
+             << opName << "' extern input port #" << inIdx
+             << " is missing an oplib role attr";
+    instanceOperands.push_back(driver);
     ++inIdx;
   }
 
   // Uniquify the instance name across the enclosing hw.module.
   unsigned tag = uniquer[opName]++;
   std::string instanceName =
-      (externOp.getSymName() + "_" + std::to_string(tag)).str();
+      (templateInst.getInstanceName() + "_" + std::to_string(tag)).str();
 
   auto instOp = hw::InstanceOp::create(
       builder, origOp->getLoc(), externOp,
       builder.getStringAttr(instanceName), instanceOperands);
 
-  // Map the original op's results to the corresponding instance results,
-  // keyed by output-port placeholders in declaration order.
+  // Map each op-result to the corresponding instance output via the
+  // extern's `oplib.result = N` per-port attr.
   unsigned outIdx = 0;
   for (auto port : externOp.getPortList()) {
     if (port.dir != hw::ModulePort::Direction::Output)
       continue;
-    // For each output port, find which result slot it corresponds to via
-    // the yield's outputs list.
-    Value placeholder = bodyConstants[inIdx + outIdx];
-    (void)placeholder;
-    Value instResult = instOp.getResult(outIdx);
-    if (outIdx < origOp->getNumResults())
-      mapping.map(origOp->getResult(outIdx), instResult);
+    DictionaryAttr portAttrs =
+        outIdx < outputAttrs.size()
+            ? dyn_cast_or_null<DictionaryAttr>(outputAttrs[outIdx])
+            : DictionaryAttr();
+    if (portAttrs) {
+      if (auto resIdxAttr =
+              dyn_cast_or_null<IntegerAttr>(portAttrs.get("oplib.result"))) {
+        unsigned j = resIdxAttr.getInt();
+        if (j < origOp->getNumResults())
+          mapping.map(origOp->getResult(j), instOp.getResult(outIdx));
+      }
+    }
     ++outIdx;
   }
   return success();
@@ -720,16 +662,15 @@ emitOpFromOperatorLibrary(Operation *origOp, OpBuilder &builder,
     return origOp->emitOpError("operator '")
            << opName << "' has no hw_match in the operator library";
 
-  if (auto hwOp = hwMatch->getAttrOfType<StringAttr>("hw_op"))
-    return emitCombOpFromOperator(origOp, builder, mapping, hwOp.getValue());
-  if (auto externRef =
-          hwMatch->getAttrOfType<FlatSymbolRefAttr>("extern_module"))
-    return emitHwInstanceFromOperator(origOp, builder, mapping, moduleOp,
-                                      externRef, clk, rst, uniquer, opName,
-                                      hwMatch);
-  return origOp->emitOpError("operator '")
-         << opName
-         << "' hw_match must carry either an `hw_op` or `extern_module` attr";
+  // Dispatch by inspecting the hw_match body: an `oplib.hw_instance`
+  // names the referenced extern; anything else (comb op, etc.) is
+  // cloned as-is via `emitCombOpFromOperator`.
+  for (auto &op : *hwMatch.getBodyBlock()) {
+    if (auto inst = dyn_cast<oplib::HwInstanceOp>(op))
+      return emitHwInstanceFromOperator(origOp, builder, mapping, moduleOp,
+                                        inst, clk, rst, uniquer, opName);
+  }
+  return emitCombOpFromOperator(origOp, builder, mapping, hwMatch);
 }
 
 //===----------------------------------------------------------------------===//

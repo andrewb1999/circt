@@ -62,8 +62,7 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
     if (!operationOp)
       continue;
 
-    std::string name = operationOp.getDialectName().str() + "." +
-                       operationOp.getOpName().str();
+    std::string name = operationOp.getOpName().str();
     auto operationName = OperationName(name, context);
 
     Operator operatorStruct(operatorOp.getLatency());

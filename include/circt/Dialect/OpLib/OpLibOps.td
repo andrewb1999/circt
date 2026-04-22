@@ -183,15 +183,25 @@ def TargetOp : OpLibOp<"target", [Symbol,
 def OperationOp : OpLibOp<"operation", [HasParent<"TargetOp">]> {
   let summary = "OpLib dialect Operation operation";
   let description = [{
+    Placeholder for the logical operator this target describes. `opName`
+    is the fully-qualified MLIR op name (e.g. `"arith.muli"`), so it
+    round-trips as a single quoted string.
   }];
   let arguments = (ins Variadic<AnyType>:$operands,
                        StrAttr:$opName,
-                       StrAttr:$dialectName,
                        OptionalAttr<DictionaryAttr>:$opDict);
   let results = (outs Variadic<AnyType>:$results);
   let assemblyFormat = [{
-    $opName `in` $dialectName (`with` $opDict^)? `(` ($operands^ `:` qualified(type($operands)))? `)`  
+    $opName (`with` $opDict^)? `(` ($operands^ `:` qualified(type($operands)))? `)`
     attr-dict (`:` qualified(type($results))^)?
+  }];
+
+  let extraClassDeclaration = [{
+    /// Split `opName` on the first `.` separator. Returns the pair
+    /// (dialect, op) — e.g. `"arith.muli"` -> (`"arith"`, `"muli"`).
+    std::pair<::llvm::StringRef, ::llvm::StringRef> getDialectAndOp() {
+      return getOpName().split('.');
+    }
   }];
 }
 
@@ -239,19 +249,27 @@ def CalyxMatchOp : OpLibOp<"calyx_match",
 
 def HwMatchOp : OpLibOp<"hw_match",
     [HasParent<"OperatorOp">,
-     NoRegionArguments,
      SingleBlock,
      DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "OpLib dialect HW match operation";
   let description = [{
     The `oplib.hw_match` op describes how a logical operator lowers to
     an HW-dialect primitive (typically an `hw.instance` of an
-    `hw.module.extern`). The body yields the logical ports (clock,
-    reset, clock-enable, inputs, outputs) via `oplib.yield`.
+    `hw.module.extern`). The body block takes named arguments for every
+    extern input port (clk, reset, ce, then each operand in declaration
+    order) so the body can instantiate the primitive using real SSA
+    values rather than placeholder constants. The terminator is
+    `oplib.hw_return`, which yields the output values in target-function
+    result order.
+
+    Each body block argument carries a role from `argRoles`: `"clk"`,
+    `"reset"`, `"ce"`, or `"in"`. The custom printer uses these to label
+    each argument (e.g. `clk %arg0: i1, in %arg3: i32`).
   }];
 
   let arguments = (ins FlatSymbolRefAttr:$target,
-                       TypeAttrOf<FunctionType>:$targetType);
+                       TypeAttrOf<FunctionType>:$targetType,
+                       StrArrayAttr:$argRoles);
 
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);
@@ -259,11 +277,18 @@ def HwMatchOp : OpLibOp<"hw_match",
   let skipDefaultBuilders = 1;
   let builders = [
     OpBuilder<(ins "mlir::FlatSymbolRefAttr":$target,
-                   "mlir::TypeAttr":$targetType), [{
+                   "mlir::TypeAttr":$targetType,
+                   "mlir::TypeRange":$blockArgTypes,
+                   "mlir::ArrayAttr":$argRoles), [{
       Region* region = $_state.addRegion();
-      region->push_back(new Block());
+      Block *body = new Block();
+      region->push_back(body);
+      ::llvm::SmallVector<::mlir::Location, 4> locs(
+          blockArgTypes.size(), $_builder.getUnknownLoc());
+      body->addArguments(blockArgTypes, locs);
       $_state.addAttribute($_builder.getStringAttr("target"), target);
       $_state.addAttribute($_builder.getStringAttr("targetType"), targetType);
+      $_state.addAttribute($_builder.getStringAttr("argRoles"), argRoles);
     }]>
   ];
 
@@ -276,10 +301,47 @@ def HwMatchOp : OpLibOp<"hw_match",
     }
   }];
 
-  let assemblyFormat = [{
-    `(` $target `:` $targetType `)` `produce` attr-dict-with-keyword $body
-  }];
+  let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
+}
+
+def HwInstanceOp : OpLibOp<"hw_instance",
+    [ParentOneOf<["HwMatchOp"]>,
+     DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Instantiate an `hw.module.extern` inside a hw_match body";
+  let description = [{
+    Same shape as `hw.instance` — operand inputs + typed results,
+    argNames / resultNames metadata, symbol reference to an
+    `hw.module.extern`. Its operands are real SSA values (the enclosing
+    `oplib.hw_match` body's block arguments), not placeholder constants.
+
+    The symbol verifier resolves the extern from the enclosing `ModuleOp`
+    (like `calyx.primitive` does), so the op can live inside
+    `oplib.operator`'s `SymbolTable` even though a real `hw.instance`
+    cannot.
+  }];
+
+  let arguments = (ins StrAttr:$instanceName,
+                       FlatSymbolRefAttr:$moduleName,
+                       Variadic<AnyType>:$inputs,
+                       StrArrayAttr:$argNames,
+                       StrArrayAttr:$resultNames);
+  let results = (outs Variadic<AnyType>:$results);
+
+  let hasCustomAssemblyFormat = 1;
+}
+
+def HwReturnOp : OpLibOp<"hw_return", [Terminator, ReturnLike,
+                                          ParentOneOf<["HwMatchOp"]>]> {
+  let summary = "Terminator for hw_match bodies";
+  let description = [{
+    Yields the hw_match's output values. The operand types must match
+    the target function's result types.
+  }];
+  let arguments = (ins Variadic<AnyType>:$outputs);
+  let assemblyFormat = [{
+    attr-dict ($outputs^ `:` qualified(type($outputs)))?
+  }];
 }
 
 def OutputOp : OpLibOp<"output", [Terminator,
@@ -297,7 +359,7 @@ def OutputOp : OpLibOp<"output", [Terminator,
 def YieldOp : OpLibOp<"yield", [Terminator,
                                    ReturnLike,
                                    AttrSizedOperandSegments,
-                                   ParentOneOf<["CalyxMatchOp", "HwMatchOp"]>]> {
+                                   ParentOneOf<["CalyxMatchOp"]>]> {
   let summary = "OpLib dialect Yield operation";
   let description = [{
     The `oplib.output` operation.

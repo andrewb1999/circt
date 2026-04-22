@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/OpLib/OpLibOps.h"
+#include "circt/Dialect/HW/CustomDirectiveImpl.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/OpLib/OpLibAttributes.h"
 #include "mlir/IR/Attributes.h"
@@ -238,8 +239,255 @@ HwMatchOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   return verifyMatchSymbolUse(*this, getTarget(), getTargetType(), symbolTable);
 }
 
+// Format:
+//   `(` $target `:` $targetType `)` `produce`
+//   `(` ( role `%name` `:` type (`,` ...)* )? `)`
+//   attr-dict-with-keyword $body
+//
+// Valid roles: `clk`, `reset`, `ce`, `in`. They're stored in `argRoles`
+// as a StrArrayAttr in block-arg order, and labelled block args are
+// printed in the same order.
+ParseResult HwMatchOp::parse(OpAsmParser &parser, OperationState &result) {
+  FlatSymbolRefAttr targetAttr;
+  TypeAttr targetTypeAttr;
+  if (parser.parseLParen() ||
+      parser.parseAttribute(targetAttr, "target", result.attributes) ||
+      parser.parseColon() ||
+      parser.parseAttribute(targetTypeAttr, "targetType", result.attributes) ||
+      parser.parseRParen() || parser.parseKeyword("produce"))
+    return failure();
+
+  SmallVector<OpAsmParser::Argument> args;
+  SmallVector<Attribute> roles;
+  auto parseArg = [&]() -> ParseResult {
+    StringRef role;
+    if (parser.parseKeyword(&role))
+      return failure();
+    if (role != "clk" && role != "reset" && role != "ce" && role != "in")
+      return parser.emitError(parser.getCurrentLocation())
+             << "expected role keyword 'clk', 'reset', 'ce', or 'in'";
+    roles.push_back(
+        StringAttr::get(parser.getContext(), role));
+    OpAsmParser::Argument arg;
+    if (parser.parseArgument(arg, /*allowType=*/false, /*allowAttrs=*/false) ||
+        parser.parseColon() || parser.parseType(arg.type))
+      return failure();
+    args.push_back(arg);
+    return success();
+  };
+  if (parser.parseCommaSeparatedList(OpAsmParser::Delimiter::Paren, parseArg))
+    return failure();
+  result.addAttribute("argRoles",
+                      ArrayAttr::get(parser.getContext(), roles));
+
+  if (parser.parseOptionalAttrDictWithKeyword(result.attributes))
+    return failure();
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body, args, /*enableNameShadowing=*/false))
+    return failure();
+  if (body->empty())
+    body->emplaceBlock();
+  return success();
+}
+
+void HwMatchOp::print(OpAsmPrinter &p) {
+  p << '(' << getTargetAttr() << " : " << getTargetType() << ") produce (";
+  Block *body = getBodyBlock();
+  auto roles = getArgRoles();
+  llvm::interleaveComma(
+      llvm::zip(body->getArguments(), roles), p,
+      [&](auto pair) {
+        auto [arg, roleAttr] = pair;
+        p << cast<StringAttr>(roleAttr).getValue() << ' ';
+        p.printOperand(arg);
+        p << " : " << arg.getType();
+      });
+  p << ')';
+  p.printOptionalAttrDictWithKeyword(
+      getOperation()->getAttrs(),
+      /*elidedAttrs=*/{"target", "targetType", "argRoles"});
+  p << ' ';
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
+}
+
 LogicalResult HwMatchOp::verify() {
-  return verifyMatchBody(*this, getBodyBlock(), getTargetType());
+  Block *body = getBodyBlock();
+  auto roles = getArgRoles();
+  if (roles.size() != body->getNumArguments())
+    return emitOpError("argRoles size (")
+           << roles.size() << ") must match block-arg count ("
+           << body->getNumArguments() << ")";
+  for (auto roleAttr : roles) {
+    auto s = dyn_cast<StringAttr>(roleAttr);
+    if (!s)
+      return emitOpError("argRoles entries must be strings");
+    auto v = s.getValue();
+    if (v != "clk" && v != "reset" && v != "ce" && v != "in")
+      return emitOpError("argRoles entry '")
+             << v << "' must be 'clk', 'reset', 'ce', or 'in'";
+  }
+
+  // The `in`-role block args, in declaration order, must match the target
+  // function's input types one-for-one (bitwidth comparison, consistent
+  // with how hw_return outputs are checked against target results).
+  // Clock / reset / enable args are ignored — they carry HW-level
+  // plumbing that sits outside the logical operator signature.
+  auto targetType = getTargetType();
+  SmallVector<Type, 4> inArgTypes;
+  for (auto [roleAttr, arg] :
+       llvm::zip(roles, body->getArguments())) {
+    if (cast<StringAttr>(roleAttr).getValue() == "in")
+      inArgTypes.push_back(arg.getType());
+  }
+  if (inArgTypes.size() != targetType.getNumInputs())
+    return emitOpError("body has ")
+           << inArgTypes.size() << " `in`-role block arg(s), target expects "
+           << targetType.getNumInputs();
+  for (auto [i, t] : llvm::enumerate(inArgTypes)) {
+    if (t.getIntOrFloatBitWidth() !=
+        targetType.getInput(i).getIntOrFloatBitWidth())
+      return emitOpError("body `in`-role block arg #")
+             << i << " bitwidth does not match target input type";
+  }
+
+  if (!body->mightHaveTerminator())
+    return emitOpError("must be terminated by an `oplib.hw_return`");
+  auto retOp = dyn_cast<oplib::HwReturnOp>(body->getTerminator());
+  if (!retOp)
+    return emitOpError("must be terminated by an `oplib.hw_return`");
+
+  if (retOp.getOutputs().size() != targetType.getNumResults())
+    return emitOpError("hw_return yields ")
+           << retOp.getOutputs().size() << " value(s), target expects "
+           << targetType.getNumResults();
+  for (auto [i, t] : llvm::enumerate(retOp.getOutputs().getTypes())) {
+    if (t.getIntOrFloatBitWidth() !=
+        targetType.getResult(i).getIntOrFloatBitWidth())
+      return emitOpError("hw_return output #")
+             << i << " bitwidth does not match target result type";
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// HwInstanceOp
+//===----------------------------------------------------------------------===//
+
+// Same assembly form as `hw.instance`:
+//   "name" @module(arg: %val: type, ...) -> (res: type, ...)
+ParseResult HwInstanceOp::parse(OpAsmParser &parser, OperationState &result) {
+  StringAttr instanceNameAttr;
+  FlatSymbolRefAttr moduleNameAttr;
+  SmallVector<OpAsmParser::UnresolvedOperand, 4> inputsOperands;
+  SmallVector<Type, 1> inputsTypes, allResultTypes;
+  ArrayAttr argNames, resultNames;
+  auto noneType = parser.getBuilder().getType<NoneType>();
+
+  if (parser.parseAttribute(instanceNameAttr, noneType, "instanceName",
+                            result.attributes) ||
+      parser.parseAttribute(moduleNameAttr, noneType, "moduleName",
+                            result.attributes))
+    return failure();
+
+  llvm::SMLoc inputsLoc = parser.getCurrentLocation();
+  if (circt::parseInputPortList(parser, inputsOperands, inputsTypes, argNames) ||
+      parser.resolveOperands(inputsOperands, inputsTypes, inputsLoc,
+                             result.operands) ||
+      parser.parseArrow() ||
+      circt::parseOutputPortList(parser, allResultTypes, resultNames) ||
+      parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  result.addAttribute("argNames", argNames);
+  result.addAttribute("resultNames", resultNames);
+  result.addTypes(allResultTypes);
+  return success();
+}
+
+void HwInstanceOp::print(OpAsmPrinter &p) {
+  p << ' ';
+  p.printAttributeWithoutType(getInstanceNameAttr());
+  p << ' ';
+  p.printAttributeWithoutType(getModuleNameAttr());
+  circt::printInputPortList(p, *this, getInputs(), getInputs().getTypes(),
+                         getArgNames());
+  p << " -> ";
+  circt::printOutputPortList(p, *this, getResultTypes(), getResultNames());
+  p.printOptionalAttrDict(
+      getOperation()->getAttrs(),
+      /*elidedAttrs=*/{"instanceName", "moduleName", "argNames",
+                       "resultNames"});
+}
+
+LogicalResult
+HwInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  // Resolve the extern from the enclosing ModuleOp, bypassing the
+  // oplib.operator / oplib.library SymbolTable boundaries. Mirrors the
+  // scope trick `calyx.primitive` uses.
+  auto moduleOp = (*this)->getParentOfType<ModuleOp>();
+  if (!moduleOp)
+    return emitOpError("must be nested in a ModuleOp");
+  auto *referenced =
+      symbolTable.lookupSymbolIn(moduleOp, getModuleNameAttr());
+  if (!referenced)
+    return emitOpError("references unknown extern module '")
+           << getModuleName() << "'";
+  auto externOp = dyn_cast<hw::HWModuleExternOp>(referenced);
+  if (!externOp)
+    return emitOpError("referenced symbol '")
+           << getModuleName() << "' is not an hw.module.extern";
+
+  // Shape-check operands and results against the referenced extern:
+  // counts, per-port types, AND per-port names must all match exactly.
+  SmallVector<Type> inputPortTypes, outputPortTypes;
+  SmallVector<StringAttr> inputPortNames, outputPortNames;
+  for (auto port : externOp.getPortList()) {
+    if (port.dir == hw::ModulePort::Direction::Input) {
+      inputPortTypes.push_back(port.type);
+      inputPortNames.push_back(port.name);
+    } else {
+      outputPortTypes.push_back(port.type);
+      outputPortNames.push_back(port.name);
+    }
+  }
+  if (getInputs().size() != inputPortTypes.size())
+    return emitOpError("has ")
+           << getInputs().size() << " input(s) but extern has "
+           << inputPortTypes.size();
+  if (getResults().size() != outputPortTypes.size())
+    return emitOpError("has ")
+           << getResults().size() << " result(s) but extern has "
+           << outputPortTypes.size();
+  if (getArgNames().size() != inputPortTypes.size())
+    return emitOpError("argNames size must equal extern input-port count");
+  if (getResultNames().size() != outputPortTypes.size())
+    return emitOpError("resultNames size must equal extern output-port count");
+  for (auto [i, t] : llvm::enumerate(inputPortTypes)) {
+    if (getInputs()[i].getType() != t)
+      return emitOpError("input #")
+             << i << " type mismatch with extern input port";
+    auto name = dyn_cast<StringAttr>(getArgNames()[i]);
+    if (!name || name != inputPortNames[i])
+      return emitOpError("input #")
+             << i << " name '"
+             << (name ? name.getValue() : StringRef("<non-string>"))
+             << "' does not match extern port name '"
+             << inputPortNames[i].getValue() << "'";
+  }
+  for (auto [i, t] : llvm::enumerate(outputPortTypes)) {
+    if (getResults()[i].getType() != t)
+      return emitOpError("result #")
+             << i << " type mismatch with extern output port";
+    auto name = dyn_cast<StringAttr>(getResultNames()[i]);
+    if (!name || name != outputPortNames[i])
+      return emitOpError("result #")
+             << i << " name '"
+             << (name ? name.getValue() : StringRef("<non-string>"))
+             << "' does not match extern port name '"
+             << outputPortNames[i].getValue() << "'";
+  }
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
