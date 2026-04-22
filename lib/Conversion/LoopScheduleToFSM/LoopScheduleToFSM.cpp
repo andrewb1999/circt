@@ -1258,14 +1258,17 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
       Block *ob = st.ensureOutput(fb);
       ob->getTerminator()->erase();
       fb.setInsertionPointToEnd(ob);
-      // Wait frames keep frame_active_i low during their cycle states
-      // (legacy behavior: for wait frames, "active" is expressed via
-      // child_active_j spanning from the launch's at-offset through
-      // WAIT_i). Non-wait frames drive frame_active_i high.
-      int activeFrameIdx = frameHasLaunch ? -1 : (int)i;
+      // frame_active_<i> is high during every cycle state of frame i,
+      // whether or not the frame has launches. This lets the per-frame
+      // merge mux keep driving the frame's contributed memory address
+      // while the launch's cycle hasn't arrived yet (e.g. a load at
+      // at-0 inside a frame whose launch fires at at-1 needs its
+      // address held through cycles 0..1 so the memory's 1-cycle-
+      // latency read-register produces the right value when the
+      // pipeline consumes it).
       fsm::OutputOp::create(
           fb, loc,
-          buildOutSets(falseVal, iterAdv, /*activeFrame=*/activeFrameIdx,
+          buildOutSets(falseVal, iterAdv, /*activeFrame=*/(int)i,
                        /*activeChildStarts=*/startsPerCycle[c],
                        /*activeLive=*/livesPerCycle[c],
                        /*activePosts=*/{},
@@ -1760,15 +1763,31 @@ static void muxStageMemPorts(
       continue; // nothing to mux for this memref (probably read-only with
                 // data-type already known to caller — not our concern).
 
+    // Use the caller's pre-existing contributions (if any) as the
+    // fallback values — so static at-body ops that set addr/wrEn at
+    // non-pipeline cycles continue to drive those signals when no
+    // stage is active. Without this, a load at at-K inside a wait
+    // frame has its address wiped the moment the pipeline runs
+    // muxStageMemPorts on the same memref.
+    auto &existing = outPorts[memref];
     SmallVector<Value> addrs;
-    for (unsigned w : widths) {
+    for (auto [d, w] : llvm::enumerate(widths)) {
       Type addrType = IntegerType::get(ctx, w);
-      addrs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
+      Value fallback = (d < existing.addrs.size() && existing.addrs[d])
+                            ? existing.addrs[d]
+                            : hw::ConstantOp::create(builder, loc, addrType, 0);
+      addrs.push_back(fallback);
     }
-    Value wrData = hw::ConstantOp::create(builder, loc, dataType, 0);
-    Value wrEn = hw::ConstantOp::create(builder, loc, i1, 0);
-    Value rdEn = needsRdEn ? hw::ConstantOp::create(builder, loc, i1, 0)
-                           : Value();
+    Value wrData = existing.wrData
+                        ? existing.wrData
+                        : hw::ConstantOp::create(builder, loc, dataType, 0);
+    Value wrEn = existing.wrEn
+                      ? existing.wrEn
+                      : hw::ConstantOp::create(builder, loc, i1, 0);
+    Value rdEn;
+    if (needsRdEn)
+      rdEn = existing.rdEn ? existing.rdEn
+                           : hw::ConstantOp::create(builder, loc, i1, 0);
 
     // Priority mux chain — last stage has lowest priority. Stages that did
     // not actually touch this memref (no address, no write) contribute
@@ -2107,9 +2126,34 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // does not place post-launch ops inside a wait frame's body (post-wait
   // work lives in a subsequent frame).
   auto lowerFrameWithChild =
-      [&](LoopScheduleFrameOp frame, Value preGate,
+      [&](LoopScheduleFrameOp frame, unsigned frameIdx, Value preGate,
           Value /*postGate*/, DenseMap<Value, MemPortMapping> &framePorts)
       -> LogicalResult {
+    bool hasCycleGates = frameLatencies[frameIdx] > 1;
+    Block &frameBody = frame.getBodyBlock();
+
+    // Is this at-op's `res` consumed at a strictly-later at-offset in
+    // the same frame, or inside a launch-holder at-op in the same
+    // frame? Such consumers run ≥1 cycle after `atOp`, so the
+    // combinational mapping (e.g. a load's rd_data) goes stale as the
+    // memory port moves on and we need to latch the value.
+    auto resultNeedsCapture = [&](Value atResult, unsigned myOffset) {
+      for (auto *user : atResult.getUsers()) {
+        Operation *anc = frameBody.findAncestorOpInBlock(*user);
+        if (!anc)
+          continue;
+        auto otherAt = dyn_cast<LoopScheduleAtOp>(anc);
+        if (!otherAt)
+          continue;
+        if ((unsigned)otherAt.getOffset() > myOffset)
+          return true;
+        for (auto &op : otherAt.getBodyBlock())
+          if (isa<LoopScheduleLaunchOp>(&op))
+            return true;
+      }
+      return false;
+    };
+
     for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
       Block &atBody = atOp.getBodyBlock();
       // Skip launch-holder ats; their child loop is lowered as a module.
@@ -2121,6 +2165,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         }
       if (isLaunchHolder)
         continue;
+      unsigned atOffset = (unsigned)atOp.getOffset();
+      // For multi-cycle wait frames, gate each at-K op by its own
+      // FRAME_<i>_<K> cycle output; for single-cycle wait frames
+      // fsmFrameCycleGates[i][0] is just frame_active_<i>.
+      Value atGate =
+          hasCycleGates && atOffset < fsmFrameCycleGates[frameIdx].size()
+              ? fsmFrameCycleGates[frameIdx][atOffset]
+              : preGate;
       for (auto &op : atBody) {
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp,
                 LoopScheduleLaunchOp>(&op))
@@ -2128,13 +2180,13 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         if (auto loadOp =
                 dyn_cast<loopschedule::HWLoadLoweringInterface>(&op)) {
           if (failed(handleHWLoad(loadOp, hw, localMapping, framePorts,
-                                     preGate)))
+                                     atGate)))
             return failure();
           continue;
         }
         if (auto storeOp =
                 dyn_cast<loopschedule::HWStoreLoweringInterface>(&op)) {
-          if (failed(handleHWStore(storeOp, hw, localMapping, preGate,
+          if (failed(handleHWStore(storeOp, hw, localMapping, atGate,
                                       framePorts)))
             return failure();
           continue;
@@ -2153,6 +2205,33 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           continue;
         if (auto mapped = localMapping.lookupOrNull(val))
           localMapping.map(res, mapped);
+      }
+      // Latch any at-op result that a later at-op or a launched
+      // child reads. The combinational mapping for a load is the
+      // memory port's `rd_data`, which is only valid for the single
+      // cycle after the load's address is applied; without this
+      // capture the consumer reads whatever address the port has
+      // moved to next.
+      if (hasCycleGates && atOffset + 1 < fsmFrameCycleGates[frameIdx].size()) {
+        Value captureGate = fsmFrameCycleGates[frameIdx][atOffset + 1];
+        hw.setInsertionPointToEnd(hwBody);
+        for (auto res : atOp.getResults()) {
+          if (!resultNeedsCapture(res, atOffset))
+            continue;
+          Value mapped = localMapping.lookupOrNull(res);
+          if (!mapped)
+            continue;
+          if (!isa<IntegerType>(mapped.getType()))
+            continue;
+          Value resetVal = createZeroConstant(hw, loc, mapped.getType());
+          auto regName = hw.getStringAttr(
+              node.prefix + "_f" + std::to_string(frameIdx) + "_at" +
+              std::to_string(atOffset) + "_r" +
+              std::to_string(res.getResultNumber()) + "_latched");
+          Value latched = seq::CompRegClockEnabledOp::create(
+              hw, loc, mapped, clk, captureGate, rst, resetVal, regName);
+          localMapping.map(res, latched);
+        }
       }
     }
     return success();
@@ -2218,7 +2297,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       Value firstSlotStart = fsmChildStarts[frameWaitIdx[frameIdx].front()];
       Value framePostActive =
           fsmPostActives[frameWaitIdx[frameIdx].back()];
-      if (failed(lowerFrameWithChild(frameOp,
+      if (failed(lowerFrameWithChild(frameOp, frameIdx,
                                       firstSlotStart, framePostActive,
                                       perFramePorts[frameIdx])))
         return failure();
@@ -2649,22 +2728,17 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   hw.setInsertionPointToEnd(hwBody);
   SmallVector<Value> frameMergeSignals(numFrames);
   for (unsigned i = 0; i < numFrames; ++i) {
-    if (!frameWaitIdx[i].empty()) {
-      // OR together child_active and post_active of every slot in this
-      // wait-frame so the merge mux sees the frame as alive across all
-      // launches.
-      Value aliveSoFar;
-      for (int j : frameWaitIdx[i]) {
-        Value slotAlive = comb::OrOp::create(
-            hw, loc, fsmChildActives[(unsigned)j], fsmPostActives[(unsigned)j]);
-        aliveSoFar = aliveSoFar ? comb::OrOp::create(hw, loc, aliveSoFar,
-                                                      slotAlive)
-                                : slotAlive;
-      }
-      frameMergeSignals[i] = aliveSoFar;
-    } else {
-      frameMergeSignals[i] = fsmFrameActives[i];
+    // Frame is "alive" on the merge mux during any cycle state
+    // (frame_active_<i>) plus — for wait frames — every launch's
+    // child_active and post_active so the frame keeps driving its
+    // contributed address through the launched child's run.
+    Value aliveSoFar = fsmFrameActives[i];
+    for (int j : frameWaitIdx[i]) {
+      Value slotAlive = comb::OrOp::create(
+          hw, loc, fsmChildActives[(unsigned)j], fsmPostActives[(unsigned)j]);
+      aliveSoFar = comb::OrOp::create(hw, loc, aliveSoFar, slotAlive);
     }
+    frameMergeSignals[i] = aliveSoFar;
   }
 
   DenseMap<Value, MemPortMapping> mergedMemPorts;
