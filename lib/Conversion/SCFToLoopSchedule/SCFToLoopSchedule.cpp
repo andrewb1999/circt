@@ -111,6 +111,159 @@ private:
   PredicateMap predicateMap;
 };
 
+/// Attribute set by upstream passes on ops whose HW latency is variable /
+/// stall-able (e.g. an `amc.load` on a dynamic port). The scheduler
+/// treats these ops normally for timing purposes but wraps them in a
+/// `loopschedule.launch` at their issue stage and inserts a
+/// `loopschedule.expect` in the stage scheduled `latency` cycles later,
+/// so downstream FSM lowering has a handle to gate stall logic on.
+static constexpr llvm::StringLiteral kDynamicLatencyAttr =
+    "loopschedule.dynamic";
+
+/// Replace each dynamic-latency op inside `pipeline` with a
+/// `loopschedule.launch` in its issue stage + a `loopschedule.expect` in
+/// the stage `latency` cycles later. Only handles single-result ops for
+/// now; multi-result dynamic ops emit a warning and are left alone.
+static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
+                                      scheduling::Problem &problem) {
+  MLIRContext *ctx = pipeline.getContext();
+  auto handleTy = HandleType::get(ctx);
+
+  // Collect dynamic ops + their issue stages up front so the scan isn't
+  // invalidated by the rewrites we do below.
+  struct Wrapping {
+    Operation *dynOp;
+    LoopScheduleAtOp issueStage;
+    unsigned latency;
+  };
+  SmallVector<Wrapping> wrappings;
+  pipeline.walk([&](LoopScheduleAtOp atOp) {
+    for (Operation &op : atOp.getBodyBlock().getOperations()) {
+      if (!op.hasAttr(kDynamicLatencyAttr))
+        continue;
+      if (op.getNumResults() > 1) {
+        op.emitWarning("loopschedule.dynamic op with multiple results is "
+                        "not yet supported; skipping launch/expect wrap");
+        continue;
+      }
+      unsigned lat = 1;
+      if (auto opr = problem.getLinkedOperatorType(&op))
+        lat = problem.getLatency(*opr).value_or(1);
+      if (lat == 0) {
+        op.emitWarning("loopschedule.dynamic op has zero latency; skipping "
+                        "launch/expect wrap");
+        continue;
+      }
+      wrappings.push_back({&op, atOp, lat});
+    }
+  });
+
+  for (auto &w : wrappings) {
+    Operation *dynOp = w.dynOp;
+    LoopScheduleAtOp issueStage = w.issueStage;
+    unsigned latency = w.latency;
+    Location loc = dynOp->getLoc();
+
+    // 1. Create launch in the issue stage, move the dynamic op inside.
+    OpBuilder b(dynOp);
+    auto launch = b.create<LoopScheduleLaunchOp>(loc, handleTy);
+    Block &launchBlock = launch.getBody().emplaceBlock();
+    dynOp->moveBefore(&launchBlock, launchBlock.begin());
+    b.setInsertionPointToEnd(&launchBlock);
+    b.create<LoopScheduleYieldOp>(loc, dynOp->getResults());
+
+    // 2. If the op had a single result, its external users inside the
+    //    issue stage should now consume the launch's handle where they
+    //    previously consumed the op's result (these users are the
+    //    at-yield and register forwarding — the dynamic op's result must
+    //    not be visible in the issue-stage body).
+    Value opRes =
+        dynOp->getNumResults() == 1 ? dynOp->getResult(0) : Value();
+
+    // 3. Rewire the issue stage's at-yield: replace slots that held the
+    //    op result with the launch's handle, and recompute the stage op's
+    //    result types (handle-typed for those slots, unchanged for the
+    //    rest). Result count stays identical, so external slot indices
+    //    are stable.
+    auto stageYield = issueStage.getYieldOp();
+    SmallVector<unsigned> rewiredSlots;
+    SmallVector<Type> newStageResultTypes(issueStage.getResultTypes());
+    for (auto [i, operand] :
+         llvm::enumerate(stageYield->getOperands())) {
+      if (opRes && operand == opRes) {
+        stageYield->setOperand(i, launch.getHandle());
+        newStageResultTypes[i] = handleTy;
+        rewiredSlots.push_back(i);
+      }
+    }
+
+    // Rebuild the issue-stage op with the updated result types and
+    // transplant its body.
+    LoopScheduleAtOp newStage;
+    if (!rewiredSlots.empty() &&
+        newStageResultTypes != SmallVector<Type>(issueStage.getResultTypes())) {
+      OpBuilder rebuild(issueStage);
+      newStage = rebuild.create<LoopScheduleAtOp>(
+          issueStage.getLoc(), newStageResultTypes,
+          issueStage.getOffsetAttr());
+      newStage.getBody().takeBody(issueStage.getBody());
+      for (auto [oldRes, newRes] :
+           llvm::zip(issueStage.getResults(), newStage.getResults()))
+        oldRes.replaceAllUsesWith(newRes);
+      issueStage.erase();
+    } else {
+      newStage = issueStage;
+    }
+
+    if (rewiredSlots.empty())
+      continue; // Nothing to expect.
+
+    // 4. Find the destination at-stage (offset = issue + latency).
+    unsigned destOffset = newStage.getOffset() + latency;
+    LoopScheduleAtOp destStage;
+    for (auto candidate :
+         pipeline.getStagesBlock().getOps<LoopScheduleAtOp>()) {
+      if (candidate.getOffset() == destOffset) {
+        destStage = candidate;
+        break;
+      }
+    }
+    if (!destStage) {
+      dynOp->emitWarning(
+          "no destination at-stage at offset ")
+          << destOffset << " for dynamic op; stall handle left dangling";
+      continue;
+    }
+
+    // 5. Insert a loopschedule.expect at the start of the destination
+    //    stage's body, consuming the forwarded handle. The expect's
+    //    results carry the op's original types so existing stage-register
+    //    forwarding of the value through to later stages keeps working
+    //    verbatim.
+    b.setInsertionPointToStart(&destStage.getBodyBlock());
+    auto expect = b.create<LoopScheduleExpectOp>(
+        loc, dynOp->getResultTypes(), newStage.getResult(rewiredSlots.front()));
+
+    // 6. Within `destStage`'s body only, replace uses of
+    //    `newStage.getResult(slot)` with the expect's results. Uses
+    //    outside that body (e.g. in later stages after cross-stage
+    //    forwarding) continue to reference the handle-typed stage
+    //    result until they're rewritten to forward the value from the
+    //    expect (handled by downstream stages picking up the expect
+    //    result through the normal register chain).
+    for (unsigned slot : rewiredSlots) {
+      Value stageRes = newStage.getResult(slot);
+      for (OpOperand &use : llvm::make_early_inc_range(stageRes.getUses())) {
+        Operation *user = use.getOwner();
+        if (user == expect.getOperation())
+          continue;
+        if (destStage->isProperAncestor(user))
+          use.set(expect.getResult(0));
+      }
+    }
+  }
+}
+
 /// Clone the `before` body's non-terminator ops into the start of the `after`
 /// body so they participate in the scheduling problem. The `before` body
 /// computes the loop condition from the iter_args; by inlining these ops into
@@ -1034,6 +1187,14 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
   builder.setInsertionPointToEnd(&stagesBlock);
   builder.create<LoopScheduleTerminatorOp>(pipelineCondResult, termResults,
                                            ValueRange{});
+
+  // Post-processing: wrap any dynamic-latency op (ops carrying a
+  // `loopschedule.dynamic` unit attr) in a `loopschedule.launch` at its
+  // issue stage, and insert a `loopschedule.expect` in the stage that
+  // sits `latency(op)` cycles later. The dynamic marker tells downstream
+  // FSM lowering to stall the pipeline on that expect's handle if the
+  // op's completion signal isn't asserted by the expected cycle.
+  wrapDynamicOpsInPipeline(pipeline, problem);
 
   // Replace loop results with pipeline results.
   for (size_t i = 0; i < loop.getNumResults(); ++i)

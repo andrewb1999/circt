@@ -48,6 +48,11 @@ public:
     auto accessName =
         op->getAttrOfType<StringAttr>(NameAnalysis::getAttributeName());
     newOp->setAttr(NameAnalysis::getAttributeName(), accessName);
+    // Preserve the "loopschedule.dynamic" marker: downstream scheduling
+    // wraps any op carrying this attr in a loopschedule.launch/expect
+    // pair, so the FSM backend has a handle to stall on.
+    if (auto dyn = op->getAttr("loopschedule.dynamic"))
+      newOp->setAttr("loopschedule.dynamic", dyn);
     return success();
   }
 };
@@ -65,6 +70,8 @@ public:
     auto accessName =
         op->getAttrOfType<StringAttr>(NameAnalysis::getAttributeName());
     newOp->setAttr(NameAnalysis::getAttributeName(), accessName);
+    if (auto dyn = op->getAttr("loopschedule.dynamic"))
+      newOp->setAttr("loopschedule.dynamic", dyn);
     return success();
   }
 };
