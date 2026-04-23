@@ -1,8 +1,8 @@
-// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule))" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule)" %s | FileCheck %s
 
 // Three-level nested gemm: C[i,j] += A[i,k]*B[k,j]. Each level becomes its
 // own launch+sequential. Checks the triple-nested launch/await structure.
-// CHECK-LABEL: func.func @gemm
+// CHECK-LABEL: loopschedule.func_sequential @gemm
 // CHECK: loopschedule.sequential
 // CHECK: loopschedule.at 0 -> !loopschedule.handle
 // CHECK:   loopschedule.launch : !loopschedule.handle

@@ -1,7 +1,7 @@
-// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule))" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule)" %s | FileCheck %s
 
 // Scalar-memref product: B[i] = a * A[i]. Multi-cycle muli.
-// CHECK-LABEL: func.func @scale
+// CHECK-LABEL: loopschedule.func_sequential @scale
 // CHECK: loopschedule.frame -> (!loopschedule.handle)
 // CHECK: loopschedule.at 0 -> !loopschedule.handle
 // CHECK:   loopschedule.launch : !loopschedule.handle

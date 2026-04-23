@@ -1,8 +1,8 @@
-// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule))" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule)" %s | FileCheck %s
 
 // 1-D 3-tap stencil: B[i] = (A[i-1] + A[i] + A[i+1]) >> 2. Multi-cycle reads
 // from the same memref at three neighboring indices.
-// CHECK-LABEL: func.func @stencil1d
+// CHECK-LABEL: loopschedule.func_sequential @stencil1d
 // CHECK: loopschedule.sequential
 // CHECK-DAG: loopschedule.at 0
 // CHECK-DAG: loopschedule.at 1

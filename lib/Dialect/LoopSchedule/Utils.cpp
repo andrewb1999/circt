@@ -527,6 +527,60 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
   return problem;
 }
 
+ChainingModuloProblem
+getChainingModuloProblem(
+    func::FuncOp funcOp,
+    LoopScheduleDependenceAnalysis &dependenceAnalysis) {
+  ChainingModuloProblem problem(funcOp);
+
+  // Insert ops + dependences for the func body. Skip ops that already live
+  // inside an inner LoopSchedule container (sequential / pipeline / frame)
+  // — those have been scheduled as launches already.
+  funcOp.getBody().walk([&](Operation *op) {
+    if (op->getParentOfType<LoopScheduleSequentialOp>() != nullptr ||
+        op->getParentOfType<LoopSchedulePipelineOp>() != nullptr)
+      return;
+
+    problem.insertOperation(op);
+
+    ArrayRef<LoopScheduleDependence> dependencies =
+        dependenceAnalysis.getDependencies(op);
+    if (dependencies.empty())
+      return;
+
+    for (const LoopScheduleDependence &memoryDep : dependencies) {
+      if (!funcOp->isAncestor(memoryDep.source))
+        continue;
+      Problem::Dependence dep(memoryDep.source, op);
+      if (isa<loopschedule::LoopScheduleStoreOp, StoreInterface,
+              memref::StoreOp>(memoryDep.source))
+        problem.setSrcAsStore(dep, true);
+      auto depInserted = problem.insertDependence(dep);
+      assert(succeeded(depInserted));
+      (void)depInserted;
+      // Cross-transaction memory dependences become distance>0 backedges
+      // in the modulo problem (ChainingModulo's whole point — bound II by
+      // both resource overlap and any real cyclic edges).
+      if (memoryDep.distance > 0)
+        problem.setDistance(dep, memoryDep.distance);
+    }
+  });
+
+  // Anchor: terminator must be scheduled after every other op.
+  auto *anchor = funcOp.getBody().back().getTerminator();
+  problem.insertOperation(anchor);
+  funcOp.getBody().walk([&](Operation *op) {
+    if (op == anchor || !problem.hasOperation(op))
+      return;
+    Problem::Dependence dep(op, anchor);
+    auto depInserted = problem.insertDependence(dep);
+    assert(succeeded(depInserted));
+    (void)depInserted;
+  });
+
+  return problem;
+}
+
 ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
     func::FuncOp funcOp, LoopScheduleDependenceAnalysis &dependenceAnalysis) {
   ChainingSharedOperatorsProblem problem(funcOp);

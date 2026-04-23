@@ -20,6 +20,8 @@ include "mlir/IR/RegionKindInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/Interfaces/CallInterfaces.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
 include "circt/Dialect/LoopSchedule/LoopSchedule.td"
 include "circt/Dialect/LoopSchedule/LoopScheduleInterfaces.td"
 include "circt/Dialect/LoopSchedule/LoopScheduleLoweringInterfaces.td"
@@ -499,7 +501,8 @@ def LoopScheduleFrameOp : LoopScheduleOp<"frame", [PhaseOpInterface]> {
 }
 
 def LoopScheduleAtOp : LoopScheduleOp<"at",
-    [ParentOneOf<["LoopScheduleFrameOp", "LoopSchedulePipelineOp"]>,
+    [ParentOneOf<["LoopScheduleFrameOp", "LoopSchedulePipelineOp",
+                  "LoopScheduleFuncPipelineOp"]>,
      PhaseOpInterface,
      SingleBlockImplicitTerminator<"LoopScheduleYieldOp">,
      NoRegionArguments]> {
@@ -665,6 +668,152 @@ def LoopScheduleIterArgUpdateOp : LoopScheduleOp<"iter_arg_update",
 
   let assemblyFormat = [{
     $iterArg `=` $value attr-dict `:` type($value)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Func-level container ops
+//
+// `loopschedule.func_sequential` and `loopschedule.func_pipeline` replace
+// `func.func` as the top-level container after SCFToLoopSchedule. Each
+// holds a single body region whose contents are constrained to be a valid
+// schedule (allocations + init ops first, then frames or pipeline stages,
+// then a `loopschedule.return`).
+//
+// Both ops carry FunctionOpInterface so external passes that walk function-
+// like ops (symbol resolution, call resolution, walk-the-module utilities)
+// continue to work. They are SymbolOp + Callable so `func.call @foo` can
+// still target them.
+//===----------------------------------------------------------------------===//
+
+class LoopScheduleFuncOpBase<string mnemonic, list<Trait> traits = []> :
+    LoopScheduleOp<mnemonic, !listconcat(traits, [
+      AutomaticAllocationScope,
+      FunctionOpInterface,
+      IsolatedFromAbove,
+      Symbol,
+      CallableOpInterface,
+      OpAsmOpInterface
+    ])> {
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    TypeAttrOf<FunctionType>:$function_type,
+    OptionalAttr<StrAttr>:$sym_visibility,
+    OptionalAttr<DictArrayAttr>:$arg_attrs,
+    OptionalAttr<DictArrayAttr>:$res_attrs
+  );
+
+  let regions = (region AnyRegion:$body);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    //===------------------------------------------------------------------===//
+    // FunctionOpInterface
+    //===------------------------------------------------------------------===//
+
+    ::llvm::ArrayRef<::mlir::Type> getArgumentTypes() {
+      return getFunctionType().getInputs();
+    }
+    ::llvm::ArrayRef<::mlir::Type> getResultTypes() {
+      return getFunctionType().getResults();
+    }
+    ::mlir::Region *getCallableRegion() {
+      return isExternal() ? nullptr : &getBody();
+    }
+
+    //===------------------------------------------------------------------===//
+    // CallableOpInterface
+    //===------------------------------------------------------------------===//
+
+    ::llvm::ArrayRef<::mlir::Type> getCallableResults() {
+      return getFunctionType().getResults();
+    }
+    ::mlir::ArrayAttr getCallableArgAttrs() {
+      return getArgAttrs().value_or(nullptr);
+    }
+    ::mlir::ArrayAttr getCallableResAttrs() {
+      return getResAttrs().value_or(nullptr);
+    }
+  }];
+}
+
+def LoopScheduleFuncSequentialOp
+    : LoopScheduleFuncOpBase<"func_sequential"> {
+  let summary = "LoopSchedule sequential function-level container.";
+  let description = [{
+    A function whose body is a sequential schedule: allocations + init ops,
+    followed by zero or more `loopschedule.frame` ops in monotonic phase
+    order, terminated by `loopschedule.return`. Replaces `func.func` as the
+    top-level container after SCFToLoopSchedule for the non-pipelined case.
+
+    No iter-args, no II — execution semantics match the existing
+    func-level lowering: frames execute in order and the function returns
+    once the last frame completes.
+  }];
+
+  let builders = [
+    OpBuilder<(ins
+      "::mlir::StringRef":$name,
+      "::mlir::FunctionType":$type,
+      CArg<"::llvm::ArrayRef<::mlir::NamedAttribute>", "{}">:$attrs,
+      CArg<"::llvm::ArrayRef<::mlir::DictionaryAttr>", "{}">:$argAttrs)>
+  ];
+}
+
+def LoopScheduleFuncPipelineOp
+    : LoopScheduleFuncOpBase<"func_pipeline"> {
+  let summary = "LoopSchedule pipelined function-level container.";
+  let description = [{
+    A function whose body is a pipelined schedule: allocations + init ops,
+    followed by `loopschedule.at` stages at increasing offsets, terminated
+    by `loopschedule.return`. New invocations may be issued every `II`
+    cycles. Replaces `func.func` as the top-level container after
+    SCFToLoopSchedule for the pipelined case.
+
+    No iter-args (function arguments are fresh per transaction). The
+    scheduling problem is a `ChainingModuloProblem` so resource sharing
+    across overlapping in-flight transactions is bounded by II, even when
+    the dependence graph itself has no cyclic edges.
+  }];
+
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    TypeAttrOf<FunctionType>:$function_type,
+    I64Attr:$II,
+    OptionalAttr<StrAttr>:$sym_visibility,
+    OptionalAttr<DictArrayAttr>:$arg_attrs,
+    OptionalAttr<DictArrayAttr>:$res_attrs
+  );
+
+  let builders = [
+    OpBuilder<(ins
+      "::mlir::StringRef":$name,
+      "::mlir::FunctionType":$type,
+      "::mlir::IntegerAttr":$II,
+      CArg<"::llvm::ArrayRef<::mlir::NamedAttribute>", "{}">:$attrs,
+      CArg<"::llvm::ArrayRef<::mlir::DictionaryAttr>", "{}">:$argAttrs)>
+  ];
+}
+
+def LoopScheduleReturnOp : LoopScheduleOp<"return",
+    [Pure, ReturnLike, Terminator,
+     ParentOneOf<["LoopScheduleFuncSequentialOp",
+                  "LoopScheduleFuncPipelineOp"]>]> {
+  let summary = "Return from a loopschedule func-level container.";
+  let description = [{
+    Terminator for `loopschedule.func_sequential` and
+    `loopschedule.func_pipeline` bodies. Operand types must match the
+    parent op's result types.
+  }];
+
+  let arguments = (ins Variadic<AnyType>:$operands);
+
+  let assemblyFormat = [{
+    attr-dict ($operands^ `:` type($operands))?
   }];
 
   let hasVerifier = 1;

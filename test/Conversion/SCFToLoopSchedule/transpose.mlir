@@ -1,7 +1,7 @@
-// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule))" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule)" %s | FileCheck %s
 
 // Matrix transpose: B[j,i] = A[i,j]. 2-D swapped indices on the store.
-// CHECK-LABEL: func.func @transpose
+// CHECK-LABEL: loopschedule.func_sequential @transpose
 // CHECK: loopschedule.sequential
 // CHECK: loopschedule.at 0 -> !loopschedule.handle
 // CHECK:   loopschedule.launch : !loopschedule.handle

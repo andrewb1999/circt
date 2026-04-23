@@ -1,8 +1,8 @@
-// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule))" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule)" %s | FileCheck %s
 
 // 1-D convolution: for i { s = 0; for j { s += A[i+j]*K[j] }; B[i] = s }.
 // Inner reduction iter-arg, result awaited and stored by outer loop frame.
-// CHECK-LABEL: func.func @conv1d
+// CHECK-LABEL: loopschedule.func_sequential @conv1d
 // CHECK: loopschedule.sequential
 // CHECK: loopschedule.at 0 -> !loopschedule.handle
 // CHECK:   loopschedule.launch : !loopschedule.handle

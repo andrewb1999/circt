@@ -1,10 +1,10 @@
-// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule))" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule)" %s | FileCheck %s
 
 // Squared L2-norm reduction: s = sum(A[i] * A[i]).
 // Same failure mode as dot.mlir: a sequential loop's reduced iter-arg is
 // returned directly by the function, but the result SSA value ends up
 // defined inside the launch region.
-// CHECK-LABEL: func.func @sqnorm
+// CHECK-LABEL: loopschedule.func_sequential @sqnorm
 // CHECK: loopschedule.sequential
 // CHECK: loopschedule.terminator {{.*}} results
 

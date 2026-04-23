@@ -307,7 +307,8 @@ public:
   void runOnOperation() override;
 
 private:
-  LogicalResult lowerFunction(func::FuncOp funcOp);
+  LogicalResult lowerFunction(loopschedule::LoopScheduleFuncSequentialOp funcOp);
+  LogicalResult lowerFunction(loopschedule::LoopScheduleFuncPipelineOp funcOp);
 
   /// Build the nesting tree from a sequential op.
   void buildLoopTree(LoopScheduleSequentialOp seqOp, LoopNode &node,
@@ -348,7 +349,7 @@ private:
   /// external values the caller must wire as inputs when instantiating.
   LogicalResult lowerLoopNodeAsModule(
       const LoopNode &node, OpBuilder &builder, Location loc,
-      func::FuncOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
+      loopschedule::LoopScheduleFuncSequentialOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
       IRMapping &parentMapping,
       hw::HWModuleOp &outModule,
       SmallVectorImpl<Value> &capturedVals);
@@ -1789,7 +1790,7 @@ static void muxStageMemPorts(
 
 LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     const LoopNode &node, OpBuilder &builder, Location loc,
-    func::FuncOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
+    loopschedule::LoopScheduleFuncSequentialOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
     IRMapping &parentMapping,
     hw::HWModuleOp &outModule,
     SmallVectorImpl<Value> &capturedVals) {
@@ -3324,8 +3325,10 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
 //===----------------------------------------------------------------------===//
 
 /// Shared hw.module creation logic used by both sequential and pipeline paths.
+/// Accepts any FunctionOpInterface so both `LoopScheduleFuncSequentialOp` and
+/// `LoopScheduleFuncPipelineOp` can flow through unchanged.
 static hw::HWModuleOp createHWModule(
-    func::FuncOp funcOp, OpBuilder &builder, IRMapping &mapping,
+    mlir::FunctionOpInterface funcOp, OpBuilder &builder, IRMapping &mapping,
     DenseMap<Value, MemPortMapping> &memPortMap,
     unsigned &clkIdx, unsigned &rstIdx, unsigned &startIdx) {
   auto *ctx = funcOp.getContext();
@@ -3366,9 +3369,18 @@ static hw::HWModuleOp createHWModule(
                      hw::ModulePort::Direction::Input}});
   startIdx = inputIdx++;
 
+  // `ready` precedes `done` in the output port list. Both sequential and
+  // pipelined func variants drive this port; for sequential it's high in
+  // IDLE (no transaction in flight), for pipelined it's high whenever the
+  // II window is open (caller can issue a new start). Callers that don't
+  // care about back-pressure (e.g. one-shot driver) can ignore it; the
+  // testbench wrapper uses it to drive multi-transaction streaming.
+  ports.push_back({{builder.getStringAttr("ready"), builder.getI1Type(),
+                     hw::ModulePort::Direction::Output}});
+
   ports.push_back({{builder.getStringAttr("done"), builder.getI1Type(),
                      hw::ModulePort::Direction::Output}});
-  
+
   for (auto [idx, retType] : llvm::enumerate(funcOp.getResultTypes())) {
     if (isHandleType(retType))
       continue;
@@ -3411,11 +3423,11 @@ static hw::HWModuleOp createHWModule(
   return hwMod;
 }
 
-/// Build hw.output with memory ports, done signal, and return values.
-static void buildHWOutput(func::FuncOp funcOp, OpBuilder &builder,
+/// Build hw.output with memory ports, ready/done handshake, and return values.
+static void buildHWOutput(mlir::FunctionOpInterface funcOp, OpBuilder &builder,
                           Location loc, Block *hwBody, IRMapping &mapping,
                           DenseMap<Value, MemPortMapping> &memPortMap,
-                          Value doneSignal) {
+                          Value readySignal, Value doneSignal) {
   SmallVector<Value> outputs;
 
   for (auto [idx, arg] : llvm::enumerate(funcOp.getArguments())) {
@@ -3427,10 +3439,12 @@ static void buildHWOutput(func::FuncOp funcOp, OpBuilder &builder,
     appendPortOutputValues(builder, loc, info, arg, memPortMap, outputs);
   }
 
+  // Order matches createHWModule: ready, then done, then results.
+  outputs.push_back(readySignal);
   outputs.push_back(doneSignal);
 
-  auto returnOp =
-      cast<func::ReturnOp>(funcOp.getBody().front().getTerminator());
+  auto returnOp = cast<loopschedule::LoopScheduleReturnOp>(
+      funcOp.getFunctionBody().front().getTerminator());
   for (auto retVal : returnOp.getOperands()) {
     if (isHandleType(retVal.getType()))
       continue;
@@ -3447,7 +3461,7 @@ static void buildHWOutput(func::FuncOp funcOp, OpBuilder &builder,
 // Function lowering (main entry)
 //===----------------------------------------------------------------------===//
 
-LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
+LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFuncSequentialOp funcOp) {
   auto *ctx = funcOp.getContext();
   auto loc = funcOp.getLoc();
   OpBuilder builder(ctx);
@@ -3487,7 +3501,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
   SmallVector<memref::AllocOp> localAllocs;
   SmallVector<loopschedule::HWMemoryInstanceLoweringInterface> instanceOps;
   for (auto &op : funcOp.getBody().front()) {
-    if (isa<func::ReturnOp>(&op))
+    if (isa<loopschedule::LoopScheduleReturnOp>(&op))
       continue;
     if (isa<LoopScheduleFrameOp, LoopScheduleSequentialOp,
             LoopSchedulePipelineOp>(&op))
@@ -4186,9 +4200,559 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
     pb.be.setValue(resolved);
   }
 
-  // Build hw.output.
+  // Build hw.output. Compute `ready` as "no transaction in flight": a
+  // sticky bit set on `start` and cleared on `done`. Sequential funcs
+  // accept exactly one transaction at a time, so this matches the FSM's
+  // IDLE-vs-RUNNING distinction without having to plumb a state-decoded
+  // signal out of the FSM machine.
   builder.setInsertionPointToEnd(hwBody);
-  buildHWOutput(funcOp, builder, loc, hwBody, mapping, memPortMap, doneSignal);
+  Value falseConstSeq =
+      hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0);
+  BackedgeBuilder readyBB(builder, loc);
+  Backedge inFlightNextBE = readyBB.get(builder.getI1Type());
+  auto inFlightReg = seq::CompRegOp::create(
+      builder, loc, Value(inFlightNextBE), clk, rst, falseConstSeq,
+      builder.getStringAttr("tx_in_flight"));
+  Value inFlight = inFlightReg;
+  Value notDoneSeq = comb::createOrFoldNot(builder, loc, doneSignal);
+  Value holdInFlight =
+      comb::AndOp::create(builder, loc, inFlight, notDoneSeq);
+  Value inFlightNext = comb::OrOp::create(builder, loc, start, holdInFlight);
+  inFlightNextBE.setValue(inFlightNext);
+  Value readySignal = comb::createOrFoldNot(builder, loc, inFlight);
+
+  buildHWOutput(funcOp, builder, loc, hwBody, mapping, memPortMap, readySignal,
+                doneSignal);
+
+  funcOp.erase();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Function pipeline lowering (Phase 1: single-transaction, straight-line)
+//===----------------------------------------------------------------------===//
+//
+// Lowers a `loopschedule.func_pipeline` to an `hw.module` whose internals
+// are pipelined. Phase 1 restrictions:
+//   - No nested loops in the body (enforced by SCFToLoopSchedule).
+//   - No iter args (function pipelines don't loop back).
+//   - No condition value (always-true; pipeline runs to completion).
+//   - No dynamic-latency ops (no launch/expect handling).
+//
+// The hw.module presents the same start/done handshake as the sequential
+// path so callers can ignore the difference. `done` pulses once when the
+// last stage's CE fires for the (single) transaction. To support multi-
+// transaction streaming the active register would need to track in-flight
+// count instead of a single bit; that's Phase 2.
+LogicalResult LoopScheduleToFSMPass::lowerFunction(
+    loopschedule::LoopScheduleFuncPipelineOp funcOp) {
+  auto *ctx = funcOp.getContext();
+  auto loc = funcOp.getLoc();
+  OpBuilder builder(ctx);
+
+  analysis::OperatorLibraryAnalysis ola(funcOp);
+  operatorLibrary = &ola;
+  auto unbindLibrary =
+      llvm::make_scope_exit([&] { operatorLibrary = nullptr; });
+
+  IRMapping mapping;
+  unsigned clkIdx, rstIdx, startIdx;
+  auto hwMod = createHWModule(funcOp, builder, mapping, memPortMap, clkIdx,
+                              rstIdx, startIdx);
+  Block *hwBody = hwMod.getBodyBlock();
+  Value clk = hwBody->getArgument(clkIdx);
+  Value rst = hwBody->getArgument(rstIdx);
+  Value start = hwBody->getArgument(startIdx);
+
+  instanceUniquer.clear();
+  auto enclosingModule = funcOp->getParentOfType<ModuleOp>();
+  builder.setInsertionPointToEnd(hwBody);
+
+  // --- Prelude: clone non-stage ops, set up local hlmems + amc instances ---
+  SmallVector<memref::AllocOp> localAllocs;
+  SmallVector<loopschedule::HWMemoryInstanceLoweringInterface> instanceOps;
+  for (auto &op : funcOp.getBody().front()) {
+    if (isa<loopschedule::LoopScheduleReturnOp>(&op))
+      continue;
+    if (isa<LoopScheduleAtOp>(&op))
+      continue;
+    if (auto allocOp = dyn_cast<memref::AllocOp>(&op)) {
+      localAllocs.push_back(allocOp);
+      continue;
+    }
+    if (auto instOp =
+            dyn_cast<loopschedule::HWMemoryInstanceLoweringInterface>(&op)) {
+      instanceOps.push_back(instOp);
+      continue;
+    }
+    builder.clone(op, mapping);
+  }
+
+  auto i1 = builder.getI1Type();
+  BackedgeBuilder funcBB(builder, loc);
+  SmallVector<HLMemBackedges> hlmemBEs;
+  for (auto [i, allocOp] : llvm::enumerate(localAllocs)) {
+    auto memType = allocOp.getType();
+    auto dataType = memType.getElementType();
+    std::string name = "local_mem" + std::to_string(i);
+    auto hlmem = seq::HLMemOp::create(builder, loc, clk, rst, name,
+                                       memType.getShape(), dataType);
+    SmallVector<Backedge> addrBEs;
+    SmallVector<Value> addrVals;
+    for (Type addrTy : hlmem.getHandle().getType().getAddressTypes()) {
+      Backedge be = funcBB.get(addrTy);
+      addrBEs.push_back(be);
+      addrVals.push_back(Value(be));
+    }
+    Backedge wrDataBE = funcBB.get(dataType);
+    Backedge wrEnBE = funcBB.get(i1);
+    Value notWrEn = comb::XorOp::create(
+        builder, loc, Value(wrEnBE),
+        hw::ConstantOp::create(builder, loc, i1, 1));
+    auto readPort = seq::ReadPortOp::create(
+        builder, loc, hlmem.getHandle(),
+        ValueRange(addrVals), notWrEn, /*latency=*/1);
+    seq::WritePortOp::create(
+        builder, loc, hlmem.getHandle(),
+        ValueRange(addrVals), Value(wrDataBE), Value(wrEnBE),
+        /*latency=*/1);
+    MemPortMapping mp;
+    mp.rdData = readPort.getReadData();
+    mp.addrs.assign(getNumAddrPorts(memType), Value());
+    mp.wrData = Value();
+    mp.wrEn = Value();
+    memPortMap[allocOp.getResult()] = mp;
+    hlmemBEs.push_back({allocOp.getResult(), std::move(addrBEs), wrDataBE,
+                        wrEnBE});
+  }
+
+  SymbolTable modSymTab(enclosingModule);
+  loopschedule::HWMemoryLoweringState memInstState(clk, rst, funcBB,
+                                                    modSymTab);
+  for (auto instOp : instanceOps) {
+    if (failed(instOp.lowerToHW(builder, memInstState)))
+      return failure();
+  }
+  for (auto &[portValue, signals] : memInstState.portMap) {
+    MemPortMapping mp;
+    mp.rdData = signals.rdData;
+    mp.addrs.assign(signals.addrs.size(), Value());
+    mp.done = signals.done;
+    memPortMap[portValue] = mp;
+  }
+
+  SmallVector<PortArgInfo> memrefArgs;
+  for (auto arg : funcOp.getArguments()) {
+    if (auto memType = dyn_cast<MemRefType>(arg.getType()))
+      memrefArgs.push_back(
+          makePortArgInfoFromMemref(arg, memType, /*isLocalMem=*/false));
+  }
+  for (auto allocOp : localAllocs) {
+    memrefArgs.push_back(makePortArgInfoFromMemref(allocOp.getResult(),
+                                                    allocOp.getType(),
+                                                    /*isLocalMem=*/true));
+  }
+  for (auto &[portValue, signals] : memInstState.portMap) {
+    PortArgInfo info;
+    info.originalArg = portValue;
+    info.isAmcPort = true;
+    info.latency = signals.latency;
+    info.addrWidths.reserve(signals.addrs.size());
+    for (Value a : signals.addrs)
+      info.addrWidths.push_back(cast<IntegerType>(a.getType()).getWidth());
+    memrefArgs.push_back(info);
+  }
+
+  // --- Collect stages ---
+  SmallVector<LoopScheduleAtOp> stages;
+  for (auto &op : funcOp.getBody().front())
+    if (auto stageOp = dyn_cast<LoopScheduleAtOp>(&op))
+      stages.push_back(stageOp);
+
+  // No stages: degenerate case (constant return). Pipe start through to done
+  // by one register cycle so the handshake still has a stable shape. Ready
+  // is always high — there's no internal delay to back-pressure on.
+  if (stages.empty()) {
+    builder.setInsertionPointToEnd(hwBody);
+    Value zero = hw::ConstantOp::create(builder, loc, i1, 0);
+    Value oneReady =
+        hw::ConstantOp::create(builder, loc, i1, 1);
+    auto doneReg = seq::CompRegOp::create(
+        builder, loc, start, clk, rst, zero,
+        builder.getStringAttr("pipe_done"));
+    buildHWOutput(funcOp, builder, loc, hwBody, mapping, memPortMap, oneReady,
+                  doneReg);
+    funcOp.erase();
+    return success();
+  }
+
+  // --- Pipeline machinery ---
+  builder.setInsertionPointToEnd(hwBody);
+  Value falseConst = hw::ConstantOp::create(builder, loc, i1, 0);
+
+  BackedgeBuilder bb(builder, loc);
+
+  // Phase 2 multi-transaction streaming. A modulo-II counter tracks the
+  // II window; caller may assert `start` whenever `ready = (counter == 0)`.
+  // The counter is *not* free-running — it sits at 0 until a start is
+  // accepted, then runs 0 → 1 → ... → II-1 → 0, after which the next
+  // start can fire. This way the existing single-shot testbench (which
+  // doesn't yet honor `ready`) still works for II ≥ 1, and a later
+  // multi-transaction testbench just needs to wait for `ready` between
+  // start pulses.
+  uint64_t II = funcOp.getII();
+  Value readySignal;
+  Value ceGen;
+  if (II <= 1) {
+    readySignal = hw::ConstantOp::create(builder, loc, i1, 1);
+    ceGen = start;
+  } else {
+    unsigned counterWidth = llvm::Log2_64_Ceil(II);
+    Type counterType = IntegerType::get(ctx, counterWidth);
+    Value cZero = hw::ConstantOp::create(builder, loc, counterType, 0);
+    Value cOne = hw::ConstantOp::create(builder, loc, counterType, 1);
+    Value cIIMinusOne =
+        hw::ConstantOp::create(builder, loc, counterType, II - 1);
+
+    Backedge counterBE = bb.get(counterType);
+    auto counterReg = seq::CompRegOp::create(
+        builder, loc, Value(counterBE), clk, rst, cZero,
+        builder.getStringAttr("pipe_ii_counter"));
+
+    Value isZero = comb::ICmpOp::create(
+        builder, loc, comb::ICmpPredicate::eq, counterReg, cZero);
+    Value counterPlusOne =
+        comb::AddOp::create(builder, loc, counterReg, cOne);
+    Value atMax = comb::ICmpOp::create(
+        builder, loc, comb::ICmpPredicate::eq, counterReg, cIIMinusOne);
+    Value wrapped =
+        comb::MuxOp::create(builder, loc, atMax, cZero, counterPlusOne);
+
+    // Advance only when not idle, OR when accepting a new start.
+    Value advanceFromIdle =
+        comb::AndOp::create(builder, loc, isZero, start);
+    Value advancingMidWindow =
+        comb::createOrFoldNot(builder, loc, isZero);
+    Value advancing =
+        comb::OrOp::create(builder, loc, advanceFromIdle, advancingMidWindow);
+    Value counterNext =
+        comb::MuxOp::create(builder, loc, advancing, wrapped, cZero);
+    counterBE.setValue(counterNext);
+
+    readySignal = isZero;
+    ceGen = advanceFromIdle; // = start & ready
+  }
+
+  // Stage CE per absolute offset. Stages may live at sparse offsets (0, 1,
+  // 4, ...) when multi-cycle ops cause the scheduler to skip cycles. Build
+  // a shift register of length `maxOffset + 1` and tap each stage by its
+  // own offset; otherwise an N-stage chain would fire the Nth tap on cycle
+  // N rather than cycle stages[N].offset.
+  unsigned maxOffset = 0;
+  for (auto stage : stages)
+    maxOffset = std::max(maxOffset, (unsigned)stage.getOffset());
+
+  SmallVector<Value> ceShift(maxOffset + 1);
+  ceShift[0] = ceGen;
+  for (unsigned i = 1; i <= maxOffset; ++i) {
+    auto ceName = builder.getStringAttr(
+        "pipe_ce_off_" + std::to_string(i));
+    ceShift[i] = seq::CompRegOp::create(
+        builder, loc, ceShift[i - 1], clk, rst, falseConst, ceName);
+  }
+
+  SmallVector<Value> stageCE(stages.size());
+  for (auto [i, stage] : llvm::enumerate(stages))
+    stageCE[i] = ceShift[(unsigned)stage.getOffset()];
+
+  // Per-stage memory port mappings.
+  SmallVector<DenseMap<Value, MemPortMapping>> perStagePorts(stages.size());
+  for (unsigned s = 0; s < stages.size(); ++s)
+    for (auto &entry : memPortMap)
+      perStagePorts[s][entry.first].rdData = entry.second.rdData;
+
+  // Cross-stage delay chains for values that hop more than one stage.
+  DenseMap<Value, SmallVector<Value>> delayChain;
+  auto getOpLatency = [this](Operation *def) -> unsigned {
+    if (!def)
+      return 0;
+    if (auto attr =
+            def->getAttrOfType<IntegerAttr>("loopschedule.cycle_latency"))
+      return (unsigned)attr.getInt();
+    if (!operatorLibrary)
+      return 0;
+    auto operatorAttr =
+        def->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+    if (!operatorAttr)
+      return 0;
+    StringRef opName = operatorLibrary->getOperatorBySymbol(operatorAttr);
+    if (opName.empty())
+      return 0;
+    return operatorLibrary->getOperatorLatency(opName);
+  };
+  auto getYieldLatency = [&](Value origVal) -> unsigned {
+    auto result = dyn_cast<OpResult>(origVal);
+    if (!result)
+      return 0;
+    auto atOp = dyn_cast<LoopScheduleAtOp>(result.getOwner());
+    if (!atOp)
+      return 0;
+    auto yieldOp = atOp.getYieldOp();
+    unsigned idx = result.getResultNumber();
+    if (idx >= yieldOp.getNumOperands())
+      return 0;
+    return getOpLatency(yieldOp.getOperand(idx).getDefiningOp());
+  };
+  auto resolveForStage = [&](Value origVal,
+                             unsigned consumerStage) -> Value {
+    auto result = dyn_cast<OpResult>(origVal);
+    if (!result)
+      return Value();
+    auto defStage = dyn_cast<LoopScheduleAtOp>(result.getOwner());
+    if (!defStage)
+      return Value();
+    unsigned J = stages.size();
+    for (unsigned s = 0; s < stages.size(); ++s)
+      if (stages[s] == defStage) {
+        J = s;
+        break;
+      }
+    unsigned L = getYieldLatency(origVal);
+    unsigned readyStage = J + L;
+    if (J == stages.size() || consumerStage <= readyStage + 1)
+      return Value();
+    auto &chain = delayChain[origVal];
+    if (chain.empty())
+      chain.push_back(mapping.lookup(origVal));
+    while (chain.size() < consumerStage - readyStage) {
+      unsigned ceStage = readyStage + chain.size();
+      if (ceStage >= stages.size())
+        break;
+      Value prev = chain.back();
+      Value resetVal = createZeroConstant(builder, loc, prev.getType());
+      auto regName = builder.getStringAttr(
+          "pipe_s" + std::to_string(ceStage) + "_dly_r" +
+          std::to_string(result.getResultNumber()) + "_from_s" +
+          std::to_string(J));
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToEnd(hwBody);
+      Value reg = seq::CompRegClockEnabledOp::create(
+          builder, loc, prev, clk, stageCE[ceStage], rst, resetVal, regName);
+      chain.push_back(reg);
+    }
+    unsigned idx = consumerStage - readyStage - 1;
+    if (idx >= chain.size())
+      idx = chain.size() - 1;
+    return chain[idx];
+  };
+
+  auto isLocalMemref = [&](Value memref) -> bool {
+    for (auto &memInfo : memrefArgs)
+      if (memInfo.originalArg == memref && memInfo.isLocalMem)
+        return true;
+    return false;
+  };
+
+  // Per-memref max read-stage offset. The testbench uses this to time its
+  // per-transaction read shift correctly under multi-transaction streaming
+  // (Phase 2). Without it, the TB would have to assume every memory is
+  // read at stage 0, which fails any kernel whose II ≥ 2 reads at later
+  // stages (e.g. the addmul kernel reads at stages 0 and 1).
+  DenseMap<Value, unsigned> memMaxReadStageOff;
+
+  // --- Stage emission: clone ops, build cross-stage registers ---
+  for (auto [stageIdx, stageOp] : llvm::enumerate(stages)) {
+    Block &body = stageOp.getBodyBlock();
+    builder.setInsertionPointToEnd(hwBody);
+
+    DenseSet<Value> localLoadResults;
+
+    for (auto &op : body.getOperations()) {
+      if (isa<LoopScheduleYieldOp>(&op))
+        continue;
+
+      SmallVector<std::pair<Value, Value>> savedMappings;
+      for (Value operand : op.getOperands()) {
+        Value delayed = resolveForStage(operand, stageIdx);
+        if (!delayed)
+          continue;
+        Value current = mapping.lookup(operand);
+        if (delayed != current) {
+          savedMappings.emplace_back(operand, current);
+          mapping.map(operand, delayed);
+        }
+      }
+
+      std::function<LogicalResult(Operation *, Value)> processOp =
+          [&](Operation *inner, Value gate) -> LogicalResult {
+        if (isa<LoopScheduleYieldOp>(inner))
+          return success();
+        if (auto ifOp = dyn_cast<LoopScheduleIfOp>(inner)) {
+          Value cond = mapping.lookup(ifOp.getCond());
+          Value innerGate =
+              comb::AndOp::create(builder, loc, gate, cond);
+          for (auto &nested : ifOp.getBody().front()) {
+            if (auto yieldOp = dyn_cast<LoopScheduleYieldOp>(&nested)) {
+              for (auto [res, val] :
+                   llvm::zip(ifOp.getResults(), yieldOp.getOperands()))
+                mapping.map(res, mapping.lookup(val));
+              continue;
+            }
+            if (failed(processOp(&nested, innerGate)))
+              return failure();
+          }
+          return success();
+        }
+        if (auto storeOp = dyn_cast<HWStoreLoweringInterface>(inner))
+          return handleHWStore(storeOp, builder, mapping, gate,
+                               perStagePorts[stageIdx]);
+        if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner)) {
+          if (auto ls = dyn_cast<LoopScheduleLoadOp>(inner))
+            if (isLocalMemref(ls.getMemRef()))
+              localLoadResults.insert(ls.getResult());
+          if (loadOp.requiresReadEnable() && loadOp.getReadLatency() > 0)
+            localLoadResults.insert(loadOp.getResult());
+          // Track the latest stage offset that issues a read against
+          // each memref. The TB indexes its read-shift register chain
+          // by this offset.
+          unsigned offset = (unsigned)stages[stageIdx].getOffset();
+          Value memVal = loadOp.getMemoryValue();
+          auto it = memMaxReadStageOff.find(memVal);
+          if (it == memMaxReadStageOff.end() || it->second < offset)
+            memMaxReadStageOff[memVal] = offset;
+          return handleHWLoad(loadOp, builder, mapping,
+                              perStagePorts[stageIdx], gate);
+        }
+        return emitComputeOp(inner, builder, mapping, enclosingModule, clk,
+                             rst);
+      };
+
+      LogicalResult opResult = processOp(&op, stageCE[stageIdx]);
+      for (auto &sm : savedMappings)
+        mapping.map(sm.first, sm.second);
+      if (failed(opResult))
+        return failure();
+    }
+
+    auto regOp = cast<LoopScheduleYieldOp>(body.getTerminator());
+    for (auto [regIdx, val] : llvm::enumerate(regOp.getOperands())) {
+      Value delayed = resolveForStage(val, stageIdx);
+      Value mappedVal = delayed ? delayed : mapping.lookup(val);
+
+      if (localLoadResults.count(val)) {
+        mapping.map(stageOp.getResult(regIdx), mappedVal);
+        continue;
+      }
+      if (getOpLatency(val.getDefiningOp()) > 0) {
+        mapping.map(stageOp.getResult(regIdx), mappedVal);
+        continue;
+      }
+
+      Value resetVal = createZeroConstant(builder, loc, mappedVal.getType());
+      auto regName = builder.getStringAttr(
+          "pipe_s" + std::to_string(stageIdx) + "_r" +
+          std::to_string(regIdx));
+      Value reg = seq::CompRegClockEnabledOp::create(
+          builder, loc, mappedVal, clk, stageCE[stageIdx], rst, resetVal,
+          regName);
+      mapping.map(stageOp.getResult(regIdx), reg);
+    }
+  }
+
+  builder.setInsertionPointToEnd(hwBody);
+
+  muxStageMemPorts(builder, loc, perStagePorts, stageCE, memPortMap);
+
+  // Annotate per-memref max read stage offset (in mem0/mem1/... port
+  // order) so the testbench can build a per-memory read-shift chain.
+  // Memrefs that aren't read at all get 0 (the chain[0] register matches
+  // the just-issued txn).
+  {
+    SmallVector<int64_t> readStageOffsets;
+    readStageOffsets.reserve(memrefArgs.size());
+    for (auto &memInfo : memrefArgs) {
+      auto it = memMaxReadStageOff.find(memInfo.originalArg);
+      readStageOffsets.push_back(
+          it == memMaxReadStageOff.end() ? 0 : (int64_t)it->second);
+    }
+    hwMod->setAttr("loopschedule.mem_read_stages",
+                    builder.getI64ArrayAttr(readStageOffsets));
+  }
+
+  // Done. The last stage's CE pulses on the same cycle as the last store
+  // commits (writes are non-blocking and only visible the following cycle),
+  // so the testbench would observe pre-write memory if we exposed the raw
+  // CE. Register `done` for one extra cycle so consumers see it after all
+  // writes have settled — same trick the loop-pipeline path uses.
+  Value doneSignal = seq::CompRegOp::create(
+      builder, loc, stageCE.back(), clk, rst, falseConst,
+      builder.getStringAttr("pipe_done"));
+
+  // --- Resolve local hlmem backedges (same as sequential path) ---
+  builder.setInsertionPointToEnd(hwBody);
+  for (auto &be : hlmemBEs) {
+    auto &ports = memPortMap[be.allocResult];
+    auto memTy = cast<MemRefType>(be.allocResult.getType());
+    auto dataType = memTy.getElementType();
+    for (auto [d, beAddr] : llvm::enumerate(be.addrBEs)) {
+      auto hlmemAddrTy = cast<IntegerType>(Value(beAddr).getType());
+      Value src;
+      if (d < ports.addrs.size() && ports.addrs[d])
+        src = resizeIntTo(builder, loc, ports.addrs[d],
+                          hlmemAddrTy.getWidth());
+      else
+        src = hw::ConstantOp::create(builder, loc, hlmemAddrTy, 0);
+      beAddr.setValue(src);
+    }
+    be.wrDataBE.setValue(ports.wrData ? ports.wrData
+        : hw::ConstantOp::create(builder, loc, dataType, 0));
+    be.wrEnBE.setValue(ports.wrEn ? ports.wrEn
+        : hw::ConstantOp::create(builder, loc, i1, 0));
+  }
+
+  // --- Resolve memory-instance backedges (same as sequential path) ---
+  for (auto &pb : memInstState.pendingBackedges) {
+    auto it = memPortMap.find(pb.portValue);
+    Value resolved;
+    Type beTy = Value(pb.be).getType();
+    auto makeZero = [&]() {
+      return hw::ConstantOp::create(builder, loc, beTy, 0);
+    };
+    auto makeOne = [&]() {
+      return hw::ConstantOp::create(builder, loc, beTy, 1);
+    };
+    using Kind = loopschedule::PortBackedge::Kind;
+    switch (pb.kind) {
+    case Kind::Addr:
+      if (it != memPortMap.end() && pb.addrIdx < it->second.addrs.size() &&
+          it->second.addrs[pb.addrIdx])
+        resolved = resizeIntTo(builder, loc, it->second.addrs[pb.addrIdx],
+                                cast<IntegerType>(beTy).getWidth());
+      else
+        resolved = makeZero();
+      break;
+    case Kind::RdEn:
+      resolved = (it != memPortMap.end() && it->second.rdEn)
+                     ? it->second.rdEn
+                     : makeOne();
+      break;
+    case Kind::WrData:
+      resolved = (it != memPortMap.end() && it->second.wrData)
+                     ? it->second.wrData
+                     : makeZero();
+      break;
+    case Kind::WrEn:
+      resolved = (it != memPortMap.end() && it->second.wrEn)
+                     ? it->second.wrEn
+                     : makeZero();
+      break;
+    }
+    pb.be.setValue(resolved);
+  }
+
+  builder.setInsertionPointToEnd(hwBody);
+  buildHWOutput(funcOp, builder, loc, hwBody, mapping, memPortMap, readySignal,
+                doneSignal);
 
   funcOp.erase();
   return success();
@@ -4203,11 +4767,12 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
 /// seq.hlmem instances. The testbench harness (and the Allo Python driver)
 /// discovers output memories by their port index, so returned allocs must sit
 /// alongside the input memref args in the final hw.module port list.
-static void hoistReturnedAllocsToArgs(func::FuncOp funcOp) {
+template <typename FuncOpT>
+static void hoistReturnedAllocsToArgs(FuncOpT funcOp) {
   if (funcOp.getBody().empty())
     return;
   auto *block = &funcOp.getBody().front();
-  auto returnOp = dyn_cast<func::ReturnOp>(block->getTerminator());
+  auto returnOp = dyn_cast<loopschedule::LoopScheduleReturnOp>(block->getTerminator());
   if (!returnOp)
     return;
   // Collect returned memref allocs and their operand indices.
@@ -4216,7 +4781,7 @@ static void hoistReturnedAllocsToArgs(func::FuncOp funcOp) {
   for (auto [idx, retVal] : llvm::enumerate(returnOp.getOperands())) {
     if (!isa<MemRefType>(retVal.getType()))
       continue;
-    auto allocOp = retVal.getDefiningOp<memref::AllocOp>();
+    auto allocOp = retVal.template getDefiningOp<memref::AllocOp>();
     if (!allocOp)
       continue;
     hoisted.push_back(allocOp);
@@ -4242,7 +4807,7 @@ static void hoistReturnedAllocsToArgs(func::FuncOp funcOp) {
   for (int i = (int)droppedReturnIdxs.size() - 1; i >= 0; --i)
     newReturnOperands.erase(newReturnOperands.begin() + droppedReturnIdxs[i]);
   OpBuilder b(returnOp);
-  auto newReturn = func::ReturnOp::create(b, returnOp.getLoc(),
+  auto newReturn = loopschedule::LoopScheduleReturnOp::create(b, returnOp.getLoc(),
                                             newReturnOperands);
   (void)newReturn;
   returnOp.erase();
@@ -4260,7 +4825,8 @@ static void hoistReturnedAllocsToArgs(func::FuncOp funcOp) {
 /// port. Upstream `flatten-memref` only knows about memref.load/store, not
 /// loopschedule.load/store, so we do the rewrite here where we have full
 /// ownership of the operations that actually touch the memref.
-static LogicalResult flattenMultiDimMemrefs(func::FuncOp funcOp) {
+template <typename FuncOpT>
+static LogicalResult flattenMultiDimMemrefs(FuncOpT funcOp) {
   if (funcOp.getBody().empty())
     return success();
   auto *block = &funcOp.getBody().front();
@@ -4360,14 +4926,26 @@ static LogicalResult flattenMultiDimMemrefs(func::FuncOp funcOp) {
 void LoopScheduleToFSMPass::runOnOperation() {
   auto moduleOp = getOperation();
 
-  SmallVector<func::FuncOp> funcs;
-  moduleOp.walk([&](func::FuncOp f) { funcs.push_back(f); });
+  SmallVector<loopschedule::LoopScheduleFuncSequentialOp> seqFuncs;
+  SmallVector<loopschedule::LoopScheduleFuncPipelineOp> pipeFuncs;
+  moduleOp.walk(
+      [&](loopschedule::LoopScheduleFuncSequentialOp f) { seqFuncs.push_back(f); });
+  moduleOp.walk(
+      [&](loopschedule::LoopScheduleFuncPipelineOp f) { pipeFuncs.push_back(f); });
 
-  for (auto funcOp : funcs)
+  for (auto funcOp : seqFuncs)
+    hoistReturnedAllocsToArgs(funcOp);
+  for (auto funcOp : pipeFuncs)
     hoistReturnedAllocsToArgs(funcOp);
 
   if (!disableFlattenMemrefs) {
-    for (auto funcOp : funcs) {
+    for (auto funcOp : seqFuncs) {
+      if (failed(flattenMultiDimMemrefs(funcOp))) {
+        signalPassFailure();
+        return;
+      }
+    }
+    for (auto funcOp : pipeFuncs) {
       if (failed(flattenMultiDimMemrefs(funcOp))) {
         signalPassFailure();
         return;
@@ -4375,7 +4953,13 @@ void LoopScheduleToFSMPass::runOnOperation() {
     }
   }
 
-  for (auto funcOp : funcs) {
+  for (auto funcOp : seqFuncs) {
+    if (failed(lowerFunction(funcOp))) {
+      signalPassFailure();
+      return;
+    }
+  }
+  for (auto funcOp : pipeFuncs) {
     if (failed(lowerFunction(funcOp))) {
       signalPassFailure();
       return;

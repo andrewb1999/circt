@@ -73,7 +73,8 @@ private:
 //===----------------------------------------------------------------------===//
 
 static bool isControlPort(StringRef name) {
-  return name == "clk" || name == "rst" || name == "start" || name == "done";
+  return name == "clk" || name == "rst" || name == "start" || name == "done" ||
+         name == "ready";
 }
 
 /// Try to detect memory port groups from DUT ports.
@@ -394,26 +395,73 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                                     0x80000002);
 
   // --- Create memory arrays and initialize from hex files ---
+  // Memories are sized to fit MAX_N_TXNS transactions worth of data
+  // (`MAX_N_TXNS * group.depth`). For each transaction T's view of
+  // memory (size group.depth), the testbench shifts the DUT's address
+  // by `T * group.depth`. This lets a single verilator run process N
+  // transactions with per-transaction-distinct inputs/outputs without
+  // needing per-transaction tags from the DUT — write attribution is
+  // recovered via per-address write counters (each transaction's write
+  // to address A is the (T+1)th write to A overall, since pipeline
+  // ordering preserves per-(mem,addr) issue order).
+  //
+  // MAX_N_TXNS is a fixed compile-time bound on batch size. Tests need
+  // num_transactions <= MAX_N_TXNS. Sim-only memory; not synthesized.
+  const unsigned MAX_N_TXNS = 1024;
+  auto i32TypeMem = builder.getIntegerType(32);
+
   struct MemInfo {
-    sv::RegOp reg;
-    Value readVal; // combinational read: mem[addr]
+    sv::RegOp reg;          // partitioned: MAX_N_TXNS * group.depth
+    Value readVal;          // combinational read wire (set later)
+    sv::RegOp writeCntReg;  // i32[group.depth]: per-addr write counter
+    unsigned perTxnDepth;   // = group.depth
   };
   DenseMap<StringRef, MemInfo> memInfoMap;
 
   for (auto &group : memGroups) {
+    unsigned partitionedDepth = MAX_N_TXNS * group.depth;
     auto arrayType =
-        hw::UnpackedArrayType::get(group.dataType, group.depth);
+        hw::UnpackedArrayType::get(group.dataType, partitionedDepth);
     auto memReg = sv::RegOp::create(builder, loc, arrayType,
                                     builder.getStringAttr(group.name));
 
-    // Initialize via sv.initial { sv.readmem }.
+    // Per-address write counter array. Tracks how many transactions have
+    // written each address; the next write to address A goes into slot
+    // `count[A] * group.depth + A`. Initialized to zero at sim start.
+    auto cntArrayType =
+        hw::UnpackedArrayType::get(i32TypeMem, group.depth);
+    auto cntReg = sv::RegOp::create(
+        builder, loc, cntArrayType,
+        builder.getStringAttr(group.name + "_addr_wcnt"));
+
+    // Init the memory contents from hex AND zero the per-addr counter in
+    // the same initial block. We use blocking assignment in a for-loop
+    // here (instead of NBA inside always_ff) because verilator rejects
+    // delayed array writes inside loops (BLKLOOPINIT).
     sv::InitialOp::create(builder, loc, [&] {
       sv::ReadMemOp::create(builder, loc, memReg,
                             dataDir + "/" + group.name + ".hex",
                             MemBaseTypeAttr::MemBaseHex);
+      Value zero32 = hw::ConstantOp::create(builder, loc, i32TypeMem, 0);
+      unsigned w = std::max(1u, group.addrWidth);
+      auto idxTy = builder.getIntegerType(w + 1);
+      Value lb = hw::ConstantOp::create(builder, loc, idxTy, 0);
+      Value ub =
+          hw::ConstantOp::create(builder, loc, idxTy, group.depth);
+      Value step = hw::ConstantOp::create(builder, loc, idxTy, 1);
+      sv::ForOp::create(
+          builder, loc, lb, ub, step, "ai", [&](BlockArgument iv) {
+            Value tIv = comb::ExtractOp::create(
+                builder, loc,
+                builder.getIntegerType(std::max(1u, group.addrWidth)), iv, 0);
+            Value cntRef = sv::ArrayIndexInOutOp::create(
+                builder, loc, cntReg, tIv);
+            sv::BPAssignOp::create(builder, loc, cntRef, zero32);
+          });
     });
 
-    memInfoMap[group.name] = {memReg, Value()};
+    memInfoMap[group.name] =
+        {memReg, Value(), cntReg, group.depth};
   }
 
   // --- Create scalar input arrays and initialize from hex files ---
@@ -440,15 +488,113 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   }
 
   // --- Control registers ---
-  auto startReg = sv::RegOp::create(builder, loc, builder.getI1Type(),
-                                    builder.getStringAttr("tb_start"));
-  Value startVal = sv::ReadInOutOp::create(builder, loc, startReg);
+  // `tb_start` is driven combinationally (a wire, not a reg) so it stays
+  // in sync with `_dut_ready` on the same cycle. A registered start would
+  // be one cycle late: the DUT's `ready` could have dropped between the
+  // cycle we sampled it and the cycle the registered start is presented,
+  // and the start would be silently rejected.
+  auto startWire = sv::WireOp::create(builder, loc, builder.getI1Type(),
+                                      builder.getStringAttr("tb_start"));
+  Value startVal = sv::ReadInOutOp::create(builder, loc, startWire);
   auto ctrReg = sv::RegOp::create(builder, loc, i8Type,
                                   builder.getStringAttr("tb_counter"));
   Value ctrVal = sv::ReadInOutOp::create(builder, loc, ctrReg);
   auto doneSeenReg = sv::RegOp::create(builder, loc, builder.getI1Type(),
                                        builder.getStringAttr("tb_done_seen"));
   Value doneSeenVal = sv::ReadInOutOp::create(builder, loc, doneSeenReg);
+
+  // Multi-transaction handshake. The number of transactions to drive is
+  // loaded at simulation init from `num_transactions.hex` (one i32 entry).
+  // Falls back to 1 when the file is absent (verilator emits a warning but
+  // leaves the array zero-initialized — we treat 0 as "1" so the legacy
+  // single-shot path still works for tests written before Phase 2).
+  auto i32Type = builder.getIntegerType(32);
+  auto numTxnsArrayType = hw::UnpackedArrayType::get(i32Type, 1);
+  auto numTxnsReg = sv::RegOp::create(builder, loc, numTxnsArrayType,
+                                      builder.getStringAttr("tb_num_txns_arr"));
+  sv::InitialOp::create(builder, loc, [&] {
+    sv::ReadMemOp::create(builder, loc, numTxnsReg,
+                          dataDir + "/num_transactions.hex",
+                          MemBaseTypeAttr::MemBaseHex);
+  });
+  auto numTxnsAddrTy = builder.getIntegerType(1);
+  Value numTxnsZeroIdx =
+      hw::ConstantOp::create(builder, loc, numTxnsAddrTy, 0);
+  Value numTxnsElemRef = sv::ArrayIndexInOutOp::create(builder, loc, numTxnsReg,
+                                                        numTxnsZeroIdx);
+  Value numTxnsRaw = sv::ReadInOutOp::create(builder, loc, numTxnsElemRef);
+  // Treat 0 as 1 for backwards compat with tests that don't write the file.
+  Value c1_i32 = hw::ConstantOp::create(builder, loc, i32Type, 1);
+  Value isZeroNumTxns = comb::ICmpOp::create(
+      builder, loc, comb::ICmpPredicate::eq, numTxnsRaw,
+      hw::ConstantOp::create(builder, loc, i32Type, 0));
+  Value numTxns =
+      comb::MuxOp::create(builder, loc, isZeroNumTxns, c1_i32, numTxnsRaw);
+
+  // Per-transaction counters. Issue counter ticks on each accepted start;
+  // done counter ticks on each done pulse. Memory dump fires once after
+  // tb_done_count == numTxns.
+  auto issueCntReg = sv::RegOp::create(
+      builder, loc, i32Type, builder.getStringAttr("tb_issue_count"));
+  Value issueCntVal = sv::ReadInOutOp::create(builder, loc, issueCntReg);
+  auto doneCntReg = sv::RegOp::create(builder, loc, i32Type,
+                                      builder.getStringAttr("tb_done_count"));
+  Value doneCntVal = sv::ReadInOutOp::create(builder, loc, doneCntReg);
+
+  // Per-memory read-shift register chain. Each memory's read shift is
+  // taken from `chain[max_read_stage_for_that_mem]`, where:
+  //   chain[0] : increments on every accepted `start`. At cycle T it
+  //              equals the txn currently entering stage 0.
+  //   chain[s] : registered copy of chain[s-1] (1-cycle delay). At cycle
+  //              T it equals the txn currently at stage s.
+  // This works for any II as long as the kernel is structurally valid
+  // (max read stage < II + min read stage), which the scheduler enforces.
+  //
+  // The DUT carries a `loopschedule.mem_read_stages` attribute (an int
+  // array, one entry per mem<i> in port order) that names the max read
+  // stage for each memory. Older DUTs (e.g. sequential funcs lowered
+  // before this attr existed) fall back to chain[0] for everything.
+  ArrayAttr memReadStagesAttr =
+      dutMod->getAttrOfType<ArrayAttr>("loopschedule.mem_read_stages");
+  unsigned maxReadStage = 0;
+  if (memReadStagesAttr) {
+    for (auto attr : memReadStagesAttr) {
+      auto intAttr = dyn_cast<IntegerAttr>(attr);
+      if (!intAttr)
+        continue;
+      maxReadStage = std::max(maxReadStage, (unsigned)intAttr.getInt());
+    }
+  }
+
+  SmallVector<sv::RegOp> shiftChainRegs(maxReadStage + 1);
+  SmallVector<Value> shiftChainVals(maxReadStage + 1);
+  for (unsigned s = 0; s <= maxReadStage; ++s) {
+    shiftChainRegs[s] = sv::RegOp::create(
+        builder, loc, i32Type,
+        builder.getStringAttr("tb_read_shift_s" + std::to_string(s)));
+    shiftChainVals[s] =
+        sv::ReadInOutOp::create(builder, loc, shiftChainRegs[s]);
+  }
+
+  // Map mem<i> name → chain index (= the memory's max read stage).
+  DenseMap<StringRef, unsigned> memShiftStage;
+  if (memReadStagesAttr) {
+    for (auto [i, attr] : llvm::enumerate(memReadStagesAttr)) {
+      auto intAttr = dyn_cast<IntegerAttr>(attr);
+      if (!intAttr)
+        continue;
+      std::string name = "mem" + std::to_string(i);
+      memShiftStage[StringAttr::get(ctx, name).strref()] =
+          (unsigned)intAttr.getInt();
+    }
+  }
+  auto shiftForMem = [&](StringRef memName) -> Value {
+    auto it = memShiftStage.find(memName);
+    unsigned s = (it != memShiftStage.end()) ? it->second : 0;
+    if (s >= shiftChainVals.size())
+      s = shiftChainVals.size() - 1;
+    return shiftChainVals[s];
+  };
 
   // --- Build DUT instance operands ---
   // We need to wire: clk, rst, start, scalar inputs, memory rd_data.
@@ -520,6 +666,7 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
 
   // --- Extract DUT output values ---
   Value doneVal;
+  Value readyVal;
   SmallVector<Value> scalarOutputValues;
   DenseMap<StringRef, Value> memAddrValues;
   DenseMap<StringRef, Value> memWrDataValues;
@@ -532,6 +679,8 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
     Value result = dutInst.getResult(outIdx++);
     if (port.getName() == "done") {
       doneVal = result;
+    } else if (port.getName() == "ready") {
+      readyVal = result;
     } else if (port.getName().ends_with("_addr")) {
       StringRef prefix = port.getName().drop_back(5); // remove "_addr"
       memAddrValues[prefix] = result;
@@ -546,14 +695,42 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
     }
   }
 
-  // --- Wire memory combinational reads: mem[addr] → rd_data wire ---
+  // --- Wire memory combinational reads: mem[txn*K + addr] → rd_data ---
+  // The shift `tb_issue_count * K` selects the slot for the transaction
+  // currently entering stage 0. tb_issue_count is the pre-increment
+  // register value at the cycle a `start` is accepted (the DUT samples
+  // mem<i>_rd_data at that cycle); after the cycle it ticks to T+1.
+  unsigned partAddrWidth = std::max(
+      1u, llvm::Log2_64_Ceil(MAX_N_TXNS) +
+              [&]() {
+                unsigned m = 0;
+                for (auto &g : memGroups)
+                  m = std::max<unsigned>(m, g.addrWidth);
+                return m;
+              }());
+  auto partAddrType = builder.getIntegerType(partAddrWidth);
   for (auto &group : memGroups) {
     auto &info = memInfoMap[group.name];
     Value addr = memAddrValues[group.name];
+    // Width-extend the DUT addr (group.addrWidth) and the issue count
+    // (i32) to a common width that fits MAX_N_TXNS * group.depth.
+    Value addrExt = comb::ConcatOp::create(
+        builder, loc,
+        ValueRange{hw::ConstantOp::create(
+                       builder, loc,
+                       builder.getIntegerType(partAddrWidth - group.addrWidth),
+                       0),
+                   addr});
+    Value txnExt = comb::ExtractOp::create(builder, loc, partAddrType,
+                                            shiftForMem(group.name), 0);
+    Value kConst = hw::ConstantOp::create(
+        builder, loc, partAddrType, group.depth);
+    Value shift = comb::MulOp::create(builder, loc, txnExt, kConst);
+    Value effectiveAddr =
+        comb::AddOp::create(builder, loc, shift, addrExt);
     Value elemRef =
-        sv::ArrayIndexInOutOp::create(builder, loc, info.reg, addr);
+        sv::ArrayIndexInOutOp::create(builder, loc, info.reg, effectiveAddr);
     Value rdData = sv::ReadInOutOp::create(builder, loc, elemRef);
-    // Assign the wire.
     sv::AssignOp::create(builder, loc, info.readVal, rdData);
   }
 
@@ -564,9 +741,19 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
             builder, loc, rst,
             // Reset.
             [&] {
-              sv::PAssignOp::create(builder, loc, startReg, falseVal);
               sv::PAssignOp::create(builder, loc, ctrReg, c0_i8);
               sv::PAssignOp::create(builder, loc, doneSeenReg, falseVal);
+              Value c0_i32 =
+                  hw::ConstantOp::create(builder, loc, i32Type, 0);
+              sv::PAssignOp::create(builder, loc, issueCntReg, c0_i32);
+              sv::PAssignOp::create(builder, loc, doneCntReg, c0_i32);
+              for (auto &reg : shiftChainRegs)
+                sv::PAssignOp::create(builder, loc, reg, c0_i32);
+              // Per-(mem, addr) write counters are zero-initialized at
+              // sim start in their `initial` block (alongside $readmemh).
+              // We don't re-zero them on rst because verilator rejects
+              // delayed (NBA) array writes inside for-loops, and tests
+              // only ever pulse rst once per simulation.
             },
             // Normal operation.
             [&] {
@@ -574,11 +761,49 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                   comb::AddOp::create(builder, loc, ctrVal, c1_i8);
               sv::PAssignOp::create(builder, loc, ctrReg, nextCtr);
 
-              Value isCycle0 = comb::ICmpOp::create(
-                  builder, loc, comb::ICmpPredicate::eq, ctrVal, c0_i8);
-              sv::PAssignOp::create(builder, loc, startReg, isCycle0);
+              // tb_start is a *wire* assigned combinationally (see assign
+              // below the always_ff) so it tracks the DUT's `ready` on
+              // the same cycle. Here we just track the issue count by
+              // observing the same combinational predicate.
+              sv::IfOp::create(builder, loc, startVal, [&] {
+                Value c1 =
+                    hw::ConstantOp::create(builder, loc, i32Type, 1);
+                Value nextIssue =
+                    comb::AddOp::create(builder, loc, issueCntVal, c1);
+                sv::PAssignOp::create(builder, loc, issueCntReg, nextIssue);
+              });
+              // Read-shift chain. chain[0] increments on accepted start
+              // (clamped to numTxns-1 so it stays valid for last-txn
+              // reads). chain[s>=1] copies chain[s-1] every cycle, so
+              // chain[s] at cycle T = chain[0] at cycle T-s = txn ID
+              // currently at stage s.
+              {
+                Value c1 =
+                    hw::ConstantOp::create(builder, loc, i32Type, 1);
+                Value nextChain0 = comb::AddOp::create(
+                    builder, loc, shiftChainVals[0], c1);
+                Value moreAfter = comb::ICmpOp::create(
+                    builder, loc, comb::ICmpPredicate::ult, nextChain0,
+                    numTxns);
+                Value chain0Bumped = comb::MuxOp::create(
+                    builder, loc, moreAfter, nextChain0,
+                    shiftChainVals[0]);
+                Value nextChain0Final = comb::MuxOp::create(
+                    builder, loc, startVal, chain0Bumped,
+                    shiftChainVals[0]);
+                sv::PAssignOp::create(builder, loc, shiftChainRegs[0],
+                                       nextChain0Final);
+                for (unsigned s = 1; s < shiftChainRegs.size(); ++s)
+                  sv::PAssignOp::create(builder, loc, shiftChainRegs[s],
+                                         shiftChainVals[s - 1]);
+              }
 
-              // Memory writes: when wr_en high, write to mem[addr].
+              // Memory writes: when wr_en high, look up per-addr write
+              // counter, place the value in slot `count*K + addr`, and
+              // bump the counter. The Tth write to address A goes to
+              // transaction T's partition. Pipeline ordering preserves
+              // per-(mem,addr) issue order, so the count = the txn id
+              // for that write.
               for (auto &group : memGroups) {
                 auto &info = memInfoMap[group.name];
                 Value wrEn = memWrEnValues[group.name];
@@ -586,17 +811,55 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                 Value wrData = memWrDataValues[group.name];
 
                 sv::IfOp::create(builder, loc, wrEn, [&] {
-                  Value elemRef = sv::ArrayIndexInOutOp::create(builder, loc,
-                                                                info.reg, addr);
+                  // Lookup current write count for this address.
+                  Value cntElemRef = sv::ArrayIndexInOutOp::create(
+                      builder, loc, info.writeCntReg, addr);
+                  Value cntVal =
+                      sv::ReadInOutOp::create(builder, loc, cntElemRef);
+                  // Compute effective address = cnt * K + addr.
+                  Value cntTrunc = comb::ExtractOp::create(
+                      builder, loc, partAddrType, cntVal, 0);
+                  Value kConst = hw::ConstantOp::create(
+                      builder, loc, partAddrType, group.depth);
+                  Value shift =
+                      comb::MulOp::create(builder, loc, cntTrunc, kConst);
+                  Value addrExt = comb::ConcatOp::create(
+                      builder, loc,
+                      ValueRange{hw::ConstantOp::create(
+                                     builder, loc,
+                                     builder.getIntegerType(partAddrWidth -
+                                                             group.addrWidth),
+                                     0),
+                                 addr});
+                  Value effectiveAddr =
+                      comb::AddOp::create(builder, loc, shift, addrExt);
+                  Value elemRef = sv::ArrayIndexInOutOp::create(
+                      builder, loc, info.reg, effectiveAddr);
                   sv::PAssignOp::create(builder, loc, elemRef, wrData);
+                  // Increment the counter for this address.
+                  Value cntPlus1 = comb::AddOp::create(
+                      builder, loc, cntVal,
+                      hw::ConstantOp::create(builder, loc, i32Type, 1));
+                  sv::PAssignOp::create(builder, loc, cntElemRef, cntPlus1);
                 });
               }
 
-              // Done handling: dump outputs and finish.
+              // Done handling: count pulses; only dump+finish on the
+              // *final* done. Each done pulse increments tb_done_count;
+              // the dump fires when tb_done_count reaches num_txns. This
+              // preserves N=1 behavior (immediate dump on first done).
               sv::IfOp::create(builder, loc, doneVal, [&] {
+                Value nextDone = comb::AddOp::create(
+                    builder, loc, doneCntVal,
+                    hw::ConstantOp::create(builder, loc, i32Type, 1));
+                sv::PAssignOp::create(builder, loc, doneCntReg, nextDone);
+                Value isLastDone = comb::ICmpOp::create(
+                    builder, loc, comb::ICmpPredicate::eq, nextDone, numTxns);
                 Value notDoneSeen =
                     comb::XorOp::create(builder, loc, doneSeenVal, trueVal);
-                sv::IfOp::create(builder, loc, notDoneSeen, [&] {
+                Value shouldDump =
+                    comb::AndOp::create(builder, loc, isLastDone, notDoneSeen);
+                sv::IfOp::create(builder, loc, shouldDump, [&] {
                   sv::PAssignOp::create(builder, loc, doneSeenReg, trueVal);
 
                   // Dump scalar outputs to stdout.
@@ -612,39 +875,54 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                                          ValueRange{outVal});
                   }
 
-                  // Dump memory contents to stdout.
+                  // Dump memory contents to stdout. With multi-txn
+                  // partitioning the memory has `numTxns * group.depth`
+                  // live entries — the rest is unused (X). Dump only
+                  // the live region. Header reports `numTxns*depth` so
+                  // the parser knows how many entries to read.
                   for (auto &group : memGroups) {
                     auto &info = memInfoMap[group.name];
                     unsigned width =
                         cast<IntegerType>(group.dataType).getWidth();
                     unsigned hexDigits = (width + 3) / 4;
 
-                    // Print header: @MEM name depth
-                    std::string headerStr =
-                        "@MEM " + group.name + " " +
-                         std::to_string(group.depth) + "\n";
-                    sv::FWriteOp::create(builder, loc, fd, headerStr,
-                                         ValueRange{});
+                    // Header: @MEM name <numTxns * group.depth> <group.depth>
+                    // (Both values printed so the Python parser can
+                    // demux per-txn outputs without separate metadata.)
+                    std::string headerFmt = "@MEM " + group.name + " %0d " +
+                                             std::to_string(group.depth) +
+                                             "\n";
+                    Value kConst =
+                        hw::ConstantOp::create(builder, loc, i32Type,
+                                               group.depth);
+                    Value totalLive =
+                        comb::MulOp::create(builder, loc, numTxns, kConst);
+                    sv::FWriteOp::create(builder, loc, fd, headerFmt,
+                                         ValueRange{totalLive});
 
-                    // Iterate with sv.for and print each element.
-                    unsigned idxWidth = group.addrWidth + 1; // +1 to avoid
-                                                             // overflow
+                    // Iterate from 0 to numTxns * group.depth.
+                    unsigned idxWidth = std::max(
+                        1u, llvm::Log2_64_Ceil(MAX_N_TXNS * group.depth) + 1);
                     auto idxType = builder.getIntegerType(idxWidth);
                     Value lb =
                         hw::ConstantOp::create(builder, loc, idxType, 0);
-                    Value ub = hw::ConstantOp::create(builder, loc, idxType,
-                                                      group.depth);
+                    Value ubExt = comb::ExtractOp::create(
+                        builder, loc, idxType, totalLive, 0);
                     Value step =
                         hw::ConstantOp::create(builder, loc, idxType, 1);
 
                     sv::ForOp::create(
-                        builder, loc, lb, ub, step, "i", [&](BlockArgument iv) {
-                          // Truncate iv to addr width for indexing.
-                          Value truncIV = comb::ExtractOp::create(
-                              builder, loc,
-                              builder.getIntegerType(group.addrWidth), iv, 0);
+                        builder, loc, lb, ubExt, step, "i",
+                        [&](BlockArgument iv) {
+                          // `iv` is `idxType` wide, which already covers
+                          // `MAX_N_TXNS * group.depth` slots — the partitioned
+                          // memory's full address space. Don't try to coerce
+                          // it through `partAddrType` (a *global* width based
+                          // on the largest mem in the group): if this group
+                          // is smaller, `partAddrType` has more bits than
+                          // `iv` and the extract would fail.
                           Value elemRef = sv::ArrayIndexInOutOp::create(
-                              builder, loc, info.reg, truncIV);
+                              builder, loc, info.reg, iv);
                           Value elem =
                               sv::ReadInOutOp::create(builder, loc, elemRef);
                           std::string elemFmtStr = std::string("%0") +
@@ -675,6 +953,20 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
               });
             });
       });
+
+  // Combinational drive of tb_start: the DUT's `ready` line gates start
+  // and the issue counter limits how many starts we issue. Using
+  // `assign` (not a registered drive) keeps tb_start in sync with
+  // `_dut_ready` on the same cycle — a registered start would lag one
+  // cycle and could be silently rejected if `ready` flips.
+  {
+    Value readyHigh = readyVal ? readyVal : trueVal;
+    Value moreToIssue = comb::ICmpOp::create(
+        builder, loc, comb::ICmpPredicate::ult, issueCntVal, numTxns);
+    Value shouldStart =
+        comb::AndOp::create(builder, loc, readyHigh, moreToIssue);
+    sv::AssignOp::create(builder, loc, startWire, shouldStart);
+  }
 
   // Clean up testbench attributes if present.
   dutMod->removeAttr("testbench.inputs");

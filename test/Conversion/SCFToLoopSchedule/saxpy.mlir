@@ -1,8 +1,8 @@
-// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule))" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule)" %s | FileCheck %s
 
 // saxpy: Y[i] = a * X[i] + Y[i]. Scalar factor `a` as a function arg means
 // the multi-cycle mul is an operator with `cycle_latency`.
-// CHECK-LABEL: func.func @saxpy
+// CHECK-LABEL: loopschedule.func_sequential @saxpy
 // CHECK: loopschedule.frame -> (!loopschedule.handle)
 // CHECK: loopschedule.at 0 -> !loopschedule.handle
 // CHECK:   loopschedule.launch : !loopschedule.handle

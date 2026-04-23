@@ -1,7 +1,7 @@
-// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal,convert-scf-to-loopschedule))" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule)" %s | FileCheck %s
 
 // Element-wise vector add: C[i] = A[i] + B[i].
-// CHECK-LABEL: func.func @vadd
+// CHECK-LABEL: loopschedule.func_sequential @vadd
 // CHECK: loopschedule.frame -> (!loopschedule.handle)
 // CHECK: loopschedule.at 0 -> !loopschedule.handle
 // CHECK:   loopschedule.launch : !loopschedule.handle

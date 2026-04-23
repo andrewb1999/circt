@@ -20,6 +20,8 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/Visitors.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/FunctionImplementation.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/STLExtras.h"
@@ -1055,10 +1057,10 @@ LogicalResult LoopScheduleAtOp::verify() {
           "loopschedule.at must appear in a frame's body region");
     return success();
   }
-  if (isa<LoopSchedulePipelineOp>(parent))
+  if (isa<LoopSchedulePipelineOp, LoopScheduleFuncPipelineOp>(parent))
     return success();
-  return emitOpError("loopschedule.at must be inside a loopschedule.frame or "
-                     "loopschedule.pipeline");
+  return emitOpError("loopschedule.at must be inside a loopschedule.frame, "
+                     "loopschedule.pipeline, or loopschedule.func_pipeline");
 }
 
 //===----------------------------------------------------------------------===//
@@ -1381,6 +1383,172 @@ Value circt::loopschedule::getIterArgPhaseResult(
     if (it.value() == inside)
       return parent->getResult(it.index());
   return inside;
+}
+
+//===----------------------------------------------------------------------===//
+// LoopScheduleFuncSequentialOp / LoopScheduleFuncPipelineOp
+//===----------------------------------------------------------------------===//
+
+namespace {
+// Shared parser/printer/builder helpers for the two func-level container
+// ops. They differ only in whether an `II` attribute is parsed/printed.
+template <typename OpT>
+ParseResult parseFuncLikeOp(OpAsmParser &parser, OperationState &result,
+                             bool hasII) {
+  auto buildFuncType =
+      [](Builder &builder, ArrayRef<Type> argTypes, ArrayRef<Type> results,
+         function_interface_impl::VariadicFlag, std::string &) {
+        return builder.getFunctionType(argTypes, results);
+      };
+
+  if (hasII) {
+    IntegerAttr ii;
+    if (parser.parseKeyword("ii") || parser.parseEqual() ||
+        parser.parseAttribute(ii, parser.getBuilder().getIntegerType(64), "II",
+                              result.attributes))
+      return failure();
+  }
+
+  return function_interface_impl::parseFunctionOp(
+      parser, result, /*allowVariadic=*/false,
+      OpT::getFunctionTypeAttrName(result.name), buildFuncType,
+      OpT::getArgAttrsAttrName(result.name),
+      OpT::getResAttrsAttrName(result.name));
+}
+
+template <typename OpT>
+void printFuncLikeOp(OpT op, OpAsmPrinter &p, bool hasII) {
+  if (hasII) {
+    p << " ii = " << op->template getAttrOfType<IntegerAttr>("II").getInt();
+  }
+  // Replicate function_interface_impl::printFunctionOp but with `II` added
+  // to the elided attribute list so it doesn't get printed twice.
+  StringRef visibilityAttrName = SymbolTable::getVisibilityAttrName();
+  StringRef sym = op.getSymName();
+  p << ' ';
+  if (auto visibility = op->template getAttrOfType<StringAttr>(visibilityAttrName))
+    p << visibility.getValue() << ' ';
+  p.printSymbolName(sym);
+  function_interface_impl::printFunctionSignature(
+      p, op, op.getArgumentTypes(), /*isVariadic=*/false, op.getResultTypes());
+  SmallVector<StringRef> elided{
+      visibilityAttrName,
+      op.getFunctionTypeAttrName().getValue(),
+      op.getArgAttrsAttrName().getValue(),
+      op.getResAttrsAttrName().getValue(),
+      SymbolTable::getSymbolAttrName(),
+  };
+  if (hasII)
+    elided.push_back("II");
+  function_interface_impl::printFunctionAttributes(p, op, elided);
+  Region &body = op->getRegion(0);
+  if (!body.empty()) {
+    p << ' ';
+    p.printRegion(body, /*printEntryBlockArgs=*/false,
+                  /*printBlockTerminators=*/true);
+  }
+}
+
+template <typename OpT>
+LogicalResult verifyFuncLikeBody(OpT op) {
+  // External (declaration-only) ops have an empty body — nothing to check.
+  if (op.isExternal())
+    return success();
+  Block &body = op.getBody().front();
+  if (body.empty() || !isa<LoopScheduleReturnOp>(body.back()))
+    return op.emitOpError(
+        "body must be terminated with `loopschedule.return`");
+  // Argument types must match function signature.
+  auto fnType = op.getFunctionType();
+  if (body.getNumArguments() != fnType.getNumInputs())
+    return op.emitOpError("body block argument count must match function "
+                          "signature input count");
+  for (auto [i, t] : llvm::enumerate(fnType.getInputs())) {
+    if (body.getArgument(i).getType() != t)
+      return op.emitOpError("body block argument #")
+             << i << " type mismatch with function signature";
+  }
+  return success();
+}
+} // namespace
+
+ParseResult LoopScheduleFuncSequentialOp::parse(OpAsmParser &parser,
+                                                 OperationState &result) {
+  return parseFuncLikeOp<LoopScheduleFuncSequentialOp>(parser, result,
+                                                        /*hasII=*/false);
+}
+void LoopScheduleFuncSequentialOp::print(OpAsmPrinter &p) {
+  printFuncLikeOp(*this, p, /*hasII=*/false);
+}
+LogicalResult LoopScheduleFuncSequentialOp::verify() {
+  return verifyFuncLikeBody(*this);
+}
+void LoopScheduleFuncSequentialOp::build(OpBuilder &builder,
+                                          OperationState &state, StringRef name,
+                                          FunctionType type,
+                                          ArrayRef<NamedAttribute> attrs,
+                                          ArrayRef<DictionaryAttr> argAttrs) {
+  state.addAttribute(SymbolTable::getSymbolAttrName(),
+                     builder.getStringAttr(name));
+  state.addAttribute(getFunctionTypeAttrName(state.name), TypeAttr::get(type));
+  state.attributes.append(attrs.begin(), attrs.end());
+  state.addRegion();
+  if (!argAttrs.empty()) {
+    call_interface_impl::addArgAndResultAttrs(
+        builder, state, argAttrs, /*resultAttrs=*/{},
+        getArgAttrsAttrName(state.name), getResAttrsAttrName(state.name));
+  }
+}
+
+ParseResult LoopScheduleFuncPipelineOp::parse(OpAsmParser &parser,
+                                               OperationState &result) {
+  return parseFuncLikeOp<LoopScheduleFuncPipelineOp>(parser, result,
+                                                      /*hasII=*/true);
+}
+void LoopScheduleFuncPipelineOp::print(OpAsmPrinter &p) {
+  printFuncLikeOp(*this, p, /*hasII=*/true);
+}
+LogicalResult LoopScheduleFuncPipelineOp::verify() {
+  if (getII() < 1)
+    return emitOpError("II must be >= 1");
+  return verifyFuncLikeBody(*this);
+}
+void LoopScheduleFuncPipelineOp::build(OpBuilder &builder,
+                                        OperationState &state, StringRef name,
+                                        FunctionType type, IntegerAttr ii,
+                                        ArrayRef<NamedAttribute> attrs,
+                                        ArrayRef<DictionaryAttr> argAttrs) {
+  state.addAttribute(SymbolTable::getSymbolAttrName(),
+                     builder.getStringAttr(name));
+  state.addAttribute(getFunctionTypeAttrName(state.name), TypeAttr::get(type));
+  state.addAttribute("II", ii);
+  state.attributes.append(attrs.begin(), attrs.end());
+  state.addRegion();
+  if (!argAttrs.empty()) {
+    call_interface_impl::addArgAndResultAttrs(
+        builder, state, argAttrs, /*resultAttrs=*/{},
+        getArgAttrsAttrName(state.name), getResAttrsAttrName(state.name));
+  }
+}
+
+LogicalResult LoopScheduleReturnOp::verify() {
+  Operation *parent = (*this)->getParentOp();
+  TypeRange parentResults;
+  if (auto seq = dyn_cast<LoopScheduleFuncSequentialOp>(parent))
+    parentResults = seq.getFunctionType().getResults();
+  else if (auto pipe = dyn_cast<LoopScheduleFuncPipelineOp>(parent))
+    parentResults = pipe.getFunctionType().getResults();
+  else
+    return emitOpError("must be inside a loopschedule func-level container");
+
+  if (getOperands().size() != parentResults.size())
+    return emitOpError("operand count must match parent result count");
+  for (auto [i, t] : llvm::enumerate(parentResults)) {
+    if (getOperand(i).getType() != t)
+      return emitOpError("operand #")
+             << i << " type mismatch with parent result type";
+  }
+  return success();
 }
 
 #include "circt/Dialect/LoopSchedule/LoopScheduleDialect.cpp.inc"

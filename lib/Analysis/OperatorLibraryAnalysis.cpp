@@ -28,18 +28,22 @@ using namespace circt::analysis;
 
 OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
   auto *context = op->getContext();
-  if (!isa<func::FuncOp>(op)) {
-    op->emitOpError("must be a FuncOp for OperatorLibraryAnalysis");
+  // Accept any function-like op carrying an `oplib.library` attribute.
+  // SCFToLoopSchedule wraps the input func in a
+  // `loopschedule.func_sequential` (still a FunctionOpInterface), so this
+  // analysis must not be locked to `func::FuncOp`.
+  if (!isa<mlir::FunctionOpInterface>(op)) {
+    op->emitOpError(
+        "must be a function-like op for OperatorLibraryAnalysis");
     return;
   }
-  auto funcOp = cast<func::FuncOp>(op);
-  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+  auto moduleOp = op->getParentOfType<ModuleOp>();
 
-  if (!funcOp->hasAttrOfType<SymbolRefAttr>("oplib.library")) {
+  if (!op->hasAttrOfType<SymbolRefAttr>("oplib.library")) {
     return;
   }
 
-  auto libraryName = funcOp->getAttrOfType<SymbolRefAttr>("oplib.library");
+  auto libraryName = op->getAttrOfType<SymbolRefAttr>("oplib.library");
   auto libraryOp = cast<oplib::LibraryOp>(moduleOp.lookupSymbol(libraryName));
 
   auto operatorOps = libraryOp.getBodyBlock()->getOps<oplib::OperatorOp>();

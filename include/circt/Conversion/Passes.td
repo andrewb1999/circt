@@ -19,7 +19,7 @@ include "mlir/Pass/PassBase.td"
 // SCFToLoopSchedule
 //===----------------------------------------------------------------------===//
 
-def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::func::FuncOp"> {
+def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
   let summary = "Convert SCF dialect to LoopSchedule scheduled loops";
   let description = [{
     This pass analyzes SCF loops and control flow, creates a Scheduling
