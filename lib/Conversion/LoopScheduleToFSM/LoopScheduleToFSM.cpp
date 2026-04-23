@@ -149,6 +149,11 @@ struct MemPortMapping {
   // HWLoadLoweringInterface::requiresReadEnable() is true (e.g. AMC
   // ports). Null means tie-high (memref case).
   Value rdEn;
+  // Memory-driven "request completed this cycle" signal. Non-null for
+  // amc ports (supplied by the hw.instance's `done` output). Null for
+  // memref-backed local memories — the FSM treats missing `done` as
+  // tied-high (no pipeline stall contribution).
+  Value done;
 };
 
 /// Information about a memory-backed value (memref argument, local
@@ -2728,9 +2733,41 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     Value startSignal, StringRef namePrefix, Value &doneSignal,
     DenseMap<Value, MemPortMapping> &memPorts,
     ArrayRef<PortArgInfo> memrefArgs) {
-  // Unwrap launch/expect pairs introduced by the scheduler for
-  // dynamic-latency ops. Step 1 of Phase 3B: no stall yet, just make the
-  // wrap transparent.
+  // Phase 3B: before the scheduler's launch/expect pairs are inlined
+  // away, snapshot the info the stall logic needs from each expect.
+  // Every expect marks a point where a dynamic-latency op's result is
+  // consumed — its `destStageOffset` is the cycle the FSM plans to see
+  // the value, and its `portValue` identifies the memory port whose
+  // `done` signal gates pipeline advance. After `inlineLaunchExpectPairs`
+  // runs, the launch/expect ops are gone, so we must capture this first.
+  struct ExpectInfo {
+    unsigned destStageOffset;
+    Value portValue;
+  };
+  SmallVector<ExpectInfo> expectInfos;
+  pipOp.walk([&](LoopScheduleExpectOp expectOp) {
+    auto dest = expectOp->getParentOfType<LoopScheduleAtOp>();
+    if (!dest)
+      return;
+    auto launch = expectOp.getLaunchOp();
+    if (!launch)
+      return;
+    Operation *payload = nullptr;
+    for (Operation &op : launch.getBody().front()) {
+      if (isa<LoopScheduleYieldOp>(op))
+        continue;
+      payload = &op;
+      break;
+    }
+    if (!payload)
+      return;
+    auto loadIface = dyn_cast<HWLoadLoweringInterface>(payload);
+    if (!loadIface)
+      return;
+    expectInfos.push_back({(unsigned)dest.getOffset(),
+                            loadIface.getMemoryValue()});
+  });
+
   inlineLaunchExpectPairs(pipOp);
 
   auto *ctx = builder.getContext();
@@ -2784,9 +2821,19 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     }
   }
 
+  // Phase 3B: stall is a backedge resolved at the end once `memPorts`
+  // are fully populated and per-expect `done` signals are looked up.
+  // Gating below wires `notStall` into the pipeline's state registers
+  // (active, II counter, stageCE shift chain) as well as the stage-CE
+  // consumption for rd_en/wr_en gates, so a low `done` at destStage
+  // freezes the whole pipeline without dropping in-flight requests.
+  Backedge stallBE = bb.get(hwBuilder.getI1Type());
+  Value stall = Value(stallBE);
+  Value notStall = comb::createOrFoldNot(hwBuilder, loc, stall);
+
   Backedge activeNextBE = bb.get(hwBuilder.getI1Type());
-  auto activeReg = seq::CompRegOp::create(
-      hwBuilder, loc, Value(activeNextBE), clk, rst, falseConst,
+  auto activeReg = seq::CompRegClockEnabledOp::create(
+      hwBuilder, loc, Value(activeNextBE), clk, notStall, rst, falseConst,
       hwBuilder.getStringAttr(namePrefix + "_active"));
   Value active = activeReg;
 
@@ -2808,8 +2855,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
         hw::ConstantOp::create(hwBuilder, loc, counterType, II - 1);
 
     Backedge counterBackedge = bb.get(counterType);
-    auto counterReg = seq::CompRegOp::create(
-        hwBuilder, loc, Value(counterBackedge), clk, rst, cZero,
+    auto counterReg = seq::CompRegClockEnabledOp::create(
+        hwBuilder, loc, Value(counterBackedge), clk, notStall, rst, cZero,
         hwBuilder.getStringAttr(namePrefix + "_ii_counter"));
 
     Value counterPlusOne =
@@ -2829,14 +2876,25 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
 
   Value activeCE = comb::AndOp::create(hwBuilder, loc, ceGen, condValue);
 
+  // Raw stage-CE shift chain (unstalled): each register holds during stall
+  // (CE=notStall) so positional iteration info isn't lost.
   SmallVector<Value> stageCE(stages.size());
   stageCE[0] = activeCE;
   for (unsigned i = 1; i < stages.size(); ++i) {
     auto ceName = hwBuilder.getStringAttr(
         (namePrefix + "_ce_stage_" + std::to_string(i)).str());
-    stageCE[i] = seq::CompRegOp::create(hwBuilder, loc, stageCE[i - 1], clk,
-                                        rst, falseConst, ceName);
+    stageCE[i] = seq::CompRegClockEnabledOp::create(
+        hwBuilder, loc, stageCE[i - 1], clk, notStall, rst, falseConst,
+        ceName);
   }
+  // Gated stage-CE used for memory-side enables (rd_en / wr_en) and any
+  // other consumer that must go low during stall — without this the
+  // memory would see stuck-high enables for the cycles the pipeline
+  // idles, creating spurious repeats.
+  SmallVector<Value> gatedStageCE(stages.size());
+  for (unsigned i = 0; i < stages.size(); ++i)
+    gatedStageCE[i] =
+        comb::AndOp::create(hwBuilder, loc, stageCE[i], notStall);
 
   // Per-stage memory port mappings. Loads/stores in stage `i` accumulate in
   // `perStagePorts[i]` so that multiple accesses to the same memref across
@@ -3037,7 +3095,9 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
             inner, hwBuilder, mapping,
             hwBody->getParentOp()->getParentOfType<ModuleOp>(), clk, rst);
       };
-      opResult = processOp(&op, stageCE[stageIdx]);
+      // Use the stall-gated stage CE as the write-/read-enable gate so
+      // memory requests don't re-fire when the pipeline idles on !done.
+      opResult = processOp(&op, gatedStageCE[stageIdx]);
 
       for (auto &sm : savedMappings)
         mapping.map(sm.first, sm.second);
@@ -3227,6 +3287,34 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       hwBuilder, loc, doneInput, clk, rst, falseConst,
       hwBuilder.getStringAttr(namePrefix + "_done"));
   doneSignal = doneReg;
+
+  // Phase 3B: resolve the stall backedge. For each expect collected
+  // before inlining, stall whenever destStage's CE is firing but the
+  // underlying memory port's `done` is low — i.e. the request we issued
+  // `latency` cycles ago hasn't completed yet.
+  SmallVector<Value> stallBits;
+  for (auto &ei : expectInfos) {
+    auto it = memPorts.find(ei.portValue);
+    if (it == memPorts.end())
+      continue;
+    Value done = it->second.done;
+    if (!done)
+      continue; // memref-backed / no done exposed → treat as tied-high
+    if (ei.destStageOffset >= stageCE.size())
+      continue;
+    Value notDone = comb::createOrFoldNot(hwBuilder, loc, done);
+    Value stallI = comb::AndOp::create(hwBuilder, loc,
+                                         stageCE[ei.destStageOffset], notDone);
+    stallBits.push_back(stallI);
+  }
+  Value stallVal = falseConst;
+  if (!stallBits.empty()) {
+    stallVal = stallBits.front();
+    for (unsigned i = 1; i < stallBits.size(); ++i)
+      stallVal =
+          comb::OrOp::create(hwBuilder, loc, stallVal, stallBits[i]);
+  }
+  stallBE.setValue(stallVal);
 
   return success();
 }
@@ -3483,6 +3571,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(func::FuncOp funcOp) {
     MemPortMapping mp;
     mp.rdData = signals.rdData;
     mp.addrs.assign(signals.addrs.size(), Value());
+    mp.done = signals.done;
     memPortMap[portValue] = mp;
   }
 

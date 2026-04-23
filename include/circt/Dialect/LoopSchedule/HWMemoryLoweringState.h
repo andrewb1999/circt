@@ -61,6 +61,14 @@ struct HWPortSignals {
   mlir::Value rdData;
   mlir::Value wrData;
   mlir::Value wrEn;
+  /// Memory-driven "this port's outstanding request has completed
+  /// this cycle" signal. For a port with a fixed-latency passthrough,
+  /// this is `rd_en | wr_en` registered `latency` cycles; for an
+  /// arbitrated port it's gated by the arbiter grant so that contention
+  /// surfaces as a delayed done. Null when the memory doesn't expose a
+  /// done signal (e.g. memref-backed local memories), in which case the
+  /// FSM treats it as tied-high (no stall from this port).
+  mlir::Value done;
   unsigned latency = 0;
 };
 
