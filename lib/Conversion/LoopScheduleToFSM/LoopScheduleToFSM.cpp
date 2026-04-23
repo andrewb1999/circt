@@ -468,6 +468,18 @@ private:
       loopschedule::HWMemoryLoweringState &memInstState,
       SmallVectorImpl<PortArgInfo> &memrefArgs);
 
+  /// Shared end-of-function wiring: resolve the address / write-data /
+  /// write-enable backedges left dangling by `setupFunctionPrelude` for
+  /// each local hlmem and amc.instance port. Unset ports tie to safe
+  /// defaults (read-enable defaults high; addr / write-data /
+  /// write-enable default to zero). Mutates the backedges in `hlmemBEs`
+  /// and `memInstState`, so neither is taken by const reference.
+  void resolveFunctionMemoryBackedges(
+      OpBuilder &builder, Location loc, Block *hwBody,
+      SmallVectorImpl<HLMemBackedges> &hlmemBEs,
+      loopschedule::HWMemoryLoweringState &memInstState,
+      DenseMap<Value, MemPortMapping> &memPortMap);
+
   /// Build the nesting tree from a sequential op.
   void buildLoopTree(LoopScheduleSequentialOp seqOp, LoopNode &node,
                      const std::string &prefix, unsigned &loopCounter);
@@ -3647,6 +3659,75 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
   return success();
 }
 
+void LoopScheduleToFSMPass::resolveFunctionMemoryBackedges(
+    OpBuilder &builder, Location loc, Block *hwBody,
+    SmallVectorImpl<HLMemBackedges> &hlmemBEs,
+    loopschedule::HWMemoryLoweringState &memInstState,
+    DenseMap<Value, MemPortMapping> &memPortMap) {
+  builder.setInsertionPointToEnd(hwBody);
+  auto i1 = builder.getI1Type();
+  for (auto &be : hlmemBEs) {
+    auto &ports = memPortMap[be.allocResult];
+    auto memTy = cast<MemRefType>(be.allocResult.getType());
+    auto dataType = memTy.getElementType();
+    for (auto [d, beAddr] : llvm::enumerate(be.addrBEs)) {
+      auto hlmemAddrTy = cast<IntegerType>(Value(beAddr).getType());
+      Value src;
+      if (d < ports.addrs.size() && ports.addrs[d])
+        src =
+            resizeIntTo(builder, loc, ports.addrs[d], hlmemAddrTy.getWidth());
+      else
+        src = hw::ConstantOp::create(builder, loc, hlmemAddrTy, 0);
+      beAddr.setValue(src);
+    }
+    be.wrDataBE.setValue(ports.wrData
+                              ? ports.wrData
+                              : hw::ConstantOp::create(builder, loc, dataType,
+                                                        0));
+    be.wrEnBE.setValue(ports.wrEn
+                            ? ports.wrEn
+                            : hw::ConstantOp::create(builder, loc, i1, 0));
+  }
+
+  for (auto &pb : memInstState.pendingBackedges) {
+    auto it = memPortMap.find(pb.portValue);
+    Value resolved;
+    Type beTy = Value(pb.be).getType();
+    auto makeZero = [&]() {
+      return hw::ConstantOp::create(builder, loc, beTy, 0);
+    };
+    auto makeOne = [&]() {
+      return hw::ConstantOp::create(builder, loc, beTy, 1);
+    };
+    using Kind = loopschedule::PortBackedge::Kind;
+    switch (pb.kind) {
+    case Kind::Addr:
+      if (it != memPortMap.end() && pb.addrIdx < it->second.addrs.size() &&
+          it->second.addrs[pb.addrIdx])
+        resolved =
+            resizeIntTo(builder, loc, it->second.addrs[pb.addrIdx],
+                        cast<IntegerType>(beTy).getWidth());
+      else
+        resolved = makeZero();
+      break;
+    case Kind::RdEn:
+      resolved = (it != memPortMap.end() && it->second.rdEn) ? it->second.rdEn
+                                                              : makeOne();
+      break;
+    case Kind::WrData:
+      resolved = (it != memPortMap.end() && it->second.wrData)
+                      ? it->second.wrData
+                      : makeZero();
+      break;
+    case Kind::WrEn:
+      resolved = (it != memPortMap.end() && it->second.wrEn) ? it->second.wrEn
+                                                              : makeZero();
+      break;
+    }
+    pb.be.setValue(resolved);
+  }
+}
+
 LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFuncSequentialOp funcOp) {
   auto *ctx = funcOp.getContext();
   auto loc = funcOp.getLoc();
@@ -4207,71 +4288,9 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         mergedMemPorts[memInfo.originalArg].wrEn;
   }
 
-  // Resolve local hlmem backedges.
-  builder.setInsertionPointToEnd(hwBody);
-  for (auto &be : hlmemBEs) {
-    auto &ports = memPortMap[be.allocResult];
-    auto memTy = cast<MemRefType>(be.allocResult.getType());
-    auto dataType = memTy.getElementType();
-    for (auto [d, beAddr] : llvm::enumerate(be.addrBEs)) {
-      auto hlmemAddrTy = cast<IntegerType>(Value(beAddr).getType());
-      Value src;
-      if (d < ports.addrs.size() && ports.addrs[d])
-        src = resizeIntTo(builder, loc, ports.addrs[d],
-                          hlmemAddrTy.getWidth());
-      else
-        src = hw::ConstantOp::create(builder, loc, hlmemAddrTy, 0);
-      beAddr.setValue(src);
-    }
-    be.wrDataBE.setValue(ports.wrData ? ports.wrData
-        : hw::ConstantOp::create(builder, loc, dataType, 0));
-    be.wrEnBE.setValue(ports.wrEn ? ports.wrEn
-        : hw::ConstantOp::create(builder, loc, i1, 0));
-  }
-
-  // Resolve memory-instance backedges (per-port addr / rdEn / wrData /
-  // wrEn inputs on the hw.instance) against the final drives accumulated
-  // in `memPortMap`. Unset slots tie to safe defaults (read-enable
-  // defaults high; addr / write-data / write-enable default to zero).
-  for (auto &pb : memInstState.pendingBackedges) {
-    auto it = memPortMap.find(pb.portValue);
-    Value resolved;
-    Type beTy = Value(pb.be).getType();
-    auto makeZero = [&]() {
-      return hw::ConstantOp::create(builder, loc, beTy, 0);
-    };
-    auto makeOne = [&]() {
-      return hw::ConstantOp::create(builder, loc, beTy, 1);
-    };
-    using Kind = loopschedule::PortBackedge::Kind;
-    switch (pb.kind) {
-    case Kind::Addr: {
-      if (it != memPortMap.end() && pb.addrIdx < it->second.addrs.size() &&
-          it->second.addrs[pb.addrIdx]) {
-        resolved = resizeIntTo(builder, loc, it->second.addrs[pb.addrIdx],
-                                cast<IntegerType>(beTy).getWidth());
-      } else {
-        resolved = makeZero();
-      }
-      break;
-    }
-    case Kind::RdEn:
-      resolved = (it != memPortMap.end() && it->second.rdEn)
-                     ? it->second.rdEn
-                     : makeOne();
-      break;
-    case Kind::WrData:
-      resolved = (it != memPortMap.end() && it->second.wrData)
-                     ? it->second.wrData
-                     : makeZero();
-      break;
-    case Kind::WrEn:
-      resolved = (it != memPortMap.end() && it->second.wrEn) ? it->second.wrEn
-                                                             : makeZero();
-      break;
-    }
-    pb.be.setValue(resolved);
-  }
+  // Resolve hlmem + amc.instance backedges left dangling by the prelude.
+  resolveFunctionMemoryBackedges(builder, loc, hwBody, hlmemBEs, memInstState,
+                                  memPortMap);
 
   // Build hw.output. Compute `ready` as "no transaction in flight": a
   // sticky bit set on `start` and cleared on `done`. Sequential funcs
@@ -4611,67 +4630,9 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
       builder, loc, stageCE.back(), clk, rst, falseConst,
       builder.getStringAttr("pipe_done"));
 
-  // --- Resolve local hlmem backedges (same as sequential path) ---
-  builder.setInsertionPointToEnd(hwBody);
-  for (auto &be : hlmemBEs) {
-    auto &ports = memPortMap[be.allocResult];
-    auto memTy = cast<MemRefType>(be.allocResult.getType());
-    auto dataType = memTy.getElementType();
-    for (auto [d, beAddr] : llvm::enumerate(be.addrBEs)) {
-      auto hlmemAddrTy = cast<IntegerType>(Value(beAddr).getType());
-      Value src;
-      if (d < ports.addrs.size() && ports.addrs[d])
-        src = resizeIntTo(builder, loc, ports.addrs[d],
-                          hlmemAddrTy.getWidth());
-      else
-        src = hw::ConstantOp::create(builder, loc, hlmemAddrTy, 0);
-      beAddr.setValue(src);
-    }
-    be.wrDataBE.setValue(ports.wrData ? ports.wrData
-        : hw::ConstantOp::create(builder, loc, dataType, 0));
-    be.wrEnBE.setValue(ports.wrEn ? ports.wrEn
-        : hw::ConstantOp::create(builder, loc, i1, 0));
-  }
-
-  // --- Resolve memory-instance backedges (same as sequential path) ---
-  for (auto &pb : memInstState.pendingBackedges) {
-    auto it = memPortMap.find(pb.portValue);
-    Value resolved;
-    Type beTy = Value(pb.be).getType();
-    auto makeZero = [&]() {
-      return hw::ConstantOp::create(builder, loc, beTy, 0);
-    };
-    auto makeOne = [&]() {
-      return hw::ConstantOp::create(builder, loc, beTy, 1);
-    };
-    using Kind = loopschedule::PortBackedge::Kind;
-    switch (pb.kind) {
-    case Kind::Addr:
-      if (it != memPortMap.end() && pb.addrIdx < it->second.addrs.size() &&
-          it->second.addrs[pb.addrIdx])
-        resolved = resizeIntTo(builder, loc, it->second.addrs[pb.addrIdx],
-                                cast<IntegerType>(beTy).getWidth());
-      else
-        resolved = makeZero();
-      break;
-    case Kind::RdEn:
-      resolved = (it != memPortMap.end() && it->second.rdEn)
-                     ? it->second.rdEn
-                     : makeOne();
-      break;
-    case Kind::WrData:
-      resolved = (it != memPortMap.end() && it->second.wrData)
-                     ? it->second.wrData
-                     : makeZero();
-      break;
-    case Kind::WrEn:
-      resolved = (it != memPortMap.end() && it->second.wrEn)
-                     ? it->second.wrEn
-                     : makeZero();
-      break;
-    }
-    pb.be.setValue(resolved);
-  }
+  // Resolve hlmem + amc.instance backedges left dangling by the prelude.
+  resolveFunctionMemoryBackedges(builder, loc, hwBody, hlmemBEs, memInstState,
+                                  memPortMap);
 
   builder.setInsertionPointToEnd(hwBody);
   buildHWOutput(funcOp, builder, loc, hwBody, mapping, memPortMap, readySignal,
