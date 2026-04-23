@@ -300,6 +300,135 @@ struct LoopNode {
   }
 };
 
+/// Compute the cycle latency of a defining op for pipelined hw lowering.
+/// Prefers an explicit `loopschedule.cycle_latency` attribute, falls back
+/// to the operator library's declared latency for ops tagged with
+/// `loopschedule.operator = @...` (covers pipelined arith ops like
+/// `i32_muli_l4` whose latency lives on the `oplib.operator` entry).
+/// Returns 0 when no latency information is available.
+static unsigned
+computeOpCycleLatency(Operation *def,
+                      analysis::OperatorLibraryAnalysis *operatorLibrary) {
+  if (!def)
+    return 0;
+  if (auto attr =
+          def->getAttrOfType<IntegerAttr>("loopschedule.cycle_latency"))
+    return (unsigned)attr.getInt();
+  if (!operatorLibrary)
+    return 0;
+  auto operatorAttr =
+      def->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+  if (!operatorAttr)
+    return 0;
+  StringRef opName = operatorLibrary->getOperatorBySymbol(operatorAttr);
+  if (opName.empty())
+    return 0;
+  return operatorLibrary->getOperatorLatency(opName);
+}
+
+/// Materializes the cross-stage delay registers needed when a value
+/// produced at stage J is consumed at stage K with K > J + L + 1
+/// (where L is the producing op's cycle latency). Owns the per-value
+/// `delayChain` and lazily extends each chain on first use.
+///
+/// Both the loop-pipeline child lowering and the function-pipeline
+/// driver instantiate one of these and call `resolveForStage` whenever
+/// they encounter an operand that crosses stage boundaries; the only
+/// per-site differences are the register-name prefix and which
+/// `OpBuilder` to wire ops onto.
+class CrossStageValueResolver {
+public:
+  CrossStageValueResolver(OpBuilder &builder, Location loc, Block *hwBody,
+                          Value clk, Value rst,
+                          ArrayRef<LoopScheduleAtOp> stages,
+                          ArrayRef<Value> stageCE, IRMapping &mapping,
+                          analysis::OperatorLibraryAnalysis *operatorLibrary,
+                          StringRef regNamePrefix)
+      : builder(builder), loc(loc), hwBody(hwBody), clk(clk), rst(rst),
+        stages(stages), stageCE(stageCE), mapping(mapping),
+        operatorLibrary(operatorLibrary),
+        regNamePrefix(regNamePrefix.str()) {}
+
+  /// Returns the delayed copy of `origVal` to feed into `consumerStage`,
+  /// or null if the consumer can read the existing stage register / op
+  /// wrapper output directly. Lazily grows the per-value chain.
+  Value resolveForStage(Value origVal, unsigned consumerStage) {
+    auto result = dyn_cast<OpResult>(origVal);
+    if (!result)
+      return Value();
+    auto defStage = dyn_cast<LoopScheduleAtOp>(result.getOwner());
+    if (!defStage)
+      return Value();
+    unsigned J = stages.size();
+    for (unsigned s = 0; s < stages.size(); ++s)
+      if (stages[s] == defStage) {
+        J = s;
+        break;
+      }
+    // Effective "ready stage" for this value accounts for any internal
+    // operator latency: the result is only logically valid at `J+L`.
+    unsigned L = getYieldLatency(origVal);
+    unsigned readyStage = J + L;
+    // Only delay values whose consumer is strictly later than the
+    // stage immediately after the ready point. Consumers at or one
+    // past readyStage read the wrapper / stage register directly.
+    if (J == stages.size() || consumerStage <= readyStage + 1)
+      return Value();
+    auto &chain = delayChain[origVal];
+    if (chain.empty())
+      chain.push_back(mapping.lookup(origVal));
+    while (chain.size() < consumerStage - readyStage) {
+      unsigned ceStage = readyStage + chain.size();
+      if (ceStage >= stages.size())
+        break;
+      Value prev = chain.back();
+      Value resetVal = createZeroConstant(builder, loc, prev.getType());
+      auto regName = builder.getStringAttr(
+          regNamePrefix + "_s" + std::to_string(ceStage) + "_dly_r" +
+          std::to_string(result.getResultNumber()) + "_from_s" +
+          std::to_string(J));
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToEnd(hwBody);
+      Value reg = seq::CompRegClockEnabledOp::create(
+          builder, loc, prev, clk, stageCE[ceStage], rst, resetVal, regName);
+      chain.push_back(reg);
+    }
+    unsigned idx = consumerStage - readyStage - 1;
+    if (idx >= chain.size())
+      idx = chain.size() - 1;
+    return chain[idx];
+  }
+
+private:
+  /// Latency of the op that produces the at-op's yielded value `origVal`.
+  unsigned getYieldLatency(Value origVal) const {
+    auto result = dyn_cast<OpResult>(origVal);
+    if (!result)
+      return 0;
+    auto atOp = dyn_cast<LoopScheduleAtOp>(result.getOwner());
+    if (!atOp)
+      return 0;
+    auto yieldOp = atOp.getYieldOp();
+    unsigned idx = result.getResultNumber();
+    if (idx >= yieldOp.getNumOperands())
+      return 0;
+    return computeOpCycleLatency(yieldOp.getOperand(idx).getDefiningOp(),
+                                  operatorLibrary);
+  }
+
+  OpBuilder &builder;
+  Location loc;
+  Block *hwBody;
+  Value clk;
+  Value rst;
+  ArrayRef<LoopScheduleAtOp> stages;
+  ArrayRef<Value> stageCE;
+  IRMapping &mapping;
+  analysis::OperatorLibraryAnalysis *operatorLibrary;
+  std::string regNamePrefix;
+  DenseMap<Value, SmallVector<Value>> delayChain;
+};
+
 /// Main pass converting LoopSchedule ops to FSM + HW.
 class LoopScheduleToFSMPass
     : public circt::impl::LoopScheduleToFSMBase<LoopScheduleToFSMPass> {
@@ -2914,105 +3043,14 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // cycle in an II=1 pipeline). chain[0] is the direct stage J register;
   // chain[k] (k >= 1) is a delay register clocked on stageCE[J + k]. Consumer
   // stage K reads chain[K - J - 1].
-  DenseMap<Value, SmallVector<Value>> delayChain;
-
-  // If an at-op's yielded value is produced by an operator-library op with
-  // non-zero cycle latency L, the op's hw.instance wrapper delays the
-  // result by L cycles internally. The stage-J register captured at
-  // stage-J's cycle latches the wrapper's output at cycle J (undefined
-  // for a cycle-(J-L) input); the schedule really means the result is
-  // ready at stage J+L. Compute that "ready stage" here so stage-register
-  // creation can skip the latent-op result and resolveForStage sizes the
-  // delay chain from J+L rather than J.
-  auto getOpLatency = [this](Operation *def) -> unsigned {
-    if (!def)
-      return 0;
-    if (auto attr =
-            def->getAttrOfType<IntegerAttr>("loopschedule.cycle_latency"))
-      return (unsigned)attr.getInt();
-    // Fall back to the operator-library latency for ops tagged with
-    // `loopschedule.operator = @...`. Covers pipelined arith ops
-    // (e.g. i32_muli_l4) whose cycle_latency isn't stamped directly
-    // on the arith op but is declared on the oplib.operator entry.
-    if (!operatorLibrary)
-      return 0;
-    auto operatorAttr =
-        def->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
-    if (!operatorAttr)
-      return 0;
-    StringRef opName = operatorLibrary->getOperatorBySymbol(operatorAttr);
-    if (opName.empty())
-      return 0;
-    return operatorLibrary->getOperatorLatency(opName);
-  };
-  auto getYieldLatency = [&](Value origVal) -> unsigned {
-    auto result = dyn_cast<OpResult>(origVal);
-    if (!result)
-      return 0;
-    auto atOp = dyn_cast<LoopScheduleAtOp>(result.getOwner());
-    if (!atOp)
-      return 0;
-    auto yieldOp = atOp.getYieldOp();
-    unsigned idx = result.getResultNumber();
-    if (idx >= yieldOp.getNumOperands())
-      return 0;
-    return getOpLatency(yieldOp.getOperand(idx).getDefiningOp());
-  };
-
-  auto resolveForStage = [&](Value origVal,
-                             unsigned consumerStage) -> Value {
-    auto result = dyn_cast<OpResult>(origVal);
-    if (!result)
-      return Value();
-    auto defStage =
-        dyn_cast<LoopScheduleAtOp>(result.getOwner());
-    if (!defStage)
-      return Value();
-    unsigned J = stages.size();
-    for (unsigned s = 0; s < stages.size(); ++s)
-      if (stages[s] == defStage) {
-        J = s;
-        break;
-      }
-    // Effective "ready stage" for this value accounts for any internal
-    // operator latency: the result is only logically valid at `J+L`.
-    unsigned L = getYieldLatency(origVal);
-    unsigned readyStage = J + L;
-    // Only delay values whose consumer is strictly later than the
-    // stage immediately after the ready point. Consumers at stage
-    // readyStage read the wrapper output / stage register directly;
-    // consumers at readyStage+1 also read it directly (the stage-J
-    // register IS the "ready-stage output" minus one cycle for non-
-    // latent values). The delay chain materializes additional
-    // registers only for further-out stages.
-    if (J == stages.size() || consumerStage <= readyStage + 1)
-      return Value();
-    auto &chain = delayChain[origVal];
-    if (chain.empty())
-      chain.push_back(mapping.lookup(origVal));
-    while (chain.size() < consumerStage - readyStage) {
-      unsigned ceStage = readyStage + chain.size();
-      if (ceStage >= stages.size())
-        break;
-      Value prev = chain.back();
-      Value resetVal = createZeroConstant(hwBuilder, loc, prev.getType());
-      auto regName = hwBuilder.getStringAttr(
-          (namePrefix + "_s" + std::to_string(ceStage) + "_dly_r" +
-           std::to_string(result.getResultNumber()) + "_from_s" +
-           std::to_string(J))
-              .str());
-      OpBuilder::InsertionGuard g(hwBuilder);
-      hwBuilder.setInsertionPointToEnd(hwBody);
-      Value reg = seq::CompRegClockEnabledOp::create(
-          hwBuilder, loc, prev, clk, stageCE[ceStage], rst, resetVal,
-          regName);
-      chain.push_back(reg);
-    }
-    unsigned idx = consumerStage - readyStage - 1;
-    if (idx >= chain.size())
-      idx = chain.size() - 1;
-    return chain[idx];
-  };
+  // Cross-stage delay registers. Owns a per-value delay chain so that
+  // when stage J yields a value consumed at stage K > J + L + 1 (with L
+  // = the producing op's cycle latency), the consumer reads from an
+  // appropriately-clocked shift register rather than the constantly-
+  // overwriting stage-J register.
+  CrossStageValueResolver delayResolver(
+      hwBuilder, loc, hwBody, clk, rst, stages, stageCE, mapping,
+      operatorLibrary, namePrefix.str());
 
   // Helper: check whether a memref is backed by a local seq.hlmem.
   auto isLocalMemref = [&](Value memref) -> bool {
@@ -3041,7 +3079,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // aren't affected.
       SmallVector<std::pair<Value, Value>> savedMappings;
       for (Value operand : op.getOperands()) {
-        Value delayed = resolveForStage(operand, stageIdx);
+        Value delayed = delayResolver.resolveForStage(operand, stageIdx);
         if (!delayed)
           continue;
         Value current = mapping.lookup(operand);
@@ -3127,7 +3165,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // The register's D input should see the delayed view for this stage
       // as well, in case the register is a direct pass-through of an
       // earlier stage's value.
-      Value delayed = resolveForStage(val, stageIdx);
+      Value delayed = delayResolver.resolveForStage(val, stageIdx);
       Value mappedVal = delayed ? delayed : mapping.lookup(val);
 
       if (localLoadResults.count(val)) {
@@ -3145,7 +3183,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // register here; `resolveForStage` uses `readyStage = J+L` so
       // stage-J+L consumers read the wrapper output directly and
       // further stages pick it up via delay registers.
-      if (getOpLatency(val.getDefiningOp()) > 0) {
+      if (computeOpCycleLatency(val.getDefiningOp(), operatorLibrary) > 0) {
         mapping.map(stageOp.getResult(regIdx), mappedVal);
         continue;
       }
@@ -4471,80 +4509,10 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
     for (auto &entry : memPortMap)
       perStagePorts[s][entry.first].rdData = entry.second.rdData;
 
-  // Cross-stage delay chains for values that hop more than one stage.
-  DenseMap<Value, SmallVector<Value>> delayChain;
-  auto getOpLatency = [this](Operation *def) -> unsigned {
-    if (!def)
-      return 0;
-    if (auto attr =
-            def->getAttrOfType<IntegerAttr>("loopschedule.cycle_latency"))
-      return (unsigned)attr.getInt();
-    if (!operatorLibrary)
-      return 0;
-    auto operatorAttr =
-        def->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
-    if (!operatorAttr)
-      return 0;
-    StringRef opName = operatorLibrary->getOperatorBySymbol(operatorAttr);
-    if (opName.empty())
-      return 0;
-    return operatorLibrary->getOperatorLatency(opName);
-  };
-  auto getYieldLatency = [&](Value origVal) -> unsigned {
-    auto result = dyn_cast<OpResult>(origVal);
-    if (!result)
-      return 0;
-    auto atOp = dyn_cast<LoopScheduleAtOp>(result.getOwner());
-    if (!atOp)
-      return 0;
-    auto yieldOp = atOp.getYieldOp();
-    unsigned idx = result.getResultNumber();
-    if (idx >= yieldOp.getNumOperands())
-      return 0;
-    return getOpLatency(yieldOp.getOperand(idx).getDefiningOp());
-  };
-  auto resolveForStage = [&](Value origVal,
-                             unsigned consumerStage) -> Value {
-    auto result = dyn_cast<OpResult>(origVal);
-    if (!result)
-      return Value();
-    auto defStage = dyn_cast<LoopScheduleAtOp>(result.getOwner());
-    if (!defStage)
-      return Value();
-    unsigned J = stages.size();
-    for (unsigned s = 0; s < stages.size(); ++s)
-      if (stages[s] == defStage) {
-        J = s;
-        break;
-      }
-    unsigned L = getYieldLatency(origVal);
-    unsigned readyStage = J + L;
-    if (J == stages.size() || consumerStage <= readyStage + 1)
-      return Value();
-    auto &chain = delayChain[origVal];
-    if (chain.empty())
-      chain.push_back(mapping.lookup(origVal));
-    while (chain.size() < consumerStage - readyStage) {
-      unsigned ceStage = readyStage + chain.size();
-      if (ceStage >= stages.size())
-        break;
-      Value prev = chain.back();
-      Value resetVal = createZeroConstant(builder, loc, prev.getType());
-      auto regName = builder.getStringAttr(
-          "pipe_s" + std::to_string(ceStage) + "_dly_r" +
-          std::to_string(result.getResultNumber()) + "_from_s" +
-          std::to_string(J));
-      OpBuilder::InsertionGuard g(builder);
-      builder.setInsertionPointToEnd(hwBody);
-      Value reg = seq::CompRegClockEnabledOp::create(
-          builder, loc, prev, clk, stageCE[ceStage], rst, resetVal, regName);
-      chain.push_back(reg);
-    }
-    unsigned idx = consumerStage - readyStage - 1;
-    if (idx >= chain.size())
-      idx = chain.size() - 1;
-    return chain[idx];
-  };
+  // Cross-stage delay registers — see CrossStageValueResolver above.
+  CrossStageValueResolver delayResolver(
+      builder, loc, hwBody, clk, rst, stages, stageCE, mapping,
+      operatorLibrary, "pipe");
 
   auto isLocalMemref = [&](Value memref) -> bool {
     for (auto &memInfo : memrefArgs)
@@ -4573,7 +4541,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
 
       SmallVector<std::pair<Value, Value>> savedMappings;
       for (Value operand : op.getOperands()) {
-        Value delayed = resolveForStage(operand, stageIdx);
+        Value delayed = delayResolver.resolveForStage(operand, stageIdx);
         if (!delayed)
           continue;
         Value current = mapping.lookup(operand);
@@ -4636,14 +4604,14 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
 
     auto regOp = cast<LoopScheduleYieldOp>(body.getTerminator());
     for (auto [regIdx, val] : llvm::enumerate(regOp.getOperands())) {
-      Value delayed = resolveForStage(val, stageIdx);
+      Value delayed = delayResolver.resolveForStage(val, stageIdx);
       Value mappedVal = delayed ? delayed : mapping.lookup(val);
 
       if (localLoadResults.count(val)) {
         mapping.map(stageOp.getResult(regIdx), mappedVal);
         continue;
       }
-      if (getOpLatency(val.getDefiningOp()) > 0) {
+      if (computeOpCycleLatency(val.getDefiningOp(), operatorLibrary) > 0) {
         mapping.map(stageOp.getResult(regIdx), mappedVal);
         continue;
       }
