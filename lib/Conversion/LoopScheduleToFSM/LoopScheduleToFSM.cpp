@@ -435,9 +435,38 @@ class LoopScheduleToFSMPass
 public:
   void runOnOperation() override;
 
+  /// Backedge info for a local hlmem (memref.alloc → seq.hlmem). Lifted
+  /// to the top of the class so member-function declarations below can
+  /// reference it by name.
+  struct HLMemBackedges {
+    Value allocResult;          // original memref.alloc result
+    SmallVector<Backedge> addrBEs; // one per memref dim (in hlmem's widths)
+    Backedge wrDataBE;
+    Backedge wrEnBE;
+  };
+
 private:
   LogicalResult lowerFunction(loopschedule::LoopScheduleFuncSequentialOp funcOp);
   LogicalResult lowerFunction(loopschedule::LoopScheduleFuncPipelineOp funcOp);
+
+  /// Shared between the function-sequential and function-pipeline drivers:
+  /// scan the function body, clone non-skip ops via `mapping`, lower
+  /// `memref.alloc` to `seq.hlmem` with backedges, lower each
+  /// `HWMemoryInstanceLoweringInterface` op, and assemble the unified
+  /// `memrefArgs` (function memref args + local allocs + amc ports).
+  /// `isStageOrFrameOp` decides which top-level body ops are the
+  /// caller's responsibility (LoopScheduleFrameOp/Sequential/Pipeline
+  /// for sequential funcs, LoopScheduleAtOp for pipelined funcs) and
+  /// should not be cloned by the prelude.
+  LogicalResult setupFunctionPrelude(
+      Block &body, ValueRange funcArgs, OpBuilder &builder, Location loc,
+      Value clk, Value rst, ModuleOp enclosingModule,
+      llvm::function_ref<bool(Operation *)> isStageOrFrameOp,
+      IRMapping &mapping, BackedgeBuilder &funcBB,
+      DenseMap<Value, MemPortMapping> &memPortMap,
+      SmallVectorImpl<HLMemBackedges> &hlmemBEs,
+      loopschedule::HWMemoryLoweringState &memInstState,
+      SmallVectorImpl<PortArgInfo> &memrefArgs);
 
   /// Build the nesting tree from a sequential op.
   void buildLoopTree(LoopScheduleSequentialOp seqOp, LoopNode &node,
@@ -533,14 +562,6 @@ private:
   /// sym_names emitted by the operator-library dispatch helpers. Reset per
   /// `hw.module` we generate.
   llvm::StringMap<unsigned> instanceUniquer;
-
-  /// Backedge info for a local hlmem (memref.alloc).
-  struct HLMemBackedges {
-    Value allocResult;          // original memref.alloc result
-    SmallVector<Backedge> addrBEs; // one per memref dim (in hlmem's widths)
-    Backedge wrDataBE;
-    Backedge wrEnBE;
-  };
 };
 
 //===----------------------------------------------------------------------===//
@@ -3499,6 +3520,133 @@ static void buildHWOutput(mlir::FunctionOpInterface funcOp, OpBuilder &builder,
 // Function lowering (main entry)
 //===----------------------------------------------------------------------===//
 
+LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
+    Block &body, ValueRange funcArgs, OpBuilder &builder, Location loc,
+    Value clk, Value rst, ModuleOp enclosingModule,
+    llvm::function_ref<bool(Operation *)> isStageOrFrameOp,
+    IRMapping &mapping, BackedgeBuilder &funcBB,
+    DenseMap<Value, MemPortMapping> &memPortMap,
+    SmallVectorImpl<HLMemBackedges> &hlmemBEs,
+    loopschedule::HWMemoryLoweringState &memInstState,
+    SmallVectorImpl<PortArgInfo> &memrefArgs) {
+  // Pass 1: walk the body once, classifying each top-level op:
+  //   * skip the return op,
+  //   * skip caller-owned scheduling containers (frames / stages — the
+  //     `isStageOrFrameOp` predicate distinguishes which kind),
+  //   * collect `memref.alloc` for hlmem creation,
+  //   * collect `HWMemoryInstanceLoweringInterface` ops for amc lowering,
+  //   * clone everything else into the hw.module body via `mapping`.
+  SmallVector<memref::AllocOp> localAllocs;
+  SmallVector<loopschedule::HWMemoryInstanceLoweringInterface> instanceOps;
+  for (auto &op : body) {
+    if (isa<loopschedule::LoopScheduleReturnOp>(&op))
+      continue;
+    if (isStageOrFrameOp(&op))
+      continue;
+    if (auto allocOp = dyn_cast<memref::AllocOp>(&op)) {
+      localAllocs.push_back(allocOp);
+      continue;
+    }
+    if (auto instOp =
+            dyn_cast<loopschedule::HWMemoryInstanceLoweringInterface>(&op)) {
+      instanceOps.push_back(instOp);
+      continue;
+    }
+    builder.clone(op, mapping);
+  }
+
+  // Pass 2: materialize a `seq.hlmem` for each local memref.alloc, with
+  // backedges for addresses, write data, and write enable. The read
+  // port's enable is the negation of write enable so a bank with a
+  // pending write doesn't also read on the same cycle.
+  auto i1 = builder.getI1Type();
+  for (auto [i, allocOp] : llvm::enumerate(localAllocs)) {
+    auto memType = allocOp.getType();
+    auto dataType = memType.getElementType();
+    std::string name = "local_mem" + std::to_string(i);
+    auto hlmem = seq::HLMemOp::create(builder, loc, clk, rst, name,
+                                       memType.getShape(), dataType);
+
+    SmallVector<Backedge> addrBEs;
+    SmallVector<Value> addrVals;
+    for (Type addrTy : hlmem.getHandle().getType().getAddressTypes()) {
+      Backedge be = funcBB.get(addrTy);
+      addrBEs.push_back(be);
+      addrVals.push_back(Value(be));
+    }
+    Backedge wrDataBE = funcBB.get(dataType);
+    Backedge wrEnBE = funcBB.get(i1);
+
+    Value notWrEn = comb::XorOp::create(
+        builder, loc, Value(wrEnBE),
+        hw::ConstantOp::create(builder, loc, i1, 1));
+    auto readPort = seq::ReadPortOp::create(
+        builder, loc, hlmem.getHandle(), ValueRange(addrVals), notWrEn,
+        /*latency=*/1);
+    seq::WritePortOp::create(builder, loc, hlmem.getHandle(),
+                              ValueRange(addrVals), Value(wrDataBE),
+                              Value(wrEnBE), /*latency=*/1);
+
+    MemPortMapping mp;
+    mp.rdData = readPort.getReadData();
+    mp.addrs.assign(getNumAddrPorts(memType), Value());
+    mp.wrData = Value();
+    mp.wrEn = Value();
+    memPortMap[allocOp.getResult()] = mp;
+
+    hlmemBEs.push_back({allocOp.getResult(), std::move(addrBEs), wrDataBE,
+                        wrEnBE});
+  }
+
+  // Pass 3: lower each amc.instance via the dialect-defined interface.
+  // Each instance owns its own hw.instance creation and registers a
+  // per-port signal bundle into `memInstState.portMap`.
+  for (auto instOp : instanceOps) {
+    if (failed(instOp.lowerToHW(builder, memInstState)))
+      return failure();
+  }
+  for (auto &[portValue, signals] : memInstState.portMap) {
+    MemPortMapping mp;
+    mp.rdData = signals.rdData;
+    mp.addrs.assign(signals.addrs.size(), Value());
+    mp.done = signals.done;
+    memPortMap[portValue] = mp;
+  }
+
+  // Pass 4: assemble `memrefArgs` in canonical order — function args
+  // first, then local allocs, then amc-instance ports — so that down-
+  // stream port-list construction (`createHWModule`, etc.) sees a
+  // stable mem0/mem1/... naming.
+  for (auto arg : funcArgs) {
+    if (auto memType = dyn_cast<MemRefType>(arg.getType()))
+      memrefArgs.push_back(
+          makePortArgInfoFromMemref(arg, memType, /*isLocalMem=*/false));
+  }
+  for (auto allocOp : localAllocs) {
+    memrefArgs.push_back(makePortArgInfoFromMemref(allocOp.getResult(),
+                                                    allocOp.getType(),
+                                                    /*isLocalMem=*/true));
+  }
+  for (auto &[portValue, signals] : memInstState.portMap) {
+    PortArgInfo info;
+    info.originalArg = portValue;
+    info.isAmcPort = true;
+    info.latency = signals.latency;
+    info.addrWidths.reserve(signals.addrs.size());
+    for (Value a : signals.addrs)
+      info.addrWidths.push_back(cast<IntegerType>(a.getType()).getWidth());
+    info.isRead = signals.rdData != Value();
+    info.isWrite = signals.wrEn != Value();
+    info.requiresRdEn = signals.rdEn != Value();
+    if (info.isRead)
+      info.elementType = signals.rdData.getType();
+    else if (info.isWrite)
+      info.elementType = signals.wrData.getType();
+    memrefArgs.push_back(std::move(info));
+  }
+  return success();
+}
+
 LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFuncSequentialOp funcOp) {
   auto *ctx = funcOp.getContext();
   auto loc = funcOp.getLoc();
@@ -3533,141 +3681,28 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
 
   builder.setInsertionPointToEnd(hwBody);
 
-  // Clone non-loopschedule ops (constants, etc.), skipping allocs and
-  // memory-instance-lowering ops (each emits its own hw.instance /
-  // primitives below).
-  SmallVector<memref::AllocOp> localAllocs;
-  SmallVector<loopschedule::HWMemoryInstanceLoweringInterface> instanceOps;
-  for (auto &op : funcOp.getBody().front()) {
-    if (isa<loopschedule::LoopScheduleReturnOp>(&op))
-      continue;
-    if (isa<LoopScheduleFrameOp, LoopScheduleSequentialOp,
-            LoopSchedulePipelineOp>(&op))
-      continue;
-    if (auto allocOp = dyn_cast<memref::AllocOp>(&op)) {
-      localAllocs.push_back(allocOp);
-      continue;
-    }
-    if (auto instOp =
-            dyn_cast<loopschedule::HWMemoryInstanceLoweringInterface>(&op)) {
-      instanceOps.push_back(instOp);
-      continue;
-    }
-    builder.clone(op, mapping);
-  }
-
-  // Create seq.hlmem for each memref.alloc.
   auto i1 = builder.getI1Type();
   BackedgeBuilder funcBB(builder, loc);
   SmallVector<HLMemBackedges> hlmemBEs;
-  for (auto [i, allocOp] : llvm::enumerate(localAllocs)) {
-    auto memType = allocOp.getType();
-    auto dataType = memType.getElementType();
-
-    std::string name = "local_mem" + std::to_string(i);
-    auto hlmem = seq::HLMemOp::create(builder, loc, clk, rst, name,
-                                        memType.getShape(), dataType);
-
-    // Per-dim address backedges using hlmem's exact address types.
-    SmallVector<Backedge> addrBEs;
-    SmallVector<Value> addrVals;
-    for (Type addrTy : hlmem.getHandle().getType().getAddressTypes()) {
-      Backedge be = funcBB.get(addrTy);
-      addrBEs.push_back(be);
-      addrVals.push_back(Value(be));
-    }
-    Backedge wrDataBE = funcBB.get(dataType);
-    Backedge wrEnBE = funcBB.get(i1);
-
-    // Read port: rdEn = NOT wrEn (read when not writing).
-    Value notWrEn = comb::XorOp::create(
-        builder, loc, Value(wrEnBE),
-        hw::ConstantOp::create(builder, loc, i1, 1));
-    auto readPort = seq::ReadPortOp::create(
-        builder, loc, hlmem.getHandle(),
-        ValueRange(addrVals), notWrEn, /*latency=*/1);
-
-    // Write port.
-    seq::WritePortOp::create(
-        builder, loc, hlmem.getHandle(),
-        ValueRange(addrVals), Value(wrDataBE), Value(wrEnBE),
-        /*latency=*/1);
-
-    // Add to memPortMap.
-    MemPortMapping mp;
-    mp.rdData = readPort.getReadData();
-    mp.addrs.assign(getNumAddrPorts(memType), Value());
-    mp.wrData = Value();
-    mp.wrEn = Value();
-    memPortMap[allocOp.getResult()] = mp;
-
-    hlmemBEs.push_back({allocOp.getResult(), std::move(addrBEs), wrDataBE,
-                        wrEnBE});
-  }
-
-  // Lower each memory-instance op (e.g. amc.instance). Each op owns the
-  // creation of its hw.instance and registers per-port signal bundles.
   SymbolTable modSymTab(enclosingModule);
   loopschedule::HWMemoryLoweringState memInstState(clk, rst, funcBB,
                                                     modSymTab);
-  for (auto instOp : instanceOps) {
-    if (failed(instOp.lowerToHW(builder, memInstState)))
-      return failure();
-  }
-  // Merge the per-port signal bundles into the pass's unified
-  // MemPortMapping table: rdData is driven by the instance, address /
-  // write-data / write-enable / read-enable are left for loads and stores
-  // to populate, and the instance's input backedges will be resolved
-  // against the final drives at end-of-lowering.
-  for (auto &[portValue, signals] : memInstState.portMap) {
-    MemPortMapping mp;
-    mp.rdData = signals.rdData;
-    mp.addrs.assign(signals.addrs.size(), Value());
-    mp.done = signals.done;
-    memPortMap[portValue] = mp;
-  }
+  SmallVector<PortArgInfo> memrefArgs;
+  if (failed(setupFunctionPrelude(
+          funcOp.getBody().front(), funcOp.getArguments(), builder, loc, clk,
+          rst, enclosingModule,
+          [](Operation *op) {
+            return isa<LoopScheduleFrameOp, LoopScheduleSequentialOp,
+                       LoopSchedulePipelineOp>(op);
+          },
+          mapping, funcBB, memPortMap, hlmemBEs, memInstState, memrefArgs)))
+    return failure();
 
   // Collect top-level frames.
   SmallVector<LoopScheduleFrameOp> topFrames;
   for (auto &op : funcOp.getBody().front())
     if (auto frameOp = dyn_cast<LoopScheduleFrameOp>(&op))
       topFrames.push_back(frameOp);
-
-  // Collect port-arg info for threading through child modules: memref
-  // function arguments, local memref allocs, and amc.instance ports.
-  SmallVector<PortArgInfo> memrefArgs;
-  for (auto arg : funcOp.getArguments()) {
-    if (auto memType = dyn_cast<MemRefType>(arg.getType()))
-      memrefArgs.push_back(
-          makePortArgInfoFromMemref(arg, memType, /*isLocalMem=*/false));
-  }
-  for (auto allocOp : localAllocs) {
-    memrefArgs.push_back(makePortArgInfoFromMemref(allocOp.getResult(),
-                                                    allocOp.getType(),
-                                                    /*isLocalMem=*/true));
-  }
-  // Ports registered by each amc.instance (via HWMemoryInstanceLoweringInterface).
-  for (auto &[portValue, signals] : memInstState.portMap) {
-    PortArgInfo info;
-    info.originalArg = portValue;
-    info.isAmcPort = true;
-    info.latency = signals.latency;
-    // Each signal bundle carries addr Values whose types give us widths;
-    // shape is informational (not used once addrWidths is set).
-    info.addrWidths.reserve(signals.addrs.size());
-    for (Value a : signals.addrs)
-      info.addrWidths.push_back(cast<IntegerType>(a.getType()).getWidth());
-    info.isRead = signals.rdData != Value();
-    info.isWrite = signals.wrEn != Value();
-    info.requiresRdEn = signals.rdEn != Value();
-    // Element type is whatever the instance publishes as rdData or wrData;
-    // at least one of them is present for a useful port.
-    if (info.isRead)
-      info.elementType = signals.rdData.getType();
-    else if (info.isWrite)
-      info.elementType = signals.wrData.getType();
-    memrefArgs.push_back(std::move(info));
-  }
 
   // --- Multi-frame path ---
   if (topFrames.empty())
@@ -4307,99 +4342,19 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
   builder.setInsertionPointToEnd(hwBody);
 
   // --- Prelude: clone non-stage ops, set up local hlmems + amc instances ---
-  SmallVector<memref::AllocOp> localAllocs;
-  SmallVector<loopschedule::HWMemoryInstanceLoweringInterface> instanceOps;
-  for (auto &op : funcOp.getBody().front()) {
-    if (isa<loopschedule::LoopScheduleReturnOp>(&op))
-      continue;
-    if (isa<LoopScheduleAtOp>(&op))
-      continue;
-    if (auto allocOp = dyn_cast<memref::AllocOp>(&op)) {
-      localAllocs.push_back(allocOp);
-      continue;
-    }
-    if (auto instOp =
-            dyn_cast<loopschedule::HWMemoryInstanceLoweringInterface>(&op)) {
-      instanceOps.push_back(instOp);
-      continue;
-    }
-    builder.clone(op, mapping);
-  }
-
   auto i1 = builder.getI1Type();
   BackedgeBuilder funcBB(builder, loc);
   SmallVector<HLMemBackedges> hlmemBEs;
-  for (auto [i, allocOp] : llvm::enumerate(localAllocs)) {
-    auto memType = allocOp.getType();
-    auto dataType = memType.getElementType();
-    std::string name = "local_mem" + std::to_string(i);
-    auto hlmem = seq::HLMemOp::create(builder, loc, clk, rst, name,
-                                       memType.getShape(), dataType);
-    SmallVector<Backedge> addrBEs;
-    SmallVector<Value> addrVals;
-    for (Type addrTy : hlmem.getHandle().getType().getAddressTypes()) {
-      Backedge be = funcBB.get(addrTy);
-      addrBEs.push_back(be);
-      addrVals.push_back(Value(be));
-    }
-    Backedge wrDataBE = funcBB.get(dataType);
-    Backedge wrEnBE = funcBB.get(i1);
-    Value notWrEn = comb::XorOp::create(
-        builder, loc, Value(wrEnBE),
-        hw::ConstantOp::create(builder, loc, i1, 1));
-    auto readPort = seq::ReadPortOp::create(
-        builder, loc, hlmem.getHandle(),
-        ValueRange(addrVals), notWrEn, /*latency=*/1);
-    seq::WritePortOp::create(
-        builder, loc, hlmem.getHandle(),
-        ValueRange(addrVals), Value(wrDataBE), Value(wrEnBE),
-        /*latency=*/1);
-    MemPortMapping mp;
-    mp.rdData = readPort.getReadData();
-    mp.addrs.assign(getNumAddrPorts(memType), Value());
-    mp.wrData = Value();
-    mp.wrEn = Value();
-    memPortMap[allocOp.getResult()] = mp;
-    hlmemBEs.push_back({allocOp.getResult(), std::move(addrBEs), wrDataBE,
-                        wrEnBE});
-  }
-
   SymbolTable modSymTab(enclosingModule);
   loopschedule::HWMemoryLoweringState memInstState(clk, rst, funcBB,
                                                     modSymTab);
-  for (auto instOp : instanceOps) {
-    if (failed(instOp.lowerToHW(builder, memInstState)))
-      return failure();
-  }
-  for (auto &[portValue, signals] : memInstState.portMap) {
-    MemPortMapping mp;
-    mp.rdData = signals.rdData;
-    mp.addrs.assign(signals.addrs.size(), Value());
-    mp.done = signals.done;
-    memPortMap[portValue] = mp;
-  }
-
   SmallVector<PortArgInfo> memrefArgs;
-  for (auto arg : funcOp.getArguments()) {
-    if (auto memType = dyn_cast<MemRefType>(arg.getType()))
-      memrefArgs.push_back(
-          makePortArgInfoFromMemref(arg, memType, /*isLocalMem=*/false));
-  }
-  for (auto allocOp : localAllocs) {
-    memrefArgs.push_back(makePortArgInfoFromMemref(allocOp.getResult(),
-                                                    allocOp.getType(),
-                                                    /*isLocalMem=*/true));
-  }
-  for (auto &[portValue, signals] : memInstState.portMap) {
-    PortArgInfo info;
-    info.originalArg = portValue;
-    info.isAmcPort = true;
-    info.latency = signals.latency;
-    info.addrWidths.reserve(signals.addrs.size());
-    for (Value a : signals.addrs)
-      info.addrWidths.push_back(cast<IntegerType>(a.getType()).getWidth());
-    memrefArgs.push_back(info);
-  }
+  if (failed(setupFunctionPrelude(
+          funcOp.getBody().front(), funcOp.getArguments(), builder, loc, clk,
+          rst, enclosingModule,
+          [](Operation *op) { return isa<LoopScheduleAtOp>(op); }, mapping,
+          funcBB, memPortMap, hlmemBEs, memInstState, memrefArgs)))
+    return failure();
 
   // --- Collect stages ---
   SmallVector<LoopScheduleAtOp> stages;
