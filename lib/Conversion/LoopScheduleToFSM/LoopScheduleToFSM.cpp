@@ -140,21 +140,49 @@ static unsigned computeFrameLatency(LoopScheduleFrameOp frame) {
 
 /// Tracks the hw.module ports for a memref function argument.
 /// `addrs` carries one address Value per memref dim (empty for 0-rank).
-struct MemPortMapping {
+/// One hardware port's worth of address/data/enable drives. Used both as
+/// the direct fields of `MemPortMapping` (for the default port 0) and as
+/// the element type of `MemPortMapping::extraPorts` (for multi-port
+/// memories, ports 1..N-1).
+struct PortDrives {
   Value rdData;             // input: read data from memory
-  SmallVector<Value> addrs; // will be set: per-dim address outputs
-  Value wrData;             // will be set: write data output
-  Value wrEn;               // will be set: write enable output
+  SmallVector<Value> addrs; // per-dim address outputs
+  Value wrData;             // write data output
+  Value wrEn;               // write enable output
   // Optional read-enable output. Set by loads whose
   // HWLoadLoweringInterface::requiresReadEnable() is true (e.g. AMC
   // ports). Null means tie-high (memref case).
   Value rdEn;
+};
+
+struct MemPortMapping {
+  // Port 0's drives are held directly as fields so the bulk of the
+  // existing single-port codepaths don't have to change. Additional
+  // ports live in `extraPorts` (port K>0 is `extraPorts[K-1]`). This is
+  // the per-port data model the multi-port emission refactor consumes;
+  // today `extraPorts` is always empty because `computeNumPortsFromUsers`
+  // is stubbed to 1.
+  Value rdData;
+  SmallVector<Value> addrs;
+  Value wrData;
+  Value wrEn;
+  Value rdEn;
+  SmallVector<PortDrives> extraPorts;
   // Memory-driven "request completed this cycle" signal. Non-null for
   // amc ports (supplied by the hw.instance's `done` output). Null for
   // memref-backed local memories — the FSM treats missing `done` as
   // tied-high (no pipeline stall contribution).
   Value done;
 };
+
+/// Extend `mp.extraPorts` so port `k` is indexable; no-op for `k == 0`
+/// (port 0 aliases the direct fields on `MemPortMapping`).
+[[maybe_unused]] static void ensurePort(MemPortMapping &mp, unsigned k) {
+  if (k == 0)
+    return;
+  while (mp.extraPorts.size() < k)
+    mp.extraPorts.emplace_back();
+}
 
 /// Information about a memory-backed value (memref argument, local
 /// memref.alloc, or amc.instance port) that gets threaded through loop
