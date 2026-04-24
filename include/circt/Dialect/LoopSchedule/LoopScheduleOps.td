@@ -450,7 +450,9 @@ def LoopScheduleBufferOp : LoopScheduleOp<"buffer", [Pure, SameOperandsAndResult
 // or consumer uses them yet.
 //===----------------------------------------------------------------------===//
 
-def LoopScheduleFrameOp : LoopScheduleOp<"frame", [PhaseOpInterface]> {
+def LoopScheduleFrameOp : LoopScheduleOp<"frame",
+    [PhaseOpInterface,
+     SingleBlockImplicitTerminator<"LoopScheduleYieldOp">]> {
   let summary = "Statically-timed window inside a sequential loop.";
   let description = [{
     A `loopschedule.frame` op bounds a statically-timed region of work within
@@ -797,6 +799,76 @@ def LoopScheduleFuncPipelineOp
       CArg<"::llvm::ArrayRef<::mlir::NamedAttribute>", "{}">:$attrs,
       CArg<"::llvm::ArrayRef<::mlir::DictionaryAttr>", "{}">:$argAttrs)>
   ];
+}
+
+def LoopScheduleCallOp : LoopScheduleOp<"call", [
+    CallOpInterface,
+    DeclareOpInterfaceMethods<SymbolUserOpInterface>
+  ]> {
+  let summary = "Call a loopschedule func-level container.";
+  let description = [{
+    Invokes a `loopschedule.func_sequential` or `loopschedule.func_pipeline`
+    by symbol. Semantics mirror `func.call`: operand types must match the
+    callee's argument types and result types must match the callee's
+    return types. The caller blocks on completion of the callee before
+    its results become available.
+
+    This op exists so that `func.call` targeting schedule-level callees
+    can be rewritten into a form that downstream LoopSchedule-aware passes
+    (and eventually the LoopScheduleToFSM lowering) can reason about.
+  }];
+
+  let arguments = (ins
+    FlatSymbolRefAttr:$callee,
+    Variadic<AnyType>:$operands,
+    OptionalAttr<DictArrayAttr>:$arg_attrs,
+    OptionalAttr<DictArrayAttr>:$res_attrs
+  );
+
+  let results = (outs Variadic<AnyType>:$results);
+
+  let assemblyFormat = [{
+    $callee `(` $operands `)` attr-dict `:` functional-type($operands, $results)
+  }];
+
+  let builders = [
+    OpBuilder<(ins "::mlir::SymbolRefAttr":$callee,
+                   "::mlir::TypeRange":$results,
+                   CArg<"::mlir::ValueRange", "{}">:$operands), [{
+      $_state.addOperands(operands);
+      $_state.addAttribute("callee", callee);
+      $_state.addTypes(results);
+    }]>,
+    OpBuilder<(ins "::mlir::StringAttr":$callee,
+                   "::mlir::TypeRange":$results,
+                   CArg<"::mlir::ValueRange", "{}">:$operands), [{
+      build($_builder, $_state,
+            ::mlir::SymbolRefAttr::get(callee), results, operands);
+    }]>,
+    OpBuilder<(ins "::llvm::StringRef":$callee,
+                   "::mlir::TypeRange":$results,
+                   CArg<"::mlir::ValueRange", "{}">:$operands), [{
+      build($_builder, $_state,
+            ::mlir::StringAttr::get($_builder.getContext(), callee),
+            results, operands);
+    }]>
+  ];
+
+  let extraClassDeclaration = [{
+    ::mlir::FunctionType getCalleeType();
+
+    ::mlir::OperandRange getArgOperands() { return getOperands(); }
+    ::mlir::MutableOperandRange getArgOperandsMutable() {
+      return getOperandsMutable();
+    }
+
+    ::mlir::CallInterfaceCallable getCallableForCallee() {
+      return (*this)->getAttrOfType<::mlir::SymbolRefAttr>("callee");
+    }
+    void setCalleeFromCallable(::mlir::CallInterfaceCallable callee) {
+      (*this)->setAttr("callee", ::llvm::cast<::mlir::SymbolRefAttr>(callee));
+    }
+  }];
 }
 
 def LoopScheduleReturnOp : LoopScheduleOp<"return",

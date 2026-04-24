@@ -3798,9 +3798,10 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   // one entry with kind=-1.
   struct FrameChild {
     unsigned frameIdx;
-    int kind; // -1 leaf, 0 sequential, 1 pipeline
+    int kind; // -1 leaf, 0 sequential, 1 pipeline, 2 call
     LoopScheduleSequentialOp seqOp;
     LoopSchedulePipelineOp pipOp;
+    LoopScheduleCallOp callOp;
     LoopScheduleLaunchOp launchOp; // non-null for kind != -1
   };
   SmallVector<FrameChild> entries;
@@ -3831,6 +3832,10 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       } else if (auto pipOp = dyn_cast_or_null<LoopSchedulePipelineOp>(child)) {
         fc.kind = 1;
         fc.pipOp = pipOp;
+        entries.push_back(fc);
+      } else if (auto callOp = dyn_cast_or_null<LoopScheduleCallOp>(child)) {
+        fc.kind = 2;
+        fc.callOp = callOp;
         entries.push_back(fc);
       }
     }
@@ -4158,6 +4163,100 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
           }
         }
         funcHandleValueMap[entry.launchOp.getHandle()] = std::move(pipResults);
+      }
+
+    } else if (entry.kind == 2) {
+      // Call: instantiate the already-lowered callee hw.module and wire up
+      // the start/done handshake plus memref port pass-through.
+      auto callOp = entry.callOp;
+      auto calleeName = callOp.getCallee();
+      auto *calleeSym = SymbolTable::lookupNearestSymbolFrom(
+          funcOp, callOp.getCalleeAttr());
+      auto calleeMod = dyn_cast_or_null<hw::HWModuleOp>(calleeSym);
+      if (!calleeMod)
+        return callOp.emitOpError("callee '")
+               << calleeName
+               << "' has not been lowered to hw.module yet — callees must "
+                  "be ordered before their callers in the module";
+
+      // Build instance inputs in createHWModule's order: per-arg — memref
+      // args contribute a rd_data input, scalar args contribute the value
+      // itself — then clk, rst, start. Track which caller memref each
+      // memref-port row corresponds to for the output-extraction loop.
+      builder.setInsertionPointToEnd(hwBody);
+      SmallVector<Value> childInputs;
+      SmallVector<PortArgInfo> calleeMemInfos;
+      SmallVector<Value> calleeMemCallerArgs;
+      for (auto operand : callOp.getOperands()) {
+        if (auto memType = dyn_cast<MemRefType>(operand.getType())) {
+          auto it = memPortMap.find(operand);
+          if (it == memPortMap.end())
+            return callOp.emitOpError(
+                "memref operand has no backing port mapping (must be a "
+                "caller memref arg or a local memref.alloc)");
+          childInputs.push_back(it->second.rdData);
+          calleeMemInfos.push_back(
+              makePortArgInfoFromMemref(operand, memType,
+                                         /*isLocalMem=*/false));
+          calleeMemCallerArgs.push_back(operand);
+        } else {
+          Value v = mapping.lookupOrNull(operand);
+          if (!v)
+            v = operand;
+          childInputs.push_back(v);
+        }
+      }
+      childInputs.push_back(clk);
+      childInputs.push_back(rst);
+      childInputs.push_back(childStartSignals[childIndexForEntry[ei]]);
+
+      auto childInst = hw::InstanceOp::create(
+          builder, loc, calleeMod,
+          builder.getStringAttr((calleeName + "_inst").str()),
+          childInputs, nullptr);
+
+      // Consume outputs in createHWModule's order: memref outputs per
+      // call-operand (addr_*, rd_en?, wr_data, wr_en), then ready, done,
+      // then any call results.
+      unsigned outIdx = 0;
+      for (auto [memIdx, info] : llvm::enumerate(calleeMemInfos)) {
+        Value callerArg = calleeMemCallerArgs[memIdx];
+        auto &mp = perEntryPorts[ei][callerArg];
+        auto widths = ArrayRef<unsigned>(info.addrWidths);
+        mp.addrs.assign(widths.size(), Value());
+        for (unsigned d = 0; d < widths.size(); ++d)
+          mp.addrs[d] = childInst.getResult(outIdx++);
+        if (info.requiresRdEn)
+          mp.rdEn = childInst.getResult(outIdx++);
+        bool emitWrite = info.isAmcPort ? info.isWrite : true;
+        if (emitWrite) {
+          mp.wrData = childInst.getResult(outIdx++);
+          mp.wrEn = childInst.getResult(outIdx++);
+        }
+      }
+      // ready — unused by the caller FSM today; skip.
+      outIdx++;
+      Value childDone = childInst.getResult(outIdx++);
+      childDoneBEs[childIndexForEntry[ei]].setValue(childDone);
+
+      SmallVector<Value> callResultVals;
+      for (auto result : callOp.getResults()) {
+        Value v = childInst.getResult(outIdx++);
+        mapping.map(result, v);
+        callResultVals.push_back(v);
+      }
+      if (entry.launchOp) {
+        if (auto launchAt =
+                entry.launchOp->getParentOfType<LoopScheduleAtOp>()) {
+          auto atYield = launchAt.getYieldOp();
+          for (auto [atRes, yOperand] :
+               llvm::zip(launchAt.getResults(), atYield.getOperands())) {
+            if (yOperand == entry.launchOp.getHandle())
+              funcHandleValueMap[atRes] = callResultVals;
+          }
+        }
+        funcHandleValueMap[entry.launchOp.getHandle()] =
+            std::move(callResultVals);
       }
 
     } else {

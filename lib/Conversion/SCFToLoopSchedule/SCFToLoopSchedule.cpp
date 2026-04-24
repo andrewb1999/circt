@@ -419,7 +419,10 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
 struct BucketContent {
   uint32_t offset;
   SmallVector<Operation *> staticOps;
-  SmallVector<Operation *> loopOps;
+  // Dynamic-latency ops: emitted inside a `loopschedule.launch` and
+  // produce a handle (await'd by a downstream frame). Includes loop ops
+  // and `func.call` — see `isLaunchLikeOp`.
+  SmallVector<Operation *> dynamicOps;
 };
 
 struct StaticExport {
@@ -436,7 +439,7 @@ struct IterArgExport {
 };
 
 struct PendingLaunch {
-  Operation *origLoop;
+  Operation *origOp;
   Value currentHandle;
   SmallVector<std::pair<unsigned, Value>> forwards;
   DenseSet<size_t> remainingUserPhases;
@@ -502,8 +505,16 @@ struct ScheduleStrategy {
       finalize;
 };
 
+/// An op whose scheduler lowering emits a `loopschedule.launch` and produces
+/// a handle (await'd by downstream frames). Today: loop ops plus `func.call`
+/// (dynamic-latency — at least one cycle between start and done; the FSM
+/// lowering stalls on the callee's done signal).
+static bool isLaunchLikeOp(Operation *op) {
+  return isa<LoopInterface, func::CallOp>(op);
+}
+
 /// Partition start-times into phases by the close-after-launch-bucket rule:
-/// a bucket containing a `LoopInterface` op closes the current phase. This
+/// a bucket containing a launch-like op closes the current phase. This
 /// guarantees that sibling launches at different start times land in separate
 /// frames so the second frame can await the first's handle (the only correct
 /// ordering for two launches with a memref dependency but no SSA dep).
@@ -519,7 +530,7 @@ partitionPhasesByLaunch(ArrayRef<unsigned> startTimes,
     auto it = startGroups.find(t);
     if (it != startGroups.end())
       for (auto *op : it->second)
-        if (isa<LoopInterface>(op)) {
+        if (isLaunchLikeOp(op)) {
           hasLaunch = true;
           break;
         }
@@ -573,6 +584,26 @@ void SCFToLoopSchedulePass::runOnOperation() {
       signalPassFailure();
       return;
     }
+
+  // After all funcs have been wrapped into loopschedule.func_sequential /
+  // loopschedule.func_pipeline, rewrite any surviving func.call whose callee
+  // resolves to a schedule-level container. Done in a second pass so the
+  // callee is guaranteed to be converted regardless of module iteration order.
+  SymbolTable symbolTable(moduleOp);
+  SmallVector<func::CallOp> calls;
+  moduleOp.walk([&](func::CallOp call) { calls.push_back(call); });
+  for (auto call : calls) {
+    Operation *callee = symbolTable.lookup(call.getCallee());
+    if (!callee ||
+        !isa<LoopScheduleFuncSequentialOp, LoopScheduleFuncPipelineOp>(callee))
+      continue;
+    OpBuilder builder(call);
+    auto newCall = builder.create<LoopScheduleCallOp>(
+        call.getLoc(), call.getCalleeAttr(), call.getResultTypes(),
+        call.getOperands());
+    call.replaceAllUsesWith(newCall.getResults());
+    call.erase();
+  }
 }
 
 LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
@@ -613,6 +644,21 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
   if (res.wasInterrupted())
     return funcOp.emitOpError(
         "Loops marked for pipelining cannot contain other loops");
+
+  // func.call is a dynamic-latency op; it cannot appear inside a
+  // pipelined context (modulo-problem scheduling assumes bounded per-op
+  // latency). Diagnose early.
+  for (auto loop : loops) {
+    func::CallOp badCall;
+    loop.getAfter().walk([&](func::CallOp call) {
+      badCall = call;
+      return WalkResult::interrupt();
+    });
+    if (badCall)
+      return badCall.emitOpError(
+          "func.call is not allowed inside a pipelined loop "
+          "(dynamic-latency op)");
+  }
 
   // Per-function analyses obtained via the analysis manager scoped to this
   // child func.
@@ -739,6 +785,16 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
     if (hasNestedLoop)
       return funcOp.emitOpError(
           "func-level pipelining does not yet support nested loops");
+
+    func::CallOp badCall;
+    funcOp.walk([&](func::CallOp call) {
+      badCall = call;
+      return WalkResult::interrupt();
+    });
+    if (badCall)
+      return badCall.emitOpError(
+          "func.call is not allowed inside a pipelined func "
+          "(dynamic-latency op)");
   }
 
   if (funcIsPipelined) {
@@ -914,6 +970,25 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
               comb::ExtractOp>([&](Operation *freeOp) {
           // Some known free ops.
           problem.setLinkedOperatorType(freeOp, freeOpr);
+          return WalkResult::advance();
+        })
+        .Case<func::CallOp>([&](Operation *callOp) {
+          // Dynamic-latency op. Scheduling sees it as at least 1 cycle
+          // between start and done — the FSM lowering stalls on the real
+          // done signal, so the actual latency can be longer. Each callee
+          // gets its own resource type so two call sites to the same
+          // callee serialize by default (sharing the single hardware
+          // instance); duplicating the instance is a future extension.
+          auto call = cast<func::CallOp>(callOp);
+          std::string id = ("call_" + call.getCallee()).str();
+          Problem::OperatorType opr = problem.getOrInsertOperatorType(id);
+          problem.setLatency(opr, 1);
+          problem.setIncomingDelay(opr, 0.0);
+          problem.setOutgoingDelay(opr, 0.0);
+          auto rsrc = problem.getOrInsertResourceType(id);
+          problem.setLimit(rsrc, 1);
+          problem.addLinkedResourceType(callOp, rsrc);
+          problem.setLinkedOperatorType(callOp, opr);
           return WalkResult::advance();
         })
         .Case<ShLIOp, ShRSIOp, ShRUIOp>([&](Operation *shOp) {
@@ -1911,7 +1986,7 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
   if (S.iterArgs && S.iterArgs->inductionVarHasUsers) {
     bool containsLoop = false;
     for (auto *op : startGroups[endTime])
-      if (isa<LoopInterface>(op)) {
+      if (isLaunchLikeOp(op)) {
         containsLoop = true;
         break;
       }
@@ -1932,11 +2007,12 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
     for (auto t : phases[phaseIdx])
       bucketTimeToPhase[t] = phaseIdx;
 
-  auto computeLopUserPhases = [&](Operation *lop, DenseSet<size_t> &userPhases,
-                                   bool &consumedByTerminator) {
+  auto computeDynamicOpUserPhases = [&](Operation *dop,
+                                         DenseSet<size_t> &userPhases,
+                                         bool &consumedByTerminator) {
     userPhases.clear();
     consumedByTerminator = false;
-    for (auto res : lop->getResults()) {
+    for (auto res : dop->getResults()) {
       for (auto *user : res.getUsers()) {
         if (S.isTerminator(user)) {
           consumedByTerminator = true;
@@ -1970,8 +2046,8 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
       BucketContent bc;
       bc.offset = t - phaseBase;
       for (auto *op : startGroups[t]) {
-        if (isa<LoopInterface>(op))
-          bc.loopOps.push_back(op);
+        if (isLaunchLikeOp(op))
+          bc.dynamicOps.push_back(op);
         else
           bc.staticOps.push_back(op);
       }
@@ -2045,15 +2121,15 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
 
     SmallVector<std::pair<BucketContent *, Operation *>> launchesInPhase;
     for (auto &bc : buckets)
-      for (auto *lop : bc.loopOps)
-        launchesInPhase.emplace_back(&bc, lop);
+      for (auto *dop : bc.dynamicOps)
+        launchesInPhase.emplace_back(&bc, dop);
 
     SmallVector<DenseSet<size_t>> launchUserPhasesInPhase;
     SmallVector<bool> launchTerminatorConsumedInPhase;
     for (auto &bl : launchesInPhase) {
       DenseSet<size_t> userPhases;
       bool terminatorConsumed = false;
-      computeLopUserPhases(bl.second, userPhases, terminatorConsumed);
+      computeDynamicOpUserPhases(bl.second, userPhases, terminatorConsumed);
       launchUserPhasesInPhase.push_back(userPhases);
       launchTerminatorConsumedInPhase.push_back(terminatorConsumed);
     }
@@ -2346,19 +2422,19 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
     // ===== Per-launch wrapping at =====
     for (auto [launchIdx, blPair] : llvm::enumerate(launchesInPhase)) {
       BucketContent *bc = blPair.first;
-      Operation *lop = blPair.second;
+      Operation *dop = blPair.second;
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPoint(bodyYield);
 
       SmallVector<Type> atResultTypes{HandleType::get(builder.getContext())};
       auto atOp = builder.create<LoopScheduleAtOp>(
-          lop->getLoc(), TypeRange(atResultTypes),
+          dop->getLoc(), TypeRange(atResultTypes),
           builder.getI64IntegerAttr(bc->offset));
       Block &atBlock = atOp.getBody().front();
       builder.setInsertionPointToStart(&atBlock);
 
       auto launch = builder.create<LoopScheduleLaunchOp>(
-          lop->getLoc(), HandleType::get(builder.getContext()));
+          dop->getLoc(), HandleType::get(builder.getContext()));
       Block &launchBlock = launch.getBody().emplaceBlock();
       {
         OpBuilder::InsertionGuard gg(builder);
@@ -2368,9 +2444,9 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
       auto *launchYield = launchBlock.getTerminator();
       builder.setInsertionPointToStart(&launchBlock);
 
-      auto *newOp = builder.clone(*lop, valueMap);
-      dependenceAnalysis->replaceOp(lop, newOp);
-      if (auto opr = problem.getLinkedOperatorType(lop)) {
+      auto *newOp = builder.clone(*dop, valueMap);
+      dependenceAnalysis->replaceOp(dop, newOp);
+      if (auto opr = problem.getLinkedOperatorType(dop)) {
         unsigned lat = problem.getLatency(*opr).value_or(1);
         if (lat > 1)
           newOp->setAttr("loopschedule.cycle_latency",
@@ -2378,7 +2454,7 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
       }
 
       std::queue<Operation *> oldOps;
-      lop->walk([&](Operation *op) { oldOps.push(op); });
+      dop->walk([&](Operation *op) { oldOps.push(op); });
       if (isa<LoopInterface>(newOp)) {
         newOp->walk([&](Operation *op) {
           Operation *oldOp = oldOps.front();
@@ -2397,7 +2473,7 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
       }
 
       for (auto [orig, clone] :
-           llvm::zip(lop->getResults(), newOp->getResults()))
+           llvm::zip(dop->getResults(), newOp->getResults()))
         valueMap.map(orig, clone);
 
       bodyYieldOperands[*launchHandleIdxOpt[launchIdx]] = atOp.getResult(0);
@@ -2468,7 +2544,7 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
     }
     for (auto [launchIdx, blPair] : llvm::enumerate(launchesInPhase)) {
       PendingLaunch pl;
-      pl.origLoop = blPair.second;
+      pl.origOp = blPair.second;
       pl.currentHandle = frame->getResult(*launchHandleIdxOpt[launchIdx]);
       for (auto res : blPair.second->getResults())
         pl.forwards.push_back({res.getResultNumber(), res});

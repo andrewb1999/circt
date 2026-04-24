@@ -31,6 +31,15 @@ using namespace mlir;
 using namespace circt;
 using namespace circt::loopschedule;
 
+// True if `block` is terminated by a `loopschedule.yield` with no operands.
+// Used by custom printers to elide the trivial terminator (mirrors the
+// SingleBlockImplicitTerminator round-trip contract: a trivial yield is
+// implicit and does not need to appear in source).
+static bool hasTrivialYield(Block &block) {
+  auto yield = dyn_cast<LoopScheduleYieldOp>(block.getTerminator());
+  return yield && yield.getOperands().empty();
+}
+
 //===----------------------------------------------------------------------===//
 // LoopInterface
 //===----------------------------------------------------------------------===//
@@ -849,12 +858,32 @@ ParseResult LoopScheduleFrameOp::parse(OpAsmParser &parser,
       return failure();
   }
 
-  // Parse the first region. It may be either the await region (followed by
-  // `do` and a body region), or — if `do` is absent — the body region itself,
-  // in which case we synthesize an empty await region.
   Region *awaitRegion = result.addRegion();
   Region *bodyRegion = result.addRegion();
 
+  // `await { ... }` form: one region is the await region; the body is
+  // synthesized as a passthrough that yields the await's yielded values
+  // (equivalently, the frame's result types) unchanged.
+  if (succeeded(parser.parseOptionalKeyword("await"))) {
+    if (parser.parseRegion(*awaitRegion, /*arguments=*/{}))
+      return failure();
+    LoopScheduleFrameOp::ensureTerminator(*awaitRegion, parser.getBuilder(),
+                                           result.location);
+    OpBuilder builder(parser.getBuilder().getContext());
+    Block *bodyBlock = builder.createBlock(bodyRegion);
+    SmallVector<Location> argLocs(result.types.size(), result.location);
+    bodyBlock->addArguments(result.types, argLocs);
+    builder.setInsertionPointToStart(bodyBlock);
+    builder.create<LoopScheduleYieldOp>(result.location,
+                                        bodyBlock->getArguments());
+    if (parser.parseOptionalAttrDict(result.attributes))
+      return failure();
+    return success();
+  }
+
+  // Parse the first region. It may be either the await region (followed by
+  // `do` and a body region), or — if `do` is absent — the body region itself,
+  // in which case we synthesize an empty await region.
   Region firstRegion;
   if (parser.parseRegion(firstRegion, /*arguments=*/{}))
     return failure();
@@ -880,6 +909,10 @@ ParseResult LoopScheduleFrameOp::parse(OpAsmParser &parser,
     builder.createBlock(awaitRegion);
     builder.create<LoopScheduleYieldOp>(result.location);
   }
+  LoopScheduleFrameOp::ensureTerminator(*awaitRegion, parser.getBuilder(),
+                                         result.location);
+  LoopScheduleFrameOp::ensureTerminator(*bodyRegion, parser.getBuilder(),
+                                         result.location);
 
   if (parser.parseOptionalAttrDict(result.attributes))
     return failure();
@@ -892,14 +925,43 @@ void LoopScheduleFrameOp::print(OpAsmPrinter &p) {
     llvm::interleaveComma(getResultTypes(), p);
     p << ")";
   }
-  p << ' ';
-  // Elide the await region if it has a single empty-yield terminator.
   Block &awaitBlock = getAwaitBlock();
   bool awaitIsTrivial = awaitBlock.without_terminator().empty() &&
                         getAwaitYield().getOperands().empty();
+
+  // "await { ... }" form: body is a passthrough of the await yield. That is,
+  // body has exactly one block whose args are yielded unchanged and whose
+  // types match the frame's result types. Only use this form when the await
+  // region is non-trivial (otherwise prefer the existing body-only form).
+  auto isPassthroughBody = [this]() {
+    Region &body = getBodyRegion();
+    if (!body.hasOneBlock())
+      return false;
+    Block &bb = body.front();
+    if (!bb.without_terminator().empty())
+      return false;
+    auto yield = dyn_cast<LoopScheduleYieldOp>(bb.getTerminator());
+    if (!yield)
+      return false;
+    if (yield.getOperands().size() != bb.getNumArguments())
+      return false;
+    for (auto [arg, val] : llvm::zip(bb.getArguments(), yield.getOperands()))
+      if (val != arg)
+        return false;
+    return true;
+  };
+  if (!awaitIsTrivial && isPassthroughBody()) {
+    p << " await ";
+    p.printRegion(getAwaitRegion(), /*printEntryBlockArgs=*/false,
+                  /*printBlockTerminators=*/!hasTrivialYield(awaitBlock));
+    p.printOptionalAttrDict((*this)->getAttrs());
+    return;
+  }
+
+  p << ' ';
   if (!awaitIsTrivial) {
     p.printRegion(getAwaitRegion(), /*printEntryBlockArgs=*/false,
-                  /*printBlockTerminators=*/true);
+                  /*printBlockTerminators=*/!hasTrivialYield(awaitBlock));
     p << " do";
     Block &bodyBlock = getBodyBlock();
     if (bodyBlock.getNumArguments() > 0) {
@@ -912,7 +974,7 @@ void LoopScheduleFrameOp::print(OpAsmPrinter &p) {
     p << ' ';
   }
   p.printRegion(getBodyRegion(), /*printEntryBlockArgs=*/false,
-                /*printBlockTerminators=*/true);
+                /*printBlockTerminators=*/!hasTrivialYield(getBodyBlock()));
   p.printOptionalAttrDict((*this)->getAttrs());
 }
 
@@ -1092,7 +1154,7 @@ void LoopScheduleLaunchOp::print(OpAsmPrinter &p) {
   p.printType(getHandle().getType());
   p << ' ';
   p.printRegion(getBody(), /*printEntryBlockArgs=*/false,
-                /*printBlockTerminators=*/true);
+                /*printBlockTerminators=*/!hasTrivialYield(getBodyBlock()));
   p.printOptionalAttrDict((*this)->getAttrs());
 }
 
@@ -1529,6 +1591,58 @@ void LoopScheduleFuncPipelineOp::build(OpBuilder &builder,
         builder, state, argAttrs, /*resultAttrs=*/{},
         getArgAttrsAttrName(state.name), getResAttrsAttrName(state.name));
   }
+}
+
+FunctionType LoopScheduleCallOp::getCalleeType() {
+  return FunctionType::get(getContext(), getOperands().getTypes(),
+                           getResultTypes());
+}
+
+LogicalResult
+LoopScheduleCallOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  if (!isa_and_nonnull<LoopScheduleLaunchOp>((*this)->getParentOp()))
+    return emitOpError(
+        "must be directly nested in a loopschedule.launch "
+        "(dynamic-latency op: caller stalls on callee done)");
+
+  auto calleeAttr = getCalleeAttr();
+  Operation *callee =
+      symbolTable.lookupNearestSymbolFrom(*this, calleeAttr);
+  if (!callee)
+    return emitOpError("'") << calleeAttr.getValue()
+                            << "' does not reference a valid symbol";
+
+  FunctionType calleeType;
+  if (auto seq = dyn_cast<LoopScheduleFuncSequentialOp>(callee))
+    calleeType = seq.getFunctionType();
+  else if (auto pipe = dyn_cast<LoopScheduleFuncPipelineOp>(callee))
+    calleeType = pipe.getFunctionType();
+  else
+    return emitOpError("'") << calleeAttr.getValue()
+                            << "' must reference a loopschedule.func_sequential "
+                               "or loopschedule.func_pipeline";
+
+  if (calleeType.getNumInputs() != getNumOperands())
+    return emitOpError("incorrect number of operands for callee: expected ")
+           << calleeType.getNumInputs() << " got " << getNumOperands();
+  for (auto [i, t] : llvm::enumerate(calleeType.getInputs())) {
+    if (getOperand(i).getType() != t)
+      return emitOpError("operand #")
+             << i << " type mismatch: expected " << t << " got "
+             << getOperand(i).getType();
+  }
+
+  if (calleeType.getNumResults() != getNumResults())
+    return emitOpError("incorrect number of results for callee: expected ")
+           << calleeType.getNumResults() << " got " << getNumResults();
+  for (auto [i, t] : llvm::enumerate(calleeType.getResults())) {
+    if (getResult(i).getType() != t)
+      return emitOpError("result #")
+             << i << " type mismatch: expected " << t << " got "
+             << getResult(i).getType();
+  }
+
+  return success();
 }
 
 LogicalResult LoopScheduleReturnOp::verify() {
