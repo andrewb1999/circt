@@ -122,6 +122,41 @@ private:
   /// `strategy`.
   LogicalResult lowerSchedule(ScheduleStrategy &strategy, Problem &problem);
 
+  /// Walk the per-stage `startGroups` and compute the per-value pipe
+  /// lifetimes (`pipeTimes`) plus the set of values that must be
+  /// registered out of each stage so consumers in later stages can read
+  /// them (`registerValues`). Shared between the loop-pipeline and
+  /// func-pipeline drivers; the optional `funcReturnSentinel` lets the
+  /// func variant treat `loopschedule.return` as an end-of-pipeline
+  /// consumer without needing a `problem.getStartTime` entry for it.
+  /// `startTimes` should be the sorted set of stage start times to walk.
+  void computePipelineStageRegisters(
+      ArrayRef<unsigned> startTimes,
+      DenseMap<unsigned, SmallVector<Operation *>> &startGroups,
+      CyclicProblem &problem, Operation *funcReturnSentinel,
+      SmallVectorImpl<SmallVector<Value>> &registerValues,
+      DenseMap<Value, std::pair<unsigned, unsigned>> &pipeTimes);
+
+  /// Emit one `loopschedule.at offset(startTime)` stage at the builder's
+  /// current insertion point. Clones each scheduled op into the stage,
+  /// honouring `predicateMap` for if-guarded ops; updates the per-stage
+  /// `valueMap` so later stages read the new values; populates the
+  /// stage's terminator with the `registerValuesAtStage` operands and
+  /// re-maps each registered value into its consumer-stage's value map.
+  /// Returns the created stage so loop-pipeline callers can record its
+  /// stage results (e.g. for the condition-result lookup).
+  ///
+  /// Shared between `createLoopSchedulePipeline` and
+  /// `createFuncLoopSchedulePipeline`; the per-driver insertion-point
+  /// difference is handled by the caller setting `builder` before the
+  /// call.
+  LoopScheduleAtOp emitOnePipelineStage(
+      ImplicitLocOpBuilder &builder, unsigned startTime,
+      ArrayRef<Operation *> group, ArrayRef<Value> registerValuesAtStage,
+      ArrayRef<Type> registerTypesAtStage,
+      MutableArrayRef<IRMapping> stageValueMaps, CyclicProblem &problem,
+      DominanceInfo &dom);
+
   std::optional<LoopScheduleDependenceAnalysis> dependenceAnalysis;
   std::optional<OperatorLibraryAnalysis> operatorLibraryAnalysis;
   PredicateUse predicateUse;
@@ -1124,6 +1159,161 @@ LogicalResult SCFToLoopSchedulePass::solveChainingSharedOperatorsProblem(
 }
 
 /// Create the pipeline op for a loop nest.
+void SCFToLoopSchedulePass::computePipelineStageRegisters(
+    ArrayRef<unsigned> startTimes,
+    DenseMap<unsigned, SmallVector<Operation *>> &startGroups,
+    CyclicProblem &problem, Operation *funcReturnSentinel,
+    SmallVectorImpl<SmallVector<Value>> &registerValues,
+    DenseMap<Value, std::pair<unsigned, unsigned>> &pipeTimes) {
+  for (auto startTime : startTimes) {
+    auto &group = startGroups[startTime];
+
+    for (unsigned i = registerValues.size(); i <= startTime; ++i)
+      registerValues.emplace_back(SmallVector<Value>());
+
+    for (auto *op : group) {
+      // Walk users (including predicate users) and find the latest one;
+      // values consumed past their producer's stage need to be registered
+      // forward through every intervening stage.
+      SmallVector<Operation *> users(op->getUsers().begin(),
+                                      op->getUsers().end());
+      for (auto res : op->getResults())
+        users.append(predicateUse.lookup(res));
+
+      bool consumedByReturn = false;
+      unsigned pipeEndTime = 0;
+      for (auto *user : users) {
+        if (funcReturnSentinel && user == funcReturnSentinel) {
+          consumedByReturn = true;
+          continue;
+        }
+        auto utOpt = problem.getStartTime(user);
+        if (!utOpt.has_value())
+          continue;
+        unsigned userStartTime = *utOpt;
+        if (userStartTime > startTime)
+          pipeEndTime = std::max(pipeEndTime, userStartTime);
+      }
+
+      if (op->getUsers().empty() && !consumedByReturn &&
+          llvm::none_of(op->getResults(),
+                        [&](Value v) { return predicateUse.contains(v); }))
+        continue;
+
+      for (auto res : op->getResults())
+        pipeTimes[res] = std::pair(startTime, pipeEndTime);
+
+      for (unsigned i = registerValues.size(); i <= pipeEndTime; ++i)
+        registerValues.push_back(SmallVector<Value>());
+
+      // Each result needs to live in registerValues[startTime] if any of
+      // its users — direct or predicate — is outside this stage's group.
+      for (auto result : op->getResults()) {
+        bool registered = false;
+        for (auto *user : result.getUsers()) {
+          if (!llvm::is_contained(group, user)) {
+            registerValues[startTime].push_back(result);
+            registered = true;
+            break;
+          }
+        }
+        if (!registered) {
+          for (auto *user : predicateUse.lookup(result)) {
+            if (!llvm::is_contained(group, user)) {
+              registerValues[startTime].push_back(result);
+              break;
+            }
+          }
+        }
+      }
+
+      // Forward through the intermediate stages so the value is visible
+      // past its producer's latency window.
+      unsigned firstUse = std::max(
+          startTime + 1,
+          startTime +
+              *problem.getLatency(*problem.getLinkedOperatorType(op)));
+      for (unsigned i = firstUse; i < pipeEndTime; ++i)
+        for (auto result : op->getResults())
+          registerValues[i].push_back(result);
+    }
+  }
+}
+
+LoopScheduleAtOp SCFToLoopSchedulePass::emitOnePipelineStage(
+    ImplicitLocOpBuilder &builder, unsigned startTime,
+    ArrayRef<Operation *> group, ArrayRef<Value> registerValuesAtStage,
+    ArrayRef<Type> registerTypesAtStage,
+    MutableArrayRef<IRMapping> stageValueMaps, CyclicProblem &problem,
+    DominanceInfo &dom) {
+  SmallVector<Operation *> sortedGroup(group.begin(), group.end());
+  llvm::sort(sortedGroup, [&](Operation *a, Operation *b) {
+    return dom.dominates(a, b);
+  });
+
+  auto startTimeAttr =
+      builder.getIntegerAttr(builder.getIntegerType(64), startTime);
+  auto stage = builder.create<LoopScheduleAtOp>(
+      SmallVector<Type>(registerTypesAtStage.begin(),
+                        registerTypesAtStage.end()),
+      startTimeAttr);
+  auto &stageBlock = stage.getBodyBlock();
+  auto *stageTerminator = stageBlock.getTerminator();
+  builder.setInsertionPointToStart(&stageBlock);
+
+  // Clone each scheduled op into the stage. If the op is predicated,
+  // wrap the clone in a `loopschedule.if` sourced from the predicate.
+  for (auto *op : sortedGroup) {
+    OpBuilder::InsertionGuard g(builder);
+    LoopScheduleIfOp ifOp;
+    if (predicateMap.contains(op)) {
+      Value cond = predicateMap.lookup(op);
+      if (stageValueMaps[startTime].contains(cond))
+        cond = stageValueMaps[startTime].lookup(cond);
+      ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(),
+                                               op->getResultTypes(), cond);
+      builder.setInsertionPointToStart(&ifOp.getBody().front());
+    }
+    auto *newOp = builder.clone(*op, stageValueMaps[startTime]);
+    dependenceAnalysis->replaceOp(op, newOp);
+    if (predicateMap.contains(op)) {
+      if (!newOp->getResults().empty())
+        builder.create<LoopScheduleYieldOp>(op->getLoc(),
+                                             newOp->getResults());
+      newOp = ifOp;
+    }
+    // Subsequent ops in this stage must consume the cloned values.
+    for (auto result : op->getResults())
+      stageValueMaps[startTime].map(
+          result, newOp->getResult(result.getResultNumber()));
+  }
+
+  // Forward registered values into the stage terminator and re-map them
+  // for the destination stage. The destination is the next stage by
+  // default; for multi-cycle ops whose result is yielded by their
+  // producing stage, the destination skips ahead by `latency` cycles so
+  // consumers see the wrapper output rather than the just-issued input.
+  SmallVector<Value> stageOperands;
+  unsigned resIndex = 0;
+  for (auto res : registerValuesAtStage) {
+    stageOperands.push_back(stageValueMaps[startTime].lookup(res));
+    unsigned destTime = startTime + 1;
+    if (!isa<BlockArgument>(res)) {
+      unsigned latency = *problem.getLatency(
+          *problem.getLinkedOperatorType(res.getDefiningOp()));
+      if (*problem.getStartTime(res.getDefiningOp()) == startTime &&
+          latency > 1)
+        destTime = startTime + latency;
+    }
+    destTime =
+        std::min((unsigned)(stageValueMaps.size() - 1), destTime);
+    stageValueMaps[destTime].map(res, stage.getResult(resIndex++));
+  }
+  stageTerminator->insertOperands(stageTerminator->getNumOperands(),
+                                  stageOperands);
+  return stage;
+}
+
 LogicalResult
 SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
                                                   CyclicProblem &problem,
@@ -1201,102 +1391,10 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
   // For storing the range of stages an operation's results need to be valid for
   DenseMap<Value, std::pair<unsigned, unsigned>> pipeTimes;
 
-  DenseSet<unsigned> newStartTimes;
-  for (auto startTime : startTimes) {
-    auto group = startGroups[startTime];
-    newStartTimes.insert(startTime);
-    // Collect the return types for this stage. Operations whose results are not
-    // used within this stage are returned.
-    auto isLoopTerminator = [loop](Operation *op) {
-      return isa<YieldOp>(op) && op->getParentOp() == loop;
-    };
-
-    // Initialize set of registers up until this point in time
-    for (unsigned i = registerValues.size(); i <= startTime; ++i)
-      registerValues.emplace_back(SmallVector<Value>());
-
-    // Check each operation to see if its results need plumbing
-    for (auto *op : group) {
-      if (op->getUsers().empty()) {
-        if (llvm::none_of(op->getResults(),
-                          [&](Value v) { return predicateUse.contains(v); })) {
-          continue;
-        }
-      }
-
-      unsigned pipeEndTime = 0;
-      SmallVector<Operation *> users;
-      users.append(op->getUsers().begin(), op->getUsers().end());
-
-      // Also check predicate users
-      for (auto res : op->getResults()) {
-        users.append(predicateUse.lookup(res));
-      }
-      for (auto *user : users) {
-        unsigned userStartTime = *problem.getStartTime(user);
-        // if (isLoopTerminator(user)) {
-        //   op->dump();
-        //   // Manually forward the value into the terminator's valueMap
-        //   pipeEndTime = std::max(
-        // } else if (*problem.getStartTime(user) > startTime)
-        if (*problem.getStartTime(user) > startTime)
-          pipeEndTime = std::max(pipeEndTime, userStartTime);
-      }
-
-      // Insert the range of pipeline stages the value needs to be valid for
-      for (auto res : op->getResults())
-        pipeTimes[res] = std::pair(startTime, pipeEndTime);
-
-      // Add register stages for each time slice we need to pipe to
-      for (unsigned i = registerValues.size(); i <= pipeEndTime; ++i)
-        registerValues.push_back(SmallVector<Value>());
-
-      // Keep a collection of this stages results as keys to our valueMaps
-      for (auto result : op->getResults()) {
-        bool registered = false;
-        for (auto *user : result.getUsers()) {
-          auto inThisGroup = false;
-          for (auto *op : group) {
-            if (user == op) {
-              inThisGroup = true;
-              break;
-            }
-          }
-          if (!inThisGroup) {
-            registerValues[startTime].push_back(result);
-            registered = true;
-            break;
-          }
-        }
-
-        // Also keep around results that are used as predicates
-        if (!registered) {
-          for (auto *user : predicateUse.lookup(result)) {
-            auto inThisGroup = false;
-            for (auto *op : group) {
-              if (user == op) {
-                inThisGroup = true;
-                break;
-              }
-            }
-            if (!inThisGroup) {
-              registerValues[startTime].push_back(result);
-              break;
-            }
-          }
-        }
-      }
-
-      // Other stages that use the value will need these values as keys too
-      unsigned firstUse = std::max(
-          startTime + 1,
-          startTime + *problem.getLatency(*problem.getLinkedOperatorType(op)));
-      for (unsigned i = firstUse; i < pipeEndTime; ++i) {
-        for (auto result : op->getResults())
-          registerValues[i].push_back(result);
-      }
-    }
-  }
+  DenseSet<unsigned> newStartTimes(startTimes.begin(), startTimes.end());
+  computePipelineStageRegisters(startTimes, startGroups, problem,
+                                 /*funcReturnSentinel=*/nullptr,
+                                 registerValues, pipeTimes);
 
   for (auto it : enumerate(loop.getAfter().getArguments())) {
     auto iterArg = it.value();
@@ -1383,79 +1481,14 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
   Value pipelineCondResult;
 
   // Create stages along with maps
-  for (auto i : enumerate(startTimes)) {
-    auto startTime = i.value();
-    auto lastStage = i.index() == startTimes.size() - 1;
-    auto group = startGroups[startTime];
-    llvm::sort(group,
-               [&](Operation *a, Operation *b) { return dom.dominates(a, b); });
-    auto stageTypes = registerTypes[startTime];
-    (void)lastStage;
-
-    // Create the stage itself. The pipeline op no longer has a default
-    // terminator (we'll create one after all stages are built), so insert at
-    // end of the stages block.
+  for (auto startTime : startTimes) {
     builder.setInsertionPointToEnd(&stagesBlock);
-    auto startTimeAttr =
-        builder.getIntegerAttr(builder.getIntegerType(64), startTime);
-    auto stage = builder.create<LoopScheduleAtOp>(
-        stageTypes, startTimeAttr);
-    auto &stageBlock = stage.getBodyBlock();
-    auto *stageTerminator = stageBlock.getTerminator();
-    builder.setInsertionPointToStart(&stageBlock);
-
-    for (auto *op : group) {
-      OpBuilder::InsertionGuard g(builder);
-      LoopScheduleIfOp ifOp;
-      if (predicateMap.contains(op)) {
-        Value cond = predicateMap.lookup(op);
-        if (stageValueMaps[startTime].contains(cond))
-          cond = stageValueMaps[startTime].lookup(cond);
-        ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(),
-                                                op->getResultTypes(), cond);
-        builder.setInsertionPointToStart(&ifOp.getBody().front());
-      }
-      auto *newOp = builder.clone(*op, stageValueMaps[startTime]);
-      dependenceAnalysis->replaceOp(op, newOp);
-      if (predicateMap.contains(op)) {
-        if (!newOp->getResults().empty())
-          builder.create<LoopScheduleYieldOp>(op->getLoc(),
-                                              newOp->getResults());
-        newOp = ifOp;
-      }
-
-      // All further uses in this stage should used the cloned-version of values
-      // So we update the mapping in this stage
-      for (auto result : op->getResults())
-        stageValueMaps[startTime].map(
-            result, newOp->getResult(result.getResultNumber()));
-    }
-
-    // Register all values in the terminator, using their mapped value
-    SmallVector<Value> stageOperands;
-    unsigned resIndex = 0;
-    for (auto res : registerValues[startTime]) {
-      stageOperands.push_back(stageValueMaps[startTime].lookup(res));
-      // Additionally, update the map of the stage that will consume the
-      // registered value
-      unsigned destTime = startTime + 1;
-      if (!isa<BlockArgument>(res)) {
-        unsigned latency = *problem.getLatency(
-            *problem.getLinkedOperatorType(res.getDefiningOp()));
-        // Multi-cycle case
-        if (*problem.getStartTime(res.getDefiningOp()) == startTime &&
-            latency > 1)
-          destTime = startTime + latency;
-      }
-      destTime = std::min((unsigned)(stageValueMaps.size() - 1), destTime);
-      stageValueMaps[destTime].map(res, stage.getResult(resIndex++));
-    }
-    // Add these mapped values to pipeline.register
-    stageTerminator->insertOperands(stageTerminator->getNumOperands(),
-                                    stageOperands);
+    auto stage = emitOnePipelineStage(
+        builder, startTime, startGroups[startTime], registerValues[startTime],
+        registerTypes[startTime], stageValueMaps, problem, dom);
 
     // If this stage contains the condition value, record its stage result
-    // for the terminator.
+    // for the terminator built after the stages loop completes.
     for (unsigned regIdx = 0; regIdx < registerValues[startTime].size();
          ++regIdx) {
       if (registerValues[startTime][regIdx] == condValue) {
@@ -1607,78 +1640,10 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedulePipeline(
   SmallVector<IRMapping> stageValueMaps;
   DenseMap<Value, std::pair<unsigned, unsigned>> pipeTimes;
 
-  DenseSet<unsigned> newStartTimes;
-  for (auto startTime : startTimes) {
-    auto group = startGroups[startTime];
-    newStartTimes.insert(startTime);
-
-    for (unsigned i = registerValues.size(); i <= startTime; ++i)
-      registerValues.emplace_back(SmallVector<Value>());
-
-    for (auto *op : group) {
-      // Determine the latest user-startTime; values used past startTime
-      // need to be registered between stages.
-      unsigned pipeEndTime = 0;
-      SmallVector<Operation *> users(op->getUsers().begin(),
-                                      op->getUsers().end());
-      for (auto res : op->getResults())
-        users.append(predicateUse.lookup(res));
-
-      bool consumedByReturn = false;
-      for (auto *user : users) {
-        if (user == funcReturn) {
-          consumedByReturn = true;
-          continue;
-        }
-        auto utOpt = problem.getStartTime(user);
-        if (!utOpt.has_value())
-          continue;
-        unsigned userStartTime = *utOpt;
-        if (userStartTime > startTime)
-          pipeEndTime = std::max(pipeEndTime, userStartTime);
-      }
-
-      if (op->getUsers().empty() && !consumedByReturn &&
-          llvm::none_of(op->getResults(),
-                        [&](Value v) { return predicateUse.contains(v); }))
-        continue;
-
-      for (auto res : op->getResults())
-        pipeTimes[res] = std::pair(startTime, pipeEndTime);
-
-      for (unsigned i = registerValues.size(); i <= pipeEndTime; ++i)
-        registerValues.push_back(SmallVector<Value>());
-
-      // Register each result that has any out-of-stage user.
-      for (auto result : op->getResults()) {
-        bool registered = false;
-        for (auto *user : result.getUsers()) {
-          if (!llvm::is_contained(group, user)) {
-            registerValues[startTime].push_back(result);
-            registered = true;
-            break;
-          }
-        }
-        if (!registered) {
-          for (auto *user : predicateUse.lookup(result)) {
-            if (!llvm::is_contained(group, user)) {
-              registerValues[startTime].push_back(result);
-              break;
-            }
-          }
-        }
-      }
-
-      // Forward this op's results through every intermediate stage so they
-      // remain visible past the multi-cycle latency window.
-      unsigned firstUse = std::max(
-          startTime + 1,
-          startTime + *problem.getLatency(*problem.getLinkedOperatorType(op)));
-      for (unsigned i = firstUse; i < pipeEndTime; ++i)
-        for (auto result : op->getResults())
-          registerValues[i].push_back(result);
-    }
-  }
+  DenseSet<unsigned> newStartTimes(startTimes.begin(), startTimes.end());
+  computePipelineStageRegisters(startTimes, startGroups, problem,
+                                 /*funcReturnSentinel=*/funcReturn,
+                                 registerValues, pipeTimes);
 
   // Make sure values consumed by the return op are also registered through
   // to the last stage. Without this, the return's operands have no
@@ -1720,60 +1685,10 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedulePipeline(
   // Emit each stage as a `loopschedule.at offset(...)` op directly inside
   // the func_pipeline body, just before the `loopschedule.return`.
   for (auto startTime : startTimes) {
-    auto group = startGroups[startTime];
-    llvm::sort(group,
-               [&](Operation *a, Operation *b) { return dom.dominates(a, b); });
-    auto stageTypes = registerTypes[startTime];
-
     builder.setInsertionPoint(funcReturn);
-    auto startTimeAttr =
-        builder.getIntegerAttr(builder.getIntegerType(64), startTime);
-    auto stage = builder.create<LoopScheduleAtOp>(stageTypes, startTimeAttr);
-    auto &stageBlock = stage.getBodyBlock();
-    auto *stageTerminator = stageBlock.getTerminator();
-    builder.setInsertionPointToStart(&stageBlock);
-
-    for (auto *op : group) {
-      OpBuilder::InsertionGuard g(builder);
-      LoopScheduleIfOp ifOp;
-      if (predicateMap.contains(op)) {
-        Value cond = predicateMap.lookup(op);
-        if (stageValueMaps[startTime].contains(cond))
-          cond = stageValueMaps[startTime].lookup(cond);
-        ifOp = builder.create<LoopScheduleIfOp>(op->getLoc(),
-                                                op->getResultTypes(), cond);
-        builder.setInsertionPointToStart(&ifOp.getBody().front());
-      }
-      auto *newOp = builder.clone(*op, stageValueMaps[startTime]);
-      dependenceAnalysis->replaceOp(op, newOp);
-      if (predicateMap.contains(op)) {
-        if (!newOp->getResults().empty())
-          builder.create<LoopScheduleYieldOp>(op->getLoc(),
-                                              newOp->getResults());
-        newOp = ifOp;
-      }
-      for (auto result : op->getResults())
-        stageValueMaps[startTime].map(
-            result, newOp->getResult(result.getResultNumber()));
-    }
-
-    SmallVector<Value> stageOperands;
-    unsigned resIndex = 0;
-    for (auto res : registerValues[startTime]) {
-      stageOperands.push_back(stageValueMaps[startTime].lookup(res));
-      unsigned destTime = startTime + 1;
-      if (!isa<BlockArgument>(res)) {
-        unsigned latency = *problem.getLatency(
-            *problem.getLinkedOperatorType(res.getDefiningOp()));
-        if (*problem.getStartTime(res.getDefiningOp()) == startTime &&
-            latency > 1)
-          destTime = startTime + latency;
-      }
-      destTime = std::min((unsigned)(stageValueMaps.size() - 1), destTime);
-      stageValueMaps[destTime].map(res, stage.getResult(resIndex++));
-    }
-    stageTerminator->insertOperands(stageTerminator->getNumOperands(),
-                                    stageOperands);
+    emitOnePipelineStage(builder, startTime, startGroups[startTime],
+                          registerValues[startTime], registerTypes[startTime],
+                          stageValueMaps, problem, dom);
   }
 
   // Rewrite the loopschedule.return operands to consume the final stage's
