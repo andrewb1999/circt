@@ -1,6 +1,6 @@
 set(BINDING_SOURCES
   Problems.cpp
-  LeftEdgeBinder.cpp
+  GreedyBinder.cpp
   )
 
 add_circt_library(CIRCTBinding

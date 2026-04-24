@@ -15,6 +15,8 @@ add_circt_dialect_library(CIRCTLoopScheduleTransforms
 
   LINK_LIBS PUBLIC
   CIRCTLoopSchedule
+  CIRCTLoopScheduleStartTimeAnalysis
+  CIRCTOperatorLibraryAnalysis
   CIRCTBinding
   CIRCTHW
   CIRCTSV

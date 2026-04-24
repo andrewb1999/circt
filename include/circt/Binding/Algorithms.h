@@ -6,12 +6,10 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file defines a library of binding algorithms. Each algorithm is a
-// free function that takes a problem instance populated by the client and
-// writes instance assignments back into it. A successful call guarantees
-// `problem.verify()` passes; a failing call leaves the problem unchanged
-// (or partially assigned but failed — callers should treat state as
-// undefined on failure).
+// Library of binding algorithms. Each algorithm is a free function that
+// takes a problem instance populated by the client and writes instance
+// assignments back into it. A successful call guarantees `problem.verify()`
+// passes; a failing call leaves the problem in an undefined state.
 //
 //===----------------------------------------------------------------------===//
 
@@ -23,34 +21,39 @@
 namespace circt {
 namespace binding {
 
-/// Bind the operations in \p prob using the Left-Edge algorithm, run
-/// independently per resource pool. Optimal for interval graphs: the final
-/// instance count per pool equals the maximum pool utilization across
-/// cycles. Fails if `prob.check()` fails, or if any pool requires more
-/// instances than its `instanceLimit` allows (which indicates the upstream
-/// scheduler did not enforce the resource constraint that binding expects).
-LogicalResult bindLeftEdge(BindingProblem &prob);
+/// Bind the operations in \p prob via greedy conflict-graph coloring.
+///
+/// Builds a conflict graph pairwise (ops conflict iff `prob.conflicts(a,b)`
+/// is true), then, processing ops in ascending `startTime` order with
+/// stable tie-breaking by registration index, assigns each op the lowest-
+/// numbered instance not currently occupied by a conflicting neighbor.
+/// Fails if `prob.check()` fails or any pool requires more instances than
+/// its `instanceLimit` allows.
+///
+/// This is the default binder for `BindingProblem`. It handles arbitrary
+/// AP-of-intervals occupancies and arbitrary concurrency relations, so it
+/// correctly covers:
+///   - pure sequential regions (single intervals),
+///   - pipelined regions (mod-II conflicts),
+///   - frames hosting inline pipelines + concurrent static ops,
+///   - multiple pipelines launched concurrently in one frame,
+///   - cross-region sharing via disjoint concurrency groups.
+///
+/// Greedy coloring is not optimal on arbitrary conflict graphs (graph
+/// coloring is NP-hard in general), but the start-time ordering is exact
+/// on pure interval graphs (where it reduces to Left-Edge) and close to
+/// optimal on the AP-mixed graphs typical of HLS output. If a tighter
+/// bound is ever needed, a DSATUR or clique-partitioning variant can be
+/// added as a parallel algorithm without disturbing this one.
+LogicalResult bindGreedy(BindingProblem &prob);
 
-/// Bind the operations in \p prob using Left-Edge within each residue class
-/// `mod II`. For fully-pipelined modulo-scheduled regions, each residue
-/// class independently reduces to a one-shot assignment: if the scheduler
-/// respected the resource limit, the class size is at most `instanceLimit`
-/// and any injective mapping suffices. Ops with `latency > 1` are handled
-/// by treating their occupancy `[start, start+latency-1] mod II` as the
-/// interval. Stable (iteration-invariant) output by tie-breaking on
-/// `prob.getOperations()` order, so the same op binds to the same instance
-/// across iterations.
-LogicalResult bindLeftEdge(ModuloBindingProblem &prob);
-
-/// Bind the operations in \p prob partitioning each resource pool by access
-/// kind first. A `Read` op is assigned an id from the pool's read or
-/// read/write instances; a `Write` op from write or read/write; etc.
-/// Instance ids are globally unique within the resource (i.e. the read
-/// sub-pool owns ids `[0, readPorts)`, write owns
-/// `[readPorts, readPorts + writePorts)`, and read/write owns the rest).
-/// Within each sub-pool, the same Left-Edge procedure runs as in the
-/// unconstrained case.
-LogicalResult bindLeftEdge(PortKindBindingProblem &prob);
+/// Bind the operations in \p prob via greedy coloring, restricting each
+/// op's candidate instance range by its declared `AccessKind`. Physical
+/// ports are laid out as `[0, R) = Read`, `[R, R+W) = Write`, and
+/// `[R+W, limit) = ReadWrite`. Ops are processed most-constrained first
+/// (RW, then W, then R) so the narrow sub-pool is filled before ops that
+/// have a wider legal range compete for it.
+LogicalResult bindGreedy(PortKindBindingProblem &prob);
 
 } // namespace binding
 } // namespace circt

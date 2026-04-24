@@ -13,6 +13,7 @@
 #include "circt/Analysis/DebugAnalysis.h"
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Analysis/FIRRTLInstanceInfo.h"
+#include "circt/Analysis/LoopScheduleStartTimeAnalysis.h"
 #include "circt/Analysis/OpCountAnalysis.h"
 #include "circt/Analysis/SCFWhileTripCountAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
@@ -372,6 +373,51 @@ void TestCombIntegerRangeAnalysisPass::runOnOperation() {
 }
 
 //===----------------------------------------------------------------------===//
+// LoopScheduleStartTimeAnalysis
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct TestLoopScheduleStartTimeAnalysisPass
+    : public PassWrapper<TestLoopScheduleStartTimeAnalysisPass,
+                         OperationPass<mlir::ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      TestLoopScheduleStartTimeAnalysisPass)
+
+  void runOnOperation() override;
+  StringRef getArgument() const override {
+    return "test-loopschedule-start-time-analysis";
+  }
+  StringRef getDescription() const override {
+    return "Run LoopScheduleStartTimeAnalysis and stamp each bindable op "
+           "with its recorded start time.";
+  }
+};
+} // namespace
+
+void TestLoopScheduleStartTimeAnalysisPass::runOnOperation() {
+  auto *ctx = &getContext();
+  auto i64 = IntegerType::get(ctx, 64);
+  LoopScheduleStartTimeAnalysis analysis(getOperation());
+  unsigned groupId = 0;
+  DenseMap<Operation *, unsigned> groupIds;
+  for (auto *op : analysis.getBindableOps()) {
+    if (auto start = analysis.getStartTime(op))
+      op->setAttr("loopschedule.start_time", IntegerAttr::get(i64, *start));
+    if (auto period = analysis.getPeriod(op); period && *period > 0)
+      op->setAttr("loopschedule.period", IntegerAttr::get(i64, *period));
+    if (auto count = analysis.getCount(op); count && *count != 1)
+      op->setAttr("loopschedule.count", IntegerAttr::get(i64, *count));
+    if (auto *group = analysis.getConcurrencyGroup(op)) {
+      auto &id = groupIds[group];
+      if (!groupIds.contains(group) || id == 0) {
+        id = ++groupId;
+      }
+      op->setAttr("loopschedule.group", IntegerAttr::get(i64, id));
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Pass registration
 //===----------------------------------------------------------------------===//
 
@@ -383,6 +429,9 @@ void registerAnalysisTestPasses() {
   });
   registerPass([]() -> std::unique_ptr<Pass> {
     return std::make_unique<TestSchedulingAnalysisPass>();
+  });
+  registerPass([]() -> std::unique_ptr<Pass> {
+    return std::make_unique<TestLoopScheduleStartTimeAnalysisPass>();
   });
   registerPass([]() -> std::unique_ptr<Pass> {
     return std::make_unique<TestSCFWhileTripCountPass>();

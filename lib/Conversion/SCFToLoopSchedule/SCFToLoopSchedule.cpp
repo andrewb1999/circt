@@ -1110,6 +1110,27 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
   if (result.wasInterrupted())
     return op->emitError("unsupported operation ") << *unsupported;
 
+  // Second walk: if any op carries `loopschedule.operator = @name` and
+  // `@name`'s `oplib.operator` entry declares a `limit`, attach a resource
+  // of that name with the declared instance limit so the modulo/shared-
+  // operator scheduler respects the cap. This is the single place where
+  // oplib-declared resource limits enter the scheduling problem — covers
+  // both arith operators (e.g. `i32_muli_l4 limit<2>`) and memory
+  // operators (`mem_<func>_<idx> limit<2>` emitted by
+  // `OperatorAllocation`).
+  loopBody.walk([&](Operation *op) {
+    auto oprAttr = op->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+    if (!oprAttr)
+      return;
+    StringRef name = oprAttr.getLeafReference();
+    auto limit = operatorLibraryAnalysis->getOperatorLimit(name);
+    if (!limit)
+      return;
+    auto rsrc = problem.getOrInsertResourceType(name);
+    problem.setLimit(rsrc, *limit);
+    problem.addLinkedResourceType(op, rsrc);
+  });
+
   return success();
 }
 

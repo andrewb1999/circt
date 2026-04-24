@@ -34,6 +34,12 @@ struct Operator {
 
   std::optional<llvm::APFloat> outDelay;
 
+  /// Declared cap on the number of physical instances of this operator
+  /// the downstream binder should create. Sourced from the
+  /// `oplib.operator`'s `limit` attribute; unset means unlimited (the
+  /// binder will create as many instances as the schedule demands).
+  std::optional<unsigned> limit;
+
   // Must be calyx::CellInterface
   Operation *templateOp;
 
@@ -80,6 +86,10 @@ struct OperatorLibraryAnalysis {
   std::optional<float> getOperatorIncomingDelay(StringRef);
 
   std::optional<float> getOperatorOutgoingDelay(StringRef);
+
+  /// Maximum number of physical instances of this operator. `std::nullopt`
+  /// means no cap — the binder will create as many as needed.
+  std::optional<unsigned> getOperatorLimit(StringRef);
 
   std::optional<unsigned> getCEResultNum(StringRef operatorName);
 

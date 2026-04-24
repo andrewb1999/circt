@@ -49,31 +49,43 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
   auto operatorOps = libraryOp.getBodyBlock()->getOps<oplib::OperatorOp>();
 
   for (auto operatorOp : operatorOps) {
-    // The signature / matching info lives on the OperatorOp's TargetOp +
-    // OperationOp; the calyx_match body is only needed for downstream
-    // Calyx lowering. Operators without a calyx_match are still tracked
-    // here so their latency/signature drives scheduling — LoopScheduleToCalyx
-    // is responsible for falling back to its TypeSwitch path when the
-    // operator has no calyx_match template.
+    // Operators without a TargetOp don't participate in operation-name-based
+    // matching (so `getPotentialOperators` never returns them), but they
+    // are still tracked in `operatorMap` so clients can query properties
+    // such as `limit` by symbol name. This is how per-memref operators
+    // attached by `OperatorAllocation` end up visible to the binder
+    // without confusing the scheduler's library matcher.
     auto targetOps = operatorOp.getBodyBlock()->getOps<oplib::TargetOp>();
-    if (targetOps.empty())
+
+    Operator operatorStruct(operatorOp.getLatency());
+    operatorStruct.incDelay = operatorOp.getIncDelay();
+    operatorStruct.outDelay = operatorOp.getOutDelay();
+    if (auto limit = operatorOp.getLimit())
+      operatorStruct.limit = static_cast<unsigned>(*limit);
+    operatorStruct.templateOp = nullptr;
+    operatorStruct.opToMatch = nullptr;
+
+    StringRef operatorName = operatorOp.getSymName();
+
+    if (targetOps.empty()) {
+      operatorMap.insert(std::pair(operatorName, operatorStruct));
       continue;
+    }
     auto targetOp = *targetOps.begin();
-    if (targetOp.getBodyBlock()->empty())
+    if (targetOp.getBodyBlock()->empty()) {
+      operatorMap.insert(std::pair(operatorName, operatorStruct));
       continue;
+    }
     auto operationOp =
         dyn_cast<oplib::OperationOp>(targetOp.getBodyBlock()->front());
-    if (!operationOp)
+    if (!operationOp) {
+      operatorMap.insert(std::pair(operatorName, operatorStruct));
       continue;
+    }
 
     std::string name = operationOp.getOpName().str();
     auto operationName = OperationName(name, context);
 
-    Operator operatorStruct(operatorOp.getLatency());
-
-    operatorStruct.incDelay = operatorOp.getIncDelay();
-    operatorStruct.outDelay = operatorOp.getOutDelay();
-    operatorStruct.templateOp = nullptr; // populated only when calyx_match exists
     operatorStruct.opToMatch = operationOp;
 
     if (operationOp.getOpDict().has_value()) {
@@ -133,9 +145,7 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
       }
     }
 
-    auto operatorName = operatorOp.getSymName();
     potentialOperatorsMap[operationName.getStringRef()].push_back(operatorName);
-
     operatorMap.insert(std::pair(operatorName, operatorStruct));
   }
 }
@@ -249,6 +259,14 @@ OperatorLibraryAnalysis::getOperatorOutgoingDelay(StringRef operatorName) {
     return std::nullopt;
 
   return (float)operatorStruct.outDelay.value().convertToDouble();
+}
+
+std::optional<unsigned>
+OperatorLibraryAnalysis::getOperatorLimit(StringRef operatorName) {
+  auto it = operatorMap.find(operatorName);
+  if (it == operatorMap.end())
+    return std::nullopt;
+  return it->second.limit;
 }
 
 std::optional<unsigned>

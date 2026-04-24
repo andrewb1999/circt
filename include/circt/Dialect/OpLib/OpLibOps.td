@@ -73,16 +73,18 @@ def OperatorOp : OpLibOp<"operator", [IsolatedFromAbove,
     operator library.
   }];
 
-  let arguments = (ins SymbolNameAttr:$sym_name, 
+  let arguments = (ins SymbolNameAttr:$sym_name,
                        I32Attr:$latency,
                        OptionalAttr<F64Attr>:$incDelay,
-                       OptionalAttr<F64Attr>:$outDelay);
+                       OptionalAttr<F64Attr>:$outDelay,
+                       OptionalAttr<I64Attr>:$limit);
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);
-  let assemblyFormat = [{
-    $sym_name `latency` `<` $latency `>` (`,` `incDelay` `<` $incDelay^ `>`)? 
-    (`,` `outDelay` `<` $outDelay^ `>`)? attr-dict-with-keyword $body
-  }];
+  // Custom parser/printer so `latency`, `incDelay`, `outDelay`, and `limit`
+  // can all live inline as `keyword<value>` terms separated by commas —
+  // MLIR's optional-group assembly format can't disambiguate multiple
+  // leading-comma optional groups.
+  let hasCustomAssemblyFormat = 1;
 
   let skipDefaultBuilders = 1;
   let builders = [

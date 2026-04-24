@@ -44,13 +44,16 @@ LogicalResult LibraryOp::verify() {
 
 LogicalResult OperatorOp::verify() {
   unsigned numMatches = 0;
+  unsigned numTargets = 0;
   for (auto &op : getBodyBlock()->getOperations()) {
     if (isa<CalyxMatchOp, HwMatchOp>(op)) {
       ++numMatches;
       continue;
     }
-    if (isa<TargetOp>(op))
+    if (isa<TargetOp>(op)) {
+      ++numTargets;
       continue;
+    }
     // Allow hoisted constants. The OperatorOp body is IsolatedFromAbove,
     // so constant-folding canonicalization patterns may legitimately
     // hoist constant placeholders out of the match-op bodies; rejecting
@@ -62,7 +65,12 @@ LogicalResult OperatorOp::verify() {
         "operator body may only contain target ops, match ops, and hoisted "
         "constants");
   }
-  if (numMatches == 0)
+  // An operator that declares a `TargetOp` is meant to drive codegen and
+  // must supply at least one matcher. An operator with no targets serves
+  // purely as a container for properties (e.g. `limit`) consumed by
+  // downstream analyses — memory operators emitted by `OperatorAllocation`
+  // are the canonical example — and does not need a match op.
+  if (numTargets > 0 && numMatches == 0)
     return emitOpError("must contain at least one match op");
 
   if (getIncDelay().has_value() != getOutDelay().has_value()) {
@@ -79,6 +87,92 @@ LogicalResult OperatorOp::verify() {
   }
 
   return success();
+}
+
+ParseResult OperatorOp::parse(OpAsmParser &parser, OperationState &result) {
+  // `@sym_name latency<N>[, incDelay<F>][, outDelay<F>][, limit<N>]
+  //  [attributes {...}] { body }`
+  StringAttr nameAttr;
+  if (parser.parseSymbolName(nameAttr,
+                              mlir::SymbolTable::getSymbolAttrName(),
+                              result.attributes))
+    return failure();
+
+  // Required `latency<N>`.
+  IntegerAttr latencyAttr;
+  if (parser.parseKeyword("latency") || parser.parseLess() ||
+      parser.parseAttribute(latencyAttr, parser.getBuilder().getIntegerType(32),
+                             "latency", result.attributes) ||
+      parser.parseGreater())
+    return failure();
+
+  // Optional `, keyword<value>` terms, in any order. We scan them in a
+  // loop so the user isn't bound to a particular emission order.
+  while (succeeded(parser.parseOptionalComma())) {
+    StringRef kw;
+    if (parser.parseKeyword(&kw))
+      return failure();
+    if (parser.parseLess())
+      return failure();
+    if (kw == "incDelay") {
+      FloatAttr fa;
+      if (parser.parseAttribute(fa, parser.getBuilder().getF64Type(),
+                                 "incDelay", result.attributes) ||
+          parser.parseGreater())
+        return failure();
+    } else if (kw == "outDelay") {
+      FloatAttr fa;
+      if (parser.parseAttribute(fa, parser.getBuilder().getF64Type(),
+                                 "outDelay", result.attributes) ||
+          parser.parseGreater())
+        return failure();
+    } else if (kw == "limit") {
+      IntegerAttr ia;
+      if (parser.parseAttribute(ia, parser.getBuilder().getIntegerType(64),
+                                 "limit", result.attributes) ||
+          parser.parseGreater())
+        return failure();
+    } else {
+      return parser.emitError(parser.getCurrentLocation())
+             << "expected one of 'incDelay', 'outDelay', 'limit'; got '" << kw
+             << "'";
+    }
+  }
+
+  if (parser.parseOptionalAttrDictWithKeyword(result.attributes))
+    return failure();
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body))
+    return failure();
+  // SizedRegion<1> requires exactly one block. An empty `{}` parses as a
+  // zero-block region; materialize an empty block so the verifier passes
+  // (memory-only operators emitted by OperatorAllocation need this).
+  if (body->empty())
+    body->emplaceBlock();
+  return success();
+}
+
+void OperatorOp::print(OpAsmPrinter &p) {
+  p << ' ';
+  p.printSymbolName(getSymName());
+  p << " latency<" << getLatency() << ">";
+  if (auto v = getIncDelay())
+    p << ", incDelay<" << *v << ">";
+  if (auto v = getOutDelay())
+    p << ", outDelay<" << *v << ">";
+  if (auto v = getLimit())
+    p << ", limit<" << *v << ">";
+  SmallVector<StringRef> elided{
+      mlir::SymbolTable::getSymbolAttrName(),
+      getLatencyAttrName().getValue(),
+      getIncDelayAttrName().getValue(),
+      getOutDelayAttrName().getValue(),
+      getLimitAttrName().getValue(),
+  };
+  p.printOptionalAttrDictWithKeyword((*this)->getAttrs(), elided);
+  p << ' ';
+  p.printRegion(getBody());
 }
 
 //===----------------------------------------------------------------------===//

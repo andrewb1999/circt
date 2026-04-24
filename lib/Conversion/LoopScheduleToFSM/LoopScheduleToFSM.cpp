@@ -172,12 +172,33 @@ struct PortArgInfo {
   bool isWrite = true;
   bool requiresRdEn = false;
   unsigned latency = 1;
+  // Number of distinct hardware ports the memory exposes. For memrefs,
+  // this is derived from the oplib operator's `limit` (e.g. `mem_f_0
+  // latency<1>, limit<2>` → numPorts == 2). Default 1. Amc-port entries
+  // always have numPorts == 1 (the amc.instance port is its own unit).
+  unsigned numPorts = 1;
   // Memref-specific.
   MemRefType memType;        // null for amc ports
   bool isLocalMem = false;   // true for memref.alloc → seq.hlmem
   // Amc-port-specific.
   bool isAmcPort = false;
 };
+
+/// Probe \p memref's memory-op users for `loopschedule.operator` and look
+/// up the referenced `oplib.operator`'s declared `limit` attribute, which
+/// `OperatorAllocation` emits as the memory's hardware port count.
+/// Returns 1 if no binding metadata is present (single-port default).
+///
+/// TODO(multi-port): currently stubbed to return 1 — the rest of the FSM
+/// lowering (MemPortMapping, merge logic, output construction, submodule
+/// forwarding, seq.hlmem backing) still assumes one port group per memref.
+/// Flipping this to the real value is the last step after those paths are
+/// parameterized by port index. The lookup machinery below is what that
+/// flip will consult.
+static unsigned computeNumPortsFromUsers(Value memref) {
+  (void)memref;
+  return 1;
+}
 
 /// Build a PortArgInfo for a memref-backed value (function argument or
 /// local alloc). Amc-port entries are built inline by the instance walk.
@@ -190,6 +211,7 @@ static PortArgInfo makePortArgInfoFromMemref(Value arg, MemRefType memType,
   info.shape.assign(memType.getShape().begin(), memType.getShape().end());
   info.elementType = memType.getElementType();
   info.addrWidths = getDimAddrWidths(memType);
+  info.numPorts = computeNumPortsFromUsers(arg);
   return info;
 }
 
@@ -204,27 +226,33 @@ static void appendPortOutputPorts(OpBuilder &builder, StringRef baseName,
                                    SmallVectorImpl<hw::PortInfo> &ports) {
   auto *ctx = builder.getContext();
   bool isOneDim = info.addrWidths.size() == 1;
-  for (auto [d, w] : llvm::enumerate(info.addrWidths)) {
-    std::string addrName =
-        isOneDim ? (baseName + "_addr").str()
-                 : (baseName + "_addr_" + std::to_string(d)).str();
-    ports.push_back({{builder.getStringAttr(addrName),
-                       IntegerType::get(ctx, w),
-                       hw::ModulePort::Direction::Output}});
-  }
-  if (info.requiresRdEn) {
-    ports.push_back({{builder.getStringAttr((baseName + "_rd_en").str()),
-                       builder.getI1Type(),
-                       hw::ModulePort::Direction::Output}});
-  }
-  bool emitWrite = info.isAmcPort ? info.isWrite : true;
-  if (emitWrite) {
-    ports.push_back({{builder.getStringAttr((baseName + "_wr_data").str()),
-                       info.elementType,
-                       hw::ModulePort::Direction::Output}});
-    ports.push_back({{builder.getStringAttr((baseName + "_wr_en").str()),
-                       builder.getI1Type(),
-                       hw::ModulePort::Direction::Output}});
+  bool multi = info.numPorts > 1;
+  for (unsigned port = 0; port < info.numPorts; ++port) {
+    std::string portPrefix = multi ? (baseName.str() + "_p" +
+                                       std::to_string(port))
+                                   : baseName.str();
+    for (auto [d, w] : llvm::enumerate(info.addrWidths)) {
+      std::string addrName =
+          isOneDim ? portPrefix + "_addr"
+                   : portPrefix + "_addr_" + std::to_string(d);
+      ports.push_back({{builder.getStringAttr(addrName),
+                         IntegerType::get(ctx, w),
+                         hw::ModulePort::Direction::Output}});
+    }
+    if (info.requiresRdEn) {
+      ports.push_back({{builder.getStringAttr(portPrefix + "_rd_en"),
+                         builder.getI1Type(),
+                         hw::ModulePort::Direction::Output}});
+    }
+    bool emitWrite = info.isAmcPort ? info.isWrite : true;
+    if (emitWrite) {
+      ports.push_back({{builder.getStringAttr(portPrefix + "_wr_data"),
+                         info.elementType,
+                         hw::ModulePort::Direction::Output}});
+      ports.push_back({{builder.getStringAttr(portPrefix + "_wr_en"),
+                         builder.getI1Type(),
+                         hw::ModulePort::Direction::Output}});
+    }
   }
 }
 
@@ -306,6 +334,13 @@ struct LoopNode {
 /// `loopschedule.operator = @...` (covers pipelined arith ops like
 /// `i32_muli_l4` whose latency lives on the `oplib.operator` entry).
 /// Returns 0 when no latency information is available.
+///
+/// Memory ops are excluded: their real latency is modeled by the FSM's
+/// port state machine, not by the cross-stage delay-chain logic that
+/// consumes this value. `OperatorAllocation` tags memory ops with
+/// `loopschedule.operator` purely for the binding pass, and that operator's
+/// declared latency is a hardware property, not a pipeline-stage count —
+/// returning it here would insert a spurious extra register.
 static unsigned
 computeOpCycleLatency(Operation *def,
                       analysis::OperatorLibraryAnalysis *operatorLibrary) {
@@ -314,6 +349,9 @@ computeOpCycleLatency(Operation *def,
   if (auto attr =
           def->getAttrOfType<IntegerAttr>("loopschedule.cycle_latency"))
     return (unsigned)attr.getInt();
+  if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp, LoadInterface,
+          StoreInterface>(def))
+    return 0;
   if (!operatorLibrary)
     return 0;
   auto operatorAttr =

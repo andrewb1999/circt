@@ -13,12 +13,36 @@
 // abstractions in `circt/Scheduling/Problems.h` so that users familiar with
 // the scheduling framework find the same shape here.
 //
+// Every operation's occupancy pattern is expressed as an *arithmetic
+// progression of intervals*:
+//
+//   active at cycles  { startTime + i*period + k : i ∈ [0, count),
+//                                                   k ∈ [0, latency) }
+//
+// With `period = 0` and `count = 1` this degenerates to a single interval
+// `[startTime, startTime+latency-1]` — the common case for static ops in a
+// sequential region. Pipelined ops set `period = II` and `count = tripCount`,
+// which captures the full liveness without collapsing it to a contiguous
+// range (important when mixing II > 1 pipelines with static work in the
+// same region — interval collapsing would over-allocate instances).
+//
+// Two operations conflict on a resource instance iff:
+//   (1) they share a *concurrency group* (an IR-structure-derived marker
+//       identifying ops that can execute simultaneously), AND
+//   (2) their AP-of-intervals occupancies intersect.
+//
+// Ops with disjoint concurrency groups never conflict — they are
+// guaranteed non-concurrent by construction (e.g. distinct frames of a
+// `loopschedule.func_sequential` serialize). This is how the same binder
+// recovers cross-region instance sharing without any post-hoc renumbering.
+//
 // The binding framework is deliberately decoupled from scheduling: a
 // `BindingProblem` carries its own operations, resource types, per-op
-// properties (start time, latency, linked resource type), and per-resource
-// limits. Callers populate it explicitly from whatever schedule source they
-// have — typically the output of a `scheduling::Problem` — without any
-// header dependency between the two namespaces.
+// properties (start time, latency, period, count, concurrency group,
+// linked resource type), and per-resource limits. Callers populate it
+// explicitly from whatever schedule source they have — typically the
+// output of a `scheduling::Problem` plus a start-time analysis — without
+// any header dependency between the two namespaces.
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,6 +52,7 @@
 #include "circt/Support/LLVM.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -39,23 +64,25 @@ namespace binding {
 
 /// This class models the basic binding problem.
 ///
-/// A problem instance is comprised of:
-///
-///  - *Operations*: The operations to be assigned hardware instances.
-///  - *Resource types*: Named pools of fungible hardware instances, each pool
-///    bounded by an *instance limit*. Every operation that participates in
-///    binding is linked to exactly one resource type.
-///
 /// Per-operation inputs (populated by the client, typically from a completed
-/// schedule):
+/// schedule plus an IR-structure analysis):
 ///
-///  - `startTime` — the cycle in which the operation begins using its
-///    assigned instance.
-///  - `latency` — the number of consecutive cycles for which the operation
-///    occupies its assigned instance, starting at `startTime`. For
-///    fully-pipelined hardware units a value of 1 is appropriate; for
-///    non-pipelined multi-cycle units (e.g. a sequential divider), pass the
-///    full occupancy in cycles.
+///  - `startTime` — the cycle at which the operation first activates,
+///    measured in the timebase of its `concurrencyGroup`.
+///  - `latency` — cycles the operation holds its assigned instance per
+///    activation. For fully-pipelined hardware units a value of 1 is
+///    appropriate; for non-pipelined multi-cycle units (e.g. a sequential
+///    divider), pass the full occupancy in cycles. Must be non-zero.
+///  - `period` — cycles between successive activations. `0` (default)
+///    denotes a non-repeating op (a single activation).
+///  - `count` — number of activations. Default is `1`. Ignored when
+///    `period == 0`.
+///  - `concurrencyGroup` — a pointer to the IR op whose timebase this op
+///    lives in (typically the innermost inline frame or func_pipeline).
+///    Ops in different concurrency groups are considered non-concurrent
+///    and never conflict. An unset group is treated as a universal group
+///    that may be concurrent with any other unset group — set this
+///    explicitly if you want cross-region sharing.
 ///  - `linkedResourceType` — the resource pool this operation contends for.
 ///
 /// Per-resource-type inputs:
@@ -66,8 +93,8 @@ namespace binding {
 ///
 /// Per-operation output (populated by a binder):
 ///
-///  - `instance` — the instance id in `[0, instanceLimit)` that this
-///    operation uses.
+///  - `instance` — the instance id in `[0, instanceLimit)` this operation
+///    uses.
 ///
 /// The `check...` methods perform validity checks on the inputs before
 /// binding. The `verify...` methods check the correctness of the solution
@@ -134,6 +161,9 @@ private:
   // Operation inputs (populated by the client).
   OperationProperty<unsigned> startTime;
   OperationProperty<unsigned> latency;
+  OperationProperty<unsigned> period;
+  OperationProperty<unsigned> count;
+  OperationProperty<Operation *> concurrencyGroup;
   OperationProperty<ResourceType> linkedResourceType;
 
   // Resource-type inputs (populated by the client).
@@ -181,18 +211,41 @@ public:
   // Access to properties
   //===--------------------------------------------------------------------===//
 public:
-  /// The cycle in which \p op begins using its assigned instance. Input.
+  /// The cycle in which \p op first activates (in its concurrency group's
+  /// timebase). Input.
   std::optional<unsigned> getStartTime(Operation *op) {
     return startTime.lookup(op);
   }
   void setStartTime(Operation *op, unsigned val) { startTime[op] = val; }
 
-  /// The number of consecutive cycles for which \p op occupies its assigned
-  /// instance starting at its `startTime`. Input.
+  /// Cycles \p op holds its assigned instance per activation. Input.
   std::optional<unsigned> getLatency(Operation *op) {
     return latency.lookup(op);
   }
   void setLatency(Operation *op, unsigned val) { latency[op] = val; }
+
+  /// Cycles between successive activations of \p op. `0` (or unset) means
+  /// \p op has a single activation (non-repeating). Input.
+  std::optional<unsigned> getPeriod(Operation *op) {
+    return period.lookup(op);
+  }
+  void setPeriod(Operation *op, unsigned val) { period[op] = val; }
+
+  /// Number of activations of \p op. Default is 1 when unset. Ignored when
+  /// `period == 0`. Input.
+  std::optional<unsigned> getCount(Operation *op) { return count.lookup(op); }
+  void setCount(Operation *op, unsigned val) { count[op] = val; }
+
+  /// The IR op whose timebase \p op lives in (typically the innermost
+  /// inline frame or func_pipeline). Ops sharing a concurrency group may
+  /// execute simultaneously; ops with distinct groups are guaranteed
+  /// non-concurrent and never conflict.
+  std::optional<Operation *> getConcurrencyGroup(Operation *op) {
+    return concurrencyGroup.lookup(op);
+  }
+  void setConcurrencyGroup(Operation *op, Operation *group) {
+    concurrencyGroup[op] = group;
+  }
 
   /// The resource pool \p op contends for. Input.
   std::optional<ResourceType> getLinkedResourceType(Operation *op) {
@@ -210,21 +263,33 @@ public:
     instanceLimit[rsrc] = val;
   }
 
-  /// The instance id assigned to \p op, in `[0, instanceLimit(rsrc))`. Output
-  /// — populated by a binding algorithm.
+  /// The instance id assigned to \p op, in `[0, instanceLimit(rsrc))`.
+  /// Output — populated by a binding algorithm.
   std::optional<unsigned> getInstance(Operation *op) {
     return instance.lookup(op);
   }
   void setInstance(Operation *op, unsigned val) { instance[op] = val; }
 
   //===--------------------------------------------------------------------===//
-  // Access to derived properties
+  // Conflict predicate
   //===--------------------------------------------------------------------===//
 public:
-  /// The last cycle (inclusive) in which \p op occupies its assigned instance.
-  /// Equals `startTime + latency - 1`. Returns `std::nullopt` if either input
-  /// is missing.
-  std::optional<unsigned> getEndTime(Operation *op);
+  /// True iff \p a and \p b can ever be live at the same cycle on the same
+  /// resource instance. Decomposes into (1) a concurrency check — do they
+  /// share a group — and (2) an AP-of-intervals intersection on their
+  /// occupancies. Virtual so specializations (e.g. port-kind) can refine.
+  virtual bool conflicts(Operation *a, Operation *b);
+
+protected:
+  /// True iff \p a and \p b may execute at overlapping wall-clock cycles.
+  /// Default: same concurrency group (or both unset, treated as a shared
+  /// universal group).
+  virtual bool areConcurrent(Operation *a, Operation *b);
+
+  /// True iff \p a and \p b's AP-of-intervals occupancies intersect,
+  /// interpreted in a shared timebase. Caller must have already established
+  /// concurrency (same group); this function does the arithmetic.
+  bool occupanciesOverlap(Operation *a, Operation *b);
 
   //===--------------------------------------------------------------------===//
   // Properties as string key-value pairs (e.g. for DOT graphs)
@@ -245,6 +310,8 @@ protected:
   virtual LogicalResult checkStartTime(Operation *op);
   /// \p op has a non-zero latency.
   virtual LogicalResult checkLatency(Operation *op);
+  /// If \p op sets `period > 0`, it also has a non-zero `count`.
+  virtual LogicalResult checkOccupancy(Operation *op);
   /// \p op is linked to a registered resource type.
   virtual LogicalResult checkLinkedResourceType(Operation *op);
   /// \p rsrc has a non-zero instance limit.
@@ -252,8 +319,8 @@ protected:
   /// \p op has an assigned instance in `[0, limit)` for its linked resource.
   virtual LogicalResult verifyInstance(Operation *op);
   /// \p rsrc is not oversubscribed: for every pair of ops `a`, `b` in the
-  /// pool with `getInstance(a) == getInstance(b)`, their occupancy intervals
-  /// `[start, start+latency-1]` must not overlap.
+  /// pool with `getInstance(a) == getInstance(b)`, `conflicts(a, b)` is
+  /// false.
   virtual LogicalResult verifyUtilization(ResourceType rsrc);
 
   //===--------------------------------------------------------------------===//
@@ -269,46 +336,6 @@ public:
   virtual LogicalResult verify();
 };
 
-/// This class models a binding problem where operations belong to a
-/// pipelined region with initiation interval `II`. Occupancy intervals are
-/// evaluated modulo `II`: two operations conflict on the same instance if
-/// and only if their `[start, start+latency-1]` intervals overlap when
-/// projected into any residue class `mod II`.
-///
-/// Pipelined binding is the common case inside `loopschedule.pipeline` /
-/// `loopschedule.func_pipeline`: the modulo scheduler has already guaranteed
-/// that no residue class oversubscribes the pool, so binding becomes a
-/// trivial in-class assignment. The verify contract is what differs from the
-/// base problem.
-class ModuloBindingProblem : public virtual BindingProblem {
-public:
-  static constexpr auto name = "ModuloBindingProblem";
-  using BindingProblem::BindingProblem;
-
-protected:
-  ModuloBindingProblem() = default;
-
-private:
-  std::optional<unsigned> initiationInterval;
-
-public:
-  /// The initiation interval — the period, in cycles, at which new
-  /// iterations enter the pipeline. Every op's occupancy interval is
-  /// evaluated modulo this value.
-  std::optional<unsigned> getInitiationInterval() { return initiationInterval; }
-  void setInitiationInterval(unsigned val) { initiationInterval = val; }
-
-protected:
-  /// This problem has a non-zero II.
-  virtual LogicalResult checkInitiationInterval();
-  /// \p rsrc is not oversubscribed in any residue class `mod II`.
-  virtual LogicalResult verifyUtilization(ResourceType rsrc) override;
-
-public:
-  virtual LogicalResult check() override;
-  virtual LogicalResult verify() override;
-};
-
 /// This class models binding on a pool of physical instances partitioned by
 /// access kind — e.g. a memory with some read-only ports, some write-only
 /// ports, and some read/write ports. Every op declares its `accessKind`; a
@@ -316,10 +343,6 @@ public:
 /// `Write` or `ReadWrite`. Instance ids are globally unique across the
 /// resource (`[0, totalInstances)`), but the sub-pool partition determines
 /// which ids are legal for each op.
-///
-/// This is the minimum machinery needed to express multi-port memories with
-/// heterogeneous ports without introducing per-port-kind resource types
-/// (which would explode the resource namespace).
 class PortKindBindingProblem : public virtual BindingProblem {
 public:
   static constexpr auto name = "PortKindBindingProblem";
