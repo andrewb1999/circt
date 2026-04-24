@@ -3,6 +3,7 @@
 ##===----------------------------------------------------------------------===//
 
 add_subdirectory(Analysis)
+add_subdirectory(Binding)
 add_subdirectory(Bindings)
 add_subdirectory(CAPI)
 add_subdirectory(Conversion)
