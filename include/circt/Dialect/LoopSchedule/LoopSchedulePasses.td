@@ -64,6 +64,26 @@ def PipelineForLoopSchedule : Pass<"pipeline-for-loopschedule", "::mlir::func::F
   let dependentDialects = ["mlir::affine::AffineDialect", "mlir::func::FuncDialect"];
 }
 
+def LoopScheduleBinding : Pass<"loopschedule-binding", "mlir::ModuleOp"> {
+  let summary = "Assign hardware instance ids to scheduled loopschedule ops.";
+  let description = [{
+    Walks each `loopschedule.func_sequential` / `loopschedule.func_pipeline`
+    and runs the binding framework on its scheduled ops. For every op
+    that contends for a limited resource (memory ports, shared arith
+    operators, etc.), this pass stamps a `loopschedule.binding = K` attr
+    identifying the hardware instance within that resource's pool.
+
+    Bare-bones at the moment: the pass is registered and walks the
+    expected func containers, but does not yet populate binding problems
+    or stamp attributes. Subsequent changes will fill in the per-op
+    resource-linking and the `bindLeftEdge` call.
+  }];
+  let constructor = "circt::loopschedule::createLoopScheduleBindingPass()";
+  let dependentDialects = [
+    "circt::loopschedule::LoopScheduleDialect"
+  ];
+}
+
 def LoopScheduleTestbenchGeneration : Pass<"loopschedule-testbench-generation", "mlir::ModuleOp"> {
   let summary = "Generate a simulation testbench for LoopScheduleToFSM output";
   let constructor = "circt::loopschedule::createLoopScheduleTestbenchGenerationPass()";
