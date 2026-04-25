@@ -217,15 +217,53 @@ struct PortArgInfo {
 /// `OperatorAllocation` emits as the memory's hardware port count.
 /// Returns 1 if no binding metadata is present (single-port default).
 ///
-/// TODO(multi-port): currently stubbed to return 1 — the rest of the FSM
-/// lowering (MemPortMapping, merge logic, output construction, submodule
-/// forwarding, seq.hlmem backing) still assumes one port group per memref.
-/// Flipping this to the real value is the last step after those paths are
-/// parameterized by port index. The lookup machinery below is what that
-/// flip will consult.
+/// TODO(multi-port): currently stubbed to 1 — the rest of the FSM
+/// lowering (mergeStepMemPorts, output construction, instance
+/// extraction, seq.hlmem backing) still produces a single port group
+/// per memref. Flipping this to the real `lookup` body once those paths
+/// are extended will activate end-to-end multi-port lowering.
 static unsigned computeNumPortsFromUsers(Value memref) {
   (void)memref;
   return 1;
+}
+
+/// Read an op's `loopschedule.binding` attr, defaulting to 0 (port 0).
+static unsigned getBindingPort(Operation *op) {
+  if (auto attr = op->getAttrOfType<IntegerAttr>("loopschedule.binding"))
+    return static_cast<unsigned>(attr.getInt());
+  return 0;
+}
+
+/// Pointer-bundle into a `MemPortMapping`'s drives for a specific port.
+/// Port 0 aliases the direct fields; higher ports live in `extraPorts`.
+/// Pointer members keep the bundle copy-/assignable.
+struct PortDrivesRef {
+  Value *rdData = nullptr;
+  SmallVector<Value> *addrs = nullptr;
+  Value *wrData = nullptr;
+  Value *wrEn = nullptr;
+  Value *rdEn = nullptr;
+};
+
+inline PortDrivesRef portRef(MemPortMapping &mp, unsigned k) {
+  PortDrivesRef ref;
+  if (k == 0) {
+    ref.rdData = &mp.rdData;
+    ref.addrs = &mp.addrs;
+    ref.wrData = &mp.wrData;
+    ref.wrEn = &mp.wrEn;
+    ref.rdEn = &mp.rdEn;
+    return ref;
+  }
+  while (mp.extraPorts.size() < k)
+    mp.extraPorts.emplace_back();
+  auto &p = mp.extraPorts[k - 1];
+  ref.rdData = &p.rdData;
+  ref.addrs = &p.addrs;
+  ref.wrData = &p.wrData;
+  ref.wrEn = &p.wrEn;
+  ref.rdEn = &p.rdEn;
+  return ref;
 }
 
 /// Build a PortArgInfo for a memref-backed value (function argument or
@@ -646,72 +684,63 @@ private:
 // Load/store helpers
 //===----------------------------------------------------------------------===//
 
-/// Resolve the per-dim address values for a memory access, given the
-/// address bit widths the memory expects. Looks up the port mapping,
-/// walks the access's indices, and width-fixes each. Stores the
-/// resulting addresses into `portsOut->addrs`.
-static LogicalResult
-prepareHWAccess(Operation *op, Value memValue, ValueRange indexVals,
-                 ArrayRef<unsigned> addrWidths, OpBuilder &builder,
-                 IRMapping &mapping,
-                 DenseMap<Value, MemPortMapping> &memPorts,
-                 MemPortMapping *&portsOut) {
-  auto it = memPorts.find(memValue);
-  if (it == memPorts.end())
-    return op->emitError("unmapped memory");
-  portsOut = &it->second;
-  if (indexVals.size() != addrWidths.size())
-    return op->emitError("memory access index count (")
-           << indexVals.size() << ") does not match memory rank ("
-           << addrWidths.size() << ")";
-  portsOut->addrs.resize(addrWidths.size());
-  for (auto [d, idx] : llvm::enumerate(indexVals)) {
-    Value addr = mapping.lookup(idx);
-    portsOut->addrs[d] = resizeIntTo(builder, op->getLoc(), addr, addrWidths[d]);
-  }
-  return success();
-}
-
 /// Lower any `HWLoadLoweringInterface` op: drive the read addresses on
-/// the memory port mapping and map the load result to the port's read
-/// data. If the op requires an explicit read-enable, drive it from
-/// `rdEnGate`; otherwise leave rdEn untouched (memref ports are
-/// implicitly always-on).
+/// the memory port mapping (port selected by `loopschedule.binding`,
+/// default 0) and map the load result to the port's read data.
 static LogicalResult
 handleHWLoad(loopschedule::HWLoadLoweringInterface loadOp, OpBuilder &builder,
              IRMapping &mapping,
              DenseMap<Value, MemPortMapping> &memPorts,
              Value rdEnGate = nullptr) {
   SmallVector<unsigned> widths = loadOp.getAddrWidths();
-  MemPortMapping *ports = nullptr;
-  if (failed(prepareHWAccess(loadOp, loadOp.getMemoryValue(),
-                              loadOp.getIndices(), widths, builder, mapping,
-                              memPorts, ports)))
-    return failure();
+  unsigned port = getBindingPort(loadOp);
+  auto it = memPorts.find(loadOp.getMemoryValue());
+  if (it == memPorts.end())
+    return loadOp->emitError("unmapped memory");
+  PortDrivesRef pref = portRef(it->second, port);
+  if (loadOp.getIndices().size() != widths.size())
+    return loadOp->emitError("memory access index count (")
+           << loadOp.getIndices().size() << ") does not match memory rank ("
+           << widths.size() << ")";
+  pref.addrs->resize(widths.size());
+  for (auto [d, idx] : llvm::enumerate(loadOp.getIndices())) {
+    Value addr = mapping.lookup(idx);
+    (*pref.addrs)[d] =
+        resizeIntTo(builder, loadOp->getLoc(), addr, widths[d]);
+  }
   if (loadOp.requiresReadEnable()) {
     assert(rdEnGate && "HW load requires an explicit read-enable gate");
-    ports->rdEn = rdEnGate;
+    *pref.rdEn = rdEnGate;
   }
-  mapping.map(loadOp.getResult(), ports->rdData);
+  mapping.map(loadOp.getResult(), *pref.rdData);
   return success();
 }
 
 /// Lower any `HWStoreLoweringInterface` op: drive the addresses, write
-/// data, and write enable (gated by `wrEnGate`) on the memory port
-/// mapping.
+/// data, and write enable (gated by `wrEnGate`) on the bound port.
 static LogicalResult
 handleHWStore(loopschedule::HWStoreLoweringInterface storeOp,
                OpBuilder &builder, IRMapping &mapping, Value wrEnGate,
                DenseMap<Value, MemPortMapping> &memPorts) {
   assert(wrEnGate && "handleHWStore requires a wrEnGate");
   SmallVector<unsigned> widths = storeOp.getAddrWidths();
-  MemPortMapping *ports = nullptr;
-  if (failed(prepareHWAccess(storeOp, storeOp.getMemoryValue(),
-                              storeOp.getIndices(), widths, builder, mapping,
-                              memPorts, ports)))
-    return failure();
-  ports->wrData = mapping.lookup(storeOp.getValueToStore());
-  ports->wrEn = wrEnGate;
+  unsigned port = getBindingPort(storeOp);
+  auto it = memPorts.find(storeOp.getMemoryValue());
+  if (it == memPorts.end())
+    return storeOp->emitError("unmapped memory");
+  PortDrivesRef pref = portRef(it->second, port);
+  if (storeOp.getIndices().size() != widths.size())
+    return storeOp->emitError("memory access index count (")
+           << storeOp.getIndices().size() << ") does not match memory rank ("
+           << widths.size() << ")";
+  pref.addrs->resize(widths.size());
+  for (auto [d, idx] : llvm::enumerate(storeOp.getIndices())) {
+    Value addr = mapping.lookup(idx);
+    (*pref.addrs)[d] =
+        resizeIntTo(builder, storeOp->getLoc(), addr, widths[d]);
+  }
+  *pref.wrData = mapping.lookup(storeOp.getValueToStore());
+  *pref.wrEn = wrEnGate;
   return success();
 }
 
