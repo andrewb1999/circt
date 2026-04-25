@@ -1851,9 +1851,40 @@ static void buildLoopModuleOutput(
   hw::OutputOp::create(builder, loc, outputs);
 }
 
+/// Per-port read accessor for a `MemPortMapping`. Returns null pointers
+/// when the requested port has not been allocated (used by merge logic
+/// to default unset drives to zero).
+struct PortDrivesView {
+  const SmallVector<Value> *addrs = nullptr;
+  Value wrData;
+  Value wrEn;
+  Value rdEn;
+};
+
+inline PortDrivesView portView(const MemPortMapping &mp, unsigned k) {
+  PortDrivesView v;
+  if (k == 0) {
+    v.addrs = &mp.addrs;
+    v.wrData = mp.wrData;
+    v.wrEn = mp.wrEn;
+    v.rdEn = mp.rdEn;
+    return v;
+  }
+  if (mp.extraPorts.size() <= k - 1)
+    return v;
+  auto &p = mp.extraPorts[k - 1];
+  v.addrs = &p.addrs;
+  v.wrData = p.wrData;
+  v.wrEn = p.wrEn;
+  v.rdEn = p.rdEn;
+  return v;
+}
+
 /// Merge per-step memory port mappings into a single mapping using
 /// step_running signals. Since steps are mutually exclusive, a priority mux
-/// chain selects the active step's ports.
+/// chain selects the active step's ports. Loops over each declared port
+/// of the memref independently — accesses bound to port K only contend
+/// with other port-K accesses.
 static void mergeStepMemPorts(
     OpBuilder &builder, Location loc,
     ArrayRef<DenseMap<Value, MemPortMapping>> perStepPorts,
@@ -1866,55 +1897,56 @@ static void mergeStepMemPorts(
 
   for (auto &memInfo : memrefArgs) {
     Type dataType = memInfo.elementType;
-
-    // Start with zero defaults: one per dim, plus wrData/wrEn/(rdEn).
-    SmallVector<Value> addrs;
-    for (unsigned w : memInfo.addrWidths) {
-      Type addrType = IntegerType::get(ctx, w);
-      addrs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
-    }
-    Value wrData = hw::ConstantOp::create(builder, loc, dataType, 0);
-    Value wrEn = hw::ConstantOp::create(builder, loc, i1, 0);
-    Value rdEn = memInfo.requiresRdEn
-                     ? hw::ConstantOp::create(builder, loc, i1, 0)
-                     : Value();
-
-    // Build priority mux chain (last step has lowest priority).
-    for (int i = perStepPorts.size() - 1; i >= 0; --i) {
-      auto it = perStepPorts[i].find(memInfo.originalArg);
-      if (it == perStepPorts[i].end())
-        continue;
-      auto &ports = it->second;
-      for (auto [d, w] : llvm::enumerate(memInfo.addrWidths)) {
-        Type addrType = IntegerType::get(ctx, w);
-        Value stepAddr = (d < ports.addrs.size() && ports.addrs[d])
-            ? ports.addrs[d]
-            : hw::ConstantOp::create(builder, loc, addrType, 0);
-        addrs[d] = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
-                                        stepAddr, addrs[d]);
-      }
-      Value stepWrData = ports.wrData ? ports.wrData
-          : hw::ConstantOp::create(builder, loc, dataType, 0);
-      Value stepWrEn = ports.wrEn ? ports.wrEn
-          : hw::ConstantOp::create(builder, loc, i1, 0);
-      wrData = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
-                                    stepWrData, wrData);
-      wrEn = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
-                                  stepWrEn, wrEn);
-      if (memInfo.requiresRdEn) {
-        Value stepRdEn = ports.rdEn ? ports.rdEn
-            : hw::ConstantOp::create(builder, loc, i1, 0);
-        rdEn = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
-                                    stepRdEn, rdEn);
-      }
-    }
-
     auto &merged = mergedPorts[memInfo.originalArg];
-    merged.addrs = std::move(addrs);
-    merged.wrData = wrData;
-    merged.wrEn = wrEn;
-    if (memInfo.requiresRdEn)
-      merged.rdEn = rdEn;
+
+    for (unsigned port = 0; port < memInfo.numPorts; ++port) {
+      SmallVector<Value> addrs;
+      for (unsigned w : memInfo.addrWidths) {
+        Type addrType = IntegerType::get(ctx, w);
+        addrs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
+      }
+      Value wrData = hw::ConstantOp::create(builder, loc, dataType, 0);
+      Value wrEn = hw::ConstantOp::create(builder, loc, i1, 0);
+      Value rdEn = memInfo.requiresRdEn
+                       ? hw::ConstantOp::create(builder, loc, i1, 0)
+                       : Value();
+
+      for (int i = perStepPorts.size() - 1; i >= 0; --i) {
+        auto it = perStepPorts[i].find(memInfo.originalArg);
+        if (it == perStepPorts[i].end())
+          continue;
+        PortDrivesView pv = portView(it->second, port);
+        for (auto [d, w] : llvm::enumerate(memInfo.addrWidths)) {
+          Type addrType = IntegerType::get(ctx, w);
+          Value stepAddr = (pv.addrs && d < pv.addrs->size() && (*pv.addrs)[d])
+              ? (*pv.addrs)[d]
+              : hw::ConstantOp::create(builder, loc, addrType, 0);
+          addrs[d] = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
+                                          stepAddr, addrs[d]);
+        }
+        Value stepWrData = pv.wrData ? pv.wrData
+            : hw::ConstantOp::create(builder, loc, dataType, 0);
+        Value stepWrEn = pv.wrEn ? pv.wrEn
+            : hw::ConstantOp::create(builder, loc, i1, 0);
+        wrData = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
+                                      stepWrData, wrData);
+        wrEn = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
+                                    stepWrEn, wrEn);
+        if (memInfo.requiresRdEn) {
+          Value stepRdEn = pv.rdEn ? pv.rdEn
+              : hw::ConstantOp::create(builder, loc, i1, 0);
+          rdEn = comb::MuxOp::create(builder, loc, stepRunningSignals[i],
+                                      stepRdEn, rdEn);
+        }
+      }
+
+      PortDrivesRef mref = portRef(merged, port);
+      *mref.addrs = std::move(addrs);
+      *mref.wrData = wrData;
+      *mref.wrEn = wrEn;
+      if (memInfo.requiresRdEn)
+        *mref.rdEn = rdEn;
+    }
   }
 }
 
