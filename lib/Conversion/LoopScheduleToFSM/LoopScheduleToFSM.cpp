@@ -216,18 +216,43 @@ struct PortArgInfo {
 /// up the referenced `oplib.operator`'s declared `limit` attribute, which
 /// `OperatorAllocation` emits as the memory's hardware port count.
 /// Returns 1 if no binding metadata is present (single-port default).
-///
-/// TODO(multi-port): currently stubbed to 1 — `appendPortOutputPorts`,
-/// `appendPortOutputValues`, `createHWModule`, `createLoopModule`, and
-/// `mergeStepMemPorts` are now multi-port-aware, but the sequential-
-/// child instance-forwarding sites in `lowerFunction` and
-/// `lowerLoopNodeAsModule` still pass / consume one port group per
-/// memref. Flipping this to the real lookup body once those forwarding
-/// sites and the `seq.hlmem` backing are extended will activate
-/// end-to-end multi-port lowering.
 static unsigned computeNumPortsFromUsers(Value memref) {
+  // TODO(multi-port): full lookup is below but currently commented out.
+  // With the lookup active, single-port AMC/CIRCT lit tests pass and the
+  // top-level hw.module port list correctly doubles per-memref ports, but
+  // a separate BackedgeBuilder type assertion fires somewhere in the
+  // Allo end-to-end flow — an off-by-one in port-group result indexing
+  // slips through that the single-port regressions don't catch. Keeping
+  // stubbed until that's tracked down.
   (void)memref;
   return 1;
+#if 0
+  auto moduleOp = memref.getParentRegion()
+                      ->getParentOfType<ModuleOp>();
+  if (!moduleOp)
+    return 1;
+  for (Operation *user : memref.getUsers()) {
+    if (!isa<loopschedule::LoopScheduleLoadOp,
+              loopschedule::LoopScheduleStoreOp>(user))
+      continue;
+    auto attr =
+        user->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+    if (!attr)
+      continue;
+    StringRef leaf = attr.getLeafReference().getValue();
+    for (auto lib : moduleOp.getOps<oplib::LibraryOp>()) {
+      for (auto op : lib.getBodyBlock()->getOps<oplib::OperatorOp>()) {
+        if (op.getSymName() == leaf) {
+          if (auto limit = op.getLimit())
+            return static_cast<unsigned>(*limit);
+          return 1;
+        }
+      }
+    }
+    break;
+  }
+  return 1;
+#endif
 }
 
 /// Read an op's `loopschedule.binding` attr, defaulting to 0 (port 0).
@@ -2593,9 +2618,18 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           for (auto &memInfo : memrefArgs) {
             bool hasRdInput =
                 memInfo.isAmcPort ? memInfo.isRead : true;
-            if (hasRdInput)
-              childInputs.push_back(
-                  perFramePorts[frameIdx][memInfo.originalArg].rdData);
+            if (!hasRdInput)
+              continue;
+            auto &callerMp =
+                perFramePorts[frameIdx][memInfo.originalArg];
+            childInputs.push_back(callerMp.rdData);
+            for (unsigned k = 1; k < memInfo.numPorts; ++k) {
+              if (k - 1 < callerMp.extraPorts.size())
+                childInputs.push_back(callerMp.extraPorts[k - 1].rdData);
+              else
+                childInputs.push_back(hw::ConstantOp::create(
+                    hw, loc, memInfo.elementType, 0));
+            }
           }
 
           auto childInst = hw::InstanceOp::create(
@@ -2633,58 +2667,57 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           handleValueMap[launchOp.getHandle()] = std::move(childResultVals);
 
           // Mux this child's memory drives into perFramePorts[frameIdx]
-          // under slotChildActive. Multiple launches in the same frame
-          // mux through cascading under each slot's active signal.
+          // under slotChildActive, per port. Multiple launches in the
+          // same frame mux through cascading under each slot's active
+          // signal.
           for (auto &memInfo : memrefArgs) {
             auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
-            SmallVector<Value> childAddrs;
-            for (unsigned d = 0; d < widths.size(); ++d)
-              childAddrs.push_back(childInst.getResult(outIdx++));
-            Value childRdEn = memInfo.requiresRdEn
-                                  ? childInst.getResult(outIdx++)
-                                  : Value();
             bool emitWrite =
                 memInfo.isAmcPort ? memInfo.isWrite : true;
-            Value childWrData, childWrEn;
-            if (emitWrite) {
-              childWrData = childInst.getResult(outIdx++);
-              childWrEn = childInst.getResult(outIdx++);
-            }
-
-            auto &ports =
-                perFramePorts[frameIdx][memInfo.originalArg];
-            if (ports.addrs.size() != widths.size())
-              ports.addrs.assign(widths.size(), Value());
             Type dataType = memInfo.elementType;
-            for (auto [d, w] : llvm::enumerate(widths)) {
-              Type addrType = IntegerType::get(ctx, w);
-              Value myAddr =
-                  ports.addrs[d] ? ports.addrs[d]
-                                 : hw::ConstantOp::create(hw, loc,
-                                                          addrType, 0);
-              ports.addrs[d] =
-                  comb::MuxOp::create(hw, loc, slotChildActive,
-                                       childAddrs[d], myAddr);
-            }
-            if (memInfo.requiresRdEn) {
-              Value myRdEn =
-                  ports.rdEn ? ports.rdEn
-                             : hw::ConstantOp::create(hw, loc, i1, 0);
-              ports.rdEn = comb::MuxOp::create(hw, loc, slotChildActive,
-                                                childRdEn, myRdEn);
-            }
-            if (emitWrite) {
-              Value myWrData =
-                  ports.wrData ? ports.wrData
-                               : hw::ConstantOp::create(hw, loc,
-                                                        dataType, 0);
-              Value myWrEn =
-                  ports.wrEn ? ports.wrEn
-                             : hw::ConstantOp::create(hw, loc, i1, 0);
-              ports.wrData = comb::MuxOp::create(hw, loc, slotChildActive,
-                                                   childWrData, myWrData);
-              ports.wrEn = comb::MuxOp::create(hw, loc, slotChildActive,
-                                                childWrEn, myWrEn);
+            for (unsigned port = 0; port < memInfo.numPorts; ++port) {
+              SmallVector<Value> childAddrs;
+              for (unsigned d = 0; d < widths.size(); ++d)
+                childAddrs.push_back(childInst.getResult(outIdx++));
+              Value childRdEn = memInfo.requiresRdEn
+                                    ? childInst.getResult(outIdx++)
+                                    : Value();
+              Value childWrData, childWrEn;
+              if (emitWrite) {
+                childWrData = childInst.getResult(outIdx++);
+                childWrEn = childInst.getResult(outIdx++);
+              }
+              PortDrivesRef portsR =
+                  portRef(perFramePorts[frameIdx][memInfo.originalArg], port);
+              if (portsR.addrs->size() != widths.size())
+                portsR.addrs->assign(widths.size(), Value());
+              for (auto [d, w] : llvm::enumerate(widths)) {
+                Type addrType = IntegerType::get(ctx, w);
+                Value myAddr = (*portsR.addrs)[d]
+                    ? (*portsR.addrs)[d]
+                    : hw::ConstantOp::create(hw, loc, addrType, 0);
+                (*portsR.addrs)[d] = comb::MuxOp::create(
+                    hw, loc, slotChildActive, childAddrs[d], myAddr);
+              }
+              if (memInfo.requiresRdEn) {
+                Value myRdEn = *portsR.rdEn ? *portsR.rdEn
+                                            : hw::ConstantOp::create(
+                                                  hw, loc, i1, 0);
+                *portsR.rdEn = comb::MuxOp::create(
+                    hw, loc, slotChildActive, childRdEn, myRdEn);
+              }
+              if (emitWrite) {
+                Value myWrData = *portsR.wrData
+                    ? *portsR.wrData
+                    : hw::ConstantOp::create(hw, loc, dataType, 0);
+                Value myWrEn = *portsR.wrEn ? *portsR.wrEn
+                                            : hw::ConstantOp::create(
+                                                  hw, loc, i1, 0);
+                *portsR.wrData = comb::MuxOp::create(
+                    hw, loc, slotChildActive, childWrData, myWrData);
+                *portsR.wrEn = comb::MuxOp::create(
+                    hw, loc, slotChildActive, childWrEn, myWrEn);
+              }
             }
           }
         } else if (slot.pipIdx >= 0) {
@@ -4239,8 +4272,17 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         childInputs.push_back(mapping.lookup(cap));
       for (auto &memInfo : memrefArgs) {
         bool hasRdInput = memInfo.isAmcPort ? memInfo.isRead : true;
-        if (hasRdInput)
-          childInputs.push_back(memPortMap[memInfo.originalArg].rdData);
+        if (!hasRdInput)
+          continue;
+        auto &callerMp = memPortMap[memInfo.originalArg];
+        childInputs.push_back(callerMp.rdData);
+        for (unsigned k = 1; k < memInfo.numPorts; ++k) {
+          if (k - 1 < callerMp.extraPorts.size())
+            childInputs.push_back(callerMp.extraPorts[k - 1].rdData);
+          else
+            childInputs.push_back(hw::ConstantOp::create(
+                builder, loc, memInfo.elementType, 0));
+        }
       }
 
       auto childInst = hw::InstanceOp::create(
@@ -4277,19 +4319,22 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
             std::move(childResultVals);
       }
 
-      // Extract child memory outputs into per-entry ports.
+      // Extract child memory outputs into per-entry ports, per-port.
       for (auto &memInfo : memrefArgs) {
         auto &mp = perEntryPorts[ei][memInfo.originalArg];
         auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
-        mp.addrs.assign(widths.size(), Value());
-        for (unsigned d = 0; d < widths.size(); ++d)
-          mp.addrs[d] = childInst.getResult(outIdx++);
-        if (memInfo.requiresRdEn)
-          mp.rdEn = childInst.getResult(outIdx++);
         bool emitWrite = memInfo.isAmcPort ? memInfo.isWrite : true;
-        if (emitWrite) {
-          mp.wrData = childInst.getResult(outIdx++);
-          mp.wrEn = childInst.getResult(outIdx++);
+        for (unsigned port = 0; port < memInfo.numPorts; ++port) {
+          PortDrivesRef portsR = portRef(mp, port);
+          portsR.addrs->assign(widths.size(), Value());
+          for (unsigned d = 0; d < widths.size(); ++d)
+            (*portsR.addrs)[d] = childInst.getResult(outIdx++);
+          if (memInfo.requiresRdEn)
+            *portsR.rdEn = childInst.getResult(outIdx++);
+          if (emitWrite) {
+            *portsR.wrData = childInst.getResult(outIdx++);
+            *portsR.wrEn = childInst.getResult(outIdx++);
+          }
         }
       }
 
