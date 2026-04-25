@@ -217,11 +217,14 @@ struct PortArgInfo {
 /// `OperatorAllocation` emits as the memory's hardware port count.
 /// Returns 1 if no binding metadata is present (single-port default).
 ///
-/// TODO(multi-port): currently stubbed to 1 — the rest of the FSM
-/// lowering (mergeStepMemPorts, output construction, instance
-/// extraction, seq.hlmem backing) still produces a single port group
-/// per memref. Flipping this to the real `lookup` body once those paths
-/// are extended will activate end-to-end multi-port lowering.
+/// TODO(multi-port): currently stubbed to 1 — `appendPortOutputPorts`,
+/// `appendPortOutputValues`, `createHWModule`, `createLoopModule`, and
+/// `mergeStepMemPorts` are now multi-port-aware, but the sequential-
+/// child instance-forwarding sites in `lowerFunction` and
+/// `lowerLoopNodeAsModule` still pass / consume one port group per
+/// memref. Flipping this to the real lookup body once those forwarding
+/// sites and the `seq.hlmem` backing are extended will activate
+/// end-to-end multi-port lowering.
 static unsigned computeNumPortsFromUsers(Value memref) {
   (void)memref;
   return 1;
@@ -232,6 +235,35 @@ static unsigned getBindingPort(Operation *op) {
   if (auto attr = op->getAttrOfType<IntegerAttr>("loopschedule.binding"))
     return static_cast<unsigned>(attr.getInt());
   return 0;
+}
+
+/// Per-port read accessor for a `MemPortMapping`. Returns null pointers
+/// when the requested port has not been allocated (used by merge logic
+/// to default unset drives to zero).
+struct PortDrivesView {
+  const SmallVector<Value> *addrs = nullptr;
+  Value wrData;
+  Value wrEn;
+  Value rdEn;
+};
+
+inline PortDrivesView portView(const MemPortMapping &mp, unsigned k) {
+  PortDrivesView v;
+  if (k == 0) {
+    v.addrs = &mp.addrs;
+    v.wrData = mp.wrData;
+    v.wrEn = mp.wrEn;
+    v.rdEn = mp.rdEn;
+    return v;
+  }
+  if (mp.extraPorts.size() <= k - 1)
+    return v;
+  auto &p = mp.extraPorts[k - 1];
+  v.addrs = &p.addrs;
+  v.wrData = p.wrData;
+  v.wrEn = p.wrEn;
+  v.rdEn = p.rdEn;
+  return v;
 }
 
 /// Pointer-bundle into a `MemPortMapping`'s drives for a specific port.
@@ -324,7 +356,8 @@ static void appendPortOutputPorts(OpBuilder &builder, StringRef baseName,
 
 /// Append hw.output values for a port-arg's output ports (addr, optional
 /// rd_en, wr_data, wr_en), falling back to safe defaults when the mapping
-/// is absent or incomplete.
+/// is absent or incomplete. For multi-port memories, emits one full
+/// signal group per port in the same order as `appendPortOutputPorts`.
 static void appendPortOutputValues(OpBuilder &builder, Location loc,
                                     const PortArgInfo &info, Value memKey,
                                     DenseMap<Value, MemPortMapping> &memPortMap,
@@ -333,30 +366,33 @@ static void appendPortOutputValues(OpBuilder &builder, Location loc,
   Type i1 = builder.getI1Type();
   auto it = memPortMap.find(memKey);
   bool has = it != memPortMap.end();
-  for (auto [d, w] : llvm::enumerate(info.addrWidths)) {
-    Type addrType = IntegerType::get(ctx, w);
-    if (has && d < it->second.addrs.size() && it->second.addrs[d])
-      outputs.push_back(it->second.addrs[d]);
-    else
-      outputs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
-  }
-  if (info.requiresRdEn) {
-    if (has && it->second.rdEn)
-      outputs.push_back(it->second.rdEn);
-    else
-      outputs.push_back(hw::ConstantOp::create(builder, loc, i1, 0));
-  }
   bool emitWrite = info.isAmcPort ? info.isWrite : true;
-  if (emitWrite) {
-    if (has && it->second.wrData)
-      outputs.push_back(it->second.wrData);
-    else
-      outputs.push_back(
-          hw::ConstantOp::create(builder, loc, info.elementType, 0));
-    if (has && it->second.wrEn)
-      outputs.push_back(it->second.wrEn);
-    else
-      outputs.push_back(hw::ConstantOp::create(builder, loc, i1, 0));
+  for (unsigned port = 0; port < info.numPorts; ++port) {
+    PortDrivesView pv = has ? portView(it->second, port) : PortDrivesView{};
+    for (auto [d, w] : llvm::enumerate(info.addrWidths)) {
+      Type addrType = IntegerType::get(ctx, w);
+      if (pv.addrs && d < pv.addrs->size() && (*pv.addrs)[d])
+        outputs.push_back((*pv.addrs)[d]);
+      else
+        outputs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
+    }
+    if (info.requiresRdEn) {
+      if (pv.rdEn)
+        outputs.push_back(pv.rdEn);
+      else
+        outputs.push_back(hw::ConstantOp::create(builder, loc, i1, 0));
+    }
+    if (emitWrite) {
+      if (pv.wrData)
+        outputs.push_back(pv.wrData);
+      else
+        outputs.push_back(
+            hw::ConstantOp::create(builder, loc, info.elementType, 0));
+      if (pv.wrEn)
+        outputs.push_back(pv.wrEn);
+      else
+        outputs.push_back(hw::ConstantOp::create(builder, loc, i1, 0));
+    }
   }
 }
 
@@ -1785,10 +1821,16 @@ static hw::HWModuleOp createLoopModule(
     if (!hasRdInput)
       continue;
     std::string baseName = "mem" + std::to_string(i);
-    ports.push_back({{builder.getStringAttr(baseName + "_rd_data"),
-                       memInfo.elementType,
-                       hw::ModulePort::Direction::Input}});
-    inputIdx++;
+    bool multi = memInfo.numPorts > 1;
+    for (unsigned port = 0; port < memInfo.numPorts; ++port) {
+      std::string portPrefix = multi ? (baseName + "_p" +
+                                         std::to_string(port))
+                                     : baseName;
+      ports.push_back({{builder.getStringAttr(portPrefix + "_rd_data"),
+                         memInfo.elementType,
+                         hw::ModulePort::Direction::Input}});
+      inputIdx++;
+    }
   }
 
   ports.push_back({{builder.getStringAttr("done"), builder.getI1Type(),
@@ -1818,11 +1860,16 @@ static hw::HWModuleOp createLoopModule(
   for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
     MemPortMapping mp;
     bool hasRdInput = memInfo.isAmcPort ? memInfo.isRead : true;
-    if (hasRdInput)
+    if (hasRdInput) {
       mp.rdData = hwBody->getArgument(argIdx++);
+      for (unsigned k = 1; k < memInfo.numPorts; ++k) {
+        PortDrives p;
+        p.rdData = hwBody->getArgument(argIdx++);
+        p.addrs.assign(memInfo.addrWidths.size(), Value());
+        mp.extraPorts.push_back(p);
+      }
+    }
     mp.addrs.assign(memInfo.addrWidths.size(), Value());
-    mp.wrData = Value();
-    mp.wrEn = Value();
     localMemPortMap[memInfo.originalArg] = mp;
   }
 
@@ -1849,35 +1896,6 @@ static void buildLoopModuleOutput(
                            localMemPortMap, outputs);
 
   hw::OutputOp::create(builder, loc, outputs);
-}
-
-/// Per-port read accessor for a `MemPortMapping`. Returns null pointers
-/// when the requested port has not been allocated (used by merge logic
-/// to default unset drives to zero).
-struct PortDrivesView {
-  const SmallVector<Value> *addrs = nullptr;
-  Value wrData;
-  Value wrEn;
-  Value rdEn;
-};
-
-inline PortDrivesView portView(const MemPortMapping &mp, unsigned k) {
-  PortDrivesView v;
-  if (k == 0) {
-    v.addrs = &mp.addrs;
-    v.wrData = mp.wrData;
-    v.wrEn = mp.wrEn;
-    v.rdEn = mp.rdEn;
-    return v;
-  }
-  if (mp.extraPorts.size() <= k - 1)
-    return v;
-  auto &p = mp.extraPorts[k - 1];
-  v.addrs = &p.addrs;
-  v.wrData = p.wrData;
-  v.wrEn = p.wrEn;
-  v.rdEn = p.rdEn;
-  return v;
 }
 
 /// Merge per-step memory port mappings into a single mapping using
@@ -3539,11 +3557,18 @@ static hw::HWModuleOp createHWModule(
     if (auto memType = dyn_cast<MemRefType>(arg.getType())) {
       std::string baseName = "mem" + std::to_string(idx);
       Type dataType = memType.getElementType();
-      inputIdx++;
-      ports.push_back({{builder.getStringAttr(baseName + "_rd_data"), dataType,
-                         hw::ModulePort::Direction::Input}});
       PortArgInfo info = makePortArgInfoFromMemref(arg, memType,
                                                     /*isLocalMem=*/false);
+      bool multi = info.numPorts > 1;
+      for (unsigned port = 0; port < info.numPorts; ++port) {
+        std::string portPrefix = multi ? (baseName + "_p" +
+                                           std::to_string(port))
+                                       : baseName;
+        ports.push_back({{builder.getStringAttr(portPrefix + "_rd_data"),
+                           dataType,
+                           hw::ModulePort::Direction::Input}});
+        inputIdx++;
+      }
       appendPortOutputPorts(builder, baseName, info, ports);
     } else {
       ports.push_back(
@@ -3607,10 +3632,18 @@ static hw::HWModuleOp createHWModule(
   for (auto [idx, arg] : llvm::enumerate(funcOp.getArguments())) {
     if (auto memTy = dyn_cast<MemRefType>(arg.getType())) {
       MemPortMapping mp;
+      unsigned numPorts = computeNumPortsFromUsers(arg);
+      // Port 0 lands in the top-level fields; remaining ports populate
+      // `extraPorts[K-1]`. Address slots are pre-sized so handleHWLoad/
+      // Store can index them without re-resizing on first use.
       mp.rdData = hwBody->getArgument(hwArgIdx++);
       mp.addrs.assign(getNumAddrPorts(memTy), Value());
-      mp.wrData = Value();
-      mp.wrEn = Value();
+      for (unsigned k = 1; k < numPorts; ++k) {
+        PortDrives p;
+        p.rdData = hwBody->getArgument(hwArgIdx++);
+        p.addrs.assign(getNumAddrPorts(memTy), Value());
+        mp.extraPorts.push_back(p);
+      }
       memPortMap[arg] = mp;
     } else {
       mapping.map(arg, hwBody->getArgument(hwArgIdx));
