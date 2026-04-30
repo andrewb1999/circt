@@ -3559,9 +3559,16 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
            std::to_string(regIdx))
               .str());
 
+      // Stall-gated CE so iter_args / inter-stage values don't advance
+      // during a multi-bank arbiter stall. The arbiter's address latch
+      // (in `--amc-to-hw`'s arbiter lowering) keeps the in-flight
+      // requests pointing at iter K's addresses across the stall;
+      // gating the iter_arg register here keeps the live-address path
+      // pointing at the same iter so a fresh issue at consume cycle
+      // sees iter K+1's addresses instead of iter K+S.
       Value reg = seq::CompRegClockEnabledOp::create(
-          hwBuilder, loc, mappedVal, clk, stageCE[stageIdx], rst, resetVal,
-          regName);
+          hwBuilder, loc, mappedVal, clk, gatedStageCE[stageIdx], rst,
+          resetVal, regName);
       mapping.map(stageOp.getResult(regIdx), reg);
     }
   }
