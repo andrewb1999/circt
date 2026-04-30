@@ -1857,6 +1857,23 @@ static hw::HWModuleOp createLoopModule(
       inputIdx++;
     }
   }
+  // For amc-port memrefs, also plumb the per-port `done` signal in.
+  // The memory module emits an honest 1-cycle pulse on the cycle the
+  // arbiter actually services this consumer; the loop FSM uses it to
+  // freeze the pipeline (and capture the live rdData) until every
+  // consumer of a shared multi-output arbiter has been served. Memref-
+  // backed entries (function-arg memrefs / local hlmems) don't expose
+  // a done signal — those reads complete in fixed latency and don't
+  // need a handshake.
+  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
+    if (!memInfo.isAmcPort || !memInfo.isRead)
+      continue;
+    std::string baseName = "mem" + std::to_string(i);
+    ports.push_back({{builder.getStringAttr(baseName + "_done"),
+                       builder.getI1Type(),
+                       hw::ModulePort::Direction::Input}});
+    inputIdx++;
+  }
 
   ports.push_back({{builder.getStringAttr("done"), builder.getI1Type(),
                      hw::ModulePort::Direction::Output}});
@@ -1896,6 +1913,12 @@ static hw::HWModuleOp createLoopModule(
     }
     mp.addrs.assign(memInfo.addrWidths.size(), Value());
     localMemPortMap[memInfo.originalArg] = mp;
+  }
+  // Mirror the order of the `mem*_done` input ports added above.
+  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
+    if (!memInfo.isAmcPort || !memInfo.isRead)
+      continue;
+    localMemPortMap[memInfo.originalArg].done = hwBody->getArgument(argIdx++);
   }
 
   return hwMod;
@@ -2388,6 +2411,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     for (auto &memInfo : memrefArgs) {
       perFramePorts[i][memInfo.originalArg].rdData =
           localMemPorts[memInfo.originalArg].rdData;
+      perFramePorts[i][memInfo.originalArg].done =
+          localMemPorts[memInfo.originalArg].done;
     }
   }
 
@@ -2630,6 +2655,18 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                 childInputs.push_back(hw::ConstantOp::create(
                     hw, loc, memInfo.elementType, 0));
             }
+          }
+          // Mirror the loop module's `mem*_done` input order.
+          for (auto &memInfo : memrefArgs) {
+            if (!memInfo.isAmcPort || !memInfo.isRead)
+              continue;
+            auto &callerMp =
+                perFramePorts[frameIdx][memInfo.originalArg];
+            Value d = callerMp.done
+                          ? callerMp.done
+                          : hw::ConstantOp::create(hw, loc,
+                                                     hw.getI1Type(), 0);
+            childInputs.push_back(d);
           }
 
           auto childInst = hw::InstanceOp::create(
@@ -3042,6 +3079,10 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                     mergedMemPorts);
 
   // Copy merged ports back into localMemPorts for output construction.
+  // For amc ports we also copy `rdEn` so the stall-aware gate built in
+  // `lowerPipelineChild` from the per-port `done` handshake propagates
+  // through the loop module's `mem*_rd_en` output — without this, the
+  // output defaults to 0 and the AMC arbiter never sees a request.
   for (auto &memInfo : memrefArgs) {
     localMemPorts[memInfo.originalArg].addrs =
         mergedMemPorts[memInfo.originalArg].addrs;
@@ -3049,6 +3090,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         mergedMemPorts[memInfo.originalArg].wrData;
     localMemPorts[memInfo.originalArg].wrEn =
         mergedMemPorts[memInfo.originalArg].wrEn;
+    if (memInfo.isAmcPort && memInfo.requiresRdEn)
+      localMemPorts[memInfo.originalArg].rdEn =
+          mergedMemPorts[memInfo.originalArg].rdEn;
   }
 
   // --- Build module output ---
@@ -3237,6 +3281,103 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     gatedStageCE[i] =
         comb::AndOp::create(hwBuilder, loc, stageCE[i], notStall);
 
+  // Per-expect handshake state. The memory module emits an honest 1-cycle
+  // pulse on `done` when the arbiter actually services this consumer.
+  // For multi-output arbiters (multiple consumers sharing one
+  // physical port) the dones arrive on different cycles, so the FSM
+  // has to:
+  //   * Latch each pulse so the stall can see "all dones have fired
+  //     by now" simultaneously, even though they fire on different
+  //     cycles.
+  //   * Capture the live `rdData` on each pulse (in case the consumer
+  //     fires later than the cycle that consumer's request was served).
+  // The combinational `stickyEff = done | sticky_reg` keeps single-
+  // output arbiters at zero latency overhead — for those, `done`
+  // pulses on the consume cycle and stickyEff is high then, so the
+  // pipeline doesn't stall and the consumer reads the live `rdData`
+  // through the `mux(done, live, captured)` wire.
+  //
+  // We mask the gating signals with `!consume_eff` (the cycle the iter
+  // advances out of destStage) so the next iter's `rd_en` is allowed
+  // through on the same cycle as consume — otherwise II=1 would lose
+  // every iter's read window to the previous iter's stickies.
+  DenseMap<Value, Value> portStickyEff;
+  DenseMap<Value, Value> portRdDataMuxed;
+  SmallVector<Value> stickyRegs(expectInfos.size());
+  for (auto [eIdx, ei] : llvm::enumerate(expectInfos)) {
+    auto it = memPorts.find(ei.portValue);
+    if (it == memPorts.end())
+      continue;
+    Value done = it->second.done;
+    if (!done)
+      continue;
+    if (ei.destStageOffset >= stages.size())
+      continue;
+
+    // sticky_reg.next = stickyEff & !consume_eff
+    //   stickyEff = done | sticky_reg              (combinational)
+    //   consume_eff = stageCE[destStage] & notStall (the cycle the iter
+    //                 actually advances out of destStage)
+    BackedgeBuilder localBE(hwBuilder, loc);
+    Backedge stickyBE = localBE.get(hwBuilder.getI1Type());
+    Value stickyReg = Value(stickyBE);
+    Value stickyEff =
+        comb::OrOp::create(hwBuilder, loc, done, stickyReg, false);
+    Value consumeEff =
+        comb::AndOp::create(hwBuilder, loc, stageCE[ei.destStageOffset],
+                              notStall, false);
+    Value notConsume = comb::createOrFoldNot(hwBuilder, loc, consumeEff);
+    Value stickyNext =
+        comb::AndOp::create(hwBuilder, loc, stickyEff, notConsume, false);
+    auto stickyName = hwBuilder.getStringAttr(
+        (namePrefix + "_sticky_" + std::to_string(eIdx)).str());
+    Value stickyRegOp = seq::CompRegOp::create(
+        hwBuilder, loc, stickyNext, clk, rst, falseConst, stickyName);
+    stickyBE.setValue(stickyRegOp);
+    stickyRegs[eIdx] = stickyRegOp;
+
+    // The gating signal we use for both stall and rd_en is the
+    // `consume`-masked stickyEff: high while the request hasn't been
+    // served yet AND we're not consuming this very cycle. ORing
+    // across multiple expects on the same port lets a port shared by
+    // many consumers gate on whichever expect is still pending.
+    Value stickyEffReg = comb::OrOp::create(
+        hwBuilder, loc, done, stickyRegOp, false);
+    Value gateForRd =
+        comb::AndOp::create(hwBuilder, loc, stickyEffReg, notConsume, false);
+    Value &portGate = portStickyEff[ei.portValue];
+    portGate = portGate
+                   ? comb::OrOp::create(hwBuilder, loc, portGate, gateForRd)
+                   : gateForRd;
+
+    // Captured rdData: feeds a mux(done, live, captured_reg). On the
+    // cycle done pulses, the consumer reads the live wire (for
+    // single-output cases this is the consume cycle; data is fresh).
+    // On other cycles, it reads the latched register (for outputs
+    // that finished on earlier cycles during a stall window). The
+    // register itself updates every cycle via the same mux, so it
+    // always holds the most recent capture.
+    if (it->second.rdData &&
+        portRdDataMuxed.find(ei.portValue) == portRdDataMuxed.end()) {
+      Value liveRdData = it->second.rdData;
+      Type dataTy = liveRdData.getType();
+      Backedge capBE = localBE.get(dataTy);
+      Value capReg = Value(capBE);
+      Value muxed =
+          comb::MuxOp::create(hwBuilder, loc, done, liveRdData, capReg);
+      Value zeroData = hw::ConstantOp::create(hwBuilder, loc, dataTy, 0);
+      auto capName = hwBuilder.getStringAttr(
+          (namePrefix + "_captured_" + std::to_string(eIdx)).str());
+      Value capRegOp = seq::CompRegOp::create(
+          hwBuilder, loc, muxed, clk, rst, zeroData, capName);
+      capBE.setValue(capRegOp);
+      portRdDataMuxed[ei.portValue] = muxed;
+      // Splice the muxed wire in place of the live rdData so later
+      // stage processing transparently picks up the captured/live mix.
+      it->second.rdData = muxed;
+    }
+  }
+
   // Per-stage memory port mappings. Loads/stores in stage `i` accumulate in
   // `perStagePorts[i]` so that multiple accesses to the same memref across
   // stages don't clobber each other in a single shared MemPortMapping. After
@@ -3338,8 +3479,21 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
               localLoadResults.insert(ls.getResult());
           if (loadOp.requiresReadEnable() && loadOp.getReadLatency() > 0)
             localLoadResults.insert(loadOp.getResult());
+          // For amc-port loads with a `done` handshake, drop rd_en the
+          // cycle the request is actually serviced (`stickyEff` high)
+          // unless we're consuming this very cycle. Without this, the
+          // arbiter would re-serve the same output every cycle of a
+          // multi-output stall window.
+          Value loadGate = gate;
+          auto stickyIt = portStickyEff.find(loadOp.getMemoryValue());
+          if (stickyIt != portStickyEff.end()) {
+            Value notSticky =
+                comb::createOrFoldNot(hwBuilder, loc, stickyIt->second);
+            loadGate = comb::AndOp::create(hwBuilder, loc,
+                                              stageCE[stageIdx], notSticky);
+          }
           return handleHWLoad(loadOp, hwBuilder, mapping,
-                                 perStagePorts[stageIdx], gate);
+                                 perStagePorts[stageIdx], loadGate);
         }
         return emitComputeOp(
             inner, hwBuilder, mapping,
@@ -3538,23 +3692,34 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       hwBuilder.getStringAttr(namePrefix + "_done"));
   doneSignal = doneReg;
 
-  // Phase 3B: resolve the stall backedge. For each expect collected
-  // before inlining, stall whenever destStage's CE is firing but the
-  // underlying memory port's `done` is low — i.e. the request we issued
-  // `latency` cycles ago hasn't completed yet.
+  // Phase 3B: resolve the stall backedge. Stall while any expect's
+  // sticky-effective signal is low — i.e. the arbiter hasn't serviced
+  // this consumer's request for the current iteration. `stickyEff =
+  // done | sticky_reg` is combinational so single-output cases (where
+  // done pulses on the consume cycle) see stickyEff=1 immediately and
+  // don't stall. Multi-output cases hold stickyEff=0 for the
+  // unserved consumers across the stall window.
   SmallVector<Value> stallBits;
-  for (auto &ei : expectInfos) {
+  for (auto [eIdx, ei] : llvm::enumerate(expectInfos)) {
+    if (eIdx >= stickyRegs.size() || !stickyRegs[eIdx])
+      continue;
+    if (ei.destStageOffset >= stageCE.size())
+      continue;
     auto it = memPorts.find(ei.portValue);
     if (it == memPorts.end())
       continue;
+    // Re-derive stickyEff combinationally for the stall: this is the
+    // same OR(done, sticky_reg) we used to feed the rd_en gate, just
+    // unmasked (no consume mask) so the stall stays correct on the
+    // consume cycle itself.
     Value done = it->second.done;
-    if (!done)
-      continue; // memref-backed / no done exposed → treat as tied-high
-    if (ei.destStageOffset >= stageCE.size())
-      continue;
-    Value notDone = comb::createOrFoldNot(hwBuilder, loc, done);
+    Value stickyEff =
+        done ? comb::OrOp::create(hwBuilder, loc, done, stickyRegs[eIdx])
+             : Value(stickyRegs[eIdx]);
+    Value notSticky = comb::createOrFoldNot(hwBuilder, loc, stickyEff);
     Value stallI = comb::AndOp::create(hwBuilder, loc,
-                                         stageCE[ei.destStageOffset], notDone);
+                                         stageCE[ei.destStageOffset],
+                                         notSticky);
     stallBits.push_back(stallI);
   }
   Value stallVal = falseConst;
@@ -4088,12 +4253,16 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   for (unsigned i = 0; i < numEntries; ++i)
     entryRunningSignals[i] = fsmInst.getResult(fsmOutIdx++);
 
-  // Per-entry memory port mappings. Each starts with shared rdData.
+  // Per-entry memory port mappings. Each starts with shared rdData and
+  // (when present) the per-port `done` so an inline-lowered pipeline
+  // can build its handshake registers.
   SmallVector<DenseMap<Value, MemPortMapping>> perEntryPorts(numEntries);
   for (unsigned i = 0; i < numEntries; ++i) {
     for (auto &memInfo : memrefArgs) {
       perEntryPorts[i][memInfo.originalArg].rdData =
           memPortMap[memInfo.originalArg].rdData;
+      perEntryPorts[i][memInfo.originalArg].done =
+          memPortMap[memInfo.originalArg].done;
     }
   }
 
@@ -4283,6 +4452,17 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
             childInputs.push_back(hw::ConstantOp::create(
                 builder, loc, memInfo.elementType, 0));
         }
+      }
+      // Mirror the loop module's `mem*_done` input order.
+      for (auto &memInfo : memrefArgs) {
+        if (!memInfo.isAmcPort || !memInfo.isRead)
+          continue;
+        auto &callerMp = memPortMap[memInfo.originalArg];
+        Value d = callerMp.done
+                      ? callerMp.done
+                      : hw::ConstantOp::create(builder, loc,
+                                                  builder.getI1Type(), 0);
+        childInputs.push_back(d);
       }
 
       auto childInst = hw::InstanceOp::create(
@@ -4582,7 +4762,14 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     }
   }
 
-  // Copy merged ports to function-level memPortMap.
+  // Copy merged ports to function-level memPortMap. For amc ports we
+  // also propagate `rdEn` so the stall-aware gate built in
+  // `lowerPipelineChild` from the per-port `done` handshake reaches
+  // the amc.instance's rd_en backedge — without this, the backedge
+  // defaults to constant 1 and the arbiter never gets a chance to
+  // deselect a served output. Memref-backed entries keep the previous
+  // behavior (rd_en defaults to high) since their hlmem reads don't
+  // need the handshake.
   for (auto &memInfo : memrefArgs) {
     memPortMap[memInfo.originalArg].addrs =
         mergedMemPorts[memInfo.originalArg].addrs;
@@ -4590,6 +4777,9 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         mergedMemPorts[memInfo.originalArg].wrData;
     memPortMap[memInfo.originalArg].wrEn =
         mergedMemPorts[memInfo.originalArg].wrEn;
+    if (memInfo.isAmcPort && memInfo.requiresRdEn)
+      memPortMap[memInfo.originalArg].rdEn =
+          mergedMemPorts[memInfo.originalArg].rdEn;
   }
 
   // Resolve hlmem + amc.instance backedges left dangling by the prelude.
