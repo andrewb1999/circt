@@ -63,11 +63,22 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
     both return results from the pipeline and register `inits`. Stages may
     access SSA values dominating the pipeline, as well as `inits`, which are
     block arguments.
+
+    The optional `latency` attribute records the schedule's total iteration
+    latency: the cycle (relative to an iteration's start) by which every op
+    in the iteration has COMMITTED — including result-less effects like a
+    static-port store, whose write lands `store latency` cycles after its
+    issue stage. Lowerings must keep the pipeline's `done` deasserted until
+    the last iteration has run `latency` cycles; they must not assume the
+    stage list spans that long (tail stages carrying no live values may be
+    absent or removed). When `latency` is absent, the stage count is the
+    only depth information available.
   }];
 
   let arguments = (ins
     I64Attr:$II,
     OptionalAttr<I64Attr>:$tripCount,
+    OptionalAttr<I64Attr>:$latency,
     Variadic<AnyType>:$inits
   );
 

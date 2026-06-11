@@ -231,7 +231,17 @@ def StoreOpInterface : OpInterface<"StoreInterface"> {
       "This returns the unique identifier of the associated memory",
       "std::string",
       "getUniqueId",
-      (ins)>
+      (ins)>,
+    InterfaceMethod<
+      "Returns true if the pipeline must wait for this store to complete "
+      "(stall on its `done`). Default true (blocking). A store may return "
+      "false to opt out — the store fires and the pipeline continues without "
+      "waiting for its completion (fire-and-forget).",
+      "bool",
+      "getWaitForCompletion",
+      (ins), /*methodBody=*/[{}], /*defaultImplementation=*/[{
+        return true;
+      }]>
   ];
   /* let verify = [{ return verifyGroupInterface(op); }]; */
 }

@@ -3146,11 +3146,17 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     }
     if (!payload)
       return;
-    auto loadIface = dyn_cast<HWLoadLoweringInterface>(payload);
-    if (!loadIface)
+    // Dynamic loads and dynamic stores are both wrapped in launch/expect; the
+    // stall machinery only needs the memory port value, which both interfaces
+    // expose.
+    Value memVal;
+    if (auto loadIface = dyn_cast<HWLoadLoweringInterface>(payload))
+      memVal = loadIface.getMemoryValue();
+    else if (auto storeIface = dyn_cast<HWStoreLoweringInterface>(payload))
+      memVal = storeIface.getMemoryValue();
+    else
       return;
-    expectInfos.push_back({(unsigned)dest.getOffset(),
-                            loadIface.getMemoryValue()});
+    expectInfos.push_back({(unsigned)dest.getOffset(), memVal});
   });
 
   inlineLaunchExpectPairs(pipOp);
@@ -3470,9 +3476,23 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
           }
           return success();
         }
-        if (auto storeOp = dyn_cast<HWStoreLoweringInterface>(inner))
-          return handleHWStore(storeOp, hwBuilder, mapping, gate,
+        if (auto storeOp = dyn_cast<HWStoreLoweringInterface>(inner)) {
+          // For amc-port stores with a `done` handshake (dynamic / AXI), hold
+          // wr_en across the stall and drop it the cycle the write is actually
+          // served (`stickyEff` high), so a single store is not re-issued every
+          // cycle of the stall window. Keep `gate` (= gatedStageCE & enclosing
+          // if-conditions) so predication and `notStall` are preserved.
+          Value storeGate = gate;
+          auto stickyIt = portStickyEff.find(storeOp.getMemoryValue());
+          if (stickyIt != portStickyEff.end()) {
+            Value notSticky =
+                comb::createOrFoldNot(hwBuilder, loc, stickyIt->second);
+            storeGate =
+                comb::AndOp::create(hwBuilder, loc, gate, notSticky);
+          }
+          return handleHWStore(storeOp, hwBuilder, mapping, storeGate,
                                   perStagePorts[stageIdx]);
+        }
         if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner)) {
           if (auto ls = dyn_cast<LoopScheduleLoadOp>(inner))
             if (isLocalMemref(ls.getMemRef()))
@@ -3678,8 +3698,17 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       hwBuilder.getStringAttr(namePrefix + "_epilogue"));
   epilogueBE.setValue(epilogueReg);
 
+  // Depth of the epilogue: prefer the schedule's declared iteration latency
+  // (which covers result-less tails like static store commits even if no
+  // stage spans them); fall back to the stage count for IR without the
+  // attribute. Take the max so extra stages (e.g. expect destinations
+  // appended after scheduling) still drain fully.
+  unsigned pipelineDepth = stages.size();
+  if (auto latency = pipOp.getLatency())
+    pipelineDepth = std::max<unsigned>(pipelineDepth, *latency);
+
   Value delayedEpilogue = Value(epilogueReg);
-  for (unsigned i = 0; i + 2 < stages.size(); ++i) {
+  for (unsigned i = 0; i + 2 < pipelineDepth; ++i) {
     Value delayInput =
         comb::MuxOp::create(hwBuilder, loc, startSignal, falseConst,
                             delayedEpilogue);
@@ -3692,6 +3721,37 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   Value notTailCE = comb::createOrFoldNot(hwBuilder, loc, stageCE.back());
   Value doneComb =
       comb::AndOp::create(hwBuilder, loc, delayedEpilogue, notTailCE);
+
+  // A static-port store commits its write `latency` cycles after issue, but
+  // the epilogue chain above only counts stages — stages exist at op START
+  // times, so a tail store's commit window extends past the last stage and
+  // `done` would fire before the write lands (inter-loop RAW hazard: the
+  // next loop reads stale data). Count the worst store-commit overhang and
+  // hold `done` that many extra cycles. The count starts from `doneComb`
+  // (actual tail-stage drain, II-robust) rather than from the epilogue
+  // chain. Dynamic-port stores are excluded: no static count is sufficient
+  // for them (they are handled by launch/expect wrapping or, eventually,
+  // explicit fences).
+  unsigned pipeEnd =
+      std::max(pipelineDepth, (unsigned)stages.back().getOffset() + 1);
+  unsigned maxStoreEnd = 0;
+  for (auto stageOp : stages)
+    stageOp.walk([&](Operation *op) {
+      if (auto st = dyn_cast<StoreInterface>(op))
+        if (!st.isDynamic())
+          maxStoreEnd = std::max(
+              maxStoreEnd, (unsigned)stageOp.getOffset() + st.getLatency());
+    });
+  unsigned storeTailCycles = maxStoreEnd > pipeEnd ? maxStoreEnd - pipeEnd : 0;
+  for (unsigned i = 0; i < storeTailCycles; ++i) {
+    Value tailInput = comb::MuxOp::create(hwBuilder, loc, startSignal,
+                                          falseConst, doneComb);
+    doneComb = seq::CompRegOp::create(
+        hwBuilder, loc, tailInput, clk, rst, falseConst,
+        hwBuilder.getStringAttr(
+            (namePrefix + "_store_tail_" + std::to_string(i)).str()));
+  }
+
   Value doneInput =
       comb::MuxOp::create(hwBuilder, loc, startSignal, falseConst, doneComb);
   auto doneReg = seq::CompRegOp::create(
@@ -3775,6 +3835,11 @@ static hw::HWModuleOp createHWModule(
         inputIdx++;
       }
       appendPortOutputPorts(builder, baseName, info, ports);
+    } else if (!hw::isHWValueType(arg.getType())) {
+      // An external-memory reference (e.g. !amc.memory_ref) has no scalar HW
+      // signal: its interface (BRAM/AXI) ports are appended to this module
+      // after its expand_ref adapter is lowered (see bramBoundaries).
+      continue;
     } else {
       ports.push_back(
           {{builder.getStringAttr("arg" + std::to_string(idx)), arg.getType(),
@@ -3850,6 +3915,10 @@ static hw::HWModuleOp createHWModule(
         mp.extraPorts.push_back(p);
       }
       memPortMap[arg] = mp;
+    } else if (!hw::isHWValueType(arg.getType())) {
+      // External-memory reference arg: elided from the signature above, so it
+      // consumes no block argument here.
+      continue;
     } else {
       mapping.map(arg, hwBody->getArgument(hwArgIdx));
       hwArgIdx++;
@@ -3891,6 +3960,36 @@ static void buildHWOutput(mlir::FunctionOpInterface funcOp, OpBuilder &builder,
   }
 
   hw::OutputOp::create(builder, loc, outputs);
+}
+
+/// Splice the external-memory (BRAM/AXI) boundary ports an `expand_ref` adapter
+/// registered onto the kernel `hw.module`: append the interface INPUT ports
+/// (resolving each dout backedge to its new block arg) and the interface OUTPUT
+/// ports (driven by the adapter's results). Runs after `buildHWOutput` so the
+/// appended outputs extend the just-built `hw.output`.
+static void appendBramBoundaries(
+    hw::HWModuleOp hwMod,
+    DenseMap<Value, loopschedule::BramBoundary> &bramBoundaries) {
+  Block *body = hwMod.getBodyBlock();
+  for (auto &kv : bramBoundaries) {
+    auto &b = kv.second;
+    if (!b.inputPorts.empty()) {
+      unsigned base = hwMod.getModuleType().getNumInputs();
+      // modifyPorts updates the module TYPE but not the body block args (and it
+      // internally re-locs every input arg), so add the matching block args
+      // FIRST — at the end, where we insert the ports — to keep type and body
+      // consistent, then update the type.
+      SmallVector<std::pair<unsigned, hw::PortInfo>> ins;
+      for (auto [k, p] : llvm::enumerate(b.inputPorts)) {
+        auto arg = body->addArgument(p.type, hwMod.getLoc());
+        b.inputBackedges[k].setValue(arg);
+        ins.push_back({base, p});
+      }
+      hwMod.modifyPorts(ins, {}, {}, {});
+    }
+    for (auto [p, v] : llvm::zip(b.outputPorts, b.outputValues))
+      hwMod.appendOutput(p.name, v);
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -4131,8 +4230,9 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   BackedgeBuilder funcBB(builder, loc);
   SmallVector<HLMemBackedges> hlmemBEs;
   SymbolTable modSymTab(enclosingModule);
-  loopschedule::HWMemoryLoweringState memInstState(clk, rst, funcBB,
-                                                    modSymTab);
+  DenseMap<Value, loopschedule::BramBoundary> bramBoundaries;
+  loopschedule::HWMemoryLoweringState memInstState(clk, rst, funcBB, modSymTab,
+                                                    bramBoundaries);
   SmallVector<PortArgInfo> memrefArgs;
   if (failed(setupFunctionPrelude(
           funcOp.getBody().front(), funcOp.getArguments(), builder, loc, clk,
@@ -4816,6 +4916,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
 
   buildHWOutput(funcOp, builder, loc, hwBody, mapping, memPortMap, readySignal,
                 doneSignal);
+  appendBramBoundaries(hwMod, bramBoundaries);
 
   funcOp.erase();
   return success();
@@ -4866,8 +4967,9 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
   BackedgeBuilder funcBB(builder, loc);
   SmallVector<HLMemBackedges> hlmemBEs;
   SymbolTable modSymTab(enclosingModule);
-  loopschedule::HWMemoryLoweringState memInstState(clk, rst, funcBB,
-                                                    modSymTab);
+  DenseMap<Value, loopschedule::BramBoundary> bramBoundaries;
+  loopschedule::HWMemoryLoweringState memInstState(clk, rst, funcBB, modSymTab,
+                                                    bramBoundaries);
   SmallVector<PortArgInfo> memrefArgs;
   if (failed(setupFunctionPrelude(
           funcOp.getBody().front(), funcOp.getArguments(), builder, loc, clk,
@@ -5138,6 +5240,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
   builder.setInsertionPointToEnd(hwBody);
   buildHWOutput(funcOp, builder, loc, hwBody, mapping, memPortMap, readySignal,
                 doneSignal);
+  appendBramBoundaries(hwMod, bramBoundaries);
 
   funcOp.erase();
   return success();

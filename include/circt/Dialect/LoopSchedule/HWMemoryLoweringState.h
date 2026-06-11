@@ -72,6 +72,28 @@ struct HWPortSignals {
   unsigned latency = 0;
 };
 
+/// Top-level hardware-interface wiring for one external memory (an
+/// `!amc.memory_ref` function arg). The kernel `hw.module` exposes the
+/// memory's interface (BRAM port wires now, AXI later) at its boundary; the
+/// `expand_ref` adapter instance bridges the internal port protocol to it.
+///
+/// The interface implementer (AMC-side, which has HW available) fills this in
+/// `lowerToHW`: it produces the `hw::PortInfo` for the boundary and, for each
+/// kernel INPUT port (e.g. BRAM read data), an `inputBackedge` it uses as the
+/// adapter instance operand; for each kernel OUTPUT port (addr/en/we/din), the
+/// adapter instance result `Value`.
+///
+/// The conversion pass stays AMC-agnostic: after `lowerToHW`, it appends
+/// `inputPorts`/`outputPorts` to the kernel `hw.module`, resolves each
+/// `inputBackedges[i]` to the new input block argument, and drops each
+/// `outputValues[i]` into the module's `hw.output`.
+struct BramBoundary {
+  llvm::SmallVector<circt::hw::PortInfo> inputPorts;
+  llvm::SmallVector<circt::Backedge> inputBackedges;
+  llvm::SmallVector<circt::hw::PortInfo> outputPorts;
+  llvm::SmallVector<mlir::Value> outputValues;
+};
+
 /// State passed to `HWMemoryInstanceLoweringInterface::lowerToHW`.
 ///
 /// Ownership: the conversion pass constructs this before invoking any
@@ -81,9 +103,10 @@ struct HWPortSignals {
 class HWMemoryLoweringState {
 public:
   HWMemoryLoweringState(mlir::Value clk, mlir::Value rst,
-                        circt::BackedgeBuilder &bb,
-                        mlir::SymbolTable &symTab)
-      : clk(clk), rst(rst), bb(bb), symTab(symTab) {}
+                        circt::BackedgeBuilder &bb, mlir::SymbolTable &symTab,
+                        llvm::DenseMap<mlir::Value, BramBoundary> &bramBoundaries)
+      : clk(clk), rst(rst), bb(bb), symTab(symTab),
+        bramBoundaries(bramBoundaries) {}
 
   /// Clock / reset values of the hw.module being built. The op should
   /// thread these into any hw.instance or seq.* primitive it creates.
@@ -97,6 +120,11 @@ public:
 
   /// Module-scope symbol table for resolving @memoryName references.
   mlir::SymbolTable &symTab;
+
+  /// Per-external-memory boundary wiring, keyed by the `!amc.memory_ref`
+  /// function argument. Filled by the `expand_ref` adapter's `lowerToHW`; the
+  /// conversion pass appends the ports to the kernel module and resolves them.
+  llvm::DenseMap<mlir::Value, BramBoundary> &bramBoundaries;
 
   /// Register the signals for a port SSA value (i.e. one of the op's
   /// results). Must be called for every SSA value the op produces.

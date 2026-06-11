@@ -191,22 +191,36 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
     Operation *dynOp;
     unsigned latency;
   };
-  SmallVector<LoopScheduleAtOp> stagesInOrder;
-  llvm::SmallDenseMap<LoopScheduleAtOp, SmallVector<Wrapping>, 8> byStage;
+  // Keyed by stage OFFSET, not the `at`-op handle: planting an expect rebuilds
+  // (and erases) a destination stage at-op, and that stage may itself be a
+  // pending issue stage. Re-resolving by offset each iteration avoids
+  // dereferencing a stale handle. The `dynOp` pointers in `Wrapping` stay valid
+  // across a rebuild because `takeBody` reparents the op rather than erasing it.
+  SmallVector<unsigned> stagesInOrder;
+  llvm::SmallDenseMap<unsigned, SmallVector<Wrapping>, 8> byStage;
+  // The set of existing stage offsets, used to tell whether an op's completion
+  // stage (offset + latency) exists in the pipeline.
+  llvm::SmallDenseSet<unsigned> stageOffsets;
+  pipeline.walk(
+      [&](LoopScheduleAtOp a) { stageOffsets.insert(a.getOffset()); });
   pipeline.walk([&](LoopScheduleAtOp atOp) {
     for (Operation &op : atOp.getBodyBlock().getOperations()) {
       if (!isDynamicLatencyOp(op))
         continue;
-      // Phase 3 only wraps single-result dynamic ops (dynamic loads).
-      // Dynamic stores — no result, so no value to expect — are left
-      // alone for now; stall semantics for stores would need to add a
-      // new handle slot to the at-stage's result list, which isn't
-      // implemented yet.
-      if (op.getNumResults() != 1) {
-        if (op.getNumResults() > 1)
-          op.emitWarning(
-              "dynamic op with multiple results is not yet supported; "
-              "skipping launch/expect wrap");
+      // An explicit fire-and-forget store opts out of the launch/expect stall:
+      // it fires and the pipeline continues without waiting for its `done`.
+      if (auto store = dyn_cast<StoreInterface>(&op))
+        if (!store.getWaitForCompletion())
+          continue;
+      // Phase 3 wraps single-result dynamic loads (the handle replaces the
+      // load's data slot in the issue stage's at-yield) and zero-result
+      // dynamic stores (the handle is appended as a fresh slot — there is no
+      // result to thread, only a completion to stall on). Multi-result dynamic
+      // ops are still unsupported.
+      if (op.getNumResults() > 1) {
+        op.emitWarning(
+            "dynamic op with multiple results is not yet supported; "
+            "skipping launch/expect wrap");
         continue;
       }
       unsigned lat = 1;
@@ -217,16 +231,38 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
                         "launch/expect wrap");
         continue;
       }
-      if (!byStage.count(atOp))
-        stagesInOrder.push_back(atOp);
-      byStage[atOp].push_back({&op, lat});
+      unsigned offset = atOp.getOffset();
+      // A zero-result store has no downstream use forcing a later stage, so it
+      // can land in the last stage where `offset + lat` does not exist. Leave
+      // such a store unwrapped (fire-and-forget) rather than dangling its
+      // launch handle. (A blocking external store in the last stage is a known
+      // limitation; single-result loads always have a later use, so their
+      // completion stage exists.)
+      if (op.getNumResults() == 0 && !stageOffsets.count(offset + lat))
+        continue;
+      if (!byStage.count(offset))
+        stagesInOrder.push_back(offset);
+      byStage[offset].push_back({&op, lat});
     }
   });
 
   // For each issue stage, perform all launches, rebuild the stage once,
   // then plant expects in destination stages.
-  for (LoopScheduleAtOp issueStage : stagesInOrder) {
-    auto &wrappings = byStage[issueStage];
+  for (unsigned issueOffset : stagesInOrder) {
+    // Re-resolve the at op at this offset: a prior iteration's destination-
+    // stage rebuild may have replaced it (same offset, fresh handle). Mirrors
+    // the destStage lookup below.
+    LoopScheduleAtOp issueStage;
+    for (auto candidate :
+         pipeline.getStagesBlock().getOps<LoopScheduleAtOp>()) {
+      if (candidate.getOffset() == issueOffset) {
+        issueStage = candidate;
+        break;
+      }
+    }
+    if (!issueStage)
+      continue;
+    auto &wrappings = byStage[issueOffset];
 
     // Create a launch per dynamic op, moving the op into the launch body.
     // Track each wrapping's launch so we can find the rewired slot below.
@@ -250,19 +286,30 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
       infos.push_back({dynOp, launch, w.latency});
     }
 
-    // Rewire the issue stage's at-yield: each slot whose operand equals
-    // a launched op's result becomes the launch handle. Slot indices are
-    // stable (result count unchanged).
+    // Rewire the issue stage's at-yield so the launch handle is threaded to
+    // the destination stage. A LOAD (one result) replaces the slot carrying
+    // its data result in place (index unchanged). A STORE (zero results) has
+    // no slot to match, so a fresh handle slot is APPENDED. Loads only
+    // overwrite in place and appends happen after the seed copy, so each
+    // store's appended index is final and stable through the single rebuild.
     auto stageYield = issueStage.getYieldOp();
     SmallVector<Type> newStageResultTypes(issueStage.getResultTypes());
-    for (auto [i, operand] : llvm::enumerate(stageYield->getOperands())) {
-      for (auto &info : infos) {
-        if (operand == info.dynOp->getResult(0)) {
-          stageYield->setOperand(i, info.launch.getHandle());
-          newStageResultTypes[i] = handleTy;
-          info.slot = i;
-          break;
+    for (auto &info : infos) {
+      if (info.dynOp->getNumResults() == 1) {
+        Value res = info.dynOp->getResult(0);
+        for (auto [i, operand] : llvm::enumerate(stageYield->getOperands())) {
+          if (operand == res) {
+            stageYield->setOperand(i, info.launch.getHandle());
+            newStageResultTypes[i] = handleTy;
+            info.slot = i;
+            break;
+          }
         }
+      } else {
+        info.slot = newStageResultTypes.size();
+        newStageResultTypes.push_back(handleTy);
+        stageYield->insertOperands(stageYield->getNumOperands(),
+                                   info.launch.getHandle());
       }
     }
 
@@ -1445,6 +1492,16 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
 
   auto pipeline = builder.create<LoopSchedulePipelineOp>(
       resultTypes, ii, tripCountAttr, iterArgs);
+
+  // Record the schedule's total iteration latency: the anchor (terminator)
+  // is constrained after every op's end time — including result-less store
+  // commits — so its solved start time is the cycle by which an iteration
+  // has fully committed. The FSM sizes the pipeline's `done` from this
+  // rather than from the stage-list length (tail stages carry no live
+  // values and are not load-bearing).
+  if (auto anchorTime =
+          problem.getStartTime(loop.getAfterBody()->getTerminator()))
+    pipeline.setLatencyAttr(builder.getI64IntegerAttr(*anchorTime));
 
   // Add the non-yield and non-if operations to their start time groups.
   DenseMap<unsigned, SmallVector<Operation *>> startGroups;

@@ -165,6 +165,14 @@ ParseResult LoopSchedulePipelineOp::parse(OpAsmParser &parser,
     result.addAttribute("tripCount", tripCount);
   }
 
+  // Parse optional iteration latency.
+  if (succeeded(parser.parseOptionalKeyword("latency"))) {
+    IntegerAttr latency;
+    if (parser.parseEqual() || parser.parseAttribute(latency))
+      return failure();
+    result.addAttribute("latency", latency);
+  }
+
   // Parse iter_args assignment list.
   SmallVector<OpAsmParser::Argument> regionArgs;
   SmallVector<OpAsmParser::UnresolvedOperand> operands;
@@ -204,6 +212,10 @@ void LoopSchedulePipelineOp::print(OpAsmPrinter &p) {
   // Print the optional tripCount.
   if (getTripCount())
     p << " trip_count = " << *getTripCount();
+
+  // Print the optional iteration latency.
+  if (getLatency())
+    p << " latency = " << *getLatency();
 
   // Print iter_args assignment list.
   p << " iter_args(";
@@ -250,6 +262,28 @@ LogicalResult LoopSchedulePipelineOp::verify() {
                << *lastStartTime << ')';
 
       lastStartTime = *startTime;
+    }
+  }
+
+  // When the iteration latency is declared, it must cover every static-port
+  // store's commit (issue stage + store latency) — lowerings size the
+  // pipeline's `done` from it. Dynamic stores are excluded: their commit is
+  // a runtime event no schedule constant can bound.
+  if (auto latency = getLatency()) {
+    for (auto stage : getStagesBlock().getOps<LoopScheduleAtOp>()) {
+      auto offset = stage.getOffset();
+      auto result = stage.walk([&](Operation *inner) {
+        if (auto store = dyn_cast<StoreInterface>(inner))
+          if (!store.isDynamic() && offset + store.getLatency() > *latency) {
+            store->emitOpError("store commits at cycle ")
+                << (offset + store.getLatency())
+                << ", past the pipeline latency (" << *latency << ')';
+            return WalkResult::interrupt();
+          }
+        return WalkResult::advance();
+      });
+      if (result.wasInterrupted())
+        return failure();
     }
   }
 

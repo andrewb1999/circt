@@ -980,6 +980,10 @@ void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp) {
     LoopScheduleAtOp destStage;
     unsigned issueSlot = ~0u; // issueStage at-yield slot holding handle
     unsigned destSlot = ~0u;  // destStage at-yield slot holding expect result
+    // A zero-result payload (a dynamic STORE) threads no value: its handle
+    // slot is dropped rather than retyped to a payload result, and its launch
+    // is erased only after the stage rebuild frees the handle.
+    bool hasResult = false;
   };
   SmallVector<PerExpect> per;
   per.reserve(expects.size());
@@ -997,6 +1001,7 @@ void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp) {
     }
     if (!pe.payload)
       continue;
+    pe.hasResult = pe.payload->getNumResults() > 0;
     pe.issueStage = pe.launch->getParentOfType<LoopScheduleAtOp>();
     pe.destStage = expect->getParentOfType<LoopScheduleAtOp>();
     if (!pe.issueStage || !pe.destStage)
@@ -1008,11 +1013,14 @@ void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp) {
         break;
       }
     }
-    for (auto [i, operand] :
-         llvm::enumerate(pe.destStage.getYieldOp()->getOperands())) {
-      if (operand == expect.getResult(0)) {
-        pe.destSlot = i;
-        break;
+    // A store's 0-result expect threads no value through the dest yield.
+    if (pe.hasResult) {
+      for (auto [i, operand] :
+           llvm::enumerate(pe.destStage.getYieldOp()->getOperands())) {
+        if (operand == expect.getResult(0)) {
+          pe.destSlot = i;
+          break;
+        }
       }
     }
     per.push_back(pe);
@@ -1024,17 +1032,23 @@ void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp) {
   // result types.
   for (auto &pe : per) {
     pe.payload->moveBefore(pe.launch);
-    pe.expect.getResult(0).replaceAllUsesWith(pe.payload->getResult(0));
-    if (pe.issueSlot != ~0u)
-      pe.issueStage.getYieldOp()->setOperand(pe.issueSlot,
-                                             pe.payload->getResult(0));
+    if (pe.hasResult) {
+      pe.expect.getResult(0).replaceAllUsesWith(pe.payload->getResult(0));
+      if (pe.issueSlot != ~0u)
+        pe.issueStage.getYieldOp()->setOperand(pe.issueSlot,
+                                               pe.payload->getResult(0));
+    }
+    // For a store (no result) the issue-yield slot keeps holding the handle
+    // until the stage rebuild below drops it; the launch is erased afterward.
   }
 
-  // Now erase launches and expects; after the RAUW above, no one uses
-  // launch.getHandle() or expect.getResult() anymore.
+  // Erase expects now (no uses). Erase LOAD launches now too (the RAUW above
+  // freed their handles); defer STORE launches until after the rebuild drops
+  // their still-referenced handle slot.
   for (auto &pe : per) {
     pe.expect.erase();
-    pe.launch.erase();
+    if (pe.hasResult)
+      pe.launch.erase();
   }
 
   // Collect per-stage edit lists: slots whose type changes (issue-side
@@ -1061,6 +1075,13 @@ void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp) {
     return edits[s];
   };
   for (auto &pe : per) {
+    if (!pe.hasResult) {
+      // Store: drop the appended handle slot; nothing consumes it after the
+      // expect is erased, so no redirect is needed.
+      if (pe.issueSlot != ~0u)
+        ensure(pe.issueStage).dropSlots.push_back(pe.issueSlot);
+      continue;
+    }
     if (pe.issueSlot != ~0u)
       ensure(pe.issueStage).retypeSlots.push_back(pe.issueSlot);
     if (pe.destSlot != ~0u) {
@@ -1144,6 +1165,12 @@ void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp) {
     replacement[oldStage] = newStage;
     oldStage.erase();
   }
+
+  // Erase the deferred STORE launches now that the rebuild has dropped their
+  // handle slots from the (reparented) issue-stage yields, freeing the handle.
+  for (auto &pe : per)
+    if (!pe.hasResult)
+      pe.launch.erase();
 }
 
 } // namespace loopschedule
