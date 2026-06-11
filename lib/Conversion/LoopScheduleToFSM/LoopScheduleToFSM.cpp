@@ -173,6 +173,9 @@ struct MemPortMapping {
   // memref-backed local memories — the FSM treats missing `done` as
   // tied-high (no pipeline stall contribution).
   Value done;
+  // Memory-driven same-cycle acceptance level for dynamic ports (see
+  // HWPortSignals::ready). Null ⇒ tied high (no issue backpressure).
+  Value ready;
 };
 
 /// Extend `mp.extraPorts` so port `k` is indexable; no-op for `k == 0`
@@ -198,6 +201,9 @@ struct PortArgInfo {
   SmallVector<unsigned> addrWidths;
   bool isRead = true;
   bool isWrite = true;
+  // True iff the port exposes a `ready` acceptance level (dynamic amc
+  // ports); plumbed through loop modules like `done`.
+  bool hasReady = false;
   bool requiresRdEn = false;
   unsigned latency = 1;
   // Number of distinct hardware ports the memory exposes. For memrefs,
@@ -1874,6 +1880,17 @@ static hw::HWModuleOp createLoopModule(
                        hw::ModulePort::Direction::Input}});
     inputIdx++;
   }
+  // Same-cycle acceptance level for dynamic ports (issue backpressure for
+  // posted accesses); plumbed like `done` above.
+  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
+    if (!memInfo.isAmcPort || !memInfo.hasReady)
+      continue;
+    std::string baseName = "mem" + std::to_string(i);
+    ports.push_back({{builder.getStringAttr(baseName + "_ready"),
+                       builder.getI1Type(),
+                       hw::ModulePort::Direction::Input}});
+    inputIdx++;
+  }
 
   ports.push_back({{builder.getStringAttr("done"), builder.getI1Type(),
                      hw::ModulePort::Direction::Output}});
@@ -1919,6 +1936,12 @@ static hw::HWModuleOp createLoopModule(
     if (!memInfo.isAmcPort || !memInfo.isRead)
       continue;
     localMemPortMap[memInfo.originalArg].done = hwBody->getArgument(argIdx++);
+  }
+  // Mirror the order of the `mem*_ready` input ports added above.
+  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
+    if (!memInfo.isAmcPort || !memInfo.hasReady)
+      continue;
+    localMemPortMap[memInfo.originalArg].ready = hwBody->getArgument(argIdx++);
   }
 
   return hwMod;
@@ -2413,6 +2436,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           localMemPorts[memInfo.originalArg].rdData;
       perFramePorts[i][memInfo.originalArg].done =
           localMemPorts[memInfo.originalArg].done;
+      perFramePorts[i][memInfo.originalArg].ready =
+          localMemPorts[memInfo.originalArg].ready;
     }
   }
 
@@ -2667,6 +2692,19 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                           : hw::ConstantOp::create(hw, loc,
                                                      hw.getI1Type(), 0);
             childInputs.push_back(d);
+          }
+          // Mirror the loop module's `mem*_ready` input order. A missing
+          // caller signal ties acceptance high (no backpressure).
+          for (auto &memInfo : memrefArgs) {
+            if (!memInfo.isAmcPort || !memInfo.hasReady)
+              continue;
+            auto &callerMp =
+                perFramePorts[frameIdx][memInfo.originalArg];
+            Value rdy = callerMp.ready
+                            ? callerMp.ready
+                            : hw::ConstantOp::create(hw, loc,
+                                                       hw.getI1Type(), 1);
+            childInputs.push_back(rdy);
           }
 
           auto childInst = hw::InstanceOp::create(
@@ -3309,6 +3347,11 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // every iter's read window to the previous iter's stickies.
   DenseMap<Value, Value> portStickyEff;
   DenseMap<Value, Value> portRdDataMuxed;
+  // Posted (no_wait) accesses on ports with acceptance backpressure: each
+  // entry is (un-stall-gated issue gate, port ready). The Phase 3B stall
+  // ORs in `rawGate & !ready` so a posted request is never dropped by a
+  // busy memory; the enable itself is gated `& ready` at the issue site.
+  SmallVector<std::pair<Value, Value>> postedReadyStalls;
   SmallVector<Value> stickyRegs(expectInfos.size());
   for (auto [eIdx, ei] : llvm::enumerate(expectInfos)) {
     auto it = memPorts.find(ei.portValue);
@@ -3455,15 +3498,19 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // when we descend into an if body. If-region results are forwarded
       // unconditionally via `mapping` (the hardware treats the body's
       // computation as always happening; the predication only affects
-      // when effects reach memory).
-      std::function<LogicalResult(Operation *, Value)> processOp =
-          [&](Operation *inner, Value gate) -> LogicalResult {
+      // when effects reach memory). `rawGate` mirrors `gate` but is built
+      // from the UN-stall-gated stageCE — stall terms derived from it
+      // cannot form a combinational loop through `notStall`.
+      std::function<LogicalResult(Operation *, Value, Value)> processOp =
+          [&](Operation *inner, Value gate, Value rawGate) -> LogicalResult {
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(inner))
           return success();
         if (auto ifOp = dyn_cast<LoopScheduleIfOp>(inner)) {
           Value cond = mapping.lookup(ifOp.getCond());
           Value innerGate =
               comb::AndOp::create(hwBuilder, loc, gate, cond);
+          Value innerRaw =
+              comb::AndOp::create(hwBuilder, loc, rawGate, cond);
           for (auto &nested : ifOp.getBody().front()) {
             if (auto yieldOp = dyn_cast<LoopScheduleYieldOp>(&nested)) {
               for (auto [res, val] :
@@ -3471,7 +3518,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
                 mapping.map(res, mapping.lookup(val));
               continue;
             }
-            if (failed(processOp(&nested, innerGate)))
+            if (failed(processOp(&nested, innerGate, innerRaw)))
               return failure();
           }
           return success();
@@ -3489,6 +3536,22 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
                 comb::createOrFoldNot(hwBuilder, loc, stickyIt->second);
             storeGate =
                 comb::AndOp::create(hwBuilder, loc, gate, notSticky);
+          }
+          // POSTED (no_wait) store on a port with acceptance backpressure:
+          // fire wr_en only on a cycle the memory will take it, and stall
+          // the pipeline while it won't. Wrapped (blocking) stores skip
+          // this — their held wr_en + expect stall already guarantee
+          // acceptance.
+          if (auto si = dyn_cast<loopschedule::StoreInterface>(inner)) {
+            if (si.isDynamic() && !si.getWaitForCompletion()) {
+              auto pIt = memPorts.find(storeOp.getMemoryValue());
+              if (pIt != memPorts.end() && pIt->second.ready) {
+                Value ready = pIt->second.ready;
+                storeGate =
+                    comb::AndOp::create(hwBuilder, loc, storeGate, ready);
+                postedReadyStalls.push_back({rawGate, ready});
+              }
+            }
           }
           return handleHWStore(storeOp, hwBuilder, mapping, storeGate,
                                   perStagePorts[stageIdx]);
@@ -3521,7 +3584,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       };
       // Use the stall-gated stage CE as the write-/read-enable gate so
       // memory requests don't re-fire when the pipeline idles on !done.
-      opResult = processOp(&op, gatedStageCE[stageIdx]);
+      // The raw stageCE rides along for loop-free stall terms.
+      opResult = processOp(&op, gatedStageCE[stageIdx], stageCE[stageIdx]);
 
       for (auto &sm : savedMappings)
         mapping.map(sm.first, sm.second);
@@ -3788,6 +3852,16 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
                                          stageCE[ei.destStageOffset],
                                          notSticky);
     stallBits.push_back(stallI);
+  }
+  // Posted-issue backpressure: hold the pipeline while a posted (no_wait)
+  // access wants to fire into a not-ready memory. The issue gate is the
+  // raw (un-stall-gated) stageCE & predication, so the term cannot loop
+  // through `notStall`; `ready` is memory/adapter state with no dependence
+  // on the pipeline's stall.
+  for (auto &[rawGate, ready] : postedReadyStalls) {
+    Value notReady = comb::createOrFoldNot(hwBuilder, loc, ready);
+    stallBits.push_back(
+        comb::AndOp::create(hwBuilder, loc, rawGate, notReady));
   }
   Value stallVal = falseConst;
   if (!stallBits.empty()) {
@@ -4086,6 +4160,7 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
     mp.rdData = signals.rdData;
     mp.addrs.assign(signals.addrs.size(), Value());
     mp.done = signals.done;
+    mp.ready = signals.ready;
     memPortMap[portValue] = mp;
   }
 
@@ -4104,6 +4179,13 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
                                                     /*isLocalMem=*/true));
   }
   for (auto &[portValue, signals] : memInstState.portMap) {
+    // A control channel registers `done` only (no addresses, no data, no
+    // enables): nothing to drive or merge per step, so it must not become
+    // a PortArgInfo — the FSM reads its done straight from memPortMap
+    // (barrier entries, kind 3).
+    if (signals.addrs.empty() && !signals.rdData && !signals.wrData &&
+        !signals.wrEn)
+      continue;
     PortArgInfo info;
     info.originalArg = portValue;
     info.isAmcPort = true;
@@ -4113,6 +4195,7 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
       info.addrWidths.push_back(cast<IntegerType>(a.getType()).getWidth());
     info.isRead = signals.rdData != Value();
     info.isWrite = signals.wrEn != Value();
+    info.hasReady = signals.ready != Value();
     info.requiresRdEn = signals.rdEn != Value();
     if (info.isRead)
       info.elementType = signals.rdData.getType();
@@ -4263,10 +4346,11 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   // one entry with kind=-1.
   struct FrameChild {
     unsigned frameIdx;
-    int kind; // -1 leaf, 0 sequential, 1 pipeline, 2 call
+    int kind; // -1 leaf, 0 sequential, 1 pipeline, 2 call, 3 barrier
     LoopScheduleSequentialOp seqOp;
     LoopSchedulePipelineOp pipOp;
     LoopScheduleCallOp callOp;
+    loopschedule::HWStoreLoweringInterface barrierOp; // kind 3
     LoopScheduleLaunchOp launchOp; // non-null for kind != -1
   };
   SmallVector<FrameChild> entries;
@@ -4301,6 +4385,14 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       } else if (auto callOp = dyn_cast_or_null<LoopScheduleCallOp>(child)) {
         fc.kind = 2;
         fc.callOp = callOp;
+        entries.push_back(fc);
+      } else if (auto barrier =
+                     dyn_cast_or_null<loopschedule::HWStoreLoweringInterface>(
+                         child)) {
+        // A barrier store (amc.control): no child hardware; its "done" is
+        // the memory control channel's completion level.
+        fc.kind = 3;
+        fc.barrierOp = barrier;
         entries.push_back(fc);
       }
     }
@@ -4370,6 +4462,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
           memPortMap[memInfo.originalArg].rdData;
       perEntryPorts[i][memInfo.originalArg].done =
           memPortMap[memInfo.originalArg].done;
+      perEntryPorts[i][memInfo.originalArg].ready =
+          memPortMap[memInfo.originalArg].ready;
     }
   }
 
@@ -4571,6 +4665,18 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
                                                   builder.getI1Type(), 0);
         childInputs.push_back(d);
       }
+      // Mirror the loop module's `mem*_ready` input order. A missing
+      // caller signal ties acceptance high (no backpressure).
+      for (auto &memInfo : memrefArgs) {
+        if (!memInfo.isAmcPort || !memInfo.hasReady)
+          continue;
+        auto &callerMp = memPortMap[memInfo.originalArg];
+        Value rdy = callerMp.ready
+                        ? callerMp.ready
+                        : hw::ConstantOp::create(builder, loc,
+                                                    builder.getI1Type(), 1);
+        childInputs.push_back(rdy);
+      }
 
       auto childInst = hw::InstanceOp::create(
           builder, loc, childModule,
@@ -4749,6 +4855,36 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         }
         funcHandleValueMap[entry.launchOp.getHandle()] =
             std::move(callResultVals);
+      }
+
+    } else if (entry.kind == 3) {
+      // Barrier (e.g. amc.control): no child hardware to instantiate. The
+      // FSM's WAIT state samples the control channel's `done` LEVEL live
+      // (no latching), so the frame holds exactly until the memory reports
+      // completion — for an AXI flush, until no write is outstanding.
+      // child_start is unused (the channel's request side is reserved).
+      Value ctrlVal = entry.barrierOp.getMemoryValue();
+      Value done;
+      auto it = memPortMap.find(ctrlVal);
+      if (it != memPortMap.end())
+        done = it->second.done;
+      if (!done)
+        done = hw::ConstantOp::create(builder, loc, i1, 1);
+      childDoneBEs[childIndexForEntry[ei]].setValue(done);
+
+      // The barrier yields no values; resolve its handle to nothing so a
+      // downstream await maps cleanly.
+      if (entry.launchOp) {
+        if (auto launchAt =
+                entry.launchOp->getParentOfType<LoopScheduleAtOp>()) {
+          auto atYield = launchAt.getYieldOp();
+          for (auto [atRes, yOperand] :
+               llvm::zip(launchAt.getResults(), atYield.getOperands())) {
+            if (yOperand == entry.launchOp.getHandle())
+              funcHandleValueMap[atRes] = SmallVector<Value>{};
+          }
+        }
+        funcHandleValueMap[entry.launchOp.getHandle()] = SmallVector<Value>{};
       }
 
     } else {

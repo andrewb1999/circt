@@ -555,9 +555,15 @@ struct ScheduleStrategy {
 /// An op whose scheduler lowering emits a `loopschedule.launch` and produces
 /// a handle (await'd by downstream frames). Today: loop ops plus `func.call`
 /// (dynamic-latency — at least one cycle between start and done; the FSM
-/// lowering stalls on the callee's done signal).
+/// lowering stalls on the callee's done signal), plus barrier stores (e.g.
+/// amc.control): data-less waits on a memory completion level, sampled by
+/// the FSM through the same frame WAIT machinery.
 static bool isLaunchLikeOp(Operation *op) {
-  return isa<LoopInterface, func::CallOp>(op);
+  if (isa<LoopInterface, func::CallOp>(op))
+    return true;
+  if (auto store = dyn_cast<StoreInterface>(op))
+    return store.isBarrier();
+  return false;
 }
 
 /// Partition start-times into phases by the close-after-launch-bucket rule:
@@ -705,6 +711,25 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
       return badCall.emitOpError(
           "func.call is not allowed inside a pipelined loop "
           "(dynamic-latency op)");
+  }
+
+  // A barrier store (e.g. amc.control) is a whole-memory completion wait;
+  // inside a pipelined loop it would have to drain per iteration, which
+  // defeats pipelining and is unsupported. Diagnose early.
+  for (auto loop : loops) {
+    Operation *badBarrier = nullptr;
+    loop.getAfter().walk([&](Operation *op) {
+      if (auto store = dyn_cast<StoreInterface>(op))
+        if (store.isBarrier()) {
+          badBarrier = op;
+          return WalkResult::interrupt();
+        }
+      return WalkResult::advance();
+    });
+    if (badBarrier)
+      return badBarrier->emitOpError(
+          "memory control waits are not allowed inside a pipelined loop; "
+          "place the wait between loops");
   }
 
   // Per-function analyses obtained via the analysis manager scoped to this

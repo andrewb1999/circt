@@ -69,6 +69,14 @@ struct HWPortSignals {
   /// done signal (e.g. memref-backed local memories), in which case the
   /// FSM treats it as tied-high (no stall from this port).
   mlir::Value done;
+  /// Memory-driven same-cycle acceptance level for DYNAMIC ports: a request
+  /// presented this cycle will be taken iff `ready` is high. Must be
+  /// valid-independent (no combinational path from the request inputs).
+  /// The FSM stalls posted (fire-and-forget) issue on it so a one-cycle
+  /// enable pulse can never be dropped by a busy memory. Null when the
+  /// port has no acceptance backpressure (static ports, memref-backed
+  /// memories) — treated as tied high.
+  mlir::Value ready;
   unsigned latency = 0;
 };
 

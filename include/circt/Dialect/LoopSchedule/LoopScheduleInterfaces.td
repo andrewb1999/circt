@@ -241,6 +241,18 @@ def StoreOpInterface : OpInterface<"StoreInterface"> {
       "getWaitForCompletion",
       (ins), /*methodBody=*/[{}], /*defaultImplementation=*/[{
         return true;
+      }]>,
+    InterfaceMethod<
+      "Returns true if this op is a memory BARRIER modeled as a data-less "
+      "store (e.g. amc.control waiting on a control channel): it drives no "
+      "address or data, and its `done` is a completion level the schedule "
+      "must wait on. Barriers are launched at sequential/function scope "
+      "(isLaunchLikeOp) so the FSM's frame WAIT machinery samples their "
+      "done. Default false (a real data store).",
+      "bool",
+      "isBarrier",
+      (ins), /*methodBody=*/[{}], /*defaultImplementation=*/[{
+        return false;
       }]>
   ];
   /* let verify = [{ return verifyGroupInterface(op); }]; */
