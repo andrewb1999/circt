@@ -223,23 +223,39 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
             "skipping launch/expect wrap");
         continue;
       }
+      // Place the expect at the op's declared latency so several
+      // iterations' requests overlap on one port (the FSM attributes the
+      // interleaved dones with per-expect counting + a data FIFO). The
+      // walk sees CLONES (stage emission), which the problem does not
+      // know, so fall back to the load/store interface latency when the
+      // operator-type lookup fails.
       unsigned lat = 1;
       if (auto opr = problem.getLinkedOperatorType(&op))
         lat = problem.getLatency(*opr).value_or(1);
+      else if (auto load = dyn_cast<LoadInterface>(&op))
+        lat = load.getLatency();
+      else if (auto store = dyn_cast<StoreInterface>(&op))
+        lat = store.getLatency();
       if (lat == 0) {
         op.emitWarning("loopschedule.dynamic op has zero latency; skipping "
                         "launch/expect wrap");
         continue;
       }
       unsigned offset = atOp.getOffset();
-      // A zero-result store has no downstream use forcing a later stage, so it
-      // can land in the last stage where `offset + lat` does not exist. Leave
-      // such a store unwrapped (fire-and-forget) rather than dangling its
-      // launch handle. (A blocking external store in the last stage is a known
-      // limitation; single-result loads always have a later use, so their
-      // completion stage exists.)
-      if (op.getNumResults() == 0 && !stageOffsets.count(offset + lat))
-        continue;
+      // A zero-result store has no downstream use forcing a later stage, so
+      // `offset + lat` may not exist. Its expect doesn't need to sit exactly
+      // at completion — the FSM's done counter stalls the planted stage until
+      // the done arrives, however late — so clamp to the last existing stage.
+      // If no later stage exists at all (a true last-stage store), leave it
+      // unwrapped (fire-and-forget) rather than dangling its launch handle;
+      // function-level control waits fence it. (Single-result loads always
+      // have a later use, so their completion stage exists.)
+      if (op.getNumResults() == 0) {
+        while (lat > 0 && !stageOffsets.count(offset + lat))
+          --lat;
+        if (lat == 0)
+          continue;
+      }
       if (!byStage.count(offset))
         stagesInOrder.push_back(offset);
       byStage[offset].push_back({&op, lat});

@@ -482,6 +482,18 @@ computeOpCycleLatency(Operation *def,
   if (auto attr =
           def->getAttrOfType<IntegerAttr>("loopschedule.cycle_latency"))
     return (unsigned)attr.getInt();
+  // The cross-stage resolver's convention is "data live during stage
+  // J + latency + 1" (a latency-1 BRAM read issued at J is live at J+1,
+  // like a latency-0 value's stage register). A dynamic load's expect
+  // FIFO presents the data live on the consume cycle J + declared
+  // latency, so report declaredLatency - 1: the consumer at the expect's
+  // dest stage reads the FIFO head directly, and any later consumer gets
+  // a delay register that captures the head at the consume edge.
+  if (auto load = dyn_cast<LoadInterface>(def))
+    if (load.isDynamic()) {
+      unsigned lat = load.getLatency();
+      return lat > 0 ? lat - 1 : 0;
+    }
   if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp, LoadInterface,
           StoreInterface>(def))
     return 0;
@@ -3165,6 +3177,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // runs, the launch/expect ops are gone, so we must capture this first.
   struct ExpectInfo {
     unsigned destStageOffset;
+    unsigned issueStageOffset;
+    bool isLoad;
     Value portValue;
   };
   SmallVector<ExpectInfo> expectInfos;
@@ -3174,6 +3188,9 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       return;
     auto launch = expectOp.getLaunchOp();
     if (!launch)
+      return;
+    auto issue = launch->getParentOfType<LoopScheduleAtOp>();
+    if (!issue)
       return;
     Operation *payload = nullptr;
     for (Operation &op : launch.getBody().front()) {
@@ -3186,15 +3203,19 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       return;
     // Dynamic loads and dynamic stores are both wrapped in launch/expect; the
     // stall machinery only needs the memory port value, which both interfaces
-    // expose.
+    // expose. Loads additionally get a small data FIFO (see below).
     Value memVal;
-    if (auto loadIface = dyn_cast<HWLoadLoweringInterface>(payload))
+    bool isLoad = false;
+    if (auto loadIface = dyn_cast<HWLoadLoweringInterface>(payload)) {
       memVal = loadIface.getMemoryValue();
-    else if (auto storeIface = dyn_cast<HWStoreLoweringInterface>(payload))
+      isLoad = true;
+    } else if (auto storeIface = dyn_cast<HWStoreLoweringInterface>(payload)) {
       memVal = storeIface.getMemoryValue();
-    else
+    } else {
       return;
-    expectInfos.push_back({(unsigned)dest.getOffset(), memVal});
+    }
+    expectInfos.push_back({(unsigned)dest.getOffset(),
+                           (unsigned)issue.getOffset(), isLoad, memVal});
   });
 
   inlineLaunchExpectPairs(pipOp);
@@ -3325,105 +3346,180 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     gatedStageCE[i] =
         comb::AndOp::create(hwBuilder, loc, stageCE[i], notStall);
 
-  // Per-expect handshake state. The memory module emits an honest 1-cycle
-  // pulse on `done` when the arbiter actually services this consumer.
-  // For multi-output arbiters (multiple consumers sharing one
-  // physical port) the dones arrive on different cycles, so the FSM
-  // has to:
-  //   * Latch each pulse so the stall can see "all dones have fired
-  //     by now" simultaneously, even though they fire on different
-  //     cycles.
-  //   * Capture the live `rdData` on each pulse (in case the consumer
-  //     fires later than the cycle that consumer's request was served).
-  // The combinational `stickyEff = done | sticky_reg` keeps single-
-  // output arbiters at zero latency overhead — for those, `done`
-  // pulses on the consume cycle and stickyEff is high then, so the
-  // pipeline doesn't stall and the consumer reads the live `rdData`
-  // through the `mux(done, live, captured)` wire.
+  // Per-expect completion tracking. The memory emits an honest 1-cycle
+  // pulse on `done` per request, with read data valid ON the pulse (the
+  // on-chip done chain matches the data latency; the AXI adapter delays
+  // done to its registered rd_data). With the expect planted `latency`
+  // stages after the issue, several iterations' requests are in flight
+  // on one port at once, so a single sticky bit cannot attribute dones
+  // to iterations. Instead each expect owns a small counter plus — for
+  // loads — a data FIFO sized to the issue→dest stage distance:
+  //   * every done pulse increments the counter and pushes the live
+  //     rdData;
+  //   * the consume cycle (stageCE[dest] & !stall) pops;
+  //   * the expect's stage stalls only while the counter is empty AND
+  //     no done is arriving this cycle, so on-time dones (on-chip
+  //     single-consumer ports) pass through with zero overhead via the
+  //     combinational empty-FIFO bypass.
+  // Attribution is positional: a port serves requests in issue order,
+  // so the k-th done belongs to the k-th unconsumed iteration. When
+  // several expects share one port, a round-robin pointer deals each
+  // done pulse to the expects in issue-stage order (one done per expect
+  // per iteration; if-predicated accesses on a shared port would break
+  // this count and are not supported).
   //
-  // We mask the gating signals with `!consume_eff` (the cycle the iter
-  // advances out of destStage) so the next iter's `rd_en` is allowed
-  // through on the same cycle as consume — otherwise II=1 would lose
-  // every iter's read window to the previous iter's stickies.
-  DenseMap<Value, Value> portStickyEff;
-  DenseMap<Value, Value> portRdDataMuxed;
   // Posted (no_wait) accesses on ports with acceptance backpressure: each
   // entry is (un-stall-gated issue gate, port ready). The Phase 3B stall
   // ORs in `rawGate & !ready` so a posted request is never dropped by a
   // busy memory; the enable itself is gated `& ready` at the issue site.
   SmallVector<std::pair<Value, Value>> postedReadyStalls;
-  SmallVector<Value> stickyRegs(expectInfos.size());
+  // Per-expect combinational "may consume this cycle" levels, indexed
+  // like expectInfos; null when the expect has no done to wait on.
+  SmallVector<Value> expectValid(expectInfos.size());
+  // Load-data splices to apply to the issue stage's per-stage port copy
+  // once `perStagePorts` is initialized below.
+  struct DataSplice {
+    unsigned issueStage;
+    Value portValue;
+    Value data;
+  };
+  SmallVector<DataSplice> dataSplices;
+  // Group expects by port (issue order) for done distribution.
+  llvm::MapVector<Value, SmallVector<unsigned>> portExpects;
   for (auto [eIdx, ei] : llvm::enumerate(expectInfos)) {
     auto it = memPorts.find(ei.portValue);
-    if (it == memPorts.end())
-      continue;
-    Value done = it->second.done;
-    if (!done)
+    if (it == memPorts.end() || !it->second.done)
       continue;
     if (ei.destStageOffset >= stages.size())
       continue;
+    portExpects[ei.portValue].push_back(eIdx);
+  }
+  for (auto &[portValue, eIdxs] : portExpects) {
+    Value done = memPorts.find(portValue)->second.done;
+    llvm::stable_sort(eIdxs, [&](unsigned a, unsigned b) {
+      return expectInfos[a].issueStageOffset <
+             expectInfos[b].issueStageOffset;
+    });
+    // Round-robin done distribution for ports shared by several expects.
+    SmallVector<Value> doneFor(eIdxs.size(), done);
+    if (eIdxs.size() > 1) {
+      unsigned k = eIdxs.size();
+      auto rrTy = IntegerType::get(ctx, llvm::Log2_64_Ceil(k));
+      Value rrZero = hw::ConstantOp::create(hwBuilder, loc, rrTy, 0);
+      Value rrLast = hw::ConstantOp::create(hwBuilder, loc, rrTy, k - 1);
+      Value rrOne = hw::ConstantOp::create(hwBuilder, loc, rrTy, 1);
+      Backedge rrBE = bb.get(rrTy);
+      Value rr = Value(rrBE);
+      Value atLast = comb::ICmpOp::create(
+          hwBuilder, loc, comb::ICmpPredicate::eq, rr, rrLast);
+      Value rrInc = comb::MuxOp::create(
+          hwBuilder, loc, atLast, rrZero,
+          comb::AddOp::create(hwBuilder, loc, rr, rrOne, false));
+      Value rrHeld = comb::MuxOp::create(hwBuilder, loc, done, rrInc, rr);
+      Value rrNext =
+          comb::MuxOp::create(hwBuilder, loc, startSignal, rrZero, rrHeld);
+      auto rrName = hwBuilder.getStringAttr(
+          (namePrefix + "_done_rr_" + std::to_string(eIdxs.front())).str());
+      Value rrReg = seq::CompRegOp::create(hwBuilder, loc, rrNext, clk, rst,
+                                           rrZero, rrName);
+      rrBE.setValue(rrReg);
+      for (unsigned rank = 0; rank < k; ++rank) {
+        Value isMine = comb::ICmpOp::create(
+            hwBuilder, loc, comb::ICmpPredicate::eq, rrReg,
+            hw::ConstantOp::create(hwBuilder, loc, rrTy, rank));
+        doneFor[rank] = comb::AndOp::create(hwBuilder, loc, done, isMine);
+      }
+    }
+    for (auto [rank, eIdx] : llvm::enumerate(eIdxs)) {
+      auto &ei = expectInfos[eIdx];
+      Value doneE = doneFor[rank];
+      // The pipeline holds at most dest-issue iterations between issue
+      // and consume, bounding both the counter and the data FIFO.
+      unsigned depth = ei.destStageOffset > ei.issueStageOffset
+                           ? ei.destStageOffset - ei.issueStageOffset
+                           : 1;
+      auto cntTy =
+          IntegerType::get(ctx, std::max(1u, llvm::Log2_64_Ceil(depth + 1)));
+      Value cntZero = hw::ConstantOp::create(hwBuilder, loc, cntTy, 0);
+      Value cntOne = hw::ConstantOp::create(hwBuilder, loc, cntTy, 1);
+      Value cntMax = hw::ConstantOp::create(hwBuilder, loc, cntTy, depth);
+      Backedge cntBE = bb.get(cntTy);
+      Value count = Value(cntBE);
+      Value isEmpty = comb::ICmpOp::create(
+          hwBuilder, loc, comb::ICmpPredicate::eq, count, cntZero);
+      Value notEmpty = comb::createOrFoldNot(hwBuilder, loc, isEmpty);
+      Value consumeEff = comb::AndOp::create(
+          hwBuilder, loc, stageCE[ei.destStageOffset], notStall, false);
+      // A done arriving on the consume cycle of an empty FIFO is consumed
+      // live (bypass): no push, zero stall overhead for on-time dones.
+      Value bypass =
+          comb::AndOp::create(hwBuilder, loc, consumeEff, isEmpty, false);
+      Value pop =
+          comb::AndOp::create(hwBuilder, loc, consumeEff, notEmpty, false);
+      Value isFull = comb::ICmpOp::create(
+          hwBuilder, loc, comb::ICmpPredicate::eq, count, cntMax);
+      Value push = comb::AndOp::create(
+          hwBuilder, loc, doneE,
+          comb::AndOp::create(hwBuilder, loc,
+                              comb::createOrFoldNot(hwBuilder, loc, bypass),
+                              comb::createOrFoldNot(hwBuilder, loc, isFull),
+                              false),
+          false);
+      Value inc = comb::MuxOp::create(hwBuilder, loc, push, cntOne, cntZero);
+      Value dec = comb::MuxOp::create(hwBuilder, loc, pop, cntOne, cntZero);
+      Value cntHeld = comb::SubOp::create(
+          hwBuilder, loc,
+          comb::AddOp::create(hwBuilder, loc, count, inc, false), dec, false);
+      Value cntNext =
+          comb::MuxOp::create(hwBuilder, loc, startSignal, cntZero, cntHeld);
+      auto cntName = hwBuilder.getStringAttr(
+          (namePrefix + "_expect_count_" + std::to_string(eIdx)).str());
+      Value cntReg = seq::CompRegOp::create(hwBuilder, loc, cntNext, clk, rst,
+                                            cntZero, cntName);
+      cntBE.setValue(cntReg);
+      expectValid[eIdx] =
+          comb::OrOp::create(hwBuilder, loc, doneE, notEmpty, false);
 
-    // sticky_reg.next = stickyEff & !consume_eff
-    //   stickyEff = done | sticky_reg              (combinational)
-    //   consume_eff = stageCE[destStage] & notStall (the cycle the iter
-    //                 actually advances out of destStage)
-    BackedgeBuilder localBE(hwBuilder, loc);
-    Backedge stickyBE = localBE.get(hwBuilder.getI1Type());
-    Value stickyReg = Value(stickyBE);
-    Value stickyEff =
-        comb::OrOp::create(hwBuilder, loc, done, stickyReg, false);
-    Value consumeEff =
-        comb::AndOp::create(hwBuilder, loc, stageCE[ei.destStageOffset],
-                              notStall, false);
-    Value notConsume = comb::createOrFoldNot(hwBuilder, loc, consumeEff);
-    Value stickyNext =
-        comb::AndOp::create(hwBuilder, loc, stickyEff, notConsume, false);
-    auto stickyName = hwBuilder.getStringAttr(
-        (namePrefix + "_sticky_" + std::to_string(eIdx)).str());
-    Value stickyRegOp = seq::CompRegOp::create(
-        hwBuilder, loc, stickyNext, clk, rst, falseConst, stickyName);
-    stickyBE.setValue(stickyRegOp);
-    stickyRegs[eIdx] = stickyRegOp;
-
-    // The gating signal we use for both stall and rd_en is the
-    // `consume`-masked stickyEff: high while the request hasn't been
-    // served yet AND we're not consuming this very cycle. ORing
-    // across multiple expects on the same port lets a port shared by
-    // many consumers gate on whichever expect is still pending.
-    Value stickyEffReg = comb::OrOp::create(
-        hwBuilder, loc, done, stickyRegOp, false);
-    Value gateForRd =
-        comb::AndOp::create(hwBuilder, loc, stickyEffReg, notConsume, false);
-    Value &portGate = portStickyEff[ei.portValue];
-    portGate = portGate
-                   ? comb::OrOp::create(hwBuilder, loc, portGate, gateForRd)
-                   : gateForRd;
-
-    // Captured rdData: feeds a mux(done, live, captured_reg). On the
-    // cycle done pulses, the consumer reads the live wire (for
-    // single-output cases this is the consume cycle; data is fresh).
-    // On other cycles, it reads the latched register (for outputs
-    // that finished on earlier cycles during a stall window). The
-    // register itself updates every cycle via the same mux, so it
-    // always holds the most recent capture.
-    if (it->second.rdData &&
-        portRdDataMuxed.find(ei.portValue) == portRdDataMuxed.end()) {
-      Value liveRdData = it->second.rdData;
+      // Load-data FIFO: push the live rdData on each done pulse, pop on
+      // consume; the consumer reads the head (or the live wire through
+      // the empty bypass). Shift-register FIFO, head at entry[0].
+      Value liveRdData =
+          ei.isLoad ? memPorts.find(portValue)->second.rdData : Value();
+      if (!liveRdData)
+        continue;
       Type dataTy = liveRdData.getType();
-      Backedge capBE = localBE.get(dataTy);
-      Value capReg = Value(capBE);
-      Value muxed =
-          comb::MuxOp::create(hwBuilder, loc, done, liveRdData, capReg);
       Value zeroData = hw::ConstantOp::create(hwBuilder, loc, dataTy, 0);
-      auto capName = hwBuilder.getStringAttr(
-          (namePrefix + "_captured_" + std::to_string(eIdx)).str());
-      Value capRegOp = seq::CompRegOp::create(
-          hwBuilder, loc, muxed, clk, rst, zeroData, capName);
-      capBE.setValue(capRegOp);
-      portRdDataMuxed[ei.portValue] = muxed;
-      // Splice the muxed wire in place of the live rdData so later
-      // stage processing transparently picks up the captured/live mix.
-      it->second.rdData = muxed;
+      SmallVector<Value> entries;
+      SmallVector<Backedge> entryBEs;
+      for (unsigned i = 0; i < depth; ++i) {
+        entryBEs.push_back(bb.get(dataTy));
+        auto eName = hwBuilder.getStringAttr(
+            (namePrefix + "_expect_fifo_" + std::to_string(eIdx) + "_" +
+             std::to_string(i))
+                .str());
+        entries.push_back(seq::CompRegOp::create(hwBuilder, loc,
+                                                 Value(entryBEs.back()), clk,
+                                                 rst, zeroData, eName));
+      }
+      // The shift consumes the head first, so a simultaneous push lands
+      // at count-1; otherwise at count.
+      Value writeIndex = comb::MuxOp::create(
+          hwBuilder, loc, pop,
+          comb::SubOp::create(hwBuilder, loc, cntReg, cntOne, false), cntReg);
+      for (unsigned i = 0; i < depth; ++i) {
+        Value upper = (i + 1 < depth) ? entries[i + 1] : zeroData;
+        Value shifted =
+            comb::MuxOp::create(hwBuilder, loc, pop, upper, entries[i]);
+        Value wsel = comb::ICmpOp::create(
+            hwBuilder, loc, comb::ICmpPredicate::eq, writeIndex,
+            hw::ConstantOp::create(hwBuilder, loc, cntTy, i));
+        Value writeI = comb::AndOp::create(hwBuilder, loc, push, wsel, false);
+        entryBEs[i].setValue(comb::MuxOp::create(hwBuilder, loc, writeI,
+                                                 liveRdData, shifted));
+      }
+      Value outData = comb::MuxOp::create(hwBuilder, loc, isEmpty, liveRdData,
+                                          entries[0]);
+      dataSplices.push_back({ei.issueStageOffset, portValue, outData});
     }
   }
 
@@ -3436,6 +3532,12 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   for (unsigned s = 0; s < stages.size(); ++s)
     for (auto &entry : memPorts)
       perStagePorts[s][entry.first].rdData = entry.second.rdData;
+  // Route each expect's FIFO output (head / live bypass) to the load that
+  // issued it: handleHWLoad maps the load's result from the issue stage's
+  // per-stage rdData slot.
+  for (auto &ds : dataSplices)
+    if (ds.issueStage < stages.size())
+      perStagePorts[ds.issueStage][ds.portValue].rdData = ds.data;
 
   // Delay chains for cross-stage values. If a value V is produced at stage J
   // and consumed at stage K > J+1, we must insert (K - J - 1) delay registers
@@ -3448,9 +3550,13 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // when stage J yields a value consumed at stage K > J + L + 1 (with L
   // = the producing op's cycle latency), the consumer reads from an
   // appropriately-clocked shift register rather than the constantly-
-  // overwriting stage-J register.
+  // overwriting stage-J register. The chain MUST clock on the
+  // stall-gated CE: the stage value registers freeze during a stall, and
+  // a raw-CE chain would keep shifting, sliding values across iterations
+  // (each consumer would read a LATER iteration's value — caught by the
+  // axi_copy end-to-end test as dst[i] = src[i+1]).
   CrossStageValueResolver delayResolver(
-      hwBuilder, loc, hwBody, clk, rst, stages, stageCE, mapping,
+      hwBuilder, loc, hwBody, clk, rst, stages, gatedStageCE, mapping,
       operatorLibrary, namePrefix.str());
 
   // Helper: check whether a memref is backed by a local seq.hlmem.
@@ -3524,26 +3630,15 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
           return success();
         }
         if (auto storeOp = dyn_cast<HWStoreLoweringInterface>(inner)) {
-          // For amc-port stores with a `done` handshake (dynamic / AXI), hold
-          // wr_en across the stall and drop it the cycle the write is actually
-          // served (`stickyEff` high), so a single store is not re-issued every
-          // cycle of the stall window. Keep `gate` (= gatedStageCE & enclosing
-          // if-conditions) so predication and `notStall` are preserved.
+          // Dynamic store issue is a single-cycle pulse on a cycle the
+          // memory will accept it: gate wr_en with the port's acceptance
+          // `ready` and stall the pipeline while the memory won't take the
+          // request. This covers posted (no_wait) and blocking stores alike
+          // — a blocking store's completion is tracked by its expect's done
+          // counter at the dest stage, not by holding wr_en.
           Value storeGate = gate;
-          auto stickyIt = portStickyEff.find(storeOp.getMemoryValue());
-          if (stickyIt != portStickyEff.end()) {
-            Value notSticky =
-                comb::createOrFoldNot(hwBuilder, loc, stickyIt->second);
-            storeGate =
-                comb::AndOp::create(hwBuilder, loc, gate, notSticky);
-          }
-          // POSTED (no_wait) store on a port with acceptance backpressure:
-          // fire wr_en only on a cycle the memory will take it, and stall
-          // the pipeline while it won't. Wrapped (blocking) stores skip
-          // this — their held wr_en + expect stall already guarantee
-          // acceptance.
           if (auto si = dyn_cast<loopschedule::StoreInterface>(inner)) {
-            if (si.isDynamic() && !si.getWaitForCompletion()) {
+            if (si.isDynamic()) {
               auto pIt = memPorts.find(storeOp.getMemoryValue());
               if (pIt != memPorts.end() && pIt->second.ready) {
                 Value ready = pIt->second.ready;
@@ -3562,18 +3657,24 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
               localLoadResults.insert(ls.getResult());
           if (loadOp.requiresReadEnable() && loadOp.getReadLatency() > 0)
             localLoadResults.insert(loadOp.getResult());
-          // For amc-port loads with a `done` handshake, drop rd_en the
-          // cycle the request is actually serviced (`stickyEff` high)
-          // unless we're consuming this very cycle. Without this, the
-          // arbiter would re-serve the same output every cycle of a
-          // multi-output stall window.
+          // Dynamic load issue is a single-cycle pulse like stores. Use the
+          // stall-gated `gate`, NOT the raw stageCE: a request held across
+          // stall cycles re-issues on a queue-style engine — an AXI master
+          // accepts a NEW read every cycle rd_en stays high (duplicate
+          // ARs, caught by the axi_copy end-to-end test).
           Value loadGate = gate;
-          auto stickyIt = portStickyEff.find(loadOp.getMemoryValue());
-          if (stickyIt != portStickyEff.end()) {
-            Value notSticky =
-                comb::createOrFoldNot(hwBuilder, loc, stickyIt->second);
-            loadGate = comb::AndOp::create(hwBuilder, loc,
-                                              stageCE[stageIdx], notSticky);
+          // Acceptance backpressure for pipelined dynamic loads: with the
+          // expect at +latency, several requests are in flight at once, so
+          // a full read queue (AXI) or a busy arbiter lane (on-chip) must
+          // stall issue rather than drop the request.
+          {
+            auto pIt = memPorts.find(loadOp.getMemoryValue());
+            if (pIt != memPorts.end() && pIt->second.ready) {
+              Value ready = pIt->second.ready;
+              loadGate =
+                  comb::AndOp::create(hwBuilder, loc, loadGate, ready);
+              postedReadyStalls.push_back({rawGate, ready});
+            }
           }
           return handleHWLoad(loadOp, hwBuilder, mapping,
                                  perStagePorts[stageIdx], loadGate);
@@ -3823,34 +3924,21 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       hwBuilder.getStringAttr(namePrefix + "_done"));
   doneSignal = doneReg;
 
-  // Phase 3B: resolve the stall backedge. Stall while any expect's
-  // sticky-effective signal is low — i.e. the arbiter hasn't serviced
-  // this consumer's request for the current iteration. `stickyEff =
-  // done | sticky_reg` is combinational so single-output cases (where
-  // done pulses on the consume cycle) see stickyEff=1 immediately and
-  // don't stall. Multi-output cases hold stickyEff=0 for the
-  // unserved consumers across the stall window.
+  // Phase 3B: resolve the stall backedge. Stall while an expect's dest
+  // stage wants to consume but its done counter is empty and no done is
+  // arriving this cycle (`expectValid = doneE | count != 0` is
+  // combinational, so on-time dones pass with zero overhead). The terms
+  // are built from registered signals only (stageCE, memory done, the
+  // counter), so no combinational loop through `notStall`.
   SmallVector<Value> stallBits;
   for (auto [eIdx, ei] : llvm::enumerate(expectInfos)) {
-    if (eIdx >= stickyRegs.size() || !stickyRegs[eIdx])
+    if (!expectValid[eIdx])
       continue;
-    if (ei.destStageOffset >= stageCE.size())
-      continue;
-    auto it = memPorts.find(ei.portValue);
-    if (it == memPorts.end())
-      continue;
-    // Re-derive stickyEff combinationally for the stall: this is the
-    // same OR(done, sticky_reg) we used to feed the rd_en gate, just
-    // unmasked (no consume mask) so the stall stays correct on the
-    // consume cycle itself.
-    Value done = it->second.done;
-    Value stickyEff =
-        done ? comb::OrOp::create(hwBuilder, loc, done, stickyRegs[eIdx])
-             : Value(stickyRegs[eIdx]);
-    Value notSticky = comb::createOrFoldNot(hwBuilder, loc, stickyEff);
+    Value notValid =
+        comb::createOrFoldNot(hwBuilder, loc, expectValid[eIdx]);
     Value stallI = comb::AndOp::create(hwBuilder, loc,
                                          stageCE[ei.destStageOffset],
-                                         notSticky);
+                                         notValid);
     stallBits.push_back(stallI);
   }
   // Posted-issue backpressure: hold the pipeline while a posted (no_wait)
