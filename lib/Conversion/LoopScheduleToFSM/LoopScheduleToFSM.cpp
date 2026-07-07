@@ -173,6 +173,10 @@ struct MemPortMapping {
   // memref-backed local memories — the FSM treats missing `done` as
   // tied-high (no pipeline stall contribution).
   Value done;
+  // Separate write-completion pulse for read+write dynamic ports (see
+  // HWPortSignals::wrDone). When non-null, `done` is read-only and store
+  // expects attribute against `wrDone` instead.
+  Value wrDone;
   // Memory-driven same-cycle acceptance level for dynamic ports (see
   // HWPortSignals::ready). Null ⇒ tied high (no issue backpressure).
   Value ready;
@@ -2448,6 +2452,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           localMemPorts[memInfo.originalArg].rdData;
       perFramePorts[i][memInfo.originalArg].done =
           localMemPorts[memInfo.originalArg].done;
+      perFramePorts[i][memInfo.originalArg].wrDone =
+          localMemPorts[memInfo.originalArg].wrDone;
       perFramePorts[i][memInfo.originalArg].ready =
           localMemPorts[memInfo.originalArg].ready;
     }
@@ -3384,18 +3390,27 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     Value data;
   };
   SmallVector<DataSplice> dataSplices;
-  // Group expects by port (issue order) for done distribution.
-  llvm::MapVector<Value, SmallVector<unsigned>> portExpects;
+  // Group expects by (port, done stream) for done distribution. Ports with
+  // a split write-done (read+write dyn faces, e.g. an rw AXI port) put load
+  // expects on the read `done` and store expects on `wrDone`: each
+  // direction completes in issue order WITHIN itself, but cross-direction
+  // interleaving (pipeline fill issues several loads before the first
+  // store's stage is reached) would break a shared positional rotation.
+  llvm::MapVector<std::pair<Value, unsigned>, SmallVector<unsigned>>
+      portExpects;
   for (auto [eIdx, ei] : llvm::enumerate(expectInfos)) {
     auto it = memPorts.find(ei.portValue);
     if (it == memPorts.end() || !it->second.done)
       continue;
     if (ei.destStageOffset >= stages.size())
       continue;
-    portExpects[ei.portValue].push_back(eIdx);
+    unsigned wrStream = (!ei.isLoad && it->second.wrDone) ? 1 : 0;
+    portExpects[{ei.portValue, wrStream}].push_back(eIdx);
   }
-  for (auto &[portValue, eIdxs] : portExpects) {
-    Value done = memPorts.find(portValue)->second.done;
+  for (auto &[groupKey, eIdxs] : portExpects) {
+    Value portValue = groupKey.first;
+    auto &groupPort = memPorts.find(portValue)->second;
+    Value done = groupKey.second ? groupPort.wrDone : groupPort.done;
     llvm::stable_sort(eIdxs, [&](unsigned a, unsigned b) {
       return expectInfos[a].issueStageOffset <
              expectInfos[b].issueStageOffset;
@@ -3852,14 +3867,23 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   Value epilogueTrigger =
       comb::AndOp::create(hwBuilder, loc, active, notCondValue);
 
+  // The epilogue chain shifts in LOCKSTEP with the stage-CE chain
+  // (CE = notStall): a stalled pipeline freezes its in-flight iterations,
+  // and an epilogue that kept shifting would race ahead of them and fire
+  // `done` while a mid-stage iteration is still frozen (the tail-CE guard
+  // below only covers the LAST stage). II=1 pipelines masked this — dense
+  // occupancy keeps the tail stage busy through the drain — but sparse
+  // II>1 schedules with a mid-stage ready/expect stall drop accesses of
+  // still-in-flight iterations when the enclosing frame consumes the
+  // early done.
   Value notStart = comb::createOrFoldNot(hwBuilder, loc, startSignal);
   Backedge epilogueBE = bb.get(hwBuilder.getI1Type());
   Value epilogueHold =
       comb::AndOp::create(hwBuilder, loc, Value(epilogueBE), notStart);
   Value epilogueNext =
       comb::OrOp::create(hwBuilder, loc, epilogueTrigger, epilogueHold);
-  auto epilogueReg = seq::CompRegOp::create(
-      hwBuilder, loc, epilogueNext, clk, rst, falseConst,
+  auto epilogueReg = seq::CompRegClockEnabledOp::create(
+      hwBuilder, loc, epilogueNext, clk, notStall, rst, falseConst,
       hwBuilder.getStringAttr(namePrefix + "_epilogue"));
   epilogueBE.setValue(epilogueReg);
 
@@ -3877,8 +3901,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     Value delayInput =
         comb::MuxOp::create(hwBuilder, loc, startSignal, falseConst,
                             delayedEpilogue);
-    delayedEpilogue = seq::CompRegOp::create(
-        hwBuilder, loc, delayInput, clk, rst, falseConst,
+    delayedEpilogue = seq::CompRegClockEnabledOp::create(
+        hwBuilder, loc, delayInput, clk, notStall, rst, falseConst,
         hwBuilder.getStringAttr(
             (namePrefix + "_epilogue_delay_" + std::to_string(i)).str()));
   }
@@ -3911,8 +3935,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   for (unsigned i = 0; i < storeTailCycles; ++i) {
     Value tailInput = comb::MuxOp::create(hwBuilder, loc, startSignal,
                                           falseConst, doneComb);
-    doneComb = seq::CompRegOp::create(
-        hwBuilder, loc, tailInput, clk, rst, falseConst,
+    doneComb = seq::CompRegClockEnabledOp::create(
+        hwBuilder, loc, tailInput, clk, notStall, rst, falseConst,
         hwBuilder.getStringAttr(
             (namePrefix + "_store_tail_" + std::to_string(i)).str()));
   }
@@ -4264,6 +4288,7 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
     mp.rdData = signals.rdData;
     mp.addrs.assign(signals.addrs.size(), Value());
     mp.done = signals.done;
+    mp.wrDone = signals.wrDone;
     mp.ready = signals.ready;
     memPortMap[portValue] = mp;
   }
@@ -4566,6 +4591,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
           memPortMap[memInfo.originalArg].rdData;
       perEntryPorts[i][memInfo.originalArg].done =
           memPortMap[memInfo.originalArg].done;
+      perEntryPorts[i][memInfo.originalArg].wrDone =
+          memPortMap[memInfo.originalArg].wrDone;
       perEntryPorts[i][memInfo.originalArg].ready =
           memPortMap[memInfo.originalArg].ready;
     }

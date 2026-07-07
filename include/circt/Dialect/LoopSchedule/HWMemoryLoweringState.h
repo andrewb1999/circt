@@ -69,6 +69,15 @@ struct HWPortSignals {
   /// done signal (e.g. memref-backed local memories), in which case the
   /// FSM treats it as tied-high (no stall from this port).
   mlir::Value done;
+  /// Separate write-completion pulse for read+write DYNAMIC ports (e.g. a
+  /// `dyn rw` AXI face): when non-null, `done` carries READ completions
+  /// only and `wrDone` carries WRITE completions (the B response). The FSM
+  /// then attributes load expects against `done` and store expects against
+  /// `wrDone` — each direction completes in issue order within itself,
+  /// which cross-direction interleaving (pipeline fill) does not
+  /// guarantee. Null for single-direction ports, where `done` carries the
+  /// port's only completion stream.
+  mlir::Value wrDone;
   /// Memory-driven same-cycle acceptance level for DYNAMIC ports: a request
   /// presented this cycle will be taken iff `ready` is high. Must be
   /// valid-independent (no combinational path from the request inputs).
