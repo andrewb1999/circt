@@ -15,7 +15,7 @@
 // Function-level FSM sequences the two frames
 // CHECK: fsm.hw_instance
 // Pipeline-local active register
-// CHECK: seq.compreg sym @loop0_active
+// CHECK: seq.compreg.ce sym @loop0_active
 // CHECK: hw.output
 
 // CHECK-LABEL: fsm.machine @pipeline_add_fsm
@@ -25,7 +25,7 @@
 // CHECK: fsm.state @FRAME_1
 // CHECK: fsm.state @DONE
 
-func.func @pipeline_add(%arg0: i32) -> i32 {
+loopschedule.func_sequential @pipeline_add(%arg0: i32) -> i32 {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c10 = arith.constant 10 : index
@@ -59,5 +59,5 @@ func.func @pipeline_add(%arg0: i32) -> i32 {
     }
     loopschedule.yield %r : i32
   }
-  return %result : i32
+  loopschedule.return %result : i32
 }

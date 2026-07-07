@@ -3,7 +3,7 @@
 
 // A sequential loop that writes to a memref.
 module {
-  func.func @fill(%arg0: memref<32xi32>) attributes {top} {
+  loopschedule.func_sequential @fill(%arg0: memref<32xi32>) attributes {top} {
     %c0 = arith.constant 0 : i32
     %c42 = arith.constant 42 : i32
     %c1_i6 = arith.constant 1 : i6
@@ -37,7 +37,7 @@ module {
     } do {
       loopschedule.yield
     }
-    return
+    loopschedule.return
   }
 }
 

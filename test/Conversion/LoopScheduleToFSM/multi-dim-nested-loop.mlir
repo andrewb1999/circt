@@ -5,7 +5,7 @@
 // ports flow through both the outer and inner loop hw.modules and that the
 // child instance per-dim address muxes wire up correctly.
 module {
-  func.func @nested2d(%arg0: memref<8x8xi32>) attributes {top} {
+  loopschedule.func_sequential @nested2d(%arg0: memref<8x8xi32>) attributes {top} {
     %c0_i32 = arith.constant 0 : i32
     %c0_i4 = arith.constant 0 : i4
     %c1_i4 = arith.constant 1 : i4
@@ -65,7 +65,7 @@ module {
     } do {
       loopschedule.yield
     }
-    return
+    loopschedule.return
   }
 }
 

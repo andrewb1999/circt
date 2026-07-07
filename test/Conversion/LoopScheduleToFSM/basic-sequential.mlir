@@ -4,7 +4,7 @@
 // A simple sequential loop that counts from 0 to 10.
 // The loop is wrapped in a top-level frame via `launch` (new shape).
 module {
-  func.func @count() attributes {top} {
+  loopschedule.func_sequential @count() attributes {top} {
     %c0 = arith.constant 0 : i32
     %c10 = arith.constant 10 : i32
     %c1 = arith.constant 1 : i32
@@ -35,7 +35,7 @@ module {
     } do {
       loopschedule.yield
     }
-    return
+    loopschedule.return
   }
 }
 

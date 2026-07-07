@@ -7,7 +7,7 @@
 // keep frame_active_0 high in all 3 cycles.
 
 module {
-  func.func @delay_step(%arg0: memref<16xi32>) attributes {top} {
+  loopschedule.func_sequential @delay_step(%arg0: memref<16xi32>) attributes {top} {
     %c0_i32 = arith.constant 0 : i32
     %c10_i32 = arith.constant 10 : i32
     %c1_i32 = arith.constant 1 : i32
@@ -42,7 +42,7 @@ module {
     } do {
       loopschedule.yield
     }
-    return
+    loopschedule.return
   }
 }
 

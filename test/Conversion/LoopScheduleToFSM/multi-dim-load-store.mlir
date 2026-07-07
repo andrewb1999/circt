@@ -5,7 +5,7 @@
 // indices. Verify the loop module exposes one address port per dim and the
 // top-level module forwards them through.
 module {
-  func.func @copy2d(%arg0: memref<4x8xi32>) attributes {top} {
+  loopschedule.func_sequential @copy2d(%arg0: memref<4x8xi32>) attributes {top} {
     %c0_i2 = arith.constant 0 : i2
     %c1_i2 = arith.constant 1 : i2
     %c0_i3 = arith.constant 0 : i3
@@ -42,7 +42,7 @@ module {
     } do {
       loopschedule.yield
     }
-    return
+    loopschedule.return
   }
 }
 

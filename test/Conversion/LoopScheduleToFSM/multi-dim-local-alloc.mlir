@@ -5,7 +5,7 @@
 // emitted, the loop module exposes one address port per dim, and three
 // per-dim backedges resolve at the function root.
 module {
-  func.func @fill_local3d() attributes {top} {
+  loopschedule.func_sequential @fill_local3d() attributes {top} {
     %c42 = arith.constant 42 : i8
     %c0_i1 = arith.constant 0 : i1
     %c0_i2 = arith.constant 0 : i2
@@ -42,7 +42,7 @@ module {
     } do {
       loopschedule.yield
     }
-    return
+    loopschedule.return
   }
 }
 

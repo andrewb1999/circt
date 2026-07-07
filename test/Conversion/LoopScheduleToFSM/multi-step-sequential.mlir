@@ -4,7 +4,7 @@
 // Two top-level frames, each containing a launched sequential loop.
 // First loop initializes memory, second loop reads/modifies it.
 module {
-  func.func @two_loops(%arg0: memref<8xi32>) attributes {top} {
+  loopschedule.func_sequential @two_loops(%arg0: memref<8xi32>) attributes {top} {
     %c0_i32 = arith.constant 0 : i32
     %c42_i32 = arith.constant 42 : i32
     %c1_i4 = arith.constant 1 : i4
@@ -65,7 +65,7 @@ module {
     } do {
       loopschedule.yield
     }
-    return
+    loopschedule.return
   }
 }
 

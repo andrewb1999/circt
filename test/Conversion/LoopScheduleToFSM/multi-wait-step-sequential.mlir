@@ -11,7 +11,7 @@
 // outputs, two child_done inputs, two post_active outputs, and matching
 // WAIT_1/POST_1 and WAIT_2/POST_2 states.
 module {
-  func.func @two_children(%arg0: memref<4xi32>, %arg1: memref<4xi32>)
+  loopschedule.func_sequential @two_children(%arg0: memref<4xi32>, %arg1: memref<4xi32>)
       attributes {top} {
     %c0_i32 = arith.constant 0 : i32
     %c5_i32 = arith.constant 5 : i32
@@ -98,7 +98,7 @@ module {
     } do {
       loopschedule.yield
     }
-    return
+    loopschedule.return
   }
 }
 

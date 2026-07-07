@@ -3,7 +3,7 @@
 
 // A sequential loop that writes to a locally allocated memory.
 module {
-  func.func @fill_local() attributes {top} {
+  loopschedule.func_sequential @fill_local() attributes {top} {
     %c42 = arith.constant 42 : i32
     %c1_i4 = arith.constant 1 : i4
     %c0_i4 = arith.constant 0 : i4
@@ -37,7 +37,7 @@ module {
     } do {
       loopschedule.yield
     }
-    return
+    loopschedule.return
   }
 }
 

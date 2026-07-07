@@ -4,7 +4,7 @@
 // Two-stage pipeline with II=2. CE fires every other cycle.
 // CHECK-LABEL: hw.module @pipeline_ii2
 // Counter for II=2 (1-bit counter cycling 0,1,0,1,...)
-// CHECK: seq.compreg sym @loop0_ii_counter
+// CHECK: seq.compreg.ce sym @loop0_ii_counter
 // Counter logic: wrap at II-1
 // CHECK: comb.icmp eq
 // CHECK: comb.mux
@@ -14,7 +14,7 @@
 // active_ce = ce_gen AND cond
 // CHECK: comb.and
 // Traveling CE for stage 1
-// CHECK: seq.compreg sym @loop0_ce_stage_1
+// CHECK: seq.compreg.ce sym @loop0_ce_stage_1
 // Stage 0 registers
 // CHECK: seq.compreg.ce sym @loop0_s0_r0
 // CHECK: seq.compreg.ce sym @loop0_s0_r1
@@ -29,7 +29,7 @@
 // CHECK: fsm.state @FRAME_1
 // CHECK: fsm.state @DONE
 
-func.func @pipeline_ii2(%arg0: i32) -> i32 {
+loopschedule.func_sequential @pipeline_ii2(%arg0: i32) -> i32 {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c10 = arith.constant 10 : index
@@ -66,5 +66,5 @@ func.func @pipeline_ii2(%arg0: i32) -> i32 {
     }
     loopschedule.yield %r : i32
   }
-  return %result : i32
+  loopschedule.return %result : i32
 }
