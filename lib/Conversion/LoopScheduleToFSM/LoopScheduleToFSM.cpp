@@ -4133,6 +4133,7 @@ static void appendBramBoundaries(
     hw::HWModuleOp hwMod,
     DenseMap<Value, loopschedule::BramBoundary> &bramBoundaries) {
   Block *body = hwMod.getBodyBlock();
+  SmallVector<Attribute> axiBundles;
   for (auto &kv : bramBoundaries) {
     auto &b = kv.second;
     if (!b.inputPorts.empty()) {
@@ -4151,7 +4152,22 @@ static void appendBramBoundaries(
     }
     for (auto [p, v] : llvm::zip(b.outputPorts, b.outputValues))
       hwMod.appendOutput(p.name, v);
+    if (b.axiMeta) {
+      auto *ctx = hwMod.getContext();
+      OpBuilder ab(ctx);
+      axiBundles.push_back(ab.getDictionaryAttr(
+          {ab.getNamedAttr("name", ab.getStringAttr(b.axiMeta->bundle)),
+           ab.getNamedAttr("depth", ab.getI64IntegerAttr(b.axiMeta->depth)),
+           ab.getNamedAttr("elem_width",
+                           ab.getI64IntegerAttr(b.axiMeta->elemWidth))}));
+    }
   }
+  // Publish AXI bundle metadata for the testbench generator (slave depth /
+  // element width are elaboration constants it cannot recover from the port
+  // face).
+  if (!axiBundles.empty())
+    hwMod->setAttr("amc.axi_bundles",
+                   ArrayAttr::get(hwMod.getContext(), axiBundles));
 }
 
 //===----------------------------------------------------------------------===//

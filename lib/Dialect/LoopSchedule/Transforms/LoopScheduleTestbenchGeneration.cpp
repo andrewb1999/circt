@@ -139,6 +139,107 @@ static bool isMemoryPort(StringRef name,
 }
 
 //===----------------------------------------------------------------------===//
+// AXI bundle classification
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// One m_axi bundle on the DUT boundary: the `<name>_m_axi_<sig>` port group
+/// plus the slave-sizing metadata the FSM lowering published via the
+/// `amc.axi_bundles` module attribute (the AXI face itself carries no depth).
+struct AxiBundleInfo {
+  std::string name;
+  uint64_t depth = 0;
+  unsigned dataW = 32;
+  unsigned addrShift = 2;
+  /// DUT ports keyed by bare signal name ("araddr", "rdata", ...).
+  llvm::StringMap<hw::PortInfo> ports;
+};
+} // namespace
+
+/// The m_axi signal set, in the port-declaration order of
+/// hdl/systemverilog/axi_slave_mem.sv. `dutOutput` marks signals the kernel
+/// master DRIVES (= slave inputs); the rest are slave outputs feeding the
+/// kernel.
+struct AxiSigDesc {
+  const char *sig;
+  bool dutOutput;
+};
+static const AxiSigDesc kAxiSigs[] = {
+    {"araddr", true},   {"arvalid", true},  {"arlen", true},
+    {"arsize", true},   {"arburst", true},  {"arid", true},
+    {"arprot", true},   {"arcache", true},  {"arlock", true},
+    {"arqos", true},    {"arregion", true}, {"arready", false},
+    {"rdata", false},   {"rvalid", false},  {"rresp", false},
+    {"rlast", false},   {"rid", false},     {"rready", true},
+    {"awaddr", true},   {"awvalid", true},  {"awlen", true},
+    {"awsize", true},   {"awburst", true},  {"awid", true},
+    {"awprot", true},   {"awcache", true},  {"awlock", true},
+    {"awqos", true},    {"awregion", true}, {"awready", false},
+    {"wdata", true},    {"wstrb", true},    {"wvalid", true},
+    {"wlast", true},    {"wready", false},  {"bvalid", false},
+    {"bresp", false},   {"bid", false},     {"bready", true},
+};
+
+static bool isAxiPort(StringRef name) { return name.contains("_m_axi_"); }
+
+/// Group the DUT's `<bundle>_m_axi_<sig>` ports into per-bundle infos and
+/// resolve each bundle's depth from the `amc.axi_bundles` attribute.
+static LogicalResult
+classifyAxiBundles(hw::HWModuleOp dutMod,
+                   const SmallVector<hw::PortInfo> &dutPorts,
+                   SmallVector<AxiBundleInfo> &bundles) {
+  llvm::MapVector<StringRef, AxiBundleInfo> byName;
+  for (auto &port : dutPorts) {
+    StringRef pname = port.getName();
+    size_t pos = pname.find("_m_axi_");
+    if (pos == StringRef::npos)
+      continue;
+    StringRef bundle = pname.take_front(pos);
+    StringRef sig = pname.drop_front(pos + strlen("_m_axi_"));
+    auto &info = byName[bundle];
+    info.name = bundle.str();
+    info.ports[sig] = port;
+  }
+  if (byName.empty())
+    return success();
+
+  auto bundlesAttr = dutMod->getAttrOfType<ArrayAttr>("amc.axi_bundles");
+  for (auto &kv : byName) {
+    auto &info = kv.second;
+    for (auto &desc : kAxiSigs)
+      if (!info.ports.count(desc.sig))
+        return dutMod.emitError("m_axi bundle '")
+               << kv.first << "' is missing signal '" << desc.sig << "'";
+    info.dataW = cast<IntegerType>(info.ports["rdata"].type).getWidth();
+    unsigned strbW = cast<IntegerType>(info.ports["wstrb"].type).getWidth();
+    info.addrShift = llvm::Log2_32(std::max(1u, strbW));
+
+    bool found = false;
+    if (bundlesAttr) {
+      for (auto attr : bundlesAttr) {
+        auto dict = dyn_cast<DictionaryAttr>(attr);
+        if (!dict)
+          continue;
+        auto nameAttr = dict.getAs<StringAttr>("name");
+        auto depthAttr = dict.getAs<IntegerAttr>("depth");
+        if (nameAttr && depthAttr && nameAttr.getValue() == kv.first) {
+          info.depth = (uint64_t)depthAttr.getInt();
+          found = true;
+          break;
+        }
+      }
+    }
+    if (!found)
+      return dutMod.emitError(
+                 "m_axi bundle '")
+             << kv.first
+             << "' has no amc.axi_bundles metadata (slave depth unknown)";
+    bundles.push_back(info);
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Attribute mode (legacy — scalar I/O from MLIR attributes)
 //===----------------------------------------------------------------------===//
 
@@ -348,11 +449,17 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   auto dutPorts = dutMod.getPortList();
   auto memGroups = classifyMemoryPorts(dutPorts);
 
-  // Classify scalar ports (excluding control and memory ports).
+  // AXI bundles get a behavioral slave instance each (axi_slave_mem.sv).
+  SmallVector<AxiBundleInfo> axiBundles;
+  if (failed(classifyAxiBundles(dutMod, dutPorts, axiBundles)))
+    return signalPassFailure();
+
+  // Classify scalar ports (excluding control, memory, and AXI ports).
   SmallVector<hw::PortInfo> scalarInputs;
   SmallVector<hw::PortInfo> scalarOutputs;
   for (auto &port : dutPorts) {
-    if (isControlPort(port.getName()) || isMemoryPort(port.getName(), memGroups))
+    if (isControlPort(port.getName()) ||
+        isMemoryPort(port.getName(), memGroups) || isAxiPort(port.getName()))
       continue;
     if (port.isInput())
       scalarInputs.push_back(port);
@@ -620,6 +727,11 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   // Use DenseMap to track which DUT input index corresponds to which mem group.
   DenseMap<StringRef, unsigned> memRdDataInputIdx;
 
+  // AXI: wires feeding the DUT's slave->master inputs (assigned from the
+  // slave instances below) and the DUT's master->slave output values.
+  llvm::StringMap<Value> axiInWires;
+  llvm::StringMap<Value> axiOutVals;
+
   for (auto &port : dutPorts) {
     if (!port.isInput())
       continue;
@@ -653,6 +765,15 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
 
       // Store the wire so we can assign to it later.
       memInfoMap[prefix].readVal = rdWire; // reuse readVal to store the wire
+    } else if (isAxiPort(port.getName())) {
+      // AXI slave->master signal: a wire assigned from the per-bundle slave
+      // instance after the DUT instance exists.
+      auto axiWire = sv::WireOp::create(
+          builder, loc, port.type,
+          builder.getStringAttr(port.getName().str() + "_wire"));
+      Value axiVal = sv::ReadInOutOp::create(builder, loc, axiWire);
+      dutInputs.push_back(axiVal);
+      axiInWires[port.getName()] = axiWire;
     } else {
       // Scalar input.
       dutInputs.push_back(scalarInputValues[scalarIdx++]);
@@ -681,6 +802,8 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
       doneVal = result;
     } else if (port.getName() == "ready") {
       readyVal = result;
+    } else if (isAxiPort(port.getName())) {
+      axiOutVals[port.getName()] = result;
     } else if (port.getName().ends_with("_addr")) {
       StringRef prefix = port.getName().drop_back(5); // remove "_addr"
       memAddrValues[prefix] = result;
@@ -734,6 +857,88 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
     sv::AssignOp::create(builder, loc, info.readVal, rdData);
   }
 
+  // --- AXI slave instances: one behavioral slave per bundle ---
+  // The slave model lives in hdl/systemverilog/axi_slave_mem.sv (compiled
+  // into every Verilator build). Each instance is hex-initialized from
+  // <bundle>.hex and dumps its memory in @MEM format on the first
+  // tb_axi_dump pulse; the TB delays $finish two cycles so the slaves flush
+  // before DONE.
+  Value axiDumpVal, axiFinishWaitVal;
+  sv::RegOp axiDumpReg, axiFinishWaitReg;
+  auto i2Type = builder.getIntegerType(2);
+  if (!axiBundles.empty()) {
+    axiDumpReg = sv::RegOp::create(builder, loc, builder.getI1Type(),
+                                   builder.getStringAttr("tb_axi_dump"));
+    axiDumpVal = sv::ReadInOutOp::create(builder, loc, axiDumpReg);
+    axiFinishWaitReg = sv::RegOp::create(
+        builder, loc, i2Type, builder.getStringAttr("tb_axi_finish_wait"));
+    axiFinishWaitVal = sv::ReadInOutOp::create(builder, loc, axiFinishWaitReg);
+
+    // One extern decl per distinct data width (the SV module is
+    // width-generic via DATA_W, so all map to the same verilog name).
+    auto noneType = builder.getNoneType();
+    auto i32ParamType = builder.getIntegerType(32);
+    DenseMap<unsigned, hw::HWModuleExternOp> externs;
+    OpBuilder externBuilder = OpBuilder::atBlockEnd(moduleOp.getBody());
+    for (auto &b : axiBundles) {
+      auto &ext = externs[b.dataW];
+      if (!ext) {
+        SmallVector<hw::PortInfo> extPorts;
+        auto addPort = [&](StringRef pname, Type ty,
+                           hw::ModulePort::Direction dir) {
+          extPorts.push_back({{builder.getStringAttr(pname), ty, dir}});
+        };
+        addPort("clk", builder.getI1Type(), hw::ModulePort::Direction::Input);
+        addPort("rst", builder.getI1Type(), hw::ModulePort::Direction::Input);
+        addPort("dump", builder.getI1Type(), hw::ModulePort::Direction::Input);
+        for (auto &desc : kAxiSigs)
+          addPort(("m_axi_" + StringRef(desc.sig)).str(),
+                  b.ports[desc.sig].type,
+                  desc.dutOutput ? hw::ModulePort::Direction::Input
+                                 : hw::ModulePort::Direction::Output);
+        SmallVector<Attribute> paramDecls = {
+            hw::ParamDeclAttr::get("NAME", noneType),
+            hw::ParamDeclAttr::get("INIT_FILE", noneType),
+            hw::ParamDeclAttr::get("DEPTH", i32ParamType),
+            hw::ParamDeclAttr::get("DATA_W", i32ParamType),
+            hw::ParamDeclAttr::get("ADDR_SHIFT", i32ParamType)};
+        ext = hw::HWModuleExternOp::create(
+            externBuilder, loc,
+            builder.getStringAttr("axi_slave_mem_w" +
+                                  std::to_string(b.dataW)),
+            ArrayRef<hw::PortInfo>(extPorts), "axi_slave_mem",
+            builder.getArrayAttr(paramDecls));
+      }
+
+      SmallVector<Attribute> paramVals = {
+          hw::ParamDeclAttr::get("NAME", builder.getStringAttr(b.name)),
+          hw::ParamDeclAttr::get(
+              "INIT_FILE",
+              builder.getStringAttr(dataDir + "/" + b.name + ".hex")),
+          hw::ParamDeclAttr::get(
+              "DEPTH", builder.getI32IntegerAttr((int32_t)b.depth)),
+          hw::ParamDeclAttr::get("DATA_W",
+                                 builder.getI32IntegerAttr(b.dataW)),
+          hw::ParamDeclAttr::get("ADDR_SHIFT",
+                                 builder.getI32IntegerAttr(b.addrShift))};
+      SmallVector<Value> operands = {clk, rst, axiDumpVal};
+      for (auto &desc : kAxiSigs)
+        if (desc.dutOutput)
+          operands.push_back(
+              axiOutVals[(b.name + "_m_axi_" + desc.sig).c_str()]);
+      auto slaveInst = hw::InstanceOp::create(
+          builder, loc, ext, builder.getStringAttr(b.name + "_slave"),
+          operands, builder.getArrayAttr(paramVals));
+      unsigned resIdx = 0;
+      for (auto &desc : kAxiSigs)
+        if (!desc.dutOutput)
+          sv::AssignOp::create(
+              builder, loc,
+              axiInWires[(b.name + "_m_axi_" + desc.sig).c_str()],
+              slaveInst.getResult(resIdx++));
+    }
+  }
+
   // --- always_ff: control, memory writes, output dump ---
   sv::AlwaysFFOp::create(
       builder, loc, sv::EventControl::AtPosEdge, clk, [&] {
@@ -749,6 +954,12 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
               sv::PAssignOp::create(builder, loc, doneCntReg, c0_i32);
               for (auto &reg : shiftChainRegs)
                 sv::PAssignOp::create(builder, loc, reg, c0_i32);
+              if (!axiBundles.empty()) {
+                sv::PAssignOp::create(builder, loc, axiDumpReg, falseVal);
+                sv::PAssignOp::create(
+                    builder, loc, axiFinishWaitReg,
+                    hw::ConstantOp::create(builder, loc, i2Type, 0));
+              }
               // Per-(mem, addr) write counters are zero-initialized at
               // sim start in their `initial` block (alongside $readmemh).
               // We don't re-zero them on rst because verilator rejects
@@ -936,12 +1147,41 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                   // Print cycle count so downstream tooling can report it.
                   sv::FWriteOp::create(builder, loc, fd, "@CYCLES %0d\n",
                                        ValueRange{ctrVal});
-                  // Print end marker.
-                  sv::FWriteOp::create(builder, loc, fd, "DONE\n",
-                                       ValueRange{});
-                  sv::FinishOp::create(builder, loc, 0);
+                  if (axiBundles.empty()) {
+                    // Print end marker.
+                    sv::FWriteOp::create(builder, loc, fd, "DONE\n",
+                                         ValueRange{});
+                    sv::FinishOp::create(builder, loc, 0);
+                  } else {
+                    // AXI slaves dump their memories on the NEXT posedge
+                    // (they see tb_axi_dump at T+1); DONE/$finish are
+                    // deferred two cycles via tb_axi_finish_wait so the
+                    // end marker stays last in the stream.
+                    sv::PAssignOp::create(builder, loc, axiDumpReg, trueVal);
+                  }
                 });
               });
+
+              // AXI epilogue: T (dump set) -> T+1 (slaves flush, wait 0->1)
+              // -> T+2 (DONE + $finish).
+              if (!axiBundles.empty()) {
+                sv::IfOp::create(builder, loc, axiDumpVal, [&] {
+                  Value c1_i2 =
+                      hw::ConstantOp::create(builder, loc, i2Type, 1);
+                  Value nextWait = comb::AddOp::create(
+                      builder, loc, axiFinishWaitVal, c1_i2);
+                  sv::PAssignOp::create(builder, loc, axiFinishWaitReg,
+                                        nextWait);
+                  Value waitDone = comb::ICmpOp::create(
+                      builder, loc, comb::ICmpPredicate::eq, axiFinishWaitVal,
+                      c1_i2);
+                  sv::IfOp::create(builder, loc, waitDone, [&] {
+                    sv::FWriteOp::create(builder, loc, fd, "DONE\n",
+                                         ValueRange{});
+                    sv::FinishOp::create(builder, loc, 0);
+                  });
+                });
+              }
 
               // Timeout.
               Value isTimeout = comb::ICmpOp::create(

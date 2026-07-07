@@ -100,6 +100,17 @@ struct BramBoundary {
   llvm::SmallVector<circt::Backedge> inputBackedges;
   llvm::SmallVector<circt::hw::PortInfo> outputPorts;
   llvm::SmallVector<mlir::Value> outputValues;
+
+  /// Set when the boundary belongs to an external AXI memory: the metadata a
+  /// testbench generator needs to size/init a behavioral slave for the
+  /// bundle. Accumulated into an `amc.axi_bundles` attribute on the kernel
+  /// hw.module by the conversion pass.
+  struct AxiMeta {
+    std::string bundle;
+    uint64_t depth;
+    unsigned elemWidth;
+  };
+  std::optional<AxiMeta> axiMeta;
 };
 
 /// State passed to `HWMemoryInstanceLoweringInterface::lowerToHW`.
