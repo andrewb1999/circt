@@ -208,6 +208,12 @@ struct PortArgInfo {
   // True iff the port exposes a `ready` acceptance level (dynamic amc
   // ports); plumbed through loop modules like `done`.
   bool hasReady = false;
+  // True iff the port exposes a completion `done` / split write-completion
+  // `wr_done` (rw dyn faces); plumbed through loop modules. Historically
+  // `done` threading was gated on isRead, starving write-only and rw
+  // ports' completion handshakes inside loop modules.
+  bool hasDone = false;
+  bool hasWrDone = false;
   bool requiresRdEn = false;
   unsigned latency = 1;
   // Number of distinct hardware ports the memory exposes. For memrefs,
@@ -719,7 +725,8 @@ private:
                                IRMapping &mapping,
                                ArrayRef<Value> cycleGates,
                                DenseMap<Value, MemPortMapping> &memPorts,
-                               ModuleOp moduleOp, Value clk, Value rst);
+                               ModuleOp moduleOp, Value clk, Value rst,
+                               struct SeqDynCtx *seqDyn = nullptr);
 
   /// Materialize a single compute op via the operator-library dispatch.
   /// Used by every internal cloning site that previously called
@@ -736,7 +743,8 @@ private:
                             IRMapping &mapping, ArrayRef<Value> cycleGates,
                             unsigned baseCycle,
                             DenseMap<Value, MemPortMapping> &memPorts,
-                            ModuleOp moduleOp, Value clk, Value rst);
+                            ModuleOp moduleOp, Value clk, Value rst,
+                            struct SeqDynCtx *seqDyn = nullptr);
 
   /// Lower a pipeline as a child of a sequential loop (no FSM needed).
   LogicalResult lowerPipelineChild(LoopSchedulePipelineOp pipOp,
@@ -825,6 +833,226 @@ handleHWStore(loopschedule::HWStoreLoweringInterface storeOp,
   *pref.wrData = mapping.lookup(storeOp.getValueToStore());
   *pref.wrEn = wrEnGate;
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Sequential-frame dynamic-access handshake
+//===----------------------------------------------------------------------===//
+
+/// Context for lowering BARE dynamic accesses (variable-latency AMC dyn
+/// ports) inside sequential frames. The sequential FSM historically treated
+/// them as fixed-latency ops — enables gated only on frame-cycle pulses and
+/// unconditional state advance — which silently drops requests when the
+/// port's `ready` is low and samples data before `done`. With this context,
+/// each dynamic access gets a one-shot ready-gated issue and the FSM stalls
+/// (via the collected `stallTerms`, OR-reduced into the sequential FSM's
+/// `stall` input) until the access's completion pulse arrives. Null where
+/// bare dynamic accesses are unsupported (function-level frames), in which
+/// case they are a pass error.
+struct SeqDynCtx {
+  Value clk;
+  Value rst;
+  Block *hwBody;               // insertion anchor for latches/registers
+  BackedgeBuilder *bb;
+  ArrayRef<Value> cycleGates;  // enclosing frame's per-cycle gates
+  Value frameActive;           // enclosing frame's active level (latch reset)
+  SmallVectorImpl<Value> *stallTerms;
+  std::string namePrefix;
+  unsigned *counter;           // unique naming across accesses
+};
+
+/// Lower one bare dynamic load/store in a sequential frame with a full
+/// ready/done handshake. Sequential steps serialize, so at most one access
+/// per port is in flight: the pipeline's per-expect counters/FIFOs collapse
+/// to one accepted-latch, one done-latch, and (for loads) one data-capture
+/// register per access.
+///
+/// Semantics (budget = the op's scheduled cycle_latency, a MINIMUM):
+///   - issue: the enable pulses only on `gate & ready & !accepted`; the FSM
+///     stalls at the issue state while `!accepted & !ready` (no drops).
+///     The accepted-latch makes the issue one-shot even while the state is
+///     held by an unrelated stall.
+///   - completion: the FSM stalls at the access's LAST budget state until
+///     the port's completion pulse has been seen (done for loads; wr_done
+///     when the rw face splits it, else done for stores). An on-time pulse
+///     bypasses the stall (zero overhead for fixed-latency-like behavior).
+///   - data: rd_data is captured on the completion pulse; consumers (which
+///     execute at states after the last budget state) read the register.
+static LogicalResult
+lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
+                  DenseMap<Value, MemPortMapping> &memPorts, Value gate,
+                  unsigned atOffset, SeqDynCtx *seqDyn) {
+  if (!seqDyn)
+    return op->emitError(
+        "dynamic memory accesses outside loops are not yet supported by the "
+        "sequential FSM lowering; place the access in a loop (or pipeline "
+        "the enclosing loop)");
+
+  auto loadOp = dyn_cast<loopschedule::HWLoadLoweringInterface>(op);
+  auto storeOp = dyn_cast<loopschedule::HWStoreLoweringInterface>(op);
+  Value memVal = loadOp ? loadOp.getMemoryValue() : storeOp.getMemoryValue();
+  auto it = memPorts.find(memVal);
+  if (it == memPorts.end())
+    return op->emitError("unmapped memory");
+  MemPortMapping &mp = it->second;
+
+  Location loc = op->getLoc();
+  auto i1 = builder.getI1Type();
+  OpBuilder hb(builder.getContext());
+  hb.setInsertionPointToEnd(seqDyn->hwBody);
+  Value zero = hw::ConstantOp::create(hb, loc, i1, 0);
+
+  unsigned lat = getOpCycleLatency(op);
+  unsigned lastC = atOffset + (lat > 0 ? lat - 1 : 0);
+  if (lastC >= seqDyn->cycleGates.size())
+    lastC = seqDyn->cycleGates.size() - 1;
+  Value lastGate = seqDyn->cycleGates[lastC];
+
+  Value ready = mp.ready; // null => tied high (no backpressure)
+  Value done = mp.done;
+  if (storeOp) {
+    if (mp.wrDone) {
+      // rw faces split write completion out (AXI dyn rw ports).
+      done = mp.wrDone;
+    } else if (mp.rdData) {
+      // Readable port without a split write-done (on-chip rw arbiter
+      // faces): `done` covers READS only — a store completion-stall would
+      // deadlock. Keep the fixed-latency budget for stores (bounded
+      // on-chip latency), with only the ready/one-shot issue machinery.
+      done = Value();
+    }
+    // Write-only ports: `done` IS the store completion — stall on it.
+  }
+  std::string base =
+      seqDyn->namePrefix + "_seqdyn" + std::to_string((*seqDyn->counter)++);
+
+  // Accepted-latch: one-shot issue. Set on the issue handshake, cleared
+  // when the frame deactivates (between iterations / frames). Registered,
+  // so an enable pulse under a same-cycle stall from another access still
+  // marks this access issued.
+  Backedge accNextBE = seqDyn->bb->get(i1);
+  auto accReg =
+      seq::CompRegOp::create(hb, loc, Value(accNextBE), seqDyn->clk,
+                             seqDyn->rst, zero, hb.getStringAttr(base + "_acc"));
+  Value notAcc = comb::createOrFoldNot(hb, loc, accReg);
+  Value issueHandshake = comb::AndOp::create(
+      hb, loc, gate,
+      ready ? (Value)comb::AndOp::create(hb, loc, ready, notAcc, false)
+            : notAcc,
+      false);
+  Value accNext = comb::AndOp::create(
+      hb, loc, comb::OrOp::create(hb, loc, accReg, issueHandshake, false),
+      seqDyn->frameActive, false);
+  accNextBE.setValue(accNext);
+
+  // Ready stall: want to issue but the port can't take it.
+  if (ready) {
+    Value notReady = comb::createOrFoldNot(hb, loc, ready);
+    Value readyStall = comb::AndOp::create(
+        hb, loc, comb::AndOp::create(hb, loc, gate, notAcc, false), notReady,
+        false);
+    seqDyn->stallTerms->push_back(readyStall);
+  }
+
+  // Done-latch: sticky completion seen since this access issued. The pulse
+  // is attributed with the REGISTERED accepted bit (a same-cycle issue of a
+  // later access on the same port cannot steal it) AND the not-yet-seen bit
+  // (the FIRST post-issue pulse belongs to this access; later pulses on the
+  // shared port belong to later accesses and must not re-trigger the data
+  // capture).
+  Value doneMine;
+  Value seenFed;
+  if (done) {
+    Backedge seenNextBE = seqDyn->bb->get(i1);
+    auto seenReg = seq::CompRegOp::create(hb, loc, Value(seenNextBE),
+                                          seqDyn->clk, seqDyn->rst, zero,
+                                          hb.getStringAttr(base + "_seen"));
+    Value notSeenReg = comb::createOrFoldNot(hb, loc, seenReg);
+    doneMine = comb::AndOp::create(
+        hb, loc, comb::AndOp::create(hb, loc, done, accReg, false),
+        notSeenReg, false);
+    Value seenNext = comb::AndOp::create(
+        hb, loc, comb::OrOp::create(hb, loc, seenReg, doneMine, false),
+        seqDyn->frameActive, false);
+    seenNextBE.setValue(seenNext);
+    // Live bypass: a pulse arriving exactly at the check state stalls
+    // nothing.
+    seenFed = comb::OrOp::create(hb, loc, seenReg, doneMine, false);
+
+    // Completion stall: hold the last budget state until the pulse landed.
+    Value notSeen = comb::createOrFoldNot(hb, loc, seenFed);
+    Value doneStall = comb::AndOp::create(hb, loc, lastGate, notSeen, false);
+    seqDyn->stallTerms->push_back(doneStall);
+  }
+
+  // Drive the port with MERGE semantics: several serialized accesses share
+  // one port's drive slot per frame (the static helpers overwrite it — the
+  // pre-existing sequential clobbering bug: only the last-lowered access
+  // ever reached the port). Enables are disjoint by construction (distinct
+  // frame-cycle gates, one-shot accepted latches), so each access muxes its
+  // address/data in under its own enable and ORs its enable in.
+  unsigned port = getBindingPort(op);
+  PortDrivesRef pref = portRef(mp, port);
+  SmallVector<unsigned> widths = loadOp ? loadOp.getAddrWidths()
+                                        : storeOp.getAddrWidths();
+  auto indices = loadOp ? loadOp.getIndices() : storeOp.getIndices();
+  if (indices.size() != widths.size())
+    return op->emitError("memory access index count (")
+           << indices.size() << ") does not match memory rank ("
+           << widths.size() << ")";
+  pref.addrs->resize(widths.size());
+  for (auto [d, idx] : llvm::enumerate(indices)) {
+    Value addr = mapping.lookup(idx);
+    addr = resizeIntTo(builder, loc, addr, widths[d]);
+    Value &slot = (*pref.addrs)[d];
+    slot = slot ? (Value)comb::MuxOp::create(builder, loc, issueHandshake,
+                                             addr, slot)
+                : addr;
+  }
+
+  if (loadOp) {
+    if (loadOp.requiresReadEnable()) {
+      Value &en = *pref.rdEn;
+      en = en ? (Value)comb::OrOp::create(builder, loc, en, issueHandshake,
+                                          false)
+              : issueHandshake;
+    }
+    // Map the result to a capture register: data is valid ON the completion
+    // pulse and consumers execute at later (post-stall) states.
+    if (done && pref.rdData && *pref.rdData) {
+      Value capCE = doneMine;
+      auto capReg = seq::CompRegClockEnabledOp::create(
+          hb, loc, *pref.rdData, seqDyn->clk, capCE, seqDyn->rst,
+          hw::ConstantOp::create(hb, loc, (*pref.rdData).getType(), 0),
+          hb.getStringAttr(base + "_cap"));
+      mapping.map(loadOp.getResult(), capReg);
+    } else {
+      mapping.map(loadOp.getResult(), *pref.rdData);
+    }
+    return success();
+  }
+
+  Value wrData = mapping.lookup(storeOp.getValueToStore());
+  Value &dataSlot = *pref.wrData;
+  dataSlot = dataSlot ? (Value)comb::MuxOp::create(builder, loc,
+                                                   issueHandshake, wrData,
+                                                   dataSlot)
+                      : wrData;
+  Value &wrEnSlot = *pref.wrEn;
+  wrEnSlot = wrEnSlot ? (Value)comb::OrOp::create(builder, loc, wrEnSlot,
+                                                  issueHandshake, false)
+                      : issueHandshake;
+  return success();
+}
+
+/// True if `op` is a variable-latency (dynamic) memory access that needs
+/// the sequential handshake path.
+static bool isSeqDynAccess(Operation *op) {
+  if (auto li = dyn_cast<loopschedule::LoadInterface>(op))
+    return li.isDynamic();
+  if (auto si = dyn_cast<loopschedule::StoreInterface>(op))
+    return si.isDynamic();
+  return false;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1030,7 +1258,7 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
     Block *body, OpBuilder &builder, IRMapping &mapping,
     ArrayRef<Value> cycleGates, unsigned baseCycle,
     DenseMap<Value, MemPortMapping> &memPorts, ModuleOp moduleOp, Value clk,
-    Value rst) {
+    Value rst, SeqDynCtx *seqDyn) {
   auto pickGate = [&](unsigned c) -> Value {
     assert(c < cycleGates.size() &&
            "issue cycle exceeds enclosing frame latency");
@@ -1063,6 +1291,9 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
       }
       return success();
     }
+    if (isSeqDynAccess(inner))
+      return lowerSeqDynAccess(inner, builder, mapping, memPorts, gate,
+                               baseCycle, seqDyn);
     if (auto storeOp = dyn_cast<HWStoreLoweringInterface>(inner))
       return handleHWStore(storeOp, builder, mapping, gate, memPorts);
     if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner))
@@ -1107,14 +1338,14 @@ LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
     Block *frameBody, OpBuilder &builder, IRMapping &mapping,
     ArrayRef<Value> cycleGates,
     DenseMap<Value, MemPortMapping> &memPorts, ModuleOp moduleOp,
-    Value clk, Value rst) {
+    Value clk, Value rst, SeqDynCtx *seqDyn) {
   for (auto &op : *frameBody) {
     if (isa<LoopScheduleYieldOp>(&op))
       continue;
     if (auto atOp = dyn_cast<LoopScheduleAtOp>(&op)) {
       unsigned offset = (unsigned)atOp.getOffset();
       if (failed(lowerAtBody(&atOp.getBodyBlock(), builder, mapping, cycleGates,
-                             offset, memPorts, moduleOp, clk, rst)))
+                             offset, memPorts, moduleOp, clk, rst, seqDyn)))
         return failure();
       // Forward at results to the caller's mapping via the at's yield.
       auto yieldOp = atOp.getYieldOp();
@@ -1314,12 +1545,18 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     }
   }
 
-  // Inputs: start, cond, child_done_0..C-1.
+  // Inputs: start, cond, child_done_0..C-1, stall.
+  // `stall` freezes the frame-state machinery: transitions between frame
+  // cycle states (and out of WAIT/POST) hold while it is high. It is the
+  // OR of the per-dynamic-access ready/done stall terms computed in the
+  // module body (low whenever no frame is active, so IDLE/COND/DONE need
+  // no guard).
   SmallVector<Type> inputTypes;
   inputTypes.push_back(i1); // start
   inputTypes.push_back(i1); // cond
   for (unsigned j = 0; j < numWaits; ++j)
     inputTypes.push_back(i1); // child_done_j
+  inputTypes.push_back(i1);   // stall
 
   // Outputs: done, first_iter, iter_advance,
   //          frame_active_0..N-1,
@@ -1345,6 +1582,7 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   for (unsigned j = 0; j < numWaits; ++j)
     argNames.push_back(
         builder.getStringAttr("child_done_" + std::to_string(j)));
+  argNames.push_back(builder.getStringAttr("stall"));
   machine.setArgNamesAttr(builder.getArrayAttr(argNames));
 
   SmallVector<Attribute> resNames;
@@ -1480,6 +1718,14 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
 
+  Value stallArg = machine.getArgument(2 + numWaits);
+  // Guard body returning !stall — frame-state transitions hold under stall
+  // (fsm.machine stays in the current state when no guard is true).
+  auto notStallGuard = [&]() {
+    Value ns = comb::createOrFoldNot(fb, loc, stallArg);
+    fsm::ReturnOp::create(fb, loc, ns);
+  };
+
   // Helper: emit the last frame's exit transition. We go back to COND so the
   // condition is evaluated with the UPDATED iter_args (the iter_arg register
   // latches on the clock edge leaving the last frame, which asserts
@@ -1488,7 +1734,8 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   // iter_args — producing one extra spurious iteration.
   auto emitLastFrameTransition = [&](Block *tb) {
     fb.setInsertionPointToEnd(tb);
-    fsm::TransitionOp::create(fb, loc, StringRef("COND"));
+    fsm::TransitionOp::create(fb, loc, StringRef("COND"), notStallGuard,
+                              []() {});
   };
 
   // --- FRAME_i cycle states (+ WAIT_i/POST_i for frames with launches) ---
@@ -1571,13 +1818,16 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
       fb.setInsertionPointToEnd(tb);
       if (!isLastCycle) {
         fsm::TransitionOp::create(fb, loc,
-                                  StringRef(frameStateName(i, c + 1)));
+                                  StringRef(frameStateName(i, c + 1)),
+                                  notStallGuard, []() {});
       } else if (frameHasLaunch) {
-        fsm::TransitionOp::create(fb, loc, StringRef(waitStateName(i)));
+        fsm::TransitionOp::create(fb, loc, StringRef(waitStateName(i)),
+                                  notStallGuard, []() {});
       } else if (isLast) {
         emitLastFrameTransition(tb);
       } else {
-        fsm::TransitionOp::create(fb, loc, StringRef(leaveTargetName));
+        fsm::TransitionOp::create(fb, loc, StringRef(leaveTargetName),
+                                  notStallGuard, []() {});
       }
       fb.setInsertionPointToEnd(&machine.getBody().front());
     }
@@ -1607,13 +1857,17 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
       fsm::TransitionOp::create(
           fb, loc, StringRef(postStateName(i)),
           [&]() {
-            // AND of child_done_<j> for every launch in this frame.
+            // AND of child_done_<j> for every launch in this frame, and
+            // !stall (conservative freeze; access stall terms are
+            // frame-gated so this rarely binds in WAIT).
             Value guard;
             for (int j : frameWaitIdx[i]) {
               Value done = machine.getArgument(2 + (unsigned)j);
               guard = guard ? comb::AndOp::create(fb, loc, guard, done)
                             : done;
             }
+            Value ns = comb::createOrFoldNot(fb, loc, stallArg);
+            guard = guard ? comb::AndOp::create(fb, loc, guard, ns) : ns;
             fsm::ReturnOp::create(fb, loc, guard);
           },
           []() {});
@@ -1641,7 +1895,8 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
       if (isLast) {
         emitLastFrameTransition(tb);
       } else {
-        fsm::TransitionOp::create(fb, loc, StringRef(leaveTargetName));
+        fsm::TransitionOp::create(fb, loc, StringRef(leaveTargetName),
+                                  notStallGuard, []() {});
       }
       fb.setInsertionPointToEnd(&machine.getBody().front());
     }
@@ -1888,10 +2143,20 @@ static hw::HWModuleOp createLoopModule(
   // a done signal — those reads complete in fixed latency and don't
   // need a handshake.
   for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
-    if (!memInfo.isAmcPort || !memInfo.isRead)
+    if (!memInfo.isAmcPort || !memInfo.hasDone)
       continue;
     std::string baseName = "mem" + std::to_string(i);
     ports.push_back({{builder.getStringAttr(baseName + "_done"),
+                       builder.getI1Type(),
+                       hw::ModulePort::Direction::Input}});
+    inputIdx++;
+  }
+  // Split write-completion for rw dyn faces; plumbed like `done`.
+  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
+    if (!memInfo.isAmcPort || !memInfo.hasWrDone)
+      continue;
+    std::string baseName = "mem" + std::to_string(i);
+    ports.push_back({{builder.getStringAttr(baseName + "_wr_done"),
                        builder.getI1Type(),
                        hw::ModulePort::Direction::Input}});
     inputIdx++;
@@ -1949,9 +2214,16 @@ static hw::HWModuleOp createLoopModule(
   }
   // Mirror the order of the `mem*_done` input ports added above.
   for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
-    if (!memInfo.isAmcPort || !memInfo.isRead)
+    if (!memInfo.isAmcPort || !memInfo.hasDone)
       continue;
     localMemPortMap[memInfo.originalArg].done = hwBody->getArgument(argIdx++);
+  }
+  // Mirror the order of the `mem*_wr_done` input ports added above.
+  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
+    if (!memInfo.isAmcPort || !memInfo.hasWrDone)
+      continue;
+    localMemPortMap[memInfo.originalArg].wrDone =
+        hwBody->getArgument(argIdx++);
   }
   // Mirror the order of the `mem*_ready` input ports added above.
   for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
@@ -2305,12 +2577,19 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   for (unsigned j = 0; j < numWaits; ++j)
     childDoneBEs.push_back(bb.get(i1));
 
-  // Build instance inputs: start, cond, child_done_0..C-1.
+  // Stall input: OR of the per-dynamic-access ready/done stall terms
+  // collected while lowering frame bodies (resolved below).
+  Backedge stallBE = bb.get(i1);
+  SmallVector<Value> seqStallTerms;
+  unsigned seqDynCounter = 0;
+
+  // Build instance inputs: start, cond, child_done_0..C-1, stall.
   SmallVector<Value> instInputs;
   instInputs.push_back(startSignal);
   instInputs.push_back(Value(condBE));
   for (auto &be : childDoneBEs)
     instInputs.push_back(Value(be));
+  instInputs.push_back(Value(stallBE));
 
   // Result types: done, first_iter, iter_advance,
   //               frame_active_0..N-1, child_start_0..C-1,
@@ -2395,10 +2674,16 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     }
   }
 
+  // While stalled (a dynamic access waiting on ready/done), everything
+  // that advances with the FSM must hold — the FSM freezes its state, and
+  // the module-side registers freeze via CE &= notStall.
+  Value notStallSeq = comb::createOrFoldNot(hw, loc, Value(stallBE));
+
   // Clock enable for iter_arg registers: advance exactly once per loop trip,
   // on the FSM's last cycle before COND. first_iter forces the init load on
   // entry to a new loop invocation.
   Value ce = comb::OrOp::create(hw, loc, fsmIterAdvance, fsmFirstIter);
+  ce = comb::AndOp::create(hw, loc, ce, notStallSeq);
 
   // --- Create iter arg registers ---
   SmallVector<Value> iterArgRegs;
@@ -2427,7 +2712,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   for (unsigned i = 0; i < numFrames; ++i) {
     if (!frameWaitIdx[i].empty())
       continue;
-    frameCaptureGate[i] = fsmFrameCycleGates[i].back();
+    // Freeze under stall: the gate is a held FSM output while stalled, and
+    // capturing mid-stall would latch values before a dynamic access's
+    // done delivered them.
+    frameCaptureGate[i] = comb::AndOp::create(
+        hw, loc, fsmFrameCycleGates[i].back(), notStallSeq);
   }
 
   // Combinational aliases for frame-result values, captured BEFORE each
@@ -2530,6 +2819,21 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp,
                 LoopScheduleLaunchOp>(&op))
           continue;
+        if (isSeqDynAccess(&op)) {
+          SeqDynCtx seqDyn{clk,
+                           rst,
+                           hwBody,
+                           &bb,
+                           fsmFrameCycleGates[frameIdx],
+                           fsmFrameActives[frameIdx],
+                           &seqStallTerms,
+                           node.prefix,
+                           &seqDynCounter};
+          if (failed(lowerSeqDynAccess(&op, hw, localMapping, framePorts,
+                                       atGate, atOffset, &seqDyn)))
+            return failure();
+          continue;
+        }
         if (auto loadOp =
                 dyn_cast<loopschedule::HWLoadLoweringInterface>(&op)) {
           if (failed(handleHWLoad(loadOp, hw, localMapping, framePorts,
@@ -2566,7 +2870,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       // capture the consumer reads whatever address the port has
       // moved to next.
       if (hasCycleGates && atOffset + 1 < fsmFrameCycleGates[frameIdx].size()) {
-        Value captureGate = fsmFrameCycleGates[frameIdx][atOffset + 1];
+        Value captureGate = comb::AndOp::create(
+            hw, loc, fsmFrameCycleGates[frameIdx][atOffset + 1],
+            notStallSeq);
         hw.setInsertionPointToEnd(hwBody);
         for (auto res : atOp.getResults()) {
           if (!resultNeedsCapture(res, atOffset))
@@ -2701,12 +3007,24 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           }
           // Mirror the loop module's `mem*_done` input order.
           for (auto &memInfo : memrefArgs) {
-            if (!memInfo.isAmcPort || !memInfo.isRead)
+            if (!memInfo.isAmcPort || !memInfo.hasDone)
               continue;
             auto &callerMp =
                 perFramePorts[frameIdx][memInfo.originalArg];
             Value d = callerMp.done
                           ? callerMp.done
+                          : hw::ConstantOp::create(hw, loc,
+                                                     hw.getI1Type(), 0);
+            childInputs.push_back(d);
+          }
+          // Mirror the loop module's `mem*_wr_done` input order.
+          for (auto &memInfo : memrefArgs) {
+            if (!memInfo.isAmcPort || !memInfo.hasWrDone)
+              continue;
+            auto &callerMp =
+                perFramePorts[frameIdx][memInfo.originalArg];
+            Value d = callerMp.wrDone
+                          ? callerMp.wrDone
                           : hw::ConstantOp::create(hw, loc,
                                                      hw.getI1Type(), 0);
             childInputs.push_back(d);
@@ -2932,10 +3250,19 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     } else {
       // Regular frame (no child/pipeline launches). Gate stores per issue
       // cycle: ops in each `at K` body get cycleGates[K].
+      SeqDynCtx seqDyn{clk,
+                       rst,
+                       hwBody,
+                       &bb,
+                       fsmFrameCycleGates[frameIdx],
+                       fsmFrameActives[frameIdx],
+                       &seqStallTerms,
+                       node.prefix,
+                       &seqDynCounter};
       if (failed(lowerFrameBody(&frameOp.getBodyBlock(), hw, localMapping,
                                  fsmFrameCycleGates[frameIdx],
                                  perFramePorts[frameIdx], moduleOp, clk,
-                                 rst)))
+                                 rst, &seqDyn)))
         return failure();
     }
 
@@ -3011,8 +3338,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       if (frameHasLocalLoad) {
         Value falseConstCap =
             hw::ConstantOp::create(hw, loc, hw.getI1Type(), 0);
-        captureGate = seq::CompRegOp::create(
-            hw, loc, frameCaptureGate[frameIdx], clk, rst, falseConstCap,
+        captureGate = seq::CompRegClockEnabledOp::create(
+            hw, loc, frameCaptureGate[frameIdx], clk, notStallSeq, rst,
+            falseConstCap,
             hw.getStringAttr(node.prefix + "_frame" +
                              std::to_string(frameIdx) +
                              "_capture_gate_delayed"));
@@ -3043,6 +3371,23 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                           ? it->second
                           : localMapping.lookup(condTermVal));
     }
+  }
+
+  // Resolve the FSM stall input: OR of every dynamic access's ready/done
+  // stall term (constant 0 when the loop has no dynamic accesses — the
+  // FSM then behaves exactly as before).
+  {
+    hw.setInsertionPointToEnd(hwBody);
+    Value stallVal;
+    if (seqStallTerms.empty()) {
+      stallVal = hw::ConstantOp::create(hw, loc, i1, 0);
+    } else {
+      stallVal = seqStallTerms.front();
+      for (unsigned k = 1; k < seqStallTerms.size(); ++k)
+        stallVal =
+            comb::OrOp::create(hw, loc, stallVal, seqStallTerms[k], false);
+    }
+    stallBE.setValue(stallVal);
   }
 
   // --- Wire up iter_arg feedback ---
@@ -4325,6 +4670,8 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
     info.isRead = signals.rdData != Value();
     info.isWrite = signals.wrEn != Value();
     info.hasReady = signals.ready != Value();
+    info.hasDone = signals.done != Value();
+    info.hasWrDone = signals.wrDone != Value();
     info.requiresRdEn = signals.rdEn != Value();
     if (info.isRead)
       info.elementType = signals.rdData.getType();
@@ -4787,11 +5134,22 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       }
       // Mirror the loop module's `mem*_done` input order.
       for (auto &memInfo : memrefArgs) {
-        if (!memInfo.isAmcPort || !memInfo.isRead)
+        if (!memInfo.isAmcPort || !memInfo.hasDone)
           continue;
         auto &callerMp = memPortMap[memInfo.originalArg];
         Value d = callerMp.done
                       ? callerMp.done
+                      : hw::ConstantOp::create(builder, loc,
+                                                  builder.getI1Type(), 0);
+        childInputs.push_back(d);
+      }
+      // Mirror the loop module's `mem*_wr_done` input order.
+      for (auto &memInfo : memrefArgs) {
+        if (!memInfo.isAmcPort || !memInfo.hasWrDone)
+          continue;
+        auto &callerMp = memPortMap[memInfo.originalArg];
+        Value d = callerMp.wrDone
+                      ? callerMp.wrDone
                       : hw::ConstantOp::create(builder, loc,
                                                   builder.getI1Type(), 0);
         childInputs.push_back(d);
