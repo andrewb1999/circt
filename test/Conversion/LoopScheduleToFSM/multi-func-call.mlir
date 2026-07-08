@@ -24,7 +24,7 @@ loopschedule.func_sequential @callee(%arg0: memref<4xi32>) attributes {oplib.lib
 // CHECK: hw.instance "callee_inst" @callee
 // CHECK-SAME: clk: %clk
 // CHECK-SAME: rst: %rst
-// CHECK-SAME: -> (mem0_addr: i2, mem0_wr_data: i32, mem0_wr_en: i1, ready: i1, done: i1)
+// CHECK-SAME: -> (mem0_addr: i2, mem0_rd_en: i1, mem0_wr_data: i32, mem0_wr_en: i1, ready: i1, done: i1)
 // CHECK: hw.output
 loopschedule.func_sequential @kernel_top(%arg0: memref<4xi32>) attributes {top, oplib.library = @lib} {
   %h = loopschedule.frame -> (!loopschedule.handle) {

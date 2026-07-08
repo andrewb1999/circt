@@ -46,6 +46,10 @@ struct MemPortGroup {
   hw::PortInfo addr;      // output: address (mem<i>_addr)
   hw::PortInfo wrData;    // output: write data
   hw::PortInfo wrEn;      // output: write enable
+  // Optional read enable (mem<i>_rd_en). When present, the behavioral
+  // memory only updates its read register on enabled cycles (BRAM hold
+  // semantics); absent (older DUTs) means always-enabled.
+  hw::PortInfo rdEn;
   unsigned addrWidth;     // address bits
   unsigned depth;         // 2^addrWidth
   Type dataType;          // element type
@@ -81,7 +85,7 @@ static bool isControlPort(StringRef name) {
 /// Memory ports follow the naming convention: {name}_rd_data, {name}_addr,
 /// {name}_wr_data, {name}_wr_en. Only 1-D I/O memories are supported —
 /// a group containing `_addr_<d>` (the multi-dim naming) is rejected.
-static SmallVector<MemPortGroup>
+static SmallVector<MemPortGroup, 2>
 classifyMemoryPorts(const SmallVector<hw::PortInfo> &dutPorts) {
   // Collect candidate prefixes from _rd_data ports.
   SmallVector<std::string> prefixes;
@@ -91,7 +95,7 @@ classifyMemoryPorts(const SmallVector<hw::PortInfo> &dutPorts) {
       prefixes.push_back(pname.drop_back(8).str()); // remove "_rd_data"
   }
 
-  SmallVector<MemPortGroup> groups;
+  SmallVector<MemPortGroup, 2> groups;
   for (auto &prefix : prefixes) {
     MemPortGroup group;
     group.name = prefix;
@@ -107,6 +111,8 @@ classifyMemoryPorts(const SmallVector<hw::PortInfo> &dutPorts) {
         group.wrData = port;
       else if (pname == prefix + "_wr_en")
         group.wrEn = port;
+      else if (pname == prefix + "_rd_en")
+        group.rdEn = port;
       else if (pname.starts_with(prefix + "_addr_"))
         multiDim = true;
     }
@@ -129,10 +135,11 @@ classifyMemoryPorts(const SmallVector<hw::PortInfo> &dutPorts) {
 
 /// Check if a port belongs to any memory group.
 static bool isMemoryPort(StringRef name,
-                         const SmallVector<MemPortGroup> &memGroups) {
+                         const SmallVectorImpl<MemPortGroup> &memGroups) {
   for (auto &g : memGroups) {
     if (name == g.name + "_rd_data" || name == g.name + "_addr" ||
-        name == g.name + "_wr_data" || name == g.name + "_wr_en")
+        name == g.name + "_wr_data" || name == g.name + "_wr_en" ||
+        name == g.name + "_rd_en")
       return true;
   }
   return false;
@@ -705,13 +712,12 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
 
   // --- Build DUT instance operands ---
   // We need to wire: clk, rst, start, scalar inputs, memory rd_data.
-  // Memory rd_data needs the DUT's addr output, which creates a dependency.
-  // We read mem[addr] combinationally after the instance is created.
-  // For the instance, we use a read from index 0 as placeholder and fix later.
-  // Actually: we need to provide rd_data BEFORE the instance. Use
-  // sv.read_inout of the array indexed by the addr (which comes from instance
-  // output). This is a combinational cycle in the testbench, which is fine for
-  // simulation — the memory model is combinational read, clocked write.
+  // Memory rd_data needs the DUT's addr output, which creates a dependency:
+  // the rd_data value must exist BEFORE the instance is created. Use an
+  // sv.wire for the read data, feed it to the instance, and assign it after
+  // the instance from a REGISTERED read of the array (BRAM-port contract:
+  // rd_data is valid the cycle after the DUT presents the address; writes
+  // are clocked as before).
   //
   // Solution: create the read wiring AFTER the instance using the addr output.
   // For hw.instance inputs, we need the rd_data value upfront. Use a wire.
@@ -792,6 +798,7 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   DenseMap<StringRef, Value> memAddrValues;
   DenseMap<StringRef, Value> memWrDataValues;
   DenseMap<StringRef, Value> memWrEnValues;
+  DenseMap<StringRef, Value> memRdEnValues;
 
   unsigned outIdx = 0;
   for (auto &port : dutPorts) {
@@ -813,6 +820,9 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
     } else if (port.getName().ends_with("_wr_en")) {
       StringRef prefix = port.getName().drop_back(6); // remove "_wr_en"
       memWrEnValues[prefix] = result;
+    } else if (port.getName().ends_with("_rd_en")) {
+      StringRef prefix = port.getName().drop_back(6); // remove "_rd_en"
+      memRdEnValues[prefix] = result;
     } else {
       scalarOutputValues.push_back(result);
     }
@@ -854,7 +864,33 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
     Value elemRef =
         sv::ArrayIndexInOutOp::create(builder, loc, info.reg, effectiveAddr);
     Value rdData = sv::ReadInOutOp::create(builder, loc, elemRef);
-    sv::AssignOp::create(builder, loc, info.readVal, rdData);
+    // BRAM-port contract: external memories present latency-1 registered
+    // reads. Register the (transaction-shifted) array read so rd_data is
+    // valid the cycle AFTER the DUT presents the address, exactly like a
+    // synchronous BRAM. When the DUT exposes a read enable, the register
+    // only updates on enabled cycles, so the last read value HOLDS between
+    // reads (ram_1rw-style content_en semantics). The index and address
+    // are sampled together in the issue cycle, so the read-shift
+    // transaction selection stays coherent.
+    auto rdReg = sv::RegOp::create(
+        builder, loc, group.dataType,
+        builder.getStringAttr(group.name + "_rd_reg"));
+    auto rdEnIt = memRdEnValues.find(group.name);
+    Value rdEnVal = rdEnIt != memRdEnValues.end() ? rdEnIt->second : Value();
+    sv::AlwaysFFOp::create(builder, loc, sv::EventControl::AtPosEdge, clk,
+                           [&] {
+                             if (rdEnVal) {
+                               sv::IfOp::create(builder, loc, rdEnVal, [&] {
+                                 sv::PAssignOp::create(builder, loc, rdReg,
+                                                       rdData);
+                               });
+                             } else {
+                               sv::PAssignOp::create(builder, loc, rdReg,
+                                                     rdData);
+                             }
+                           });
+    Value rdRegVal = sv::ReadInOutOp::create(builder, loc, rdReg);
+    sv::AssignOp::create(builder, loc, info.readVal, rdRegVal);
   }
 
   // --- AXI slave instances: one behavioral slave per bundle ---

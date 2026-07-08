@@ -351,6 +351,11 @@ static PortArgInfo makePortArgInfoFromMemref(Value arg, MemRefType memType,
   info.elementType = memType.getElementType();
   info.addrWidths = getDimAddrWidths(memType);
   info.numPorts = computeNumPortsFromUsers(arg);
+  // External BRAM-style ports carry a read enable so the memory's output
+  // register HOLDS the last read value between reads (like ram_1rw's
+  // content_en) instead of tracking the address bus every cycle. Local
+  // hlmems are internal seq.hlmem instances with no module-level port.
+  info.requiresRdEn = !isLocalMem;
   return info;
 }
 
@@ -726,7 +731,8 @@ private:
                                ArrayRef<Value> cycleGates,
                                DenseMap<Value, MemPortMapping> &memPorts,
                                ModuleOp moduleOp, Value clk, Value rst,
-                               struct SeqDynCtx *seqDyn = nullptr);
+                               struct SeqDynCtx *seqDyn = nullptr,
+                               struct SeqPortMuxCtx *seqMux = nullptr);
 
   /// Materialize a single compute op via the operator-library dispatch.
   /// Used by every internal cloning site that previously called
@@ -744,7 +750,8 @@ private:
                             unsigned baseCycle,
                             DenseMap<Value, MemPortMapping> &memPorts,
                             ModuleOp moduleOp, Value clk, Value rst,
-                            struct SeqDynCtx *seqDyn = nullptr);
+                            struct SeqDynCtx *seqDyn = nullptr,
+                            struct SeqPortMuxCtx *seqMux = nullptr);
 
   /// Lower a pipeline as a child of a sequential loop (no FSM needed).
   LogicalResult lowerPipelineChild(LoopSchedulePipelineOp pipOp,
@@ -775,6 +782,72 @@ private:
 // Load/store helpers
 //===----------------------------------------------------------------------===//
 
+static bool isSeqDynAccess(Operation *op);
+
+/// Context for lowering sequential frames that contain MORE THAN ONE static
+/// access to the same memory port. The frame's accesses share one set of
+/// address/write-data/write-enable slots in `MemPortMapping`; without this
+/// context each access overwrites the previous one's drives (last writer
+/// wins), so only the final access's address ever reaches the port and every
+/// load result aliases the raw `rd_data` wire (caught by the fib kernel:
+/// `A[i] = A[i-1] + A[i-2]` silently dropped all loop stores). With the
+/// context, each access on a contended port muxes its drives in under its
+/// own issue-cycle gate, write enables OR together, and each load's result
+/// is captured into a register at its data-valid cycle (with a live-cycle
+/// bypass) so later-cycle consumers read the held value.
+///
+/// Ports with a single static access are intentionally left on the direct
+/// drive path: their address is stable for the whole frame, the raw
+/// `rd_data` mapping is correct, and the generated HW stays identical to
+/// what this pass emitted before the context existed.
+struct SeqPortMuxCtx {
+  /// (memory value, binding port) pairs with >1 static access in the frame.
+  llvm::DenseSet<std::pair<Value, unsigned>> multi;
+  /// Memories whose rd_data wire is registered: their data is valid the
+  /// cycle AFTER issue. Under the BRAM-port contract this is every memory
+  /// — local seq.hlmem and amc instance rams by construction, external
+  /// memref ports because they present latency-1 registered reads (the
+  /// testbench models them the same way). The set exists so a future
+  /// combinational-read port kind can opt out.
+  llvm::DenseSet<Value> registeredMems;
+  /// Per-cycle gates of the enclosing frame (frame_cycle_<i>_<c>).
+  ArrayRef<Value> cycleGates;
+  /// Issue cycle of the access currently being lowered (set by the caller
+  /// before each handleHWLoad/handleHWStore call).
+  unsigned cycle = 0;
+  Value clk;
+  Value rst;
+  std::string regPrefix;
+  unsigned counter = 0;
+};
+
+/// Populate `multi` with the (memory value, binding port) pairs that have
+/// more than one static (fixed-latency) access in `frameBody`. Dynamic
+/// accesses go through the SeqDynCtx handshake path (which already
+/// OR-accumulates its drives) and launched children lower in their own
+/// modules, so both are excluded.
+static void
+collectFrameMultiAccess(Block &frameBody,
+                        llvm::DenseSet<std::pair<Value, unsigned>> &multi) {
+  llvm::DenseMap<std::pair<Value, unsigned>, unsigned> counts;
+  frameBody.walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
+    if (isa<LoopScheduleLaunchOp, LoopScheduleSequentialOp,
+            LoopSchedulePipelineOp>(op))
+      return WalkResult::skip();
+    if (isSeqDynAccess(op))
+      return WalkResult::advance();
+    if (auto loadOp = dyn_cast<loopschedule::HWLoadLoweringInterface>(op))
+      ++counts[{loadOp.getMemoryValue(), getBindingPort(loadOp)}];
+    else if (auto storeOp =
+                 dyn_cast<loopschedule::HWStoreLoweringInterface>(op))
+      ++counts[{storeOp.getMemoryValue(), getBindingPort(storeOp)}];
+    return WalkResult::advance();
+  });
+  for (auto &entry : counts)
+    if (entry.second > 1)
+      multi.insert(entry.first);
+}
+
 /// Lower any `HWLoadLoweringInterface` op: drive the read addresses on
 /// the memory port mapping (port selected by `loopschedule.binding`,
 /// default 0) and map the load result to the port's read data.
@@ -782,7 +855,8 @@ static LogicalResult
 handleHWLoad(loopschedule::HWLoadLoweringInterface loadOp, OpBuilder &builder,
              IRMapping &mapping,
              DenseMap<Value, MemPortMapping> &memPorts,
-             Value rdEnGate = nullptr) {
+             Value rdEnGate = nullptr, SeqPortMuxCtx *seqMux = nullptr) {
+  Location loc = loadOp->getLoc();
   SmallVector<unsigned> widths = loadOp.getAddrWidths();
   unsigned port = getBindingPort(loadOp);
   auto it = memPorts.find(loadOp.getMemoryValue());
@@ -793,15 +867,55 @@ handleHWLoad(loopschedule::HWLoadLoweringInterface loadOp, OpBuilder &builder,
     return loadOp->emitError("memory access index count (")
            << loadOp.getIndices().size() << ") does not match memory rank ("
            << widths.size() << ")";
+  bool contended =
+      seqMux && seqMux->multi.contains({loadOp.getMemoryValue(), port});
+  assert((!contended || rdEnGate) &&
+         "contended-port load lowering requires the issue-cycle gate");
   pref.addrs->resize(widths.size());
   for (auto [d, idx] : llvm::enumerate(loadOp.getIndices())) {
     Value addr = mapping.lookup(idx);
-    (*pref.addrs)[d] =
-        resizeIntTo(builder, loadOp->getLoc(), addr, widths[d]);
+    addr = resizeIntTo(builder, loc, addr, widths[d]);
+    if (contended) {
+      Value prev = (*pref.addrs)[d];
+      if (!prev)
+        prev = hw::ConstantOp::create(builder, loc, addr.getType(), 0);
+      addr = comb::MuxOp::create(builder, loc, rdEnGate, addr, prev);
+    }
+    (*pref.addrs)[d] = addr;
   }
-  if (loadOp.requiresReadEnable()) {
-    assert(rdEnGate && "HW load requires an explicit read-enable gate");
-    *pref.rdEn = rdEnGate;
+  // Drive the port's read enable with this load's issue gate. AMC ports
+  // require it (assert below); memref ports use it for the BRAM-port
+  // hold contract (emitted only when the port declares requiresRdEn —
+  // local hlmem entries simply ignore the slot).
+  assert((rdEnGate || !loadOp.requiresReadEnable()) &&
+         "HW load requires an explicit read-enable gate");
+  if (rdEnGate) {
+    *pref.rdEn = (contended && *pref.rdEn)
+                     ? (Value)comb::OrOp::create(builder, loc, *pref.rdEn,
+                                                 rdEnGate)
+                     : rdEnGate;
+  }
+  // On a contended port the raw rd_data wire only carries this load's data
+  // during its data-valid cycle — afterwards the port serves the frame's
+  // next access. Capture the data into a register on the valid cycle and
+  // hand consumers a live-cycle bypass mux.
+  if (contended) {
+    unsigned wireLatency =
+        seqMux->registeredMems.contains(loadOp.getMemoryValue()) ? 1 : 0;
+    unsigned dataCycle = seqMux->cycle + wireLatency;
+    if (dataCycle < seqMux->cycleGates.size()) {
+      Value liveGate = seqMux->cycleGates[dataCycle];
+      Value resetVal = createZeroConstant(builder, loc, pref.rdData->getType());
+      auto regName = builder.getStringAttr(
+          seqMux->regPrefix + "_ldcap_" + std::to_string(seqMux->counter++));
+      Value captured = seq::CompRegClockEnabledOp::create(
+          builder, loc, *pref.rdData, seqMux->clk, liveGate, seqMux->rst,
+          resetVal, regName);
+      mapping.map(loadOp.getResult(),
+                  comb::MuxOp::create(builder, loc, liveGate, *pref.rdData,
+                                      captured));
+      return success();
+    }
   }
   mapping.map(loadOp.getResult(), *pref.rdData);
   return success();
@@ -812,8 +926,10 @@ handleHWLoad(loopschedule::HWLoadLoweringInterface loadOp, OpBuilder &builder,
 static LogicalResult
 handleHWStore(loopschedule::HWStoreLoweringInterface storeOp,
                OpBuilder &builder, IRMapping &mapping, Value wrEnGate,
-               DenseMap<Value, MemPortMapping> &memPorts) {
+               DenseMap<Value, MemPortMapping> &memPorts,
+               SeqPortMuxCtx *seqMux = nullptr) {
   assert(wrEnGate && "handleHWStore requires a wrEnGate");
+  Location loc = storeOp->getLoc();
   SmallVector<unsigned> widths = storeOp.getAddrWidths();
   unsigned port = getBindingPort(storeOp);
   auto it = memPorts.find(storeOp.getMemoryValue());
@@ -824,14 +940,28 @@ handleHWStore(loopschedule::HWStoreLoweringInterface storeOp,
     return storeOp->emitError("memory access index count (")
            << storeOp.getIndices().size() << ") does not match memory rank ("
            << widths.size() << ")";
+  bool contended =
+      seqMux && seqMux->multi.contains({storeOp.getMemoryValue(), port});
   pref.addrs->resize(widths.size());
   for (auto [d, idx] : llvm::enumerate(storeOp.getIndices())) {
     Value addr = mapping.lookup(idx);
-    (*pref.addrs)[d] =
-        resizeIntTo(builder, storeOp->getLoc(), addr, widths[d]);
+    addr = resizeIntTo(builder, loc, addr, widths[d]);
+    if (contended) {
+      Value prev = (*pref.addrs)[d];
+      if (!prev)
+        prev = hw::ConstantOp::create(builder, loc, addr.getType(), 0);
+      addr = comb::MuxOp::create(builder, loc, wrEnGate, addr, prev);
+    }
+    (*pref.addrs)[d] = addr;
   }
-  *pref.wrData = mapping.lookup(storeOp.getValueToStore());
-  *pref.wrEn = wrEnGate;
+  Value wrData = mapping.lookup(storeOp.getValueToStore());
+  if (contended && *pref.wrData)
+    wrData = comb::MuxOp::create(builder, loc, wrEnGate, wrData, *pref.wrData);
+  *pref.wrData = wrData;
+  *pref.wrEn = (contended && *pref.wrEn)
+                   ? (Value)comb::OrOp::create(builder, loc, *pref.wrEn,
+                                               wrEnGate)
+                   : wrEnGate;
   return success();
 }
 
@@ -1258,7 +1388,9 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
     Block *body, OpBuilder &builder, IRMapping &mapping,
     ArrayRef<Value> cycleGates, unsigned baseCycle,
     DenseMap<Value, MemPortMapping> &memPorts, ModuleOp moduleOp, Value clk,
-    Value rst, SeqDynCtx *seqDyn) {
+    Value rst, SeqDynCtx *seqDyn, SeqPortMuxCtx *seqMux) {
+  if (seqMux)
+    seqMux->cycle = baseCycle;
   auto pickGate = [&](unsigned c) -> Value {
     assert(c < cycleGates.size() &&
            "issue cycle exceeds enclosing frame latency");
@@ -1295,9 +1427,9 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
       return lowerSeqDynAccess(inner, builder, mapping, memPorts, gate,
                                baseCycle, seqDyn);
     if (auto storeOp = dyn_cast<HWStoreLoweringInterface>(inner))
-      return handleHWStore(storeOp, builder, mapping, gate, memPorts);
+      return handleHWStore(storeOp, builder, mapping, gate, memPorts, seqMux);
     if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner))
-      return handleHWLoad(loadOp, builder, mapping, memPorts, gate);
+      return handleHWLoad(loadOp, builder, mapping, memPorts, gate, seqMux);
     return emitComputeOp(inner, builder, mapping, moduleOp, clk, rst);
   };
   for (auto &op : *body) {
@@ -1338,14 +1470,15 @@ LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
     Block *frameBody, OpBuilder &builder, IRMapping &mapping,
     ArrayRef<Value> cycleGates,
     DenseMap<Value, MemPortMapping> &memPorts, ModuleOp moduleOp,
-    Value clk, Value rst, SeqDynCtx *seqDyn) {
+    Value clk, Value rst, SeqDynCtx *seqDyn, SeqPortMuxCtx *seqMux) {
   for (auto &op : *frameBody) {
     if (isa<LoopScheduleYieldOp>(&op))
       continue;
     if (auto atOp = dyn_cast<LoopScheduleAtOp>(&op)) {
       unsigned offset = (unsigned)atOp.getOffset();
       if (failed(lowerAtBody(&atOp.getBodyBlock(), builder, mapping, cycleGates,
-                             offset, memPorts, moduleOp, clk, rst, seqDyn)))
+                             offset, memPorts, moduleOp, clk, rst, seqDyn,
+                             seqMux)))
         return failure();
       // Forward at results to the caller's mapping via the at's yield.
       auto yieldOp = atOp.getYieldOp();
@@ -2774,6 +2907,19 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     bool hasCycleGates = frameLatencies[frameIdx] > 1;
     Block &frameBody = frame.getBodyBlock();
 
+    // Contended-port handling for the static accesses lowered below (see
+    // SeqPortMuxCtx). Launched children are excluded by the collector —
+    // they drive their own port slots through the child-instance muxing.
+    SeqPortMuxCtx seqMux;
+    collectFrameMultiAccess(frameBody, seqMux.multi);
+    for (auto &memInfo : memrefArgs)
+      seqMux.registeredMems.insert(memInfo.originalArg);
+    seqMux.cycleGates = fsmFrameCycleGates[frameIdx];
+    seqMux.clk = clk;
+    seqMux.rst = rst;
+    seqMux.regPrefix = node.prefix + "_f" + std::to_string(frameIdx);
+    SeqPortMuxCtx *seqMuxPtr = seqMux.multi.empty() ? nullptr : &seqMux;
+
     // Is this at-op's `res` consumed at a strictly-later at-offset in
     // the same frame, or inside a launch-holder at-op in the same
     // frame? Such consumers run ≥1 cycle after `atOp`, so the
@@ -2836,15 +2982,19 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         }
         if (auto loadOp =
                 dyn_cast<loopschedule::HWLoadLoweringInterface>(&op)) {
+          if (seqMuxPtr)
+            seqMuxPtr->cycle = atOffset;
           if (failed(handleHWLoad(loadOp, hw, localMapping, framePorts,
-                                     atGate)))
+                                     atGate, seqMuxPtr)))
             return failure();
           continue;
         }
         if (auto storeOp =
                 dyn_cast<loopschedule::HWStoreLoweringInterface>(&op)) {
+          if (seqMuxPtr)
+            seqMuxPtr->cycle = atOffset;
           if (failed(handleHWStore(storeOp, hw, localMapping, atGate,
-                                      framePorts)))
+                                      framePorts, seqMuxPtr)))
             return failure();
           continue;
         }
@@ -3259,29 +3409,34 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                        &seqStallTerms,
                        node.prefix,
                        &seqDynCounter};
+      SeqPortMuxCtx seqMux;
+      collectFrameMultiAccess(frameOp.getBodyBlock(), seqMux.multi);
+      for (auto &memInfo : memrefArgs)
+        seqMux.registeredMems.insert(memInfo.originalArg);
+      seqMux.cycleGates = fsmFrameCycleGates[frameIdx];
+      seqMux.clk = clk;
+      seqMux.rst = rst;
+      seqMux.regPrefix = node.prefix + "_f" + std::to_string(frameIdx);
       if (failed(lowerFrameBody(&frameOp.getBodyBlock(), hw, localMapping,
                                  fsmFrameCycleGates[frameIdx],
                                  perFramePorts[frameIdx], moduleOp, clk,
-                                 rst, &seqDyn)))
+                                 rst, &seqDyn,
+                                 seqMux.multi.empty() ? nullptr : &seqMux)))
         return failure();
     }
 
-    // Detect whether this frame contains any loads from local hlmem
-    // memories. Local hlmem read ports have latency=1: `rd_data` during
-    // cycle N reflects `rd_addr` from cycle N-1. So during the cycle where
-    // frame_active_<i> is high, rd_data is stale (reflecting the prior
-    // state's addr). We must capture rd_data ONE CYCLE LATER, when it
-    // correctly reflects the addr driven during the frame. For frames
-    // without local loads, the normal gate works fine.
-    bool frameHasLocalLoad = false;
+    // Detect whether this frame contains any memref loads. All memref
+    // reads have latency=1 (local hlmems by construction, external ports
+    // by the BRAM-port contract): `rd_data` during cycle N reflects the
+    // addr from cycle N-1. So during the cycle where frame_active_<i> is
+    // high, rd_data is stale (reflecting the prior state's addr). We must
+    // capture rd_data ONE CYCLE LATER, when it correctly reflects the addr
+    // driven during the frame. For frames without loads, the normal gate
+    // works fine.
+    bool frameHasMemLoad = false;
     frameOp->walk([&](LoopScheduleLoadOp loadOp) {
-      for (auto &memInfo : memrefArgs) {
-        if (memInfo.originalArg == loadOp.getMemRef() && memInfo.isLocalMem) {
-          frameHasLocalLoad = true;
-          return WalkResult::interrupt();
-        }
-      }
-      return WalkResult::advance();
+      frameHasMemLoad = true;
+      return WalkResult::interrupt();
     });
 
     // Forward each at's external results from its yield operands, so that
@@ -3335,7 +3490,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       // by one cycle so we latch rd_data when it's valid (the cycle after
       // the address is applied), not when it's still stale.
       Value captureGate = frameCaptureGate[frameIdx];
-      if (frameHasLocalLoad) {
+      if (frameHasMemLoad) {
         Value falseConstCap =
             hw::ConstantOp::create(hw, loc, hw.getI1Type(), 0);
         captureGate = seq::CompRegClockEnabledOp::create(
@@ -3491,7 +3646,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         mergedMemPorts[memInfo.originalArg].wrData;
     localMemPorts[memInfo.originalArg].wrEn =
         mergedMemPorts[memInfo.originalArg].wrEn;
-    if (memInfo.isAmcPort && memInfo.requiresRdEn)
+    if (memInfo.requiresRdEn)
       localMemPorts[memInfo.originalArg].rdEn =
           mergedMemPorts[memInfo.originalArg].rdEn;
   }
@@ -3919,14 +4074,6 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       hwBuilder, loc, hwBody, clk, rst, stages, gatedStageCE, mapping,
       operatorLibrary, namePrefix.str());
 
-  // Helper: check whether a memref is backed by a local seq.hlmem.
-  auto isLocalMemref = [&](Value memref) -> bool {
-    for (auto &memInfo : memrefArgs)
-      if (memInfo.originalArg == memref && memInfo.isLocalMem)
-        return true;
-    return false;
-  };
-
   for (auto [stageIdx, stageOp] : llvm::enumerate(stages)) {
     Block &body = stageOp.getBodyBlock();
     hwBuilder.setInsertionPointToEnd(hwBody);
@@ -4012,9 +4159,12 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
                                   perStagePorts[stageIdx]);
         }
         if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner)) {
+          // Every memref-backed load is a latency-1 registered read:
+          // local hlmems by construction, and external ports by the
+          // BRAM-port contract (the external memory's output register
+          // provides the 1-cycle delay, so no stage register is added).
           if (auto ls = dyn_cast<LoopScheduleLoadOp>(inner))
-            if (isLocalMemref(ls.getMemRef()))
-              localLoadResults.insert(ls.getResult());
+            localLoadResults.insert(ls.getResult());
           if (loadOp.requiresReadEnable() && loadOp.getReadLatency() > 0)
             localLoadResults.insert(loadOp.getResult());
           // Dynamic load issue is a single-cycle pulse like stores. Use the
@@ -5389,22 +5539,36 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     // Register frame results only after the last entry for this frame
     // completes.
     if (ei == lastEntryForFrame[frameIdx]) {
-      // Pre-scan for loads from local hlmem — skip capture for those.
+      // Pre-scan memref loads in this frame. Local hlmem reads hold their
+      // output (the read enable drops after the frame), so their results
+      // map raw. External BRAM ports are always-enabled latency-1 reads:
+      // the data for this frame's address is on the wire only during the
+      // NEXT FSM state, so their results are captured one state later.
       DenseSet<Value> localLoadResults;
+      DenseSet<Value> externalLoadResults;
       topFrames[frameIdx]->walk([&](LoopScheduleLoadOp loadOp) {
+        bool isLocal = false;
         for (auto &memInfo : memrefArgs)
           if (memInfo.originalArg == loadOp.getMemRef() &&
               memInfo.isLocalMem)
-            localLoadResults.insert(loadOp.getResult());
+            isLocal = true;
+        (isLocal ? localLoadResults : externalLoadResults)
+            .insert(loadOp.getResult());
       });
 
       // Forward each at's external results from its yield operands so the
       // frame body yield (whose operands reference at results) resolves.
+      // Propagate the load classification through the at-yield forwarding
+      // so the frame-result loop below sees it on the yield operands.
       for (auto atOp :
            topFrames[frameIdx].getBodyBlock().getOps<LoopScheduleAtOp>()) {
         auto atYield = atOp.getYieldOp();
         for (auto [res, val] :
              llvm::zip(atOp.getResults(), atYield.getOperands())) {
+          if (localLoadResults.count(val))
+            localLoadResults.insert(res);
+          if (externalLoadResults.count(val))
+            externalLoadResults.insert(res);
           if (mapping.lookupOrNull(res))
             continue;
           if (auto m = mapping.lookupOrNull(val))
@@ -5426,6 +5590,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         if (it != funcHandleValueMap.end())
           funcHandleValueMap[frameResult] = it->second;
       }
+      Value delayedEntryGate;
       for (auto [frameResult, yOperand] :
            llvm::zip(topFrames[frameIdx].getResults(),
                      frameYieldOp.getOperands())) {
@@ -5438,12 +5603,27 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
           mapping.map(frameResult, val);
           continue;
         }
+        Value captureGate = entryRunningSignals[ei];
+        if (externalLoadResults.count(yOperand)) {
+          // External BRAM read: the data arrives the state after the
+          // address was presented, so delay the capture gate one cycle.
+          if (!delayedEntryGate) {
+            Value falseVal =
+                hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0);
+            delayedEntryGate = seq::CompRegOp::create(
+                builder, loc, entryRunningSignals[ei], clk, rst, falseVal,
+                builder.getStringAttr(funcName + "_frame" +
+                                      std::to_string(frameIdx) +
+                                      "_capture_gate_delayed"));
+          }
+          captureGate = delayedEntryGate;
+        }
         auto regName = builder.getStringAttr(
             funcName + "_frame" + std::to_string(frameIdx) + "_result_" +
             std::to_string(frameResult.getResultNumber()));
         Value resetVal = createZeroConstant(builder, loc, val.getType());
         auto reg = seq::CompRegClockEnabledOp::create(
-            builder, loc, val, clk, entryRunningSignals[ei], rst, resetVal,
+            builder, loc, val, clk, captureGate, rst, resetVal,
             regName);
         mapping.map(frameResult, reg);
       }
@@ -5494,14 +5674,13 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     }
   }
 
-  // Copy merged ports to function-level memPortMap. For amc ports we
-  // also propagate `rdEn` so the stall-aware gate built in
-  // `lowerPipelineChild` from the per-port `done` handshake reaches
-  // the amc.instance's rd_en backedge — without this, the backedge
-  // defaults to constant 1 and the arbiter never gets a chance to
-  // deselect a served output. Memref-backed entries keep the previous
-  // behavior (rd_en defaults to high) since their hlmem reads don't
-  // need the handshake.
+  // Copy merged ports to function-level memPortMap. `rdEn` propagates for
+  // every port that declares one: amc ports need it so the stall-aware
+  // gate built in `lowerPipelineChild` from the per-port `done` handshake
+  // reaches the amc.instance's rd_en backedge, and external memref ports
+  // need it for the BRAM-port hold contract (without it the module output
+  // ties rd_en low and the external memory never updates its read
+  // register).
   for (auto &memInfo : memrefArgs) {
     memPortMap[memInfo.originalArg].addrs =
         mergedMemPorts[memInfo.originalArg].addrs;
@@ -5509,7 +5688,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         mergedMemPorts[memInfo.originalArg].wrData;
     memPortMap[memInfo.originalArg].wrEn =
         mergedMemPorts[memInfo.originalArg].wrEn;
-    if (memInfo.isAmcPort && memInfo.requiresRdEn)
+    if (memInfo.requiresRdEn)
       memPortMap[memInfo.originalArg].rdEn =
           mergedMemPorts[memInfo.originalArg].rdEn;
   }
@@ -5716,13 +5895,6 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
       builder, loc, hwBody, clk, rst, stages, stageCE, mapping,
       operatorLibrary, "pipe");
 
-  auto isLocalMemref = [&](Value memref) -> bool {
-    for (auto &memInfo : memrefArgs)
-      if (memInfo.originalArg == memref && memInfo.isLocalMem)
-        return true;
-    return false;
-  };
-
   // Per-memref max read-stage offset. The testbench uses this to time its
   // per-transaction read shift correctly under multi-transaction streaming
   // (Phase 2). Without it, the TB would have to assume every memory is
@@ -5777,9 +5949,12 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
           return handleHWStore(storeOp, builder, mapping, gate,
                                perStagePorts[stageIdx]);
         if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner)) {
+          // Every memref-backed load is a latency-1 registered read:
+          // local hlmems by construction, and external ports by the
+          // BRAM-port contract (the external memory's output register
+          // provides the 1-cycle delay, so no stage register is added).
           if (auto ls = dyn_cast<LoopScheduleLoadOp>(inner))
-            if (isLocalMemref(ls.getMemRef()))
-              localLoadResults.insert(ls.getResult());
+            localLoadResults.insert(ls.getResult());
           if (loadOp.requiresReadEnable() && loadOp.getReadLatency() > 0)
             localLoadResults.insert(loadOp.getResult());
           // Track the latest stage offset that issues a read against
