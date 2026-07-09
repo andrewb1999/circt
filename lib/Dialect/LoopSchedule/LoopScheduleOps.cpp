@@ -1505,6 +1505,16 @@ ParseResult parseFuncLikeOp(OpAsmParser &parser, OperationState &result,
       return failure();
   }
 
+  // Optional block-control protocol clause: `control = <kind>` (a bare
+  // keyword, e.g. ap_ctrl_hs or none).
+  if (succeeded(parser.parseOptionalKeyword("control"))) {
+    StringRef kind;
+    if (parser.parseEqual() || parser.parseKeyword(&kind))
+      return failure();
+    result.addAttribute(OpT::getControlInterfaceAttrName(result.name),
+                        parser.getBuilder().getStringAttr(kind));
+  }
+
   return function_interface_impl::parseFunctionOp(
       parser, result, /*allowVariadic=*/false,
       OpT::getFunctionTypeAttrName(result.name), buildFuncType,
@@ -1517,8 +1527,11 @@ void printFuncLikeOp(OpT op, OpAsmPrinter &p, bool hasII) {
   if (hasII) {
     p << " ii = " << op->template getAttrOfType<IntegerAttr>("II").getInt();
   }
-  // Replicate function_interface_impl::printFunctionOp but with `II` added
-  // to the elided attribute list so it doesn't get printed twice.
+  if (auto ctrl = op.getControlInterface())
+    p << " control = " << *ctrl;
+  // Replicate function_interface_impl::printFunctionOp but with `II` (and
+  // the control clause) added to the elided attribute list so they don't
+  // get printed twice.
   StringRef visibilityAttrName = SymbolTable::getVisibilityAttrName();
   StringRef sym = op.getSymName();
   p << ' ';
@@ -1533,6 +1546,7 @@ void printFuncLikeOp(OpT op, OpAsmPrinter &p, bool hasII) {
       op.getArgAttrsAttrName().getValue(),
       op.getResAttrsAttrName().getValue(),
       SymbolTable::getSymbolAttrName(),
+      op.getControlInterfaceAttrName().getValue(),
   };
   if (hasII)
     elided.push_back("II");
@@ -1547,6 +1561,11 @@ void printFuncLikeOp(OpT op, OpAsmPrinter &p, bool hasII) {
 
 template <typename OpT>
 LogicalResult verifyFuncLikeBody(OpT op) {
+  if (auto ctrl = op.getControlInterface())
+    if (*ctrl != "ap_ctrl_hs" && *ctrl != "none")
+      return op.emitOpError("control interface must be 'ap_ctrl_hs' or "
+                            "'none', got '")
+             << *ctrl << "'";
   // External (declaration-only) ops have an empty body — nothing to check.
   if (op.isExternal())
     return success();

@@ -713,6 +713,13 @@ class LoopScheduleFuncOpBase<string mnemonic, list<Trait> traits = []> :
   let arguments = (ins
     SymbolNameAttr:$sym_name,
     TypeAttrOf<FunctionType>:$function_type,
+    // Block-level control protocol of the eventual hardware kernel:
+    // "ap_ctrl_hs" (start/done via an s_axilite control slave) or "none"
+    // (raw start/ready/done handshake, ap_ctrl_none). Absent means
+    // unspecified, which downstream lowering treats like "none". Printed
+    // as a dedicated `control = <kind>` clause rather than living in the
+    // discardable attribute dictionary.
+    OptionalAttr<StrAttr>:$control_interface,
     OptionalAttr<StrAttr>:$sym_visibility,
     OptionalAttr<DictArrayAttr>:$arg_attrs,
     OptionalAttr<DictArrayAttr>:$res_attrs
@@ -797,6 +804,8 @@ def LoopScheduleFuncPipelineOp
     SymbolNameAttr:$sym_name,
     TypeAttrOf<FunctionType>:$function_type,
     I64Attr:$II,
+    // See LoopScheduleFuncOpBase — same `control = <kind>` clause.
+    OptionalAttr<StrAttr>:$control_interface,
     OptionalAttr<StrAttr>:$sym_visibility,
     OptionalAttr<DictArrayAttr>:$arg_attrs,
     OptionalAttr<DictArrayAttr>:$res_attrs

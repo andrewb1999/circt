@@ -1781,6 +1781,12 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedulePipeline(
         name == funcOp.getFunctionTypeAttrName() || name == "II" ||
         name == "hls.pipeline")
       continue;
+    // The frontend's discardable `amc.control_interface` marker becomes the
+    // op's inherent `control` clause.
+    if (name == "amc.control_interface") {
+      newOp.setControlInterfaceAttr(cast<StringAttr>(attr.getValue()));
+      continue;
+    }
     newOp->setAttr(attr.getName(), attr.getValue());
   }
 
@@ -2928,6 +2934,12 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
         if (name == SymbolTable::getSymbolAttrName() ||
             name == funcOp.getFunctionTypeAttrName())
           continue;
+        // The frontend's discardable `amc.control_interface` marker becomes
+        // the op's inherent `control` clause.
+        if (name == "amc.control_interface") {
+          newOp.setControlInterfaceAttr(cast<StringAttr>(attr.getValue()));
+          continue;
+        }
         newOp->setAttr(attr.getName(), attr.getValue());
       }
       newOp.getBody().takeBody(funcOp.getBody());

@@ -189,6 +189,14 @@ static const AxiSigDesc kAxiSigs[] = {
 
 static bool isAxiPort(StringRef name) { return name.contains("_m_axi_"); }
 
+/// Ports of the ap_ctrl_hs wrapper's s_axilite control face (plus its
+/// interrupt line). Driven by the axi_lite_ctrl_bfm instance, never by hex
+/// files, and never dumped as scalar outputs.
+static constexpr StringLiteral kCtrlSlavePrefix = "s_axi_control_";
+static bool isCtrlSlavePort(StringRef name) {
+  return name.starts_with(kCtrlSlavePrefix) || name == "interrupt";
+}
+
 /// Group the DUT's `<bundle>_m_axi_<sig>` ports into per-bundle infos and
 /// resolve each bundle's depth from the `amc.axi_bundles` attribute.
 static LogicalResult
@@ -456,6 +464,13 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   auto dutPorts = dutMod.getPortList();
   auto memGroups = classifyMemoryPorts(dutPorts);
 
+  // ap_ctrl_hs DUTs (wrapped by amc-insert-axi-lite-control) have no raw
+  // start/ready/done handshake; they are driven through their s_axilite
+  // control slave by a behavioral AXI-Lite master (axi_lite_ctrl_bfm.sv).
+  auto ctrlAttr =
+      dutMod->getAttrOfType<StringAttr>("amc.control_interface");
+  const bool ctrlHs = ctrlAttr && ctrlAttr.getValue() == "ap_ctrl_hs";
+
   // AXI bundles get a behavioral slave instance each (axi_slave_mem.sv).
   SmallVector<AxiBundleInfo> axiBundles;
   if (failed(classifyAxiBundles(dutMod, dutPorts, axiBundles)))
@@ -466,7 +481,8 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   SmallVector<hw::PortInfo> scalarOutputs;
   for (auto &port : dutPorts) {
     if (isControlPort(port.getName()) ||
-        isMemoryPort(port.getName(), memGroups) || isAxiPort(port.getName()))
+        isMemoryPort(port.getName(), memGroups) || isAxiPort(port.getName()) ||
+        (ctrlHs && isCtrlSlavePort(port.getName())))
       continue;
     if (port.isInput())
       scalarInputs.push_back(port);
@@ -738,6 +754,12 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   llvm::StringMap<Value> axiInWires;
   llvm::StringMap<Value> axiOutVals;
 
+  // ap_ctrl_hs: wires feeding the DUT's s_axi_control_* inputs (assigned
+  // from the axi_lite_ctrl_bfm instance below) and the DUT's control-slave
+  // output values (the BFM's inputs).
+  llvm::StringMap<Value> ctrlInWires;
+  llvm::StringMap<Value> ctrlOutVals;
+
   for (auto &port : dutPorts) {
     if (!port.isInput())
       continue;
@@ -747,6 +769,13 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
       dutInputs.push_back(rst);
     } else if (port.getName() == "start") {
       dutInputs.push_back(startVal);
+    } else if (ctrlHs && isCtrlSlavePort(port.getName())) {
+      auto ctrlWire = sv::WireOp::create(
+          builder, loc, port.type,
+          builder.getStringAttr(port.getName().str() + "_wire"));
+      Value ctrlVal = sv::ReadInOutOp::create(builder, loc, ctrlWire);
+      dutInputs.push_back(ctrlVal);
+      ctrlInWires[port.getName()] = ctrlWire;
     } else if (port.getName().ends_with("_rd_data")) {
       // Memory read data — placeholder; will be wired after instance.
       // We need a zero constant of the right type as placeholder.
@@ -809,6 +838,8 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
       doneVal = result;
     } else if (port.getName() == "ready") {
       readyVal = result;
+    } else if (ctrlHs && isCtrlSlavePort(port.getName())) {
+      ctrlOutVals[port.getName()] = result;
     } else if (isAxiPort(port.getName())) {
       axiOutVals[port.getName()] = result;
     } else if (port.getName().ends_with("_addr")) {
@@ -975,6 +1006,91 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
     }
   }
 
+  // --- ap_ctrl_hs: behavioral AXI-Lite control master ---
+  // The BFM (hdl/systemverilog/axi_lite_ctrl_bfm.sv) plays the host: it
+  // zeroes the base-address registers, then per transaction writes ap_start
+  // and polls ap_done, for `numTxns` transactions. Its start/done pulses
+  // stand in for the raw start/done handshake in the transaction accounting
+  // below (transactions are strictly serialized under ap_ctrl_hs, so the
+  // few-cycle skew against the kernel's internal start is harmless).
+  Value ctrlStartPulse;
+  if (ctrlHs) {
+    static const char *kBfmIns[] = {"awready", "wready", "bresp", "bvalid",
+                                    "arready", "rdata",  "rresp", "rvalid"};
+    static const char *kBfmOuts[] = {"awaddr", "awvalid", "wdata",
+                                     "wstrb",  "wvalid",  "bready",
+                                     "araddr", "arvalid", "rready"};
+    llvm::StringMap<Type> ctrlPortTypes;
+    for (auto &port : dutPorts)
+      if (port.getName().starts_with(kCtrlSlavePrefix))
+        ctrlPortTypes[port.getName().drop_front(kCtrlSlavePrefix.size())] =
+            port.type;
+    for (const char *sig : kBfmIns)
+      if (!ctrlPortTypes.count(sig)) {
+        dutMod.emitError("ap_ctrl_hs DUT is missing control-slave port '")
+            << kCtrlSlavePrefix << sig << "'";
+        return signalPassFailure();
+      }
+    for (const char *sig : kBfmOuts)
+      if (!ctrlPortTypes.count(sig)) {
+        dutMod.emitError("ap_ctrl_hs DUT is missing control-slave port '")
+            << kCtrlSlavePrefix << sig << "'";
+        return signalPassFailure();
+      }
+    unsigned ctrlAddrW =
+        cast<IntegerType>(ctrlPortTypes["awaddr"]).getWidth();
+
+    SmallVector<hw::PortInfo> extPorts;
+    auto addPort = [&](StringRef pname, Type ty,
+                       hw::ModulePort::Direction dir) {
+      extPorts.push_back({{builder.getStringAttr(pname), ty, dir}});
+    };
+    addPort("clk", builder.getI1Type(), hw::ModulePort::Direction::Input);
+    addPort("rst", builder.getI1Type(), hw::ModulePort::Direction::Input);
+    addPort("num_txns", i32Type, hw::ModulePort::Direction::Input);
+    for (const char *sig : kBfmIns)
+      addPort(("s_axi_" + StringRef(sig)).str(), ctrlPortTypes[sig],
+              hw::ModulePort::Direction::Input);
+    for (const char *sig : kBfmOuts)
+      addPort(("s_axi_" + StringRef(sig)).str(), ctrlPortTypes[sig],
+              hw::ModulePort::Direction::Output);
+    addPort("start_pulse", builder.getI1Type(),
+            hw::ModulePort::Direction::Output);
+    addPort("done_pulse", builder.getI1Type(),
+            hw::ModulePort::Direction::Output);
+
+    auto i32ParamType = builder.getIntegerType(32);
+    SmallVector<Attribute> paramDecls = {
+        hw::ParamDeclAttr::get("ADDR_W", i32ParamType),
+        hw::ParamDeclAttr::get("NUM_BASE_ADDRS", i32ParamType)};
+    OpBuilder externBuilder = OpBuilder::atBlockEnd(moduleOp.getBody());
+    auto bfmExt = hw::HWModuleExternOp::create(
+        externBuilder, loc, builder.getStringAttr("axi_lite_ctrl_bfm"),
+        ArrayRef<hw::PortInfo>(extPorts), "axi_lite_ctrl_bfm",
+        builder.getArrayAttr(paramDecls));
+
+    SmallVector<Attribute> paramVals = {
+        hw::ParamDeclAttr::get("ADDR_W", builder.getI32IntegerAttr(ctrlAddrW)),
+        hw::ParamDeclAttr::get(
+            "NUM_BASE_ADDRS",
+            builder.getI32IntegerAttr((int32_t)axiBundles.size()))};
+    SmallVector<Value> operands = {clk, rst, numTxns};
+    for (const char *sig : kBfmIns)
+      operands.push_back(ctrlOutVals[(kCtrlSlavePrefix + sig).str()]);
+    auto bfmInst = hw::InstanceOp::create(
+        builder, loc, bfmExt, builder.getStringAttr("ctrl_bfm"), operands,
+        builder.getArrayAttr(paramVals));
+    unsigned resIdx = 0;
+    for (const char *sig : kBfmOuts)
+      sv::AssignOp::create(builder, loc,
+                           ctrlInWires[(kCtrlSlavePrefix + sig).str()],
+                           bfmInst.getResult(resIdx++));
+    ctrlStartPulse = bfmInst.getResult(resIdx++);
+    // The BFM's done pulse is the DUT-completion signal for everything
+    // downstream (dump + $finish).
+    doneVal = bfmInst.getResult(resIdx++);
+  }
+
   // --- always_ff: control, memory writes, output dump ---
   sv::AlwaysFFOp::create(
       builder, loc, sv::EventControl::AtPosEdge, clk, [&] {
@@ -1024,7 +1140,16 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
               // reads). chain[s>=1] copies chain[s-1] every cycle, so
               // chain[s] at cycle T = chain[0] at cycle T-s = txn ID
               // currently at stage s.
+              //
+              // ap_ctrl_hs: the BFM's start pulse fires when the ap_start
+              // WRITE completes — a few cycles before the kernel's internal
+              // start, so a start-keyed bump would already point past the
+              // txn whose reads are about to issue. Transactions are
+              // strictly serialized under ap_ctrl_hs, so key the bump off
+              // the DONE pulse instead: chain[0] then simply holds the
+              // id of the txn currently executing.
               {
+                Value chainBump = ctrlHs ? doneVal : startVal;
                 Value c1 =
                     hw::ConstantOp::create(builder, loc, i32Type, 1);
                 Value nextChain0 = comb::AddOp::create(
@@ -1036,7 +1161,7 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                     builder, loc, moreAfter, nextChain0,
                     shiftChainVals[0]);
                 Value nextChain0Final = comb::MuxOp::create(
-                    builder, loc, startVal, chain0Bumped,
+                    builder, loc, chainBump, chain0Bumped,
                     shiftChainVals[0]);
                 sv::PAssignOp::create(builder, loc, shiftChainRegs[0],
                                        nextChain0Final);
@@ -1235,7 +1360,13 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   // `assign` (not a registered drive) keeps tb_start in sync with
   // `_dut_ready` on the same cycle — a registered start would lag one
   // cycle and could be silently rejected if `ready` flips.
-  {
+  //
+  // ap_ctrl_hs DUTs have no start input; the BFM sequences the starts
+  // itself, and tb_start just mirrors its start pulse so the issue-count /
+  // read-shift accounting in the always_ff above keeps working.
+  if (ctrlHs) {
+    sv::AssignOp::create(builder, loc, startWire, ctrlStartPulse);
+  } else {
     Value readyHigh = readyVal ? readyVal : trueVal;
     Value moreToIssue = comb::ICmpOp::create(
         builder, loc, comb::ICmpPredicate::ult, issueCntVal, numTxns);

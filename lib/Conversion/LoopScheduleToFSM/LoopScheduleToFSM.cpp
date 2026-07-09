@@ -4576,6 +4576,23 @@ static hw::HWModuleOp createHWModule(
       hwMod->setAttr(attr.getName(), attr.getValue());
   }
 
+  // The loopschedule func ops carry the block-control protocol as an
+  // inherent attribute (their `control = <kind>` clause); republish it as a
+  // discardable `amc.control_interface` marker on the hw.module for the
+  // control-slave wrapper pass and the testbench generator.
+  {
+    StringAttr ctrl;
+    Operation *funcOperation = funcOp.getOperation();
+    if (auto seq = dyn_cast<loopschedule::LoopScheduleFuncSequentialOp>(
+            funcOperation))
+      ctrl = seq.getControlInterfaceAttr();
+    else if (auto pipe = dyn_cast<loopschedule::LoopScheduleFuncPipelineOp>(
+                 funcOperation))
+      ctrl = pipe.getControlInterfaceAttr();
+    if (ctrl)
+      hwMod->setAttr("amc.control_interface", ctrl);
+  }
+
   // Map function arguments.
   memPortMap.clear();
   Block *hwBody = hwMod.getBodyBlock();
