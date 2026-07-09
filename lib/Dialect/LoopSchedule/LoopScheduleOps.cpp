@@ -1506,7 +1506,7 @@ ParseResult parseFuncLikeOp(OpAsmParser &parser, OperationState &result,
   }
 
   // Optional block-control protocol clause: `control = <kind>` (a bare
-  // keyword, e.g. ap_ctrl_hs or none).
+  // keyword, e.g. axil_handshake or handshake).
   if (succeeded(parser.parseOptionalKeyword("control"))) {
     StringRef kind;
     if (parser.parseEqual() || parser.parseKeyword(&kind))
@@ -1562,9 +1562,9 @@ void printFuncLikeOp(OpT op, OpAsmPrinter &p, bool hasII) {
 template <typename OpT>
 LogicalResult verifyFuncLikeBody(OpT op) {
   if (auto ctrl = op.getControlInterface())
-    if (*ctrl != "ap_ctrl_hs" && *ctrl != "none")
-      return op.emitOpError("control interface must be 'ap_ctrl_hs' or "
-                            "'none', got '")
+    if (*ctrl != "axil_handshake" && *ctrl != "handshake")
+      return op.emitOpError("control interface must be 'axil_handshake' or "
+                            "'handshake', got '")
              << *ctrl << "'";
   // External (declaration-only) ops have an empty body — nothing to check.
   if (op.isExternal())

@@ -91,7 +91,7 @@ func.func @non_monotonic_start() {
 
 // -----
 
-// expected-error @below {{control interface must be 'ap_ctrl_hs' or 'none', got 'bogus'}}
+// expected-error @below {{control interface must be 'axil_handshake' or 'handshake', got 'bogus'}}
 loopschedule.func_sequential control = bogus @bad_control(%a: memref<4xi32>) {
   loopschedule.return
 }

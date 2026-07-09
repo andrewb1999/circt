@@ -4,14 +4,14 @@
 // `control = <kind>` clause (it must NOT round-trip through the discardable
 // attribute dictionary).
 
-// CHECK-LABEL: loopschedule.func_sequential control = ap_ctrl_hs @seq_hs
+// CHECK-LABEL: loopschedule.func_sequential control = axil_handshake @seq_axil
 // CHECK-NOT: attributes
-loopschedule.func_sequential control = ap_ctrl_hs @seq_hs(%a: memref<16xi32>) {
+loopschedule.func_sequential control = axil_handshake @seq_axil(%a: memref<16xi32>) {
   loopschedule.return
 }
 
-// CHECK-LABEL: loopschedule.func_sequential control = none @seq_none
-loopschedule.func_sequential control = none @seq_none(%a: memref<16xi32>) {
+// CHECK-LABEL: loopschedule.func_sequential control = handshake @seq_handshake
+loopschedule.func_sequential control = handshake @seq_handshake(%a: memref<16xi32>) {
   loopschedule.return
 }
 
@@ -22,7 +22,7 @@ loopschedule.func_sequential @seq_plain(%a: memref<16xi32>) {
   loopschedule.return
 }
 
-// CHECK-LABEL: loopschedule.func_pipeline ii = 2 control = ap_ctrl_hs @pipe_hs
-loopschedule.func_pipeline ii = 2 control = ap_ctrl_hs @pipe_hs(%a: memref<16xi32>) {
+// CHECK-LABEL: loopschedule.func_pipeline ii = 2 control = axil_handshake @pipe_axil
+loopschedule.func_pipeline ii = 2 control = axil_handshake @pipe_axil(%a: memref<16xi32>) {
   loopschedule.return
 }

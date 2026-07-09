@@ -714,9 +714,9 @@ class LoopScheduleFuncOpBase<string mnemonic, list<Trait> traits = []> :
     SymbolNameAttr:$sym_name,
     TypeAttrOf<FunctionType>:$function_type,
     // Block-level control protocol of the eventual hardware kernel:
-    // "ap_ctrl_hs" (start/done via an s_axilite control slave) or "none"
+    // "axil_handshake" (start/done via an s_axilite control slave) or "handshake"
     // (raw start/ready/done handshake, ap_ctrl_none). Absent means
-    // unspecified, which downstream lowering treats like "none". Printed
+    // unspecified, which downstream lowering treats like "handshake". Printed
     // as a dedicated `control = <kind>` clause rather than living in the
     // discardable attribute dictionary.
     OptionalAttr<StrAttr>:$control_interface,

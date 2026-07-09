@@ -189,7 +189,7 @@ static const AxiSigDesc kAxiSigs[] = {
 
 static bool isAxiPort(StringRef name) { return name.contains("_m_axi_"); }
 
-/// Ports of the ap_ctrl_hs wrapper's s_axilite control face (plus its
+/// Ports of the axil_handshake wrapper's s_axilite control face (plus its
 /// interrupt line). Driven by the axi_lite_ctrl_bfm instance, never by hex
 /// files, and never dumped as scalar outputs.
 static constexpr StringLiteral kCtrlSlavePrefix = "s_axi_control_";
@@ -464,12 +464,12 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   auto dutPorts = dutMod.getPortList();
   auto memGroups = classifyMemoryPorts(dutPorts);
 
-  // ap_ctrl_hs DUTs (wrapped by amc-insert-axi-lite-control) have no raw
+  // axil_handshake DUTs (wrapped by amc-insert-axi-lite-control) have no raw
   // start/ready/done handshake; they are driven through their s_axilite
   // control slave by a behavioral AXI-Lite master (axi_lite_ctrl_bfm.sv).
   auto ctrlAttr =
       dutMod->getAttrOfType<StringAttr>("amc.control_interface");
-  const bool ctrlHs = ctrlAttr && ctrlAttr.getValue() == "ap_ctrl_hs";
+  const bool ctrlHs = ctrlAttr && ctrlAttr.getValue() == "axil_handshake";
 
   // AXI bundles get a behavioral slave instance each (axi_slave_mem.sv).
   SmallVector<AxiBundleInfo> axiBundles;
@@ -754,7 +754,7 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   llvm::StringMap<Value> axiInWires;
   llvm::StringMap<Value> axiOutVals;
 
-  // ap_ctrl_hs: wires feeding the DUT's s_axi_control_* inputs (assigned
+  // axil_handshake: wires feeding the DUT's s_axi_control_* inputs (assigned
   // from the axi_lite_ctrl_bfm instance below) and the DUT's control-slave
   // output values (the BFM's inputs).
   llvm::StringMap<Value> ctrlInWires;
@@ -1006,12 +1006,12 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
     }
   }
 
-  // --- ap_ctrl_hs: behavioral AXI-Lite control master ---
+  // --- axil_handshake: behavioral AXI-Lite control master ---
   // The BFM (hdl/systemverilog/axi_lite_ctrl_bfm.sv) plays the host: it
   // zeroes the base-address registers, then per transaction writes ap_start
   // and polls ap_done, for `numTxns` transactions. Its start/done pulses
   // stand in for the raw start/done handshake in the transaction accounting
-  // below (transactions are strictly serialized under ap_ctrl_hs, so the
+  // below (transactions are strictly serialized under axil_handshake, so the
   // few-cycle skew against the kernel's internal start is harmless).
   Value ctrlStartPulse;
   if (ctrlHs) {
@@ -1027,13 +1027,13 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
             port.type;
     for (const char *sig : kBfmIns)
       if (!ctrlPortTypes.count(sig)) {
-        dutMod.emitError("ap_ctrl_hs DUT is missing control-slave port '")
+        dutMod.emitError("axil_handshake DUT is missing control-slave port '")
             << kCtrlSlavePrefix << sig << "'";
         return signalPassFailure();
       }
     for (const char *sig : kBfmOuts)
       if (!ctrlPortTypes.count(sig)) {
-        dutMod.emitError("ap_ctrl_hs DUT is missing control-slave port '")
+        dutMod.emitError("axil_handshake DUT is missing control-slave port '")
             << kCtrlSlavePrefix << sig << "'";
         return signalPassFailure();
       }
@@ -1141,11 +1141,11 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
               // chain[s] at cycle T = chain[0] at cycle T-s = txn ID
               // currently at stage s.
               //
-              // ap_ctrl_hs: the BFM's start pulse fires when the ap_start
+              // axil_handshake: the BFM's start pulse fires when the ap_start
               // WRITE completes — a few cycles before the kernel's internal
               // start, so a start-keyed bump would already point past the
               // txn whose reads are about to issue. Transactions are
-              // strictly serialized under ap_ctrl_hs, so key the bump off
+              // strictly serialized under axil_handshake, so key the bump off
               // the DONE pulse instead: chain[0] then simply holds the
               // id of the txn currently executing.
               {
@@ -1361,7 +1361,7 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   // `_dut_ready` on the same cycle — a registered start would lag one
   // cycle and could be silently rejected if `ready` flips.
   //
-  // ap_ctrl_hs DUTs have no start input; the BFM sequences the starts
+  // axil_handshake DUTs have no start input; the BFM sequences the starts
   // itself, and tb_start just mirrors its start pulse so the issue-count /
   // read-shift accounting in the always_ff above keeps working.
   if (ctrlHs) {
