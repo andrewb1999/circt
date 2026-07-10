@@ -125,6 +125,15 @@ protected:
   /// them from being pivoted into basis again.
   DenseMap<unsigned, unsigned> frozenVariables;
 
+  /// Whether `solveTableau` may unilaterally increase `parameterT` (the II)
+  /// to restore feasibility. Schedulers whose driver owns the II — and whose
+  /// modulo reservation table is keyed on it — must disable this: a mid-
+  /// placement II change would silently invalidate every occupied congruence
+  /// slot. With the flag off, such rows report plain infeasibility, which
+  /// the backtracking placement handles (and the driver raises the II
+  /// between attempts).
+  bool allowIIIncreaseDuringSolve = true;
+
   /// Number of rows in the tableau = |obj| + |deps|.
   unsigned nRows;
   /// Number of explicitly stored columns in the tableau = |params| + |ops|.
@@ -366,7 +375,6 @@ private:
   };
 
   ChainingModuloProblem &prob;
-  SmallVector<unsigned> asapTimes, alapTimes;
   SmallVector<Operation *> unscheduled, scheduled;
   MRT mrt;
   float cycleTime;
@@ -392,9 +400,22 @@ protected:
   LogicalResult checkLastOp() override;
   enum { OBJ_LATENCY = 0, OBJ_AXAP /* i.e. either ASAP or ALAP */ };
   bool fillObjectiveRow(SmallVector<int> &row, unsigned obj) override;
-  void updateMargins();
   LogicalResult scheduleOperation(Operation *n);
   unsigned computeResMinII();
+
+  /// Rau's height-based priority (MICRO-27 1994, Fig. 5): the longest
+  /// dependence path toward the schedule's end, with inter-iteration edges
+  /// discounted by II*distance. Static per II attempt — unlike the previous
+  /// least-slack heuristic it needs no per-pick tableau re-solves, and it
+  /// places producers of long (e.g. port-serialized) chains before their
+  /// dependent consumers, keeping eviction (and budget consumption) rare.
+  /// This ordering also composes with dependence chains generated for
+  /// dynamic-latency launches, which matters once function-frame dyn
+  /// accesses are wrapped in launches (see benchmarks/DEBUG_NOTES.md).
+  DenseMap<Operation *, int> heightPriority;
+  /// Deterministic tie-break: the op's index in the problem's op list.
+  DenseMap<Operation *, unsigned> stableIndex;
+  void computeHeightPriorities();
   /// Unpin `op`: drop its equality, release its MRT slot, and requeue it.
   /// The tableau is NOT rebuilt here — batch unpins, then rebuildWithPins().
   void unpin(Operation *op);
@@ -411,7 +432,11 @@ public:
                                  float cycleTime,
                                  std::optional<int32_t> ii = std::nullopt)
       : ChainingCyclicSimplexScheduler(prob, lastOp, cycleTime, ii), prob(prob),
-        mrt(*this), cycleTime(cycleTime), ii(ii) {}
+        mrt(*this), cycleTime(cycleTime), ii(ii) {
+    // The driver owns the II (fresh attempt per candidate II); the solver
+    // must not change it under the MRT's feet.
+    allowIIIncreaseDuringSolve = false;
+  }
   LogicalResult schedule() override;
 };
 
@@ -716,14 +741,20 @@ LogicalResult SimplexSchedulerBase::solveTableau() {
     // the entry in the `parameterTColumn` is positive, we can try to make the
     // LP feasible again by increasing the II.
     int entry1Col = tableau[*pivotRow][parameter1Column];
+    int entrySCol = tableau[*pivotRow][parameterSColumn];
     int entryTCol = tableau[*pivotRow][parameterTColumn];
-    if (entryTCol > 0) {
-      // The negation of `entry1Col` is not in the paper. I think this is an
-      // oversight, because `entry1Col` certainly is negative (otherwise the row
-      // would not have been a valid pivot row), and without the negation, the
-      // new II would be negative.
-      assert(entry1Col < 0);
-      int newParameterT = (-entry1Col - 1) / entryTCol + 1;
+    if (entryTCol > 0 && allowIIIncreaseDuringSolve) {
+      // Solve `effConst + T * entryTCol >= 0` for the smallest feasible T.
+      // The S contribution must be folded into the constant: during
+      // `scheduleAt`, `parameterS` is temporarily nonzero, so the row's
+      // negative parametric constant may stem from the S term while
+      // `entry1Col` alone is non-negative (the original formula, following
+      // the paper's S = 0 setting, missed this and asserted).
+      int effConst = entry1Col + parameterS * entrySCol;
+      // The row's parametric constant `effConst + T * entryTCol` is
+      // negative (it was a valid pivot row) and entryTCol > 0, so:
+      assert(effConst < 0);
+      int newParameterT = (-effConst - 1) / entryTCol + 1;
       if (newParameterT > parameterT) {
         parameterT = newParameterT;
         LLVM_DEBUG(dbgs() << "Increased II to " << parameterT << '\n');
@@ -1457,7 +1488,6 @@ LogicalResult ModuloSimplexScheduler::schedule() {
   while (!unscheduled.empty()) {
     // Update ASAP/ALAP times.
     updateMargins();
-    updateMargins();
 
     // Heuristically (here: least amount of slack) pick the next operation to
     // schedule.
@@ -1811,22 +1841,38 @@ bool ChainingModuloSimplexScheduler::fillObjectiveRow(SmallVector<int> &row,
   }
 }
 
-void ChainingModuloSimplexScheduler::updateMargins() {
-  // Assumption: current secondary objective is "ASAP".
-  // Negate the objective row once to effectively maximize the sum of start
-  // times, which yields the "ALAP" times after solving the tableau. Then,
-  // negate it again to restore the "ASAP" objective, and store these times as
-  // well.
-  for (auto *axapTimes : {&alapTimes, &asapTimes}) {
-    multiplyRow(OBJ_AXAP, -1);
-    // This should not fail for a feasible tableau.
-    auto dualFeasRestored = restoreDualFeasibility();
-    auto solved = solveTableau();
-    assert(succeeded(dualFeasRestored) && succeeded(solved));
-    (void)dualFeasRestored, (void)solved;
-
-    for (unsigned stv = 0; stv < startTimeLocations.size(); ++stv)
-      (*axapTimes)[stv] = getStartTime(stv);
+void ChainingModuloSimplexScheduler::computeHeightPriorities() {
+  heightPriority.clear();
+  stableIndex.clear();
+  auto &ops = prob.getOperations();
+  for (auto [idx, op] : llvm::enumerate(ops)) {
+    stableIndex[op] = idx;
+    heightPriority[op] = 0;
+  }
+  // Bellman-Ford-style relaxation of
+  //   height(src) >= height(dst) + latency(src) - II * distance(src, dst)
+  // over all dependences. The initial LP being feasible at this II implies
+  // every dependence cycle's total weight is non-positive, so this
+  // converges within |ops| passes; the iteration cap is defensive.
+  bool changed = true;
+  for (unsigned iter = 0; changed && iter <= ops.size(); ++iter) {
+    changed = false;
+    for (auto *dst : ops) {
+      int heightDst = heightPriority[dst];
+      for (auto &dep : prob.getDependences(dst)) {
+        Operation *srcOp = dep.getSource();
+        int latency = 0;
+        if (auto opr = prob.getLinkedOperatorType(srcOp))
+          latency = (int)prob.getLatency(*opr).value_or(0);
+        int distance = (int)prob.getDistance(dep).value_or(0);
+        int cand = heightDst + latency - (int)parameterT * distance;
+        auto it = heightPriority.find(srcOp);
+        if (it != heightPriority.end() && cand > it->second) {
+          it->second = cand;
+          changed = true;
+        }
+      }
+    }
   }
 }
 
@@ -1864,8 +1910,6 @@ void ChainingModuloSimplexScheduler::unpin(Operation *op) {
 LogicalResult ChainingModuloSimplexScheduler::rebuildWithPins() {
   resetTableau();
   buildTableau();
-  asapTimes.resize(startTimeLocations.size());
-  alapTimes.resize(startTimeLocations.size());
   if (failed(solveTableau()))
     return failure();
   // Re-applying a subset of a previously feasible pin set stays feasible.
@@ -1990,13 +2034,15 @@ LogicalResult ChainingModuloSimplexScheduler::schedule() {
   LLVM_DEBUG(dbgs() << "Attempting to schedule with II = " << parameterT
                     << "\n");
   buildTableau();
-  asapTimes.resize(startTimeLocations.size());
-  alapTimes.resize(startTimeLocations.size());
 
   LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
 
   if (failed(solveTableau()))
     return prob.getContainingOp()->emitError() << "problem is infeasible";
+
+  // Static, height-based placement order (recomputed per II attempt since
+  // inter-iteration edges weigh in at II*distance).
+  computeHeightPriorities();
 
   // Determine which operations are subject to resource constraints.
   auto &ops = prob.getOperations();
@@ -2017,19 +2063,19 @@ LogicalResult ChainingModuloSimplexScheduler::schedule() {
       return failure();
     }
     --budget;
-    // Update ASAP/ALAP times.
-    updateMargins();
-
-    // Heuristically (here: least amount of slack) pick the next operation to
-    // schedule.
+    // Pick the highest-priority operation (Rau's height-based priority:
+    // ops heading long dependence chains place first, so their consumers'
+    // deadlines are computed against committed producers, not optimistic
+    // floating times).
     auto *opIt =
         std::min_element(unscheduled.begin(), unscheduled.end(),
                          [&](Operation *opA, Operation *opB) {
-                           auto stvA = startTimeVariables[opA];
-                           auto stvB = startTimeVariables[opB];
-                           auto slackA = alapTimes[stvA] - asapTimes[stvA];
-                           auto slackB = alapTimes[stvB] - asapTimes[stvB];
-                           return slackA < slackB;
+                           int ha = heightPriority.lookup(opA);
+                           int hb = heightPriority.lookup(opB);
+                           if (ha != hb)
+                             return ha > hb;
+                           return stableIndex.lookup(opA) <
+                                  stableIndex.lookup(opB);
                          });
     Operation *op = *opIt;
     unscheduled.erase(opIt);
