@@ -19,10 +19,13 @@
 //     flattened iteration, which is safe because they are pure.
 //   - CARRIED CHAINS: the inner loops may carry extra iter-args (e.g. a
 //     reduction accumulator) initialized at some origin boundary from a
-//     constant or nest-invariant value, threaded unchanged through
-//     intermediate levels, and updated only in the innermost body. In the
-//     flattened loop each chain becomes one iter-arg that RESETS to its
-//     init (via arith.select) whenever the levels below its origin wrap.
+//     constant, a nest-invariant value, or a LOAD-SHAPED pre-op (an
+//     accumulator resuming from an indexed buffer, sum[p]); threaded
+//     unchanged through intermediate levels, and updated only in the
+//     innermost body. In the flattened loop each chain becomes one
+//     iter-arg that RESETS to its init whenever the levels below its
+//     origin wrap (via arith.select, or a predicated re-load with the
+//     next pass's IVs for load-initialized chains).
 //   - POST-ops: pure ops and memref.stores after the inner loop (e.g. the
 //     reduction's store to memory). These become an scf.if predicated on
 //     "the levels below just wrapped", i.e. they execute exactly on the
@@ -232,8 +235,15 @@ struct CarriedChain {
   /// region, right before level originLevel+1. -1 means the init lives
   /// above the whole nest and the outermost loop carries (and returns) it.
   int originLevel;
-  /// Init value: an arith.constant or a value defined above the nest.
+  /// Init value: an arith.constant, a value defined above the nest, or the
+  /// result of `initLoad` (a load-shaped pre-op at the origin boundary).
   Value init;
+  /// Non-null when the init is produced by a load-shaped pre-op (e.g. a
+  /// reduction accumulating into an indexed buffer: acc starts from
+  /// sum[p]). The flattened loop re-executes it once per pass: an
+  /// unpredicated clone before the loop for the first pass, and a clone
+  /// inside the wrap-predicated scf.if (with next-pass IVs) for the rest.
+  Operation *initLoad = nullptr;
   /// Iter-arg index of this chain at each level it threads through
   /// (levels originLevel+1 .. N-1); index into `argIdx` is the level.
   SmallVector<int> argIdx; // size N; -1 where the chain is absent.
@@ -330,9 +340,19 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
         continue;
       }
       if (!seenInner) {
-        // Pre-op: must be pure (recomputed every flattened iteration).
-        if (!isPure(&op))
-          return std::nullopt;
+        // Pre-op: pure (recomputed every flattened iteration), or
+        // load-shaped — one result, no regions, not pure — which may ONLY
+        // feed a carried chain's init (validated during chain resolution;
+        // re-executed once per pass in the flattened loop). Ops with a
+        // memory-effects interface must be read-only to qualify.
+        if (!isPure(&op)) {
+          bool loadShaped =
+              op.getNumResults() == 1 && op.getNumRegions() == 0;
+          if (auto memEffects = dyn_cast<MemoryEffectOpInterface>(&op))
+            loadShaped &= memEffects.onlyHasEffect<MemoryEffects::Read>();
+          if (!loadShaped)
+            return std::nullopt;
+        }
         info.preOps.back().push_back(&op);
       } else {
         // Post-op: pure, or a store-shaped op — resultless and region-free
@@ -354,6 +374,24 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
     return std::nullopt;
 
   unsigned N = nest.size();
+
+  // Almost-perfect structure (carried chains, pre/post ops) is only
+  // handled for PIPELINED innermost loops: that is where eliminating the
+  // per-pass fill/drain pays, and where the downstream scheduler's
+  // predication machinery (ifOpConversion / launch-expect wrapping) is
+  // exercised. Sequential frames lower predicated dynamic accesses
+  // differently, so a sequential nest must be perfect to flatten.
+  if (!nest.back().loop->hasAttr("hls.pipeline")) {
+    bool hasBoundaryStructure = false;
+    for (auto &ops : info.preOps)
+      hasBoundaryStructure |= !ops.empty();
+    for (auto &ops : info.postOps)
+      hasBoundaryStructure |= !ops.empty();
+    for (unsigned k = 0; k < N; ++k)
+      hasBoundaryStructure |= nest[k].loop.getInits().size() > 1;
+    if (hasBoundaryStructure)
+      return std::nullopt;
+  }
 
   // The innermost level must have no partition entries (it has no inner
   // while, so everything landed in preOps; that's its body, not a boundary).
@@ -409,10 +447,29 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
           info.chains[it->second].argIdx[k] = a;
           continue;
         }
-        // New chain anchored at boundary k-1. Its init must be reset-safe.
-        if (!isConstantValue(init) && !isDefinedAboveNest(init, outer))
-          return std::nullopt;
+        // New chain anchored at boundary k-1. Its init must be reset-safe:
+        // a constant, a nest-invariant value, or a load-shaped pre-op of
+        // the origin boundary (re-executed once per pass).
+        Operation *initLoad = nullptr;
+        if (!isConstantValue(init) && !isDefinedAboveNest(init, outer)) {
+          Operation *def = init.getDefiningOp();
+          if (def && !isPure(def) &&
+              llvm::is_contained(info.preOps[k - 1], def))
+            initLoad = def;
+          else
+            return std::nullopt;
+        }
         origin = int(k) - 1;
+
+        CarriedChain chain;
+        chain.originLevel = origin;
+        chain.init = init;
+        chain.initLoad = initLoad;
+        chain.argIdx.assign(N, -1);
+        chain.argIdx[k] = a;
+        chainAt[k][a] = info.chains.size();
+        info.chains.push_back(chain);
+        continue;
       }
 
       CarriedChain chain;
@@ -502,6 +559,25 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
     for (OpOperand &use : chain.originResult.getUses())
       if (!postSet.contains(use.getOwner()))
         return std::nullopt;
+  }
+
+  // --- Validate load-shaped pre-op uses. ---
+  // A non-pure pre-op's single result may only be a chain init (its
+  // re-execution schedule is defined by the chain's pass structure).
+  for (unsigned k = 0; k + 1 < N; ++k) {
+    for (Operation *op : info.preOps[k]) {
+      if (isPure(op))
+        continue;
+      bool isChainInit = false;
+      for (const CarriedChain &chain : info.chains)
+        if (chain.initLoad == op)
+          isChainInit = true;
+      if (!isChainInit)
+        return std::nullopt;
+      for (OpOperand &use : op->getResult(0).getUses())
+        if (use.getOwner() != nest[k + 1].loop.getOperation())
+          return std::nullopt;
+    }
   }
 
   // --- Validate pre-op operand availability. ---
@@ -758,12 +834,37 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
   }
   // Chain inits: values above the nest are used directly; constants that
   // live inside the nest (e.g. the zero right before the reduction loop)
-  // are rematerialized here so dominance holds. The reset sites in the
-  // yield reuse the same value.
+  // are rematerialized here so dominance holds. Load-initialized chains
+  // clone their pure index pre-ops and the load itself with every IV at
+  // its lower bound — the first pass's init, executed once before the
+  // loop just as the original program did.
+  IRMapping lbMap;
+  for (unsigned k = 0; k < N; ++k) {
+    auto lbCst = builder.create<arith::ConstantOp>(
+        loc, nest[k].ivType, IntegerAttr::get(nest[k].ivType, nest[k].lb));
+    lbMap.map(nest[k].ivAfter, lbCst);
+  }
+  bool clonedLbPreOps = false;
   SmallVector<Value> chainInits;
   for (const CarriedChain &chain : info.chains) {
     Value init = chain.init;
-    if (!isDefinedAboveNest(init, outer)) {
+    if (chain.initLoad) {
+      if (!clonedLbPreOps) {
+        // Clone the pure pre-ops of every boundary once, in program
+        // order, at lower-bound IVs (dead ones fall to later CSE/DCE).
+        for (unsigned k = 0; k + 1 < N; ++k)
+          for (Operation *op : info.preOps[k])
+            if (isPure(op))
+              builder.clone(*op, lbMap);
+        clonedLbPreOps = true;
+      }
+      Operation *cloned = builder.clone(*chain.initLoad, lbMap);
+      if (auto nameAttr = cloned->getAttrOfType<StringAttr>(
+              "loopschedule.name"))
+        cloned->setAttr("loopschedule.name",
+                        StringAttr::get(ctx, nameAttr.getValue() + ".init"));
+      init = cloned->getResult(0);
+    } else if (!isDefinedAboveNest(init, outer)) {
       Operation *cloned = builder.clone(*init.getDefiningOp());
       init = cloned->getResult(cast<OpResult>(chain.init).getResultNumber());
     }
@@ -842,13 +943,16 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
       mapping.map(info.chains[c].innerAfterArg,
                   afterBlock->getArgument(N + M + c));
 
-    // Clone the boundary pre-ops (outermost boundary first, preserving
-    // program order and def-use among them). They are pure, so
-    // re-executing them every flattened iteration is safe; inner-body ops
-    // that referenced them keep working through the mapping.
+    // Clone the PURE boundary pre-ops (outermost boundary first,
+    // preserving program order and def-use among them); re-executing them
+    // every flattened iteration is safe, and inner-body ops that
+    // referenced them keep working through the mapping. Load-shaped
+    // pre-ops are NOT body ops — the chain machinery re-executes them
+    // once per pass.
     for (unsigned k = 0; k + 1 < N; ++k)
       for (Operation *op : info.preOps[k])
-        builder.clone(*op, mapping);
+        if (isPure(op))
+          builder.clone(*op, mapping);
 
     // Clone the innermost body, skipping the IV update addi and the yield.
     Block *innerAfter = inner.getAfterBody();
@@ -1032,7 +1136,12 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
 
     // --- Chain yields: reset to the init when the levels below the origin
     // wrapped (the next iteration starts a fresh pass); origin -1 chains
-    // never reset. ---
+    // never reset. Constant/invariant inits reset via arith.select;
+    // load-initialized chains re-load under the wrap predicate with the
+    // NEXT pass's IVs (the odometer's ivOut values). ---
+    IRMapping nextMap;
+    for (unsigned k = 0; k < N; ++k)
+      nextMap.map(nest[k].ivAfter, ivOut[k]);
     SmallVector<Value> chainOut(C);
     for (unsigned c = 0; c < C; ++c) {
       const CarriedChain &chain = info.chains[c];
@@ -1041,8 +1150,33 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
         continue;
       }
       Value reset = doneAtLevel[chain.originLevel + 1];
-      chainOut[c] = builder.create<arith::SelectOp>(
-          loc, reset, chainInits[c], chainNext[c]);
+      if (!chain.initLoad) {
+        chainOut[c] = builder.create<arith::SelectOp>(
+            loc, reset, chainInits[c], chainNext[c]);
+        continue;
+      }
+      auto ifOp = builder.create<scf::IfOp>(
+          loc, TypeRange{chain.init.getType()}, reset,
+          /*withElseRegion=*/true);
+      {
+        OpBuilder::InsertionGuard g2(builder);
+        builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+        for (unsigned k = 0; k + 1 < N; ++k)
+          for (Operation *op : info.preOps[k])
+            if (isPure(op))
+              builder.clone(*op, nextMap);
+        // This clone KEEPS the original loopschedule.name: it is the one
+        // inside the pipelined loop, so the memory-dependence records that
+        // reference the original load by name must resolve to it.
+        Operation *cloned = builder.clone(*chain.initLoad, nextMap);
+        builder.create<scf::YieldOp>(loc, cloned->getResult(0));
+      }
+      {
+        OpBuilder::InsertionGuard g2(builder);
+        builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+        builder.create<scf::YieldOp>(loc, chainNext[c]);
+      }
+      chainOut[c] = ifOp.getResult(0);
     }
 
     SmallVector<Value> yieldOperands(ivOut.begin(), ivOut.end());

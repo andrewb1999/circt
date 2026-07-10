@@ -263,9 +263,9 @@ func.func @noncanonical_inner(%ubDyn: i32) {
 
 // -----
 
-// Positive (since almost-perfect support): a stray PURE op after the inner
-// loop is a legal post-op; it is predicated on the inner wrap and the nest
-// still flattens.
+// Positive (since almost-perfect support): a stray PURE op after a
+// PIPELINED inner loop is a legal post-op; it is predicated on the inner
+// wrap and the nest still flattens.
 
 // CHECK-LABEL: func.func @outer_extra_op
 // CHECK:         scf.while
@@ -287,7 +287,7 @@ func.func @outer_extra_op(%arg: memref<4xi32>) {
     ^bb0(%j: i32):
       %jn = arith.addi %j, %c1 : i32
       scf.yield %jn : i32
-    }
+    } attributes {hls.pipeline}
     %stray = arith.addi %i, %i : i32
     %in = arith.addi %i, %c1 : i32
     scf.yield %in : i32
@@ -1033,7 +1033,7 @@ func.func @matmul_acc(%A: memref<64xi32>, %B: memref<64xi32>, %C: memref<64xi32>
         %s = arith.addi %acc, %m : i32
         %kn = arith.addi %k, %c1 : i32
         scf.yield %kn, %s : i32, i32
-      }
+      } attributes {hls.pipeline}
       %ji = arith.index_cast %j : i32 to index
       memref.store %rk#1, %C[%ji] : memref<64xi32>
       %jn = arith.addi %j, %c1 : i32
@@ -1077,7 +1077,7 @@ func.func @gemv_acc(%A: memref<64xi32>, %y: memref<8xi32>) {
       %s = arith.addi %acc, %a : i32
       %jn = arith.addi %j, %c1 : i32
       scf.yield %jn, %s : i32, i32
-    }
+    } attributes {hls.pipeline}
     %ii = arith.index_cast %i : i32 to index
     memref.store %rj#1, %y[%ii] : memref<8xi32>
     %in = arith.addi %i, %c1 : i32
@@ -1126,7 +1126,7 @@ func.func @conv_threaded(%A: memref<64xi32>, %y: memref<8xi32>) {
         %sum = arith.addi %acc2, %a : i32
         %kwn = arith.addi %kw, %c1 : i32
         scf.yield %kwn, %sum : i32, i32
-      }
+      } attributes {hls.pipeline}
       %khn = arith.addi %kh, %c1 : i32
       scf.yield %khn, %rkw#1 : i32, i32
     }
@@ -1171,7 +1171,7 @@ func.func @full_reduction(%A: memref<64xi32>, %y: memref<1xi32>) {
       %s = arith.addi %acc2, %a : i32
       %jn = arith.addi %j, %c1 : i32
       scf.yield %jn, %s : i32, i32
-    }
+    } attributes {hls.pipeline}
     %in = arith.addi %i, %c1 : i32
     scf.yield %in, %rj#1 : i32, i32
   }
@@ -1243,6 +1243,44 @@ func.func @neg_impure_preop(%y: memref<8xi32>) {
       %jn = arith.addi %j, %c1 : i32
       scf.yield %jn : i32
     }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Negative: an almost-perfect nest whose innermost loop is NOT pipelined
+// must not flatten (sequential frames lower predicated accesses through a
+// different path; the fill/drain win doesn't exist without a pipeline).
+
+// CHECK-LABEL: func.func @neg_sequential_almost_perfect
+// CHECK:         scf.while
+// CHECK:         do {
+// CHECK:           scf.while
+// CHECK:         }
+func.func @neg_sequential_almost_perfect(%y: memref<8xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %ri = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c8 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %zero = arith.constant 0 : i32
+    %rj:2 = scf.while (%j = %c0, %acc = %zero) : (i32, i32) -> (i32, i32) {
+      %cj = arith.cmpi slt, %j, %c8 : i32
+      scf.condition(%cj) %j, %acc : i32, i32
+    } do {
+    ^bb0(%j: i32, %acc: i32):
+      %s = arith.addi %acc, %j : i32
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn, %s : i32, i32
+    }
+    %ii = arith.index_cast %i : i32 to index
+    memref.store %rj#1, %y[%ii] : memref<8xi32>
     %in = arith.addi %i, %c1 : i32
     scf.yield %in : i32
   }
