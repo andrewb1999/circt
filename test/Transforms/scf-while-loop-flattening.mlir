@@ -929,7 +929,7 @@ func.func @linearized_addr_bare_iv(%m: memref<4xi32>) {
 
 // CHECK-LABEL: func.func @pipeline_attr_unit
 // CHECK:         scf.while
-// CHECK:         } attributes {hls.pipeline}
+// CHECK:         } attributes {hls.pipeline, loopschedule.trip_count = 12 : i64}
 func.func @pipeline_attr_unit() {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32
@@ -961,7 +961,7 @@ func.func @pipeline_attr_unit() {
 
 // CHECK-LABEL: func.func @pipeline_attr_ii
 // CHECK:         scf.while
-// CHECK:         } attributes {hls.pipeline = 2 : i64}
+// CHECK:         } attributes {hls.pipeline = 2 : i64, loopschedule.trip_count = 12 : i64}
 func.func @pipeline_attr_ii() {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32

@@ -335,8 +335,13 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
           return std::nullopt;
         info.preOps.back().push_back(&op);
       } else {
-        // Post-op: pure or a memref.store (predicated on wrap later).
-        if (!isPure(&op) && !isa<memref::StoreOp>(op))
+        // Post-op: pure, or a store-shaped op — resultless and region-free
+        // (memref.store, loopschedule.store, ...). Its only observable
+        // behavior is its side effect, which the scf.if gates to exactly
+        // the iterations where the original epilogue ran.
+        bool storeShaped =
+            op.getNumResults() == 0 && op.getNumRegions() == 0;
+        if (!isPure(&op) && !storeShaped)
           return std::nullopt;
         info.postOps.back().push_back(&op);
       }
@@ -774,6 +779,22 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
   // the flattened loop as pipelined.
   if (auto pipeAttr = inner->getAttr("hls.pipeline"))
     flat->setAttr("hls.pipeline", pipeAttr);
+
+  // The flattened trip count is the product of the per-level trips;
+  // restore the metadata the per-level loops carried.
+  {
+    uint64_t total = 1;
+    for (const NestLevel &lvl : nest) {
+      APInt range = lvl.ubNormalized - lvl.lb;
+      APInt step = lvl.step;
+      uint64_t trips =
+          (range.zext(64) + (step.zext(64) - 1)).udiv(step.zext(64))
+              .getZExtValue();
+      total *= trips;
+    }
+    flat->setAttr("loopschedule.trip_count",
+                  IntegerAttr::get(IntegerType::get(ctx, 64), total));
+  }
 
   // --- Before region. ---
   {
