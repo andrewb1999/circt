@@ -158,6 +158,13 @@ protected:
   virtual void fillAdditionalConstraintRow(SmallVector<int> &row,
                                            Problem::Problem::Dependence dep);
   void buildTableau();
+  /// Discard the tableau and all variable bookkeeping (including frozen
+  /// variables) so `buildTableau` can be called again. `parameterT` (the II)
+  /// is preserved. Backtracking schedulers use this to "unfreeze" pinned
+  /// operations: rather than surgically undoing an old equality in a tableau
+  /// that has pivoted arbitrarily since, they rebuild from scratch and
+  /// re-apply the surviving pins.
+  void resetTableau();
 
   int getParametricConstant(unsigned row);
   SmallVector<int> getObjectiveVector(unsigned column);
@@ -350,6 +357,12 @@ private:
     explicit MRT(ChainingModuloSimplexScheduler &sched) : sched(sched) {}
     LogicalResult enter(Operation *op, unsigned timeStep);
     void release(Operation *op);
+    /// Collect the current occupants blocking `op` at `timeStep`'s
+    /// congruence slot: for each of `op`'s resource types whose cell is at
+    /// its limit, every op in that cell (Rau §3.4: "all operations are
+    /// unscheduled which conflict").
+    void gatherConflicts(Operation *op, unsigned timeStep,
+                         SmallVectorImpl<Operation *> &conflicts);
   };
 
   ChainingModuloProblem &prob;
@@ -359,6 +372,21 @@ private:
   float cycleTime;
   std::optional<int32_t> ii;
 
+  /// Backtracking state (Rau, "Iterative Modulo Scheduling", MICRO-27 1994;
+  /// Canis et al., "Modulo SDC Scheduling", FPL 2014). `pinnedOps` holds the
+  /// committed (op -> start time) equalities currently baked into the
+  /// tableau; unpinning removes entries and rebuilds the tableau from the
+  /// survivors. `prevSched` implements the forward-progress rule: a
+  /// re-placed op never returns to its previous slot, so two ops cannot
+  /// displace each other endlessly.
+  DenseMap<Operation *, unsigned> pinnedOps;
+  DenseMap<Operation *, unsigned> prevSched;
+
+  /// Rau's budget: maximum number of (re-)placements per II attempt, as a
+  /// multiple of the operation count. Both Rau and Canis found ~6 to be a
+  /// good trade-off empirically.
+  static constexpr unsigned budgetRatio = 6;
+
 protected:
   Problem &getProblem() override { return prob; }
   LogicalResult checkLastOp() override;
@@ -367,14 +395,17 @@ protected:
   void updateMargins();
   LogicalResult scheduleOperation(Operation *n);
   unsigned computeResMinII();
+  /// Unpin `op`: drop its equality, release its MRT slot, and requeue it.
+  /// The tableau is NOT rebuilt here — batch unpins, then rebuildWithPins().
+  void unpin(Operation *op);
+  /// Rebuild the tableau from scratch and re-apply all surviving pins.
+  LogicalResult rebuildWithPins();
 
 public:
-  /// Floor for the initial II. The incremental II-bumping conflict
-  /// resolution in `scheduleOperation` can drive the tableau infeasible
-  /// (its op-move heuristic is approximate — see the TODO there); the
-  /// driver retries the whole schedule from a fresh tableau at a higher
-  /// starting II instead of asserting.
-  unsigned minII = 1;
+  /// Added on top of the resource-derived minimum II for this attempt; the
+  /// driver bumps it when an attempt fails (budget exhausted or genuinely
+  /// infeasible), mirroring Rau's ModuloSchedule outer loop.
+  unsigned iiIncrement = 0;
 
   ChainingModuloSimplexScheduler(ChainingModuloProblem &prob, Operation *lastOp,
                                  float cycleTime,
@@ -478,6 +509,20 @@ void SimplexSchedulerBase::buildTableau() {
 
   // one row per objective + one row per dependence
   nRows = tableau.size();
+}
+
+void SimplexSchedulerBase::resetTableau() {
+  tableau.clear();
+  implicitBasicVariableColumnVector.clear();
+  nonBasicVariables.clear();
+  basicVariables.clear();
+  startTimeVariables.clear();
+  startTimeLocations.clear();
+  frozenVariables.clear();
+  parameterS = 0;
+  nRows = 0;
+  nColumns = 0;
+  nObjectives = 0;
 }
 
 int SimplexSchedulerBase::getParametricConstant(unsigned row) {
@@ -1412,6 +1457,7 @@ LogicalResult ModuloSimplexScheduler::schedule() {
   while (!unscheduled.empty()) {
     // Update ASAP/ALAP times.
     updateMargins();
+    updateMargins();
 
     // Heuristically (here: least amount of slack) pick the next operation to
     // schedule.
@@ -1784,134 +1830,129 @@ void ChainingModuloSimplexScheduler::updateMargins() {
   }
 }
 
+void ChainingModuloSimplexScheduler::MRT::gatherConflicts(
+    Operation *op, unsigned timeStep, SmallVectorImpl<Operation *> &conflicts) {
+  unsigned slot = timeStep % sched.parameterT;
+  auto maybeRsrcs = sched.prob.getLinkedResourceTypes(op);
+  if (!maybeRsrcs.has_value())
+    return;
+  DenseSet<Operation *> seen;
+  for (auto rsrc : *maybeRsrcs) {
+    auto lim = sched.prob.getLimit(rsrc);
+    auto tabIt = tables.find(rsrc);
+    if (tabIt == tables.end())
+      continue;
+    auto cellIt = tabIt->second.find(slot);
+    if (cellIt == tabIt->second.end())
+      continue;
+    if (lim && cellIt->second.size() < *lim)
+      continue; // room left for this resource; no conflict here
+    for (auto *occupant : cellIt->second)
+      if (seen.insert(occupant).second)
+        conflicts.push_back(occupant);
+  }
+}
+
+void ChainingModuloSimplexScheduler::unpin(Operation *op) {
+  assert(pinnedOps.count(op));
+  pinnedOps.erase(op);
+  mrt.release(op);
+  unscheduled.push_back(op);
+  LLVM_DEBUG(dbgs() << "Unpinned: " << *op << '\n');
+}
+
+LogicalResult ChainingModuloSimplexScheduler::rebuildWithPins() {
+  resetTableau();
+  buildTableau();
+  asapTimes.resize(startTimeLocations.size());
+  alapTimes.resize(startTimeLocations.size());
+  if (failed(solveTableau()))
+    return failure();
+  // Re-applying a subset of a previously feasible pin set stays feasible.
+  for (auto &[op, time] : pinnedOps)
+    if (failed(scheduleAt(startTimeVariables[op], time)))
+      return failure();
+  return success();
+}
+
+// Backtracking placement, following Rau's iterative modulo scheduling
+// (MICRO-27, 1994, §3.1/3.4) with the LP adaptation of Canis et al.'s
+// modulo SDC scheduler (FPL 2014, Alg. 1/2): try the op's II-wide window;
+// if no slot is simultaneously MRT-free and LP-feasible, force-place it —
+// evicting the MRT occupants at the chosen slot, and if the LP still
+// refuses (a dependence conflict with pinned ops, e.g. an already-pinned
+// consumer whose deadline the port-serialized accesses cannot meet),
+// unpinning ALL other ops. Evicted ops return to the worklist; the
+// `prevSched + 1` rule guarantees forward progress, and the caller's
+// budget bounds total work before the II is incremented.
 LogicalResult
 ChainingModuloSimplexScheduler::scheduleOperation(Operation *n) {
-  auto oprN = *prob.getLinkedOperatorType(n);
   unsigned stvN = startTimeVariables[n];
-
-  // Get current state of the LP. We'll try to schedule at its current time step
-  // in the partial solution, and the II-1 following time steps. Scheduling the
-  // op to a later time step may increase the overall latency, however, as long
-  // as the solution is still feasible, we prefer that over incrementing the II
-  // to resolve resource conflicts.
   unsigned stN = getStartTime(stvN);
-  unsigned ubN = stN + parameterT - 1;
 
-  LLVM_DEBUG(dbgs() << "Attempting to schedule in [" << stN << ", " << ubN
-                    << "]: " << *n << '\n');
+  LLVM_DEBUG(dbgs() << "Attempting to schedule in [" << stN << ", "
+                    << stN + parameterT - 1 << "]: " << *n << '\n');
 
-  for (unsigned ct = stN; ct <= ubN; ++ct)
-    if (succeeded(mrt.enter(n, ct))) {
-      // llvm::errs() << "entered, schedule at " << ct << "\n";
-      auto fixedN = scheduleAt(stvN, ct);
-      if (succeeded(fixedN)) {
-        LLVM_DEBUG(dbgs() << "Success at t=" << ct << " " << *n << '\n');
-        return success();
-      }
-      // Problem became infeasible with `n` at `ct`, roll back the MRT
-      // assignment. Also, no later time can be feasible, so stop the search
-      // here.
+  // Happy path: a slot in the II-wide window that is both MRT-free and
+  // LP-feasible. Unlike the previous implementation, an LP-infeasible slot
+  // does not abort the search — later slots can still be feasible.
+  for (unsigned ct = stN; ct < stN + parameterT; ++ct) {
+    if (failed(mrt.enter(n, ct)))
+      continue;
+    if (succeeded(scheduleAt(stvN, ct))) {
+      pinnedOps[n] = ct;
+      prevSched[n] = ct;
+      LLVM_DEBUG(dbgs() << "Success at t=" << ct << " " << *n << '\n');
+      return success();
+    }
+    mrt.release(n);
+  }
+
+  // Forced placement. Pinning at the LP's own current solution value is
+  // always feasible w.r.t. the pinned set, so `stN` plays the role of
+  // Canis's resource-free minTime. The forward-progress rule keeps two
+  // ops from displacing each other endlessly (Rau §3.4).
+  unsigned evictTime;
+  auto prevIt = prevSched.find(n);
+  if (prevIt == prevSched.end() || stN > prevIt->second)
+    evictTime = stN;
+  else
+    evictTime = prevIt->second + 1;
+
+  // Resource conflict at the forced slot: evict the occupants.
+  SmallVector<Operation *> conflicts;
+  mrt.gatherConflicts(n, evictTime, conflicts);
+  if (!conflicts.empty()) {
+    for (auto *c : conflicts)
+      unpin(c);
+    if (failed(rebuildWithPins()))
+      return failure();
+  }
+  if (failed(mrt.enter(n, evictTime)))
+    return failure(); // stale MRT state; should not happen
+
+  if (failed(scheduleAt(stvN, evictTime))) {
+    // Dependence conflict with the remaining pinned ops. Take Canis's
+    // aggressive branch: unpin everything else and re-place it later.
+    SmallVector<Operation *> allPinned;
+    for (auto &entry : pinnedOps)
+      allPinned.push_back(entry.first);
+    for (auto *p : allPinned)
+      unpin(p);
+    if (failed(rebuildWithPins()))
+      return failure();
+    stvN = startTimeVariables[n];
+    if (failed(scheduleAt(stvN, evictTime))) {
+      // Infeasible even with n as the only pin: a recurrence bounds n's
+      // start time below `evictTime`. Let the driver raise the II.
       mrt.release(n);
-      break;
+      return failure();
     }
-
-  // As a last resort, increase II to make room for the op. De Dinechin's
-  // Theorem 1 lays out conditions/guidelines to transform the current partial
-  // schedule for II to a valid one for a larger II'.
-
-  LLVM_DEBUG(dbgs() << "Incrementing II to " << (parameterT + 1)
-                    << " to resolve resource conflict for " << *n << '\n');
-
-  // Note that the approach below is much simpler than in the paper
-  // because of the fully-pipelined operators. In our case, it's always
-  // sufficient to increment the II by one.
-
-  // llvm::errs() << "parameterT: " << parameterT << "\n";
-
-  // Decompose start time.
-  unsigned phiN = stN / parameterT;
-  unsigned tauN = stN % parameterT;
-
-  // Keep track whether the following moves free at least one operator
-  // instance in the slot desired by the current op - then it can stay there.
-  unsigned deltaN = 1;
-
-  // We're going to revisit the current partial schedule.
-  SmallVector<Operation *> moved;
-  for (Operation *j : scheduled) {
-    auto oprJ = *prob.getLinkedOperatorType(j);
-    unsigned stvJ = startTimeVariables[j];
-    unsigned stJ = getStartTime(stvJ);
-    unsigned phiJ = stJ / parameterT;
-    unsigned tauJ = stJ % parameterT;
-    unsigned deltaJ = 0;
-
-    if (oprN == oprJ) {
-      // To actually resolve the resource conflicts, we will move operations
-      // that are "preceded" (cf. de Dinechin's ≺ relation) one slot to the
-      // right.
-      if (tauN < tauJ || (tauN == tauJ && phiN > phiJ) ||
-          (tauN == tauJ && phiN == phiJ && stvN < stvJ)) {
-        // TODO: Replace the last condition with a proper graph analysis.
-
-        deltaJ = 1;
-        moved.push_back(j);
-        if (tauN == tauJ)
-          deltaN = 0;
-      }
-    }
-
-    // j->dump();
-    // llvm::errs() << "phiJ: " << phiJ << "\n";
-    // llvm::errs() << "deltaJ: " << deltaJ << "\n";
-    // llvm::errs() << "========================\n";
-
-    // Move operation.
-    //
-    // In order to keep the op in its current MRT slot `tauJ` after incrementing
-    // the II, we add `phiJ`:
-    //   stJ + phiJ = (phiJ * parameterT + tauJ) + phiJ
-    //              = phiJ * (parameterT + 1) + tauJ
-    //
-    // Shifting an additional `deltaJ` time steps then moves the op to a
-    // different MRT slot, in order to make room for the operation that caused
-    // the resource conflict.
-    moveBy(stvJ, phiJ + deltaJ);
   }
-
-  // Finally, increment the II and solve to apply the moves.
-  ++parameterT;
-  auto solved = solveTableau();
-  if (failed(solved)) {
-    // The move set computed above is heuristic (see the TODO); it can leave
-    // the tableau infeasible. Report failure so the driver can retry from a
-    // fresh tableau at a higher starting II rather than aborting.
-    LLVM_DEBUG(dbgs() << "Tableau infeasible after II increment to "
-                      << parameterT << "; giving up on this attempt\n");
-    return failure();
-  }
-
-  // Re-enter moved operations into their new slots.
-  for (auto *m : moved)
-    mrt.release(m);
-  for (auto *m : moved) {
-    auto enteredM = mrt.enter(m, getStartTime(startTimeVariables[m]));
-    assert(succeeded(enteredM));
-    (void)enteredM;
-  }
-
-  // Finally, schedule the operation. Again, adding `phiN` accounts for the
-  // implicit shift caused by incrementing the II.
-  // llvm::errs() << "II shift schedule at " << stN + phiN + deltaN << "\n";
-  // llvm::errs() << "stN: " << stN << "\n";
-  // llvm::errs() << "phiN: " << phiN << "\n";
-  // llvm::errs() << "deltaN: " << deltaN << "\n";
-  auto fixedN = scheduleAt(stvN, stN + phiN + deltaN);
-  auto enteredN = mrt.enter(n, tauN + deltaN);
-  // n->dump();
-  assert(succeeded(enteredN));
-  assert(succeeded(fixedN));
-  (void)fixedN, (void)enteredN;
+  pinnedOps[n] = evictTime;
+  prevSched[n] = evictTime;
+  LLVM_DEBUG(dbgs() << "Forced placement at t=" << evictTime << " " << *n
+                    << '\n');
   return success();
 }
 
@@ -1944,9 +1985,10 @@ LogicalResult ChainingModuloSimplexScheduler::schedule() {
     return failure();
 
   parameterS = 0;
-  parameterT = std::max(computeResMinII(), minII);
+  parameterT = std::max(computeResMinII() + iiIncrement, 1u);
 
-  LLVM_DEBUG(dbgs() << "ResMinII = " << parameterT << "\n");
+  LLVM_DEBUG(dbgs() << "Attempting to schedule with II = " << parameterT
+                    << "\n");
   buildTableau();
   asapTimes.resize(startTimeLocations.size());
   alapTimes.resize(startTimeLocations.size());
@@ -1962,8 +2004,19 @@ LogicalResult ChainingModuloSimplexScheduler::schedule() {
     if (isLimited(op, prob))
       unscheduled.push_back(op);
 
-  // Main loop: Iteratively fix limited operations to time steps.
+  // Rau's placement budget: evicted ops return to the worklist, so bound
+  // the total number of (re-)placements before conceding this II.
+  unsigned budget = budgetRatio * ops.size();
+
+  // Main loop: Iteratively fix limited operations to time steps. Evictions
+  // requeue ops, so the same op may be placed several times.
   while (!unscheduled.empty()) {
+    if (budget == 0) {
+      LLVM_DEBUG(dbgs() << "Budget exhausted at II = " << parameterT
+                        << "\n");
+      return failure();
+    }
+    --budget;
     // Update ASAP/ALAP times.
     updateMargins();
 
@@ -2050,16 +2103,14 @@ LogicalResult scheduling::scheduleSimplex(ChainingCyclicProblem &prob,
 LogicalResult scheduling::scheduleSimplex(ChainingModuloProblem &prob,
                                           Operation *lastOp, float cycleTime,
                                           std::optional<int32_t> ii) {
-  // The incremental II-bumping conflict resolution inside the scheduler is
-  // heuristic and can fail on feasible problems (its op-move logic carries a
-  // TODO for proper graph analysis). Retry from a fresh tableau with a
-  // higher starting II before declaring defeat: a clean solve at the target
-  // II sidesteps the fragile incremental moves entirely.
-  constexpr unsigned kMaxRetries = 64;
-  unsigned minII = 1;
-  for (unsigned attempt = 0; attempt < kMaxRetries; ++attempt, ++minII) {
+  // Rau's ModuloSchedule outer loop: attempt successively larger IIs, each
+  // with a fresh scheduler whose backtracking placement is bounded by the
+  // budget. The attempt cap only guards against pathological inputs; a
+  // feasible problem schedules long before it (usually at the first II).
+  constexpr unsigned kMaxAttempts = 64;
+  for (unsigned attempt = 0; attempt < kMaxAttempts; ++attempt) {
     ChainingModuloSimplexScheduler simplex(prob, lastOp, cycleTime, ii);
-    simplex.minII = minII;
+    simplex.iiIncrement = attempt;
     if (succeeded(simplex.schedule()))
       return success();
     // A user-requested exact II leaves no room to retry.
@@ -2068,5 +2119,5 @@ LogicalResult scheduling::scheduleSimplex(ChainingModuloProblem &prob,
   }
   return prob.getContainingOp()->emitError()
          << "modulo scheduling failed to find a feasible II after "
-         << kMaxRetries << " attempts";
+         << kMaxAttempts << " attempts";
 }
