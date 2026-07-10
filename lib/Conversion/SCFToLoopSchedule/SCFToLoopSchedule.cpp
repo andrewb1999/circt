@@ -555,6 +555,12 @@ struct ScheduleStrategy {
   // Cond support — null Value if absent.
   Value condValue;
 
+  // FUNCTION-level strategy only: wrap dynamic-latency memory accesses in
+  // `loopschedule.launch` ops so the function FSM can give each one the
+  // issue/completion handshake. Sequential-loop bodies keep them inline —
+  // the loop FSM lowers them through the SeqDynCtx handshake path.
+  bool dynAccessesAsLaunches = false;
+
   // Iter-arg support — std::nullopt for func.
   std::optional<IterArgSupport> iterArgs;
 
@@ -590,7 +596,8 @@ static bool isLaunchLikeOp(Operation *op) {
 static SmallVector<SmallVector<unsigned>>
 partitionPhasesByLaunch(ArrayRef<unsigned> startTimes,
                         const DenseMap<unsigned, SmallVector<Operation *>>
-                            &startGroups) {
+                            &startGroups,
+                        llvm::function_ref<bool(Operation *)> isLaunchLike) {
   SmallVector<SmallVector<unsigned>> phases;
   SmallVector<unsigned> currentPhase;
   for (auto t : startTimes) {
@@ -599,7 +606,7 @@ partitionPhasesByLaunch(ArrayRef<unsigned> startTimes,
     auto it = startGroups.find(t);
     if (it != startGroups.end())
       for (auto *op : it->second)
-        if (isLaunchLikeOp(op)) {
+        if (isLaunchLike(op)) {
           hasLaunch = true;
           break;
         }
@@ -2125,7 +2132,11 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
     startTimes.push_back(group.first);
   llvm::sort(startTimes);
 
-  auto phases = partitionPhasesByLaunch(startTimes, startGroups);
+  auto isLaunchLike = [&](Operation *op) {
+    return isLaunchLikeOp(op) ||
+           (S.dynAccessesAsLaunches && isDynamicLatencyOp(*op));
+  };
+  auto phases = partitionPhasesByLaunch(startTimes, startGroups, isLaunchLike);
 
   DenseMap<uint32_t, size_t> bucketTimeToPhase;
   for (auto phaseIdx : llvm::seq<size_t>(0, phases.size()))
@@ -2171,7 +2182,7 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
       BucketContent bc;
       bc.offset = t - phaseBase;
       for (auto *op : startGroups[t]) {
-        if (isLaunchLikeOp(op))
+        if (isLaunchLike(op))
           bc.dynamicOps.push_back(op);
         else
           bc.staticOps.push_back(op);
@@ -2814,6 +2825,7 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
     b.setInsertionPoint(funcReturn);
   };
   S.seedValueMap = [](IRMapping &) {};
+  S.dynAccessesAsLaunches = true;
 
   S.finalize = [&](ImplicitLocOpBuilder &b,
                    ArrayRef<PendingLaunch> pendingLaunches,

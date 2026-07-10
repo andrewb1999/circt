@@ -738,7 +738,8 @@ private:
                                DenseMap<Value, MemPortMapping> &memPorts,
                                ModuleOp moduleOp, Value clk, Value rst,
                                struct SeqDynCtx *seqDyn = nullptr,
-                               struct SeqPortMuxCtx *seqMux = nullptr);
+                               struct SeqPortMuxCtx *seqMux = nullptr,
+                               Value opCE = {});
 
   /// Materialize a single compute op via the operator-library dispatch.
   /// Used by every internal cloning site that previously called
@@ -747,7 +748,7 @@ private:
   /// op's results.
   LogicalResult emitComputeOp(Operation *op, OpBuilder &builder,
                               IRMapping &mapping, ModuleOp moduleOp,
-                              Value clk, Value rst);
+                              Value clk, Value rst, Value opCE = {});
 
   /// `lowerAtBody` is a method (not a free function) so it can access
   /// `operatorLibrary` and `instanceUniquer` directly.
@@ -757,7 +758,8 @@ private:
                             DenseMap<Value, MemPortMapping> &memPorts,
                             ModuleOp moduleOp, Value clk, Value rst,
                             struct SeqDynCtx *seqDyn = nullptr,
-                            struct SeqPortMuxCtx *seqMux = nullptr);
+                            struct SeqPortMuxCtx *seqMux = nullptr,
+                            Value opCE = {});
 
   /// Lower a pipeline as a child of a sequential loop (no FSM needed).
   LogicalResult lowerPipelineChild(LoopSchedulePipelineOp pipOp,
@@ -1282,7 +1284,7 @@ emitHwInstanceFromOperator(Operation *origOp, OpBuilder &builder,
                            IRMapping &mapping, ModuleOp moduleOp,
                            oplib::HwInstanceOp templateInst, Value clk,
                            Value rst, llvm::StringMap<unsigned> &uniquer,
-                           StringRef opName) {
+                           StringRef opName, Value opCE = {}) {
   auto externOp = moduleOp.lookupSymbol<hw::HWModuleExternOp>(
       templateInst.getModuleNameAttr().getValue());
   if (!externOp)
@@ -1315,7 +1317,13 @@ emitHwInstanceFromOperator(Operation *origOp, OpBuilder &builder,
     } else if (portAttrs && portAttrs.get("oplib.reset")) {
       driver = rst;
     } else if (portAttrs && portAttrs.get("oplib.enable")) {
-      driver = oneI1;
+      // Pipelined operators (e.g. int_mul_pipe_*) shift internally every
+      // enabled cycle. In a context that can stall (a pipeline waiting on
+      // dyn-latency expects, a sequential frame stalled on a handshake),
+      // the operator must freeze with the stage/frame registers — a free-
+      // running CE lets in-flight values march out of the operator pipe
+      // during the stall and be lost or double-consumed.
+      driver = opCE ? opCE : oneI1;
     } else if (portAttrs) {
       if (auto opIdxAttr =
               dyn_cast_or_null<IntegerAttr>(portAttrs.get("oplib.operand"))) {
@@ -1373,7 +1381,8 @@ static LogicalResult
 emitOpFromOperatorLibrary(Operation *origOp, OpBuilder &builder,
                           IRMapping &mapping, ModuleOp moduleOp, Value clk,
                           Value rst, llvm::StringMap<unsigned> &uniquer,
-                          analysis::OperatorLibraryAnalysis &ola) {
+                          analysis::OperatorLibraryAnalysis &ola,
+                          Value opCE = {}) {
   auto operatorAttr =
       origOp->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
   if (!operatorAttr)
@@ -1393,7 +1402,8 @@ emitOpFromOperatorLibrary(Operation *origOp, OpBuilder &builder,
   for (auto &op : *hwMatch.getBodyBlock()) {
     if (auto inst = dyn_cast<oplib::HwInstanceOp>(op))
       return emitHwInstanceFromOperator(origOp, builder, mapping, moduleOp,
-                                        inst, clk, rst, uniquer, opName);
+                                        inst, clk, rst, uniquer, opName,
+                                        opCE);
   }
   return emitCombOpFromOperator(origOp, builder, mapping, hwMatch);
 }
@@ -1409,7 +1419,7 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
     Block *body, OpBuilder &builder, IRMapping &mapping,
     ArrayRef<Value> cycleGates, unsigned baseCycle,
     DenseMap<Value, MemPortMapping> &memPorts, ModuleOp moduleOp, Value clk,
-    Value rst, SeqDynCtx *seqDyn, SeqPortMuxCtx *seqMux) {
+    Value rst, SeqDynCtx *seqDyn, SeqPortMuxCtx *seqMux, Value opCE) {
   if (seqMux)
     seqMux->cycle = baseCycle;
   auto pickGate = [&](unsigned c) -> Value {
@@ -1451,7 +1461,7 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
       return handleHWStore(storeOp, builder, mapping, gate, memPorts, seqMux);
     if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner))
       return handleHWLoad(loadOp, builder, mapping, memPorts, gate, seqMux);
-    return emitComputeOp(inner, builder, mapping, moduleOp, clk, rst);
+    return emitComputeOp(inner, builder, mapping, moduleOp, clk, rst, opCE);
   };
   for (auto &op : *body) {
     if (failed(processOp(&op, pickGate(baseCycle))))
@@ -1462,7 +1472,7 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
 
 LogicalResult LoopScheduleToFSMPass::emitComputeOp(
     Operation *op, OpBuilder &builder, IRMapping &mapping, ModuleOp moduleOp,
-    Value clk, Value rst) {
+    Value clk, Value rst, Value opCE) {
   // Constants and free-pass casts (extsi/extui/trunci/index_cast) are not
   // first-class operator-library entries. They get cloned through the
   // mapping so downstream consumers see them.
@@ -1484,14 +1494,15 @@ LogicalResult LoopScheduleToFSMPass::emitComputeOp(
     return success();
   }
   return emitOpFromOperatorLibrary(op, builder, mapping, moduleOp, clk, rst,
-                                    instanceUniquer, *operatorLibrary);
+                                    instanceUniquer, *operatorLibrary, opCE);
 }
 
 LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
     Block *frameBody, OpBuilder &builder, IRMapping &mapping,
     ArrayRef<Value> cycleGates,
     DenseMap<Value, MemPortMapping> &memPorts, ModuleOp moduleOp,
-    Value clk, Value rst, SeqDynCtx *seqDyn, SeqPortMuxCtx *seqMux) {
+    Value clk, Value rst, SeqDynCtx *seqDyn, SeqPortMuxCtx *seqMux,
+    Value opCE) {
   for (auto &op : *frameBody) {
     if (isa<LoopScheduleYieldOp>(&op))
       continue;
@@ -1499,7 +1510,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
       unsigned offset = (unsigned)atOp.getOffset();
       if (failed(lowerAtBody(&atOp.getBodyBlock(), builder, mapping, cycleGates,
                              offset, memPorts, moduleOp, clk, rst, seqDyn,
-                             seqMux)))
+                             seqMux, opCE)))
         return failure();
       // Forward at results to the caller's mapping via the at's yield.
       auto yieldOp = atOp.getYieldOp();
@@ -3497,7 +3508,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                                  fsmFrameCycleGates[frameIdx],
                                  perFramePorts[frameIdx], moduleOp, clk,
                                  rst, &seqDyn,
-                                 seqMux.multi.empty() ? nullptr : &seqMux)))
+                                 seqMux.multi.empty() ? nullptr : &seqMux,
+                                 /*opCE=*/notStallSeq)))
         return failure();
     }
 
@@ -4267,7 +4279,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
         }
         return emitComputeOp(
             inner, hwBuilder, mapping,
-            hwBody->getParentOp()->getParentOfType<ModuleOp>(), clk, rst);
+            hwBody->getParentOp()->getParentOfType<ModuleOp>(), clk, rst,
+            /*opCE=*/notStall);
       };
       // Use the stall-gated stage CE as the write-/read-enable gate so
       // memory requests don't re-fire when the pipeline idles on !done.
@@ -4379,16 +4392,24 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   muxStageMemPorts(hwBuilder, loc, perStagePorts, stageCE, memPorts);
 
   // Per-stage first_iter signals. Each stage s's first_iter is 1 on reset,
-  // re-arms to 1 on start, and clears the first time stageCE[s] fires. An
-  // iter_arg whose feedback value is produced at stage s must read its init
-  // value until that stage has fired at least once in this pipeline run — a
-  // single global first_iter flipping on `active` is too early for iter_args
-  // fed by late stages (e.g. a matmul accumulator at the last stage reads a
-  // stale register for cycles 1..N before the stage first writes).
+  // re-arms to 1 on start, and clears the first time stageCE[s] genuinely
+  // fires. An iter_arg whose feedback value is produced at stage s must read
+  // its init value until that stage has fired at least once in this pipeline
+  // run — a single global first_iter flipping on `active` is too early for
+  // iter_args fed by late stages (e.g. a matmul accumulator at the last stage
+  // reads a stale register for cycles 1..N before the stage first writes).
+  //
+  // The clear MUST use the stall-gated CE: the raw stageCE only means "stage
+  // occupied" and freezes high across stalls, while the feedback registers
+  // capture on the gated CE. Clearing on the raw CE flips the init/feedback
+  // mux during the stall, cycles before the first genuine fire, so the
+  // consumer reads stale feedback (the previous run's final value) instead of
+  // init. Masked on run 0 (feedback resets to init's usual value) and on
+  // stall-free loops; broke run N>0 of stall-heavy (AXI) inner loops.
   SmallVector<Value> firstIterPerStage(stages.size());
   for (unsigned s = 0; s < stages.size(); ++s) {
     Backedge be = bb.get(hwBuilder.getI1Type());
-    Value notCE = comb::createOrFoldNot(hwBuilder, loc, stageCE[s]);
+    Value notCE = comb::createOrFoldNot(hwBuilder, loc, gatedStageCE[s]);
     Value sticky = comb::AndOp::create(hwBuilder, loc, Value(be), notCE);
     Value nxt = comb::OrOp::create(hwBuilder, loc, startSignal, sticky);
     auto reg = seq::CompRegOp::create(
@@ -5065,11 +5086,14 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   // one entry with kind=-1.
   struct FrameChild {
     unsigned frameIdx;
-    int kind; // -1 leaf, 0 sequential, 1 pipeline, 2 call, 3 barrier
+    // -1 leaf, 0 sequential, 1 pipeline, 2 call, 3 barrier, 4 dynamic
+    // port access (launch-wrapped m_axi load/store in a function frame)
+    int kind;
     LoopScheduleSequentialOp seqOp;
     LoopSchedulePipelineOp pipOp;
     LoopScheduleCallOp callOp;
     loopschedule::HWStoreLoweringInterface barrierOp; // kind 3
+    Operation *dynOp = nullptr;                       // kind 4
     LoopScheduleLaunchOp launchOp; // non-null for kind != -1
   };
   SmallVector<FrameChild> entries;
@@ -5107,11 +5131,21 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         entries.push_back(fc);
       } else if (auto barrier =
                      dyn_cast_or_null<loopschedule::HWStoreLoweringInterface>(
-                         child)) {
+                         child);
+                 barrier && isa<loopschedule::StoreInterface>(child) &&
+                 cast<loopschedule::StoreInterface>(child).isBarrier()) {
         // A barrier store (amc.control): no child hardware; its "done" is
         // the memory control channel's completion level.
         fc.kind = 3;
         fc.barrierOp = barrier;
+        entries.push_back(fc);
+      } else if (child && isSeqDynAccess(child)) {
+        // A launch-wrapped dynamic port access (m_axi load/store in a
+        // function frame, wrapped by the scheduler's func strategy): no
+        // child hardware; the entry drives the port with the issue
+        // handshake and its WAIT state holds until the completion pulse.
+        fc.kind = 4;
+        fc.dynOp = child;
         entries.push_back(fc);
       }
     }
@@ -5685,6 +5719,151 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
           }
         }
         funcHandleValueMap[entry.launchOp.getHandle()] = SmallVector<Value>{};
+      }
+
+    } else if (entry.kind == 4) {
+      // Dynamic port access entry (launch-wrapped m_axi load/store in a
+      // function frame). Mirrors lowerSeqDynAccess, with the FSM's WAIT
+      // state standing in for the sequential stall machinery: child_start
+      // pulses in FRAME_i, the request is held until the port accepts it,
+      // and WAIT_i holds the frame until the port's completion pulse is
+      // attributed to this access. Drives land in perEntryPorts[ei], so
+      // mergeStepMemPorts gates them on this entry's running signal.
+      Operation *dop = entry.dynOp;
+      auto dLoad = dyn_cast<loopschedule::HWLoadLoweringInterface>(dop);
+      auto dStore = dyn_cast<loopschedule::HWStoreLoweringInterface>(dop);
+      Value memVal = dLoad ? dLoad.getMemoryValue() : dStore.getMemoryValue();
+      unsigned dynPort = getBindingPort(dop);
+      auto pit = perEntryPorts[ei].find(memVal);
+      if (pit == perEntryPorts[ei].end())
+        return dop->emitError("unmapped memory in function-frame dynamic "
+                              "access");
+      MemPortMapping &mp = pit->second;
+      PortDrivesRef pref = portRef(mp, dynPort);
+
+      Value startPulse = childStartSignals[childIndexForEntry[ei]];
+      Value active = entryRunningSignals[ei];
+      Value zero1 = hw::ConstantOp::create(builder, loc, i1, 0);
+      std::string base =
+          funcOp.getName().str() + "_fdyn" + std::to_string(ei);
+
+      // Request-held latch: the start pulse is one cycle, but the port may
+      // not be ready that cycle. Clears when the entry deactivates, so a
+      // later kernel invocation starts fresh.
+      Backedge wantNextBE = bb.get(i1);
+      auto wantReg =
+          seq::CompRegOp::create(builder, loc, Value(wantNextBE), clk, rst,
+                                 zero1, builder.getStringAttr(base + "_want"));
+      Value want =
+          comb::OrOp::create(builder, loc, startPulse, Value(wantReg), false);
+      wantNextBE.setValue(
+          comb::AndOp::create(builder, loc, want, active, false));
+
+      // Accepted latch: one-shot issue.
+      Backedge accNextBE = bb.get(i1);
+      auto accReg =
+          seq::CompRegOp::create(builder, loc, Value(accNextBE), clk, rst,
+                                 zero1, builder.getStringAttr(base + "_acc"));
+      Value notAcc = comb::createOrFoldNot(builder, loc, accReg);
+      Value issue = comb::AndOp::create(builder, loc, want, notAcc, false);
+      if (mp.ready)
+        issue = comb::AndOp::create(builder, loc, issue, mp.ready, false);
+      accNextBE.setValue(comb::AndOp::create(
+          builder, loc,
+          comb::OrOp::create(builder, loc, accReg, issue, false), active,
+          false));
+
+      // Operand resolution: awaited frame results arrive via `mapping`;
+      // constants defined at function scope are cloned on demand.
+      auto resolve = [&](Value v) -> Value {
+        if (auto m = mapping.lookupOrNull(v))
+          return m;
+        if (auto *def = v.getDefiningOp();
+            def && def->hasTrait<OpTrait::ConstantLike>())
+          return builder.clone(*def, mapping)->getResult(0);
+        return Value();
+      };
+
+      SmallVector<unsigned> widths =
+          dLoad ? dLoad.getAddrWidths() : dStore.getAddrWidths();
+      auto indices = dLoad ? dLoad.getIndices() : dStore.getIndices();
+      pref.addrs->resize(widths.size());
+      for (auto [d, idx] : llvm::enumerate(indices)) {
+        Value a = resolve(idx);
+        if (!a)
+          return dop->emitError("unresolved address operand in "
+                                "function-frame dynamic access");
+        (*pref.addrs)[d] = resizeIntTo(builder, loc, a, widths[d]);
+      }
+
+      Value done;
+      if (dStore) {
+        Value wrData = resolve(dStore.getValueToStore());
+        if (!wrData)
+          return dop->emitError("unresolved store operand in "
+                                "function-frame dynamic access");
+        *pref.wrData = wrData;
+        *pref.wrEn = issue;
+        // rw faces split write completion out; write-only ports report it
+        // on `done`.
+        done = mp.wrDone ? mp.wrDone : mp.done;
+      } else {
+        if (dLoad.requiresReadEnable())
+          *pref.rdEn = issue;
+        done = mp.done;
+      }
+
+      // Completion attribution: the FIRST post-issue pulse belongs to this
+      // access; the sticky `seen` latch keeps later pulses on the shared
+      // port from re-triggering, and clears when the entry deactivates.
+      Value childDone;
+      Value doneMine;
+      if (done) {
+        Backedge seenNextBE = bb.get(i1);
+        auto seenReg = seq::CompRegOp::create(
+            builder, loc, Value(seenNextBE), clk, rst, zero1,
+            builder.getStringAttr(base + "_seen"));
+        Value notSeen = comb::createOrFoldNot(builder, loc, seenReg);
+        doneMine = comb::AndOp::create(
+            builder, loc,
+            comb::AndOp::create(builder, loc, done, Value(accReg), false),
+            notSeen, false);
+        Value seenFed =
+            comb::OrOp::create(builder, loc, Value(seenReg), doneMine, false);
+        seenNextBE.setValue(
+            comb::AndOp::create(builder, loc, seenFed, active, false));
+        childDone = seenFed;
+      } else {
+        // No completion signal on this port: treat acceptance as done.
+        childDone = accReg;
+      }
+      childDoneBEs[childIndexForEntry[ei]].setValue(childDone);
+
+      // Loads deliver their data via the launch-handle map; capture on the
+      // completion pulse since consumers run in later FSM states.
+      SmallVector<Value> resultVals;
+      if (dLoad) {
+        Value cap = mp.rdData;
+        if (done && mp.rdData) {
+          cap = seq::CompRegClockEnabledOp::create(
+              builder, loc, mp.rdData, clk, doneMine, rst,
+              createZeroConstant(builder, loc, mp.rdData.getType()),
+              builder.getStringAttr(base + "_cap"));
+        }
+        mapping.map(dLoad->getResult(0), cap);
+        resultVals.push_back(cap);
+      }
+      if (entry.launchOp) {
+        if (auto launchAt =
+                entry.launchOp->getParentOfType<LoopScheduleAtOp>()) {
+          auto atYield = launchAt.getYieldOp();
+          for (auto [atRes, yOperand] :
+               llvm::zip(launchAt.getResults(), atYield.getOperands())) {
+            if (yOperand == entry.launchOp.getHandle())
+              funcHandleValueMap[atRes] = resultVals;
+          }
+        }
+        funcHandleValueMap[entry.launchOp.getHandle()] = resultVals;
       }
 
     } else {
