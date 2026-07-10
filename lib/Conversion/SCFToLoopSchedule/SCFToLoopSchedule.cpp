@@ -2396,9 +2396,6 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
     };
 
     for (auto &bc : buckets) {
-      if (bc.staticOps.empty())
-        continue;
-
       SmallVector<Type> atTypes;
       SmallVector<AtSlot> slots;
 
@@ -2453,6 +2450,15 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
         atTypes.push_back(re.second.getType());
         slots.push_back(s);
       }
+
+      // A bucket with no static ops can still owe the frame re-registered
+      // or iter-arg slots (e.g. a value that must pass through a phase whose
+      // only compute is dynamic launches); its `at` is then a pure
+      // pass-through yield. Skipping it would leave those frame slots as
+      // null yield operands. Only buckets that contribute nothing at all
+      // are skipped.
+      if (bc.staticOps.empty() && slots.empty())
+        continue;
 
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPoint(bodyYield);

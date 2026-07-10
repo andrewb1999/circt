@@ -708,9 +708,15 @@ private:
 
   /// Create linear run-once FSM for sequencing top-level function frames.
   /// frameChildKind[i]: -1 = leaf, 0 = sequential child, 1 = pipeline child.
+  /// entryLatencies[i] is the leaf entry's frame latency: leaves with
+  /// latency L > 1 hold their state for L cycles and expose per-cycle
+  /// outputs appended after frame_running_*; entryCycleOutBase[i] receives
+  /// each entry's base index into that region (-1 = single-cycle).
   fsm::MachineOp createFunctionFSM(OpBuilder &builder, Location loc,
                                     StringRef fsmName,
-                                    ArrayRef<int> frameChildKind);
+                                    ArrayRef<int> frameChildKind,
+                                    ArrayRef<unsigned> entryLatencies,
+                                    SmallVectorImpl<int> &entryCycleOutBase);
 
   /// Recursively lower a loop node as its own hw.module.
   /// Creates the module and populates outModule. capturedVals are the
@@ -826,10 +832,9 @@ struct SeqPortMuxCtx {
 /// accesses go through the SeqDynCtx handshake path (which already
 /// OR-accumulates its drives) and launched children lower in their own
 /// modules, so both are excluded.
-static void
-collectFrameMultiAccess(Block &frameBody,
-                        llvm::DenseSet<std::pair<Value, unsigned>> &multi) {
-  llvm::DenseMap<std::pair<Value, unsigned>, unsigned> counts;
+static void collectFrameAccessCounts(
+    Block &frameBody,
+    llvm::DenseMap<std::pair<Value, unsigned>, unsigned> &counts) {
   frameBody.walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
     if (isa<LoopScheduleLaunchOp, LoopScheduleSequentialOp,
             LoopSchedulePipelineOp>(op))
@@ -843,10 +848,8 @@ collectFrameMultiAccess(Block &frameBody,
       ++counts[{storeOp.getMemoryValue(), getBindingPort(storeOp)}];
     return WalkResult::advance();
   });
-  for (auto &entry : counts)
-    if (entry.second > 1)
-      multi.insert(entry.first);
 }
+
 
 /// Lower any `HWLoadLoweringInterface` op: drive the read addresses on
 /// the memory port mapping (port selected by `loopschedule.binding`,
@@ -903,19 +906,37 @@ handleHWLoad(loopschedule::HWLoadLoweringInterface loadOp, OpBuilder &builder,
     unsigned wireLatency =
         seqMux->registeredMems.contains(loadOp.getMemoryValue()) ? 1 : 0;
     unsigned dataCycle = seqMux->cycle + wireLatency;
+    Value liveGate;
     if (dataCycle < seqMux->cycleGates.size()) {
-      Value liveGate = seqMux->cycleGates[dataCycle];
-      Value resetVal = createZeroConstant(builder, loc, pref.rdData->getType());
-      auto regName = builder.getStringAttr(
-          seqMux->regPrefix + "_ldcap_" + std::to_string(seqMux->counter++));
-      Value captured = seq::CompRegClockEnabledOp::create(
-          builder, loc, *pref.rdData, seqMux->clk, liveGate, seqMux->rst,
-          resetVal, regName);
-      mapping.map(loadOp.getResult(),
-                  comb::MuxOp::create(builder, loc, liveGate, *pref.rdData,
-                                      captured));
-      return success();
+      liveGate = seqMux->cycleGates[dataCycle];
+    } else {
+      // The data-valid cycle falls past the enclosing frame's last cycle
+      // (a registered read issued on the frame's final cycle): the FSM has
+      // already advanced, but the BRAM holds this read's data until the
+      // port's NEXT enabled read commits — which is at least one cycle
+      // after any subsequent issue. A one-cycle-delayed copy of the ISSUE
+      // gate therefore fires exactly within the data-valid window,
+      // regardless of which frame the FSM is in by then. Falling through
+      // to the raw rd_data wire here would silently hand cross-frame
+      // consumers a later access's data.
+      Value issueGate = seqMux->cycleGates[seqMux->cycle];
+      Value zero1 =
+          hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0);
+      auto gateName = builder.getStringAttr(
+          seqMux->regPrefix + "_ldcapgate_" + std::to_string(seqMux->counter));
+      liveGate = seq::CompRegOp::create(builder, loc, issueGate, seqMux->clk,
+                                        seqMux->rst, zero1, gateName);
     }
+    Value resetVal = createZeroConstant(builder, loc, pref.rdData->getType());
+    auto regName = builder.getStringAttr(
+        seqMux->regPrefix + "_ldcap_" + std::to_string(seqMux->counter++));
+    Value captured = seq::CompRegClockEnabledOp::create(
+        builder, loc, *pref.rdData, seqMux->clk, liveGate, seqMux->rst,
+        resetVal, regName);
+    mapping.map(loadOp.getResult(),
+                comb::MuxOp::create(builder, loc, liveGate, *pref.rdData,
+                                    captured));
+    return success();
   }
   mapping.map(loadOp.getResult(), *pref.rdData);
   return success();
@@ -2057,7 +2078,8 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
 
 fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
     OpBuilder &builder, Location loc, StringRef fsmName,
-    ArrayRef<int> frameChildKind) {
+    ArrayRef<int> frameChildKind, ArrayRef<unsigned> entryLatencies,
+    SmallVectorImpl<int> &entryCycleOutBase) {
   auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
   unsigned numFrames = frameChildKind.size();
@@ -2073,10 +2095,30 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
     }
   }
 
+  // Multi-cycle LEAF entries (latency > 1, e.g. two same-port stores the
+  // scheduler serialized into `at 0` / `at 1`) hold their state for L
+  // cycles and expose one dedicated cycle output per cycle, mirroring the
+  // sequential FSM's frame-cycle outputs. `entryCycleOutBase[i]` is the
+  // entry's base index into that appended output region (-1 = none).
+  auto latencyOf = [&](unsigned i) -> unsigned {
+    unsigned l = i < entryLatencies.size() ? entryLatencies[i] : 1;
+    return frameChildKind[i] < 0 ? std::max(l, 1u) : 1u;
+  };
+  entryCycleOutBase.assign(numFrames, -1);
+  unsigned totalCycleOuts = 0;
+  for (unsigned i = 0; i < numFrames; ++i) {
+    if (latencyOf(i) > 1) {
+      entryCycleOutBase[i] = (int)totalCycleOuts;
+      totalCycleOuts += latencyOf(i);
+    }
+  }
+
   // Inputs: start, child_done_0, ..., child_done_{numChildren-1}
   SmallVector<Type> inputTypes(1 + numChildren, i1);
-  // Outputs: done, child_start_0..N, frame_running_0..M
-  SmallVector<Type> outputTypes(1 + numChildren + numFrames, i1);
+  // Outputs: done, child_start_0..N, frame_running_0..M, then the appended
+  // per-cycle outputs of multi-cycle leaf entries.
+  SmallVector<Type> outputTypes(1 + numChildren + numFrames + totalCycleOuts,
+                                i1);
 
   auto funcType = FunctionType::get(ctx, inputTypes, outputTypes);
   auto machine =
@@ -2099,6 +2141,10 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
   for (unsigned i = 0; i < numFrames; ++i)
     resNameAttrs.push_back(
         builder.getStringAttr("frame_running_" + std::to_string(i)));
+  for (unsigned i = 0; i < numFrames; ++i)
+    for (unsigned c = 0; entryCycleOutBase[i] >= 0 && c < latencyOf(i); ++c)
+      resNameAttrs.push_back(builder.getStringAttr(
+          "frame_cycle_" + std::to_string(i) + "_" + std::to_string(c)));
   machine.setResNamesAttr(builder.getArrayAttr(resNameAttrs));
 
   OpBuilder fb(ctx);
@@ -2109,15 +2155,19 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
 
   // Helper to build output vector.
   // out[0] = done, out[1..numChildren] = child_start,
-  // out[1+numChildren..] = frame_running
+  // out[1+numChildren..] = frame_running, then the per-cycle outputs
+  // (activeCycleOut is a GLOBAL index into that appended region, -1 none).
   auto makeOutput = [&](bool done, int activeChildStart,
-                        int activeFrameRunning) -> SmallVector<Value> {
+                        int activeFrameRunning,
+                        int activeCycleOut = -1) -> SmallVector<Value> {
     SmallVector<Value> vals;
     vals.push_back(done ? trueVal : falseVal);
     for (unsigned i = 0; i < numChildren; ++i)
       vals.push_back((int)i == activeChildStart ? trueVal : falseVal);
     for (unsigned i = 0; i < numFrames; ++i)
       vals.push_back((int)i == activeFrameRunning ? trueVal : falseVal);
+    for (unsigned c = 0; c < totalCycleOuts; ++c)
+      vals.push_back((int)c == activeCycleOut ? trueVal : falseVal);
     return vals;
   };
 
@@ -2144,35 +2194,39 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
         (i + 1 < numFrames) ? "FRAME_" + std::to_string(i + 1) : "DONE";
     bool isLeaf = (frameChildKind[i] < 0);
 
-    // FRAME_i
+    // FRAME_i, plus FRAME_i_C1..C{L-1} chained cycle states for multi-cycle
+    // leaf entries: frame_running_i stays high across the whole chain and
+    // each cycle state additionally raises its frame_cycle_<i>_<c> output,
+    // so `at K` bodies get a genuine per-cycle issue gate (two same-port
+    // stores serialized by the scheduler need K to really be cycle K).
     {
-      auto st = fsm::StateOp::create(fb, loc, frameName);
-      Block *ob = st.ensureOutput(fb);
-      ob->getTerminator()->erase();
-      fb.setInsertionPointToEnd(ob);
-
-      if (isLeaf) {
-        // Leaf: frame_running_i = 1, no child_start
-        fsm::OutputOp::create(fb, loc, makeOutput(false, -1, i));
-      } else {
-        // Non-leaf: child_start_j = 1, frame_running_i = 1
-        fsm::OutputOp::create(fb, loc,
-                               makeOutput(false, childIndexForFrame[i], i));
-      }
-
-      Block *tb = &st.getTransitions().front();
-      fb.setInsertionPointToEnd(tb);
-
-      if (isLeaf) {
-        // Leaf: unconditional to next
-        fsm::TransitionOp::create(fb, loc, StringRef(nextState));
-      } else {
-        // Non-leaf: go to WAIT_i
-        std::string waitName = "WAIT_" + std::to_string(i);
-        fsm::TransitionOp::create(fb, loc, StringRef(waitName));
+      unsigned lat = latencyOf(i);
+      for (unsigned c = 0; c < lat; ++c) {
+        std::string stateName =
+            c == 0 ? frameName : frameName + "_C" + std::to_string(c);
+        std::string succ =
+            (c + 1 < lat) ? frameName + "_C" + std::to_string(c + 1)
+                          : (isLeaf ? nextState : "WAIT_" + std::to_string(i));
+        auto st = fsm::StateOp::create(fb, loc, stateName);
+        Block *ob = st.ensureOutput(fb);
+        ob->getTerminator()->erase();
+        fb.setInsertionPointToEnd(ob);
+        int cycleSlot =
+            entryCycleOutBase[i] >= 0 ? entryCycleOutBase[i] + (int)c : -1;
+        if (isLeaf) {
+          // Leaf: frame_running_i = 1, no child_start
+          fsm::OutputOp::create(fb, loc, makeOutput(false, -1, i, cycleSlot));
+        } else {
+          // Non-leaf: child_start_j = 1, frame_running_i = 1
+          fsm::OutputOp::create(
+              fb, loc, makeOutput(false, childIndexForFrame[i], i, cycleSlot));
+        }
+        Block *tb = &st.getTransitions().front();
+        fb.setInsertionPointToEnd(tb);
+        fsm::TransitionOp::create(fb, loc, StringRef(succ));
+        fb.setInsertionPointToEnd(&machine.getBody().front());
       }
     }
-    fb.setInsertionPointToEnd(&machine.getBody().front());
 
     // WAIT_i (non-leaf only)
     if (!isLeaf) {
@@ -2654,6 +2708,28 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
   unsigned numFrames = frames.size();
 
+  // Port contention is a BODY-global property, not per-frame: the frames
+  // share each port's address/rd_data wires, so two frames that each make a
+  // single access to the same port still contend — a later frame's access
+  // retargets the port while an earlier frame's load result may still be
+  // consumed (its raw rd_data mapping would silently deliver the later
+  // access's data). Compute the multi-access set across ALL frames and use
+  // it for every frame's SeqPortMuxCtx so each such access gets the
+  // gate-muxed drive and the data-valid capture register.
+  llvm::DenseSet<std::pair<Value, unsigned>> bodyMultiAccess;
+  {
+    llvm::DenseMap<std::pair<Value, unsigned>, unsigned> counts;
+    // Walk EVERY region of each frame: await-frames keep their post-await
+    // work in the `do` region, which getBodyBlock() doesn't cover.
+    for (auto frameOp : frames)
+      for (Region &region : frameOp->getRegions())
+        for (Block &block : region)
+          collectFrameAccessCounts(block, counts);
+    for (auto &entry : counts)
+      if (entry.second > 1)
+        bodyMultiAccess.insert(entry.first);
+  }
+
   // Collect the global wait slots — one per launch across all frames,
   // emitted in (frame, at-offset) order. `frameWaitIdx[i]` lists the
   // global wait indices for frame i's launches; `launchAtOffsets[j]`
@@ -2911,7 +2987,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     // SeqPortMuxCtx). Launched children are excluded by the collector —
     // they drive their own port slots through the child-instance muxing.
     SeqPortMuxCtx seqMux;
-    collectFrameMultiAccess(frameBody, seqMux.multi);
+    seqMux.multi = bodyMultiAccess;
     for (auto &memInfo : memrefArgs)
       seqMux.registeredMems.insert(memInfo.originalArg);
     seqMux.cycleGates = fsmFrameCycleGates[frameIdx];
@@ -3410,7 +3486,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                        node.prefix,
                        &seqDynCounter};
       SeqPortMuxCtx seqMux;
-      collectFrameMultiAccess(frameOp.getBodyBlock(), seqMux.multi);
+      seqMux.multi = bodyMultiAccess;
       for (auto &memInfo : memrefArgs)
         seqMux.registeredMems.insert(memInfo.originalArg);
       seqMux.cycleGates = fsmFrameCycleGates[frameIdx];
@@ -5047,6 +5123,32 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   for (auto &e : entries)
     entryKinds.push_back(e.kind);
 
+  // Leaf entries with multi-cycle frames (e.g. two same-port stores the
+  // scheduler serialized to `at 0` / `at 1`) hold their FSM state for the
+  // frame's latency and get per-cycle gates.
+  SmallVector<unsigned> entryLatencies;
+  for (auto &e : entries)
+    entryLatencies.push_back(
+        e.kind < 0 ? computeFrameLatency(topFrames[e.frameIdx]) : 1u);
+
+  // Function-level port contention (same rationale as the sequential-loop
+  // body's bodyMultiAccess): count static accesses across ALL top frames so
+  // same-port accesses in different frames/cycles get gate-muxed drives.
+  llvm::DenseSet<std::pair<Value, unsigned>> funcMultiAccess;
+  {
+    llvm::DenseMap<std::pair<Value, unsigned>, unsigned> counts;
+    // Walk EVERY region of each frame: await-frames keep their post-await
+    // work in the `do` region, which getBodyBlock() (the await region)
+    // doesn't cover.
+    for (auto frameOp : topFrames)
+      for (Region &region : frameOp->getRegions())
+        for (Block &block : region)
+          collectFrameAccessCounts(block, counts);
+    for (auto &entry : counts)
+      if (entry.second > 1)
+        funcMultiAccess.insert(entry.first);
+  }
+
   // Count non-leaf entries.
   unsigned numChildren = 0;
   SmallVector<int> childIndexForEntry(entries.size(), -1);
@@ -5062,7 +5164,13 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   std::string fsmName = funcName + "_fsm";
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   builder.setInsertionPointToEnd(moduleOp.getBody());
-  createFunctionFSM(builder, loc, fsmName, entryKinds);
+  SmallVector<int> entryCycleOutBase;
+  createFunctionFSM(builder, loc, fsmName, entryKinds, entryLatencies,
+                    entryCycleOutBase);
+  unsigned totalEntryCycleOuts = 0;
+  for (unsigned i = 0; i < entries.size(); ++i)
+    if (entryCycleOutBase[i] >= 0)
+      totalEntryCycleOuts += entryLatencies[i];
 
   // Instantiate function FSM in HW module body.
   builder.setInsertionPointToEnd(hwBody);
@@ -5078,7 +5186,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   }
 
   unsigned numEntries = entries.size();
-  SmallVector<Type> fsmResultTypes(1 + numChildren + numEntries, i1);
+  SmallVector<Type> fsmResultTypes(
+      1 + numChildren + numEntries + totalEntryCycleOuts, i1);
   auto fsmInst = fsm::HWInstanceOp::create(
       builder, loc, fsmResultTypes,
       builder.getStringAttr(fsmName + "_inst"),
@@ -5094,6 +5203,18 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   SmallVector<Value> entryRunningSignals(numEntries);
   for (unsigned i = 0; i < numEntries; ++i)
     entryRunningSignals[i] = fsmInst.getResult(fsmOutIdx++);
+  // Per-entry issue gates: multi-cycle leaf entries get their dedicated
+  // frame_cycle_<i>_<c> outputs; single-cycle entries use entry_running.
+  SmallVector<SmallVector<Value>> entryCycleGates(numEntries);
+  for (unsigned i = 0; i < numEntries; ++i) {
+    if (entryCycleOutBase[i] >= 0) {
+      for (unsigned c = 0; c < entryLatencies[i]; ++c)
+        entryCycleGates[i].push_back(fsmInst.getResult(
+            1 + numChildren + numEntries + entryCycleOutBase[i] + c));
+    } else {
+      entryCycleGates[i].push_back(entryRunningSignals[i]);
+    }
+  }
 
   // Per-entry memory port mappings. Each starts with shared rdData and
   // (when present) the per-port `done` so an inline-lowered pipeline
@@ -5190,6 +5311,29 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp,
                 LoopScheduleLaunchOp>(&op))
           continue;
+        // Dynamic-latency accesses need the full issue/completion handshake
+        // (SeqDynCtx), which the function-level frame path does not provide.
+        // Lowering them as static single-cycle drives silently produces
+        // wrong hardware in general (no ready gating, no completion wait,
+        // same-cycle clobbering of a shared port). The ONE historically
+        // supported shape stays: a posted (`no_wait`) store that is its
+        // port's only static access in the function frames — one issue
+        // pulse, nothing to wait for, nothing to clobber. Everything else
+        // is rejected, matching the explicit error lowerSeqDynAccess raises
+        // without a context.
+        if (isSeqDynAccess(&op)) {
+          auto asStore = dyn_cast<loopschedule::HWStoreLoweringInterface>(&op);
+          bool posted = op.hasAttr("no_wait");
+          bool multi =
+              asStore && funcMultiAccess.contains(
+                             {asStore.getMemoryValue(), getBindingPort(&op)});
+          if (!asStore || !posted || multi)
+            return op.emitError(
+                "dynamic memory accesses in function-level frames are not "
+                "yet supported by the FSM lowering (only a posted `no_wait` "
+                "store that is its port's sole access is allowed); keep the "
+                "access inside a loop");
+        }
         // Memory ops must flow through the HW store/load interface so
         // their memref operands get rewritten to the memPortMap ports
         // instead of leaking into the cloned output as dangling
@@ -5544,12 +5688,27 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       }
 
     } else {
-      // Leaf frame: lower body with entry_running as wrEn gate.
-      Value oneGate = entryRunningSignals[ei];
+      // Leaf frame: lower body with the entry's per-cycle gates (a
+      // single-cycle frame's gate vector is just entry_running; a
+      // multi-cycle frame gets the FSM's frame_cycle_<i>_<c> outputs so
+      // `at K` bodies issue at their scheduled cycle). Contended ports
+      // (multiple static accesses across the function's frames, e.g. two
+      // stores to one memory serialized to `at 0`/`at 1`) need the
+      // gate-muxed drives — without a SeqPortMuxCtx the later access's
+      // addr/data/enable would simply overwrite the earlier one's.
+      SeqPortMuxCtx seqMux;
+      seqMux.multi = funcMultiAccess;
+      for (auto &memInfo : memrefArgs)
+        seqMux.registeredMems.insert(memInfo.originalArg);
+      seqMux.cycleGates = entryCycleGates[ei];
+      seqMux.clk = clk;
+      seqMux.rst = rst;
+      seqMux.regPrefix = funcOp.getName().str() + "_e" + std::to_string(ei);
+      SeqPortMuxCtx *seqMuxPtr = seqMux.multi.empty() ? nullptr : &seqMux;
       if (failed(lowerFrameBody(&topFrames[frameIdx].getBodyBlock(), builder,
-                                mapping, ArrayRef<Value>(oneGate),
+                                mapping, entryCycleGates[ei],
                                 perEntryPorts[ei], enclosingModule, clk,
-                                rst)))
+                                rst, /*seqDyn=*/nullptr, seqMuxPtr)))
         return failure();
     }
 
@@ -5620,7 +5779,10 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
           mapping.map(frameResult, val);
           continue;
         }
-        Value captureGate = entryRunningSignals[ei];
+        // Multi-cycle leaf frames capture on their LAST cycle gate so
+        // results computed in later `at` offsets are latched, not the
+        // cycle-0 values.
+        Value captureGate = entryCycleGates[ei].back();
         if (externalLoadResults.count(yOperand)) {
           // External BRAM read: the data arrives the state after the
           // address was presented, so delay the capture gate one cycle.

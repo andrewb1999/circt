@@ -265,7 +265,7 @@ protected:
   enum { OBJ_LATENCY = 0, OBJ_AXAP /* i.e. either ASAP or ALAP */ };
   bool fillObjectiveRow(SmallVector<int> &row, unsigned obj) override;
   void updateMargins();
-  void scheduleOperation(Operation *n);
+  LogicalResult scheduleOperation(Operation *n);
   unsigned computeResMinII();
 
 public:
@@ -365,10 +365,17 @@ protected:
   enum { OBJ_LATENCY = 0, OBJ_AXAP /* i.e. either ASAP or ALAP */ };
   bool fillObjectiveRow(SmallVector<int> &row, unsigned obj) override;
   void updateMargins();
-  void scheduleOperation(Operation *n);
+  LogicalResult scheduleOperation(Operation *n);
   unsigned computeResMinII();
 
 public:
+  /// Floor for the initial II. The incremental II-bumping conflict
+  /// resolution in `scheduleOperation` can drive the tableau infeasible
+  /// (its op-move heuristic is approximate — see the TODO there); the
+  /// driver retries the whole schedule from a fresh tableau at a higher
+  /// starting II instead of asserting.
+  unsigned minII = 1;
+
   ChainingModuloSimplexScheduler(ChainingModuloProblem &prob, Operation *lastOp,
                                  float cycleTime,
                                  std::optional<int32_t> ii = std::nullopt)
@@ -1227,7 +1234,7 @@ void ModuloSimplexScheduler::updateMargins() {
   }
 }
 
-void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
+LogicalResult ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   auto oprN = *prob.getLinkedOperatorType(n);
   unsigned stvN = startTimeVariables[n];
 
@@ -1248,7 +1255,7 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
       auto fixedN = scheduleAt(stvN, ct);
       if (succeeded(fixedN)) {
         LLVM_DEBUG(dbgs() << "Success at t=" << ct << " " << *n << '\n');
-        return;
+        return success();
       }
       // Problem became infeasible with `n` at `ct`, roll back the MRT
       // assignment. Also, no later time can be feasible, so stop the search
@@ -1324,8 +1331,13 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   // Finally, increment the II and solve to apply the moves.
   ++parameterT;
   auto solved = solveTableau();
-  assert(succeeded(solved));
-  (void)solved;
+  if (failed(solved)) {
+    // Same fragility as the chaining variant: the heuristic move set can
+    // leave the tableau infeasible. Propagate instead of asserting.
+    LLVM_DEBUG(dbgs() << "Tableau infeasible after II increment to "
+                      << parameterT << "; giving up on this attempt\n");
+    return failure();
+  }
 
   // Re-enter moved operations into their new slots.
   for (auto *m : moved)
@@ -1348,6 +1360,7 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   assert(succeeded(enteredN));
   assert(succeeded(fixedN));
   (void)fixedN, (void)enteredN;
+  return success();
 }
 
 unsigned ModuloSimplexScheduler::computeResMinII() {
@@ -1414,7 +1427,8 @@ LogicalResult ModuloSimplexScheduler::schedule() {
     Operation *op = *opIt;
     unscheduled.erase(opIt);
 
-    scheduleOperation(op);
+    if (failed(scheduleOperation(op)))
+      return failure();
     scheduled.push_back(op);
   }
 
@@ -1770,7 +1784,8 @@ void ChainingModuloSimplexScheduler::updateMargins() {
   }
 }
 
-void ChainingModuloSimplexScheduler::scheduleOperation(Operation *n) {
+LogicalResult
+ChainingModuloSimplexScheduler::scheduleOperation(Operation *n) {
   auto oprN = *prob.getLinkedOperatorType(n);
   unsigned stvN = startTimeVariables[n];
 
@@ -1791,7 +1806,7 @@ void ChainingModuloSimplexScheduler::scheduleOperation(Operation *n) {
       auto fixedN = scheduleAt(stvN, ct);
       if (succeeded(fixedN)) {
         LLVM_DEBUG(dbgs() << "Success at t=" << ct << " " << *n << '\n');
-        return;
+        return success();
       }
       // Problem became infeasible with `n` at `ct`, roll back the MRT
       // assignment. Also, no later time can be feasible, so stop the search
@@ -1867,8 +1882,14 @@ void ChainingModuloSimplexScheduler::scheduleOperation(Operation *n) {
   // Finally, increment the II and solve to apply the moves.
   ++parameterT;
   auto solved = solveTableau();
-  assert(succeeded(solved));
-  (void)solved;
+  if (failed(solved)) {
+    // The move set computed above is heuristic (see the TODO); it can leave
+    // the tableau infeasible. Report failure so the driver can retry from a
+    // fresh tableau at a higher starting II rather than aborting.
+    LLVM_DEBUG(dbgs() << "Tableau infeasible after II increment to "
+                      << parameterT << "; giving up on this attempt\n");
+    return failure();
+  }
 
   // Re-enter moved operations into their new slots.
   for (auto *m : moved)
@@ -1891,6 +1912,7 @@ void ChainingModuloSimplexScheduler::scheduleOperation(Operation *n) {
   assert(succeeded(enteredN));
   assert(succeeded(fixedN));
   (void)fixedN, (void)enteredN;
+  return success();
 }
 
 unsigned ChainingModuloSimplexScheduler::computeResMinII() {
@@ -1922,7 +1944,7 @@ LogicalResult ChainingModuloSimplexScheduler::schedule() {
     return failure();
 
   parameterS = 0;
-  parameterT = computeResMinII();
+  parameterT = std::max(computeResMinII(), minII);
 
   LLVM_DEBUG(dbgs() << "ResMinII = " << parameterT << "\n");
   buildTableau();
@@ -1959,7 +1981,8 @@ LogicalResult ChainingModuloSimplexScheduler::schedule() {
     Operation *op = *opIt;
     unscheduled.erase(opIt);
 
-    scheduleOperation(op);
+    if (failed(scheduleOperation(op)))
+      return failure();
     scheduled.push_back(op);
   }
 
@@ -2027,6 +2050,23 @@ LogicalResult scheduling::scheduleSimplex(ChainingCyclicProblem &prob,
 LogicalResult scheduling::scheduleSimplex(ChainingModuloProblem &prob,
                                           Operation *lastOp, float cycleTime,
                                           std::optional<int32_t> ii) {
-  ChainingModuloSimplexScheduler simplex(prob, lastOp, cycleTime, ii);
-  return simplex.schedule();
+  // The incremental II-bumping conflict resolution inside the scheduler is
+  // heuristic and can fail on feasible problems (its op-move logic carries a
+  // TODO for proper graph analysis). Retry from a fresh tableau with a
+  // higher starting II before declaring defeat: a clean solve at the target
+  // II sidesteps the fragile incremental moves entirely.
+  constexpr unsigned kMaxRetries = 64;
+  unsigned minII = 1;
+  for (unsigned attempt = 0; attempt < kMaxRetries; ++attempt, ++minII) {
+    ChainingModuloSimplexScheduler simplex(prob, lastOp, cycleTime, ii);
+    simplex.minII = minII;
+    if (succeeded(simplex.schedule()))
+      return success();
+    // A user-requested exact II leaves no room to retry.
+    if (ii.has_value())
+      return failure();
+  }
+  return prob.getContainingOp()->emitError()
+         << "modulo scheduling failed to find a feasible II after "
+         << kMaxRetries << " attempts";
 }
