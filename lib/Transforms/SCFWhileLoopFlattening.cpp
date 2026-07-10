@@ -6,10 +6,28 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Flattens a perfect nest of scf.while loops (each structurally a for-loop
-// per getSCFWhileConstantTripCount) into a single scf.while that tracks
-// each level's IV in its own iter-arg and updates them via an odometer
+// Flattens a nest of scf.while loops (each structurally a for-loop per
+// getSCFWhileConstantTripCount) into a single scf.while that tracks each
+// level's IV in its own iter-arg and updates them via an odometer
 // (compares + selects) instead of div/mod.
+//
+// Besides perfect nests, ALMOST-perfect nests are supported (matching what
+// Vitis HLS's pipeline-driven auto-flattening accepts): a level's after
+// region may additionally contain
+//   - PRE-ops: pure ops before the inner loop (e.g. an accumulator's zero
+//     constant, invariant address math). These are recomputed every
+//     flattened iteration, which is safe because they are pure.
+//   - CARRIED CHAINS: the inner loops may carry extra iter-args (e.g. a
+//     reduction accumulator) initialized at some origin boundary from a
+//     constant or nest-invariant value, threaded unchanged through
+//     intermediate levels, and updated only in the innermost body. In the
+//     flattened loop each chain becomes one iter-arg that RESETS to its
+//     init (via arith.select) whenever the levels below its origin wrap.
+//   - POST-ops: pure ops and memref.stores after the inner loop (e.g. the
+//     reduction's store to memory). These become an scf.if predicated on
+//     "the levels below just wrapped", i.e. they execute exactly on the
+//     iterations where the original epilogue ran. Downstream scheduling
+//     (ifOpConversion) turns the scf.if into predicated operations.
 //
 //===----------------------------------------------------------------------===//
 
@@ -22,6 +40,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -90,15 +109,23 @@ static arith::CmpIPredicate wrapPredicate(arith::CmpIPredicate p) {
 
 /// Re-run the canonical-form matcher to recover lb/ub/step/pred for a single
 /// scf.while. Mirrors the structural checks in SCFWhileTripCountAnalysis.cpp
-/// but also returns the extra fields the flattening pass needs.
+/// but also returns the extra fields the flattening pass needs. Loops may
+/// carry extra (non-IV) iter-args; those are resolved into carried chains by
+/// collectNest, which requires the condition to forward the before-args
+/// identically (so init/yield/result/after-arg indices all coincide).
 static std::optional<NestLevel> matchLevel(WhileOp whileOp) {
-  // Canonical form implies a single iter-arg. The analysis also requires
-  // this, but the matcher here walks the structure directly so we can grab
-  // the addi op reference.
-  if (whileOp.getNumResults() != 1)
-    return std::nullopt;
-
+  // Identity forwarding: condition args are exactly the before-args, in
+  // order. This makes iter-arg index == after-arg index == result index,
+  // which the carried-chain threading below relies on.
   ConditionOp condOp = whileOp.getConditionOp();
+  if (condOp.getArgs().size() != whileOp.getBeforeBody()->getNumArguments())
+    return std::nullopt;
+  for (auto [j, fwd] : llvm::enumerate(condOp.getArgs())) {
+    auto arg = dyn_cast<BlockArgument>(fwd);
+    if (!arg || arg.getOwner() != whileOp.getBeforeBody() ||
+        arg.getArgNumber() != j)
+      return std::nullopt;
+  }
   auto cmp = condOp.getCondition().getDefiningOp<arith::CmpIOp>();
   if (!cmp || !isSupportedPredicate(cmp.getPredicate()))
     return std::nullopt;
@@ -195,13 +222,66 @@ static std::optional<NestLevel> matchLevel(WhileOp whileOp) {
                    cmp.getPredicate(), addOp, ivAfter, ivType};
 }
 
+/// A scalar value carried through the nest's inner levels: initialized at an
+/// origin boundary (or above the nest entirely), threaded unchanged through
+/// intermediate levels' iter-args, updated only in the innermost body, and
+/// consumed either by post-ops at the origin boundary or (for origin == -1)
+/// by uses of the outermost loop's result.
+struct CarriedChain {
+  /// Boundary index: the chain is initialized in level originLevel's after
+  /// region, right before level originLevel+1. -1 means the init lives
+  /// above the whole nest and the outermost loop carries (and returns) it.
+  int originLevel;
+  /// Init value: an arith.constant or a value defined above the nest.
+  Value init;
+  /// Iter-arg index of this chain at each level it threads through
+  /// (levels originLevel+1 .. N-1); index into `argIdx` is the level.
+  SmallVector<int> argIdx; // size N; -1 where the chain is absent.
+  /// After-region block argument at the innermost level (mapped into the
+  /// flattened body).
+  BlockArgument innerAfterArg;
+  /// Value the innermost body yields for this chain (the updated value).
+  Value innerYieldVal;
+  /// The loop result consumed by the chain's users: result of
+  /// nest[originLevel+1] (or of nest[0] when originLevel == -1).
+  Value originResult;
+};
+
+/// A matched (almost-)perfect nest.
+struct NestInfo {
+  SmallVector<NestLevel> levels;
+  SmallVector<CarriedChain> chains;
+  /// Pure ops preceding the inner while in level k's after region.
+  SmallVector<SmallVector<Operation *>> preOps;  // size N (innermost empty)
+  /// Epilogue ops following the inner while in level k's after region
+  /// (pure ops and memref.stores, in program order).
+  SmallVector<SmallVector<Operation *>> postOps; // size N (innermost empty)
+};
+
+/// True if `v` is safe to reference from the flattened loop's init AND from
+/// inside its body: a value defined above `outer` (including constants that
+/// were CSE'd to function scope).
+static bool isDefinedAboveNest(Value v, WhileOp outer) {
+  if (auto arg = dyn_cast<BlockArgument>(v))
+    return !outer->isAncestor(arg.getOwner()->getParentOp());
+  Operation *def = v.getDefiningOp();
+  return def && !outer->isAncestor(def);
+}
+
+/// True if `v` is produced by a ConstantLike op (rematerializable anywhere;
+/// covers integer and float accumulator inits).
+static bool isConstantValue(Value v) {
+  Operation *def = v.getDefiningOp();
+  return def && def->hasTrait<OpTrait::ConstantLike>();
+}
+
 /// Walk down from `outer`, collecting a maximal chain of nested canonical
-/// scf.while loops whose after regions have the shape
-/// `{addi, inner while, yield}`. Returns the chain (≥2 elements) or
-/// std::nullopt if `outer` does not anchor a flattenable perfect nest.
-static std::optional<SmallVector<NestLevel>>
-collectPerfectNest(WhileOp outer) {
-  SmallVector<NestLevel> nest;
+/// scf.while loops, allowing pure pre-ops, carried iter-arg chains, and
+/// store/pure post-ops at each boundary (see file header). Returns the
+/// matched nest (≥2 levels) or std::nullopt.
+static std::optional<NestInfo> collectNest(WhileOp outer) {
+  NestInfo info;
+  SmallVector<NestLevel> &nest = info.levels;
 
   WhileOp current = outer;
   while (true) {
@@ -210,24 +290,28 @@ collectPerfectNest(WhileOp outer) {
       return std::nullopt;
 
     // Require a non-zero constant trip count so the flattened loop isn't
-    // degenerate. We call the public analysis here for consistency with
-    // the rest of the codebase.
-    auto tc = circt::analysis::getSCFWhileConstantTripCount(current);
-    if (!tc || tc->isZero())
-      return std::nullopt;
+    // degenerate. (Computed locally: the public analysis only accepts
+    // single-iter-arg loops, and levels here may carry chains.)
+    {
+      APInt range = level->ubNormalized - level->lb;
+      if (!range.isStrictlyPositive())
+        return std::nullopt;
+      if (level->origPred == arith::CmpIPredicate::ne &&
+          !range.urem(level->step).isZero())
+        return std::nullopt; // `ne` bound never hit exactly -> not a for.
+    }
 
     nest.push_back(*level);
+    info.preOps.emplace_back();
+    info.postOps.emplace_back();
 
-    // Look for a nested scf.while inside current.getAfterBody(). For an
-    // intermediate level the after region must contain exactly
-    // {addi, inner while, yield}. For the innermost level we stop.
+    // Find the (unique) nested while first; the innermost level's body is
+    // the pipelined payload and is not subject to boundary classification.
     Block *afterBlock = current.getAfterBody();
     WhileOp nextInner = nullptr;
-    unsigned opCount = 0;
     for (Operation &op : afterBlock->without_terminator()) {
-      opCount++;
       if (auto w = dyn_cast<WhileOp>(op)) {
-        if (nextInner) // more than one while -> not perfect
+        if (nextInner) // more than one while -> not flattenable
           return std::nullopt;
         nextInner = w;
       }
@@ -235,40 +319,239 @@ collectPerfectNest(WhileOp outer) {
     if (!nextInner)
       break; // innermost reached
 
-    // Intermediate level: exactly {addi, inner while} besides the yield.
-    if (opCount != 2)
-      return std::nullopt;
-    // The addi must be our level's update op.
-    // (opCount == 2 and one of them is the inner while, so the other is
-    // something; verify it is exactly `level->updateOp`.)
-    bool sawAddi = false;
+    // Partition the rest into {pre-ops, post-ops}; the IV update addi may
+    // sit anywhere and is skipped.
+    bool seenInner = false;
     for (Operation &op : afterBlock->without_terminator()) {
-      if (&op == nextInner.getOperation())
+      if (&op == level->updateOp.getOperation())
         continue;
-      if (&op == level->updateOp.getOperation()) {
-        sawAddi = true;
+      if (&op == nextInner.getOperation()) {
+        seenInner = true;
         continue;
       }
-      return std::nullopt;
+      if (!seenInner) {
+        // Pre-op: must be pure (recomputed every flattened iteration).
+        if (!isPure(&op))
+          return std::nullopt;
+        info.preOps.back().push_back(&op);
+      } else {
+        // Post-op: pure or a memref.store (predicated on wrap later).
+        if (!isPure(&op) && !isa<memref::StoreOp>(op))
+          return std::nullopt;
+        info.postOps.back().push_back(&op);
+      }
     }
-    if (!sawAddi)
-      return std::nullopt;
-
-    // The inner loop's inits must not depend on the outer IV (the
-    // canonical-form matcher already requires them to be constants, but
-    // double check their defining ops lie outside the nest.) `matchLevel`
-    // will verify this when we descend.
-
-    // Also ensure the inner loop's result does not feed the outer yield
-    // IV operand — that is already implied because the outer yield at
-    // ivIdx is the `addi` result, not the while result.
 
     current = nextInner;
   }
 
   if (nest.size() < 2)
     return std::nullopt;
-  return nest;
+
+  unsigned N = nest.size();
+
+  // The innermost level must have no partition entries (it has no inner
+  // while, so everything landed in preOps; that's its body, not a boundary).
+  info.preOps.back().clear();
+  info.postOps.back().clear();
+
+  // --- Resolve extra iter-args into carried chains. ---
+  // For each level's non-IV iter-args, walk the init side upward: an init
+  // that is the parent's extra after-arg is threading; anything else must
+  // be a constant or nest-invariant value and anchors the chain's origin.
+  // Chains are keyed by their (level, argIdx) at the innermost loop.
+  //
+  // chainAt[k] maps iter-arg index at level k -> chain id (or absent).
+  SmallVector<DenseMap<unsigned, unsigned>> chainAt(N);
+
+  for (unsigned k = 0; k < N; ++k) {
+    WhileOp loop = nest[k].loop;
+    for (unsigned a = 0; a < loop.getInits().size(); ++a) {
+      if (a == nest[k].ivIdx)
+        continue;
+      Value init = loop.getInits()[a];
+
+      int origin;
+      if (k == 0) {
+        // Outermost extra arg: carried across the whole nest.
+        if (!isConstantValue(init) && !isDefinedAboveNest(init, outer))
+          return std::nullopt;
+        origin = -1;
+      } else {
+        auto parentArg = dyn_cast<BlockArgument>(init);
+        if (parentArg &&
+            parentArg.getOwner() == nest[k - 1].loop.getAfterBody()) {
+          // Threading from the parent: the parent must carry a chain at
+          // this arg index, and the parent's yield for that index must be
+          // exactly this loop's result at index `a`.
+          unsigned pIdx = parentArg.getArgNumber();
+          auto it = chainAt[k - 1].find(pIdx);
+          if (it == chainAt[k - 1].end())
+            return std::nullopt;
+          Value parentYield =
+              nest[k - 1].loop.getYieldOp().getOperand(pIdx);
+          if (parentYield != loop.getResult(a))
+            return std::nullopt;
+          // Intermediate levels must not otherwise use the value: the
+          // after-arg's only allowed uses are this loop's init (checked
+          // here structurally: it IS this init) and nothing else.
+          for (OpOperand &use : parentArg.getUses()) {
+            if (use.getOwner() == loop.getOperation())
+              continue;
+            return std::nullopt;
+          }
+          chainAt[k][a] = it->second;
+          info.chains[it->second].argIdx[k] = a;
+          continue;
+        }
+        // New chain anchored at boundary k-1. Its init must be reset-safe.
+        if (!isConstantValue(init) && !isDefinedAboveNest(init, outer))
+          return std::nullopt;
+        origin = int(k) - 1;
+      }
+
+      CarriedChain chain;
+      chain.originLevel = origin;
+      chain.init = init;
+      chain.argIdx.assign(N, -1);
+      chain.argIdx[k] = a;
+      chainAt[k][a] = info.chains.size();
+      info.chains.push_back(chain);
+    }
+  }
+
+  // Every chain must reach the innermost loop (it is updated there); fill
+  // in innerAfterArg / innerYieldVal / originResult and validate uses.
+  for (CarriedChain &chain : info.chains) {
+    int innerIdx = chain.argIdx[N - 1];
+    if (innerIdx < 0)
+      return std::nullopt; // dead-ends at an intermediate level
+    WhileOp inner = nest[N - 1].loop;
+    chain.innerAfterArg = inner.getAfterBody()->getArgument(innerIdx);
+    chain.innerYieldVal = inner.getYieldOp().getOperand(innerIdx);
+
+    // The result consumed by the chain's users.
+    unsigned firstLevel = unsigned(chain.originLevel + 1);
+    WhileOp originLoop = nest[firstLevel].loop;
+    chain.originResult = originLoop.getResult(chain.argIdx[firstLevel]);
+  }
+
+  // --- Validate post-op operands and result escapes. ---
+  // Post-ops at boundary k may consume: values defined above the nest,
+  // IV after-args of levels <= k, pre-op results at boundaries <= k,
+  // chain origin results anchored at boundary k, and other post-ops of the
+  // same boundary. Their results must not escape the boundary's post-op set.
+  for (unsigned k = 0; k + 1 < N; ++k) {
+    llvm::SmallPtrSet<Operation *, 8> postSet;
+    for (Operation *op : info.postOps[k])
+      postSet.insert(op);
+    llvm::SmallPtrSet<Operation *, 8> preSet;
+    for (unsigned j = 0; j <= k; ++j)
+      for (Operation *op : info.preOps[j])
+        preSet.insert(op);
+
+    for (Operation *op : info.postOps[k]) {
+      for (Value operand : op->getOperands()) {
+        if (isDefinedAboveNest(operand, outer))
+          continue;
+        if (auto arg = dyn_cast<BlockArgument>(operand)) {
+          // IV after-arg of an enclosing level.
+          bool ok = false;
+          for (unsigned j = 0; j <= k; ++j)
+            if (arg == nest[j].ivAfter)
+              ok = true;
+          if (ok)
+            continue;
+          return std::nullopt;
+        }
+        Operation *def = operand.getDefiningOp();
+        if (postSet.contains(def) || preSet.contains(def))
+          continue;
+        // A chain result anchored at this boundary.
+        bool isChainResult = false;
+        for (const CarriedChain &chain : info.chains)
+          if (chain.originLevel == int(k) && operand == chain.originResult)
+            isChainResult = true;
+        if (isChainResult)
+          continue;
+        return std::nullopt;
+      }
+      // Results may only feed other post-ops of this boundary.
+      for (Value result : op->getResults())
+        for (OpOperand &use : result.getUses())
+          if (!postSet.contains(use.getOwner()))
+            return std::nullopt;
+    }
+  }
+
+  // --- Validate chain-result uses. ---
+  // A chain's origin result may only be consumed by post-ops of its origin
+  // boundary; for origin == -1 it escapes the nest (rewired to the
+  // flattened loop's result).
+  for (const CarriedChain &chain : info.chains) {
+    if (chain.originLevel < 0)
+      continue;
+    llvm::SmallPtrSet<Operation *, 8> postSet;
+    for (Operation *op : info.postOps[chain.originLevel])
+      postSet.insert(op);
+    for (OpOperand &use : chain.originResult.getUses())
+      if (!postSet.contains(use.getOwner()))
+        return std::nullopt;
+  }
+
+  // --- Validate pre-op operand availability. ---
+  // Pre-ops at boundary k may use: values above the nest, IV after-args of
+  // levels <= k, and earlier pre-op results (any boundary <= k).
+  {
+    llvm::SmallPtrSet<Operation *, 16> preSoFar;
+    for (unsigned k = 0; k + 1 < N; ++k) {
+      for (Operation *op : info.preOps[k]) {
+        for (Value operand : op->getOperands()) {
+          if (isDefinedAboveNest(operand, outer))
+            continue;
+          if (auto arg = dyn_cast<BlockArgument>(operand)) {
+            bool ok = false;
+            for (unsigned j = 0; j <= k; ++j)
+              if (arg == nest[j].ivAfter)
+                ok = true;
+            if (ok)
+              continue;
+            return std::nullopt;
+          }
+          if (preSoFar.contains(operand.getDefiningOp()))
+            continue;
+          return std::nullopt;
+        }
+        preSoFar.insert(op);
+      }
+    }
+  }
+
+  // Intermediate IV results and dead extras: the loops' IV results must be
+  // unused (the enclosing yield uses the addi, not the result); any other
+  // use would break after flattening.
+  for (unsigned k = 1; k < N; ++k) {
+    WhileOp loop = nest[k].loop;
+    for (unsigned r = 0; r < loop.getNumResults(); ++r) {
+      if (int(r) == int(nest[k].ivIdx)) {
+        if (!loop.getResult(r).use_empty())
+          return std::nullopt;
+        continue;
+      }
+      // Chain results were validated above; anything else unused is fine,
+      // used is not.
+      bool isChain = chainAt[k].contains(r);
+      if (!isChain && !loop.getResult(r).use_empty())
+        return std::nullopt;
+      // Threaded (non-origin) chain results are consumed by the parent's
+      // yield only — already verified during threading.
+    }
+  }
+  // The outermost loop: IV result may be used (rewired to the flat loop's
+  // result); chain results with origin -1 are rewired too. Other extras
+  // were rejected during chain construction.
+
+  return info;
 }
 
 /// A constant-coefficient linear combination of the nest's IVs:
@@ -428,12 +711,13 @@ collectAddrCandidates(WhileOp inner, ArrayRef<NestLevel> nest) {
   return result;
 }
 
-/// Emit the flattened scf.while for a collected perfect nest.
-static void emitFlattenedNest(OpBuilder &builder,
-                              ArrayRef<NestLevel> nest) {
+/// Emit the flattened scf.while for a collected (almost-)perfect nest.
+static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
+  ArrayRef<NestLevel> nest = info.levels;
   WhileOp outer = nest.front().loop;
   WhileOp inner = nest.back().loop;
   unsigned N = nest.size();
+  unsigned C = info.chains.size();
   MLIRContext *ctx = builder.getContext();
   Location loc = outer.getLoc();
 
@@ -447,11 +731,11 @@ static void emitFlattenedNest(OpBuilder &builder,
 
   builder.setInsertionPoint(outer);
 
-  // --- Inits: one per level, plus one per address candidate. ---
+  // --- Inits: one per level, one per address candidate, one per chain. ---
   SmallVector<Value> inits;
   SmallVector<Type> ivTypes;
-  inits.reserve(N + M);
-  ivTypes.reserve(N + M);
+  inits.reserve(N + M + C);
+  ivTypes.reserve(N + M + C);
   for (NestLevel lvl : nest) {
     auto cst = builder.create<arith::ConstantOp>(
         loc, lvl.ivType, IntegerAttr::get(lvl.ivType, lvl.lb));
@@ -467,6 +751,21 @@ static void emitFlattenedNest(OpBuilder &builder,
     inits.push_back(cst);
     ivTypes.push_back(cand.type);
   }
+  // Chain inits: values above the nest are used directly; constants that
+  // live inside the nest (e.g. the zero right before the reduction loop)
+  // are rematerialized here so dominance holds. The reset sites in the
+  // yield reuse the same value.
+  SmallVector<Value> chainInits;
+  for (const CarriedChain &chain : info.chains) {
+    Value init = chain.init;
+    if (!isDefinedAboveNest(init, outer)) {
+      Operation *cloned = builder.clone(*init.getDefiningOp());
+      init = cloned->getResult(cast<OpResult>(chain.init).getResultNumber());
+    }
+    chainInits.push_back(init);
+    inits.push_back(init);
+    ivTypes.push_back(init.getType());
+  }
 
   auto flat = builder.create<WhileOp>(loc, ivTypes, inits);
 
@@ -480,7 +779,7 @@ static void emitFlattenedNest(OpBuilder &builder,
   {
     Block *beforeBlock =
         builder.createBlock(&flat.getBefore(), {}, ivTypes,
-                            SmallVector<Location>(N + M, loc));
+                            SmallVector<Location>(N + M + C, loc));
     OpBuilder::InsertionGuard g(builder);
     builder.setInsertionPointToStart(beforeBlock);
 
@@ -508,15 +807,27 @@ static void emitFlattenedNest(OpBuilder &builder,
   {
     Block *afterBlock =
         builder.createBlock(&flat.getAfter(), {}, ivTypes,
-                            SmallVector<Location>(N + M, loc));
+                            SmallVector<Location>(N + M + C, loc));
     OpBuilder::InsertionGuard g(builder);
     builder.setInsertionPointToStart(afterBlock);
 
     // Map each level's after-region IV block arg to the corresponding
-    // flattened block arg.
+    // flattened block arg, and each chain's innermost after-arg to its
+    // flattened iter-arg.
     IRMapping mapping;
     for (unsigned k = 0; k < N; ++k)
       mapping.map(nest[k].ivAfter, afterBlock->getArgument(k));
+    for (unsigned c = 0; c < C; ++c)
+      mapping.map(info.chains[c].innerAfterArg,
+                  afterBlock->getArgument(N + M + c));
+
+    // Clone the boundary pre-ops (outermost boundary first, preserving
+    // program order and def-use among them). They are pure, so
+    // re-executing them every flattened iteration is safe; inner-body ops
+    // that referenced them keep working through the mapping.
+    for (unsigned k = 0; k + 1 < N; ++k)
+      for (Operation *op : info.preOps[k])
+        builder.clone(*op, mapping);
 
     // Clone the innermost body, skipping the IV update addi and the yield.
     Block *innerAfter = inner.getAfterBody();
@@ -527,6 +838,11 @@ static void emitFlattenedNest(OpBuilder &builder,
         continue;
       builder.clone(op, mapping);
     }
+
+    // The chains' updated values as visible in the flattened body.
+    SmallVector<Value> chainNext(C);
+    for (unsigned c = 0; c < C; ++c)
+      chainNext[c] = mapping.lookupOrDefault(info.chains[c].innerYieldVal);
 
     // For each promoted address candidate, replace uses of the cloned arith
     // chain with the new iter-arg, then erase the now-dead chain (no
@@ -573,6 +889,10 @@ static void emitFlattenedNest(OpBuilder &builder,
     SmallVector<Value> addrAccum(M);
     for (unsigned c = 0; c < M; ++c)
       addrAccum[c] = afterBlock->getArgument(N + c);
+    // done signal per level: doneAtLevel[k] == "levels k..N-1 all wrapped
+    // this iteration" (defined for k >= 1). Boundary k's epilogue and chain
+    // resets key off doneAtLevel[k+1].
+    SmallVector<Value> doneAtLevel(N, Value());
 
     // Innermost: unconditional contribution `stride[N-1] * step[N-1]`.
     {
@@ -667,16 +987,59 @@ static void emitFlattenedNest(OpBuilder &builder,
       ivOut[k] = builder.create<arith::SelectOp>(loc, doneHere, lbCst, ivNext);
 
       doneChild = doneHere;
+      doneAtLevel[k] = doneHere;
+    }
+
+    // --- Boundary epilogues. ---
+    // Post-ops at boundary b ran in the original program each time the
+    // levels below b completed a full pass: guard them with
+    // scf.if(doneAtLevel[b+1]). Innermost boundary first, matching original
+    // execution order when several boundaries complete on the same
+    // iteration. Chain origin results map to the chains' updated values.
+    for (unsigned c = 0; c < C; ++c)
+      mapping.map(info.chains[c].originResult, chainNext[c]);
+    for (int b = int(N) - 2; b >= 0; --b) {
+      if (info.postOps[b].empty())
+        continue;
+      auto ifOp = builder.create<scf::IfOp>(loc, doneAtLevel[b + 1],
+                                            /*withElseRegion=*/false);
+      OpBuilder::InsertionGuard g2(builder);
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      for (Operation *op : info.postOps[b])
+        builder.clone(*op, mapping);
+    }
+
+    // --- Chain yields: reset to the init when the levels below the origin
+    // wrapped (the next iteration starts a fresh pass); origin -1 chains
+    // never reset. ---
+    SmallVector<Value> chainOut(C);
+    for (unsigned c = 0; c < C; ++c) {
+      const CarriedChain &chain = info.chains[c];
+      if (chain.originLevel < 0) {
+        chainOut[c] = chainNext[c];
+        continue;
+      }
+      Value reset = doneAtLevel[chain.originLevel + 1];
+      chainOut[c] = builder.create<arith::SelectOp>(
+          loc, reset, chainInits[c], chainNext[c]);
     }
 
     SmallVector<Value> yieldOperands(ivOut.begin(), ivOut.end());
     yieldOperands.append(addrAccum.begin(), addrAccum.end());
+    yieldOperands.append(chainOut.begin(), chainOut.end());
     builder.create<YieldOp>(loc, yieldOperands);
   }
 
-  // Replace the outer while's single result with the flat loop's result[0].
-  // (All other flat results are unused.)
-  outer.getResult(0).replaceAllUsesWith(flat.getResult(0));
+  // Rewire the outer while's used results: its IV result maps to the flat
+  // loop's corresponding IV result, and origin == -1 chains map to their
+  // flat iter-arg results.
+  outer.getResult(nest.front().ivIdx)
+      .replaceAllUsesWith(flat.getResult(0));
+  for (unsigned c = 0; c < C; ++c) {
+    CarriedChain &chain = info.chains[c];
+    if (chain.originLevel == -1)
+      chain.originResult.replaceAllUsesWith(flat.getResult(N + M + c));
+  }
 
   // Erase nest from outer down; each inner sits inside its parent's after
   // region, so erasing the outer takes the whole chain with it.
@@ -711,10 +1074,10 @@ void SCFWhileLoopFlatteningPass::runOnOperation() {
   for (WhileOp op : roots) {
     if (consumed.contains(op.getOperation()))
       continue;
-    auto nest = collectPerfectNest(op);
+    auto nest = collectNest(op);
     if (!nest)
       continue;
-    for (NestLevel &lvl : *nest)
+    for (NestLevel &lvl : nest->levels)
       consumed.insert(lvl.loop.getOperation());
     emitFlattenedNest(builder, *nest);
   }

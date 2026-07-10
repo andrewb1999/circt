@@ -263,14 +263,13 @@ func.func @noncanonical_inner(%ubDyn: i32) {
 
 // -----
 
-// Negative: extra op in the outer after region (a stray addi that isn't the
-// IV update). The intermediate-level shape check rejects this.
+// Positive (since almost-perfect support): a stray PURE op after the inner
+// loop is a legal post-op; it is predicated on the inner wrap and the nest
+// still flattens.
 
 // CHECK-LABEL: func.func @outer_extra_op
 // CHECK:         scf.while
-// CHECK:         do {
-// CHECK:           scf.while
-// CHECK:         }
+// CHECK-NOT:     scf.while (
 func.func @outer_extra_op(%arg: memref<4xi32>) {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32
@@ -982,6 +981,268 @@ func.func @pipeline_attr_ii() {
       %jn = arith.addi %j, %c1 : i32
       scf.yield %jn : i32
     } attributes {hls.pipeline = 2 : i64}
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Positive (almost-perfect): matmul-style reduction. The innermost loop
+// carries an accumulator iter-arg initialized to a constant at the j/k
+// boundary and stored to memory after the k loop. Expect a single flattened
+// while with a 4th iter-arg for the accumulator, a select that RESETS it to
+// zero when k wraps, and the epilogue store inside an scf.if predicated on
+// the k wrap.
+
+// CHECK-LABEL: func.func @matmul_acc
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) : (i32, i32, i32, i32) -> (i32, i32, i32, i32)
+// CHECK:         do {
+// CHECK:           %[[SUM:.*]] = arith.addi
+// CHECK:           %[[DONEK:.*]] = arith.cmpi sge
+// CHECK:           scf.if
+// CHECK:             memref.store %[[SUM]]
+// CHECK:           %[[ACCOUT:.*]] = arith.select %{{.*}}, %{{.*}}, %[[SUM]] : i32
+// CHECK:           scf.yield
+// CHECK-NOT:     scf.while (
+func.func @matmul_acc(%A: memref<64xi32>, %B: memref<64xi32>, %C: memref<64xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %ri = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c8 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c8 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %zero = arith.constant 0 : i32
+      %rk:2 = scf.while (%k = %c0, %acc = %zero) : (i32, i32) -> (i32, i32) {
+        %ck = arith.cmpi slt, %k, %c8 : i32
+        scf.condition(%ck) %k, %acc : i32, i32
+      } do {
+      ^bb0(%k: i32, %acc: i32):
+        %ki = arith.index_cast %k : i32 to index
+        %a = memref.load %A[%ki] : memref<64xi32>
+        %b = memref.load %B[%ki] : memref<64xi32>
+        %m = arith.muli %a, %b : i32
+        %s = arith.addi %acc, %m : i32
+        %kn = arith.addi %k, %c1 : i32
+        scf.yield %kn, %s : i32, i32
+      }
+      %ji = arith.index_cast %j : i32 to index
+      memref.store %rk#1, %C[%ji] : memref<64xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Positive (almost-perfect): gemv-style, the boundary is at the OUTERMOST
+// level: acc initialized in the i body before the j loop and stored after it.
+
+// CHECK-LABEL: func.func @gemv_acc
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) : (i32, i32, i32) -> (i32, i32, i32)
+// CHECK:         do {
+// CHECK:           scf.if
+// CHECK:             memref.store
+// CHECK:           arith.select
+// CHECK-NOT:     scf.while (
+func.func @gemv_acc(%A: memref<64xi32>, %y: memref<8xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %ri = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c8 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %zero = arith.constant 0 : i32
+    %rj:2 = scf.while (%j = %c0, %acc = %zero) : (i32, i32) -> (i32, i32) {
+      %cj = arith.cmpi slt, %j, %c8 : i32
+      scf.condition(%cj) %j, %acc : i32, i32
+    } do {
+    ^bb0(%j: i32, %acc: i32):
+      %ji = arith.index_cast %j : i32 to index
+      %a = memref.load %A[%ji] : memref<64xi32>
+      %s = arith.addi %acc, %a : i32
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn, %s : i32, i32
+    }
+    %ii = arith.index_cast %i : i32 to index
+    memref.store %rj#1, %y[%ii] : memref<8xi32>
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Positive (almost-perfect): conv-style THREADING. The accumulator is
+// initialized at the outermost boundary, threads untouched through the
+// middle level's iter-args, and is updated only in the innermost body.
+
+// CHECK-LABEL: func.func @conv_threaded
+// CHECK:         scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) : (i32, i32, i32, i32) -> (i32, i32, i32, i32)
+// CHECK:         do {
+// CHECK:           scf.if
+// CHECK:             memref.store
+// CHECK:           arith.select
+// CHECK-NOT:     scf.while (
+func.func @conv_threaded(%A: memref<64xi32>, %y: memref<8xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c3 = arith.constant 3 : i32
+  %c8 = arith.constant 8 : i32
+  %ri = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c8 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %zero = arith.constant 0 : i32
+    %rkh:2 = scf.while (%kh = %c0, %acc = %zero) : (i32, i32) -> (i32, i32) {
+      %ckh = arith.cmpi slt, %kh, %c3 : i32
+      scf.condition(%ckh) %kh, %acc : i32, i32
+    } do {
+    ^bb0(%kh: i32, %acc: i32):
+      %rkw:2 = scf.while (%kw = %c0, %acc2 = %acc) : (i32, i32) -> (i32, i32) {
+        %ckw = arith.cmpi slt, %kw, %c3 : i32
+        scf.condition(%ckw) %kw, %acc2 : i32, i32
+      } do {
+      ^bb0(%kw: i32, %acc2: i32):
+        %s = arith.addi %kh, %kw : i32
+        %si = arith.index_cast %s : i32 to index
+        %a = memref.load %A[%si] : memref<64xi32>
+        %sum = arith.addi %acc2, %a : i32
+        %kwn = arith.addi %kw, %c1 : i32
+        scf.yield %kwn, %sum : i32, i32
+      }
+      %khn = arith.addi %kh, %c1 : i32
+      scf.yield %khn, %rkw#1 : i32, i32
+    }
+    %ii = arith.index_cast %i : i32 to index
+    memref.store %rkh#1, %y[%ii] : memref<8xi32>
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Positive (almost-perfect): a FULL reduction carried across the whole
+// nest (origin above the outermost loop); the outer result is consumed
+// after the nest and must be rewired to the flattened loop's result.
+
+// CHECK-LABEL: func.func @full_reduction
+// CHECK:         %[[R:.*]]:3 = scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) : (i32, i32, i32) -> (i32, i32, i32)
+// CHECK:         do {
+// CHECK-NOT:       scf.if
+// CHECK:           scf.yield
+// CHECK:         }
+// CHECK:         memref.store %[[R]]#2
+func.func @full_reduction(%A: memref<64xi32>, %y: memref<1xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %c0idx = arith.constant 0 : index
+  %r:2 = scf.while (%i = %c0, %acc = %c0) : (i32, i32) -> (i32, i32) {
+    %ci = arith.cmpi slt, %i, %c8 : i32
+    scf.condition(%ci) %i, %acc : i32, i32
+  } do {
+  ^bb0(%i: i32, %acc: i32):
+    %rj:2 = scf.while (%j = %c0, %acc2 = %acc) : (i32, i32) -> (i32, i32) {
+      %cj = arith.cmpi slt, %j, %c8 : i32
+      scf.condition(%cj) %j, %acc2 : i32, i32
+    } do {
+    ^bb0(%j: i32, %acc2: i32):
+      %ji = arith.index_cast %j : i32 to index
+      %a = memref.load %A[%ji] : memref<64xi32>
+      %s = arith.addi %acc2, %a : i32
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn, %s : i32, i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in, %rj#1 : i32, i32
+  }
+  memref.store %r#1, %y[%c0idx] : memref<1xi32>
+  return
+}
+
+// -----
+
+// Negative: the inner loop's IV RESULT is consumed by the epilogue — the
+// flattened loop has no equivalent value, so the nest must not flatten.
+
+// CHECK-LABEL: func.func @neg_iv_result_used
+// CHECK:         scf.while
+// CHECK:         do {
+// CHECK:           scf.while
+// CHECK:         }
+func.func @neg_iv_result_used(%y: memref<8xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %ri = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c8 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c8 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %ii = arith.index_cast %i : i32 to index
+    memref.store %rj, %y[%ii] : memref<8xi32>
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Negative: an IMPURE pre-op (a store before the inner loop) cannot be
+// re-executed every flattened iteration; the nest must not flatten.
+
+// CHECK-LABEL: func.func @neg_impure_preop
+// CHECK:         scf.while
+// CHECK:         do {
+// CHECK:           scf.while
+// CHECK:         }
+func.func @neg_impure_preop(%y: memref<8xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %ri = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c8 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %ii = arith.index_cast %i : i32 to index
+    memref.store %c0, %y[%ii] : memref<8xi32>
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c8 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
     %in = arith.addi %i, %c1 : i32
     scf.yield %in : i32
   }
