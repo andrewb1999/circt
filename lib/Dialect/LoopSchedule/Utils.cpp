@@ -710,14 +710,20 @@ LogicalResult recordMemoryResources(Operation *op, Region &body,
     } else if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp, LoadInterface,
                    StoreInterface>(op)) {
       std::string name;
+      // Port groups (a `!amc.port<... x N>`) declare a per-cycle capacity of N
+      // via the access op's `getLimit()`; honor it so N accesses may share the
+      // resource in one cycle. `LoopScheduleLoad/Store` are single-ported.
+      unsigned limit = 1;
       if (isa<LoopScheduleLoadOp, LoopScheduleStoreOp>(op)) {
         Value memRef = getMemref(op);
         name = "mem_" + std::to_string(hash_value(memRef));
       } else if (auto loadOp = dyn_cast<loopschedule::LoadInterface>(*op)) {
         name = loadOp.getUniqueId();
+        limit = loadOp.getLimit().value_or(1);
       } else {
         auto storeOp = cast<loopschedule::StoreInterface>(*op);
         name = storeOp.getUniqueId();
+        limit = storeOp.getLimit().value_or(1);
       }
       if (!ifOps.empty()) {
         auto &ifOpTypes = ifOps.back();
@@ -725,7 +731,7 @@ LogicalResult recordMemoryResources(Operation *op, Region &body,
         std::string memRsrc = name + "_" + getUnqiueName(ifOp) +
                               (ifOpTypes->inThen ? "then" : "else");
         resourceMap[op].push_back(memRsrc);
-        resourceLimits.insert(std::pair(memRsrc, 1));
+        resourceLimits.insert(std::pair(memRsrc, limit));
         auto &thenOrElseMap =
             ifOpTypes->inThen ? ifOpTypes->thenTypes : ifOpTypes->elseTypes;
         for (const auto &opr : thenOrElseMap[name]) {
@@ -734,7 +740,7 @@ LogicalResult recordMemoryResources(Operation *op, Region &body,
         thenOrElseMap[name].push_back(memRsrc);
       } else {
         finalTypes[name].push_back(name);
-        resourceLimits.insert(std::pair(name, 1));
+        resourceLimits.insert(std::pair(name, limit));
       }
 
       for (const auto &opr : finalTypes[name]) {
