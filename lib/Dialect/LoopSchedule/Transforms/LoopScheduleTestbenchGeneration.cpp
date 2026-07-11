@@ -37,19 +37,35 @@ using namespace circt::loopschedule;
 
 namespace {
 
-/// A group of memory ports sharing a common prefix. Only 1-D I/O memories
-/// are supported here — multi-dim memrefs would need a richer testbench
-/// model and are intentionally rejected.
-struct MemPortGroup {
-  std::string name;       // e.g. "mem0"
-  hw::PortInfo rdData;    // input: read data
-  hw::PortInfo addr;      // output: address (mem<i>_addr)
-  hw::PortInfo wrData;    // output: write data
-  hw::PortInfo wrEn;      // output: write enable
-  // Optional read enable (mem<i>_rd_en). When present, the behavioral
+/// One physical access port of a memory. A memory with `count > 1` (a
+/// dual-port BRAM arg) exposes several of these over the same backing array,
+/// so the read/write drive is generated per physical port while the array,
+/// hex init, and `@MEM` dump stay per logical memory.
+struct MemPort {
+  std::string physPrefix; // "mem0" (AMC) or "mem0_bram0"/"mem0_bram1" (BRAM)
+  hw::PortInfo rdData;     // input: read data (AMC: _rd_data, BRAM: _dout)
+  hw::PortInfo addr;       // output: address
+  hw::PortInfo wrData;     // output: write data (AMC: _wr_data, BRAM: _din)
+  hw::PortInfo wrEn;       // output: write enable (AMC: _wr_en, BRAM: _we)
+  // Optional AMC read enable (mem<i>_rd_en). When present, the behavioral
   // memory only updates its read register on enabled cycles (BRAM hold
   // semantics); absent (older DUTs) means always-enabled.
   hw::PortInfo rdEn;
+  // Xilinx-BRAM chip-enable (= rd_en | wr_en); the effective read-enable is
+  // recovered as `en & ~we`.
+  hw::PortInfo en;
+};
+
+/// A logical memory at the DUT boundary and its one-or-more physical ports.
+/// Only 1-D I/O memories are supported — multi-dim memrefs would need a richer
+/// testbench model and are intentionally rejected.
+struct MemPortGroup {
+  std::string name;       // e.g. "mem0"
+  // Xilinx-BRAM adapter interface (see lib/Support/BramInterfaceGen.cpp):
+  // the boundary speaks addr/en/we/din/dout instead of the AMC memory-port
+  // protocol. `isBram` selects that decoding.
+  bool isBram = false;
+  llvm::SmallVector<MemPort, 2> ports;
   unsigned addrWidth;     // address bits
   unsigned depth;         // 2^addrWidth
   Type dataType;          // element type
@@ -99,20 +115,22 @@ classifyMemoryPorts(const SmallVector<hw::PortInfo> &dutPorts) {
   for (auto &prefix : prefixes) {
     MemPortGroup group;
     group.name = prefix;
+    MemPort mp;
+    mp.physPrefix = prefix;
     bool multiDim = false;
 
     for (auto &port : dutPorts) {
       StringRef pname = port.getName();
       if (pname == prefix + "_rd_data")
-        group.rdData = port;
+        mp.rdData = port;
       else if (pname == prefix + "_addr")
-        group.addr = port;
+        mp.addr = port;
       else if (pname == prefix + "_wr_data")
-        group.wrData = port;
+        mp.wrData = port;
       else if (pname == prefix + "_wr_en")
-        group.wrEn = port;
+        mp.wrEn = port;
       else if (pname == prefix + "_rd_en")
-        group.rdEn = port;
+        mp.rdEn = port;
       else if (pname.starts_with(prefix + "_addr_"))
         multiDim = true;
     }
@@ -120,15 +138,82 @@ classifyMemoryPorts(const SmallVector<hw::PortInfo> &dutPorts) {
     if (multiDim)
       continue;
 
-    // Verify all four ports exist.
-    if (group.rdData.getName().empty() || group.addr.getName().empty() ||
-        group.wrData.getName().empty() || group.wrEn.getName().empty())
+    // Verify all four ports exist (a null port name means not found).
+    if (!mp.rdData.name || !mp.addr.name || !mp.wrData.name || !mp.wrEn.name)
       continue;
 
-    group.dataType = group.rdData.type;
-    group.addrWidth = cast<IntegerType>(group.addr.type).getWidth();
+    group.dataType = mp.rdData.type;
+    group.addrWidth = cast<IntegerType>(mp.addr.type).getWidth();
     group.depth = 1u << group.addrWidth;
+    group.ports.push_back(mp);
     groups.push_back(group);
+  }
+  return groups;
+}
+
+/// Detect external Block-RAM adapter port groups from DUT ports. The
+/// `amc.memory_ref` → `amc.expand_ref` → `buildBramInterface` path exposes a
+/// single logical memory `mem<i>` as one or more physical BRAM ports named
+/// `mem<i>_bram<k>_{addr,en,we,din,dout}` (see BramInterfaceGen.cpp). Each
+/// physical port drives the shared backing array independently; a dual-port
+/// (multi-access) arg yields two ports over one memory.
+static SmallVector<MemPortGroup, 2>
+classifyBramMemoryPorts(const SmallVector<hw::PortInfo> &dutPorts) {
+  // Candidate logical names from `bram0`'s data ports: `_bram0_dout`
+  // (readable) or, for write-only memories, `_bram0_din`.
+  SmallVector<std::string> names;
+  llvm::SmallDenseSet<StringRef> seenName;
+  for (auto &port : dutPorts) {
+    StringRef pname = port.getName();
+    StringRef base;
+    if (pname.ends_with("_bram0_dout"))
+      base = pname.drop_back(11); // "_bram0_dout"
+    else if (pname.ends_with("_bram0_din"))
+      base = pname.drop_back(10); // "_bram0_din"
+    else
+      continue;
+    if (seenName.insert(base).second)
+      names.push_back(base.str());
+  }
+
+  SmallVector<MemPortGroup, 2> groups;
+  for (auto &name : names) {
+    MemPortGroup group;
+    group.name = name;
+    group.isBram = true;
+    // Gather every physical port `<name>_bram<k>_*`, in ascending k order.
+    for (unsigned k = 0;; ++k) {
+      std::string p = name + "_bram" + std::to_string(k);
+      MemPort mp;
+      mp.physPrefix = p;
+      for (auto &port : dutPorts) {
+        StringRef pn = port.getName();
+        if (pn == p + "_addr")
+          mp.addr = port;
+        else if (pn == p + "_dout")
+          mp.rdData = port;
+        else if (pn == p + "_din")
+          mp.wrData = port;
+        else if (pn == p + "_we")
+          mp.wrEn = port;
+        else if (pn == p + "_en")
+          mp.en = port;
+      }
+      // Address + chip-enable are mandatory for a real port; their absence
+      // (a null port name on the default-constructed PortInfo) means we've
+      // run past the last physical port.
+      if (!mp.addr.name || !mp.en.name)
+        break;
+      if (group.ports.empty()) {
+        // Element type / depth are memory-wide; take them from the first port.
+        group.dataType = mp.rdData.name ? mp.rdData.type : mp.wrData.type;
+        group.addrWidth = cast<IntegerType>(mp.addr.type).getWidth();
+        group.depth = 1u << group.addrWidth;
+      }
+      group.ports.push_back(mp);
+    }
+    if (!group.ports.empty())
+      groups.push_back(group);
   }
   return groups;
 }
@@ -137,10 +222,18 @@ classifyMemoryPorts(const SmallVector<hw::PortInfo> &dutPorts) {
 static bool isMemoryPort(StringRef name,
                          const SmallVectorImpl<MemPortGroup> &memGroups) {
   for (auto &g : memGroups) {
-    if (name == g.name + "_rd_data" || name == g.name + "_addr" ||
-        name == g.name + "_wr_data" || name == g.name + "_wr_en" ||
-        name == g.name + "_rd_en")
-      return true;
+    for (auto &mp : g.ports) {
+      const std::string &p = mp.physPrefix;
+      if (g.isBram) {
+        if (name == p + "_addr" || name == p + "_en" || name == p + "_we" ||
+            name == p + "_din" || name == p + "_dout")
+          return true;
+      } else if (name == p + "_rd_data" || name == p + "_addr" ||
+                 name == p + "_wr_data" || name == p + "_wr_en" ||
+                 name == p + "_rd_en") {
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -463,6 +556,11 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
 
   auto dutPorts = dutMod.getPortList();
   auto memGroups = classifyMemoryPorts(dutPorts);
+  // External Block-RAM adapter memories (amc.memory_ref args lowered via
+  // buildBramInterface) present a different boundary protocol; fold them into
+  // the same group list so the drive/dump logic below treats them uniformly.
+  for (auto &g : classifyBramMemoryPorts(dutPorts))
+    memGroups.push_back(g);
 
   // axil_handshake DUTs (wrapped by amc-insert-axi-lite-control) have no raw
   // start/ready/done handshake; they are driven through their s_axilite
@@ -748,6 +846,10 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   // We'll collect memory read values to connect after instance creation.
   // Use DenseMap to track which DUT input index corresponds to which mem group.
   DenseMap<StringRef, unsigned> memRdDataInputIdx;
+  // Per physical read port: the sv.wire feeding its rd_data/dout DUT input,
+  // keyed by the port's physical prefix (`mem0`, or `mem0_bram1` for the 2nd
+  // port of a dual-port BRAM). Assigned from the registered array read below.
+  DenseMap<StringRef, Value> physRdWire;
 
   // AXI: wires feeding the DUT's slave->master inputs (assigned from the
   // slave instances below) and the DUT's master->slave output values.
@@ -776,30 +878,25 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
       Value ctrlVal = sv::ReadInOutOp::create(builder, loc, ctrlWire);
       dutInputs.push_back(ctrlVal);
       ctrlInWires[port.getName()] = ctrlWire;
-    } else if (port.getName().ends_with("_rd_data")) {
+    } else if (port.getName().ends_with("_rd_data") ||
+               port.getName().ends_with("_dout")) {
       // Memory read data — placeholder; will be wired after instance.
-      // We need a zero constant of the right type as placeholder.
-      // Actually, we can't modify instance inputs after creation.
-      // Instead, use the combinational memory read path.
-      // The read depends on the addr output of the instance, but we
-      // haven't created the instance yet.
-      //
-      // The correct approach: create the memory read wire first,
-      // and use a backedge-like pattern. But hw.instance doesn't
-      // support backedges.
-      //
-      // Standard solution: use an sv.wire for the read data, feed it
-      // to the instance, then assign it combinationally from mem[addr].
-      StringRef prefix = port.getName().drop_back(8); // remove "_rd_data"
+      // hw.instance inputs can't be back-patched, so feed the DUT an sv.wire
+      // now and assign it after the instance from the registered array read.
+      // Key the wire by the PHYSICAL port prefix: `<mem>_rd_data` (AMC) or
+      // `<mem>_bram<k>_dout` (BRAM), so each port of a dual-port memory gets
+      // its own read path.
+      StringRef pn = port.getName();
+      StringRef prefix = pn.ends_with("_dout")
+                             ? pn.drop_back(5)  // "_dout"
+                             : pn.drop_back(8); // "_rd_data"
       auto rdWire = sv::WireOp::create(builder, loc, port.type,
                                        builder.getStringAttr(
                                            prefix.str() + "_rd_wire"));
       Value rdVal = sv::ReadInOutOp::create(builder, loc, rdWire);
       dutInputs.push_back(rdVal);
       memRdDataInputIdx[prefix] = dutInputs.size() - 1;
-
-      // Store the wire so we can assign to it later.
-      memInfoMap[prefix].readVal = rdWire; // reuse readVal to store the wire
+      physRdWire[prefix] = rdWire;
     } else if (isAxiPort(port.getName())) {
       // AXI slave->master signal: a wire assigned from the per-bundle slave
       // instance after the DUT instance exists.
@@ -828,34 +925,63 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   DenseMap<StringRef, Value> memWrDataValues;
   DenseMap<StringRef, Value> memWrEnValues;
   DenseMap<StringRef, Value> memRdEnValues;
+  DenseMap<StringRef, Value> memBramEnValues; // BRAM chip-enable (en)
 
+  // Memory value maps are keyed by PHYSICAL port prefix (`mem0`, or
+  // `mem0_bram1` for the 2nd port of a dual-port BRAM) so each physical port
+  // of a memory drives independently.
   unsigned outIdx = 0;
   for (auto &port : dutPorts) {
     if (!port.isOutput())
       continue;
     Value result = dutInst.getResult(outIdx++);
-    if (port.getName() == "done") {
+    StringRef pn = port.getName();
+    // Order matters: the AMC `_wr_en`/`_rd_en` suffixes also end in `_en`, so
+    // match them before the BRAM chip-enable `_en`.
+    if (pn == "done") {
       doneVal = result;
-    } else if (port.getName() == "ready") {
+    } else if (pn == "ready") {
       readyVal = result;
-    } else if (ctrlHs && isCtrlSlavePort(port.getName())) {
-      ctrlOutVals[port.getName()] = result;
-    } else if (isAxiPort(port.getName())) {
-      axiOutVals[port.getName()] = result;
-    } else if (port.getName().ends_with("_addr")) {
-      StringRef prefix = port.getName().drop_back(5); // remove "_addr"
-      memAddrValues[prefix] = result;
-    } else if (port.getName().ends_with("_wr_data")) {
-      StringRef prefix = port.getName().drop_back(8); // remove "_wr_data"
-      memWrDataValues[prefix] = result;
-    } else if (port.getName().ends_with("_wr_en")) {
-      StringRef prefix = port.getName().drop_back(6); // remove "_wr_en"
-      memWrEnValues[prefix] = result;
-    } else if (port.getName().ends_with("_rd_en")) {
-      StringRef prefix = port.getName().drop_back(6); // remove "_rd_en"
-      memRdEnValues[prefix] = result;
+    } else if (ctrlHs && isCtrlSlavePort(pn)) {
+      ctrlOutVals[pn] = result;
+    } else if (isAxiPort(pn)) {
+      axiOutVals[pn] = result;
+    } else if (pn.ends_with("_wr_data")) {
+      memWrDataValues[pn.drop_back(8)] = result; // AMC write data
+    } else if (pn.ends_with("_wr_en")) {
+      memWrEnValues[pn.drop_back(6)] = result; // AMC write enable
+    } else if (pn.ends_with("_rd_en")) {
+      memRdEnValues[pn.drop_back(6)] = result; // AMC read enable
+    } else if (pn.ends_with("_din")) {
+      memWrDataValues[pn.drop_back(4)] = result; // BRAM write data
+    } else if (pn.ends_with("_we")) {
+      memWrEnValues[pn.drop_back(3)] = result; // BRAM write enable
+    } else if (pn.ends_with("_en")) {
+      memBramEnValues[pn.drop_back(3)] = result; // BRAM chip enable
+    } else if (pn.ends_with("_addr")) {
+      memAddrValues[pn.drop_back(5)] = result; // address (AMC + BRAM)
     } else {
       scalarOutputValues.push_back(result);
+    }
+  }
+
+  // For BRAM ports, recover the effective read-enable as `en & ~we` (the
+  // adapter drives `en = rd_en | wr_en`, `we = wr_en`). This feeds the read
+  // register's hold gating exactly like an AMC `rd_en` port.
+  for (auto &group : memGroups) {
+    if (!group.isBram)
+      continue;
+    for (auto &mp : group.ports) {
+      Value en = memBramEnValues.lookup(mp.physPrefix);
+      if (!en)
+        continue;
+      Value we = memWrEnValues.lookup(mp.physPrefix);
+      Value rdEn = en;
+      if (we) {
+        Value notWe = comb::XorOp::create(builder, loc, we, trueVal);
+        rdEn = comb::AndOp::create(builder, loc, en, notWe);
+      }
+      memRdEnValues[mp.physPrefix] = rdEn;
     }
   }
 
@@ -875,53 +1001,62 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   auto partAddrType = builder.getIntegerType(partAddrWidth);
   for (auto &group : memGroups) {
     auto &info = memInfoMap[group.name];
-    Value addr = memAddrValues[group.name];
-    // Width-extend the DUT addr (group.addrWidth) and the issue count
-    // (i32) to a common width that fits MAX_N_TXNS * group.depth.
-    Value addrExt = comb::ConcatOp::create(
-        builder, loc,
-        ValueRange{hw::ConstantOp::create(
-                       builder, loc,
-                       builder.getIntegerType(partAddrWidth - group.addrWidth),
-                       0),
-                   addr});
-    Value txnExt = comb::ExtractOp::create(builder, loc, partAddrType,
-                                            shiftForMem(group.name), 0);
-    Value kConst = hw::ConstantOp::create(
-        builder, loc, partAddrType, group.depth);
-    Value shift = comb::MulOp::create(builder, loc, txnExt, kConst);
-    Value effectiveAddr =
-        comb::AddOp::create(builder, loc, shift, addrExt);
-    Value elemRef =
-        sv::ArrayIndexInOutOp::create(builder, loc, info.reg, effectiveAddr);
-    Value rdData = sv::ReadInOutOp::create(builder, loc, elemRef);
-    // BRAM-port contract: external memories present latency-1 registered
-    // reads. Register the (transaction-shifted) array read so rd_data is
-    // valid the cycle AFTER the DUT presents the address, exactly like a
-    // synchronous BRAM. When the DUT exposes a read enable, the register
-    // only updates on enabled cycles, so the last read value HOLDS between
-    // reads (ram_1rw-style content_en semantics). The index and address
-    // are sampled together in the issue cycle, so the read-shift
-    // transaction selection stays coherent.
-    auto rdReg = sv::RegOp::create(
-        builder, loc, group.dataType,
-        builder.getStringAttr(group.name + "_rd_reg"));
-    auto rdEnIt = memRdEnValues.find(group.name);
-    Value rdEnVal = rdEnIt != memRdEnValues.end() ? rdEnIt->second : Value();
-    sv::AlwaysFFOp::create(builder, loc, sv::EventControl::AtPosEdge, clk,
-                           [&] {
-                             if (rdEnVal) {
-                               sv::IfOp::create(builder, loc, rdEnVal, [&] {
+    // One read path per PHYSICAL read port; all share this memory's array and
+    // transaction read-shift. Write-only ports have no rd wire and are skipped.
+    for (auto [pi, mp] : llvm::enumerate(group.ports)) {
+      Value rdWire = physRdWire.lookup(mp.physPrefix);
+      if (!rdWire)
+        continue;
+      Value addr = memAddrValues[mp.physPrefix];
+      // Width-extend the DUT addr (group.addrWidth) and the issue count
+      // (i32) to a common width that fits MAX_N_TXNS * group.depth.
+      Value addrExt = comb::ConcatOp::create(
+          builder, loc,
+          ValueRange{hw::ConstantOp::create(
+                         builder, loc,
+                         builder.getIntegerType(partAddrWidth -
+                                                group.addrWidth),
+                         0),
+                     addr});
+      Value txnExt = comb::ExtractOp::create(builder, loc, partAddrType,
+                                              shiftForMem(group.name), 0);
+      Value kConst = hw::ConstantOp::create(
+          builder, loc, partAddrType, group.depth);
+      Value shift = comb::MulOp::create(builder, loc, txnExt, kConst);
+      Value effectiveAddr =
+          comb::AddOp::create(builder, loc, shift, addrExt);
+      Value elemRef =
+          sv::ArrayIndexInOutOp::create(builder, loc, info.reg, effectiveAddr);
+      Value rdData = sv::ReadInOutOp::create(builder, loc, elemRef);
+      // BRAM-port contract: external memories present latency-1 registered
+      // reads. Register the (transaction-shifted) array read so rd_data is
+      // valid the cycle AFTER the DUT presents the address, exactly like a
+      // synchronous BRAM. When the DUT exposes a read enable, the register
+      // only updates on enabled cycles, so the last read value HOLDS between
+      // reads (ram_1rw-style content_en semantics). The index and address
+      // are sampled together in the issue cycle, so the read-shift
+      // transaction selection stays coherent.
+      auto rdReg = sv::RegOp::create(
+          builder, loc, group.dataType,
+          builder.getStringAttr(mp.physPrefix + "_rd_reg"));
+      auto rdEnIt = memRdEnValues.find(mp.physPrefix);
+      Value rdEnVal =
+          rdEnIt != memRdEnValues.end() ? rdEnIt->second : Value();
+      sv::AlwaysFFOp::create(builder, loc, sv::EventControl::AtPosEdge, clk,
+                             [&] {
+                               if (rdEnVal) {
+                                 sv::IfOp::create(builder, loc, rdEnVal, [&] {
+                                   sv::PAssignOp::create(builder, loc, rdReg,
+                                                         rdData);
+                                 });
+                               } else {
                                  sv::PAssignOp::create(builder, loc, rdReg,
                                                        rdData);
-                               });
-                             } else {
-                               sv::PAssignOp::create(builder, loc, rdReg,
-                                                     rdData);
-                             }
-                           });
-    Value rdRegVal = sv::ReadInOutOp::create(builder, loc, rdReg);
-    sv::AssignOp::create(builder, loc, info.readVal, rdRegVal);
+                               }
+                             });
+      Value rdRegVal = sv::ReadInOutOp::create(builder, loc, rdReg);
+      sv::AssignOp::create(builder, loc, rdWire, rdRegVal);
+    }
   }
 
   // --- AXI slave instances: one behavioral slave per bundle ---
@@ -1175,45 +1310,52 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
               // bump the counter. The Tth write to address A goes to
               // transaction T's partition. Pipeline ordering preserves
               // per-(mem,addr) issue order, so the count = the txn id
-              // for that write.
+              // for that write. Each physical port of a dual-port memory
+              // writes the shared array independently (the scheduler
+              // guarantees the two ports never target the same address in
+              // the same cycle).
               for (auto &group : memGroups) {
                 auto &info = memInfoMap[group.name];
-                Value wrEn = memWrEnValues[group.name];
-                Value addr = memAddrValues[group.name];
-                Value wrData = memWrDataValues[group.name];
+                for (auto &mp : group.ports) {
+                  Value wrEn = memWrEnValues.lookup(mp.physPrefix);
+                  Value wrData = memWrDataValues.lookup(mp.physPrefix);
+                  if (!wrEn || !wrData)
+                    continue; // read-only port
+                  Value addr = memAddrValues[mp.physPrefix];
 
-                sv::IfOp::create(builder, loc, wrEn, [&] {
-                  // Lookup current write count for this address.
-                  Value cntElemRef = sv::ArrayIndexInOutOp::create(
-                      builder, loc, info.writeCntReg, addr);
-                  Value cntVal =
-                      sv::ReadInOutOp::create(builder, loc, cntElemRef);
-                  // Compute effective address = cnt * K + addr.
-                  Value cntTrunc = comb::ExtractOp::create(
-                      builder, loc, partAddrType, cntVal, 0);
-                  Value kConst = hw::ConstantOp::create(
-                      builder, loc, partAddrType, group.depth);
-                  Value shift =
-                      comb::MulOp::create(builder, loc, cntTrunc, kConst);
-                  Value addrExt = comb::ConcatOp::create(
-                      builder, loc,
-                      ValueRange{hw::ConstantOp::create(
-                                     builder, loc,
-                                     builder.getIntegerType(partAddrWidth -
-                                                             group.addrWidth),
-                                     0),
-                                 addr});
-                  Value effectiveAddr =
-                      comb::AddOp::create(builder, loc, shift, addrExt);
-                  Value elemRef = sv::ArrayIndexInOutOp::create(
-                      builder, loc, info.reg, effectiveAddr);
-                  sv::PAssignOp::create(builder, loc, elemRef, wrData);
-                  // Increment the counter for this address.
-                  Value cntPlus1 = comb::AddOp::create(
-                      builder, loc, cntVal,
-                      hw::ConstantOp::create(builder, loc, i32Type, 1));
-                  sv::PAssignOp::create(builder, loc, cntElemRef, cntPlus1);
-                });
+                  sv::IfOp::create(builder, loc, wrEn, [&] {
+                    // Lookup current write count for this address.
+                    Value cntElemRef = sv::ArrayIndexInOutOp::create(
+                        builder, loc, info.writeCntReg, addr);
+                    Value cntVal =
+                        sv::ReadInOutOp::create(builder, loc, cntElemRef);
+                    // Compute effective address = cnt * K + addr.
+                    Value cntTrunc = comb::ExtractOp::create(
+                        builder, loc, partAddrType, cntVal, 0);
+                    Value kConst = hw::ConstantOp::create(
+                        builder, loc, partAddrType, group.depth);
+                    Value shift =
+                        comb::MulOp::create(builder, loc, cntTrunc, kConst);
+                    Value addrExt = comb::ConcatOp::create(
+                        builder, loc,
+                        ValueRange{hw::ConstantOp::create(
+                                       builder, loc,
+                                       builder.getIntegerType(partAddrWidth -
+                                                               group.addrWidth),
+                                       0),
+                                   addr});
+                    Value effectiveAddr =
+                        comb::AddOp::create(builder, loc, shift, addrExt);
+                    Value elemRef = sv::ArrayIndexInOutOp::create(
+                        builder, loc, info.reg, effectiveAddr);
+                    sv::PAssignOp::create(builder, loc, elemRef, wrData);
+                    // Increment the counter for this address.
+                    Value cntPlus1 = comb::AddOp::create(
+                        builder, loc, cntVal,
+                        hw::ConstantOp::create(builder, loc, i32Type, 1));
+                    sv::PAssignOp::create(builder, loc, cntElemRef, cntPlus1);
+                  });
+                }
               }
 
               // Done handling: count pulses; only dump+finish on the
