@@ -769,60 +769,18 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                                       builder.getStringAttr("tb_done_count"));
   Value doneCntVal = sv::ReadInOutOp::create(builder, loc, doneCntReg);
 
-  // Per-memory read-shift register chain. Each memory's read shift is
-  // taken from `chain[max_read_stage_for_that_mem]`, where:
-  //   chain[0] : increments on every accepted `start`. At cycle T it
-  //              equals the txn currently entering stage 0.
-  //   chain[s] : registered copy of chain[s-1] (1-cycle delay). At cycle
-  //              T it equals the txn currently at stage s.
-  // This works for any II as long as the kernel is structurally valid
-  // (max read stage < II + min read stage), which the scheduler enforces.
-  //
-  // The DUT carries a `loopschedule.mem_read_stages` attribute (an int
-  // array, one entry per mem<i> in port order) that names the max read
-  // stage for each memory. Older DUTs (e.g. sequential funcs lowered
-  // before this attr existed) fall back to chain[0] for everything.
-  ArrayAttr memReadStagesAttr =
-      dutMod->getAttrOfType<ArrayAttr>("loopschedule.mem_read_stages");
-  unsigned maxReadStage = 0;
-  if (memReadStagesAttr) {
-    for (auto attr : memReadStagesAttr) {
-      auto intAttr = dyn_cast<IntegerAttr>(attr);
-      if (!intAttr)
-        continue;
-      maxReadStage = std::max(maxReadStage, (unsigned)intAttr.getInt());
-    }
-  }
-
-  SmallVector<sv::RegOp> shiftChainRegs(maxReadStage + 1);
-  SmallVector<Value> shiftChainVals(maxReadStage + 1);
-  for (unsigned s = 0; s <= maxReadStage; ++s) {
-    shiftChainRegs[s] = sv::RegOp::create(
-        builder, loc, i32Type,
-        builder.getStringAttr("tb_read_shift_s" + std::to_string(s)));
-    shiftChainVals[s] =
-        sv::ReadInOutOp::create(builder, loc, shiftChainRegs[s]);
-  }
-
-  // Map mem<i> name → chain index (= the memory's max read stage).
-  DenseMap<StringRef, unsigned> memShiftStage;
-  if (memReadStagesAttr) {
-    for (auto [i, attr] : llvm::enumerate(memReadStagesAttr)) {
-      auto intAttr = dyn_cast<IntegerAttr>(attr);
-      if (!intAttr)
-        continue;
-      std::string name = "mem" + std::to_string(i);
-      memShiftStage[StringAttr::get(ctx, name).strref()] =
-          (unsigned)intAttr.getInt();
-    }
-  }
-  auto shiftForMem = [&](StringRef memName) -> Value {
-    auto it = memShiftStage.find(memName);
-    unsigned s = (it != memShiftStage.end()) ? it->second : 0;
-    if (s >= shiftChainVals.size())
-      s = shiftChainVals.size() - 1;
-    return shiftChainVals[s];
-  };
+  // Transaction-slot register: which transaction's memory image serves
+  // reads. It increments on each accepted `start` (or on `done` under
+  // axil_handshake — see the always_ff below), so at cycle T it equals
+  // the id of the currently-executing transaction. A single register
+  // suffices because at most one transaction's reads are ever in flight
+  // per memory: sequential functions serialize transactions on done, and
+  // func-level pipelining rejects memory arguments outright (a memory
+  // argument has no per-transaction identity, so overlapped transactions
+  // would each need their own memory image — unsupported).
+  auto txnSlotReg = sv::RegOp::create(
+      builder, loc, i32Type, builder.getStringAttr("tb_txn_slot"));
+  Value txnSlotVal = sv::ReadInOutOp::create(builder, loc, txnSlotReg);
 
   // --- Build DUT instance operands ---
   // We need to wire: clk, rst, start, scalar inputs, memory rd_data.
@@ -1019,7 +977,7 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                          0),
                      addr});
       Value txnExt = comb::ExtractOp::create(builder, loc, partAddrType,
-                                              shiftForMem(group.name), 0);
+                                              txnSlotVal, 0);
       Value kConst = hw::ConstantOp::create(
           builder, loc, partAddrType, group.depth);
       Value shift = comb::MulOp::create(builder, loc, txnExt, kConst);
@@ -1239,8 +1197,7 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                   hw::ConstantOp::create(builder, loc, i32Type, 0);
               sv::PAssignOp::create(builder, loc, issueCntReg, c0_i32);
               sv::PAssignOp::create(builder, loc, doneCntReg, c0_i32);
-              for (auto &reg : shiftChainRegs)
-                sv::PAssignOp::create(builder, loc, reg, c0_i32);
+              sv::PAssignOp::create(builder, loc, txnSlotReg, c0_i32);
               if (!axiBundles.empty()) {
                 sv::PAssignOp::create(builder, loc, axiDumpReg, falseVal);
                 sv::PAssignOp::create(
@@ -1270,39 +1227,31 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                     comb::AddOp::create(builder, loc, issueCntVal, c1);
                 sv::PAssignOp::create(builder, loc, issueCntReg, nextIssue);
               });
-              // Read-shift chain. chain[0] increments on accepted start
-              // (clamped to numTxns-1 so it stays valid for last-txn
-              // reads). chain[s>=1] copies chain[s-1] every cycle, so
-              // chain[s] at cycle T = chain[0] at cycle T-s = txn ID
-              // currently at stage s.
+              // Transaction slot. Increments on accepted start (clamped
+              // to numTxns-1 so it stays valid for last-txn reads).
               //
               // axil_handshake: the BFM's start pulse fires when the ap_start
               // WRITE completes — a few cycles before the kernel's internal
               // start, so a start-keyed bump would already point past the
               // txn whose reads are about to issue. Transactions are
               // strictly serialized under axil_handshake, so key the bump off
-              // the DONE pulse instead: chain[0] then simply holds the
+              // the DONE pulse instead: the slot then simply holds the
               // id of the txn currently executing.
               {
-                Value chainBump = ctrlHs ? doneVal : startVal;
+                Value slotBump = ctrlHs ? doneVal : startVal;
                 Value c1 =
                     hw::ConstantOp::create(builder, loc, i32Type, 1);
-                Value nextChain0 = comb::AddOp::create(
-                    builder, loc, shiftChainVals[0], c1);
+                Value nextSlot = comb::AddOp::create(
+                    builder, loc, txnSlotVal, c1);
                 Value moreAfter = comb::ICmpOp::create(
-                    builder, loc, comb::ICmpPredicate::ult, nextChain0,
+                    builder, loc, comb::ICmpPredicate::ult, nextSlot,
                     numTxns);
-                Value chain0Bumped = comb::MuxOp::create(
-                    builder, loc, moreAfter, nextChain0,
-                    shiftChainVals[0]);
-                Value nextChain0Final = comb::MuxOp::create(
-                    builder, loc, chainBump, chain0Bumped,
-                    shiftChainVals[0]);
-                sv::PAssignOp::create(builder, loc, shiftChainRegs[0],
-                                       nextChain0Final);
-                for (unsigned s = 1; s < shiftChainRegs.size(); ++s)
-                  sv::PAssignOp::create(builder, loc, shiftChainRegs[s],
-                                         shiftChainVals[s - 1]);
+                Value slotBumped = comb::MuxOp::create(
+                    builder, loc, moreAfter, nextSlot, txnSlotVal);
+                Value nextSlotFinal = comb::MuxOp::create(
+                    builder, loc, slotBump, slotBumped, txnSlotVal);
+                sv::PAssignOp::create(builder, loc, txnSlotReg,
+                                       nextSlotFinal);
               }
 
               // Memory writes: when wr_en high, look up per-addr write

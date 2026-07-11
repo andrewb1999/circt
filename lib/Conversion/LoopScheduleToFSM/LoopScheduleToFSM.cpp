@@ -524,6 +524,33 @@ computeOpCycleLatency(Operation *def,
   return operatorLibrary->getOperatorLatency(opName);
 }
 
+/// Value-sensitive variant of `computeOpCycleLatency`: looks through
+/// `loopschedule.if` wrappers to the op that actually produces the value.
+/// Predication gates side effects but adds no cycles, so an if-wrapped
+/// multi-cycle operator's result is live exactly when the bare operator's
+/// would be. Without the look-through, an if-wrapped latency-L result
+/// reports 0 and picks up a spurious stage register on top of the
+/// operator's internal pipeline, skewing every downstream consumer by one
+/// cycle (first seen when loop flattening began predicating compute
+/// epilogues, e.g. gesummv's `y[i] = alpha*accA + beta*accB`).
+static unsigned
+computeValueCycleLatency(Value v,
+                         analysis::OperatorLibraryAnalysis *operatorLibrary) {
+  Operation *def = v.getDefiningOp();
+  while (auto ifOp = dyn_cast_or_null<LoopScheduleIfOp>(def)) {
+    auto yieldOp =
+        dyn_cast<LoopScheduleYieldOp>(ifOp.getBody().front().getTerminator());
+    if (!yieldOp)
+      return 0;
+    unsigned idx = cast<OpResult>(v).getResultNumber();
+    if (idx >= yieldOp.getNumOperands())
+      return 0;
+    v = yieldOp.getOperand(idx);
+    def = v.getDefiningOp();
+  }
+  return computeOpCycleLatency(def, operatorLibrary);
+}
+
 /// Materializes the cross-stage delay registers needed when a value
 /// produced at stage J is consumed at stage K with K > J + L + 1
 /// (where L is the producing op's cycle latency). Owns the per-value
@@ -610,8 +637,7 @@ private:
     unsigned idx = result.getResultNumber();
     if (idx >= yieldOp.getNumOperands())
       return 0;
-    return computeOpCycleLatency(yieldOp.getOperand(idx).getDefiningOp(),
-                                  operatorLibrary);
+    return computeValueCycleLatency(yieldOp.getOperand(idx), operatorLibrary);
   }
 
   OpBuilder &builder;
@@ -4332,7 +4358,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // register here; `resolveForStage` uses `readyStage = J+L` so
       // stage-J+L consumers read the wrapper output directly and
       // further stages pick it up via delay registers.
-      if (computeOpCycleLatency(val.getDefiningOp(), operatorLibrary) > 0) {
+      if (computeValueCycleLatency(val, operatorLibrary) > 0) {
         mapping.map(stageOp.getResult(regIdx), mappedVal);
         continue;
       }
@@ -5321,16 +5347,40 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   // handled per-entry as children; `at` ops that carry real compute coexist
   // with launch-holder ats in the same frame. A launch-holder at is one
   // whose body is just a launch (+ yield); those are skipped entirely.
-  // Collected static-store drives from `cloneFrameAtBodies`. Each entry's
-  // `wrEn` is already gated by the owning frame's 1-cycle header pulse
-  // (see caller). After `mergeStepMemPorts` runs, these drives get
-  // priority-composed into `memPortMap` so a static store coexisting
+  // Collected static access drives from `cloneFrameAtBodies`. Each entry's
+  // `wrEn` (stores) / `rdEn` (loads) is already gated by the owning
+  // frame's 1-cycle header pulse (see caller). After `mergeStepMemPorts`
+  // runs — which unconditionally rebuilds every memory's drives from the
+  // per-entry maps, clobbering anything driven into `memPortMap` directly
+  // — these get priority-composed back in, so a static access coexisting
   // with a launch in the same frame takes priority during its single
-  // firing cycle (and leaves the pipeline's drives untouched otherwise).
+  // firing cycle (and leaves the child's drives untouched otherwise).
   SmallVector<std::pair<Value, MemPortMapping>> staticDrives;
+  unsigned staticFrameCounter = 0;
+  unsigned staticCapCounter = 0;
 
   auto cloneFrameAtBodies = [&](LoopScheduleFrameOp frame,
                                  Value preGate) -> LogicalResult {
+    // Per-offset issue gates: `at k` bodies fire k cycles after the
+    // frame's header pulse, matching their scheduled cycle. Two static
+    // accesses on the SAME port at different offsets would otherwise
+    // both fire on the header cycle and the later one's address mux
+    // would shadow the earlier one's read entirely.
+    unsigned frameId = staticFrameCounter++;
+    SmallVector<Value> offsetGates{preGate};
+    auto gateAt = [&](unsigned offset) -> Value {
+      while (offsetGates.size() <= offset) {
+        Value zero1 =
+            hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0);
+        auto name = builder.getStringAttr(
+            "frame" + std::to_string(frameId) + "_hdr_d" +
+            std::to_string(offsetGates.size()));
+        offsetGates.push_back(seq::CompRegOp::create(
+            builder, loc, offsetGates.back(), clk, rst, zero1, name));
+      }
+      return offsetGates[offset];
+    };
+
     for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
       bool isLaunchHolder = false;
       for (auto &op : atOp.getBodyBlock()) {
@@ -5341,6 +5391,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       }
       if (isLaunchHolder)
         continue;
+      Value atGate = gateAt((unsigned)atOp.getOffset());
       for (auto &op : atOp.getBodyBlock()) {
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp,
                 LoopScheduleLaunchOp>(&op))
@@ -5381,7 +5432,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
           for (auto &memInfo : memrefArgs)
             localPorts[memInfo.originalArg].rdData =
                 memPortMap[memInfo.originalArg].rdData;
-          if (failed(handleHWStore(storeOp, builder, mapping, preGate,
+          if (failed(handleHWStore(storeOp, builder, mapping, atGate,
                                       localPorts)))
             return failure();
           Value target = storeOp.getMemoryValue();
@@ -5390,9 +5441,40 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         }
         if (auto loadOp =
                 dyn_cast<loopschedule::HWLoadLoweringInterface>(&op)) {
-          if (failed(handleHWLoad(loadOp, builder, mapping, memPortMap,
-                                     preGate)))
+          // Like the store path above: drive into a temporary map and
+          // stash, so the addr/rd_en survive the `mergeStepMemPorts`
+          // overwrite. The result mapping (load -> rdData wire) is
+          // unaffected by the merge and needs the real rdData here.
+          DenseMap<Value, MemPortMapping> localPorts;
+          unsigned latency = 1;
+          for (auto &memInfo : memrefArgs) {
+            localPorts[memInfo.originalArg].rdData =
+                memPortMap[memInfo.originalArg].rdData;
+            if (memInfo.originalArg == loadOp.getMemoryValue())
+              latency = std::max(1u, memInfo.latency);
+          }
+          if (failed(handleHWLoad(loadOp, builder, mapping, localPorts,
+                                     atGate)))
             return failure();
+          Value target = loadOp.getMemoryValue();
+          // The port's rd_data wire only holds this load's data until the
+          // port's NEXT read — and another hoisted load may share the
+          // port (e.g. two coefficient reads at different frame offsets).
+          // Capture the data into a register on its valid cycle and hand
+          // consumers a live-cycle bypass, mirroring handleHWLoad's
+          // contended-port path inside loops.
+          Value rdData = memPortMap[target].rdData;
+          Value dataGate = gateAt((unsigned)atOp.getOffset() + latency);
+          Value zeroD = createZeroConstant(builder, loc, rdData.getType());
+          auto capName = builder.getStringAttr(
+              "frame" + std::to_string(frameId) + "_ldcap_" +
+              std::to_string(staticCapCounter++));
+          Value captured = seq::CompRegClockEnabledOp::create(
+              builder, loc, rdData, clk, dataGate, rst, zeroD, capName);
+          Value bypass =
+              comb::MuxOp::create(builder, loc, dataGate, rdData, captured);
+          mapping.map(loadOp.getResult(), bypass);
+          staticDrives.emplace_back(target, std::move(localPorts[target]));
           continue;
         }
         if (failed(emitComputeOp(&op, builder, mapping, enclosingModule, clk,
@@ -5997,20 +6079,28 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   mergeStepMemPorts(builder, loc, perEntryPorts, entryRunningSignals,
                     memrefArgs, mergedMemPorts);
 
-  // Priority-compose any static at-body store drives (collected by
+  // Priority-compose the static at-body access drives (collected by
   // `cloneFrameAtBodies`) over the merged entry drives. Each static
-  // drive's wrEn is already gated by its owning frame's header pulse,
-  // so the static fires during that one cycle and the child's drives
-  // take over for the rest of the frame.
+  // drive's wrEn (stores) / rdEn (loads) is already gated by its owning
+  // frame's header pulse, so the static access fires during that one
+  // cycle and the child's drives take over for the rest of the frame.
   for (auto &[memVal, staticMp] : staticDrives) {
     auto &merged = mergedMemPorts[memVal];
-    Value sGate = staticMp.wrEn;
+    Value sGate = staticMp.wrEn ? staticMp.wrEn : staticMp.rdEn;
     if (!sGate)
       continue;
-    if (merged.wrEn) {
-      merged.wrEn = comb::OrOp::create(builder, loc, sGate, merged.wrEn);
-    } else {
-      merged.wrEn = sGate;
+    if (staticMp.wrEn) {
+      if (merged.wrEn)
+        merged.wrEn = comb::OrOp::create(builder, loc, sGate, merged.wrEn);
+      else
+        merged.wrEn = sGate;
+    }
+    if (staticMp.rdEn) {
+      if (merged.rdEn)
+        merged.rdEn =
+            comb::OrOp::create(builder, loc, staticMp.rdEn, merged.rdEn);
+      else
+        merged.rdEn = staticMp.rdEn;
     }
     if (staticMp.wrData) {
       if (merged.wrData)
@@ -6253,13 +6343,6 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
       builder, loc, hwBody, clk, rst, stages, stageCE, mapping,
       operatorLibrary, "pipe");
 
-  // Per-memref max read-stage offset. The testbench uses this to time its
-  // per-transaction read shift correctly under multi-transaction streaming
-  // (Phase 2). Without it, the TB would have to assume every memory is
-  // read at stage 0, which fails any kernel whose II ≥ 2 reads at later
-  // stages (e.g. the addmul kernel reads at stages 0 and 1).
-  DenseMap<Value, unsigned> memMaxReadStageOff;
-
   // --- Stage emission: clone ops, build cross-stage registers ---
   for (auto [stageIdx, stageOp] : llvm::enumerate(stages)) {
     Block &body = stageOp.getBodyBlock();
@@ -6315,14 +6398,6 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
             localLoadResults.insert(ls.getResult());
           if (loadOp.requiresReadEnable() && loadOp.getReadLatency() > 0)
             localLoadResults.insert(loadOp.getResult());
-          // Track the latest stage offset that issues a read against
-          // each memref. The TB indexes its read-shift register chain
-          // by this offset.
-          unsigned offset = (unsigned)stages[stageIdx].getOffset();
-          Value memVal = loadOp.getMemoryValue();
-          auto it = memMaxReadStageOff.find(memVal);
-          if (it == memMaxReadStageOff.end() || it->second < offset)
-            memMaxReadStageOff[memVal] = offset;
           return handleHWLoad(loadOp, builder, mapping,
                               perStagePorts[stageIdx], gate);
         }
@@ -6346,7 +6421,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
         mapping.map(stageOp.getResult(regIdx), mappedVal);
         continue;
       }
-      if (computeOpCycleLatency(val.getDefiningOp(), operatorLibrary) > 0) {
+      if (computeValueCycleLatency(val, operatorLibrary) > 0) {
         mapping.map(stageOp.getResult(regIdx), mappedVal);
         continue;
       }
@@ -6365,22 +6440,6 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
   builder.setInsertionPointToEnd(hwBody);
 
   muxStageMemPorts(builder, loc, perStagePorts, stageCE, memPortMap);
-
-  // Annotate per-memref max read stage offset (in mem0/mem1/... port
-  // order) so the testbench can build a per-memory read-shift chain.
-  // Memrefs that aren't read at all get 0 (the chain[0] register matches
-  // the just-issued txn).
-  {
-    SmallVector<int64_t> readStageOffsets;
-    readStageOffsets.reserve(memrefArgs.size());
-    for (auto &memInfo : memrefArgs) {
-      auto it = memMaxReadStageOff.find(memInfo.originalArg);
-      readStageOffsets.push_back(
-          it == memMaxReadStageOff.end() ? 0 : (int64_t)it->second);
-    }
-    hwMod->setAttr("loopschedule.mem_read_stages",
-                    builder.getI64ArrayAttr(readStageOffsets));
-  }
 
   // Done. The last stage's CE pulses on the same cycle as the last store
   // commits (writes are non-blocking and only visible the following cycle),

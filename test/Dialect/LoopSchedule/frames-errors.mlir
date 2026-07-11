@@ -2,7 +2,7 @@
 
 // `loopschedule.at` cannot appear outside a frame or pipeline.
 func.func @at_outside_frame() {
-  // expected-error @+1 {{op expects parent op to be one of 'loopschedule.frame, loopschedule.pipeline'}}
+  // expected-error @+1 {{op expects parent op to be one of 'loopschedule.frame, loopschedule.pipeline, loopschedule.func_pipeline'}}
   loopschedule.at 0 {
     loopschedule.yield
   }
@@ -24,7 +24,7 @@ func.func @await_outside_frame(%h: !loopschedule.handle) {
 // a frame/pipeline transitively). The enclosing `at` is what the verifier
 // rejects when it lives outside a frame.
 func.func @launch_outside_frame() {
-  // expected-error @+1 {{op expects parent op to be one of 'loopschedule.frame, loopschedule.pipeline'}}
+  // expected-error @+1 {{op expects parent op to be one of 'loopschedule.frame, loopschedule.pipeline, loopschedule.func_pipeline'}}
   %h = loopschedule.at 0 -> !loopschedule.handle {
     %h_launch = loopschedule.launch : !loopschedule.handle {
       %dummy = arith.constant 0 : i32

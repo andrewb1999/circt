@@ -881,6 +881,18 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
       return funcOp.emitOpError(
           "func-level pipelining does not yet support nested loops");
 
+    // Pipelined functions overlap in-flight transactions, but a memory
+    // argument carries no per-transaction identity: nothing at the
+    // interface says which transaction a read or write belongs to, so
+    // each overlapped transaction would need its own image of the
+    // memory maintained by the environment with cycle-exact timing.
+    // Until that contract is architectural (e.g. ping-pong buffers or
+    // per-transaction base addresses), reject memory arguments up front.
+    for (BlockArgument arg : funcOp.getArguments())
+      if (!arg.getType().isIntOrIndexOrFloat())
+        return funcOp.emitOpError(
+            "func-level pipelining does not support memory arguments");
+
     func::CallOp badCall;
     funcOp.walk([&](func::CallOp call) {
       badCall = call;
