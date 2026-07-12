@@ -44,7 +44,9 @@ module {
 // CHECK: hw.module @loop0
 // CHECK: fsm.hw_instance "loop0_fsm_inst" @loop0_fsm
 // CHECK: fsm.machine @loop0_fsm
+// The loop condition is pure comb of the iter_args, so the COND bypass
+// applies: IDLE enters FRAME_0 directly and no COND state is emitted.
 // CHECK: fsm.state @IDLE
-// CHECK: fsm.state @COND
+// CHECK-NOT: fsm.state @COND
 // CHECK: fsm.state @FRAME_0
 // CHECK: fsm.state @DONE

@@ -89,4 +89,5 @@ module {
 // CHECK: comb.mux %[[FSM]]#3, %[[ADDR]],
 // CHECK: comb.mux %[[FSM]]#3, %[[SUM]],
 // CHECK: %[[WREN:.+]] = comb.mux %[[FSM]]#3, %[[FSM]]#7,
-// CHECK: hw.output %[[FSM]]#0, %{{.+}}, %{{.+}}, %[[WREN]]
+// (done is the FSM's done OR'd with the early-done advance-edge term)
+// CHECK: hw.output %{{.+}}, %{{.+}}, %{{.+}}, %[[WREN]]

@@ -442,6 +442,94 @@ static void appendPortOutputValues(OpBuilder &builder, Location loc,
   }
 }
 
+/// Is `v` (a loop result or a value forwarded through the launch/at/frame
+/// yield plumbing) ever actually consumed? Values threaded through yields
+/// reach consumers only via an await WITH results (handleValueMap) or the
+/// enclosing terminator; a pure-ordering `loopschedule.await` (no results)
+/// does not read them. Used to decide whether a loop module may cut its
+/// done output through on the final advance edge: that edge is the SAME
+/// posedge the loop's result registers latch, so a parent latching a value
+/// derived from those results on its own advance edge would read the
+/// pre-edge (stale) value — only loops whose results are dead may cut
+/// through. Conservative: any unrecognized use counts as consumed.
+static bool loopScheduleValueConsumed(Value v, unsigned depth = 0) {
+  if (depth > 16)
+    return true;
+  for (OpOperand &use : v.getUses()) {
+    Operation *user = use.getOwner();
+    if (isa<LoopScheduleYieldOp>(user)) {
+      Operation *parent = user->getParentOp();
+      unsigned idx = use.getOperandNumber();
+      if (auto launch = dyn_cast<LoopScheduleLaunchOp>(parent)) {
+        if (loopScheduleValueConsumed(launch.getHandle(), depth + 1))
+          return true;
+        continue;
+      }
+      if (auto at = dyn_cast<LoopScheduleAtOp>(parent)) {
+        if (idx < at->getNumResults() &&
+            loopScheduleValueConsumed(at->getResult(idx), depth + 1))
+          return true;
+        continue;
+      }
+      if (auto frame = dyn_cast<LoopScheduleFrameOp>(parent)) {
+        if (idx < frame->getNumResults() &&
+            loopScheduleValueConsumed(frame->getResult(idx), depth + 1))
+          return true;
+        continue;
+      }
+      return true;
+    }
+    if (auto await = dyn_cast<LoopScheduleAwaitOp>(user)) {
+      if (await->getNumResults() > 0)
+        return true; // await-with-value delivers the results
+      continue;      // pure ordering await
+    }
+    return true; // terminator, arith use, anything else — consumed
+  }
+  return false;
+}
+
+/// May this loop's FSM latch its iter_arg inits on the START edge (the
+/// IDLE/DONE entry bypass) instead of one cycle later in COND? Unsafe when
+/// an init is produced by an at-op in the SAME frame that launches the
+/// loop and its capture register only becomes readable after the launch
+/// cycle — e.g. an accumulator init loaded from memory at at-0 with the
+/// launch at at-1: the capture register latches on the same posedge the
+/// start pulse fires, so an entry-edge init latch would read the PREVIOUS
+/// invocation's value. Such loops keep the COND entry state (one settle
+/// cycle). Inits that are constants, block args, or values from earlier
+/// frames are stable well before the start pulse.
+static bool entryInitsReadyAtStart(LoopScheduleSequentialOp seqOp) {
+  auto launch = seqOp->getParentOfType<LoopScheduleLaunchOp>();
+  if (!launch)
+    return true; // top-level loop: inits are function-scope values
+  auto launchAt = launch->getParentOfType<LoopScheduleAtOp>();
+  unsigned launchOffset = launchAt ? (unsigned)launchAt.getOffset() : 0;
+  auto frame = launch->getParentOfType<LoopScheduleFrameOp>();
+  if (!frame)
+    return true;
+  for (Value init : seqOp.getInits()) {
+    Operation *def = init.getDefiningOp();
+    if (!def || !frame->isAncestor(def))
+      continue; // stable before the frame started
+    auto defAt = dyn_cast<LoopScheduleAtOp>(def);
+    if (!defAt)
+      return false; // unmodeled same-frame producer — be conservative
+    Value inner = defAt.getYieldOp()
+                      .getOperands()[cast<OpResult>(init).getResultNumber()];
+    Operation *producer = inner.getDefiningOp();
+    unsigned lat = 1;
+    if (producer)
+      lat = isa<loopschedule::HWLoadLoweringInterface>(producer)
+                ? 1
+                : getOpCycleLatency(producer);
+    // Capture register readable the cycle AFTER offset+latency.
+    if ((unsigned)defAt.getOffset() + lat + 1 > launchOffset)
+      return false;
+  }
+  return true;
+}
+
 /// Represents one sequential loop in the nesting tree.
 ///
 /// A frame can contain multiple launches (e.g. doitgen's q-frame runs an
@@ -726,14 +814,25 @@ private:
   ///   frame_active_0..N-1,                      (N = numFrames)
   ///   child_start_0..C-1,
   ///   post_active_0..C-1
+  /// `launchStartOffsets[j] <= launchAtOffsets[j]` is the cycle where
+  /// launch j's child_start actually pulses (the early-start peephole may
+  /// pull a pipeline launch ahead of its scheduled at-offset); the frame's
+  /// cycle-state count still covers the SCHEDULED offset so static-op
+  /// issue/capture cycles are untouched.
   fsm::MachineOp createSequentialFSM(OpBuilder &builder, Location loc,
                                      StringRef fsmName, unsigned numFrames,
                                      ArrayRef<unsigned> waitFrameIndices,
                                      ArrayRef<unsigned> launchAtOffsets,
-                                     ArrayRef<unsigned> frameLatencies);
+                                     ArrayRef<unsigned> launchStartOffsets,
+                                     ArrayRef<unsigned> frameLatencies,
+                                     bool foldLastFrame, bool condBypass,
+                                     bool entryBypass);
 
   /// Create linear run-once FSM for sequencing top-level function frames.
-  /// frameChildKind[i]: -1 = leaf, 0 = sequential child, 1 = pipeline child.
+  /// frameChildKind[i]: -1 = leaf, 0 = sequential child, 1 = pipeline child,
+  /// -2 = stateless (an await-only frame: its ordering is already enforced
+  /// by the preceding WAIT, so it gets no state — its frame_running output
+  /// is declared but never driven).
   /// entryLatencies[i] is the leaf entry's frame latency: leaves with
   /// latency L > 1 hold their state for L cycles and expose per-cycle
   /// outputs appended after frame_running_*; entryCycleOutBase[i] receives
@@ -1038,6 +1137,12 @@ struct SeqDynCtx {
   SmallVectorImpl<Value> *stallTerms;
   std::string namePrefix;
   unsigned *counter;           // unique naming across accesses
+  // Iteration-advance edge (iter_advance & !stall, may be null). With the
+  // COND bypass the FSM loops from the last frame state straight back into
+  // FRAME_0, so frameActive never drops between iterations — the one-shot
+  // accepted/seen latches must ALSO clear on this edge or iteration N+1's
+  // accesses would see themselves as already issued/completed.
+  Value advanceEdge;
 };
 
 /// Lower one bare dynamic load/store in a sequential frame with a full
@@ -1105,10 +1210,20 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
   std::string base =
       seqDyn->namePrefix + "_seqdyn" + std::to_string((*seqDyn->counter)++);
 
+  // Latch hold gate: latches persist while the frame stays active and the
+  // loop is not advancing to its next iteration (the COND-bypass FSM keeps
+  // frameActive high across back-to-back iterations, so the advance edge
+  // is the only reset between them).
+  Value latchHold = seqDyn->frameActive;
+  if (seqDyn->advanceEdge) {
+    Value notAdvance = comb::createOrFoldNot(hb, loc, seqDyn->advanceEdge);
+    latchHold = comb::AndOp::create(hb, loc, latchHold, notAdvance, false);
+  }
+
   // Accepted-latch: one-shot issue. Set on the issue handshake, cleared
-  // when the frame deactivates (between iterations / frames). Registered,
-  // so an enable pulse under a same-cycle stall from another access still
-  // marks this access issued.
+  // when the frame deactivates (between frames) or the iteration advances.
+  // Registered, so an enable pulse under a same-cycle stall from another
+  // access still marks this access issued.
   Backedge accNextBE = seqDyn->bb->get(i1);
   auto accReg =
       seq::CompRegOp::create(hb, loc, Value(accNextBE), seqDyn->clk,
@@ -1121,7 +1236,7 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
       false);
   Value accNext = comb::AndOp::create(
       hb, loc, comb::OrOp::create(hb, loc, accReg, issueHandshake, false),
-      seqDyn->frameActive, false);
+      latchHold, false);
   accNextBE.setValue(accNext);
 
   // Ready stall: want to issue but the port can't take it.
@@ -1152,7 +1267,7 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
         notSeenReg, false);
     Value seenNext = comb::AndOp::create(
         hb, loc, comb::OrOp::create(hb, loc, seenReg, doneMine, false),
-        seqDyn->frameActive, false);
+        latchHold, false);
     seenNextBE.setValue(seenNext);
     // Live bypass: a pulse arriving exactly at the check state stalls
     // nothing.
@@ -1688,7 +1803,9 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     OpBuilder &builder, Location loc, StringRef fsmName, unsigned numFrames,
     ArrayRef<unsigned> waitFrameIndices,
     ArrayRef<unsigned> launchAtOffsets,
-    ArrayRef<unsigned> frameLatencies) {
+    ArrayRef<unsigned> launchStartOffsets,
+    ArrayRef<unsigned> frameLatencies, bool foldLastFrame, bool condBypass,
+    bool entryBypass) {
   auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
 
@@ -1709,8 +1826,22 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
            "waitFrameIndices must be sorted non-descending");
   assert(launchAtOffsets.size() == waitFrameIndices.size() &&
          "launchAtOffsets must have one entry per launch");
+  assert(launchStartOffsets.size() == launchAtOffsets.size() &&
+         "launchStartOffsets must have one entry per launch");
+  for (unsigned j = 0; j < launchAtOffsets.size(); ++j)
+    assert(launchStartOffsets[j] <= launchAtOffsets[j] &&
+           "a launch may only start EARLIER than its scheduled at-offset");
 
   unsigned numWaits = waitFrameIndices.size();
+
+  // A folded last frame (pure-comb iter_arg advance — see the fold
+  // predicate in lowerLoopNodeAsModule) gets no FSM states: its ops are
+  // combinational into the iter_arg registers' D inputs, so iter_advance
+  // simply fires one frame earlier. Its frame_active_<i> output is still
+  // declared (keeping the wrapper's result indexing intact) but is never
+  // driven high.
+  unsigned numStateFrames = foldLastFrame ? numFrames - 1 : numFrames;
+  assert(numStateFrames >= 1 && "folded loop must keep at least one frame");
 
   // Normalize frameLatencies — default 1 per frame. Extend each
   // wait-frame's latency so it covers the latest launch's at-offset
@@ -1723,6 +1854,9 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
       frameLats[i] = std::max(frameLats[i],
                               launchAtOffsets[(unsigned)j] + 1);
   }
+  assert((!foldLastFrame || (frameWaitIdx[numFrames - 1].empty() &&
+                             frameLats[numFrames - 1] == 1)) &&
+         "folded last frame must be launch-free and single-cycle");
 
   // Compute the per-frame base index in the "frame_cycle" output region.
   // Frames with latency > 1 contribute L_i outputs; single-cycle frames
@@ -1736,15 +1870,21 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     }
   }
 
-  // Inputs: start, cond, child_done_0..C-1, stall.
+  // Inputs: start, cond, cond_next, child_done_0..C-1, stall.
+  // `cond_next` is the loop condition evaluated on the iter_args' NEXT
+  // values (the feedback wires that latch on the iteration-advance edge).
+  // With condBypass the last state loops back directly to FRAME_0 /
+  // DONE on it, skipping the per-iteration COND state; without the
+  // bypass the wrapper drives it with constant 0 and it is unused.
   // `stall` freezes the frame-state machinery: transitions between frame
-  // cycle states (and out of WAIT/POST) hold while it is high. It is the
+  // cycle states (and out of WAIT) hold while it is high. It is the
   // OR of the per-dynamic-access ready/done stall terms computed in the
   // module body (low whenever no frame is active, so IDLE/COND/DONE need
   // no guard).
   SmallVector<Type> inputTypes;
   inputTypes.push_back(i1); // start
   inputTypes.push_back(i1); // cond
+  inputTypes.push_back(i1); // cond_next
   for (unsigned j = 0; j < numWaits; ++j)
     inputTypes.push_back(i1); // child_done_j
   inputTypes.push_back(i1);   // stall
@@ -1770,6 +1910,7 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   SmallVector<Attribute> argNames;
   argNames.push_back(builder.getStringAttr("start"));
   argNames.push_back(builder.getStringAttr("cond"));
+  argNames.push_back(builder.getStringAttr("cond_next"));
   for (unsigned j = 0; j < numWaits; ++j)
     argNames.push_back(
         builder.getStringAttr("child_done_" + std::to_string(j)));
@@ -1872,28 +2013,58 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   auto waitStateName = [&](unsigned i) -> std::string {
     return "WAIT_" + std::to_string(i);
   };
-  auto postStateName = [&](unsigned i) -> std::string {
-    return "POST_" + std::to_string(i);
-  };
 
   // --- IDLE ---
+  // IDLE (and, with the bypass, DONE) outputs first_iter = the START
+  // input rather than the first_iter variable: the iter_arg registers'
+  // clock-enable includes first_iter, so the inits latch exactly on the
+  // start cycle, and the wrapper's cond input — which reads the
+  // iter_args through the first_iter mux — is automatically evaluated
+  // over the inits while start is high. With condBypass that lets IDLE
+  // jump straight into FRAME_0 (or DONE for a zero-trip run), skipping
+  // the entry COND state entirely; COND then has no predecessors and is
+  // not emitted.
+  auto entryOut = [&]() -> SmallVector<Value> {
+    SmallVector<Value> v = buildOut(falseVal, false, -1, -1, -1, -1);
+    v[1] = machine.getArgument(0); // first_iter = start
+    return v;
+  };
+  assert(!entryBypass || condBypass);
+  auto emitEntryTransitions = [&](Block *tb) {
+    fb.setInsertionPointToEnd(tb);
+    if (!entryBypass) {
+      fsm::TransitionOp::create(
+          fb, loc, StringRef("COND"),
+          [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(0)); },
+          [&]() { fsm::UpdateOp::create(fb, loc, fiVar, trueVal); });
+      return;
+    }
+    fsm::TransitionOp::create(
+        fb, loc, StringRef(frameStateName(0, 0)),
+        [&]() {
+          Value g = comb::AndOp::create(fb, loc, machine.getArgument(0),
+                                        machine.getArgument(1));
+          fsm::ReturnOp::create(fb, loc, g);
+        },
+        [&]() { fsm::UpdateOp::create(fb, loc, fiVar, falseVal); });
+    // Zero-trip run: report done without entering the body.
+    fsm::TransitionOp::create(
+        fb, loc, StringRef("DONE"),
+        [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(0)); },
+        []() {});
+  };
   {
     auto st = fsm::StateOp::create(fb, loc, "IDLE");
     Block *ob = st.ensureOutput(fb);
     ob->getTerminator()->erase();
     fb.setInsertionPointToEnd(ob);
-    fsm::OutputOp::create(fb, loc, buildOut(falseVal, false, -1, -1, -1, -1));
-    Block *tb = &st.getTransitions().front();
-    fb.setInsertionPointToEnd(tb);
-    fsm::TransitionOp::create(
-        fb, loc, StringRef("COND"),
-        [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(0)); },
-        [&]() { fsm::UpdateOp::create(fb, loc, fiVar, trueVal); });
+    fsm::OutputOp::create(fb, loc, entryOut());
+    emitEntryTransitions(&st.getTransitions().front());
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
 
   // --- COND ---
-  {
+  if (!entryBypass) {
     auto st = fsm::StateOp::create(fb, loc, "COND");
     Block *ob = st.ensureOutput(fb);
     ob->getTerminator()->erase();
@@ -1909,7 +2080,8 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
 
-  Value stallArg = machine.getArgument(2 + numWaits);
+  Value condNextArg = machine.getArgument(2);
+  Value stallArg = machine.getArgument(3 + numWaits);
   // Guard body returning !stall — frame-state transitions hold under stall
   // (fsm.machine stays in the current state when no guard is true).
   auto notStallGuard = [&]() {
@@ -1917,16 +2089,48 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     fsm::ReturnOp::create(fb, loc, ns);
   };
 
-  // Helper: emit the last frame's exit transition. We go back to COND so the
-  // condition is evaluated with the UPDATED iter_args (the iter_arg register
-  // latches on the clock edge leaving the last frame, which asserts
-  // iter_advance). Checking `cond` directly at the last frame instead would
-  // race: the register hasn't updated yet, so cond still reflects the OLD
-  // iter_args — producing one extra spurious iteration.
-  auto emitLastFrameTransition = [&](Block *tb) {
+  // Helper: emit the last frame's exit transitions. `extraGuard` (may be
+  // null) is ANDed into every guard alongside !stall — the WAIT exit
+  // passes its all-child-dones term through it.
+  //
+  // Without condBypass we go back to COND so the condition is evaluated
+  // with the UPDATED iter_args (the iter_arg register latches on the
+  // clock edge leaving the last frame). Checking `cond` at the last
+  // frame instead would race: the register hasn't updated yet, so cond
+  // still reflects the OLD iter_args — producing one extra spurious
+  // iteration.
+  //
+  // With condBypass the wrapper evaluates the condition on the
+  // registers' D wires (`cond_next`), which is exactly the value the
+  // iter_args latch on this edge — so we can skip COND and loop straight
+  // back into FRAME_0 (or leave to DONE), saving one cycle per
+  // iteration. COND remains for loop entry from IDLE.
+  auto emitLastFrameTransition = [&](Block *tb,
+                                     llvm::function_ref<Value()> extraGuard) {
     fb.setInsertionPointToEnd(tb);
-    fsm::TransitionOp::create(fb, loc, StringRef("COND"), notStallGuard,
-                              []() {});
+    auto guardWith = [&](bool negateCondNext, bool useCondNext) {
+      return [&, negateCondNext, useCondNext]() {
+        Value g = comb::createOrFoldNot(fb, loc, stallArg);
+        if (extraGuard)
+          g = comb::AndOp::create(fb, loc, g, extraGuard());
+        if (useCondNext) {
+          Value cn = negateCondNext
+                         ? comb::createOrFoldNot(fb, loc, condNextArg)
+                         : condNextArg;
+          g = comb::AndOp::create(fb, loc, g, cn);
+        }
+        fsm::ReturnOp::create(fb, loc, g);
+      };
+    };
+    if (!condBypass) {
+      fsm::TransitionOp::create(fb, loc, StringRef("COND"),
+                                guardWith(false, false), []() {});
+      return;
+    }
+    fsm::TransitionOp::create(fb, loc, StringRef(frameStateName(0, 0)),
+                              guardWith(false, true), []() {});
+    fsm::TransitionOp::create(fb, loc, StringRef("DONE"),
+                              guardWith(true, true), []() {});
   };
 
   // --- FRAME_i cycle states (+ WAIT_i/POST_i for frames with launches) ---
@@ -1939,30 +2143,36 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   //
   // If the frame has launches, the last cycle state transitions to a
   // single WAIT_i (guarded on the AND of all latched child_dones in
-  // this frame — latching is done in the hardware wrapper), then
-  // POST_i (1-cycle settle). Otherwise the last cycle state transitions
-  // directly to the next frame (or COND for the last frame).
+  // this frame — latching is done in the hardware wrapper), and WAIT_i
+  // exits directly into the next frame (or COND for the last frame).
+  // Otherwise the last cycle state transitions directly to the next
+  // frame (or COND for the last frame).
   //
-  // iter_advance fires in POST_i of the last frame (if it has
-  // launches) or the last cycle state of the last frame (if it
-  // doesn't).
+  // iter_advance fires in the last cycle state of the last frame when
+  // it has no launches. When the last frame ends in a WAIT there is no
+  // state left to host a Moore iter_advance (held high across a
+  // multi-cycle WAIT it would re-latch the iter_args every cycle), so
+  // the WRAPPER computes the advance clock-enable from the WAIT exit
+  // condition itself (in-WAIT AND all child dones — see
+  // lowerLoopNodeAsModule).
   //
   // Multiple launches in the same frame run concurrently: each fires
   // its start pulse at its own atOffset, and the single WAIT waits for
   // all of them to finish. Launches at the same atOffset fire in the
   // same cycle.
-  for (unsigned i = 0; i < numFrames; ++i) {
-    bool isLast = (i + 1 == numFrames);
+  for (unsigned i = 0; i < numStateFrames; ++i) {
+    bool isLast = (i + 1 == numStateFrames);
     unsigned L = frameLats[i];
     bool frameHasLaunch = !frameWaitIdx[i].empty();
 
     // Precompute per-cycle start/live lists for this frame.
     // frameWaitIdx[i] holds global launch indices for launches in frame i;
-    // launchAtOffsets[j] is the at-offset for launch j.
+    // launchStartOffsets[j] is the cycle where launch j's child_start
+    // pulses (<= its scheduled at-offset — the early-start peephole).
     SmallVector<SmallVector<unsigned>> startsPerCycle(L);
     SmallVector<SmallVector<unsigned>> livesPerCycle(L);
     for (int j : frameWaitIdx[i]) {
-      unsigned o = launchAtOffsets[(unsigned)j];
+      unsigned o = launchStartOffsets[(unsigned)j];
       if (o < L)
         startsPerCycle[o].push_back((unsigned)j);
       for (unsigned c = o; c < L; ++c)
@@ -2015,7 +2225,7 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
         fsm::TransitionOp::create(fb, loc, StringRef(waitStateName(i)),
                                   notStallGuard, []() {});
       } else if (isLast) {
-        emitLastFrameTransition(tb);
+        emitLastFrameTransition(tb, nullptr);
       } else {
         fsm::TransitionOp::create(fb, loc, StringRef(leaveTargetName),
                                   notStallGuard, []() {});
@@ -2031,7 +2241,10 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     // of all (hardware-latched) child_dones for launches in this
     // frame. The wrapper feeds a latched signal into child_done_<j> so
     // that a launch which finished early still reports done while WAIT
-    // is sampling.
+    // is sampling. WAIT exits directly into the next frame (or COND for
+    // the last frame — the iter_arg latch enable is computed in the
+    // wrapper from this same exit condition, see lowerLoopNodeAsModule);
+    // there is no POST settle state.
     {
       auto wSt = fsm::StateOp::create(fb, loc, waitStateName(i));
       Block *ob = wSt.ensureOutput(fb);
@@ -2045,49 +2258,31 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
                        /*activePosts=*/{}));
       Block *tb = &wSt.getTransitions().front();
       fb.setInsertionPointToEnd(tb);
-      fsm::TransitionOp::create(
-          fb, loc, StringRef(postStateName(i)),
-          [&]() {
-            // AND of child_done_<j> for every launch in this frame, and
-            // !stall (conservative freeze; access stall terms are
-            // frame-gated so this rarely binds in WAIT).
-            Value guard;
-            for (int j : frameWaitIdx[i]) {
-              Value done = machine.getArgument(2 + (unsigned)j);
-              guard = guard ? comb::AndOp::create(fb, loc, guard, done)
-                            : done;
-            }
-            Value ns = comb::createOrFoldNot(fb, loc, stallArg);
-            guard = guard ? comb::AndOp::create(fb, loc, guard, ns) : ns;
-            fsm::ReturnOp::create(fb, loc, guard);
-          },
-          []() {});
-      fb.setInsertionPointToEnd(&machine.getBody().front());
-    }
-
-    // POST_i: 1-cycle settle where post_active goes high for every
-    // launch in this frame. iter_advance pulses in POST_i of the last
-    // frame (the cycle where the iter_arg register actually latches
-    // the next iteration's value).
-    {
-      bool pIterAdv = isLast;
-      auto pSt = fsm::StateOp::create(fb, loc, postStateName(i));
-      Block *ob = pSt.ensureOutput(fb);
-      ob->getTerminator()->erase();
-      fb.setInsertionPointToEnd(ob);
-      fsm::OutputOp::create(
-          fb, loc,
-          buildOutSets(falseVal, pIterAdv, /*activeFrame=*/-1,
-                       /*activeChildStarts=*/{},
-                       /*activeLive=*/{},
-                       /*activePosts=*/allLaunches));
-      Block *tb = &pSt.getTransitions().front();
-      fb.setInsertionPointToEnd(tb);
+      // AND of child_done_<j> for every launch in this frame (!stall is
+      // added by the transition emitters; access stall terms are
+      // frame-gated so it rarely binds in WAIT).
+      auto allDonesGuard = [&]() -> Value {
+        Value guard;
+        for (int j : frameWaitIdx[i]) {
+          Value done = machine.getArgument(3 + (unsigned)j);
+          guard = guard ? comb::AndOp::create(fb, loc, guard, done)
+                        : done;
+        }
+        return guard;
+      };
       if (isLast) {
-        emitLastFrameTransition(tb);
+        emitLastFrameTransition(tb, allDonesGuard);
       } else {
-        fsm::TransitionOp::create(fb, loc, StringRef(leaveTargetName),
-                                  notStallGuard, []() {});
+        fsm::TransitionOp::create(
+            fb, loc, StringRef(leaveTargetName),
+            [&]() {
+              Value guard = allDonesGuard();
+              Value ns = comb::createOrFoldNot(fb, loc, stallArg);
+              guard =
+                  guard ? comb::AndOp::create(fb, loc, guard, ns) : ns;
+              fsm::ReturnOp::create(fb, loc, guard);
+            },
+            []() {});
       }
       fb.setInsertionPointToEnd(&machine.getBody().front());
     }
@@ -2099,9 +2294,31 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     Block *ob = st.ensureOutput(fb);
     ob->getTerminator()->erase();
     fb.setInsertionPointToEnd(ob);
-    fsm::OutputOp::create(fb, loc, buildOut(trueVal, false, -1, -1, -1, -1));
+    SmallVector<Value> v = buildOut(trueVal, false, -1, -1, -1, -1);
+    if (condBypass)
+      v[1] = machine.getArgument(0); // first_iter = start (re-entry latch)
+    fsm::OutputOp::create(fb, loc, v);
     Block *tb = &st.getTransitions().front();
     fb.setInsertionPointToEnd(tb);
+    if (condBypass) {
+      // With the early-done cut-through the parent's WAIT exits on our
+      // final advance edge — its next start pulse lands while we are
+      // still transiting DONE→IDLE, so DONE must accept start exactly
+      // like IDLE. A zero-trip re-entry holds DONE (done stays high for
+      // the new invocation).
+      fsm::TransitionOp::create(
+          fb, loc, StringRef(frameStateName(0, 0)),
+          [&]() {
+            Value g = comb::AndOp::create(fb, loc, machine.getArgument(0),
+                                          machine.getArgument(1));
+            fsm::ReturnOp::create(fb, loc, g);
+          },
+          [&]() { fsm::UpdateOp::create(fb, loc, fiVar, falseVal); });
+      fsm::TransitionOp::create(
+          fb, loc, StringRef("DONE"),
+          [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(0)); },
+          []() {});
+    }
     fsm::TransitionOp::create(fb, loc, StringRef("IDLE"));
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
@@ -2208,17 +2425,40 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
     return vals;
   };
 
+  // Stateless (-2) entries get no states: successor chains skip them.
+  auto nextEmittedState = [&](unsigned i) -> std::string {
+    for (unsigned j = i + 1; j < numFrames; ++j)
+      if (frameChildKind[j] != -2)
+        return "FRAME_" + std::to_string(j);
+    return "DONE";
+  };
+  int firstEmitted = -1;
+  for (unsigned i = 0; i < numFrames; ++i)
+    if (frameChildKind[i] != -2) {
+      firstEmitted = (int)i;
+      break;
+    }
+
   // --- IDLE ---
   {
     auto st = fsm::StateOp::create(fb, loc, "IDLE");
     Block *ob = st.ensureOutput(fb);
     ob->getTerminator()->erase();
     fb.setInsertionPointToEnd(ob);
+    // NOTE: an IDLE->WAIT entry-launch bypass (starting the first child
+    // straight from IDLE) was tried and reverted: both the Mealy- and the
+    // wrapper-pulse variant reshaped the one-hot FSM enough to flip a
+    // marginal state-decode -> LUTRAM -> DSP-operand path in atax from
+    // +0.17ns to about -0.3ns at the 2ns target — one cycle per kernel
+    // invocation is not worth an Fmax cliff.
     fsm::OutputOp::create(fb, loc, makeOutput(false, -1, -1));
     Block *tb = &st.getTransitions().front();
     fb.setInsertionPointToEnd(tb);
+    std::string entryTarget =
+        firstEmitted < 0 ? std::string("DONE")
+                         : "FRAME_" + std::to_string(firstEmitted);
     fsm::TransitionOp::create(
-        fb, loc, StringRef("FRAME_0"),
+        fb, loc, StringRef(entryTarget),
         [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(0)); },
         []() {});
   }
@@ -2226,9 +2466,10 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
 
   // --- FRAME_i and WAIT_i states ---
   for (unsigned i = 0; i < numFrames; ++i) {
+    if (frameChildKind[i] == -2)
+      continue; // stateless await-only entry
     std::string frameName = "FRAME_" + std::to_string(i);
-    std::string nextState =
-        (i + 1 < numFrames) ? "FRAME_" + std::to_string(i + 1) : "DONE";
+    std::string nextState = nextEmittedState(i);
     bool isLeaf = (frameChildKind[i] < 0);
 
     // FRAME_i, plus FRAME_i_C1..C{L-1} chained cycle states for multi-cycle
@@ -2805,17 +3046,246 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     }
   }
 
+  // --- Early child_start peephole ---
+  // A pipeline launch scheduled at at-offset K > 0 usually sits there
+  // because a same-frame static op produces one of its iter_arg inits
+  // (e.g. an accumulator init loaded from memory). But the pipeline does
+  // not read an init until the FIRST STAGE THAT USES the corresponding
+  // iter_arg (the per-stage first_iter mux samples it on that stage's
+  // first fire), so the start pulse can move ahead of the init's ready
+  // cycle — often all the way to at-0 — overlapping the pipeline's first
+  // stages with the frame's remaining preamble cycles and shaving
+  // K - newStart cycles per iteration. The frame keeps its full cycle
+  // count (static-op issue/capture cycles are untouched); only the
+  // child_start pulse and the child_active window move.
+  //
+  // Guards:
+  //  (a) single-launch frames with a PIPELINE child only (sequential-loop
+  //      and call children sample captured inputs from their start),
+  //  (b) init timing: newStart + firstUseStage(iter_arg) >= ready cycle
+  //      of every same-frame-produced init (ready = the cycle its
+  //      launch-consumer capture register is readable),
+  //  (c) port disjointness: pipeline stages that would overlap the
+  //      frame's cycle states must not touch any (port, binding) the
+  //      frame's static ops drive (static addresses are held through the
+  //      whole frame by the merge muxes).
+  SmallVector<unsigned> launchStartOffsets(launchAtOffsets.begin(),
+                                           launchAtOffsets.end());
+  for (unsigned i = 0; i < numFrames; ++i) {
+    auto &slots = node.frameLaunches[i];
+    if (slots.size() != 1 || slots[0].pipIdx < 0 || slots[0].atOffset == 0)
+      continue;
+    unsigned schedOffset = slots[0].atOffset;
+    auto pipOp = node.pipelineChildren[slots[0].pipIdx];
+    LoopScheduleFrameOp frameOp = frames[i];
+    Block &pipBlock = pipOp.getStagesBlock();
+
+    // (b) earliest legal start from the init-timing constraints.
+    unsigned minStart = 0;
+    bool analyzable = true;
+    for (auto [argIdx, init] : llvm::enumerate(pipOp.getInits())) {
+      Operation *def = init.getDefiningOp();
+      if (!def || !frameOp->isAncestor(def))
+        continue; // defined before the frame — stable, no constraint
+      auto defAt = dyn_cast<LoopScheduleAtOp>(def);
+      if (!defAt) {
+        analyzable = false;
+        break;
+      }
+      Value inner = defAt.getYieldOp()
+                        .getOperands()[cast<OpResult>(init).getResultNumber()];
+      Operation *producer = inner.getDefiningOp();
+      // Only memory loads are modeled (the doitgen-style accumulator
+      // init); any other same-frame producer keeps the scheduled offset.
+      if (!producer ||
+          !isa<loopschedule::HWLoadLoweringInterface>(producer)) {
+        analyzable = false;
+        break;
+      }
+      // Load issued at the at's offset; rd_data valid one cycle later and
+      // latched into the launch-consumer capture register at the end of
+      // that cycle — register-readable the cycle after.
+      unsigned ready = (unsigned)defAt.getOffset() + 2;
+      // First pipeline stage that reads this iter_arg.
+      BlockArgument arg = pipBlock.getArgument(argIdx);
+      unsigned firstUse = UINT_MAX;
+      for (auto *user : arg.getUsers()) {
+        LoopScheduleAtOp userAt;
+        Operation *anc = user;
+        while (anc && anc != pipOp.getOperation()) {
+          if ((userAt = dyn_cast<LoopScheduleAtOp>(anc)))
+            break;
+          anc = anc->getParentOp();
+        }
+        firstUse = std::min(
+            firstUse, userAt ? (unsigned)userAt.getOffset() : 0u);
+      }
+      if (firstUse == UINT_MAX)
+        continue; // init never read
+      minStart = std::max(minStart, ready > firstUse ? ready - firstUse : 0);
+    }
+    if (!analyzable || minStart >= schedOffset)
+      continue;
+
+    // (c) port disjointness over the overlap window.
+    DenseSet<std::pair<Value, unsigned>> framePortSet;
+    for (auto atOp : frameOp.getBodyBlock().getOps<LoopScheduleAtOp>()) {
+      bool isLaunchHolder = llvm::any_of(
+          atOp.getBodyBlock(),
+          [](Operation &op) { return isa<LoopScheduleLaunchOp>(op); });
+      if (isLaunchHolder)
+        continue;
+      atOp.walk([&](Operation *op) {
+        if (auto l = dyn_cast<loopschedule::HWLoadLoweringInterface>(op))
+          framePortSet.insert({l.getMemoryValue(), getBindingPort(op)});
+        else if (auto s =
+                     dyn_cast<loopschedule::HWStoreLoweringInterface>(op))
+          framePortSet.insert({s.getMemoryValue(), getBindingPort(op)});
+      });
+    }
+    bool portConflict = false;
+    unsigned window = schedOffset - minStart;
+    for (auto stageAt : pipBlock.getOps<LoopScheduleAtOp>()) {
+      if ((unsigned)stageAt.getOffset() >= window)
+        continue;
+      stageAt.walk([&](Operation *op) {
+        Value mem;
+        if (auto l = dyn_cast<loopschedule::HWLoadLoweringInterface>(op))
+          mem = l.getMemoryValue();
+        else if (auto s =
+                     dyn_cast<loopschedule::HWStoreLoweringInterface>(op))
+          mem = s.getMemoryValue();
+        else
+          return;
+        if (framePortSet.contains({mem, getBindingPort(op)}))
+          portConflict = true;
+      });
+    }
+    if (portConflict)
+      continue;
+    launchStartOffsets[(unsigned)frameWaitIdx[i].front()] = minStart;
+  }
+
+  // --- Fold a trailing iter-advance-only frame ---
+  // SCFToLoopSchedule ends every sequential loop with a frame that only
+  // computes the next iter_arg values (e.g. `iv + 1` feeding an
+  // iter_arg_update). Those ops are pure comb into the iter_arg
+  // registers' D inputs and the frame's results are read only through
+  // the terminator (feedback + loop results), both of which use the
+  // combinational alias — so the frame needs no FSM state of its own.
+  // Folding it fires iter_advance in the previous frame's exit instead,
+  // saving one cycle per loop iteration. Bail when the frame produces
+  // the loop condition (COND consumes it from a state that would no
+  // longer exist), launches children, spans multiple cycles, or touches
+  // memory.
+  bool foldLastFrame = false;
+  if (numFrames >= 2 && frameWaitIdx[numFrames - 1].empty() &&
+      frameLatencies[numFrames - 1] == 1) {
+    LoopScheduleFrameOp lastFrame = frames[numFrames - 1];
+    bool pure = terminatorOp.getCondition().getDefiningOp() !=
+                lastFrame.getOperation();
+    if (pure) {
+      lastFrame.getBodyBlock().walk([&](Operation *op) {
+        if (isa<LoopScheduleAtOp, LoopScheduleYieldOp,
+                LoopScheduleIterArgUpdateOp>(op))
+          return WalkResult::advance();
+        if (isMemoryEffectFree(op))
+          return WalkResult::advance();
+        pure = false;
+        return WalkResult::interrupt();
+      });
+    }
+    foldLastFrame = pure;
+  }
+
+  // --- Decide the COND bypass ---
+  // With the bypass the last state loops straight back into FRAME_0 (or
+  // out to DONE) guarded on `cond_next` — the loop condition evaluated on
+  // the iter_arg registers' D wires — skipping the per-iteration COND
+  // state. That is only sound when the condition is a pure combinational
+  // function of the iter_args and loop-invariant values: a load, a
+  // launch result, or an operator that lowers to a registered
+  // hw.instance would not have its next-iteration value available on the
+  // advance edge. Walk the condition's backward slice (through frame/at
+  // result indirection) and check every op lowers combinationally.
+  auto lowersCombinationally = [&](Operation *op) -> bool {
+    if (isFreeArithOp(op))
+      return true;
+    auto operatorAttr =
+        op->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+    if (!operatorLibrary || !operatorAttr)
+      return getOpCycleLatency(op) <= 1; // plain-clone fallback path
+    StringRef opName = operatorLibrary->getOperatorBySymbol(operatorAttr);
+    oplib::HwMatchOp hwMatch = operatorLibrary->getHwMatchOp(opName);
+    if (!hwMatch)
+      return false;
+    for (auto &o : *hwMatch.getBodyBlock())
+      if (isa<oplib::HwInstanceOp>(o))
+        return false;
+    return true;
+  };
+  bool condBypass = [&]() -> bool {
+    SmallVector<Value> stack{terminatorOp.getCondition()};
+    DenseSet<Value> visited;
+    while (!stack.empty()) {
+      Value v = stack.pop_back_val();
+      if (!visited.insert(v).second)
+        continue;
+      if (auto barg = dyn_cast<BlockArgument>(v)) {
+        Block *owner = barg.getOwner();
+        if (owner == &seqOp.getScheduleBlock())
+          continue; // iter_arg — substituted with its feedback wire
+        if (auto ownerFrame =
+                dyn_cast<LoopScheduleFrameOp>(owner->getParentOp())) {
+          // Await-frame body arg: follow the await-yield operand.
+          stack.push_back(
+              ownerFrame.getAwaitYield().getOperands()[barg.getArgNumber()]);
+          continue;
+        }
+        if (!seqOp->isAncestor(owner->getParentOp()))
+          continue; // defined above the loop — invariant
+        return false;
+      }
+      Operation *def = v.getDefiningOp();
+      if (!seqOp->isAncestor(def))
+        continue; // invariant
+      if (auto defFrame = dyn_cast<LoopScheduleFrameOp>(def)) {
+        auto yieldOp2 = cast<LoopScheduleYieldOp>(
+            defFrame.getBodyBlock().getTerminator());
+        stack.push_back(yieldOp2.getOperands()[cast<OpResult>(v)
+                                                   .getResultNumber()]);
+        continue;
+      }
+      if (auto defAt = dyn_cast<LoopScheduleAtOp>(def)) {
+        stack.push_back(defAt.getYieldOp().getOperands()[cast<OpResult>(v)
+                                                             .getResultNumber()]);
+        continue;
+      }
+      if (def->getNumRegions() != 0 || !isMemoryEffectFree(def) ||
+          !lowersCombinationally(def))
+        return false;
+      for (Value o : def->getOperands())
+        stack.push_back(o);
+    }
+    return true;
+  }();
+
   // --- Create FSM machine ---
   std::string fsmName = node.prefix + "_fsm";
   builder.setInsertionPointToEnd(moduleOp.getBody());
   (void)createSequentialFSM(builder, loc, fsmName, numFrames, waitFrameIndices,
-                            launchAtOffsets, frameLatencies);
+                            launchAtOffsets, launchStartOffsets,
+                            frameLatencies, foldLastFrame, condBypass,
+                            condBypass && entryInitsReadyAtStart(seqOp));
 
   // --- Create FSM instance with backedges ---
   hw.setInsertionPointToEnd(hwBody);
   BackedgeBuilder bb(hw, loc);
 
   Backedge condBE = bb.get(i1);
+  // cond re-evaluated on the iter_arg feedback wires; resolved after the
+  // feedback values exist (constant 0 when the bypass is off).
+  Backedge condNextBE = bb.get(i1);
 
   // One backedge per wait step for its child_done input.
   SmallVector<Backedge> childDoneBEs;
@@ -2829,10 +3299,12 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   SmallVector<Value> seqStallTerms;
   unsigned seqDynCounter = 0;
 
-  // Build instance inputs: start, cond, child_done_0..C-1, stall.
+  // Build instance inputs: start, cond, cond_next, child_done_0..C-1,
+  // stall.
   SmallVector<Value> instInputs;
   instInputs.push_back(startSignal);
   instInputs.push_back(Value(condBE));
+  instInputs.push_back(Value(condNextBE));
   for (auto &be : childDoneBEs)
     instInputs.push_back(Value(be));
   instInputs.push_back(Value(stallBE));
@@ -2925,10 +3397,43 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // the module-side registers freeze via CE &= notStall.
   Value notStallSeq = comb::createOrFoldNot(hw, loc, Value(stallBE));
 
-  // Clock enable for iter_arg registers: advance exactly once per loop trip,
-  // on the FSM's last cycle before COND. first_iter forces the init load on
-  // entry to a new loop invocation.
-  Value ce = comb::OrOp::create(hw, loc, fsmIterAdvance, fsmFirstIter);
+  // Raw per-trip advance term: the FSM's iter_advance output. When the
+  // last state-emitting frame ends in a WAIT there is no state left to
+  // host a Moore iter_advance (WAIT has no POST settle state, and
+  // asserting iter_advance throughout a multi-cycle WAIT would re-latch
+  // the iter_args every cycle) — compute the advance from the WAIT exit
+  // condition itself: in-WAIT (a launch is active but no cycle state is)
+  // AND every one of the frame's child dones — exactly the FSM's WAIT_i
+  // exit guard, so the latch fires on the same edge the state leaves
+  // WAIT.
+  Value advanceRaw = fsmIterAdvance;
+  unsigned lastStateFrame = foldLastFrame ? numFrames - 2 : numFrames - 1;
+  if (!frameWaitIdx[lastStateFrame].empty()) {
+    Value notFrameCycle = comb::createOrFoldNot(
+        hw, loc, fsmFrameActives[lastStateFrame]);
+    Value inWait = comb::AndOp::create(
+        hw, loc,
+        fsmChildActives[(unsigned)frameWaitIdx[lastStateFrame].front()],
+        notFrameCycle);
+    Value allDones;
+    for (int j : frameWaitIdx[lastStateFrame]) {
+      Value d = Value(childDoneBEs[(unsigned)j]);
+      allDones = allDones ? comb::AndOp::create(hw, loc, allDones, d) : d;
+    }
+    Value advTerm = comb::AndOp::create(hw, loc, inWait, allDones);
+    advanceRaw = comb::OrOp::create(hw, loc, advanceRaw, advTerm);
+  }
+  // The advance EDGE (advance & !stall): the posedge on which the
+  // iter_args latch and the state loops back. Also clears the seq-dyn
+  // one-shot latches — with the COND bypass, frameActive stays high
+  // across back-to-back iterations, so this edge is their only
+  // between-iterations reset.
+  Value iterAdvanceEdge =
+      comb::AndOp::create(hw, loc, advanceRaw, notStallSeq);
+  // Clock enable for iter_arg registers: advance exactly once per loop
+  // trip. first_iter forces the init load on entry to a new loop
+  // invocation.
+  Value ce = comb::OrOp::create(hw, loc, advanceRaw, fsmFirstIter);
   ce = comb::AndOp::create(hw, loc, ce, notStallSeq);
 
   // --- Create iter arg registers ---
@@ -2957,6 +3462,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   SmallVector<Value> frameCaptureGate(numFrames);
   for (unsigned i = 0; i < numFrames; ++i) {
     if (!frameWaitIdx[i].empty())
+      continue;
+    // A folded last frame has no FSM state (its frame_active output is
+    // never driven), and its results are only consumed combinationally
+    // through the terminator — skip the dead capture registers.
+    if (foldLastFrame && i + 1 == numFrames)
       continue;
     // Freeze under stall: the gate is a held FSM output while stalled, and
     // capturing mid-stall would latch values before a dynamic access's
@@ -3087,7 +3597,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                            fsmFrameActives[frameIdx],
                            &seqStallTerms,
                            node.prefix,
-                           &seqDynCounter};
+                           &seqDynCounter,
+                           iterAdvanceEdge};
           if (failed(lowerSeqDynAccess(&op, hw, localMapping, framePorts,
                                        atGate, atOffset, &seqDyn)))
             return failure();
@@ -3521,7 +4032,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                        fsmFrameActives[frameIdx],
                        &seqStallTerms,
                        node.prefix,
-                       &seqDynCounter};
+                       &seqDynCounter,
+                       iterAdvanceEdge};
       SeqPortMuxCtx seqMux;
       seqMux.multi = bodyMultiAccess;
       for (auto &memInfo : memrefArgs)
@@ -3691,15 +4203,80 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       iterArgPhaseResults[i] = loopschedule::getIterArgPhaseResult(u);
   }
   hw.setInsertionPointToEnd(hwBody);
+  SmallVector<Value> iterArgFeedbacks(iterArgRegs.size());
   for (unsigned i = 0; i < iterArgRegs.size(); ++i) {
     Value termArg = iterArgPhaseResults[i];
     auto combIt = frameResultComb.find(termArg);
     Value feedback = combIt != frameResultComb.end()
                          ? combIt->second
                          : localMapping.lookup(termArg);
+    iterArgFeedbacks[i] = feedback;
     Value init = localMapping.lookup(seqOp.getInits()[i]);
     Value muxed = comb::MuxOp::create(hw, loc, fsmFirstIter, init, feedback);
     iterArgRegs[i].getDefiningOp()->setOperand(0, muxed);
+  }
+
+  // --- Resolve cond_next ---
+  // Re-lower the condition's source slice with every iter_arg mapped to
+  // its feedback wire (the value latching on the advance edge). The
+  // bypass pre-analysis guaranteed the slice is pure comb of iter_args
+  // and loop-invariant values, so emitComputeOp only clones comb ops.
+  if (!condBypass) {
+    condNextBE.setValue(hw::ConstantOp::create(hw, loc, i1, 0));
+  } else {
+    IRMapping condNextMapping;
+    std::function<Value(Value)> resolveNext = [&](Value v) -> Value {
+      if (Value m = condNextMapping.lookupOrNull(v))
+        return m;
+      if (auto barg = dyn_cast<BlockArgument>(v)) {
+        Block *owner = barg.getOwner();
+        if (owner == &seqOp.getScheduleBlock()) {
+          Value f = iterArgFeedbacks[barg.getArgNumber()];
+          condNextMapping.map(v, f);
+          return f;
+        }
+        if (auto ownerFrame =
+                dyn_cast<LoopScheduleFrameOp>(owner->getParentOp())) {
+          Value r = resolveNext(
+              ownerFrame.getAwaitYield().getOperands()[barg.getArgNumber()]);
+          condNextMapping.map(v, r);
+          return r;
+        }
+        Value m = localMapping.lookup(v);
+        condNextMapping.map(v, m);
+        return m;
+      }
+      Operation *def = v.getDefiningOp();
+      if (!seqOp->isAncestor(def)) {
+        Value m = localMapping.lookup(v);
+        condNextMapping.map(v, m);
+        return m;
+      }
+      if (auto defFrame = dyn_cast<LoopScheduleFrameOp>(def)) {
+        auto yieldOp2 = cast<LoopScheduleYieldOp>(
+            defFrame.getBodyBlock().getTerminator());
+        Value r = resolveNext(
+            yieldOp2.getOperands()[cast<OpResult>(v).getResultNumber()]);
+        condNextMapping.map(v, r);
+        return r;
+      }
+      if (auto defAt = dyn_cast<LoopScheduleAtOp>(def)) {
+        Value r = resolveNext(defAt.getYieldOp()
+                                  .getOperands()[cast<OpResult>(v)
+                                                     .getResultNumber()]);
+        condNextMapping.map(v, r);
+        return r;
+      }
+      for (Value o : def->getOperands())
+        (void)resolveNext(o);
+      hw.setInsertionPointToEnd(hwBody);
+      if (failed(emitComputeOp(def, hw, condNextMapping, moduleOp, clk, rst,
+                               /*opCE=*/{})))
+        llvm_unreachable("cond_next slice op failed to lower; the bypass "
+                         "pre-analysis admitted a non-comb op");
+      return condNextMapping.lookup(v);
+    };
+    condNextBE.setValue(resolveNext(terminatorOp.getCondition()));
   }
 
   // Map sequential op results to register values where possible.
@@ -3767,7 +4344,29 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
   // --- Build module output ---
   hw.setInsertionPointToEnd(hwBody);
-  buildLoopModuleOutput(hw, loc, localMemPorts, memrefArgs, fsmDone,
+  // Early done: the loop is finished exactly when it takes an advance
+  // edge with a false next-condition — one cycle before the FSM's Moore
+  // DONE output. Cutting done through on that edge lets the parent's
+  // WAIT exit a cycle earlier per invocation. Both operands already
+  // exist (no new logic depth beyond one AND/OR).
+  //
+  // Only sound when the loop's results are dead: the advance edge is the
+  // SAME posedge the result (iter_arg) registers latch their final
+  // values, so a parent that consumed our results on its own advance
+  // edge would read the pre-edge (stale) value. Loops whose results feed
+  // downstream consumers keep the Moore DONE (one settle cycle).
+  bool resultsDead = llvm::none_of(seqOp.getResults(), [](Value r) {
+    return loopScheduleValueConsumed(r);
+  });
+  Value moduleDone = fsmDone;
+  if (condBypass && resultsDead) {
+    Value notCondNext =
+        comb::createOrFoldNot(hw, loc, Value(condNextBE));
+    Value earlyDone =
+        comb::AndOp::create(hw, loc, iterAdvanceEdge, notCondNext);
+    moduleDone = comb::OrOp::create(hw, loc, fsmDone, earlyDone);
+  }
+  buildLoopModuleOutput(hw, loc, localMemPorts, memrefArgs, moduleDone,
                          resultValues);
 
   return success();
@@ -4559,12 +5158,13 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
             (namePrefix + "_store_tail_" + std::to_string(i)).str()));
   }
 
-  Value doneInput =
-      comb::MuxOp::create(hwBuilder, loc, startSignal, falseConst, doneComb);
-  auto doneReg = seq::CompRegOp::create(
-      hwBuilder, loc, doneInput, clk, rst, falseConst,
-      hwBuilder.getStringAttr(namePrefix + "_done"));
-  doneSignal = doneReg;
+  // Done cuts through combinationally. doneComb is already exact (the
+  // tail stage has drained) and level-held: the epilogue chain holds
+  // until the next start clears it at the start edge, so like the old
+  // registered done it reads 0 from one cycle after child_start — the
+  // first cycle any WAIT state can sample it. Registering it here only
+  // cost a flat +1 cycle on every launch.
+  doneSignal = doneComb;
 
   // Phase 3B: resolve the stall backedge. Stall while an expect's dest
   // stage wants to consume but its done counter is empty and no done is
@@ -5178,10 +5778,21 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   }
 
   // Build a per-entry kind vector for createFunctionFSM. The FSM sees one
-  // state per entry, not per step.
+  // state per entry, not per step. Leaf entries whose frame contains no
+  // ops at all (await-only frames, e.g. the trailing `frame await` that
+  // orders the function terminator after the last launch) become
+  // STATELESS (-2): the preceding WAIT already enforced the ordering, so
+  // the state would burn a cycle doing nothing. Their awaits still
+  // resolve in the entry-processing loop below.
   SmallVector<int> entryKinds;
-  for (auto &e : entries)
-    entryKinds.push_back(e.kind);
+  for (auto &e : entries) {
+    int kind = e.kind;
+    if (kind == -1 &&
+        topFrames[e.frameIdx].getBodyBlock().getOps<LoopScheduleAtOp>()
+            .empty())
+      kind = -2;
+    entryKinds.push_back(kind);
+  }
 
   // Leaf entries with multi-cycle frames (e.g. two same-port stores the
   // scheduler serialized to `at 0` / `at 1`) hold their FSM state for the
@@ -5263,6 +5874,22 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   SmallVector<Value> entryRunningSignals(numEntries);
   for (unsigned i = 0; i < numEntries; ++i)
     entryRunningSignals[i] = fsmInst.getResult(fsmOutIdx++);
+
+  // Transaction-in-flight bit (also drives `ready` at module output):
+  // set on start, cleared on the FINAL done (backedge — resolved after
+  // the early-done OR below).
+  Backedge funcDoneBE = bb.get(i1);
+  Value falseConstIF = hw::ConstantOp::create(builder, loc, i1, 0);
+  Backedge inFlightNextBE = bb.get(i1);
+  auto inFlightReg = seq::CompRegOp::create(
+      builder, loc, Value(inFlightNextBE), clk, rst, falseConstIF,
+      builder.getStringAttr("tx_in_flight"));
+  Value notFuncDone = comb::createOrFoldNot(builder, loc, Value(funcDoneBE));
+  Value holdInFlight =
+      comb::AndOp::create(builder, loc, inFlightReg, notFuncDone);
+  Value inFlightNext = comb::OrOp::create(builder, loc, start, holdInFlight);
+  inFlightNextBE.setValue(inFlightNext);
+
   // Per-entry issue gates: multi-cycle leaf entries get their dedicated
   // frame_cycle_<i>_<c> outputs; single-cycle entries use entry_running.
   SmallVector<SmallVector<Value>> entryCycleGates(numEntries);
@@ -5273,6 +5900,39 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
             1 + numChildren + numEntries + entryCycleOutBase[i] + c));
     } else {
       entryCycleGates[i].push_back(entryRunningSignals[i]);
+    }
+  }
+
+  // Early function done: when the LAST stateful entry is a PIPELINE
+  // launch and the function returns nothing, done cuts through on the
+  // child's completion instead of waiting for the Moore DONE state.
+  // ~child_start excludes the launch cycle, where a stale done from the
+  // previous invocation may still be high. Pipelines only: their done
+  // carries the epilogue/store-tail margin (it asserts at least one
+  // cycle after the final store issues), whereas a sequential child's
+  // advance-edge done coincides with its final store cycle — cutting the
+  // MODULE-boundary done through on that edge would let the outside
+  // world observe done on the same posedge the last write commits.
+  {
+    int lastEmitted = -1;
+    for (int i = (int)numEntries - 1; i >= 0; --i) {
+      if (entryKinds[i] == -2)
+        continue;
+      lastEmitted = i;
+      break;
+    }
+    bool funcReturnsNothing =
+        funcOp.getBody().front().getTerminator()->getNumOperands() == 0;
+    if (lastEmitted >= 0 && entries[lastEmitted].kind == 1 &&
+        funcReturnsNothing) {
+      unsigned ci = (unsigned)childIndexForEntry[lastEmitted];
+      Value notStart =
+          comb::createOrFoldNot(builder, loc, childStartSignals[ci]);
+      Value inWait = comb::AndOp::create(
+          builder, loc, entryRunningSignals[(unsigned)lastEmitted], notStart);
+      Value early = comb::AndOp::create(builder, loc, inWait,
+                                        Value(childDoneBEs[ci]));
+      doneSignal = comb::OrOp::create(builder, loc, doneSignal, early);
     }
   }
 
@@ -6145,26 +6805,13 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   resolveFunctionMemoryBackedges(builder, loc, hwBody, hlmemBEs, memInstState,
                                   memPortMap);
 
-  // Build hw.output. Compute `ready` as "no transaction in flight": a
-  // sticky bit set on `start` and cleared on `done`. Sequential funcs
-  // accept exactly one transaction at a time, so this matches the FSM's
-  // IDLE-vs-RUNNING distinction without having to plumb a state-decoded
-  // signal out of the FSM machine.
+  // Build hw.output. `ready` = "no transaction in flight" — the sticky
+  // bit built next to the FSM instance (set on start, cleared on done);
+  // its done backedge resolves against the final (early-done-OR'd)
+  // signal here.
   builder.setInsertionPointToEnd(hwBody);
-  Value falseConstSeq =
-      hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0);
-  BackedgeBuilder readyBB(builder, loc);
-  Backedge inFlightNextBE = readyBB.get(builder.getI1Type());
-  auto inFlightReg = seq::CompRegOp::create(
-      builder, loc, Value(inFlightNextBE), clk, rst, falseConstSeq,
-      builder.getStringAttr("tx_in_flight"));
-  Value inFlight = inFlightReg;
-  Value notDoneSeq = comb::createOrFoldNot(builder, loc, doneSignal);
-  Value holdInFlight =
-      comb::AndOp::create(builder, loc, inFlight, notDoneSeq);
-  Value inFlightNext = comb::OrOp::create(builder, loc, start, holdInFlight);
-  inFlightNextBE.setValue(inFlightNext);
-  Value readySignal = comb::createOrFoldNot(builder, loc, inFlight);
+  funcDoneBE.setValue(doneSignal);
+  Value readySignal = comb::createOrFoldNot(builder, loc, inFlightReg);
 
   buildHWOutput(funcOp, builder, loc, hwBody, mapping, memPortMap, readySignal,
                 doneSignal);

@@ -8,8 +8,8 @@
 //
 // Exercises the unified FSM emission with multiple "wait" frames in a
 // single parent loop: createSequentialFSM must produce two child_start
-// outputs, two child_done inputs, two post_active outputs, and matching
-// WAIT_1/POST_1 and WAIT_2/POST_2 states.
+// outputs, two child_done inputs, and matching WAIT_1 and WAIT_2 states
+// (each WAIT exits directly into the next frame — no POST settle state).
 module {
   loopschedule.func_sequential @two_children(%arg0: memref<4xi32>, %arg1: memref<4xi32>)
       attributes {top} {
@@ -104,7 +104,7 @@ module {
 
 // The parent loop becomes loop0; its frames 1 and 2 each become a
 // child module (loop0_loop1, loop0_loop2). The parent FSM (loop0_fsm)
-// must contain BOTH WAIT_1/POST_1 and WAIT_2/POST_2.
+// must contain BOTH WAIT_1 and WAIT_2.
 
 // CHECK: hw.module @loop0
 // CHECK-DAG: hw.instance "loop0_loop1_inst" @loop0_loop1
@@ -121,10 +121,8 @@ module {
 // CHECK-DAG: fsm.state @FRAME_0
 // CHECK-DAG: fsm.state @FRAME_1
 // CHECK-DAG: fsm.state @WAIT_1
-// CHECK-DAG: fsm.state @POST_1
 // CHECK-DAG: fsm.state @FRAME_2
 // CHECK-DAG: fsm.state @WAIT_2
-// CHECK-DAG: fsm.state @POST_2
 
 // CHECK: hw.module @loop0_loop1
 // CHECK: hw.module @loop0_loop2
