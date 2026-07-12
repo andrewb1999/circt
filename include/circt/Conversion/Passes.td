@@ -38,8 +38,10 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
     "circt::oplib::OpLibDialect"
   ];
   let options = [
-    Option<"prioritizeII", "prioritize-II", "bool", "",
-            "Whether to prioritize lower II over cycle time.">
+    Option<"cycleTimeNs", "cycle-time-ns", "float", "1.0",
+            "Combinational delay budget per cycle (ns) for chaining-aware "
+            "scheduling; typically the target clock period minus clock "
+            "uncertainty. Operator delays are expressed in the same unit.">
   ];
 }
 

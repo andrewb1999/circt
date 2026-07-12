@@ -683,7 +683,7 @@ void SCFToLoopSchedulePass::runOnOperation() {
 }
 
 LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
-  float cycleTime = prioritizeII ? 2.0 : 1.0;
+  float cycleTime = cycleTimeNs;
 
   // Reset per-func state so we don't leak entries from a prior func.
   predicateMap.clear();
@@ -1011,6 +1011,46 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
     Operation *op, Region &loopBody, ChainingSharedOperatorsProblem &problem) {
   // Scheduling analyis only considers the innermost loop nest for now.
 
+  // Set an operator type's delays, clamped to the cycle budget. The
+  // chaining analysis hard-fails when a single operator's delay exceeds
+  // the cycle time; the physically honest fallback is to give such an
+  // operator a full cycle to itself, so clamp and warn instead.
+  float cycleTime = cycleTimeNs;
+  auto setDelays = [&](Problem::OperatorType opr, float inc, float out,
+                       Operation *locOp) {
+    if (inc > cycleTime || out > cycleTime)
+      locOp->emitWarning("operator '")
+          << opr.getAttr().getValue() << "' delays (incoming " << inc
+          << ", outgoing " << out << " ns) exceed the cycle time of "
+          << cycleTime << " ns; clamping to the full cycle";
+    problem.setIncomingDelay(opr, std::min(inc, cycleTime));
+    problem.setOutgoingDelay(opr, std::min(out, cycleTime));
+  };
+
+  // Resolve a memory access's scheduling timing from the per-memory
+  // `oplib.operator` stamped by OperatorAllocation, when present. Returns
+  // {operator name, latency, incoming delay, outgoing delay}; the delay
+  // defaults match the historical hardcoded memory constants.
+  struct MemTiming {
+    StringRef name;
+    unsigned latency;
+    float incomingDelay;
+    float outgoingDelay;
+  };
+  auto memAccessTiming = [&](Operation *memOp) -> std::optional<MemTiming> {
+    auto sym = memOp->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+    if (!sym)
+      return std::nullopt;
+    StringRef name = sym.getLeafReference();
+    if (!operatorLibraryAnalysis->hasOperator(name))
+      return std::nullopt;
+    return MemTiming{
+        name, operatorLibraryAnalysis->getOperatorLatency(name),
+        operatorLibraryAnalysis->getOperatorIncomingDelay(name).value_or(0.5f),
+        operatorLibraryAnalysis->getOperatorOutgoingDelay(name).value_or(
+            0.5f)};
+  };
+
   // Load the Calyx operator library into the problem. This is a very minimal
   // set of arithmetic and memory operators for now. This should ultimately be
   // pulled out into some sort of dialect interface.
@@ -1056,14 +1096,13 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
           problem.getOrInsertOperatorType(selectedOperator);
       problem.setLatency(libOpr, operatorLibraryAnalysis->getOperatorLatency(
                                      selectedOperator));
-      problem.setIncomingDelay(
+      setDelays(
           libOpr,
           operatorLibraryAnalysis->getOperatorIncomingDelay(selectedOperator)
-              .value_or(0.0));
-      problem.setOutgoingDelay(
-          libOpr,
+              .value_or(0.0),
           operatorLibraryAnalysis->getOperatorOutgoingDelay(selectedOperator)
-              .value_or(0.0));
+              .value_or(0.0),
+          op);
       problem.setLinkedOperatorType(op, libOpr);
       op->setAttr("loopschedule.operator",
                   SymbolRefAttr::get(libOpr.getAttr()));
@@ -1140,6 +1179,15 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
           return WalkResult::advance();
         })
         .Case<LoopScheduleStoreOp, AffineStoreOp>([&](Operation *memOp) {
+          if (auto timing = memAccessTiming(memOp)) {
+            Problem::OperatorType memOpr =
+                problem.getOrInsertOperatorType(timing->name);
+            problem.setLatency(memOpr, timing->latency);
+            problem.setLinkedOperatorType(memOp, memOpr);
+            setDelays(memOpr, timing->incomingDelay, timing->outgoingDelay,
+                      memOp);
+            return WalkResult::advance();
+          }
           Value memRef = isa<AffineStoreOp>(*memOp)
                              ? cast<AffineStoreOp>(*memOp).getMemRef()
                              : cast<LoopScheduleStoreOp>(*memOp).getMemRef();
@@ -1152,6 +1200,15 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
           return WalkResult::advance();
         })
         .Case<LoopScheduleLoadOp, AffineLoadOp>([&](Operation *memOp) {
+          if (auto timing = memAccessTiming(memOp)) {
+            Problem::OperatorType memOpr =
+                problem.getOrInsertOperatorType(timing->name);
+            problem.setLatency(memOpr, timing->latency);
+            problem.setLinkedOperatorType(memOp, memOpr);
+            setDelays(memOpr, timing->incomingDelay, timing->outgoingDelay,
+                      memOp);
+            return WalkResult::advance();
+          }
           Value memRef = getMemref(memOp);
           Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
               "mem_" + std::to_string(hash_value(memRef)));
@@ -1177,12 +1234,22 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
             uniqueId = storeOp.getUniqueId();
             incomingDelay = storeOp.getIncomingDelay();
           }
+          // Prefer characterized delays from the per-memory operator when
+          // OperatorAllocation stamped one; the interface methods are the
+          // uncalibrated fallback. Latency stays with the port type (it is
+          // authoritative for the FSM lowering), and the operator-type key
+          // stays the per-port uniqueId so port/resource semantics are
+          // unchanged.
+          if (auto timing = memAccessTiming(op)) {
+            incomingDelay = timing->incomingDelay;
+            if (isa<loopschedule::LoadInterface>(*op))
+              outgoingDelay = timing->outgoingDelay;
+          }
           Problem::OperatorType portOpr =
               problem.getOrInsertOperatorType(uniqueId);
           problem.setLatency(portOpr, latency);
           problem.setLinkedOperatorType(op, portOpr);
-          problem.setIncomingDelay(portOpr, incomingDelay);
-          problem.setOutgoingDelay(portOpr, outgoingDelay);
+          setDelays(portOpr, incomingDelay, outgoingDelay, op);
 
           return WalkResult::advance();
         })
@@ -1199,8 +1266,8 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
             problem.addLinkedResourceType(op, rsrc);
           }
           problem.setLinkedOperatorType(op, opr);
-          problem.setIncomingDelay(opr, schedOp.getIncomingDelay());
-          problem.setOutgoingDelay(opr, schedOp.getOutgoingDelay());
+          setDelays(opr, schedOp.getIncomingDelay(),
+                    schedOp.getOutgoingDelay(), op);
 
           return WalkResult::advance();
         })

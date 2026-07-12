@@ -81,6 +81,11 @@ struct OperatorLibraryAnalysis {
 
   Operation *getOperatorTemplateOp(StringRef);
 
+  /// True when an operator with this symbol name exists in the library.
+  /// The per-operator getters below assert on unknown names; callers
+  /// resolving symbols from attributes should check this first.
+  bool hasOperator(StringRef);
+
   unsigned int getOperatorLatency(StringRef);
 
   std::optional<float> getOperatorIncomingDelay(StringRef);

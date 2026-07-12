@@ -235,6 +235,10 @@ SmallVector<StringRef> OperatorLibraryAnalysis::getAllSupportedTargets() {
   return targets;
 }
 
+bool OperatorLibraryAnalysis::hasOperator(StringRef operatorName) {
+  return operatorMap.find(operatorName) != operatorMap.end();
+}
+
 unsigned OperatorLibraryAnalysis::getOperatorLatency(StringRef operatorName) {
   auto operatorStruct = operatorMap.at(operatorName);
 
