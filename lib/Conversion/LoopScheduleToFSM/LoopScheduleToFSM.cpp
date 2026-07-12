@@ -741,6 +741,25 @@ private:
   DenseMap<Value, SmallVector<Value>> delayChain;
 };
 
+/// One extern operator instance shared by several scheduled ops that the
+/// binding pass proved can never issue in the same cycle (same
+/// `loopschedule.operator` and `loopschedule.binding`). The first user
+/// creates the instance; each subsequent user rewrites the instance's
+/// operand ports to `mux(userGate, userOperand, previousDrive)` and
+/// narrows the CE port to the AND of the users' CEs (hw.module bodies
+/// are graph regions, so the later-defined muxes may legally drive the
+/// earlier instance).
+struct SharedOperatorInstance {
+  hw::InstanceOp instOp;
+  /// Instance input index for the extern port carrying `oplib.operand j`
+  /// (index j into this vector), -1 when the operator has no such port.
+  SmallVector<int> operandPortForIdx;
+  /// Instance input index of the `oplib.enable` port, -1 if none.
+  int ceInputIdx = -1;
+  /// Current CE drive (ANDed as users join).
+  Value ce;
+};
+
 /// Main pass converting LoopSchedule ops to FSM + HW.
 class LoopScheduleToFSMPass
     : public circt::impl::LoopScheduleToFSMBase<LoopScheduleToFSMPass> {
@@ -873,7 +892,8 @@ private:
   /// op's results.
   LogicalResult emitComputeOp(Operation *op, OpBuilder &builder,
                               IRMapping &mapping, ModuleOp moduleOp,
-                              Value clk, Value rst, Value opCE = {});
+                              Value clk, Value rst, Value opCE = {},
+                              Value shareGate = {});
 
   /// `lowerAtBody` is a method (not a free function) so it can access
   /// `operatorLibrary` and `instanceUniquer` directly.
@@ -909,6 +929,19 @@ private:
   /// sym_names emitted by the operator-library dispatch helpers. Reset per
   /// `hw.module` we generate.
   llvm::StringMap<unsigned> instanceUniquer;
+
+  /// Extern operator instances shared by binding id within the hw.module
+  /// currently being generated (reset alongside `instanceUniquer`). Ops
+  /// stamped with the same (operator, `loopschedule.binding`) pair by the
+  /// binding pass reuse one instance: each joining user's operands are
+  /// muxed in under its activation gate, and the clock-enable narrows to
+  /// the AND of the users' CEs. The AND is sound because every stall term
+  /// in a module is gated on its own frame/stage being active, so a
+  /// non-owning user's CE reads idle-high — and cross-frame users are
+  /// separated by full pipeline drains (frame WAIT semantics), so at most
+  /// one user ever has values in flight.
+  llvm::DenseMap<std::pair<mlir::StringAttr, int64_t>, SharedOperatorInstance>
+      sharedOperators;
 };
 
 //===----------------------------------------------------------------------===//
@@ -1421,11 +1454,13 @@ emitCombOpFromOperator(Operation *origOp, OpBuilder &builder,
 /// `oplib.operand = N` / `oplib.result = N` per-port attrs stamped by
 /// `OperatorLibraryLoader::makePortAttrDict`.
 static LogicalResult
-emitHwInstanceFromOperator(Operation *origOp, OpBuilder &builder,
-                           IRMapping &mapping, ModuleOp moduleOp,
-                           oplib::HwInstanceOp templateInst, Value clk,
-                           Value rst, llvm::StringMap<unsigned> &uniquer,
-                           StringRef opName, Value opCE = {}) {
+emitHwInstanceFromOperator(
+    Operation *origOp, OpBuilder &builder, IRMapping &mapping,
+    ModuleOp moduleOp, oplib::HwInstanceOp templateInst, Value clk, Value rst,
+    llvm::StringMap<unsigned> &uniquer, StringRef opName, Value opCE = {},
+    Value shareGate = {},
+    llvm::DenseMap<std::pair<mlir::StringAttr, int64_t>,
+                   SharedOperatorInstance> *sharedOps = nullptr) {
   auto externOp = moduleOp.lookupSymbol<hw::HWModuleExternOp>(
       templateInst.getModuleNameAttr().getValue());
   if (!externOp)
@@ -1436,11 +1471,75 @@ emitHwInstanceFromOperator(Operation *origOp, OpBuilder &builder,
   auto inputAttrs = externOp.getAllInputAttrs();
   auto outputAttrs = externOp.getAllOutputAttrs();
 
+  // Map each op-result to the instance output carrying `oplib.result = N`.
+  auto mapResults = [&](hw::InstanceOp instOp) {
+    unsigned outIdx = 0;
+    for (auto port : externOp.getPortList()) {
+      if (port.dir != hw::ModulePort::Direction::Output)
+        continue;
+      DictionaryAttr portAttrs =
+          outIdx < outputAttrs.size()
+              ? dyn_cast_or_null<DictionaryAttr>(outputAttrs[outIdx])
+              : DictionaryAttr();
+      if (portAttrs) {
+        if (auto resIdxAttr =
+                dyn_cast_or_null<IntegerAttr>(portAttrs.get("oplib.result"))) {
+          unsigned j = resIdxAttr.getInt();
+          if (j < origOp->getNumResults())
+            mapping.map(origOp->getResult(j), instOp.getResult(outIdx));
+        }
+      }
+      ++outIdx;
+    }
+  };
+
+  // Shared-instance path: the binding pass proved same-(operator, binding)
+  // ops never issue in the same cycle, so a later user joins the first
+  // user's instance — operands muxed in under this user's activation gate,
+  // CE narrowed to the AND of the users' CEs (see SharedOperatorInstance).
+  auto bindingAttr =
+      origOp->getAttrOfType<IntegerAttr>("loopschedule.binding");
+  bool shareable = bindingAttr && shareGate && sharedOps;
+  std::pair<mlir::StringAttr, int64_t> shareKey;
+  if (shareable) {
+    shareKey = {builder.getStringAttr(opName), bindingAttr.getInt()};
+    auto it = sharedOps->find(shareKey);
+    if (it != sharedOps->end()) {
+      SharedOperatorInstance &shared = it->second;
+      for (auto [j, idx] : llvm::enumerate(shared.operandPortForIdx)) {
+        if (idx < 0)
+          continue;
+        if (j >= origOp->getNumOperands())
+          return origOp->emitOpError("operator '")
+                 << opName << "' shared instance expects operand " << j;
+        Value mine = mapping.lookup(origOp->getOperand(j));
+        Value cur = shared.instOp->getOperand(idx);
+        Value muxed = comb::MuxOp::create(builder, origOp->getLoc(),
+                                          shareGate, mine, cur);
+        shared.instOp->setOperand(idx, muxed);
+      }
+      if (shared.ceInputIdx >= 0) {
+        Value oneI1Local = hw::ConstantOp::create(
+            builder, origOp->getLoc(), builder.getI1Type(), (int64_t)1);
+        Value myCE = opCE ? opCE : oneI1Local;
+        if (myCE != shared.ce) {
+          Value newCE = comb::AndOp::create(builder, origOp->getLoc(),
+                                            shared.ce, myCE);
+          shared.instOp->setOperand(shared.ceInputIdx, newCE);
+          shared.ce = newCE;
+        }
+      }
+      mapResults(shared.instOp);
+      return success();
+    }
+  }
+
   Value oneI1 = hw::ConstantOp::create(builder, origOp->getLoc(),
                                        builder.getI1Type(), (int64_t)1);
   Value clkValue = clk;
 
   SmallVector<Value> instanceOperands;
+  SharedOperatorInstance sharedEntry;
   unsigned inIdx = 0;
   for (auto port : externOp.getPortList()) {
     if (port.dir != hw::ModulePort::Direction::Input)
@@ -1465,6 +1564,8 @@ emitHwInstanceFromOperator(Operation *origOp, OpBuilder &builder,
       // running CE lets in-flight values march out of the operator pipe
       // during the stall and be lost or double-consumed.
       driver = opCE ? opCE : oneI1;
+      sharedEntry.ceInputIdx = (int)instanceOperands.size();
+      sharedEntry.ce = driver;
     } else if (portAttrs) {
       if (auto opIdxAttr =
               dyn_cast_or_null<IntegerAttr>(portAttrs.get("oplib.operand"))) {
@@ -1474,6 +1575,9 @@ emitHwInstanceFromOperator(Operation *origOp, OpBuilder &builder,
                  << opName << "' extern port operand index " << j
                  << " exceeds op operand count";
         driver = mapping.lookup(origOp->getOperand(j));
+        if (sharedEntry.operandPortForIdx.size() <= j)
+          sharedEntry.operandPortForIdx.resize(j + 1, -1);
+        sharedEntry.operandPortForIdx[j] = (int)instanceOperands.size();
       }
     }
     if (!driver)
@@ -1493,26 +1597,12 @@ emitHwInstanceFromOperator(Operation *origOp, OpBuilder &builder,
       builder, origOp->getLoc(), externOp,
       builder.getStringAttr(instanceName), instanceOperands);
 
-  // Map each op-result to the corresponding instance output via the
-  // extern's `oplib.result = N` per-port attr.
-  unsigned outIdx = 0;
-  for (auto port : externOp.getPortList()) {
-    if (port.dir != hw::ModulePort::Direction::Output)
-      continue;
-    DictionaryAttr portAttrs =
-        outIdx < outputAttrs.size()
-            ? dyn_cast_or_null<DictionaryAttr>(outputAttrs[outIdx])
-            : DictionaryAttr();
-    if (portAttrs) {
-      if (auto resIdxAttr =
-              dyn_cast_or_null<IntegerAttr>(portAttrs.get("oplib.result"))) {
-        unsigned j = resIdxAttr.getInt();
-        if (j < origOp->getNumResults())
-          mapping.map(origOp->getResult(j), instOp.getResult(outIdx));
-      }
-    }
-    ++outIdx;
+  if (shareable) {
+    sharedEntry.instOp = instOp;
+    (*sharedOps)[shareKey] = sharedEntry;
   }
+
+  mapResults(instOp);
   return success();
 }
 
@@ -1523,7 +1613,10 @@ emitOpFromOperatorLibrary(Operation *origOp, OpBuilder &builder,
                           IRMapping &mapping, ModuleOp moduleOp, Value clk,
                           Value rst, llvm::StringMap<unsigned> &uniquer,
                           analysis::OperatorLibraryAnalysis &ola,
-                          Value opCE = {}) {
+                          Value opCE = {}, Value shareGate = {},
+                          llvm::DenseMap<std::pair<mlir::StringAttr, int64_t>,
+                                         SharedOperatorInstance> *sharedOps =
+                              nullptr) {
   auto operatorAttr =
       origOp->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
   if (!operatorAttr)
@@ -1544,7 +1637,7 @@ emitOpFromOperatorLibrary(Operation *origOp, OpBuilder &builder,
     if (auto inst = dyn_cast<oplib::HwInstanceOp>(op))
       return emitHwInstanceFromOperator(origOp, builder, mapping, moduleOp,
                                         inst, clk, rst, uniquer, opName,
-                                        opCE);
+                                        opCE, shareGate, sharedOps);
   }
   return emitCombOpFromOperator(origOp, builder, mapping, hwMatch);
 }
@@ -1602,7 +1695,8 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
       return handleHWStore(storeOp, builder, mapping, gate, memPorts, seqMux);
     if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner))
       return handleHWLoad(loadOp, builder, mapping, memPorts, gate, seqMux);
-    return emitComputeOp(inner, builder, mapping, moduleOp, clk, rst, opCE);
+    return emitComputeOp(inner, builder, mapping, moduleOp, clk, rst, opCE,
+                         /*shareGate=*/gate);
   };
   for (auto &op : *body) {
     if (failed(processOp(&op, pickGate(baseCycle))))
@@ -1613,7 +1707,7 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
 
 LogicalResult LoopScheduleToFSMPass::emitComputeOp(
     Operation *op, OpBuilder &builder, IRMapping &mapping, ModuleOp moduleOp,
-    Value clk, Value rst, Value opCE) {
+    Value clk, Value rst, Value opCE, Value shareGate) {
   // Constants and free-pass casts (extsi/extui/trunci/index_cast) are not
   // first-class operator-library entries. They get cloned through the
   // mapping so downstream consumers see them.
@@ -1635,7 +1729,8 @@ LogicalResult LoopScheduleToFSMPass::emitComputeOp(
     return success();
   }
   return emitOpFromOperatorLibrary(op, builder, mapping, moduleOp, clk, rst,
-                                    instanceUniquer, *operatorLibrary, opCE);
+                                    instanceUniquer, *operatorLibrary, opCE,
+                                    shareGate, &sharedOperators);
 }
 
 LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
@@ -2964,6 +3059,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // Reset the per-hw.module instance-name uniquer so generated `hw.instance`
   // sym_names don't collide across nested loop modules.
   instanceUniquer.clear();
+  sharedOperators.clear();
 
   // Clone referenced constants into the module body.
   OpBuilder hw(ctx);
@@ -4905,7 +5001,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
         return emitComputeOp(
             inner, hwBuilder, mapping,
             hwBody->getParentOp()->getParentOfType<ModuleOp>(), clk, rst,
-            /*opCE=*/notStall);
+            /*opCE=*/notStall, /*shareGate=*/gate);
       };
       // Use the stall-gated stage CE as the write-/read-enable gate so
       // memory requests don't re-fire when the pipeline idles on !done.
@@ -5668,6 +5764,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
 
   // Reset the per-hw.module instance-name uniquer.
   instanceUniquer.clear();
+  sharedOperators.clear();
 
   // Resolve the enclosing builtin.module so the operator-library lowering
   // can look up `hw.module.extern` declarations by symbol.
@@ -6858,6 +6955,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
   Value start = hwBody->getArgument(startIdx);
 
   instanceUniquer.clear();
+  sharedOperators.clear();
   auto enclosingModule = funcOp->getParentOfType<ModuleOp>();
   builder.setInsertionPointToEnd(hwBody);
 
@@ -7049,7 +7147,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
                               perStagePorts[stageIdx], gate);
         }
         return emitComputeOp(inner, builder, mapping, enclosingModule, clk,
-                             rst);
+                             rst, /*opCE=*/{}, /*shareGate=*/gate);
       };
 
       LogicalResult opResult = processOp(&op, stageCE[stageIdx]);

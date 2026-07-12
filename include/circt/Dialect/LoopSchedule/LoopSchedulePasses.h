@@ -35,6 +35,8 @@ std::unique_ptr<mlir::Pass> createUnrollForLoopSchedulePass();
 std::unique_ptr<mlir::Pass> createPipelineForLoopSchedulePass();
 std::unique_ptr<mlir::Pass> createUnrollMarkedLoopsPass();
 std::unique_ptr<mlir::Pass> createLoopScheduleBindingPass();
+std::unique_ptr<mlir::Pass>
+createLoopScheduleBindingPass(const LoopScheduleBindingOptions &options);
 std::unique_ptr<mlir::Pass> createLoopScheduleTestbenchGenerationPass();
 std::unique_ptr<mlir::Pass> createLoopScheduleTestbenchGenerationPass(
     const LoopScheduleTestbenchGenerationOptions &options);

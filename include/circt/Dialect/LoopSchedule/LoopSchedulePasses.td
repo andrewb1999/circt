@@ -68,19 +68,31 @@ def LoopScheduleBinding : Pass<"loopschedule-binding", "mlir::ModuleOp"> {
   let summary = "Assign hardware instance ids to scheduled loopschedule ops.";
   let description = [{
     Walks each `loopschedule.func_sequential` / `loopschedule.func_pipeline`
-    and runs the binding framework on its scheduled ops. For every op
-    that contends for a limited resource (memory ports, shared arith
-    operators, etc.), this pass stamps a `loopschedule.binding = K` attr
-    identifying the hardware instance within that resource's pool.
+    and runs the binding framework on its scheduled ops, stamping a
+    `loopschedule.binding = K` attr identifying the hardware instance
+    within each resource's pool.
 
-    Bare-bones at the moment: the pass is registered and walks the
-    expected func containers, but does not yet populate binding problems
-    or stamp attributes. Subsequent changes will fill in the per-op
-    resource-linking and the `bindLeftEdge` call.
+    Ops whose `oplib.operator` declares a `limit` bind against that cap
+    (memory accesses arrive this way). Ops whose operator is backed by an
+    extern hw.instance but declares no limit bind in SHARE mode: the pool
+    is sized to the op count, so the greedy binder assigns the minimal
+    number of physical instances consistent with the schedule — never
+    fewer than the concurrent demand, hence zero schedule impact. The FSM
+    lowering coalesces same-(operator, binding) ops in one hw.module onto
+    a single extern instance.
   }];
   let constructor = "circt::loopschedule::createLoopScheduleBindingPass()";
   let dependentDialects = [
     "circt::loopschedule::LoopScheduleDialect"
+  ];
+  let options = [
+    Option<"bindMemories", "bind-memories", "bool", "true",
+           "Bind memory accesses against their declared port limits. "
+           "Pipeline integrations that assign memory ports elsewhere "
+           "(e.g. AMC port-group binding) should disable this.">,
+    Option<"shareOperators", "share-operators", "bool", "true",
+           "Bind extern-instance compute operators in share mode "
+           "(minimal instances, zero schedule impact).">
   ];
 }
 
