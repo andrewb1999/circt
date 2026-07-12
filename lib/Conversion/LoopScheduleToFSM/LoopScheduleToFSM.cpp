@@ -3014,6 +3014,34 @@ static void muxStageMemPorts(
 // Modular loop lowering (one hw.module per sequential loop)
 //===----------------------------------------------------------------------===//
 
+/// Minimum at-offset at which pipeline iter_arg `argIdx` is read inside
+/// `pipOp` (users outside any `loopschedule.at` count as offset 0), or
+/// UINT_MAX when the argument is never read. Shared between the early
+/// child_start peephole's init-timing guard and the iter-arg preload
+/// depth in `lowerPipelineChild` — the two MUST agree: the peephole only
+/// guarantees a same-frame-produced init is readable by cycle
+/// `start + firstUse`, and the preload samples the init at exactly that
+/// cycle. (This lowering assumes stage at-offsets are contiguous from 0,
+/// i.e. offset == position in the stage list — the same invariant the
+/// stageCE indexing relies on elsewhere.)
+static unsigned firstIterArgUseOffset(loopschedule::LoopSchedulePipelineOp pipOp,
+                                      unsigned argIdx) {
+  BlockArgument arg = pipOp.getStagesBlock().getArgument(argIdx);
+  unsigned firstUse = UINT_MAX;
+  for (auto *user : arg.getUsers()) {
+    LoopScheduleAtOp userAt;
+    Operation *anc = user;
+    while (anc && anc != pipOp.getOperation()) {
+      if ((userAt = dyn_cast<LoopScheduleAtOp>(anc)))
+        break;
+      anc = anc->getParentOp();
+    }
+    firstUse =
+        std::min(firstUse, userAt ? (unsigned)userAt.getOffset() : 0u);
+  }
+  return firstUse;
+}
+
 LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     const LoopNode &node, OpBuilder &builder, Location loc,
     loopschedule::LoopScheduleFuncSequentialOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
@@ -3147,12 +3175,13 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // because a same-frame static op produces one of its iter_arg inits
   // (e.g. an accumulator init loaded from memory). But the pipeline does
   // not read an init until the FIRST STAGE THAT USES the corresponding
-  // iter_arg (the per-stage first_iter mux samples it on that stage's
-  // first fire), so the start pulse can move ahead of the init's ready
-  // cycle — often all the way to at-0 — overlapping the pipeline's first
-  // stages with the frame's remaining preamble cycles and shaving
-  // K - newStart cycles per iteration. The frame keeps its full cycle
-  // count (static-op issue/capture cycles are untouched); only the
+  // iter_arg (the feedback-register preload in `lowerPipelineChild`
+  // samples it on the start pulse delayed by `firstIterArgUseOffset`),
+  // so the start pulse can move ahead of the init's ready cycle — often
+  // all the way to at-0 — overlapping the pipeline's first stages with
+  // the frame's remaining preamble cycles and shaving K - newStart
+  // cycles per iteration. The frame keeps its full cycle count
+  // (static-op issue/capture cycles are untouched); only the
   // child_start pulse and the child_active window move.
   //
   // Guards:
@@ -3202,20 +3231,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       // latched into the launch-consumer capture register at the end of
       // that cycle — register-readable the cycle after.
       unsigned ready = (unsigned)defAt.getOffset() + 2;
-      // First pipeline stage that reads this iter_arg.
-      BlockArgument arg = pipBlock.getArgument(argIdx);
-      unsigned firstUse = UINT_MAX;
-      for (auto *user : arg.getUsers()) {
-        LoopScheduleAtOp userAt;
-        Operation *anc = user;
-        while (anc && anc != pipOp.getOperation()) {
-          if ((userAt = dyn_cast<LoopScheduleAtOp>(anc)))
-            break;
-          anc = anc->getParentOp();
-        }
-        firstUse = std::min(
-            firstUse, userAt ? (unsigned)userAt.getOffset() : 0u);
-      }
+      // First pipeline stage that reads this iter_arg (shared with the
+      // preload-depth computation in lowerPipelineChild).
+      unsigned firstUse = firstIterArgUseOffset(pipOp, argIdx);
       if (firstUse == UINT_MAX)
         continue; // init never read
       minStart = std::max(minStart, ready > firstUse ? ready - firstUse : 0);
@@ -5112,23 +5130,54 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
 
   muxStageMemPorts(hwBuilder, loc, perStagePorts, stageCE, memPorts);
 
-  // Per-stage first_iter signals. Each stage s's first_iter is 1 on reset,
-  // re-arms to 1 on start, and clears the first time stageCE[s] genuinely
-  // fires. An iter_arg whose feedback value is produced at stage s must read
-  // its init value until that stage has fired at least once in this pipeline
-  // run — a single global first_iter flipping on `active` is too early for
-  // iter_args fed by late stages (e.g. a matmul accumulator at the last stage
-  // reads a stale register for cycles 1..N before the stage first writes).
+  // Iter-arg init delivery. Historically each iter_arg's value was a
+  // combinational mux `first_iter_s<fs> ? init : feedback` driving the
+  // backedge, so a 1-bit per-stage first_iter flop fanned out across
+  // every consumer bit of every iter_arg (bitwidth x iter_args loads —
+  // a fanout-97 net on doitgen's accumulator) and the mux logic sat in
+  // front of the accumulator's carry chain on the critical path.
   //
-  // The clear MUST use the stall-gated CE: the raw stageCE only means "stage
-  // occupied" and freezes high across stalls, while the feedback registers
-  // capture on the gated CE. Clearing on the raw CE flips the init/feedback
-  // mux during the stall, cycles before the first genuine fire, so the
-  // consumer reads stale feedback (the previous run's final value) instead of
-  // init. Masked on run 0 (feedback resets to init's usual value) and on
-  // stall-free loops; broke run N>0 of stall-heavy (AXI) inner loops.
+  // Instead, PRELOAD the feedback register with the init value on a
+  // delayed copy of the start pulse and resolve the backedge to the
+  // register output directly: no datapath mux, no first_iter fanout.
+  //
+  // Preload phasing: for a start pulse in cycle T, stage u first fires
+  // (consumers sample, captures land) during cycle T+1+u — `active`
+  // rises at T+1 and stageCE[u] is activeCE delayed u cycles, all on
+  // notStall-gated flops that freeze in lockstep with the preload delay
+  // chain during stalls. Preloading on start delayed by d lands the
+  // init at the END of cycle T+d, register-readable from T+1+d — one
+  // full cycle before the earliest consumer fire at T+1+u, u >= d. The
+  // depth d = firstIterArgUseOffset matches the early child_start
+  // peephole's init-timing guard exactly: the peephole only guarantees
+  // a same-frame-produced init is readable at cycle start + firstUse,
+  // so sampling any earlier would latch garbage on peephole-started
+  // pipelines (the doitgen accumulator case).
+  //
+  // Forced/fallback cases:
+  //  * an iter_arg feeding the loop condition combinationally must
+  //    present init from T+1 (the condition gates activeCE from the
+  //    first post-start cycle, reading the backedge unregistered), so
+  //    its depth is forced to 0 — the same timing the old mux gave,
+  //    whose first_iter re-armed at the end of the start cycle;
+  //  * when firstUse > feedbackStage (preload could sample an init the
+  //    peephole never proved ready) or the feedback is not a plain
+  //    stage register (local hlmem reads, latent operator outputs,
+  //    passthroughs), fall back to the historical first_iter mux,
+  //    built lazily below.
+  //
+  // The preload is edge-triggered by the start pulse rather than
+  // derived from CE history, which structurally removes the run-N>0
+  // stall hazard the old first_iter clear had (the clear had to use the
+  // stall-gated CE or run N>0 of stall-heavy AXI loops read the
+  // previous run's final accumulator instead of init).
   SmallVector<Value> firstIterPerStage(stages.size());
-  for (unsigned s = 0; s < stages.size(); ++s) {
+  auto getFirstIter = [&](unsigned s) -> Value {
+    if (firstIterPerStage[s])
+      return firstIterPerStage[s];
+    // 1 on reset, re-arms to 1 on start, clears the first time
+    // gatedStageCE[s] genuinely fires (the raw stageCE only means
+    // "stage occupied" and freezes high across stalls).
     Backedge be = bb.get(hwBuilder.getI1Type());
     Value notCE = comb::createOrFoldNot(hwBuilder, loc, gatedStageCE[s]);
     Value sticky = comb::AndOp::create(hwBuilder, loc, Value(be), notCE);
@@ -5139,19 +5188,70 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
             (namePrefix + "_first_iter_s" + std::to_string(s)).str()));
     be.setValue(reg);
     firstIterPerStage[s] = reg;
+    return reg;
+  };
+
+  // Lazily grown chain of notStall-gated start-pulse delays. Assumes the
+  // 1-cycle start pulse contract the old first_iter re-arm also relied
+  // on.
+  SmallVector<Value> startDelayChain = {startSignal};
+  auto getStartDelayed = [&](unsigned d) -> Value {
+    while (startDelayChain.size() <= d)
+      startDelayChain.push_back(seq::CompRegClockEnabledOp::create(
+          hwBuilder, loc, startDelayChain.back(), clk, notStall, rst,
+          falseConst,
+          hwBuilder.getStringAttr((namePrefix + "_preload_start_d" +
+                                   std::to_string(startDelayChain.size()))
+                                      .str())));
+    return startDelayChain[d];
+  };
+
+  // Conservative backward slice of the condition's combinational cone
+  // over the source IR: stage-result crossings are registered and stop
+  // the walk; every stages-block argument reached is an iter_arg the
+  // condition reads combinationally at T+1.
+  DenseSet<unsigned> condConeArgs;
+  {
+    SmallVector<Value> worklist;
+    if (auto condResult = dyn_cast<OpResult>(condTermVal);
+        condResult && isa<LoopScheduleAtOp>(condResult.getOwner()))
+      worklist.push_back(stages[condStageIdx].getYieldOp().getOperands()
+                             [condResult.getResultNumber()]);
+    else
+      worklist.push_back(condTermVal);
+    DenseSet<Value> seen;
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      if (!v || !seen.insert(v).second)
+        continue;
+      if (auto barg = dyn_cast<BlockArgument>(v)) {
+        if (barg.getOwner() == &pipOp.getStagesBlock())
+          condConeArgs.insert(barg.getArgNumber());
+        continue;
+      }
+      Operation *def = v.getDefiningOp();
+      if (!def || isa<LoopScheduleAtOp>(def) || !pipOp->isAncestor(def))
+        continue; // registered stage result / defined outside: stop.
+      for (Value operand : def->getOperands())
+        worklist.push_back(operand);
+    }
   }
 
   auto pipIterArgUpdates = loopschedule::getIterArgUpdatesInOrder(pipOp);
+  // Registers already preloaded: init value + pulse depth, so a second
+  // iter_arg resolving to the same register can reuse the preload only
+  // when it is provably compatible.
+  DenseMap<Operation *, std::pair<Value, unsigned>> preloadedRegs;
   for (unsigned i = 0; i < numIterArgs; ++i) {
     Value init = mapping.lookup(pipOp.getInits()[i]);
     Value termVal = pipIterArgUpdates[i]
                         ? loopschedule::getIterArgPhaseResult(pipIterArgUpdates[i])
                         : Value{};
     Value feedback = mapping.lookup(termVal);
-    // The feedback value is produced at some stage; first_iter must stay
-    // high until that stage has fired at least once. If the feedback isn't
-    // a stage result (shouldn't happen for well-formed pipelines), fall
-    // back to stage 0.
+    // The feedback value is produced at some stage; the init must stay
+    // visible until that stage has fired at least once. If the feedback
+    // isn't a stage result (shouldn't happen for well-formed pipelines),
+    // fall back to stage 0.
     unsigned feedbackStage = 0;
     if (auto opResult = dyn_cast<OpResult>(termVal)) {
       if (auto stage = dyn_cast<LoopScheduleAtOp>(opResult.getOwner())) {
@@ -5162,8 +5262,42 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
           }
       }
     }
+
+    unsigned firstUse = firstIterArgUseOffset(pipOp, i);
+    unsigned d = condConeArgs.contains(i) ? 0u
+                 : firstUse == UINT_MAX   ? feedbackStage
+                                          : firstUse;
+
+    auto feedbackReg =
+        feedback ? feedback.getDefiningOp<seq::CompRegClockEnabledOp>()
+                 : seq::CompRegClockEnabledOp();
+    bool canPreload =
+        feedbackReg && d <= feedbackStage && init != Value(iterArgBackedges[i]);
+    if (canPreload) {
+      if (auto it = preloadedRegs.find(feedbackReg);
+          it != preloadedRegs.end())
+        canPreload = it->second.first == init && it->second.second <= d;
+      else
+        canPreload =
+            feedbackReg.getClockEnable() == gatedStageCE[feedbackStage];
+    }
+
+    if (canPreload) {
+      if (!preloadedRegs.count(feedbackReg)) {
+        Value pulse = getStartDelayed(d);
+        Value newD = comb::MuxOp::create(hwBuilder, loc, pulse, init,
+                                         feedbackReg.getInput());
+        Value newCE = comb::OrOp::create(
+            hwBuilder, loc, feedbackReg.getClockEnable(), pulse);
+        feedbackReg.getInputMutable().assign(newD);
+        feedbackReg.getClockEnableMutable().assign(newCE);
+        preloadedRegs[feedbackReg] = {init, d};
+      }
+      iterArgBackedges[i].setValue(feedbackReg);
+      continue;
+    }
     Value muxed = comb::MuxOp::create(
-        hwBuilder, loc, firstIterPerStage[feedbackStage], init, feedback);
+        hwBuilder, loc, getFirstIter(feedbackStage), init, feedback);
     iterArgBackedges[i].setValue(muxed);
   }
 
