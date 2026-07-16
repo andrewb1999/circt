@@ -35,8 +35,21 @@ def UnrollSubLoops : Pass<"unroll-sub-loops", "::mlir::func::FuncOp"> {
 }
 
 def UnrollMarkedLoops : Pass<"unroll-marked-loops", "mlir::func::FuncOp"> {
-  let summary = "Unrolls loops with an `hls.unroll` attribute by a given factor.";
+  let summary = "Unrolls loops marked `loopschedule.parallel` in place by "
+                "the requested factor.";
   let description = [{
+    Consumes the `loopschedule.parallel = N` in-place unroll directive on
+    `affine.for` loops (Allo's `s.unroll(axis, factor)` is the producer).
+
+    A factor N > 1 unrolls in place by N — a remainder loop is cloned for
+    non-divisible trip counts and keeps the original's attributes (e.g.
+    `hls.pipeline`). A factor of 0 means "fully unroll" (Allo's encoding
+    for a factor-less `s.unroll(axis)`) and dissolves the loop entirely. A
+    factor of 1 requests no unrolling and just erases the directive. Any
+    directive that cannot be honored is a loud error, never a silent drop.
+    Must run before memory-dependence construction and before AMC
+    allocation (see the pass source for why both orderings are
+    load-bearing).
   }];
   let dependentDialects = ["mlir::scf::SCFDialect,mlir::affine::AffineDialect"];
   let constructor = "circt::loopschedule::createUnrollMarkedLoopsPass()";
