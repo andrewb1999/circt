@@ -50,20 +50,6 @@ def BitwidthReductionForLoopSchedule : Pass<"bitwidth-reduction-for-loopschedule
                            "mlir::func::FuncDialect", "mlir::arith::ArithDialect"];
 }
 
-def UnrollForLoopSchedule : Pass<"unroll-for-loopschedule", "::mlir::func::FuncOp"> {
-  let summary = "Unroll loops to exploit data-level parallelism";
-  let description = [{Unroll loops to exploit data-level parallelism}];
-  let constructor = "circt::loopschedule::createUnrollForLoopSchedulePass()";
-  let dependentDialects = ["mlir::affine::AffineDialect", "mlir::func::FuncDialect"];
-}
-
-def PipelineForLoopSchedule : Pass<"pipeline-for-loopschedule", "::mlir::func::FuncOp"> {
-  let summary = "Unroll and pipeline loops inner loops";
-  let description = [{Unroll and pipeline loops inner loops}];
-  let constructor = "circt::loopschedule::createPipelineForLoopSchedulePass()";
-  let dependentDialects = ["mlir::affine::AffineDialect", "mlir::func::FuncDialect"];
-}
-
 def LoopScheduleBinding : Pass<"loopschedule-binding", "mlir::ModuleOp"> {
   let summary = "Assign hardware instance ids to scheduled loopschedule ops.";
   let description = [{

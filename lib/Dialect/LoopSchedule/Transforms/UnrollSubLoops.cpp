@@ -1,4 +1,4 @@
-//===- UnrollSubLoops.cpp - Dependencies pass ---------*- C++ -*-===//
+//===- UnrollSubLoops.cpp - Make pipelined loop bodies loop-free -*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,14 +6,33 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Implements the UnrollSubLoops pass.
+// A pipelined loop's body must be loop-free: the pipeline scheduler assigns
+// every op a fixed cycle offset, so a nested loop (a variable op count per
+// iteration) cannot be scheduled — it survives to SCFToLoopSchedule as an
+// scf.while and dies with `unsupported operation "scf.condition"`. This pass
+// fully unrolls constant-trip loops (affine.for and scf.for) nested inside
+// `hls.pipeline`-marked loops, innermost-first so trip counts stay constant.
+//
+// Loops that cannot be statically dissolved are loud errors, not silent
+// pass-through: dynamic bounds and scf.while are unschedulable inside a
+// static pipeline by construction. While loops are unsupported by design —
+// pipeline the while loop itself instead of an ancestor.
+//
+// Placement invariant: like all unrolling in this flow, this must run BEFORE
+// ConstructMemoryDependencies. Dependences are name-keyed with iteration
+// distances; body replication would leave clones sharing one name and turn
+// same-iteration lane orderings into misread next-initiation constraints.
 //
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h"
+#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -34,34 +53,66 @@ using namespace mlir::affine;
 //===----------------------------------------------------------------------===//
 
 namespace {
-struct UnrollSubLoopsPass : public circt::loopschedule::impl::UnrollSubLoopsBase<UnrollSubLoopsPass> {
+struct UnrollSubLoopsPass
+    : public circt::loopschedule::impl::UnrollSubLoopsBase<UnrollSubLoopsPass> {
   void runOnOperation() override;
 };
 } // end anonymous namespace
 
-LogicalResult unrollSubLoops(scf::ForOp &forOp) {
-  auto result = forOp.getBody()->walk<WalkOrder::PostOrder>([](scf::ForOp op) {
-    std::optional<int64_t> lbCstOp = getConstantIntValue(op.getLowerBound());
-    std::optional<int64_t> ubCstOp = getConstantIntValue(op.getUpperBound());
-    std::optional<int64_t> stepCstOp = getConstantIntValue(op.getStep());
-    if (!lbCstOp || !ubCstOp || !stepCstOp) {
-      return WalkResult::interrupt();
-    }
-    int64_t lbCst = lbCstOp.value();
-    int64_t ubCst = ubCstOp.value();
-    int64_t stepCst = stepCstOp.value();
-    assert(lbCst >= 0 && ubCst >= 0 && stepCst >= 0 &&
-           "expected positive loop bounds and step");
-    int64_t tripCount = llvm::divideCeilSigned(ubCst - lbCst, stepCst);
-    if (failed(loopUnrollByFactor(op, tripCount)))
-      return WalkResult::interrupt();
-    return WalkResult::advance();
-  });
+static bool hasPipelinedAncestor(Operation *op) {
+  for (Operation *parent = op->getParentOp();
+       parent && !isa<ModuleOp>(parent); parent = parent->getParentOp())
+    if (parent->hasAttr("hls.pipeline"))
+      return true;
+  return false;
+}
 
-  if (result.wasInterrupted()) {
-    forOp.emitOpError("Could not unroll sub loops");
-    return failure();
+/// A zero-trip loop contributes nothing: its results are its inits.
+static void eraseZeroTripLoop(Operation *op, ValueRange inits) {
+  op->replaceAllUsesWith(inits);
+  op->erase();
+}
+
+/// Fully unroll one loop nested inside a pipelined loop, erasing it (the
+/// unroll utilities promote the single remaining iteration). Loops that
+/// cannot be statically dissolved get a diagnostic naming why.
+static LogicalResult fullyUnroll(Operation *op) {
+  if (auto affineFor = dyn_cast<AffineForOp>(op)) {
+    std::optional<uint64_t> trip = getConstantTripCount(affineFor);
+    if (!trip)
+      return affineFor.emitOpError(
+          "has a non-constant trip count and cannot be fully unrolled inside "
+          "a pipelined loop; pipelined loop bodies must be loop-free");
+    if (*trip == 0) {
+      eraseZeroTripLoop(affineFor, affineFor.getInits());
+      return success();
+    }
+    return loopUnrollFull(affineFor);
   }
+
+  if (auto scfFor = dyn_cast<scf::ForOp>(op)) {
+    std::optional<int64_t> lb = getConstantIntValue(scfFor.getLowerBound());
+    std::optional<int64_t> ub = getConstantIntValue(scfFor.getUpperBound());
+    std::optional<int64_t> step = getConstantIntValue(scfFor.getStep());
+    if (!lb || !ub || !step)
+      return scfFor.emitOpError(
+          "has non-constant bounds and cannot be fully unrolled inside a "
+          "pipelined loop; pipelined loop bodies must be loop-free");
+    if (*step <= 0)
+      return scfFor.emitOpError("expected a positive step");
+    int64_t trip =
+        *ub <= *lb ? 0 : llvm::divideCeilSigned(*ub - *lb, *step);
+    if (trip == 0) {
+      eraseZeroTripLoop(scfFor, scfFor.getInitArgs());
+      return success();
+    }
+    return loopUnrollByFactor(scfFor, trip);
+  }
+
+  if (isa<scf::WhileOp>(op))
+    return op->emitOpError(
+        "cannot be statically unrolled inside a pipelined loop; pipeline the "
+        "while loop itself instead");
 
   return success();
 }
@@ -69,35 +120,32 @@ LogicalResult unrollSubLoops(scf::ForOp &forOp) {
 void UnrollSubLoopsPass::runOnOperation() {
   auto funcOp = getOperation();
 
-  // Collect loops to pipeline and work on them.
-  SmallVector<scf::ForOp> loops;
-
-  auto hasPipelinedParent = [](Operation *op) {
-    Operation *currentOp = op;
-
-    while (!isa<ModuleOp>(currentOp->getParentOp())) {
-      if (currentOp->getParentOp()->hasAttr("hls.pipeline"))
-        return true;
-      currentOp = currentOp->getParentOp();
-    }
-
-    return false;
-  };
-
+  // Outermost pipelined loops of any loop type. Inner pipelined loops are
+  // dissolved into their pipelined ancestor like any other sub-loop.
+  SmallVector<Operation *> roots;
   funcOp.walk<WalkOrder::PreOrder>([&](Operation *op) {
-    if (!isa<scf::ForOp>(op) || !op->hasAttr("hls.pipeline"))
+    if (!isa<AffineForOp, scf::ForOp, scf::WhileOp>(op) ||
+        !op->hasAttr("hls.pipeline"))
       return;
-
-    if (hasPipelinedParent(op))
+    if (hasPipelinedAncestor(op))
       return;
-
-    loops.push_back(cast<scf::ForOp>(op));
+    roots.push_back(op);
   });
 
-  // Unroll loops within this loop to make pipelining possible
-  for (auto loop : llvm::make_early_inc_range(loops)) {
-    if (failed(unrollSubLoops(loop)))
-      return signalPassFailure();
+  for (Operation *root : roots) {
+    // Post-order: innermost loops unroll first, so enclosing loops keep
+    // constant trip counts and their unrolls replicate straight-line code.
+    // Unrolling erases only the processed loop, so the collected outer
+    // loops stay valid.
+    SmallVector<Operation *> subLoops;
+    for (Region &region : root->getRegions())
+      region.walk<WalkOrder::PostOrder>([&](Operation *op) {
+        if (isa<AffineForOp, scf::ForOp, scf::WhileOp>(op))
+          subLoops.push_back(op);
+      });
+    for (Operation *subLoop : subLoops)
+      if (failed(fullyUnroll(subLoop)))
+        return signalPassFailure();
   }
 }
 
