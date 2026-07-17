@@ -545,6 +545,7 @@ def LoopScheduleFrameOp : LoopScheduleOp<"frame",
 
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
+  let hasCanonicalizer = 1;
 
   let extraClassDeclaration = [{
     Block &getAwaitBlock() { return getAwaitRegion().front(); }

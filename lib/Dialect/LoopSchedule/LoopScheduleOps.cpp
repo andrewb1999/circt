@@ -1121,6 +1121,93 @@ LogicalResult LoopScheduleFrameOp::verify() {
   return success();
 }
 
+namespace {
+/// Merge sibling `loopschedule.at` ops with the same offset inside a
+/// frame body into one `at`. Two same-offset ats describe work of the
+/// same cycle; keeping them fused gives downstream lowerings (the FSM's
+/// per-frame entry partitioning in particular) a single phase per start
+/// time, so concurrently-launched children are visible as siblings of
+/// one phase instead of a chain of look-alike phases.
+///
+/// The frame verifier enforces non-decreasing offsets, so equal-offset
+/// ats are adjacent. The merge is skipped when:
+///   * the second at's body reads the first's results — that dependence
+///     means the ats are not order-free even within their shared cycle
+///     (e.g. a latency-0 chain), and merging would break the value's
+///     capture point; or
+///   * exactly one of the pair holds a `loopschedule.launch` — the FSM
+///     lowerings classify an at containing a launch as a launch holder
+///     and skip its other body ops, so folding compute into a launch at
+///     (or vice versa) would silently drop the compute.
+struct MergeSameOffsetAts : public OpRewritePattern<LoopScheduleFrameOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LoopScheduleFrameOp frame,
+                                PatternRewriter &rewriter) const override {
+    auto holdsLaunch = [](LoopScheduleAtOp at) {
+      return llvm::any_of(at.getBodyBlock(), [](Operation &op) {
+        return isa<LoopScheduleLaunchOp>(op);
+      });
+    };
+    LoopScheduleAtOp first, second;
+    for (Operation &op : frame.getBodyBlock().without_terminator()) {
+      auto at = cast<LoopScheduleAtOp>(op);
+      if (first && at.getOffset() == first.getOffset() &&
+          holdsLaunch(at) == holdsLaunch(first)) {
+        // Bail if `at` uses any result of `first`.
+        bool usesFirst = false;
+        for (Value r : first.getResults())
+          for (Operation *user : r.getUsers())
+            if (at->isAncestor(user)) {
+              usesFirst = true;
+              break;
+            }
+        if (!usesFirst) {
+          second = at;
+          break;
+        }
+      }
+      first = at;
+    }
+    if (!second)
+      return failure();
+
+    auto *firstYield = first.getBodyBlock().getTerminator();
+    auto *secondYield = second.getBodyBlock().getTerminator();
+
+    SmallVector<Type> mergedTypes(first.getResultTypes());
+    llvm::append_range(mergedTypes, second.getResultTypes());
+
+    rewriter.setInsertionPoint(first);
+    auto merged = rewriter.create<LoopScheduleAtOp>(
+        first.getLoc(), mergedTypes, first.getOffsetAttr());
+
+    // Move both bodies into the merged at, then a combined yield. The
+    // builder pre-creates an empty terminator; drop it first.
+    Block &mergedBlock = merged.getBodyBlock();
+    SmallVector<Value> yieldVals(firstYield->getOperands());
+    llvm::append_range(yieldVals, secondYield->getOperands());
+    rewriter.eraseOp(mergedBlock.getTerminator());
+    rewriter.eraseOp(firstYield);
+    rewriter.eraseOp(secondYield);
+    rewriter.mergeBlocks(&first.getBodyBlock(), &mergedBlock);
+    rewriter.mergeBlocks(&second.getBodyBlock(), &mergedBlock);
+    rewriter.setInsertionPointToEnd(&mergedBlock);
+    rewriter.create<LoopScheduleYieldOp>(merged.getLoc(), yieldVals);
+
+    unsigned nFirst = first.getNumResults();
+    rewriter.replaceOp(first, merged.getResults().take_front(nFirst));
+    rewriter.replaceOp(second, merged.getResults().drop_front(nFirst));
+    return success();
+  }
+};
+} // namespace
+
+void LoopScheduleFrameOp::getCanonicalizationPatterns(
+    RewritePatternSet &results, MLIRContext *context) {
+  results.add<MergeSameOffsetAts>(context);
+}
+
 //===----------------------------------------------------------------------===//
 // LoopScheduleAtOp
 //===----------------------------------------------------------------------===//
