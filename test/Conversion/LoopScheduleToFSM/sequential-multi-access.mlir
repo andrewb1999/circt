@@ -83,11 +83,14 @@ module {
 // aliases of the raw rd_data wire.
 // CHECK: %[[SUM:.+]] = arith.addi %[[V0]], %[[V1]]
 
-// Store at cycle 3: its address has lowest priority in the mux chain and
-// wr_en fires only in its own cycle.
+// Store at cycle 3: its address has lowest priority in the mux chain,
+// and wr_en fires only in its own cycle. Enables merge as gate-qualified
+// OR terms (concurrent-sibling-safe), addr/data keep the gate-keyed mux
+// (this port is a passive-read memref).
 // CHECK: %[[ADDR:.+]] = comb.mux %[[FSM]]#7, %{{.+}}, %[[A1]]
+// CHECK: %[[GWREN:.+]] = comb.and %[[FSM]]#3, %[[FSM]]#7
 // CHECK: comb.mux %[[FSM]]#3, %[[ADDR]],
 // CHECK: comb.mux %[[FSM]]#3, %[[SUM]],
-// CHECK: %[[WREN:.+]] = comb.mux %[[FSM]]#3, %[[FSM]]#7,
+// CHECK: %[[WREN:.+]] = comb.or %[[GWREN]], %false
 // (done is the FSM's done OR'd with the early-done advance-edge term)
 // CHECK: hw.output %{{.+}}, %{{.+}}, %{{.+}}, %[[WREN]]
