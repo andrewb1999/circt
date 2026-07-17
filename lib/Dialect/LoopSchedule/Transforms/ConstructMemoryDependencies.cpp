@@ -19,6 +19,7 @@
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
@@ -108,10 +109,78 @@ struct MemoryDependence {
 
 using MemoryDependenceResult = std::map<StringRef, std::set<MemoryDependence>>;
 
+static bool isLoadLike(Operation *op) {
+  return isa<memref::LoadOp, AffineReadOpInterface, LoadInterface>(op);
+}
+
+/// The access's subscript vector when it composes to compile-time
+/// constants — the shape every access in a fully-unrolled /
+/// trip-1-promoted body has (the constants typically arrive through
+/// affine.apply chains, hence the full composition). For such pairs "may
+/// they touch the same element" is integer equality per dimension; no
+/// constraint system needed. Composition is memoized per operation: the
+/// pair loops would otherwise recompute it O(n^2) times.
+using ConstantIndexCache =
+    llvm::DenseMap<Operation *, std::optional<SmallVector<int64_t, 4>>>;
+
+// Returned BY VALUE: a reference into the DenseMap would be invalidated
+// when the caller's second lookup rehashes the table.
+static std::optional<SmallVector<int64_t, 4>>
+getConstantAccessIndices(Operation *op, ConstantIndexCache &cache) {
+  auto it = cache.find(op);
+  if (it != cache.end())
+    return it->second;
+
+  MemRefAccess access(op);
+  AffineValueMap valueMap;
+  access.getAccessMap(&valueMap);
+  AffineMap map = valueMap.getAffineMap();
+  SmallVector<Value, 4> operands(valueMap.getOperands());
+  fullyComposeAffineMapAndOperands(&map, &operands);
+  // Composition folds through affine.apply chains but leaves plain
+  // constant operands (arith.constant index) as dims/symbols; substitute
+  // them so a fully-constant access actually reads as one.
+  {
+    MLIRContext *ctx = map.getContext();
+    SmallVector<AffineExpr, 4> dimRepl, symRepl;
+    for (unsigned i = 0; i < map.getNumDims(); ++i) {
+      if (auto c = getConstantIntValue(operands[i]))
+        dimRepl.push_back(getAffineConstantExpr(*c, ctx));
+      else
+        dimRepl.push_back(getAffineDimExpr(i, ctx));
+    }
+    for (unsigned i = 0; i < map.getNumSymbols(); ++i) {
+      if (auto c = getConstantIntValue(operands[map.getNumDims() + i]))
+        symRepl.push_back(getAffineConstantExpr(*c, ctx));
+      else
+        symRepl.push_back(getAffineSymbolExpr(i, ctx));
+    }
+    map = map.replaceDimsAndSymbols(dimRepl, symRepl, map.getNumDims(),
+                                    map.getNumSymbols());
+  }
+  map = simplifyAffineMap(map);
+
+  std::optional<SmallVector<int64_t, 4>> indices;
+  SmallVector<int64_t, 4> constants;
+  bool allConstant = true;
+  for (AffineExpr e : map.getResults()) {
+    auto c = dyn_cast<AffineConstantExpr>(e);
+    if (!c) {
+      allConstant = false;
+      break;
+    }
+    constants.push_back(c.getValue());
+  }
+  if (allConstant)
+    indices = std::move(constants);
+  return cache.try_emplace(op, std::move(indices)).first->second;
+}
+
 static void checkAffineAccessPair(Operation *source, Operation *destination,
                                   MemoryDependenceResult &results,
-                                  NameAnalysis nameAnalysis,
-                                  bool isIntraIteration) {
+                                  NameAnalysis &nameAnalysis,
+                                  bool isIntraIteration,
+                                  ConstantIndexCache &constIndexCache) {
   if (source == destination)
     return;
 
@@ -131,6 +200,13 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
   // destination->dump();
   // llvm::errs() << "isIntraIteration: " << isIntraIteration << "\n";
 
+  // Read-after-read pairs carry no scheduling constraint (the non-affine
+  // driver already skips them); without this, a fully-unrolled body with
+  // N loads of one memory pays N^2 dependence solves for edges the
+  // scheduler never needed.
+  if (isLoadLike(source) && isLoadLike(destination))
+    return;
+
   // Look for inter-iteration dependences on the same memory location.
   MemRefAccess src(source);
   MemRefAccess dst(destination);
@@ -140,6 +216,18 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
       // llvm::errs() << "=======================================\n";
       return;
     }
+  }
+
+  // Constant-subscript fast path: when both access maps compose to
+  // constants (every access in a fully-unrolled body does), provable
+  // disjointness is per-dimension integer inequality — skip the
+  // Presburger machinery. Same-address pairs deliberately FALL THROUGH
+  // to the full check so the ordering/depth semantics of the result stay
+  // bit-identical.
+  if (auto srcIdx = getConstantAccessIndices(source, constIndexCache)) {
+    auto dstIdx = getConstantAccessIndices(destination, constIndexCache);
+    if (dstIdx && *srcIdx != *dstIdx)
+      return;
   }
 
   // Hack to avoid having to copy the checkMemrefAccessDependence function
@@ -196,7 +284,7 @@ static bool isLoad(Operation *op) {
 
 static void checkNonAffineAccessPair(Operation *source, Operation *destination,
                                      MemoryDependenceResult &results,
-                                     NameAnalysis nameAnalysis,
+                                     NameAnalysis &nameAnalysis,
                                      bool isIntraIteration) {
   if (source == destination)
     return;
@@ -334,10 +422,13 @@ void ConstructMemoryDependenciesPass::runOnOperation() {
   });
 
   // For each depth, check memref accesses.
+  ConstantIndexCache constIndexCache;
   for (auto *source : affineOps) {
     for (auto *destination : affineOps) {
-      checkAffineAccessPair(source, destination, results, nameAnalysis, false);
-      checkAffineAccessPair(source, destination, results, nameAnalysis, true);
+      checkAffineAccessPair(source, destination, results, nameAnalysis, false,
+                            constIndexCache);
+      checkAffineAccessPair(source, destination, results, nameAnalysis, true,
+                            constIndexCache);
     }
   }
 
