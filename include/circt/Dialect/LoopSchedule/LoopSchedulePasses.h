@@ -31,7 +31,6 @@ std::unique_ptr<mlir::Pass> createMarkMemoryAccessesPass();
 std::unique_ptr<mlir::Pass> createConstructMemoryDependenciesPass();
 std::unique_ptr<mlir::Pass> createUnrollSubLoopsPass();
 std::unique_ptr<mlir::Pass> createBitwidthReductionForLoopSchedulePass();
-std::unique_ptr<mlir::Pass> createUnrollMarkedLoopsPass();
 std::unique_ptr<mlir::Pass> createLoopScheduleBindingPass();
 std::unique_ptr<mlir::Pass>
 createLoopScheduleBindingPass(const LoopScheduleBindingOptions &options);

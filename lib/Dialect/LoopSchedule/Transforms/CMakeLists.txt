@@ -3,7 +3,6 @@ add_circt_dialect_library(CIRCTLoopScheduleTransforms
   ConstructMemoryDependencies.cpp
   BitwidthReductionForLoopSchedule.cpp
   UnrollSubLoops.cpp
-  UnrollMarkedLoops.cpp
   LoopScheduleBinding.cpp
   LoopScheduleTestbenchGeneration.cpp
 

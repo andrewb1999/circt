@@ -826,6 +826,65 @@ void LoopScheduleIfOp::build(OpBuilder &odsBuilder, OperationState &odsState,
 // LoopScheduleYieldOp (shared terminator)
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// LoopScheduleParOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult LoopScheduleParOp::verify() {
+  Block &block = getBodyBlock();
+  Operation *terminator = block.getTerminator();
+  Operation *self = getOperation();
+
+  // Resolve an operation to the par op's direct child containing it, or
+  // null when the op lives outside this par entirely.
+  auto directChildAncestor = [&](Operation *op) -> Operation * {
+    Operation *cur = op;
+    while (cur && cur != self && cur->getBlock() != &block)
+      cur = cur->getParentOp();
+    if (!cur || cur == self)
+      return nullptr;
+    return cur;
+  };
+
+  // Yielded values: results of distinct direct children (lane-to-join
+  // dataflow only).
+  llvm::SmallPtrSet<Operation *, 4> yieldSources;
+  for (Value v : terminator->getOperands()) {
+    auto result = dyn_cast<OpResult>(v);
+    if (!result || result.getOwner()->getBlock() != &block)
+      return terminator->emitOpError(
+          "operands must be results of the par op's direct children");
+    if (!yieldSources.insert(result.getOwner()).second)
+      return terminator->emitOpError(
+          "each yielded value must come from a distinct child");
+  }
+
+  // Children are order-free by the op's contract, so any SSA edge between
+  // two children would demand an ordering the op cannot express; children
+  // communicate through memory only.
+  for (Operation &child : block.without_terminator()) {
+    auto walkResult = child.walk([&](Operation *op) {
+      for (Value operand : op->getOperands()) {
+        Operation *def = operand.getDefiningOp();
+        if (!def)
+          continue;
+        Operation *defChild = directChildAncestor(def);
+        if (defChild && defChild != &child) {
+          op->emitOpError("uses a value defined by a sibling child of the "
+                          "enclosing loopschedule.par; children are "
+                          "order-free and may communicate only through "
+                          "memory");
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    if (walkResult.wasInterrupted())
+      return failure();
+  }
+  return success();
+}
+
 LogicalResult LoopScheduleYieldOp::verify() {
   Operation *parent = (*this)->getParentOp();
   TypeRange yielded = getResults().getTypes();
@@ -853,6 +912,13 @@ LogicalResult LoopScheduleYieldOp::verify() {
   if (isa<LoopScheduleLaunchOp>(parent)) {
     // Loose at this slice — the launch surface result is a handle; child
     // yielded types are not plumbed onto the launch op yet.
+    return success();
+  }
+
+  if (auto parOp = dyn_cast<LoopScheduleParOp>(parent)) {
+    if (!typesEqual(yielded, parOp.getResultTypes()))
+      return emitOpError("yielded types must match parent loopschedule.par "
+                         "result types");
     return success();
   }
 

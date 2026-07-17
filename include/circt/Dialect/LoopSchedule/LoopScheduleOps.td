@@ -203,6 +203,48 @@ def LoopScheduleSequentialOp : LoopScheduleOp<"sequential", [LoopOpInterface]> {
   }];
 }
 
+def LoopScheduleParOp : LoopScheduleOp<"par",
+    [SingleBlockImplicitTerminator<"LoopScheduleYieldOp">, NoRegionArguments,
+     RecursiveMemoryEffects]> {
+  let summary = "Fork-join band of order-free parallel lanes";
+  let description = [{
+    `loopschedule.par` holds N sibling child ops (typically `affine.for`
+    lane loops produced by cyclic-splitting a loop marked
+    `loopschedule.parallel = N`) with fork-join semantics:
+
+      - Children may execute concurrently or interleaved in ANY order; the
+        op completes when all children complete. Sequential execution of
+        the children, in any order, is a legal refinement — which is what
+        makes the "leave it split" lowering trivially correct.
+      - Races between children are permitted and resolve
+        NONDETERMINISTICALLY (matching arbitrated hardware); they are not
+        undefined behavior. Transforms may commit to any single
+        interleaving but must not assume race-freedom.
+      - Children communicate only through memory. Cross-child SSA use is
+        verifier-rejected; the one exception is the terminator: each
+        yielded value must be a result of a distinct direct child
+        (lane-to-JOIN dataflow, e.g. per-lane reduction accumulators whose
+        combine is emitted after the op).
+
+    The op carries the parallelism license granted by the user's directive
+    so that the mechanism-selection lowering (fuse to one lock-step loop
+    when every lane port is statically served; inline as sequential
+    siblings otherwise) is a structural rewrite requiring no dependence
+    re-analysis.
+  }];
+
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = [{ attr-dict-with-keyword $body (`:` type($results)^)? }];
+
+  let extraClassDeclaration = [{
+    mlir::Block &getBodyBlock() { return getBody().front(); }
+  }];
+
+  let hasVerifier = 1;
+}
+
 def LoopScheduleTerminatorOp : LoopScheduleOp<"terminator",
     [ParentOneOf<["LoopSchedulePipelineOp", "LoopScheduleSequentialOp"]>, Terminator, AttrSizedOperandSegments]> {
   let summary = "LoopSchedule dialect terminator.";
@@ -394,7 +436,8 @@ def LoopScheduleAccessOp : LoopScheduleOp<"access",
 
 def LoopScheduleYieldOp : LoopScheduleOp<"yield", [Pure, ReturnLike, Terminator,
     ParentOneOf<["LoopScheduleIfOp", "LoopScheduleFrameOp",
-                 "LoopScheduleAtOp", "LoopScheduleLaunchOp"]>]> {
+                 "LoopScheduleAtOp", "LoopScheduleLaunchOp",
+                 "LoopScheduleParOp"]>]> {
   let summary = "Terminator yielding values to the enclosing region-bearing op";
   let description = [{
     Shared terminator op. Used as the terminator of:
@@ -404,7 +447,9 @@ def LoopScheduleYieldOp : LoopScheduleOp<"yield", [Pure, ReturnLike, Terminator,
       - `loopschedule.frame`'s body region (yields the frame op's results),
       - `loopschedule.at`'s body region (yields the at op's results),
       - `loopschedule.launch`'s body region (yields child loop results,
-        though the launch op's only surface result is a handle).
+        though the launch op's only surface result is a handle),
+      - `loopschedule.par`'s body region (yields each lane's result to the
+        join; every operand must come from a distinct direct child).
 
     The verifier dispatches on the parent op + enclosing region to enforce
     the right type-matching rule.
