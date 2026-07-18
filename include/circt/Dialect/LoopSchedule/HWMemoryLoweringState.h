@@ -26,6 +26,8 @@
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include <optional>
+#include <string>
 
 namespace circt {
 namespace loopschedule {
@@ -122,6 +124,39 @@ struct BramBoundary {
   std::optional<AxiMeta> axiMeta;
 };
 
+/// One wire of an interface-tier bundle (`!amc.axi` bus or `!amc.burst` face)
+/// threaded between a producer and a consumer of that SSA value across two
+/// `HWMemoryInstanceLoweringInterface` ops (e.g. an `expand_ref` boundary
+/// splice producing a bus that an `amc.instance` of the master consumes).
+///
+/// `name` matches the `hw.module` port name on both faces (producer and
+/// consumer use mirror-image port lists with identical names).
+///   - Producer-driven wire (a response the design receives): `value` holds the
+///     producer's concrete signal (e.g. a boundary input backedge resolved to a
+///     block arg); the consumer reads it as an instance operand. `outputSlot`
+///     is -1.
+///   - Consumer-driven wire (a request the design drives): `outputSlot` is the
+///     index into the producer's `BramBoundary::outputValues` the consumer must
+///     fill with its matching instance result (found via `boundaryKey`).
+/// Because the conversion pass lowers instances in SSA (def-before-use) order,
+/// the producer runs first, so `value` wires are concrete and the output slots
+/// exist by the time the consumer runs.
+struct InterfaceWire {
+  std::string name;
+  mlir::Value value;      // set iff producer-driven (consumer reads it)
+  int outputSlot = -1;    // >=0 iff consumer-driven (fills a boundary output)
+};
+
+/// The set of wires for one interface-tier SSA value, keyed in `interfaceBundles`
+/// by that value (an `!amc.axi` or `!amc.burst` result of the producing op).
+/// `boundaryKey` is the key (an `!amc.memory_ref`) under which the producer
+/// registered its `BramBoundary`, so a consumer can fill the reserved output
+/// slots with concrete instance results.
+struct InterfaceBundle {
+  llvm::SmallVector<InterfaceWire> wires;
+  mlir::Value boundaryKey;
+};
+
 /// State passed to `HWMemoryInstanceLoweringInterface::lowerToHW`.
 ///
 /// Ownership: the conversion pass constructs this before invoking any
@@ -175,6 +210,23 @@ public:
   /// drives have been populated. Populated by interface implementers
   /// during `lowerToHW`.
   llvm::SmallVector<PortBackedge> pendingBackedges;
+
+  /// Interface-tier bundles (`!amc.axi` / `!amc.burst`) threaded between a
+  /// producer and consumer instance op, keyed by the producing SSA value.
+  /// Registered by the producer's `lowerToHW`, read by the consumer's.
+  llvm::DenseMap<mlir::Value, InterfaceBundle> interfaceBundles;
+
+  /// Register an interface bundle for a producer's result value.
+  void registerInterface(mlir::Value ifaceValue, InterfaceBundle bundle) {
+    interfaceBundles[ifaceValue] = std::move(bundle);
+  }
+
+  /// Look up the interface bundle registered for `ifaceValue` (the SSA value a
+  /// consumer op takes as an operand). Null if none was registered.
+  InterfaceBundle *lookupInterface(mlir::Value ifaceValue) {
+    auto it = interfaceBundles.find(ifaceValue);
+    return it == interfaceBundles.end() ? nullptr : &it->second;
+  }
 };
 
 } // namespace loopschedule
