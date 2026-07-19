@@ -1197,6 +1197,13 @@ struct SeqDynCtx {
   // accepted/seen latches must ALSO clear on this edge or iteration N+1's
   // accesses would see themselves as already issued/completed.
   Value advanceEdge;
+  // Per-port "previous read's registered `seen`" for THIS frame (null ⇒ no
+  // chaining). Multi-outstanding reads on one dyn port share the port's
+  // `done` pulse; to attribute each pulse to the right read (responses are
+  // in issue order on a single-ID master) a read may only capture once the
+  // previous read on its port has been seen. Keyed by the port value; reset
+  // per frame because the `seen` latches reset when the frame deactivates.
+  llvm::DenseMap<mlir::Value, mlir::Value> *prevReadSeen = nullptr;
 };
 
 /// Lower one bare dynamic load/store in a sequential frame with a full
@@ -1330,6 +1337,18 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
     doneMine = comb::AndOp::create(
         hb, loc, comb::AndOp::create(hb, loc, done, accReg, false),
         notSeenReg, false);
+    // Multi-outstanding read attribution: this port's `done` pulse belongs to
+    // the OLDEST un-seen read (single-ID master ⇒ responses in issue order).
+    // Gate this load's capture on the previous read's REGISTERED `seen` so it
+    // only fires on the NEXT pulse, not the one the previous read already
+    // consumed. Then record this read's `seen` as the chain tail. Loads only —
+    // stores don't capture data and the tested sequential kernels keep one
+    // store per port in flight.
+    if (loadOp && seqDyn->prevReadSeen) {
+      if (Value prev = seqDyn->prevReadSeen->lookup(memVal))
+        doneMine = comb::AndOp::create(hb, loc, doneMine, prev, false);
+      (*seqDyn->prevReadSeen)[memVal] = seenReg;
+    }
     Value seenNext = comb::AndOp::create(
         hb, loc, comb::OrOp::create(hb, loc, seenReg, doneMine, false),
         latchHold, false);
@@ -3801,6 +3820,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     bool hasCycleGates = frameLatencies[frameIdx] > 1;
     Block &frameBody = frame.getBodyBlock();
 
+    // Per-port read-completion chain for this frame (see SeqDynCtx).
+    DenseMap<Value, Value> framePrevReadSeen;
+
     // Contended-port handling for the static accesses lowered below (see
     // SeqPortMuxCtx). Launched children are excluded by the collector —
     // they drive their own port slots through the child-instance muxing.
@@ -3869,7 +3891,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                            &seqStallTerms,
                            node.prefix,
                            &seqDynCounter,
-                           iterAdvanceEdge};
+                           iterAdvanceEdge,
+                           &framePrevReadSeen};
           if (failed(lowerSeqDynAccess(&op, hw, localMapping, framePorts,
                                        atGate, atOffset, &seqDyn)))
             return failure();
@@ -4315,6 +4338,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     } else {
       // Regular frame (no child/pipeline launches). Gate stores per issue
       // cycle: ops in each `at K` body get cycleGates[K].
+      DenseMap<Value, Value> framePrevReadSeen;
       SeqDynCtx seqDyn{clk,
                        rst,
                        hwBody,
@@ -4324,7 +4348,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                        &seqStallTerms,
                        node.prefix,
                        &seqDynCounter,
-                       iterAdvanceEdge};
+                       iterAdvanceEdge,
+                       &framePrevReadSeen};
       SeqPortMuxCtx seqMux;
       seqMux.multi = bodyMultiAccess;
       for (auto &memInfo : memrefArgs)
