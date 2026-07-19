@@ -88,6 +88,14 @@ struct HWPortSignals {
   /// port has no acceptance backpressure (static ports, memref-backed
   /// memories) — treated as tied high.
   mlir::Value ready;
+  /// Memory-driven write-drain / read-drain levels for POSTED dynamic ports
+  /// (an AXI master face): `wrIdle` is high iff no write is outstanding,
+  /// `rdIdle` iff no read is outstanding. A per-access RAW fence gates a
+  /// load's `rdEn` on `wrIdle` (wait for prior writes to commit); a WAR fence
+  /// gates a store's `wrEn` on `rdIdle`. Null when the memory exposes no drain
+  /// (non-posted / non-AXI ports) — treated as tied high (fence is a no-op).
+  mlir::Value rdIdle;
+  mlir::Value wrIdle;
   unsigned latency = 0;
 };
 

@@ -180,6 +180,12 @@ struct MemPortMapping {
   // Memory-driven same-cycle acceptance level for dynamic ports (see
   // HWPortSignals::ready). Null ⇒ tied high (no issue backpressure).
   Value ready;
+  // Memory-driven write-/read-drain levels for posted AXI faces (see
+  // HWPortSignals::wrIdle/rdIdle). A fenced load ANDs `wrIdle` into its
+  // rd_en (RAW); a fenced store ANDs `rdIdle` into its wr_en (WAR). Null ⇒
+  // tied high (fence is a no-op for non-posted ports).
+  Value rdIdle;
+  Value wrIdle;
 };
 
 /// Extend `mp.extraPorts` so port `k` is indexable; no-op for `k == 0`
@@ -214,6 +220,11 @@ struct PortArgInfo {
   // ports' completion handshakes inside loop modules.
   bool hasDone = false;
   bool hasWrDone = false;
+  // True iff the port exposes write-/read-drain levels (`wr_idle`/`rd_idle`,
+  // posted AXI faces); plumbed through loop modules like `ready` so a fenced
+  // access inside a loop can gate its rd_en/wr_en on the drain.
+  bool hasRdIdle = false;
+  bool hasWrIdle = false;
   bool requiresRdEn = false;
   unsigned latency = 1;
   // Number of distinct hardware ports the memory exposes. For memrefs,
@@ -1236,6 +1247,17 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
   Value lastGate = seqDyn->cycleGates[lastC];
 
   Value ready = mp.ready; // null => tied high (no backpressure)
+  // RAW/WAR fence: a fenced access may not issue until the opposite
+  // direction's drain is idle (a load waits for wr_idle, a store for
+  // rd_idle). Folding the drain into `ready` reuses the one-shot-issue /
+  // ready-stall machinery below, so completion accounting stays exact. Null
+  // drain (non-posted port) leaves it a no-op.
+  if (op->hasAttr("fence")) {
+    Value drain = loadOp ? mp.wrIdle : mp.rdIdle;
+    if (drain)
+      ready = ready ? (Value)comb::AndOp::create(hb, loc, ready, drain, false)
+                    : drain;
+  }
   Value done = mp.done;
   if (storeOp) {
     if (mp.wrDone) {
@@ -2787,6 +2809,26 @@ static hw::HWModuleOp createLoopModule(
                        hw::ModulePort::Direction::Input}});
     inputIdx++;
   }
+  // Write-/read-drain levels for posted AXI faces (RAW/WAR fence); plumbed
+  // like `ready` above. rd_idle first, then wr_idle.
+  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
+    if (!memInfo.isAmcPort || !memInfo.hasRdIdle)
+      continue;
+    std::string baseName = "mem" + std::to_string(i);
+    ports.push_back({{builder.getStringAttr(baseName + "_rd_idle"),
+                       builder.getI1Type(),
+                       hw::ModulePort::Direction::Input}});
+    inputIdx++;
+  }
+  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
+    if (!memInfo.isAmcPort || !memInfo.hasWrIdle)
+      continue;
+    std::string baseName = "mem" + std::to_string(i);
+    ports.push_back({{builder.getStringAttr(baseName + "_wr_idle"),
+                       builder.getI1Type(),
+                       hw::ModulePort::Direction::Input}});
+    inputIdx++;
+  }
 
   ports.push_back({{builder.getStringAttr("done"), builder.getI1Type(),
                      hw::ModulePort::Direction::Output}});
@@ -2845,6 +2887,17 @@ static hw::HWModuleOp createLoopModule(
     if (!memInfo.isAmcPort || !memInfo.hasReady)
       continue;
     localMemPortMap[memInfo.originalArg].ready = hwBody->getArgument(argIdx++);
+  }
+  // Mirror the order of the `mem*_rd_idle` / `mem*_wr_idle` input ports.
+  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
+    if (!memInfo.isAmcPort || !memInfo.hasRdIdle)
+      continue;
+    localMemPortMap[memInfo.originalArg].rdIdle = hwBody->getArgument(argIdx++);
+  }
+  for (auto [i, memInfo] : llvm::enumerate(memrefArgs)) {
+    if (!memInfo.isAmcPort || !memInfo.hasWrIdle)
+      continue;
+    localMemPortMap[memInfo.originalArg].wrIdle = hwBody->getArgument(argIdx++);
   }
 
   return hwMod;
@@ -3715,6 +3768,10 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           localMemPorts[memInfo.originalArg].wrDone;
       perFramePorts[i][memInfo.originalArg].ready =
           localMemPorts[memInfo.originalArg].ready;
+      perFramePorts[i][memInfo.originalArg].rdIdle =
+          localMemPorts[memInfo.originalArg].rdIdle;
+      perFramePorts[i][memInfo.originalArg].wrIdle =
+          localMemPorts[memInfo.originalArg].wrIdle;
     }
   }
 
@@ -4029,6 +4086,26 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                             : hw::ConstantOp::create(hw, loc,
                                                        hw.getI1Type(), 1);
             childInputs.push_back(rdy);
+          }
+          // Mirror the loop module's `mem*_rd_idle` / `mem*_wr_idle` input
+          // order. Missing caller signals tie the drain high (fence no-op).
+          for (auto &memInfo : memrefArgs) {
+            if (!memInfo.isAmcPort || !memInfo.hasRdIdle)
+              continue;
+            auto &callerMp = perFramePorts[frameIdx][memInfo.originalArg];
+            Value v = callerMp.rdIdle
+                          ? callerMp.rdIdle
+                          : hw::ConstantOp::create(hw, loc, hw.getI1Type(), 1);
+            childInputs.push_back(v);
+          }
+          for (auto &memInfo : memrefArgs) {
+            if (!memInfo.isAmcPort || !memInfo.hasWrIdle)
+              continue;
+            auto &callerMp = perFramePorts[frameIdx][memInfo.originalArg];
+            Value v = callerMp.wrIdle
+                          ? callerMp.wrIdle
+                          : hw::ConstantOp::create(hw, loc, hw.getI1Type(), 1);
+            childInputs.push_back(v);
           }
 
           auto childInst = hw::InstanceOp::create(
@@ -5855,6 +5932,8 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
     mp.done = signals.done;
     mp.wrDone = signals.wrDone;
     mp.ready = signals.ready;
+    mp.rdIdle = signals.rdIdle;
+    mp.wrIdle = signals.wrIdle;
     memPortMap[portValue] = mp;
   }
 
@@ -5892,6 +5971,8 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
     info.hasReady = signals.ready != Value();
     info.hasDone = signals.done != Value();
     info.hasWrDone = signals.wrDone != Value();
+    info.hasRdIdle = signals.rdIdle != Value();
+    info.hasWrIdle = signals.wrIdle != Value();
     info.requiresRdEn = signals.rdEn != Value();
     if (info.isRead)
       info.elementType = signals.rdData.getType();
@@ -6368,6 +6449,10 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
           memPortMap[memInfo.originalArg].wrDone;
       perEntryPorts[i][memInfo.originalArg].ready =
           memPortMap[memInfo.originalArg].ready;
+      perEntryPorts[i][memInfo.originalArg].rdIdle =
+          memPortMap[memInfo.originalArg].rdIdle;
+      perEntryPorts[i][memInfo.originalArg].wrIdle =
+          memPortMap[memInfo.originalArg].wrIdle;
     }
   }
 
@@ -6670,6 +6755,28 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
                         : hw::ConstantOp::create(builder, loc,
                                                     builder.getI1Type(), 1);
         childInputs.push_back(rdy);
+      }
+      // Mirror the loop module's `mem*_rd_idle` / `mem*_wr_idle` input order. A
+      // missing caller signal ties the drain high (fence is a no-op).
+      for (auto &memInfo : memrefArgs) {
+        if (!memInfo.isAmcPort || !memInfo.hasRdIdle)
+          continue;
+        auto &callerMp = memPortMap[memInfo.originalArg];
+        Value v = callerMp.rdIdle
+                      ? callerMp.rdIdle
+                      : hw::ConstantOp::create(builder, loc,
+                                                  builder.getI1Type(), 1);
+        childInputs.push_back(v);
+      }
+      for (auto &memInfo : memrefArgs) {
+        if (!memInfo.isAmcPort || !memInfo.hasWrIdle)
+          continue;
+        auto &callerMp = memPortMap[memInfo.originalArg];
+        Value v = callerMp.wrIdle
+                      ? callerMp.wrIdle
+                      : hw::ConstantOp::create(builder, loc,
+                                                  builder.getI1Type(), 1);
+        childInputs.push_back(v);
       }
 
       auto childInst = hw::InstanceOp::create(
