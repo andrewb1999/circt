@@ -1074,6 +1074,12 @@ handleHWLoad(loopschedule::HWLoadLoweringInterface loadOp, OpBuilder &builder,
   assert((rdEnGate || !loadOp.requiresReadEnable()) &&
          "HW load requires an explicit read-enable gate");
   if (rdEnGate) {
+    // NB: no RAW fence here (the sequential path folds the drain into `ready`
+    // in lowerSeqDynAccess). Gating a pipelined load's rd_en on wr_idle
+    // self-deadlocks: the stall freezes the whole pipeline, including the store
+    // whose drain would raise wr_idle. A pipelined intra-loop AXI RAW is left
+    // to program order / the engine committing at the W beat; a completion-
+    // based fence would be needed to make it robust to a reordering slave.
     *pref.rdEn = (contended && *pref.rdEn)
                      ? (Value)comb::OrOp::create(builder, loc, *pref.rdEn,
                                                  rdEnGate)
@@ -1160,6 +1166,13 @@ handleHWStore(loopschedule::HWStoreLoweringInterface storeOp,
   if (contended && *pref.wrData)
     wrData = comb::MuxOp::create(builder, loc, wrEnGate, wrData, *pref.wrData);
   *pref.wrData = wrData;
+  // NB: no WAR fence here. Unlike the sequential path (lowerSeqDynAccess),
+  // gating a store's wr_en on rd_idle in a PIPELINE deadlocks an rw port: the
+  // store would wait for all reads to drain while a RAW-fenced load waits for
+  // this store to drain — a cross-direction cycle the overlapping schedule
+  // cannot break. WAR on a pipelined AXI port instead relies on program order
+  // (the earlier load's AR issues before this store's AW). The RAW fence in
+  // handleHWLoad is deadlock-free because writes drain autonomously.
   *pref.wrEn = (contended && *pref.wrEn)
                    ? (Value)comb::OrOp::create(builder, loc, *pref.wrEn,
                                                wrEnGate)
