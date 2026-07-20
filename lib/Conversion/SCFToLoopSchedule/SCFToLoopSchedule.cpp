@@ -237,8 +237,16 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
       else if (auto store = dyn_cast<StoreInterface>(&op))
         lat = store.getLatency();
       if (lat == 0) {
-        op.emitWarning("loopschedule.dynamic op has zero latency; skipping "
-                        "launch/expect wrap");
+        // A DECLARED-zero-latency dynamic load with a read-enable is an
+        // FWFT stream pop: data is combinational, issue is stall-gated on
+        // the port's beat-valid, and skipping the launch/expect wrap is
+        // the designed lowering — stay silent. Anything else reaching
+        // here is a misconfigured port worth warning about.
+        auto hwLoad = dyn_cast<HWLoadLoweringInterface>(&op);
+        if (!(hwLoad && hwLoad.getReadLatency() == 0 &&
+              hwLoad.requiresReadEnable()))
+          op.emitWarning("loopschedule.dynamic op has zero latency; skipping "
+                         "launch/expect wrap");
         continue;
       }
       unsigned offset = atOp.getOffset();

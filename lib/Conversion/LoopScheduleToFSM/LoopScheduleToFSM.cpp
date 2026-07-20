@@ -1408,6 +1408,22 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
                                           false)
               : issueHandshake;
     }
+    // FWFT stream pop (declared-zero read latency + read-enable): the beat
+    // is valid ON the pop cycle and the FIFO head advances right after, so
+    // the doneMine-timed capture below would latch the NEXT beat (accReg
+    // registers one cycle behind the pop). Capture at issue instead —
+    // issueHandshake is gated on the port's beat-valid `ready`, so the
+    // captured datum is exactly the popped beat. Acceptance is completion:
+    // the ready-stall above already holds the state until the beat lands.
+    if (loadOp.requiresReadEnable() && loadOp.getReadLatency() == 0 &&
+        pref.rdData && *pref.rdData) {
+      auto capReg = seq::CompRegClockEnabledOp::create(
+          hb, loc, *pref.rdData, seqDyn->clk, issueHandshake, seqDyn->rst,
+          hw::ConstantOp::create(hb, loc, (*pref.rdData).getType(), 0),
+          hb.getStringAttr(base + "_cap"));
+      mapping.map(loadOp.getResult(), capReg);
+      return success();
+    }
     // Map the result to a capture register: data is valid ON the completion
     // pulse and consumers execute at later (post-stall) states.
     if (done && pref.rdData && *pref.rdData) {
@@ -1423,12 +1439,16 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
     return success();
   }
 
-  Value wrData = mapping.lookup(storeOp.getValueToStore());
-  Value &dataSlot = *pref.wrData;
-  dataSlot = dataSlot ? (Value)comb::MuxOp::create(builder, loc,
-                                                   issueHandshake, wrData,
-                                                   dataSlot)
-                      : wrData;
+  // Data-less dynamic stores (amc.burst_copy: the data plane lives inside
+  // the copy engine) drive only the enable.
+  if (Value toStore = storeOp.getValueToStore()) {
+    Value wrData = mapping.lookup(toStore);
+    Value &dataSlot = *pref.wrData;
+    dataSlot = dataSlot ? (Value)comb::MuxOp::create(builder, loc,
+                                                     issueHandshake, wrData,
+                                                     dataSlot)
+                        : wrData;
+  }
   Value &wrEnSlot = *pref.wrEn;
   wrEnSlot = wrEnSlot ? (Value)comb::OrOp::create(builder, loc, wrEnSlot,
                                                   issueHandshake, false)
@@ -1563,7 +1583,10 @@ emitHwInstanceFromOperator(
   // CE narrowed to the AND of the users' CEs (see SharedOperatorInstance).
   auto bindingAttr =
       origOp->getAttrOfType<IntegerAttr>("loopschedule.binding");
-  bool shareable = bindingAttr && shareGate && sharedOps;
+  // Debug escape hatch: LOOPSCHEDULE_NO_SHARED_OPERATORS=1 gives every
+  // user its own instance (isolates shared-join bugs from schedule bugs).
+  bool shareable = bindingAttr && shareGate && sharedOps &&
+                   !::getenv("LOOPSCHEDULE_NO_SHARED_OPERATORS");
   std::pair<mlir::StringAttr, int64_t> shareKey;
   if (shareable) {
     shareKey = {builder.getStringAttr(opName), bindingAttr.getInt()};
@@ -3123,7 +3146,20 @@ static void muxStageMemPorts(
       if (ports.rdEn)
         needsRdEn = true;
     }
-    if (widths.empty() || !dataType)
+    // Zero-address ports are real: stream beat faces (burst_pop/burst_push)
+    // drive rdEn/wrData/wrEn with no address slots. Only skip a memref with
+    // no consumer-side drives at all.
+    bool anyDrive = needsRdEn;
+    for (auto &stagePorts : perStagePorts) {
+      auto it = stagePorts.find(memref);
+      if (it == stagePorts.end())
+        continue;
+      const MemPortMapping &ports = it->second;
+      if (ports.wrEn || ports.wrData ||
+          llvm::any_of(ports.addrs, [](Value v) { return (bool)v; }))
+        anyDrive = true;
+    }
+    if (!anyDrive)
       continue; // nothing to mux for this memref (probably read-only with
                 // data-type already known to caller — not our concern).
 
@@ -3142,9 +3178,11 @@ static void muxStageMemPorts(
                             : hw::ConstantOp::create(builder, loc, addrType, 0);
       addrs.push_back(fallback);
     }
-    Value wrData = existing.wrData
-                        ? existing.wrData
-                        : hw::ConstantOp::create(builder, loc, dataType, 0);
+    // A read-only zero-address port (a pop-only stream face) has no data
+    // type to mux — leave wrData untouched.
+    Value wrData = existing.wrData;
+    if (!wrData && dataType)
+      wrData = hw::ConstantOp::create(builder, loc, dataType, 0);
     Value wrEn = existing.wrEn
                       ? existing.wrEn
                       : hw::ConstantOp::create(builder, loc, i1, 0);
@@ -3233,6 +3271,19 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     IRMapping &parentMapping,
     hw::HWModuleOp &outModule,
     SmallVectorImpl<Value> &capturedVals) {
+  // `sharedOperators` / `instanceUniquer` are scoped to the hw.module
+  // CURRENTLY being emitted, and this function runs mid-emission of the
+  // caller's module. Save the caller's in-progress state and restore it on
+  // exit: the child's clear-and-populate must never leak back — a caller
+  // op emitted after this returns would join a shared operator instance
+  // living inside the CHILD module's region (invalid cross-region IR; the
+  // nested-stream two_nests regression), and instance names would collide.
+  auto savedShared = std::move(sharedOperators);
+  auto savedUniquer = std::move(instanceUniquer);
+  auto restoreScopes = llvm::make_scope_exit([&] {
+    sharedOperators = std::move(savedShared);
+    instanceUniquer = std::move(savedUniquer);
+  });
 
   auto *ctx = builder.getContext();
   auto seqOp = node.seqOp;
@@ -3384,6 +3435,36 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   for (unsigned i = 0; i < numFrames; ++i) {
     auto &slots = node.frameLaunches[i];
     if (slots.size() != 1 || slots[0].pipIdx < 0 || slots[0].atOffset == 0)
+      continue;
+    // (d) dynamic-latency accesses in the frame: a variable-latency access
+    // (an amc.burst_copy fill, a dyn AXI load) scheduled before the child
+    // carries a completion dependence the scheduler encoded as the child's
+    // at-offset — the access's done-stall holds its last budget cycle
+    // until the access actually completes, and the child sits after that
+    // budget precisely so it reads what the access produced. An
+    // early-started child escapes the stall (it fires before the stalled
+    // cycle is even reached) and overlaps the access: the tiled
+    // burst_copy kernel's compute overlapped its fill and read a stale
+    // staging buffer. The port-disjointness guard below cannot see this
+    // conflict — the access's engine-owned port is a different SSA value
+    // from the pipeline's ports even when both back the same ram — so be
+    // conservative: any dynamic access in this frame (launch-wrapped or
+    // not) keeps the child at its scheduled offset.
+    bool hasDynAccess = false;
+    frames[i].getBodyBlock().walk([&](Operation *op) {
+      if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(op))
+        return WalkResult::skip(); // the child's own body doesn't count
+      bool dyn = false;
+      if (auto l = dyn_cast<loopschedule::LoadInterface>(op))
+        dyn = l.isDynamic();
+      else if (auto s = dyn_cast<loopschedule::StoreInterface>(op))
+        dyn = s.isDynamic();
+      if (!dyn)
+        return WalkResult::advance();
+      hasDynAccess = true;
+      return WalkResult::interrupt();
+    });
+    if (hasDynAccess)
       continue;
     unsigned schedOffset = slots[0].atOffset;
     auto pipOp = node.pipelineChildren[slots[0].pipIdx];
@@ -4050,6 +4131,29 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         Value slotChildStart = fsmChildStarts[waitIdx];
         Value slotChildActive = fsmChildActives[waitIdx];
         auto launchOp = launches[slotIdx];
+
+        // A blocking dynamic access (e.g. an amc.burst_copy) whose
+        // completion budget ends in the state that launches this child may
+        // still be draining: the done-stall holds the STATE, but the entry
+        // pulse alone would launch the child concurrently with the access.
+        // Defer the start until the stall clears, latching the pulse so it
+        // is not lost mid-stall. Without an active stall this is a
+        // passthrough (fire == the original pulse).
+        {
+          hw.setInsertionPointToEnd(hwBody);
+          Value zero1 = hw::ConstantOp::create(hw, loc, i1, 0);
+          auto pendReg = seq::CompRegOp::create(
+              hw, loc, zero1, clk, rst, zero1,
+              hw.getStringAttr(node.prefix + "_w" + std::to_string(waitIdx) +
+                               "_start_pend"));
+          Value raw = comb::OrOp::create(hw, loc, slotChildStart,
+                                         pendReg.getResult(), false);
+          Value fire = comb::AndOp::create(hw, loc, raw, notStallSeq, false);
+          Value notFire = comb::createOrFoldNot(hw, loc, fire);
+          pendReg->setOperand(
+              0, comb::AndOp::create(hw, loc, raw, notFire, false));
+          slotChildStart = fire;
+        }
 
         if (slot.childIdx >= 0) {
           auto &childNode = node.children[slot.childIdx];
@@ -7103,11 +7207,15 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
 
       Value done;
       if (dStore) {
-        Value wrData = resolve(dStore.getValueToStore());
-        if (!wrData)
-          return dop->emitError("unresolved store operand in "
-                                "function-frame dynamic access");
-        *pref.wrData = wrData;
+        // Data-less dynamic stores (amc.burst_copy: the data plane lives
+        // inside the copy engine) drive only the enable.
+        if (Value toStore = dStore.getValueToStore()) {
+          Value wrData = resolve(toStore);
+          if (!wrData)
+            return dop->emitError("unresolved store operand in "
+                                  "function-frame dynamic access");
+          *pref.wrData = wrData;
+        }
         *pref.wrEn = issue;
         // rw faces split write completion out; write-only ports report it
         // on `done`.
@@ -7149,7 +7257,18 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       SmallVector<Value> resultVals;
       if (dLoad) {
         Value cap = mp.rdData;
-        if (done && mp.rdData) {
+        if (mp.rdData && dLoad.requiresReadEnable() &&
+            dLoad.getReadLatency() == 0) {
+          // FWFT stream pop: the beat is valid ON the pop (issue) cycle and
+          // the FIFO head advances right after — capture at issue, which is
+          // gated on the port's beat-valid `ready`. The doneMine-timed
+          // capture below would latch the NEXT beat (accReg registers one
+          // cycle behind the pop); acceptance is completion here.
+          cap = seq::CompRegClockEnabledOp::create(
+              builder, loc, mp.rdData, clk, issue, rst,
+              createZeroConstant(builder, loc, mp.rdData.getType()),
+              builder.getStringAttr(base + "_cap"));
+        } else if (done && mp.rdData) {
           cap = seq::CompRegClockEnabledOp::create(
               builder, loc, mp.rdData, clk, doneMine, rst,
               createZeroConstant(builder, loc, mp.rdData.getType()),
