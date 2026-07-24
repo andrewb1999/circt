@@ -3952,6 +3952,13 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       return false;
     };
 
+    // Results produced by a dynamic (seqDyn) access in this frame. Their
+    // value is already held in a completion-clocked `_cap` register, so the
+    // fixed-offset result-capture latch below must NOT re-sample them (it
+    // would fire at atOffset+1, before the variable-latency access actually
+    // completes, and capture a stale beat).
+    llvm::DenseSet<Value> frameSeqDynResults;
+
     for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
       Block &atBody = atOp.getBodyBlock();
       // Skip launch-holder ats; their child loop is lowered as a module.
@@ -3990,6 +3997,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           if (failed(lowerSeqDynAccess(&op, hw, localMapping, framePorts,
                                        atGate, atOffset, &seqDyn)))
             return failure();
+          for (Value r : op.getResults())
+            frameSeqDynResults.insert(r);
           continue;
         }
         if (auto loadOp =
@@ -4038,6 +4047,13 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         hw.setInsertionPointToEnd(hwBody);
         for (auto res : atOp.getResults()) {
           if (!resultNeedsCapture(res, atOffset))
+            continue;
+          // A dynamic access already latched its data into a stable
+          // completion-clocked register; re-capturing at the fixed
+          // atOffset+1 cycle would read it before the access completes.
+          // The consumer already maps to that register, so leave it be.
+          Value yielded = atYield.getOperands()[res.getResultNumber()];
+          if (frameSeqDynResults.contains(yielded))
             continue;
           Value mapped = localMapping.lookupOrNull(res);
           if (!mapped)
