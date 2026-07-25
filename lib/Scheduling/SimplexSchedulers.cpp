@@ -1929,8 +1929,7 @@ LogicalResult ChainingModuloSimplexScheduler::rebuildWithPins() {
 // unpinning ALL other ops. Evicted ops return to the worklist; the
 // `prevSched + 1` rule guarantees forward progress, and the caller's
 // budget bounds total work before the II is incremented.
-LogicalResult
-ChainingModuloSimplexScheduler::scheduleOperation(Operation *n) {
+LogicalResult ChainingModuloSimplexScheduler::scheduleOperation(Operation *n) {
   unsigned stvN = startTimeVariables[n];
   unsigned stN = getStartTime(stvN);
 
@@ -2037,8 +2036,10 @@ LogicalResult ChainingModuloSimplexScheduler::schedule() {
 
   LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
 
-  if (failed(solveTableau()))
-    return prob.getContainingOp()->emitError() << "problem is infeasible";
+  if (failed(solveTableau())) {
+    prob.getContainingOp()->emitError() << "problem is infeasible";
+    return failure();
+  }
 
   // Static, height-based placement order (recomputed per II attempt since
   // inter-iteration edges weigh in at II*distance).
@@ -2058,8 +2059,7 @@ LogicalResult ChainingModuloSimplexScheduler::schedule() {
   // requeue ops, so the same op may be placed several times.
   while (!unscheduled.empty()) {
     if (budget == 0) {
-      LLVM_DEBUG(dbgs() << "Budget exhausted at II = " << parameterT
-                        << "\n");
+      LLVM_DEBUG(dbgs() << "Budget exhausted at II = " << parameterT << "\n");
       return failure();
     }
     --budget;
@@ -2067,16 +2067,15 @@ LogicalResult ChainingModuloSimplexScheduler::schedule() {
     // ops heading long dependence chains place first, so their consumers'
     // deadlines are computed against committed producers, not optimistic
     // floating times).
-    auto *opIt =
-        std::min_element(unscheduled.begin(), unscheduled.end(),
-                         [&](Operation *opA, Operation *opB) {
-                           int ha = heightPriority.lookup(opA);
-                           int hb = heightPriority.lookup(opB);
-                           if (ha != hb)
-                             return ha > hb;
-                           return stableIndex.lookup(opA) <
-                                  stableIndex.lookup(opB);
-                         });
+    auto *opIt = std::min_element(unscheduled.begin(), unscheduled.end(),
+                                  [&](Operation *opA, Operation *opB) {
+                                    int ha = heightPriority.lookup(opA);
+                                    int hb = heightPriority.lookup(opB);
+                                    if (ha != hb)
+                                      return ha > hb;
+                                    return stableIndex.lookup(opA) <
+                                           stableIndex.lookup(opB);
+                                  });
     Operation *op = *opIt;
     unscheduled.erase(opIt);
 
