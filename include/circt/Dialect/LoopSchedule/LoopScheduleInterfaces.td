@@ -160,6 +160,18 @@ def LoadOpInterface : OpInterface<"LoadInterface"> {
       "hasDependence",
       (ins "Operation *":$otherOp)>,
     InterfaceMethod<
+      "True if two reads of this memory may NOT be reordered with respect to "
+      "each other. False for a random-access memory, where a "
+      "read-after-read pair carries no constraint and the dependence analysis "
+      "drops it. True for a DESTRUCTIVE read — a FIFO pop takes the head "
+      "element, so the k-th read in program order is the one that gets the "
+      "k-th element, and swapping two of them swaps their data.",
+      "bool",
+      "readsAreOrdered",
+      (ins),
+      /*methodBody=*/"",
+      /*defaultImplementation=*/[{ return false; }]>,
+    InterfaceMethod<
       "This returns the unique identifier of the associated memory",
       "std::string",
       "getUniqueId",

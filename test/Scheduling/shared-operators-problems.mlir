@@ -69,3 +69,26 @@ ssp.instance @multiple of "SharedOperatorsProblem" {
     operation<@_1> @last(%5) [t<11>]
   }
 }
+
+// A zero-latency operator on a limited resource: three FWFT-style reads of one
+// single-ported FIFO cannot share a cycle, so the scheduler spreads them over
+// three consecutive steps even though none of them takes a cycle to produce
+// its result.
+// CHECK-LABEL: zero_latency_limited
+ssp.instance @zero_latency_limited of "SharedOperatorsProblem" {
+  library {
+    operator_type @pop [latency<0>]
+    operator_type @_1 [latency<1>]
+  }
+  resource {
+    resource_type @fifo [limit<1>]
+  }
+  graph {
+    %0 = operation<@pop>() uses[@fifo] [t<0>]
+    %1 = operation<@pop>() uses[@fifo] [t<1>]
+    %2 = operation<@pop>() uses[@fifo] [t<2>]
+    // SIMPLEX: @last(%{{.*}}) [t<2>]
+    // CPSAT: @last(%{{.*}}) [t<2>]
+    operation<@_1> @last(%0, %1, %2) [t<3>]
+  }
+}

@@ -1,7 +1,13 @@
 // RUN: circt-opt %s -ssp-roundtrip=verify -verify-diagnostics -split-input-file
 
-// expected-error@+1 {{Operator type 'limited' using limited resource 'limited_rsrc' has zero latency.}}
-ssp.instance @limited_but_zero_latency of "SharedOperatorsProblem" {
+// A zero-latency operator MAY use a limited resource — use is accounted for by
+// start time, so an operation that finishes in the cycle it starts still
+// occupies its resource for that cycle (an FWFT FIFO read is the motivating
+// case: combinational data, one read-enable strobe). It is oversubscribed by
+// the same rule as any other operator.
+
+// expected-error@+1 {{Resource type 'limited_rsrc' is oversubscribed}}
+ssp.instance @zero_latency_oversubscribed of "SharedOperatorsProblem" {
   library {
     operator_type @limited [latency<0>]
   }
@@ -9,6 +15,7 @@ ssp.instance @limited_but_zero_latency of "SharedOperatorsProblem" {
     resource_type @limited_rsrc [limit<1>]
   }
   graph {
+    operation<@limited>() uses[@limited_rsrc] [t<0>]
     operation<@limited>() uses[@limited_rsrc] [t<0>]
   }
 }

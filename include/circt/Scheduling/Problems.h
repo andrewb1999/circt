@@ -526,9 +526,12 @@ public:
   virtual PropertyStringVector getProperties(ResourceType rsrc) override;
 
 protected:
-  /// If \p op is limited, it has a non-zero latency.
-  virtual LogicalResult checkLatency(Operation *op) override;
-  /// \p rsrc is not oversubscribed in any time step.
+  /// \p rsrc is not oversubscribed in any time step. Use is counted by an
+  /// operation's START time, so a ZERO-LATENCY operation may hold a limited
+  /// resource: it occupies it for the one cycle it starts in. (A
+  /// first-word-fall-through queue read is the motivating shape — its data is
+  /// combinational off the queue head, so it has no latency, but it still
+  /// consumes one read port for that cycle.)
   virtual LogicalResult verifyUtilization(ResourceType rsrc);
 
 public:

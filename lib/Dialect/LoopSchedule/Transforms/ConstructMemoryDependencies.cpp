@@ -113,6 +113,19 @@ static bool isLoadLike(Operation *op) {
   return isa<memref::LoadOp, AffineReadOpInterface, LoadInterface>(op);
 }
 
+/// True if this read-after-read pair still needs an ordering edge. Reordering
+/// two reads of a random-access memory is free — which is why RAR pairs are
+/// dropped below — but a DESTRUCTIVE read (a FIFO pop) hands out the head
+/// element, so the two reads would swap data. Either side declaring it is
+/// enough: they are reads of the same memory.
+static bool orderedReadPair(Operation *source, Operation *destination) {
+  auto ordered = [](Operation *op) {
+    auto load = dyn_cast<LoadInterface>(op);
+    return load && load.readsAreOrdered();
+  };
+  return ordered(source) || ordered(destination);
+}
+
 /// The access's subscript vector when it composes to compile-time
 /// constants — the shape every access in a fully-unrolled /
 /// trip-1-promoted body has (the constants typically arrive through
@@ -203,8 +216,10 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
   // Read-after-read pairs carry no scheduling constraint (the non-affine
   // driver already skips them); without this, a fully-unrolled body with
   // N loads of one memory pays N^2 dependence solves for edges the
-  // scheduler never needed.
-  if (isLoadLike(source) && isLoadLike(destination))
+  // scheduler never needed. Destructive reads are the exception — see
+  // `orderedReadPair`.
+  if (isLoadLike(source) && isLoadLike(destination) &&
+      !orderedReadPair(source, destination))
     return;
 
   // Look for inter-iteration dependences on the same memory location.
@@ -360,8 +375,10 @@ static void checkNonAffineAccessPair(Operation *source, Operation *destination,
   // llvm::errs() << "dest is load: " << isLoad(destination) << "\n";
   // llvm::errs() << "=======================================\n";
 
-  // We don't care about RAR dependencies
-  if (isLoad(source) && isLoad(destination))
+  // We don't care about RAR dependencies, unless the reads are destructive
+  // (see `orderedReadPair`).
+  if (isLoad(source) && isLoad(destination) &&
+      !orderedReadPair(source, destination))
     return;
 
   if (auto *commonBlock = getCommonBlockInAffineScope(source, destination)) {

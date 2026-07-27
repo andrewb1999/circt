@@ -794,15 +794,23 @@ LogicalResult addMemoryResources(Operation *op, Region &body,
   for (const auto &it : resourceMap) {
     auto *op = it.first;
     auto rsrcs = it.second;
-    auto opr = problem.getLinkedOperatorType(op);
-    if (opr.has_value()) {
-      auto latency = problem.getLatency(opr.value());
-      if (latency != 0) {
-        for (const auto &name : rsrcs) {
-          auto memRsrc = problem.getOrInsertResourceType(name);
-          problem.addLinkedResourceType(op, memRsrc);
-        }
-      }
+    // An access occupies its resource in the cycle it STARTS, whatever its
+    // latency, so a latency-0 access is reserved like any other. It used to be
+    // skipped, on the reasoning that an operator finishing in the cycle it
+    // starts is combinational and therefore free — true of its data path and
+    // false of its port. A first-word-fall-through stream read is latency 0 by
+    // design (its data is combinational off the queue head) and still strobes
+    // one read enable, so N of them placed in one cycle dequeue ONE element
+    // and hand it to all N readers. That is what happened to a merged stencil
+    // window: three reads, one beat, three identical values, and an II the
+    // hardware could not honour. Only ops that declared a resource are in this
+    // map, so nothing that was already scheduled correctly gains a constraint
+    // it did not have.
+    if (!problem.getLinkedOperatorType(op).has_value())
+      continue; // not part of this problem
+    for (const auto &name : rsrcs) {
+      auto memRsrc = problem.getOrInsertResourceType(name);
+      problem.addLinkedResourceType(op, memRsrc);
     }
   }
 

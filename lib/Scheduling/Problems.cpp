@@ -349,29 +349,16 @@ SharedOperatorsProblem::getProperties(ResourceType rsrc) {
   return psv;
 }
 
-LogicalResult SharedOperatorsProblem::checkLatency(Operation *op) {
-  if (failed(Problem::checkLatency(op)))
-    return failure();
-
-  auto maybeRsrcs = getLinkedResourceTypes(op);
-  if (!maybeRsrcs)
-    return success();
-
-  // `linkedOprType` is not null since it must have been checked by the base
-  // class' `checkLatency`.
-  OperatorType linkedOprType = *getLinkedOperatorType(op);
-
-  for (auto rsrc : *maybeRsrcs) {
-    auto limit = getLimit(rsrc);
-    if (limit && *limit > 0 && *getLatency(linkedOprType) == 0)
-      return getContainingOp()->emitError()
-             << "Operator type '" << linkedOprType.getValue()
-             << "' using limited resource '" << rsrc.getValue()
-             << "' has zero latency.";
-  }
-  return success();
-}
-
+// NOTE there is deliberately no `checkLatency` override rejecting a
+// zero-latency operator on a limited resource. Resource use is accounted for by
+// START TIME throughout this model — `verifyUtilization` below counts
+// operations per time step (per congruence class in `ModuloProblem`) and the
+// simplex schedulers reserve the start step in their reservation tables — so an
+// operation that finishes in the cycle it starts still holds its resource for
+// exactly that cycle, which is both representable and sometimes required: a
+// first-word-fall-through queue read has no latency (its data is combinational
+// off the queue head) and still consumes one read port, so two of them in one
+// cycle would dequeue a single element and hand it to both readers.
 LogicalResult SharedOperatorsProblem::verifyUtilization(ResourceType rsrc) {
   auto limit = getLimit(rsrc);
   if (!limit)
