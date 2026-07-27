@@ -5948,18 +5948,47 @@ static void buildHWOutput(mlir::FunctionOpInterface funcOp, OpBuilder &builder,
   hw::OutputOp::create(builder, loc, outputs);
 }
 
+/// The name the boundary is ordered by: its first port. Port names are unique
+/// within a module, so this is a total order over the boundaries of one kernel.
+static StringRef bramBoundaryOrderKey(const loopschedule::BramBoundary &b) {
+  if (!b.inputPorts.empty())
+    return b.inputPorts.front().getName();
+  if (!b.outputPorts.empty())
+    return b.outputPorts.front().getName();
+  return StringRef();
+}
+
 /// Splice the external-memory (BRAM/AXI) boundary ports an `expand_ref` adapter
 /// registered onto the kernel `hw.module`: append the interface INPUT ports
 /// (resolving each dout backedge to its new block arg) and the interface OUTPUT
 /// ports (driven by the adapter's results). Runs after `buildHWOutput` so the
 /// appended outputs extend the just-built `hw.output`.
+///
+/// `bramBoundaries` is keyed by SSA value, so iterating it directly would emit
+/// the kernel's boundary ports (and the `amc.axi_bundles` register map derived
+/// from them) in POINTER-HASH order — different from run to run for the same
+/// input, which is how a pure refactor ended up wobbling downstream synthesis
+/// results by ~1%. Order the boundaries by their first port name instead, with
+/// a numeric-aware compare so `mem2` precedes `mem10`. Every producer in tree
+/// names a boundary after the function argument it came from (`mem<argNo>` for
+/// a BRAM arg, `gmem<k>`-style bundles assigned in argument order for m_axi),
+/// so this IS argument order, and the per-bundle `<b>_base_addr` boundary sorts
+/// just ahead of its own `<b>_m_axi_*` face.
 static void appendBramBoundaries(
     hw::HWModuleOp hwMod,
     DenseMap<Value, loopschedule::BramBoundary> &bramBoundaries) {
   Block *body = hwMod.getBodyBlock();
   SmallVector<Attribute> axiBundles;
-  for (auto &kv : bramBoundaries) {
-    auto &b = kv.second;
+  SmallVector<loopschedule::BramBoundary *> ordered;
+  for (auto &kv : bramBoundaries)
+    ordered.push_back(&kv.second);
+  llvm::sort(ordered, [](const loopschedule::BramBoundary *a,
+                         const loopschedule::BramBoundary *b) {
+    return bramBoundaryOrderKey(*a).compare_numeric(bramBoundaryOrderKey(*b)) <
+           0;
+  });
+  for (auto *bp : ordered) {
+    auto &b = *bp;
     if (!b.inputPorts.empty()) {
       unsigned base = hwMod.getModuleType().getNumInputs();
       // modifyPorts updates the module TYPE but not the body block args (and it
@@ -6083,7 +6112,24 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
     if (failed(instOp.lowerToHW(builder, memInstState)))
       return failure();
   }
-  for (auto &[portValue, signals] : memInstState.portMap) {
+
+  // The registered ports in a DEFINED order: instance ops in program order,
+  // each op's results in result order. `portMap` is keyed by SSA value, so
+  // walking it directly would order `memrefArgs` — and with it the FSM's
+  // per-port naming and the order the per-step access drives are merged in —
+  // by pointer hash, i.e. differently from run to run for the same input.
+  // Every registered value is a result of the instance op that registered it,
+  // so this traversal is exhaustive.
+  SmallVector<Value> orderedPorts;
+  for (auto instOp : instanceOps)
+    for (Value res : instOp->getResults())
+      if (memInstState.portMap.count(res))
+        orderedPorts.push_back(res);
+  assert(orderedPorts.size() == memInstState.portMap.size() &&
+         "a registered port is not a result of any lowered instance op");
+
+  for (Value portValue : orderedPorts) {
+    const auto &signals = *memInstState.lookupPort(portValue);
     MemPortMapping mp;
     mp.rdData = signals.rdData;
     mp.addrs.assign(signals.addrs.size(), Value());
@@ -6109,7 +6155,8 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
                                                     allocOp.getType(),
                                                     /*isLocalMem=*/true));
   }
-  for (auto &[portValue, signals] : memInstState.portMap) {
+  for (Value portValue : orderedPorts) {
+    const auto &signals = *memInstState.lookupPort(portValue);
     // A control channel registers `done` only (no addresses, no data, no
     // enables): nothing to drive or merge per step, so it must not become
     // a PortArgInfo — the FSM reads its done straight from memPortMap
