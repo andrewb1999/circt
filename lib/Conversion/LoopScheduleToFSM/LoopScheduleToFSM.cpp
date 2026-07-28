@@ -6008,11 +6008,17 @@ static void appendBramBoundaries(
     if (b.axiMeta) {
       auto *ctx = hwMod.getContext();
       OpBuilder ab(ctx);
+      SmallVector<int64_t> argElems(b.axiMeta->argElems.begin(),
+                                    b.axiMeta->argElems.end());
       axiBundles.push_back(ab.getDictionaryAttr(
           {ab.getNamedAttr("name", ab.getStringAttr(b.axiMeta->bundle)),
            ab.getNamedAttr("depth", ab.getI64IntegerAttr(b.axiMeta->depth)),
            ab.getNamedAttr("elem_width",
-                           ab.getI64IntegerAttr(b.axiMeta->elemWidth))}));
+                           ab.getI64IntegerAttr(b.axiMeta->elemWidth)),
+           // One entry per ARGUMENT on the bundle, in base-register order:
+           // each has its own runtime base, so a testbench places them
+           // independently instead of assuming one packed allocation.
+           ab.getNamedAttr("arg_elems", ab.getDenseI64ArrayAttr(argElems))}));
     }
   }
   // Publish AXI bundle metadata for the testbench generator (slave depth /

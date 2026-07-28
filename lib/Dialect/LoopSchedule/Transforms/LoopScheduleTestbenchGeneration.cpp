@@ -251,10 +251,51 @@ struct AxiBundleInfo {
   uint64_t depth = 0;
   unsigned dataW = 32;
   unsigned addrShift = 2;
+  /// Position in the `amc.axi_bundles` array, which is the order the
+  /// s_axilite register map is laid out in.
+  unsigned metaIndex = 0;
+  /// Element count of each ARGUMENT on this bundle, in base-register order,
+  /// and the element offset this testbench places each of them at inside the
+  /// bundle's one behavioral slave (see `sharedBundleOffsets`).
+  llvm::SmallVector<uint64_t, 1> argElems;
+  llvm::SmallVector<uint64_t, 1> argOffsets;
   /// DUT ports keyed by bare signal name ("araddr", "rdata", ...).
   llvm::StringMap<hw::PortInfo> ports;
 };
 } // namespace
+
+/// Gap, in elements, this testbench leaves between the arrays of a SHARED
+/// m_axi bundle. Deliberately small and odd: it is there to make the layout
+/// non-contiguous and non-power-of-two-aligned, not to be convenient.
+static constexpr uint64_t kSharedArgGapElems = 3;
+
+/// Where this testbench PLACES each argument of an m_axi bundle inside the
+/// bundle's one behavioral slave, and how big that slave must be.
+///
+/// Every argument has its own runtime base register, so the placement is the
+/// HARNESS's choice, not the compiler's — and the choice here is deliberately
+/// hostile to any surviving compile-time packed-layout assumption: REVERSE
+/// declaration order, with a gap between the arrays, so declaration order is
+/// not address order and nothing is contiguous.
+///
+/// A single-argument (dedicated) bundle is offset 0, depth = its element
+/// count: byte-identical to the layout before per-argument bases existed.
+///
+/// KEEP IN SYNC with `shared_bundle_offsets` in allo/allo/backend/amc.py,
+/// which writes the hex image this placement reads and splits the dumped
+/// memory back apart at the same offsets.
+static std::pair<llvm::SmallVector<uint64_t, 1>, uint64_t>
+sharedBundleOffsets(ArrayRef<uint64_t> argElems) {
+  llvm::SmallVector<uint64_t, 1> offsets(argElems.size(), 0);
+  if (argElems.size() <= 1)
+    return {offsets, argElems.empty() ? 0 : argElems[0]};
+  uint64_t off = 0;
+  for (unsigned k = argElems.size(); k-- > 0;) {
+    offsets[k] = off;
+    off += argElems[k] + kSharedArgGapElems;
+  }
+  return {offsets, offsets[0] + argElems[0]};
+}
 
 /// The m_axi signal set, in the port-declaration order of
 /// hdl/systemverilog/axi_slave_mem.sv. `dutOutput` marks signals the kernel
@@ -324,14 +365,23 @@ classifyAxiBundles(hw::HWModuleOp dutMod,
 
     bool found = false;
     if (bundlesAttr) {
-      for (auto attr : bundlesAttr) {
+      for (auto [idx, attr] : llvm::enumerate(bundlesAttr)) {
         auto dict = dyn_cast<DictionaryAttr>(attr);
         if (!dict)
           continue;
         auto nameAttr = dict.getAs<StringAttr>("name");
         auto depthAttr = dict.getAs<IntegerAttr>("depth");
         if (nameAttr && depthAttr && nameAttr.getValue() == kv.first) {
-          info.depth = (uint64_t)depthAttr.getInt();
+          info.metaIndex = (unsigned)idx;
+          // Per-ARGUMENT element counts (one per runtime base register).
+          // Absent metadata means a single argument spanning the whole ram.
+          if (auto argElems = dict.getAs<DenseI64ArrayAttr>("arg_elems"))
+            for (int64_t n : argElems.asArrayRef())
+              info.argElems.push_back((uint64_t)n);
+          if (info.argElems.empty())
+            info.argElems.push_back((uint64_t)depthAttr.getInt());
+          std::tie(info.argOffsets, info.depth) =
+              sharedBundleOffsets(info.argElems);
           found = true;
           break;
         }
@@ -1152,10 +1202,33 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
     addPort("done_pulse", builder.getI1Type(),
             hw::ModulePort::Direction::Output);
 
+    // One 64-bit base register PER ARGUMENT, in bundle-then-argument order —
+    // the order amc-insert-axi-lite-control lays the register map out in — and
+    // each one holds the BYTE address this testbench placed that argument at
+    // inside its bundle's slave (see `sharedBundleOffsets`). A dedicated
+    // bundle's single argument sits at 0, so its register is written 0 exactly
+    // as before per-argument bases existed.
+    SmallVector<const AxiBundleInfo *> byRegOrder;
+    for (auto &b : axiBundles)
+      byRegOrder.push_back(&b);
+    llvm::sort(byRegOrder, [](const AxiBundleInfo *a, const AxiBundleInfo *b) {
+      return a->metaIndex < b->metaIndex;
+    });
+    SmallVector<uint64_t> baseValues;
+    for (const AxiBundleInfo *b : byRegOrder)
+      for (uint64_t off : b->argOffsets)
+        baseValues.push_back(off << b->addrShift);
+    // Packed {base[N-1], .., base[0]}, 64 bits each; the BFM slices it.
+    APInt packed(std::max<unsigned>(64, 64 * baseValues.size()), 0);
+    for (auto [k, v] : llvm::enumerate(baseValues))
+      packed.insertBits(APInt(64, v), 64 * k);
+
     auto i32ParamType = builder.getIntegerType(32);
     SmallVector<Attribute> paramDecls = {
         hw::ParamDeclAttr::get("ADDR_W", i32ParamType),
-        hw::ParamDeclAttr::get("NUM_BASE_ADDRS", i32ParamType)};
+        hw::ParamDeclAttr::get("NUM_BASE_ADDRS", i32ParamType),
+        hw::ParamDeclAttr::get(
+            "BASE_VALUES", builder.getIntegerType(packed.getBitWidth()))};
     OpBuilder externBuilder = OpBuilder::atBlockEnd(moduleOp.getBody());
     auto bfmExt = hw::HWModuleExternOp::create(
         externBuilder, loc, builder.getStringAttr("axi_lite_ctrl_bfm"),
@@ -1166,7 +1239,11 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
         hw::ParamDeclAttr::get("ADDR_W", builder.getI32IntegerAttr(ctrlAddrW)),
         hw::ParamDeclAttr::get(
             "NUM_BASE_ADDRS",
-            builder.getI32IntegerAttr((int32_t)axiBundles.size()))};
+            builder.getI32IntegerAttr((int32_t)baseValues.size())),
+        hw::ParamDeclAttr::get("BASE_VALUES",
+                               builder.getIntegerAttr(
+                                   builder.getIntegerType(packed.getBitWidth()),
+                                   packed))};
     SmallVector<Value> operands = {clk, rst, numTxns};
     for (const char *sig : kBfmIns)
       operands.push_back(ctrlOutVals[(kCtrlSlavePrefix + sig).str()]);

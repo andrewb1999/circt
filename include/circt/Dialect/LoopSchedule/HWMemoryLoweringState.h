@@ -128,6 +128,13 @@ struct BramBoundary {
     std::string bundle;
     uint64_t depth;
     unsigned elemWidth;
+    /// Element count of each ARGUMENT carried on this bundle, in the order
+    /// their runtime base registers are laid out (which is the order
+    /// amc-insert-axi-lite-control assigns s_axilite offsets in). One entry is
+    /// a dedicated bundle; several are a SHARED bundle, whose arguments are
+    /// placed independently by the host, so a testbench must give each of them
+    /// its own base rather than assume one packed allocation.
+    llvm::SmallVector<uint64_t, 1> argElems;
   };
   std::optional<AxiMeta> axiMeta;
 };
