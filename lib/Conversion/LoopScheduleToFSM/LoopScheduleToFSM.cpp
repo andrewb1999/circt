@@ -38,6 +38,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
+#include <limits>
 
 namespace circt {
 #define GEN_PASS_DEF_LOOPSCHEDULETOFSM
@@ -4059,11 +4060,24 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     seqMux.regPrefix = node.prefix + "_f" + std::to_string(frameIdx);
     SeqPortMuxCtx *seqMuxPtr = seqMux.multi.empty() ? nullptr : &seqMux;
 
-    // Is this at-op's `res` consumed at a strictly-later at-offset in
-    // the same frame, or inside a launch-holder at-op in the same
-    // frame? Such consumers run ≥1 cycle after `atOp`, so the
-    // combinational mapping (e.g. a load's rd_data) goes stale as the
-    // memory port moves on and we need to latch the value.
+    // Is this at-op's `res` consumed at an at-offset the capture register
+    // can actually serve, or inside a launch-holder at-op in the same
+    // frame? The register is clocked at `myOffset + 1` and therefore only
+    // READABLE from `myOffset + 2` on, so only a consumer that far out
+    // needs it; a consumer at exactly `myOffset + 1` keeps the
+    // combinational value.
+    //
+    // That is safe because an at-result's combinational mapping stays
+    // valid from `myOffset + 1` through the REST of the frame's cycle
+    // states, not just for one cycle: a port with one static access holds
+    // its address frame-wide (see SeqPortMuxCtx), a contended port's load
+    // result is already a live-bypassed capture register, a dynamic
+    // access's result is a completion-clocked `_cap` register, and
+    // anything else is a pure function of frame-stable values. What the
+    // hold register buys is validity ACROSS the frame boundary — during
+    // WAIT_i the launched child owns the port and rd_data moves — which is
+    // why a launch-holder consumer still counts at any offset: the child
+    // runs after every cycle state of the frame.
     auto resultNeedsCapture = [&](Value atResult, unsigned myOffset) {
       for (auto *user : atResult.getUsers()) {
         Operation *anc = frameBody.findAncestorOpInBlock(*user);
@@ -4072,13 +4086,35 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         auto otherAt = dyn_cast<LoopScheduleAtOp>(anc);
         if (!otherAt)
           continue;
-        if ((unsigned)otherAt.getOffset() > myOffset)
+        if ((unsigned)otherAt.getOffset() > myOffset + 1)
           return true;
         for (auto &op : otherAt.getBodyBlock())
           if (isa<LoopScheduleLaunchOp>(&op))
             return true;
       }
       return false;
+    };
+
+    // Capture registers created for this frame's at-results, each with the
+    // at-offset from which its value is READABLE (the cycle after its
+    // clock enable). Applied to `localMapping` lazily — see the flush at
+    // the top of the at-op loop — because rewriting the mapping the moment
+    // the register is created would hand the register to the at-op that
+    // executes in the register's own clock cycle, which reads the value
+    // the PREVIOUS loop iteration left behind.
+    struct PendingCapture {
+      unsigned readableFrom;
+      Value atResult;
+      Value reg;
+    };
+    SmallVector<PendingCapture> pendingCaptures;
+    auto flushCaptures = [&](unsigned upToOffset) {
+      llvm::erase_if(pendingCaptures, [&](const PendingCapture &pc) {
+        if (pc.readableFrom > upToOffset)
+          return false;
+        localMapping.map(pc.atResult, pc.reg);
+        return true;
+      });
     };
 
     // Results produced by a dynamic (seqDyn) access in this frame. Their
@@ -4100,6 +4136,10 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       if (isLaunchHolder)
         continue;
       unsigned atOffset = (unsigned)atOp.getOffset();
+      // Hand over any capture register that has become readable by this
+      // cycle. Everything still pending is a register clocked in THIS
+      // cycle or later; this at-op's operands must stay combinational.
+      flushCaptures(atOffset);
       // For multi-cycle wait frames, gate each at-K op by its own
       // FRAME_<i>_<K> cycle output; for single-cycle wait frames
       // fsmFrameCycleGates[i][0] is just frame_active_<i>.
@@ -4196,10 +4236,15 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
               std::to_string(res.getResultNumber()) + "_latched");
           Value latched = seq::CompRegClockEnabledOp::create(
               hw, loc, mapped, clk, captureGate, rst, resetVal, regName);
-          localMapping.map(res, latched);
+          // Readable from atOffset + 2: the enable is atOffset + 1's gate.
+          pendingCaptures.push_back({atOffset + 2, res, latched});
         }
       }
     }
+    // Everything left over is readable by the time the frame's own cycle
+    // states are done: the frame yield, the launched child (which runs in
+    // WAIT_i) and later frames all read the held value.
+    flushCaptures(std::numeric_limits<unsigned>::max());
     return success();
   };
 
