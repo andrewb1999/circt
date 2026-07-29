@@ -678,20 +678,33 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
   // memory (size group.depth), the testbench shifts the DUT's address
   // by `T * group.depth`. This lets a single verilator run process N
   // transactions with per-transaction-distinct inputs/outputs without
-  // needing per-transaction tags from the DUT — write attribution is
-  // recovered via per-address write counters (each transaction's write
-  // to address A is the (T+1)th write to A overall, since pipeline
-  // ordering preserves per-(mem,addr) issue order).
+  // needing per-transaction tags from the DUT — write attribution uses
+  // `tb_done_count`, the number of transactions that have already
+  // finished, which IS the id of the transaction currently executing
+  // (transactions are serialized on `done`; see the txn-slot register).
+  //
+  // It used to use a per-address write counter instead, on the theory
+  // that "transaction T's write to address A is the (T+1)th write to A
+  // overall". That holds only when every transaction writes each address
+  // at most ONCE. A kernel that writes one address twice in a single
+  // transaction — a scatter with a repeated destination, a
+  // data-dependent write cursor rewriting its slot, `B[0] = src[i]` in a
+  // loop — had its second and later writes filed under transactions
+  // 1, 2, ... which nothing ever reads back, so the FIRST write to each
+  // address won and the compiler looked like it had reordered stores.
+  // It had not: the writes were issued in the right order, into the
+  // wrong slots. Keying on the transaction id cannot misfile a repeated
+  // write, and it also fixes the mirror case the counter got wrong (a
+  // transaction that skips address A shifted every later transaction's
+  // write to A down a slot).
   //
   // MAX_N_TXNS is a fixed compile-time bound on batch size. Tests need
   // num_transactions <= MAX_N_TXNS. Sim-only memory; not synthesized.
   const unsigned MAX_N_TXNS = 1024;
-  auto i32TypeMem = builder.getIntegerType(32);
 
   struct MemInfo {
     sv::RegOp reg;          // partitioned: MAX_N_TXNS * group.depth
     Value readVal;          // combinational read wire (set later)
-    sv::RegOp writeCntReg;  // i32[group.depth]: per-addr write counter
     unsigned perTxnDepth;   // = group.depth
   };
   DenseMap<StringRef, MemInfo> memInfoMap;
@@ -703,43 +716,13 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
     auto memReg = sv::RegOp::create(builder, loc, arrayType,
                                     builder.getStringAttr(group.name));
 
-    // Per-address write counter array. Tracks how many transactions have
-    // written each address; the next write to address A goes into slot
-    // `count[A] * group.depth + A`. Initialized to zero at sim start.
-    auto cntArrayType =
-        hw::UnpackedArrayType::get(i32TypeMem, group.depth);
-    auto cntReg = sv::RegOp::create(
-        builder, loc, cntArrayType,
-        builder.getStringAttr(group.name + "_addr_wcnt"));
-
-    // Init the memory contents from hex AND zero the per-addr counter in
-    // the same initial block. We use blocking assignment in a for-loop
-    // here (instead of NBA inside always_ff) because verilator rejects
-    // delayed array writes inside loops (BLKLOOPINIT).
     sv::InitialOp::create(builder, loc, [&] {
       sv::ReadMemOp::create(builder, loc, memReg,
                             dataDir + "/" + group.name + ".hex",
                             MemBaseTypeAttr::MemBaseHex);
-      Value zero32 = hw::ConstantOp::create(builder, loc, i32TypeMem, 0);
-      unsigned w = std::max(1u, group.addrWidth);
-      auto idxTy = builder.getIntegerType(w + 1);
-      Value lb = hw::ConstantOp::create(builder, loc, idxTy, 0);
-      Value ub =
-          hw::ConstantOp::create(builder, loc, idxTy, group.depth);
-      Value step = hw::ConstantOp::create(builder, loc, idxTy, 1);
-      sv::ForOp::create(
-          builder, loc, lb, ub, step, "ai", [&](BlockArgument iv) {
-            Value tIv = comb::ExtractOp::create(
-                builder, loc,
-                builder.getIntegerType(std::max(1u, group.addrWidth)), iv, 0);
-            Value cntRef = sv::ArrayIndexInOutOp::create(
-                builder, loc, cntReg, tIv);
-            sv::BPAssignOp::create(builder, loc, cntRef, zero32);
-          });
     });
 
-    memInfoMap[group.name] =
-        {memReg, Value(), cntReg, group.depth};
+    memInfoMap[group.name] = {memReg, Value(), group.depth};
   }
 
   // --- Create scalar input arrays and initialize from hex files ---
@@ -819,18 +802,24 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                                       builder.getStringAttr("tb_done_count"));
   Value doneCntVal = sv::ReadInOutOp::create(builder, loc, doneCntReg);
 
-  // Transaction-slot register: which transaction's memory image serves
-  // reads. It increments on each accepted `start` (or on `done` under
-  // axil_handshake — see the always_ff below), so at cycle T it equals
-  // the id of the currently-executing transaction. A single register
-  // suffices because at most one transaction's reads are ever in flight
-  // per memory: sequential functions serialize transactions on done, and
-  // func-level pipelining rejects memory arguments outright (a memory
-  // argument has no per-transaction identity, so overlapped transactions
-  // would each need their own memory image — unsupported).
-  auto txnSlotReg = sv::RegOp::create(
-      builder, loc, i32Type, builder.getStringAttr("tb_txn_slot"));
-  Value txnSlotVal = sv::ReadInOutOp::create(builder, loc, txnSlotReg);
+  // Which transaction's memory image serves reads AND absorbs writes:
+  // `tb_done_count`, the number of transactions that have already
+  // finished, which is the id of the one now running. One register
+  // suffices because transactions never overlap — sequential functions
+  // serialize them on `done`, and func-level pipelining rejects memory
+  // arguments outright (a memory argument has no per-transaction
+  // identity, so overlapped transactions would each need their own image
+  // — unsupported).
+  //
+  // Reads used to key off a separate `tb_txn_slot` that bumped on each
+  // accepted `start` under the raw handshake (and on `done` only under
+  // axil_handshake). Bumping on start makes the slot the id of the NEXT
+  // transaction for the whole of the current one, so a raw-handshake
+  // `run_batch` served every transaction its successor's inputs — masked
+  // in-tree because the only multi-transaction test uses axil_handshake,
+  // and by the clamp at the last slot, which made the final transaction
+  // (the one a same-data `run_streaming` checks) come out right.
+  Value txnSlotVal = doneCntVal;
 
   // --- Build DUT instance operands ---
   // We need to wire: clk, rst, start, scalar inputs, memory rd_data.
@@ -1274,18 +1263,12 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                   hw::ConstantOp::create(builder, loc, i32Type, 0);
               sv::PAssignOp::create(builder, loc, issueCntReg, c0_i32);
               sv::PAssignOp::create(builder, loc, doneCntReg, c0_i32);
-              sv::PAssignOp::create(builder, loc, txnSlotReg, c0_i32);
               if (!axiBundles.empty()) {
                 sv::PAssignOp::create(builder, loc, axiDumpReg, falseVal);
                 sv::PAssignOp::create(
                     builder, loc, axiFinishWaitReg,
                     hw::ConstantOp::create(builder, loc, i2Type, 0));
               }
-              // Per-(mem, addr) write counters are zero-initialized at
-              // sim start in their `initial` block (alongside $readmemh).
-              // We don't re-zero them on rst because verilator rejects
-              // delayed (NBA) array writes inside for-loops, and tests
-              // only ever pulse rst once per simulation.
             },
             // Normal operation.
             [&] {
@@ -1304,42 +1287,19 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                     comb::AddOp::create(builder, loc, issueCntVal, c1);
                 sv::PAssignOp::create(builder, loc, issueCntReg, nextIssue);
               });
-              // Transaction slot. Increments on accepted start (clamped
-              // to numTxns-1 so it stays valid for last-txn reads).
-              //
-              // axil_handshake: the BFM's start pulse fires when the ap_start
-              // WRITE completes — a few cycles before the kernel's internal
-              // start, so a start-keyed bump would already point past the
-              // txn whose reads are about to issue. Transactions are
-              // strictly serialized under axil_handshake, so key the bump off
-              // the DONE pulse instead: the slot then simply holds the
-              // id of the txn currently executing.
-              {
-                Value slotBump = ctrlHs ? doneVal : startVal;
-                Value c1 =
-                    hw::ConstantOp::create(builder, loc, i32Type, 1);
-                Value nextSlot = comb::AddOp::create(
-                    builder, loc, txnSlotVal, c1);
-                Value moreAfter = comb::ICmpOp::create(
-                    builder, loc, comb::ICmpPredicate::ult, nextSlot,
-                    numTxns);
-                Value slotBumped = comb::MuxOp::create(
-                    builder, loc, moreAfter, nextSlot, txnSlotVal);
-                Value nextSlotFinal = comb::MuxOp::create(
-                    builder, loc, slotBump, slotBumped, txnSlotVal);
-                sv::PAssignOp::create(builder, loc, txnSlotReg,
-                                       nextSlotFinal);
-              }
-
-              // Memory writes: when wr_en high, look up per-addr write
-              // counter, place the value in slot `count*K + addr`, and
-              // bump the counter. The Tth write to address A goes to
-              // transaction T's partition. Pipeline ordering preserves
-              // per-(mem,addr) issue order, so the count = the txn id
-              // for that write. Each physical port of a dual-port memory
-              // writes the shared array independently (the scheduler
-              // guarantees the two ports never target the same address in
-              // the same cycle).
+              // Memory writes: when wr_en high, place the value in the
+              // CURRENT transaction's slot, `tb_done_count*K + addr`.
+              // `tb_done_count` is the number of transactions that have
+              // already raised `done`, i.e. the id of the one now
+              // running — it is read here pre-edge, so a write landing in
+              // the same cycle as its own `done` still files under that
+              // transaction. Repeated writes to one address within a
+              // transaction all target the same slot, so the last writer
+              // wins exactly as the source says (see the write-attribution
+              // note on the memory arrays above). Each physical port of a
+              // dual-port memory writes the shared array independently
+              // (the scheduler guarantees the two ports never target the
+              // same address in the same cycle).
               for (auto &group : memGroups) {
                 auto &info = memInfoMap[group.name];
                 for (auto &mp : group.ports) {
@@ -1350,18 +1310,13 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                   Value addr = memAddrValues[mp.physPrefix];
 
                   sv::IfOp::create(builder, loc, wrEn, [&] {
-                    // Lookup current write count for this address.
-                    Value cntElemRef = sv::ArrayIndexInOutOp::create(
-                        builder, loc, info.writeCntReg, addr);
-                    Value cntVal =
-                        sv::ReadInOutOp::create(builder, loc, cntElemRef);
-                    // Compute effective address = cnt * K + addr.
-                    Value cntTrunc = comb::ExtractOp::create(
-                        builder, loc, partAddrType, cntVal, 0);
+                    // Compute effective address = txn * K + addr.
+                    Value txnTrunc = comb::ExtractOp::create(
+                        builder, loc, partAddrType, doneCntVal, 0);
                     Value kConst = hw::ConstantOp::create(
                         builder, loc, partAddrType, group.depth);
                     Value shift =
-                        comb::MulOp::create(builder, loc, cntTrunc, kConst);
+                        comb::MulOp::create(builder, loc, txnTrunc, kConst);
                     Value addrExt = comb::ConcatOp::create(
                         builder, loc,
                         ValueRange{hw::ConstantOp::create(
@@ -1375,11 +1330,6 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                     Value elemRef = sv::ArrayIndexInOutOp::create(
                         builder, loc, info.reg, effectiveAddr);
                     sv::PAssignOp::create(builder, loc, elemRef, wrData);
-                    // Increment the counter for this address.
-                    Value cntPlus1 = comb::AddOp::create(
-                        builder, loc, cntVal,
-                        hw::ConstantOp::create(builder, loc, i32Type, 1));
-                    sv::PAssignOp::create(builder, loc, cntElemRef, cntPlus1);
                   });
                 }
               }
