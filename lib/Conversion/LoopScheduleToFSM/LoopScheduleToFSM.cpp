@@ -3265,6 +3265,55 @@ static unsigned firstIterArgUseOffset(loopschedule::LoopSchedulePipelineOp pipOp
   return firstUse;
 }
 
+/// Earliest cycle within `frameOp` at which `pipOp`'s child_start may pulse
+/// without an iter_arg INIT latching a stale value.
+///
+/// A same-frame value reaches a launched child through the capture chain
+/// `resultNeedsCapture` builds: a producer in `at O` (or anything it feeds
+/// combinationally) is register-readable no earlier than cycle O+2, because
+/// the deepest capture in its cone latches during O+1. The feedback-register
+/// preload in `lowerPipelineChild` samples an init at cycle
+/// `start + firstIterArgUseOffset(arg)` and latches it at the END of that
+/// cycle, so the value must be readable DURING it:
+///
+///     start + firstUse >= O + 2
+///
+/// The SCHEDULE only guarantees the init is COMBINATIONALLY available at
+/// `O + operator latency`, which is why this floor is needed. It bites
+/// exactly when firstUse is small, i.e. for the induction variable (whose
+/// preload depth is forced to 0 because the loop condition reads it
+/// unregistered) of a loop with a runtime LOWER bound. Inits that are
+/// constants, block args, or frame-external values -- every loop with a
+/// static lower bound -- give no constraint at all.
+///
+/// Deliberately does NOT constrain what the pipeline BODY reads: those
+/// crossings are modelled by the scheduler and re-checked by the early
+/// child_start peephole's guard (b2).
+static unsigned
+minLegalLaunchStart(loopschedule::LoopSchedulePipelineOp pipOp,
+                    loopschedule::LoopScheduleFrameOp frameOp) {
+  Operation *launchHolder =
+      frameOp.getBodyBlock().findAncestorOpInBlock(*pipOp.getOperation());
+  unsigned minStart = 0;
+  for (auto [argIdx, init] : llvm::enumerate(pipOp.getInits())) {
+    Operation *def = init.getDefiningOp();
+    if (!def || !frameOp->isAncestor(def))
+      continue; // stable before the frame started
+    Operation *top = frameOp.getBodyBlock().findAncestorOpInBlock(*def);
+    if (!top || top == launchHolder)
+      continue; // inside our own launch: moves with the child
+    auto defAt = dyn_cast<LoopScheduleAtOp>(top);
+    if (!defAt)
+      continue;
+    unsigned firstUse = firstIterArgUseOffset(pipOp, argIdx);
+    if (firstUse == UINT_MAX)
+      continue; // never read
+    unsigned ready = (unsigned)defAt.getOffset() + 2;
+    minStart = std::max(minStart, ready > firstUse ? ready - firstUse : 0u);
+  }
+  return minStart;
+}
+
 LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     const LoopNode &node, OpBuilder &builder, Location loc,
     loopschedule::LoopScheduleFuncSequentialOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
@@ -3380,7 +3429,33 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     for (auto &slot : node.frameLaunches[i]) {
       frameWaitIdx[i].push_back((int)waitFrameIndices.size());
       waitFrameIndices.push_back(i);
-      launchAtOffsets.push_back(slot.atOffset);
+      unsigned offset = slot.atOffset;
+      // --- Late child_start correction (CORRECTNESS, not an optimisation) ---
+      // A launch reads its frame-produced operands out of the
+      // launch-consumer capture registers, which latch during cycle O+1 for
+      // a producer at at-offset O and are register-readable from O+2. The
+      // SCHEDULE, by contrast, places a launch as soon as its operands are
+      // COMBINATIONALLY available (O + operator latency), which is a cycle
+      // or two too early whenever a pipeline iter_arg init comes out of the
+      // same frame and is read at a small stage offset. The IV of a loop
+      // with a runtime LOWER bound is exactly that case:
+      // `for k in range(rowptr[i], rowptr[i+1])` inits its IV from an
+      // at-result, and the IV's preload depth is forced to 0 because the
+      // loop condition reads it combinationally -- so the preload samples
+      // the capture register on the start edge and latches the PREVIOUS
+      // outer iteration's bound. Every row then walked from the previous
+      // row's base: plausible numbers, silently wrong.
+      //
+      // Push such a launch to the first legal cycle. Frame cycle states
+      // extend to cover it, so the static ops keep their issue/capture
+      // cycles. Loops whose inits are constants or frame-external values --
+      // i.e. every loop with a static lower bound -- are unaffected, which
+      // is why this leaves existing designs bit-identical.
+      if (slot.pipIdx >= 0)
+        offset = std::max(
+            offset, minLegalLaunchStart(node.pipelineChildren[slot.pipIdx],
+                                        frames[i]));
+      launchAtOffsets.push_back(offset);
     }
   }
   unsigned numWaits = waitFrameIndices.size();
@@ -3434,7 +3509,13 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                                            launchAtOffsets.end());
   for (unsigned i = 0; i < numFrames; ++i) {
     auto &slots = node.frameLaunches[i];
-    if (slots.size() != 1 || slots[0].pipIdx < 0 || slots[0].atOffset == 0)
+    if (slots.size() != 1 || slots[0].pipIdx < 0)
+      continue;
+    // The scheduled offset AFTER the late-start correction above: the
+    // peephole may only move a launch earlier within the window the
+    // correction left legal.
+    unsigned schedOffset = launchAtOffsets[(unsigned)frameWaitIdx[i].front()];
+    if (schedOffset == 0)
       continue;
     // (d) dynamic-latency accesses in the frame: a variable-latency access
     // (an amc.burst_copy fill, a dyn AXI load) scheduled before the child
@@ -3466,7 +3547,6 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     });
     if (hasDynAccess)
       continue;
-    unsigned schedOffset = slots[0].atOffset;
     auto pipOp = node.pipelineChildren[slots[0].pipIdx];
     LoopScheduleFrameOp frameOp = frames[i];
     Block &pipBlock = pipOp.getStagesBlock();
