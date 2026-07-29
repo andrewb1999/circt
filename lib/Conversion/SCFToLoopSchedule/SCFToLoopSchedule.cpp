@@ -97,7 +97,8 @@ struct SCFToLoopSchedulePass
 private:
   LogicalResult runOnFunc(FuncOp funcOp);
   LogicalResult populateOperatorTypes(Operation *op, Region &body,
-                                      ChainingSharedOperatorsProblem &problem);
+                                      ChainingSharedOperatorsProblem &problem,
+                                      bool sequentialRegion);
   LogicalResult solveChainingModuloProblem(scf::WhileOp &loop,
                                            ChainingModuloProblem &problem,
                                            float cycleTime);
@@ -792,7 +793,8 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
         getChainingModuloProblem(loop, *dependenceAnalysis);
 
     if (failed(populateOperatorTypes(loop.getOperation(), loop.getAfter(),
-                                     moduloProblem)))
+                                     moduloProblem,
+                                     /*sequentialRegion=*/false)))
       return failure();
 
     if (failed(addMemoryResources(loop.getOperation(), loop.getAfter(),
@@ -842,7 +844,7 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
 
     // Populate the target operator types.
     if (failed(populateOperatorTypes(loop.getOperation(), loop.getAfter(),
-                                     problem)))
+                                     problem, /*sequentialRegion=*/true)))
       return failure();
 
     if (failed(addMemoryResources(loop.getOperation(), loop.getAfter(), problem,
@@ -915,7 +917,7 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
   if (funcIsPipelined) {
     auto problem = getChainingModuloProblem(funcOp, *dependenceAnalysis);
     if (failed(populateOperatorTypes(funcOp.getOperation(), funcOp.getBody(),
-                                     problem)))
+                                     problem, /*sequentialRegion=*/false)))
       return failure();
     if (failed(addMemoryResources(funcOp.getOperation(), funcOp.getRegion(),
                                   problem, resourceMap, resourceLimits)))
@@ -968,7 +970,7 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
 
   // Populate the target operator types.
   if (failed(populateOperatorTypes(funcOp.getOperation(), funcOp.getBody(),
-                                   problem)))
+                                   problem, /*sequentialRegion=*/true)))
     return failure();
 
   if (failed(addMemoryResources(funcOp.getOperation(), funcOp.getRegion(),
@@ -1011,12 +1013,44 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
   return success();
 }
 
+/// True iff `v` reaches, through pure ops in the SAME region level, an operand
+/// of a memory access — an op whose address or write data the FSM drives
+/// combinationally in the very cycle it is scheduled in.
+///
+/// That is the one consumer kind for which a sequential frame's completion-
+/// clocked `_cap` register is a cycle too late (see the caller). Users inside a
+/// nested `loopschedule.sequential` / `loopschedule.pipeline` are deliberately
+/// NOT followed: those reach the value through a launch, whose body runs the
+/// cycle after the start pulse, by which time `_cap` holds it.
+static bool feedsSameCycleAccess(Value v) {
+  SmallVector<Value, 4> work{v};
+  llvm::SmallDenseSet<Operation *, 8> seen;
+  while (!work.empty()) {
+    for (Operation *user : work.pop_back_val().getUsers()) {
+      if (user->getParentOfType<LoopScheduleSequentialOp>() ||
+          user->getParentOfType<LoopSchedulePipelineOp>())
+        continue; // reached through a launch, a cycle later
+      if (isa<LoadInterface, StoreInterface, AffineLoadOp, AffineStoreOp,
+              memref::LoadOp, memref::StoreOp>(user))
+        return true;
+      // Only pure single-result forwarding is followed; anything else is not
+      // an address computation.
+      if (user->getNumResults() != 1 || !isMemoryEffectFree(user))
+        continue;
+      if (seen.insert(user).second)
+        work.push_back(user->getResult(0));
+    }
+  }
+  return false;
+}
+
 /// Populate the schedling problem operator types for the dialect we are
 /// targetting. Right now, we assume Calyx, which has a standard library with
 /// well-defined operator latencies. Ultimately, we should move this to a
 /// dialect interface in the Scheduling dialect.
 LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
-    Operation *op, Region &loopBody, ChainingSharedOperatorsProblem &problem) {
+    Operation *op, Region &loopBody, ChainingSharedOperatorsProblem &problem,
+    bool sequentialRegion) {
   // Scheduling analyis only considers the innermost loop nest for now.
 
   // Set an operator type's delays, clamped to the cycle budget. The
@@ -1253,6 +1287,44 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
             if (isa<loopschedule::LoadInterface>(*op))
               outgoingDelay = timing->outgoingDelay;
           }
+          // A DECLARED-ZERO-LATENCY dynamic load is an FWFT stream pop
+          // (`amc.burst_pop`): the beat is combinationally valid on the pop
+          // cycle, and a PIPELINE forwards that raw port data straight to a
+          // same-stage consumer, so latency 0 is exactly right there.
+          //
+          // In a SEQUENTIAL frame `lowerSeqDynAccess` maps the result to a
+          // `_cap` register instead, because the frame may stall on a SIBLING
+          // access in the same cycle and the beat has to survive it. `_cap` is
+          // written at the END of the pop cycle, which is fine for the
+          // consumers a sequential frame usually has: a launched child's start
+          // pulse fires in the pop cycle and its body runs the next one, so it
+          // reads the register after it has been written. It is NOT fine for a
+          // consumer that COMMITS IN ITS OWN CYCLE, and the one that does is
+          // another memory access in the same frame cycle: its address is
+          // driven combinationally out of `_cap`, so it issues against the
+          // PREVIOUS beat. That is exactly how the in-loop dynamic-base
+          // request took each row's address from the row before it — silently,
+          // every iteration, `out[i] = sum(A[idx[i-1]])`.
+          //
+          // Give the pop a scheduling latency of 1 in that case, which puts
+          // the consumer one cycle later where the register is readable — the
+          // invariant every latency >= 1 dynamic access already has (consumers
+          // land at `offset + latency`, `_cap` is readable at
+          // `offset + latency`). Deliberately NOT applied when no such
+          // consumer exists: bumping unconditionally also moves launches that
+          // were correct at cycle 0, costing a cycle per outer iteration and
+          // rewriting the RTL of kernels this has nothing to do with
+          // (outer_product's `a[i]`).
+          //
+          // The FSM's budget arithmetic (`lastC = offset + (lat ? lat - 1 : 0)`)
+          // is identical at 0 and 1, so the stall and capture hardware do not
+          // change shape; only the consumer's cycle moves.
+          if (sequentialRegion && latency == 0)
+            if (auto hwLoad = dyn_cast<HWLoadLoweringInterface>(op))
+              if (hwLoad.getReadLatency() == 0 && hwLoad.requiresReadEnable() &&
+                  op->getNumResults() == 1 &&
+                  feedsSameCycleAccess(op->getResult(0)))
+                latency = 1;
           Problem::OperatorType portOpr =
               problem.getOrInsertOperatorType(uniqueId);
           problem.setLatency(portOpr, latency);
