@@ -3504,6 +3504,55 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         continue; // init never read
       minStart = std::max(minStart, ready > firstUse ? ready - firstUse : 0);
     }
+
+    // (b2) earliest legal start from the values the pipeline BODY reads.
+    // Inits are not the only thing a pipeline consumes from its frame: the
+    // stages can reference a same-frame `at` result directly — the hoisted
+    // `r: index = idx[i]` gather spelling puts the row index load in the
+    // outer frame and reads it from stage 0 to form the inner address.
+    // Such a value reaches the child through the launch-consumer capture
+    // register, which `resultNeedsCapture` gates on cycle O+1 (O = the
+    // producing at's offset), making it register-readable from cycle O+2.
+    // A body stage at offset S runs in cycle `start + 1 + S` (child_start
+    // pulses in `start`, `pipN_active` is its registered form), so the
+    // start pulse must satisfy `start + 1 + S >= O + 2`. Without this the
+    // peephole hoisted the launch on top of the load feeding it and the
+    // pipeline's FIRST iteration read the PREVIOUS outer iteration's
+    // value — one stale element per inner loop, silently.
+    Operation *launchHolder =
+        frameOp.getBodyBlock().findAncestorOpInBlock(*pipOp.getOperation());
+    pipBlock.walk([&](Operation *user) {
+      if (!analyzable)
+        return;
+      for (Value operand : user->getOperands()) {
+        Operation *def = operand.getDefiningOp();
+        if (!def || !frameOp->isAncestor(def))
+          continue; // defined before the frame — stable, no constraint
+        Operation *defTop =
+            frameOp.getBodyBlock().findAncestorOpInBlock(*def);
+        if (defTop == launchHolder)
+          continue; // inside our own launch: moves with the child
+        auto defAt = dyn_cast_or_null<LoopScheduleAtOp>(defTop);
+        // Only `at` results cross from the frame into the child; a
+        // producer we cannot place in a cycle keeps the scheduled offset.
+        if (!defAt) {
+          analyzable = false;
+          return;
+        }
+        // The stage that reads it (users outside any stage `at` count as
+        // stage 0, matching `firstIterArgUseOffset`).
+        unsigned stage = 0;
+        for (Operation *anc = user; anc && anc != pipOp.getOperation();
+             anc = anc->getParentOp())
+          if (auto stageAt = dyn_cast<LoopScheduleAtOp>(anc)) {
+            stage = (unsigned)stageAt.getOffset();
+            break;
+          }
+        unsigned readable = (unsigned)defAt.getOffset() + 1;
+        minStart = std::max(minStart, readable > stage ? readable - stage : 0);
+      }
+    });
+
     if (!analyzable || minStart >= schedOffset)
       continue;
 
