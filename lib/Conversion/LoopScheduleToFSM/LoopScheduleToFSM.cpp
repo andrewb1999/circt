@@ -5205,10 +5205,12 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   //     combinational empty-FIFO bypass.
   // Attribution is positional: a port serves requests in issue order,
   // so the k-th done belongs to the k-th unconsumed iteration. When
-  // several expects share one port, a round-robin pointer deals each
-  // done pulse to the expects in issue-stage order (one done per expect
-  // per iteration; if-predicated accesses on a shared port would break
-  // this count and are not supported).
+  // several expects share one port we must additionally know WHICH expect
+  // issued the k-th request; see the issue-window analysis below (a
+  // rotation for a window narrower than II, an issue-order tag FIFO
+  // otherwise). One done per expect per iteration either way —
+  // if-predicated accesses on a shared port would break the count and are
+  // not supported.
   //
   // Posted (no_wait) accesses on ports with acceptance backpressure: each
   // entry is (un-stall-gated issue gate, port ready). The Phase 3B stall
@@ -5251,34 +5253,190 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       return expectInfos[a].issueStageOffset <
              expectInfos[b].issueStageOffset;
     });
-    // Round-robin done distribution for ports shared by several expects.
+    // Done distribution for ports shared by several expects.
+    //
+    // THE INVARIANT: responses on a single-ID port come back in REQUEST
+    // ISSUE ORDER, so the k-th done belongs to the k-th request the port
+    // accepted. What needs deciding is which expect issued that request.
+    //
+    // Expect r issues in cycle o_r + II*i (o_r = its issue at-offset, i =
+    // the iteration), and a stall freezes every stage together, so the
+    // order in which the port sees requests is the static sort of
+    // {o_r + II*i}. That sequence is the plain cyclic rotation
+    // o_0, o_1, ..., o_{k-1}, o_0, ... exactly when the expects' whole
+    // ISSUE WINDOW fits inside one II:
+    //
+    //     max(o_r) - min(o_r) < II
+    //
+    // i.e. every iteration's requests are all issued before the next
+    // iteration's first one. That is the vadd/saxpy shape on a shared
+    // bundle — two INDEPENDENT reads, which the modulo scheduler packs
+    // into ADJACENT at-offsets (window 1, II 2) — and there the rotation
+    // is exact, prologue and epilogue included (iteration 0 issues all k
+    // in order; the last iteration likewise), so keep it: it is one
+    // log2(k)-bit register.
+    //
+    // A DEPENDENT pair does not fit. `x[colidx[j]]`'s address IS
+    // `colidx[j]`'s data, so the scheduler cannot issue it until that
+    // read's expect — a whole `--axi-port-latency` window downstream,
+    // plus a cycle of address arithmetic — while II stays at 2 because
+    // the port still only accepts one request per cycle. The window is 17
+    // wide, so the port carries floor(window/II) requests from the
+    // earlier expect before the later expect's first one and a rotation
+    // is off by that many for the rest of the run: every response lands
+    // in the wrong expect's FIFO and the loop reads plausible garbage.
+    //
+    // For a window that wide, CARRY THE TAG instead of assuming it: a
+    // FIFO of expect ranks, pushed on each expect's issue pulse, popped
+    // by each done. Its head names the expect the arriving done belongs
+    // to — in true issue order, through prologue, epilogue and stalls
+    // alike. `gatedStageCE[o_r]` is exactly that issue pulse: a dynamic
+    // access's enable is `gatedStageCE & ready` and Phase 3B stalls on
+    // `stageCE[o_r] & !ready`, so gatedStageCE[o_r] high implies ready
+    // high and the two coincide cycle for cycle. The head is a plain
+    // register with no bypass, which is sound because a done never
+    // arrives in the same cycle as the request it answers (the expect
+    // sits at least one stage past its launch) — and it keeps the tag out
+    // of the `notStall` cone.
     SmallVector<Value> doneFor(eIdxs.size(), done);
     if (eIdxs.size() > 1) {
-      unsigned k = eIdxs.size();
-      auto rrTy = IntegerType::get(ctx, llvm::Log2_64_Ceil(k));
-      Value rrZero = hw::ConstantOp::create(hwBuilder, loc, rrTy, 0);
-      Value rrLast = hw::ConstantOp::create(hwBuilder, loc, rrTy, k - 1);
-      Value rrOne = hw::ConstantOp::create(hwBuilder, loc, rrTy, 1);
-      Backedge rrBE = bb.get(rrTy);
-      Value rr = Value(rrBE);
-      Value atLast = comb::ICmpOp::create(
-          hwBuilder, loc, comb::ICmpPredicate::eq, rr, rrLast);
-      Value rrInc = comb::MuxOp::create(
-          hwBuilder, loc, atLast, rrZero,
-          comb::AddOp::create(hwBuilder, loc, rr, rrOne, false));
-      Value rrHeld = comb::MuxOp::create(hwBuilder, loc, done, rrInc, rr);
-      Value rrNext =
-          comb::MuxOp::create(hwBuilder, loc, startSignal, rrZero, rrHeld);
-      auto rrName = hwBuilder.getStringAttr(
-          (namePrefix + "_done_rr_" + std::to_string(eIdxs.front())).str());
-      Value rrReg = seq::CompRegOp::create(hwBuilder, loc, rrNext, clk, rst,
-                                           rrZero, rrName);
-      rrBE.setValue(rrReg);
-      for (unsigned rank = 0; rank < k; ++rank) {
-        Value isMine = comb::ICmpOp::create(
-            hwBuilder, loc, comb::ICmpPredicate::eq, rrReg,
-            hw::ConstantOp::create(hwBuilder, loc, rrTy, rank));
-        doneFor[rank] = comb::AndOp::create(hwBuilder, loc, done, isMine);
+      unsigned issueWindow = expectInfos[eIdxs.back()].issueStageOffset -
+                             expectInfos[eIdxs.front()].issueStageOffset;
+      if (issueWindow < II) {
+        unsigned k = eIdxs.size();
+        auto rrTy = IntegerType::get(ctx, llvm::Log2_64_Ceil(k));
+        Value rrZero = hw::ConstantOp::create(hwBuilder, loc, rrTy, 0);
+        Value rrLast = hw::ConstantOp::create(hwBuilder, loc, rrTy, k - 1);
+        Value rrOne = hw::ConstantOp::create(hwBuilder, loc, rrTy, 1);
+        Backedge rrBE = bb.get(rrTy);
+        Value rr = Value(rrBE);
+        Value atLast = comb::ICmpOp::create(
+            hwBuilder, loc, comb::ICmpPredicate::eq, rr, rrLast);
+        Value rrInc = comb::MuxOp::create(
+            hwBuilder, loc, atLast, rrZero,
+            comb::AddOp::create(hwBuilder, loc, rr, rrOne, false));
+        Value rrHeld = comb::MuxOp::create(hwBuilder, loc, done, rrInc, rr);
+        Value rrNext =
+            comb::MuxOp::create(hwBuilder, loc, startSignal, rrZero, rrHeld);
+        auto rrName = hwBuilder.getStringAttr(
+            (namePrefix + "_done_rr_" + std::to_string(eIdxs.front())).str());
+        Value rrReg = seq::CompRegOp::create(hwBuilder, loc, rrNext, clk, rst,
+                                             rrZero, rrName);
+        rrBE.setValue(rrReg);
+        for (unsigned rank = 0; rank < k; ++rank) {
+          Value isMine = comb::ICmpOp::create(
+              hwBuilder, loc, comb::ICmpPredicate::eq, rrReg,
+              hw::ConstantOp::create(hwBuilder, loc, rrTy, rank));
+          doneFor[rank] = comb::AndOp::create(hwBuilder, loc, done, isMine);
+        }
+      } else {
+        unsigned k = eIdxs.size();
+        if (llvm::any_of(eIdxs, [&](unsigned e) {
+              return expectInfos[e].issueStageOffset >= stages.size();
+            }))
+          return pipOp.emitError(
+              "dynamic access issues outside the pipeline's stage list");
+        auto tagTy = IntegerType::get(ctx, llvm::Log2_64_Ceil(k));
+        // Depth. Expect r can hold at most floor((dest_r - o_r)/II) + 1
+        // requests issued-but-not-done: its dest stage stalls the WHOLE
+        // pipeline (freezing every issue) until its done has arrived, so
+        // no iteration passes dest_r with its request outstanding, and
+        // the iterations in flight between o_r and dest_r are that many.
+        // Summing over the group bounds the FIFO exactly, so it can
+        // never overflow and the push needs no full-check.
+        unsigned tagDepth = 0;
+        for (unsigned eIdx : eIdxs) {
+          auto &ei = expectInfos[eIdx];
+          unsigned reach = ei.destStageOffset > ei.issueStageOffset
+                               ? ei.destStageOffset - ei.issueStageOffset
+                               : 1;
+          tagDepth += reach / std::max<uint64_t>(1, II) + 1;
+        }
+        auto tcTy = IntegerType::get(
+            ctx, std::max(1u, llvm::Log2_64_Ceil(tagDepth + 1)));
+        Value tagZero = hw::ConstantOp::create(hwBuilder, loc, tagTy, 0);
+        Value tcZero = hw::ConstantOp::create(hwBuilder, loc, tcTy, 0);
+        Value tcOne = hw::ConstantOp::create(hwBuilder, loc, tcTy, 1);
+        Backedge tcBE = bb.get(tcTy);
+        Value tcount = Value(tcBE);
+        Value tagEmpty = comb::ICmpOp::create(
+            hwBuilder, loc, comb::ICmpPredicate::eq, tcount, tcZero);
+        Value tagNotEmpty = comb::createOrFoldNot(hwBuilder, loc, tagEmpty);
+        // At most one rank pushes per cycle: two accesses to one port in
+        // the same mod-II class are rejected outright below ("accessing
+        // the same memory on the same cycle"), and stages fire one cycle
+        // apart otherwise. The reverse walk still makes the choice
+        // deterministic (lowest rank wins) rather than undefined.
+        Value tagPush = falseConst;
+        Value tagIn = tagZero;
+        for (unsigned rank = k; rank-- > 0;) {
+          Value issue =
+              gatedStageCE[expectInfos[eIdxs[rank]].issueStageOffset];
+          tagPush = comb::OrOp::create(hwBuilder, loc, tagPush, issue, false);
+          tagIn = comb::MuxOp::create(
+              hwBuilder, loc, issue,
+              hw::ConstantOp::create(hwBuilder, loc, tagTy, rank), tagIn);
+        }
+        Value tagPop =
+            comb::AndOp::create(hwBuilder, loc, done, tagNotEmpty, false);
+        Value tcInc =
+            comb::MuxOp::create(hwBuilder, loc, tagPush, tcOne, tcZero);
+        Value tcDec =
+            comb::MuxOp::create(hwBuilder, loc, tagPop, tcOne, tcZero);
+        Value tcHeld = comb::SubOp::create(
+            hwBuilder, loc,
+            comb::AddOp::create(hwBuilder, loc, tcount, tcInc, false), tcDec,
+            false);
+        Value tcNext =
+            comb::MuxOp::create(hwBuilder, loc, startSignal, tcZero, tcHeld);
+        Value tcReg = seq::CompRegOp::create(
+            hwBuilder, loc, tcNext, clk, rst, tcZero,
+            hwBuilder.getStringAttr((namePrefix + "_done_tag_count_" +
+                                     std::to_string(eIdxs.front()))
+                                        .str()));
+        tcBE.setValue(tcReg);
+        // Shift-register FIFO, head at entry[0] — the same shape as the
+        // per-expect data FIFO below. A pop consumes the head first, so a
+        // simultaneous push lands at count-1; otherwise at count.
+        SmallVector<Value> tagEntries;
+        SmallVector<Backedge> tagBEs;
+        for (unsigned i = 0; i < tagDepth; ++i) {
+          tagBEs.push_back(bb.get(tagTy));
+          tagEntries.push_back(seq::CompRegOp::create(
+              hwBuilder, loc, Value(tagBEs.back()), clk, rst, tagZero,
+              hwBuilder.getStringAttr(
+                  (namePrefix + "_done_tag_" + std::to_string(eIdxs.front()) +
+                   "_" + std::to_string(i))
+                      .str())));
+        }
+        Value tagWrIdx = comb::MuxOp::create(
+            hwBuilder, loc, tagPop,
+            comb::SubOp::create(hwBuilder, loc, tcReg, tcOne, false), tcReg);
+        for (unsigned i = 0; i < tagDepth; ++i) {
+          Value upper = (i + 1 < tagDepth) ? tagEntries[i + 1] : tagZero;
+          Value shifted =
+              comb::MuxOp::create(hwBuilder, loc, tagPop, upper, tagEntries[i]);
+          Value wsel = comb::ICmpOp::create(
+              hwBuilder, loc, comb::ICmpPredicate::eq, tagWrIdx,
+              hw::ConstantOp::create(hwBuilder, loc, tcTy, i));
+          Value writeI =
+              comb::AndOp::create(hwBuilder, loc, tagPush, wsel, false);
+          tagBEs[i].setValue(
+              comb::MuxOp::create(hwBuilder, loc, writeI, tagIn, shifted));
+        }
+        // An empty FIFO means the done answers a request this group never
+        // issued (a posted access with no expect on the same done
+        // stream). Give it to nobody: the waiting expect then stalls,
+        // which is a hang rather than a silent mis-attribution.
+        for (unsigned rank = 0; rank < k; ++rank) {
+          Value isMine = comb::ICmpOp::create(
+              hwBuilder, loc, comb::ICmpPredicate::eq, tagEntries[0],
+              hw::ConstantOp::create(hwBuilder, loc, tagTy, rank));
+          doneFor[rank] = comb::AndOp::create(
+              hwBuilder, loc, done,
+              comb::AndOp::create(hwBuilder, loc, tagNotEmpty, isMine, false),
+              false);
+        }
       }
     }
     for (auto [rank, eIdx] : llvm::enumerate(eIdxs)) {
