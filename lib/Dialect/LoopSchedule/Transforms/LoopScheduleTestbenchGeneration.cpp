@@ -748,6 +748,67 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
     scalarInputValues.push_back(scalarVal);
   }
 
+  // --- axil_handshake scalar ARGUMENTS live in the control register map ---
+  // Under axil_handshake a scalar argument is not a DUT port at all: it is a
+  // register in the s_axilite map, and the host writes it before ap_start
+  // (amc-insert-axi-lite-control moved it there and recorded the byte offset
+  // it assigned in `amc.axil_scalars`). The value still comes from
+  // `<arg>.hex` at simulation time — the Allo backend writes one hex file per
+  // call against RTL it built once — so load it exactly as above, then split
+  // it into the 32-bit words the BFM writes over AXI4-Lite.
+  //
+  // `axilScalarWordAddrs[i]` / `axilScalarWordVals[i]` are one 32-bit
+  // register word each, in the order the BFM writes them.
+  SmallVector<unsigned> axilScalarWordAddrs;
+  SmallVector<Value> axilScalarWordVals;
+  if (ctrlHs) {
+    auto scalarsAttr = dutMod->getAttrOfType<ArrayAttr>("amc.axil_scalars");
+    for (auto attr : scalarsAttr ? scalarsAttr.getValue()
+                                 : ArrayRef<Attribute>()) {
+      auto dict = dyn_cast<DictionaryAttr>(attr);
+      auto nameAttr = dict ? dict.getAs<StringAttr>("name") : StringAttr();
+      auto widthAttr = dict ? dict.getAs<IntegerAttr>("width") : IntegerAttr();
+      auto offAttr = dict ? dict.getAs<IntegerAttr>("offset") : IntegerAttr();
+      if (!nameAttr || !widthAttr || !offAttr) {
+        dutMod.emitError("malformed amc.axil_scalars entry (need name, width, "
+                         "offset)");
+        return signalPassFailure();
+      }
+      unsigned width = (unsigned)widthAttr.getInt();
+      auto scalarTy = builder.getIntegerType(width);
+      auto arrayType = hw::UnpackedArrayType::get(scalarTy, 1);
+      auto scalarReg = sv::RegOp::create(
+          builder, loc, arrayType,
+          builder.getStringAttr(nameAttr.getValue().str() + "_data"));
+      sv::InitialOp::create(builder, loc, [&] {
+        sv::ReadMemOp::create(builder, loc, scalarReg,
+                              dataDir + "/" + nameAttr.getValue().str() +
+                                  ".hex",
+                              MemBaseTypeAttr::MemBaseHex);
+      });
+      Value idx = hw::ConstantOp::create(builder, loc,
+                                         builder.getIntegerType(1), 0);
+      Value elemRef =
+          sv::ArrayIndexInOutOp::create(builder, loc, scalarReg, idx);
+      Value scalarVal = sv::ReadInOutOp::create(builder, loc, elemRef);
+      // Word 0 is the register's low half, matching the slave's layout.
+      for (unsigned lo = 0; lo < width; lo += 32) {
+        unsigned w = std::min(32u, width - lo);
+        Value word = comb::ExtractOp::create(
+            builder, loc, builder.getIntegerType(w), scalarVal, lo);
+        if (w < 32) {
+          Value pad = hw::ConstantOp::create(
+              builder, loc, builder.getIntegerType(32 - w), 0);
+          word = comb::ConcatOp::create(builder, loc,
+                                        ArrayRef<Value>{pad, word});
+        }
+        axilScalarWordAddrs.push_back((unsigned)offAttr.getInt() +
+                                      (lo / 32) * 4);
+        axilScalarWordVals.push_back(word);
+      }
+    }
+  }
+
   // --- Control registers ---
   // `tb_start` is driven combinationally (a wire, not a reg) so it stays
   // in sync with `_dut_ready` on the same cycle. A registered start would
@@ -1140,11 +1201,14 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
 
   // --- axil_handshake: behavioral AXI-Lite control master ---
   // The BFM (hdl/systemverilog/axi_lite_ctrl_bfm.sv) plays the host: it
-  // zeroes the base-address registers, then per transaction writes ap_start
-  // and polls ap_done, for `numTxns` transactions. Its start/done pulses
-  // stand in for the raw start/done handshake in the transaction accounting
-  // below (transactions are strictly serialized under axil_handshake, so the
-  // few-cycle skew against the kernel's internal start is harmless).
+  // programs the base-address registers and the scalar-argument registers,
+  // then per transaction writes ap_start and polls ap_done, for `numTxns`
+  // transactions. Its start/done pulses stand in for the raw start/done
+  // handshake in the transaction accounting below (transactions are strictly
+  // serialized under axil_handshake, so the few-cycle skew against the
+  // kernel's internal start is harmless). The argument registers are written
+  // ONCE, after reset: they persist across transactions, and the wrapper
+  // re-captures the scalars on every launch.
   Value ctrlStartPulse;
   if (ctrlHs) {
     static const char *kBfmIns[] = {"awready", "wready", "bresp", "bvalid",
@@ -1177,9 +1241,15 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                        hw::ModulePort::Direction dir) {
       extPorts.push_back({{builder.getStringAttr(pname), ty, dir}});
     };
+    // Packed scalar-register words, 32 bits each: {word[N-1], .., word[0]}.
+    // The declared width follows the same never-truncate rule as BASE_VALUES.
+    unsigned numScalarWords = axilScalarWordVals.size();
+    auto scalarDataTy =
+        builder.getIntegerType(32 * std::max(1u, numScalarWords));
     addPort("clk", builder.getI1Type(), hw::ModulePort::Direction::Input);
     addPort("rst", builder.getI1Type(), hw::ModulePort::Direction::Input);
     addPort("num_txns", i32Type, hw::ModulePort::Direction::Input);
+    addPort("scalar_data", scalarDataTy, hw::ModulePort::Direction::Input);
     for (const char *sig : kBfmIns)
       addPort(("s_axi_" + StringRef(sig)).str(), ctrlPortTypes[sig],
               hw::ModulePort::Direction::Input);
@@ -1212,12 +1282,22 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
     for (auto [k, v] : llvm::enumerate(baseValues))
       packed.insertBits(APInt(64, v), 64 * k);
 
+    // Scalar-register WORD addresses, packed 32 bits each — the byte offsets
+    // amc-insert-axi-lite-control recorded, not offsets recomputed here.
+    APInt scalarAddrs(32 * std::max(1u, numScalarWords), 0);
+    for (auto [k, a] : llvm::enumerate(axilScalarWordAddrs))
+      scalarAddrs.insertBits(APInt(32, a), 32 * k);
+
     auto i32ParamType = builder.getIntegerType(32);
     SmallVector<Attribute> paramDecls = {
         hw::ParamDeclAttr::get("ADDR_W", i32ParamType),
         hw::ParamDeclAttr::get("NUM_BASE_ADDRS", i32ParamType),
         hw::ParamDeclAttr::get(
-            "BASE_VALUES", builder.getIntegerType(packed.getBitWidth()))};
+            "BASE_VALUES", builder.getIntegerType(packed.getBitWidth())),
+        hw::ParamDeclAttr::get("NUM_SCALAR_WORDS", i32ParamType),
+        hw::ParamDeclAttr::get(
+            "SCALAR_ADDRS",
+            builder.getIntegerType(scalarAddrs.getBitWidth()))};
     OpBuilder externBuilder = OpBuilder::atBlockEnd(moduleOp.getBody());
     auto bfmExt = hw::HWModuleExternOp::create(
         externBuilder, loc, builder.getStringAttr("axi_lite_ctrl_bfm"),
@@ -1232,8 +1312,28 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
         hw::ParamDeclAttr::get("BASE_VALUES",
                                builder.getIntegerAttr(
                                    builder.getIntegerType(packed.getBitWidth()),
-                                   packed))};
-    SmallVector<Value> operands = {clk, rst, numTxns};
+                                   packed)),
+        hw::ParamDeclAttr::get(
+            "NUM_SCALAR_WORDS",
+            builder.getI32IntegerAttr((int32_t)numScalarWords)),
+        hw::ParamDeclAttr::get(
+            "SCALAR_ADDRS",
+            builder.getIntegerAttr(
+                builder.getIntegerType(scalarAddrs.getBitWidth()),
+                scalarAddrs))};
+    // Packed scalar data, word 0 in the low bits (concat takes MSB first).
+    Value scalarData;
+    if (numScalarWords) {
+      SmallVector<Value> msbFirst(axilScalarWordVals.rbegin(),
+                                  axilScalarWordVals.rend());
+      scalarData = numScalarWords == 1
+                       ? axilScalarWordVals[0]
+                       : comb::ConcatOp::create(builder, loc, msbFirst)
+                             .getResult();
+    } else {
+      scalarData = hw::ConstantOp::create(builder, loc, scalarDataTy, 0);
+    }
+    SmallVector<Value> operands = {clk, rst, numTxns, scalarData};
     for (const char *sig : kBfmIns)
       operands.push_back(ctrlOutVals[(kCtrlSlavePrefix + sig).str()]);
     auto bfmInst = hw::InstanceOp::create(
