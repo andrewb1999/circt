@@ -55,8 +55,17 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
     `init` must be used and registered in the same stage.
 
     The pipeline initiates new iterations while the condition operand of
-    `loopschedule.terminator` is `true : i1`. The condition must be produced
-    by the first `loopschedule.pipeline.stage`.
+    `loopschedule.terminator` is `true : i1`.
+
+    The condition must be DECIDABLE by the first phase: a new iteration is
+    launched every II cycles from cycle 0, so a continuation that is not known
+    by then means iterations run — and commit — after the loop has stopped.
+    Which `loopschedule.at` nominally holds it does not matter (a lowering may
+    re-derive a condition that is a pure function of the iter-args on their
+    feedback wires); what matters is that the SCHEDULE places it at cycle 0.
+    That is not a structural property, so it is not verified here — it is
+    checked by the pass that solves the schedule (SCFToLoopSchedule), which is
+    the only place the start times exist.
 
     The single-block `stages` region wraps `loopschedule.pipeline.stage`
     operations. It has a `loopschedule.terminator` terminator, which can
@@ -144,8 +153,10 @@ def LoopScheduleSequentialOp : LoopScheduleOp<"sequential", [LoopOpInterface]> {
     to the initial values specified in the `inits` section here.
 
     The loop initiates new iterations while the condition operand of
-    `loopschedule.terminator` is `true : i1`. The condition must be produced
-    by the first `loopschedule.step`.
+    `loopschedule.terminator` is `true : i1`. Unlike a pipeline, a sequential
+    loop does NOT require the condition to come from the first phase: its FSM
+    evaluates it in a decision state entered after the whole body has run (and
+    before the first iteration), so any phase may produce it.
 
     The single-block `schedule` region wraps `loopschedule.step`
     operations. It has a `loopschedule.terminator` terminator, which can
