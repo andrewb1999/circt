@@ -1237,10 +1237,17 @@ struct SeqDynCtx {
 ///     bypasses the stall (zero overhead for fixed-latency-like behavior).
 ///   - data: rd_data is captured on the completion pulse; consumers (which
 ///     execute at states after the last budget state) read the register.
+///
+/// `predicate` is non-null when the access sits inside a `loopschedule.if`,
+/// i.e. when it may decide not to issue at all on a given iteration. Nothing
+/// downstream of a request that was never made will ever pulse, so every
+/// wait below has to be conditioned on the request having actually been made
+/// — see `issued`.
 static LogicalResult
 lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
                   DenseMap<Value, MemPortMapping> &memPorts, Value gate,
-                  unsigned atOffset, SeqDynCtx *seqDyn) {
+                  unsigned atOffset, SeqDynCtx *seqDyn,
+                  Value predicate = Value()) {
   if (!seqDyn)
     return op->emitError(
         "dynamic memory accesses outside loops are not yet supported by the "
@@ -1325,6 +1332,19 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
       latchHold, false);
   accNextBE.setValue(accNext);
 
+  // "A request from this access is outstanding, or is being made this very
+  // cycle." For an UNPREDICATED access this is a tautology by the time
+  // anything below consults it (the issue gate has already fired, or the
+  // ready-stall is holding the state at it), so it is only materialised for a
+  // predicated one — unpredicated designs keep bit-identical RTL. For a
+  // predicated one it is the whole correctness argument: an access whose
+  // condition was false never handshakes, so `acc` stays low, and every wait
+  // below must fold away rather than wait forever for a completion nobody
+  // asked for.
+  Value issued;
+  if (predicate)
+    issued = comb::OrOp::create(hb, loc, accReg, issueHandshake, false);
+
   // Ready stall: want to issue but the port can't take it.
   if (ready) {
     Value notReady = comb::createOrFoldNot(hb, loc, ready);
@@ -1361,7 +1381,15 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
     if (loadOp && seqDyn->prevReadSeen) {
       if (Value prev = seqDyn->prevReadSeen->lookup(memVal))
         doneMine = comb::AndOp::create(hb, loc, doneMine, prev, false);
-      (*seqDyn->prevReadSeen)[memVal] = seenReg;
+      // The chain tail is "this read is no longer pending". For a predicated
+      // read that never issued that is true from the start — recording a bare
+      // `seen` (which can never set) would wedge every later read on the port.
+      Value tail = seenReg;
+      if (issued)
+        tail = comb::OrOp::create(hb, loc, tail,
+                                  comb::createOrFoldNot(hb, loc, issued),
+                                  false);
+      (*seqDyn->prevReadSeen)[memVal] = tail;
     }
     Value seenNext = comb::AndOp::create(
         hb, loc, comb::OrOp::create(hb, loc, seenReg, doneMine, false),
@@ -1371,9 +1399,15 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
     // nothing.
     seenFed = comb::OrOp::create(hb, loc, seenReg, doneMine, false);
 
-    // Completion stall: hold the last budget state until the pulse landed.
+    // Completion stall: hold the last budget state until the pulse landed —
+    // but only if this access issued. A predicated store whose condition was
+    // false has no write in flight and no `wr_done` coming, and stalling on
+    // it hangs the loop forever (find_first's `out[0] = i` on any iteration
+    // that does not match).
     Value notSeen = comb::createOrFoldNot(hb, loc, seenFed);
     Value doneStall = comb::AndOp::create(hb, loc, lastGate, notSeen, false);
+    if (issued)
+      doneStall = comb::AndOp::create(hb, loc, doneStall, issued, false);
     seqDyn->stallTerms->push_back(doneStall);
   }
 
@@ -1753,8 +1787,14 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
   // `loopschedule.if` by AND'ing the condition into the store/load
   // gates for body ops. See the pipeline-stage counterpart in
   // lowerPipelineChild for the same pattern.
-  std::function<LogicalResult(Operation *, Value)> processOp =
-      [&](Operation *inner, Value gate) -> LogicalResult {
+  //
+  // `pred` is the conjunction of the enclosing `loopschedule.if` conditions
+  // (null at the top level). It is carried ALONGSIDE the gate rather than
+  // recovered from it: a dynamic access needs to know not just when to issue
+  // but whether it is issuing at all this iteration, because everything that
+  // waits on its completion must fold away when it is not.
+  std::function<LogicalResult(Operation *, Value, Value)> processOp =
+      [&](Operation *inner, Value gate, Value pred) -> LogicalResult {
     if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp>(inner))
       return success();
     if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp,
@@ -1764,6 +1804,10 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
       Value cond = mapping.lookup(ifOp.getCond());
       Value innerGate = comb::AndOp::create(builder, inner->getLoc(),
                                               gate, cond);
+      Value innerPred =
+          pred ? (Value)comb::AndOp::create(builder, inner->getLoc(), pred,
+                                            cond)
+               : cond;
       for (auto &nested : ifOp.getBody().front()) {
         if (auto yieldOp = dyn_cast<LoopScheduleYieldOp>(&nested)) {
           for (auto [res, val] :
@@ -1771,14 +1815,14 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
             mapping.map(res, mapping.lookup(val));
           continue;
         }
-        if (failed(processOp(&nested, innerGate)))
+        if (failed(processOp(&nested, innerGate, innerPred)))
           return failure();
       }
       return success();
     }
     if (isSeqDynAccess(inner))
       return lowerSeqDynAccess(inner, builder, mapping, memPorts, gate,
-                               baseCycle, seqDyn);
+                               baseCycle, seqDyn, pred);
     if (auto storeOp = dyn_cast<HWStoreLoweringInterface>(inner))
       return handleHWStore(storeOp, builder, mapping, gate, memPorts, seqMux);
     if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner))
@@ -1787,7 +1831,7 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
                          /*shareGate=*/gate);
   };
   for (auto &op : *body) {
-    if (failed(processOp(&op, pickGate(baseCycle))))
+    if (failed(processOp(&op, pickGate(baseCycle), /*pred=*/Value())))
       return failure();
   }
   return success();

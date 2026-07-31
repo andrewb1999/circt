@@ -653,6 +653,58 @@ static Value inlineBeforeBodyOps(scf::WhileOp loop) {
   return mapping.lookup(scfCond.getCondition());
 }
 
+/// Check that a sequential loop's continuation is something the loop FSM can
+/// actually evaluate when it has to.
+///
+/// `loopschedule.sequential` decides whether to run another iteration in a
+/// COND state that is entered BEFORE the first one, and the hardware reads
+/// that decision off the loop's carried registers (or, with the COND bypass,
+/// off their D wires). So the condition must be a function of the iteration
+/// arguments and of values that dominate the loop. A condition that READS
+/// MEMORY inside the body has no value at all on loop entry — the FSM would
+/// sample whatever the memory's output register happened to hold.
+///
+/// This is exactly the shape a source `while (A[i] != 0)` has, and the shape
+/// `--promote-scf-scalars` removes for a search state kept in a scratch
+/// memref by making it a carried value. Diagnose what it could not reach,
+/// with the source loop's location, instead of lowering it into an FSM that
+/// would be quietly wrong.
+static LogicalResult checkSequentialCondition(scf::WhileOp loop, Value cond) {
+  SmallVector<Value> stack{cond};
+  DenseSet<Value> visited;
+  while (!stack.empty()) {
+    Value v = stack.pop_back_val();
+    if (!visited.insert(v).second)
+      continue;
+    // A block argument is either an iteration argument (a register the FSM
+    // reads directly) or belongs to an enclosing region — both fine.
+    if (isa<BlockArgument>(v))
+      continue;
+    Operation *def = v.getDefiningOp();
+    // Defined outside the loop body: computed once, before the loop runs.
+    if (!def || !loop.getAfter().isAncestor(def->getParentRegion()))
+      continue;
+    if (!isMemoryEffectFree(def) || def->getNumRegions() != 0) {
+      InFlightDiagnostic diag = loop.emitOpError(
+          "`while` condition is computed from something the loop FSM cannot "
+          "read before an iteration runs");
+      diag.attachNote(def->getLoc())
+          << "'" << def->getName()
+          << "' contributes to the condition but executes inside the loop "
+             "body";
+      diag.attachNote()
+          << "a sequential loop evaluates its continuation from the values it "
+             "CARRIES, once before every iteration including the first; make "
+             "the searched-for state a loop-carried value rather than reading "
+             "it out of memory inside the loop";
+      return failure();
+    }
+    for (Value operand : def->getOperands())
+      stack.push_back(operand);
+  }
+  return success();
+}
+
 } // namespace
 
 void SCFToLoopSchedulePass::runOnOperation() {
@@ -829,6 +881,13 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
     // Inline the before-body condition ops into the after body so they
     // participate in the scheduling problem like any other operation.
     loopCondValues[loop] = inlineBeforeBodyOps(loop);
+
+    // The continuation has to be readable before an iteration runs. Checked
+    // here, on the still-recognisable loop, so an unsupported `while` gets a
+    // diagnostic pointing at the offending op instead of a schedule the FSM
+    // lowering cannot honour.
+    if (failed(checkSequentialCondition(loop, loopCondValues[loop])))
+      return failure();
 
     ResourceMap resourceMap;
     ResourceLimits resourceLimits;
@@ -1670,6 +1729,46 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
                                                   Value condValue) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
 
+  // The continuation must be decided before the NEXT iteration is launched,
+  // and a pipeline launches one every II cycles starting at cycle 0 — so the
+  // condition has to be ready in the first stage. That is what
+  // `loopschedule.terminator` documents ("the condition must be produced by
+  // the first phase"), and the op's verifier only checks that it is produced
+  // by SOME phase.
+  //
+  // For every loop either suite pipelines the condition is a compare on the
+  // iteration arguments and lands at cycle 0, so this refuses nothing that
+  // works today (measured over all 84 kernel x interface configurations of
+  // both suites). What it refuses is a `while` whose exit is DATA-dependent:
+  // `find_first`'s `found` flag is set from a memory read, so its condition
+  // schedules a stage late, and at II=1 the pipeline would launch the next
+  // iteration before knowing whether the loop had already stopped. Those
+  // speculative iterations are not free to run — the one thing in the body is
+  // a PREDICATED store of the match index, so a second match one element
+  // later would overwrite the first and the search would return the wrong
+  // answer, plausibly. Making that legal needs squash-on-exit for in-flight
+  // iterations plus a way to abandon their outstanding memory traffic; until
+  // then the loop belongs on the sequential path, where the FSM evaluates the
+  // condition once per iteration and nothing runs ahead.
+  if (Operation *condOp = condValue.getDefiningOp())
+    if (problem.hasOperation(condOp)) {
+      auto start = problem.getStartTime(condOp);
+      if (start && *start != 0) {
+        InFlightDiagnostic diag = loop.emitOpError(
+            "cannot pipeline a loop whose continuation is not decided in the "
+            "first stage");
+        diag.attachNote(condOp->getLoc())
+            << "the condition is scheduled at cycle " << *start
+            << ", so iterations would launch before the loop knows it has "
+               "stopped";
+        diag.attachNote()
+            << "a data-dependent exit needs the in-flight iterations squashed "
+               "(and their memory traffic abandoned) on the exit; run this "
+               "loop sequentially instead";
+        return failure();
+      }
+    }
+
   builder.setInsertionPointToStart(
       &loop->getParentOfType<FuncOp>().getBody().front());
 
@@ -2126,7 +2225,12 @@ SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
     ia.afterArgs.push_back(arg);
   for (auto arg : sequential.getScheduleBlock().getArguments())
     ia.scheduleBlockArgs.push_back(arg);
+  // A `for`-derived while carries its induction variable as iter-arg 0; a
+  // SOURCE `scf.while` may carry nothing at all (its state lives in memory
+  // or in the condition's own operands). Guard the probe rather than
+  // indexing an empty argument list.
   ia.inductionVarHasUsers =
+      loop.getAfter().getNumArguments() > 0 &&
       !loop.getAfter().getArgument(0).getUsers().empty();
   S.iterArgs = std::move(ia);
 
