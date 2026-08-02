@@ -32,6 +32,17 @@
 //     iterations where the original epilogue ran. Downstream scheduling
 //     (ifOpConversion) turns the scf.if into predicated operations.
 //
+// LOADS used in the inner body are NOT absorbed here — a load pre-op still
+// rejects the nest. AmcLoopReperfection (which runs immediately before this
+// pass in the AMC pipeline) owns their placement: it SINKS on-chip invariant
+// load pre-ops back into the loop body (restoring perfection, re-reads are
+// free) and HOISTS AXI word-mode invariant loads out (a redundant read is a
+// bus round trip; that nest then correctly stays unflattened). A load
+// pre-op reaching this pass therefore means reperfection had a reason to
+// refuse (a store dependence, multiple consumer loops, an on-chip arbiter
+// port), and the conservative rejection below is the right response — do
+// not "fix" it by absorbing loads here.
+//
 //===----------------------------------------------------------------------===//
 
 #include "circt/Analysis/SCFWhileTripCountAnalysis.h"
