@@ -5140,10 +5140,10 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
        llvm::zip(pipOp.getStagesBlock().getArguments(), iterArgBackedges))
     mapping.map(arg, Value(be));
 
-  // The loop condition is produced by some stage (guaranteed by the verifier
-  // to be within the first II cycles). Stand it up as a backedge here so the
-  // active/CE chain can be built first; resolve it after lowering the
-  // producing stage below.
+  // The loop condition is produced by some stage — SCFToLoopSchedule's
+  // late-condition guard guarantees its cycle is within the first initiation
+  // interval. Stand it up as a backedge here so the active/CE chain can be
+  // built first; resolve it after lowering the producing stage below.
   Backedge condValueBE = bb.get(hwBuilder.getI1Type());
   Value condValue = Value(condValueBE);
 
@@ -5155,6 +5155,31 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       condStageIdx = idx;
       break;
     }
+  }
+
+  // A condition produced by a later stage (condStageIdx > 0) is decided one
+  // or more cycles AFTER the iteration it belongs to entered the pipeline,
+  // so it cannot gate that iteration's own launch — and while no live
+  // iteration occupies the condition stage the condition cone is reading
+  // idle stage registers, i.e. garbage. Launches are therefore gated on
+  // "no live iteration has a decided-false condition":
+  //
+  //     condEffective = !stageCE[condStageIdx] | condValue
+  //
+  // While the condition stage is unoccupied (pipeline fill, and the very
+  // first iteration) the pipeline keeps launching; those launches are
+  // speculative, and the one launched past the loop's first decided-false
+  // (the "ghost") has its effects squashed by the kill chain built after
+  // the stage-CE chain below. The scheduler guarantees at most one ghost by
+  // requiring the condition's start cycle <= II, and guarantees the squash
+  // is sufficient by requiring every observable effect to be scheduled at
+  // or after the condition's cycle (SCFToLoopSchedule's late-condition
+  // guard). A backedge because stageCE[condStageIdx] does not exist yet.
+  std::optional<Backedge> condEffectiveBE;
+  Value condEffective = condValue;
+  if (condStageIdx > 0) {
+    condEffectiveBE = bb.get(hwBuilder.getI1Type());
+    condEffective = Value(*condEffectiveBE);
   }
 
   // Phase 3B: stall is a backedge resolved at the end once `memPorts`
@@ -5173,7 +5198,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       hwBuilder.getStringAttr(namePrefix + "_active"));
   Value active = activeReg;
 
-  Value holdActive = comb::AndOp::create(hwBuilder, loc, active, condValue);
+  Value holdActive =
+      comb::AndOp::create(hwBuilder, loc, active, condEffective);
   Value activeNext =
       comb::OrOp::create(hwBuilder, loc, startSignal, holdActive);
   activeNextBE.setValue(activeNext);
@@ -5210,7 +5236,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     ceGen = comb::AndOp::create(hwBuilder, loc, isZero, active);
   }
 
-  Value activeCE = comb::AndOp::create(hwBuilder, loc, ceGen, condValue);
+  Value activeCE = comb::AndOp::create(hwBuilder, loc, ceGen, condEffective);
 
   // Raw stage-CE shift chain (unstalled): each register holds during stall
   // (CE=notStall) so positional iteration info isn't lost.
@@ -5231,6 +5257,46 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   for (unsigned i = 0; i < stages.size(); ++i)
     gatedStageCE[i] =
         comb::AndOp::create(hwBuilder, loc, stageCE[i], notStall);
+
+  // Late-condition kill chain. killAt is the condition of the iteration
+  // CURRENTLY at each stage >= condStageIdx: condValue itself at the
+  // condition stage (the unregistered cone — decided in that same cycle),
+  // then registered forward in lockstep with the stage-CE shift chain.
+  // `effectGate[s]` replaces gatedStageCE[s] as the enable for everything
+  // observable a stage does (memory rd_en/wr_en, compute-op share gates):
+  // for a valid iteration its kill bit carries its own true condition and
+  // changes nothing; for the ghost launched past the loop's first
+  // decided-false it is that false condition, so the ghost's effects are
+  // squashed at the condition stage combinationally and at every later
+  // stage through the registered copy travelling beside it. Stages before
+  // the condition stage cannot be gated (the condition is not decided
+  // yet) — the scheduler refuses pipelines with observable effects there.
+  // condEffective resolves here: launches are gated by a decided-false
+  // only, never by the idle cone (pipeline fill reads garbage stage regs).
+  SmallVector<Value> effectGate(gatedStageCE.begin(), gatedStageCE.end());
+  if (condStageIdx > 0) {
+    Value condStageOccupied = stageCE[condStageIdx];
+    Value notOccupied =
+        comb::createOrFoldNot(hwBuilder, loc, condStageOccupied);
+    condEffectiveBE->setValue(
+        comb::OrOp::create(hwBuilder, loc, notOccupied, condValue));
+    // Refresh the local handle: setValue RAUWs existing uses, but Values
+    // taken from the backedge BEFORE resolution still point at the orphaned
+    // placeholder (see the condValue refresh in the stage loop below).
+    condEffective = Value(*condEffectiveBE);
+    Value killAt = condValue;
+    effectGate[condStageIdx] =
+        comb::AndOp::create(hwBuilder, loc, gatedStageCE[condStageIdx],
+                            killAt);
+    for (unsigned s = condStageIdx + 1; s < stages.size(); ++s) {
+      killAt = seq::CompRegClockEnabledOp::create(
+          hwBuilder, loc, killAt, clk, notStall, rst, falseConst,
+          hwBuilder.getStringAttr(
+              (namePrefix + "_kill_s" + std::to_string(s)).str()));
+      effectGate[s] =
+          comb::AndOp::create(hwBuilder, loc, gatedStageCE[s], killAt);
+    }
+  }
 
   // Per-expect completion tracking. The memory emits an honest 1-cycle
   // pulse on `done` per request, with read data valid ON the pulse (the
@@ -5735,7 +5801,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // Use the stall-gated stage CE as the write-/read-enable gate so
       // memory requests don't re-fire when the pipeline idles on !done.
       // The raw stageCE rides along for loop-free stall terms.
-      opResult = processOp(&op, gatedStageCE[stageIdx], stageCE[stageIdx]);
+      opResult = processOp(&op, effectGate[stageIdx], stageCE[stageIdx]);
 
       for (auto &sm : savedMappings)
         mapping.map(sm.first, sm.second);
@@ -6021,7 +6087,10 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // pipeline depth. Done fires when the delayed epilogue reaches the end —
   // exactly when the last valid bit has drained from the tail stage.
   // Combinational depth: O(1) (single AND of two register outputs).
-  Value notCondValue = comb::createOrFoldNot(hwBuilder, loc, condValue);
+  // condEffective was refreshed post-resolution only on the late-condition
+  // path; the stage loop's refresh covers condValue for the classic path.
+  Value notCondValue = comb::createOrFoldNot(
+      hwBuilder, loc, condStageIdx > 0 ? condEffective : condValue);
   Value epilogueTrigger =
       comb::AndOp::create(hwBuilder, loc, active, notCondValue);
 

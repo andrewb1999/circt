@@ -57,15 +57,27 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
     The pipeline initiates new iterations while the condition operand of
     `loopschedule.terminator` is `true : i1`.
 
-    The condition must be DECIDABLE by the first phase: a new iteration is
-    launched every II cycles from cycle 0, so a continuation that is not known
-    by then means iterations run — and commit — after the loop has stopped.
-    Which `loopschedule.at` nominally holds it does not matter (a lowering may
-    re-derive a condition that is a pure function of the iter-args on their
-    feedback wires); what matters is that the SCHEDULE places it at cycle 0.
-    That is not a structural property, so it is not verified here — it is
-    checked by the pass that solves the schedule (SCFToLoopSchedule), which is
-    the only place the start times exist.
+    The condition must be DECIDED within the first initiation interval: a
+    new iteration is launched every II cycles from cycle 0, and the
+    condition is the launch decision. A condition scheduled at cycle 0
+    gates its own iteration's entry, so nothing speculative ever runs. A
+    condition scheduled at cycle c, 0 < c <= II, resolves in the same cycle
+    the next launch happens; the lowering gates that launch on it
+    combinationally, so exactly one iteration — the "ghost" launched past
+    the loop's first decided-false — is ever in flight speculatively, and
+    the lowering squashes its observable effects with a per-stage kill
+    chain carrying each in-flight iteration's own condition. That squash is
+    only sufficient when every observable effect is scheduled at or after
+    the condition's cycle, when the loop's results are unused (the ghost
+    updates carried values before its condition resolves), and when no
+    body access has dynamic latency (a speculative bus request cannot be
+    abandoned). Beyond c = II a second speculative iteration would launch
+    whose condition is computed from ghost-corrupted iter_args, so it
+    cannot be trusted to squash anything.
+
+    None of this is a structural property, so it is not verified here — it
+    is checked by the pass that solves the schedule (SCFToLoopSchedule),
+    which is the only place the start times exist.
 
     The single-block `stages` region wraps `loopschedule.pipeline.stage`
     operations. It has a `loopschedule.terminator` terminator, which can
@@ -264,8 +276,11 @@ def LoopScheduleTerminatorOp : LoopScheduleOp<"terminator",
     a `loopschedule.pipeline` or `loopschedule.sequential` op.
 
     The `condition` operand is an `i1` value that controls whether the loop
-    initiates a new iteration. It must be produced by the first phase
-    (`loopschedule.pipeline.stage` or `loopschedule.step`) of the body.
+    initiates a new iteration. It must be produced by a phase
+    (`loopschedule.pipeline.stage` or `loopschedule.step`) of the body; for
+    a pipeline, the schedule must decide it within the first initiation
+    interval (see `loopschedule.pipeline`'s late-condition contract —
+    enforced by SCFToLoopSchedule, where the start times exist).
 
     The `results` section accepts a variadic list of values which become the
     loop's return values. These must be results of a phase, and their types

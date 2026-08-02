@@ -1729,43 +1729,122 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
                                                   Value condValue) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
 
-  // The continuation must be decided before the NEXT iteration is launched,
-  // and a pipeline launches one every II cycles starting at cycle 0 — so the
-  // condition has to be ready in the first stage. That is what
-  // `loopschedule.terminator` documents ("the condition must be produced by
-  // the first phase"), and the op's verifier only checks that it is produced
-  // by SOME phase.
+  // A pipeline launches a new iteration every II cycles from cycle 0, and
+  // the continuation is the launch decision. A condition scheduled at cycle
+  // 0 gates its own iteration's entry, so nothing speculative ever runs. A
+  // condition scheduled at cycle c, 0 < c <= II, is decided in the same
+  // cycle the NEXT launch happens: the lowering gates that launch on it
+  // combinationally, so exactly ONE iteration — the "ghost" launched past
+  // the loop's first decided-false — is ever in flight speculatively, and
+  // the lowering's kill chain squashes its observable effects with its own
+  // (false) condition (see the late-condition handling in
+  // LoopScheduleToFSM's lowerPipelineChild). find_first's data-dependent
+  // exit — `found` set from a latency-1 memory read, condition at cycle 1,
+  // II 1 — is the canonical legal case.
   //
-  // For every loop either suite pipelines the condition is a compare on the
-  // iteration arguments and lands at cycle 0, so this refuses nothing that
-  // works today (measured over all 84 kernel x interface configurations of
-  // both suites). What it refuses is a `while` whose exit is DATA-dependent:
-  // `find_first`'s `found` flag is set from a memory read, so its condition
-  // schedules a stage late, and at II=1 the pipeline would launch the next
-  // iteration before knowing whether the loop had already stopped. Those
-  // speculative iterations are not free to run — the one thing in the body is
-  // a PREDICATED store of the match index, so a second match one element
-  // later would overwrite the first and the search would return the wrong
-  // answer, plausibly. Making that legal needs squash-on-exit for in-flight
-  // iterations plus a way to abandon their outstanding memory traffic; until
-  // then the loop belongs on the sequential path, where the FSM evaluates the
-  // condition once per iteration and nothing runs ahead.
+  // That leaves three things the kill chain cannot save, refused here with
+  // the schedule in hand (start times exist nowhere else):
+  //
+  //  * c > II — a second speculative iteration launches before the first
+  //    decided-false, and ITS condition is computed from iter_args the
+  //    ghost already corrupted, so it cannot be trusted to squash anything.
+  //  * an observable effect scheduled at a cycle < c — it commits before
+  //    the condition that should have squashed it exists. (Reads from
+  //    static ports are harmless and stay legal; this is about stores.)
+  //  * dynamic-latency accesses anywhere in the body — the ghost's request
+  //    is already on the bus when the exit resolves, and an unconsumed
+  //    response beat wedges the bundle. Abandonment/quiescence is engine
+  //    work that does not exist yet (RESULTS.md gap 4).
+  //
+  // The ghost also updates the carried values before its condition
+  // resolves, so the loop's RESULTS are corrupted when the condition is
+  // late; refuse when they are used. (`--promote-scf-scalars` loops carry
+  // scratch state whose final values nothing reads, so this costs no
+  // real kernel today.)
   if (Operation *condOp = condValue.getDefiningOp())
     if (problem.hasOperation(condOp)) {
       auto start = problem.getStartTime(condOp);
-      if (start && *start != 0) {
+      unsigned condStart = start ? *start : 0;
+      unsigned ii = problem.getInitiationInterval().value_or(1);
+      // Root cause first: with a dynamic-latency access in the body the
+      // continuation is late by the BUS's latency, so the cycle-count
+      // refusal below would fire too — with advice ("restructure the exit")
+      // that no restructuring can follow. Name the access instead.
+      if (condStart > 0) {
+        WalkResult dynCheck = loop.getAfter().walk([&](Operation *op) {
+          if (!isDynamicLatencyOp(*op))
+            return WalkResult::advance();
+          InFlightDiagnostic diag = loop.emitOpError(
+              "cannot pipeline a loop with dynamic-latency memory "
+              "accesses and a late-deciding continuation");
+          diag.attachNote(op->getLoc())
+              << "a speculative iteration's request would already be "
+                 "on the bus when the exit resolves; abandoning it "
+                 "needs engine support that does not exist";
+          return WalkResult::interrupt();
+        });
+        if (dynCheck.wasInterrupted())
+          return failure();
+      }
+      if (condStart > ii) {
         InFlightDiagnostic diag = loop.emitOpError(
-            "cannot pipeline a loop whose continuation is not decided in the "
-            "first stage");
+            "cannot pipeline a loop whose continuation is not decided in "
+            "time to gate the next launch");
         diag.attachNote(condOp->getLoc())
-            << "the condition is scheduled at cycle " << *start
-            << ", so iterations would launch before the loop knows it has "
-               "stopped";
+            << "the condition is scheduled at cycle " << condStart
+            << " but a new iteration launches every " << ii
+            << " cycle(s), so more than one speculative iteration would be "
+               "in flight past the exit — and only the first one's "
+               "condition is trustworthy";
         diag.attachNote()
-            << "a data-dependent exit needs the in-flight iterations squashed "
-               "(and their memory traffic abandoned) on the exit; run this "
-               "loop sequentially instead";
+            << "run this loop sequentially instead, or restructure it so "
+               "the exit condition is decided within one initiation "
+               "interval";
         return failure();
+      }
+      if (condStart > 0) {
+        // Observable effects must not commit before the condition that
+        // squashes the ghost exists.
+        auto isObservableEffect = [](Operation &op) {
+          if (isa<StoreInterface>(&op))
+            return true;
+          if (isa<HWStoreLoweringInterface>(&op))
+            return true;
+          if (auto memOp = dyn_cast<MemoryEffectOpInterface>(&op))
+            return memOp.hasEffect<MemoryEffects::Write>();
+          return false;
+        };
+        WalkResult effectCheck =
+            loop.getAfter().walk([&](Operation *op) {
+              if (!isObservableEffect(*op) || !problem.hasOperation(op))
+                return WalkResult::advance();
+              auto effectStart = problem.getStartTime(op);
+              if (effectStart && *effectStart < condStart) {
+                InFlightDiagnostic diag = loop.emitOpError(
+                    "cannot pipeline a loop with an observable effect "
+                    "scheduled before its continuation is decided");
+                diag.attachNote(op->getLoc())
+                    << "this effect commits at cycle " << *effectStart
+                    << ", before the cycle-" << condStart
+                    << " condition could squash the speculative iteration "
+                       "that issues it";
+                return WalkResult::interrupt();
+              }
+              return WalkResult::advance();
+            });
+        if (effectCheck.wasInterrupted())
+          return failure();
+        if (!llvm::all_of(loop.getResults(),
+                          [](Value r) { return r.use_empty(); })) {
+          InFlightDiagnostic diag = loop.emitOpError(
+              "cannot pipeline a loop whose results are used when its "
+              "continuation is decided late");
+          diag.attachNote()
+              << "the speculative iteration past the exit updates the "
+                 "carried values before its condition resolves, so the "
+                 "loop's results would hold corrupted values";
+          return failure();
+        }
       }
     }
 
