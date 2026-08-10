@@ -825,6 +825,22 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                                        builder.getStringAttr("tb_done_seen"));
   Value doneSeenVal = sv::ReadInOutOp::create(builder, loc, doneSeenReg);
 
+  // The memory dump is DEFERRED one posedge past the final done. With the
+  // early-done cut-through, `done` can land on the very edge the kernel's
+  // final store commits; that store is a non-blocking assign in this same
+  // always_ff block, so a dump on the done edge reads the pre-store value
+  // of the last address. One settle cycle restores the read-after-write
+  // order (the AXI slave dump already works this way — it fires on the
+  // NEXT posedge via tb_axi_dump). The cycle counter is latched AT done so
+  // @CYCLES still reports the done edge, not the dump edge.
+  auto dumpPendingReg = sv::RegOp::create(
+      builder, loc, builder.getI1Type(),
+      builder.getStringAttr("tb_dump_pending"));
+  Value dumpPendingVal = sv::ReadInOutOp::create(builder, loc, dumpPendingReg);
+  auto doneCyclesReg = sv::RegOp::create(
+      builder, loc, i8Type, builder.getStringAttr("tb_done_cycles"));
+  Value doneCyclesVal = sv::ReadInOutOp::create(builder, loc, doneCyclesReg);
+
   // Multi-transaction handshake. The number of transactions to drive is
   // loaded at simulation init from `num_transactions.hex` (one i32 entry).
   // Falls back to 1 when the file is absent (verilator emits a warning but
@@ -1434,10 +1450,12 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                 }
               }
 
-              // Done handling: count pulses; only dump+finish on the
+              // Done handling: count pulses; arm the DEFERRED dump on the
               // *final* done. Each done pulse increments tb_done_count;
-              // the dump fires when tb_done_count reaches num_txns. This
-              // preserves N=1 behavior (immediate dump on first done).
+              // the dump itself runs one posedge later (tb_dump_pending)
+              // so the final store's non-blocking assign — which may land
+              // on the done edge under the early-done cut-through — is
+              // visible to the dump reads.
               sv::IfOp::create(builder, loc, doneVal, [&] {
                 Value nextDone = comb::AddOp::create(
                     builder, loc, doneCntVal,
@@ -1451,7 +1469,19 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                     comb::AndOp::create(builder, loc, isLastDone, notDoneSeen);
                 sv::IfOp::create(builder, loc, shouldDump, [&] {
                   sv::PAssignOp::create(builder, loc, doneSeenReg, trueVal);
+                  sv::PAssignOp::create(builder, loc, dumpPendingReg, trueVal);
+                  // @CYCLES reports the DONE edge, not the dump edge.
+                  sv::PAssignOp::create(builder, loc, doneCyclesReg, ctrVal);
+                });
+              });
 
+              // Deferred dump: one posedge after the final done.
+              sv::IfOp::create(builder, loc, dumpPendingVal, [&] {
+                Value falseC =
+                    hw::ConstantOp::create(builder, loc, builder.getI1Type(),
+                                           0);
+                sv::PAssignOp::create(builder, loc, dumpPendingReg, falseC);
+                {
                   // Dump scalar outputs to stdout.
                   for (auto [idx, outVal] :
                        llvm::enumerate(scalarOutputValues)) {
@@ -1523,9 +1553,11 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                         });
                   }
 
-                  // Print cycle count so downstream tooling can report it.
+                  // Print cycle count so downstream tooling can report it
+                  // (latched at the done edge — the dump runs a cycle
+                  // later).
                   sv::FWriteOp::create(builder, loc, fd, "@CYCLES %0d\n",
-                                       ValueRange{ctrVal});
+                                       ValueRange{doneCyclesVal});
                   if (axiBundles.empty()) {
                     // Print end marker.
                     sv::FWriteOp::create(builder, loc, fd, "DONE\n",
@@ -1538,7 +1570,7 @@ void LoopScheduleTestbenchGenerationPass::generateDataDirMode(
                     // end marker stays last in the stream.
                     sv::PAssignOp::create(builder, loc, axiDumpReg, trueVal);
                   }
-                });
+                }
               });
 
               // AXI epilogue: T (dump set) -> T+1 (slaves flush, wait 0->1)

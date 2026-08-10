@@ -2811,6 +2811,15 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
     fsm::OutputOp::create(fb, loc, makeOutput(true, {}, {}));
     Block *tb = &st.getTransitions().front();
     fb.setInsertionPointToEnd(tb);
+    // No start arc here, and none is needed even with the early-done
+    // cut-through: `ready` (~tx_in_flight) clears on the REGISTERED Moore
+    // done, so it rises the cycle AFTER this state — when the machine is
+    // back in IDLE — and both start protocols (the testbench's level start
+    // gated on ready, the AXI wrapper's one-shot startFire) deliver the
+    // next invocation's start there. That is the historical protocol
+    // timing, kept deliberately: it is what keeps the child-done chain out
+    // of tx_in_flight's cone (see mooreDoneSignal) and this machine's
+    // shape identical whether or not a cut-through exists.
     fsm::TransitionOp::create(fb, loc, StringRef("IDLE"));
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
@@ -6920,6 +6929,54 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     }
   }
 
+  // Decide the early-done cut-through: `earlyDoneEntry` is the entry whose
+  // completion the module-level done PORT will cut through on, or -1. The
+  // FSM's shape does not depend on it (tx_in_flight/ready keep the Moore
+  // timing either way — see mooreDoneSignal); it is computed up front only
+  // because the entry bookkeeping it needs lives here.
+  int earlyDoneEntry = -1;
+  {
+    int lastEmitted = -1;
+    for (int i = (int)entries.size() - 1; i >= 0; --i) {
+      if (entryKinds[i] == -2)
+        continue;
+      lastEmitted = i;
+      break;
+    }
+    bool funcReturnsNothing =
+        funcOp.getBody().front().getTerminator()->getNumOperands() == 0;
+    bool lastIsSoloChild =
+        lastEmitted >= 0 &&
+        llvm::count_if(entries, [&](const FrameChild &e) {
+          return e.frameIdx == entries[lastEmitted].frameIdx && e.kind >= 0;
+        }) == 1;
+    auto resultsDead = [](auto results) {
+      return llvm::none_of(
+          results, [](Value r) { return loopScheduleValueConsumed(r); });
+    };
+    if (lastEmitted >= 0 && funcReturnsNothing) {
+      const FrameChild &last = entries[lastEmitted];
+      bool eligible = false;
+      switch (last.kind) {
+      case 1:
+        eligible = lastIsSoloChild;
+        break;
+      case 0: {
+        LoopScheduleSequentialOp seqOp = last.seqOp;
+        eligible = lastIsSoloChild && resultsDead(seqOp.getResults());
+        break;
+      }
+      case -1:
+        eligible = resultsDead(topFrames[last.frameIdx].getResults());
+        break;
+      default:
+        break;
+      }
+      if (eligible)
+        earlyDoneEntry = lastEmitted;
+    }
+  }
+
   // Create function-level FSM.
   std::string funcName = funcOp.getName().str();
   std::string fsmName = funcName + "_fsm";
@@ -7010,6 +7067,18 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   // Extract FSM outputs.
   unsigned fsmOutIdx = 0;
   Value doneSignal = fsmInst.getResult(fsmOutIdx++);
+  // The REGISTERED Moore done, before the early-done cut-through ORs into
+  // `doneSignal`. tx_in_flight clears on THIS, not on the cut-through:
+  // the early term carries the child-done chain — for a nested loop a
+  // combinational cut across every level's advance edge — and routing it
+  // into tx_in_flight's next-state put that whole cone in front of a
+  // register that used to see a one-level state decode. Measured on
+  // matmul_tiled_n (4-deep nest): WNS -1.011 -> -1.171 ns with the worst
+  // path first_iter_reg -> tx_in_flight_reg/D. Clearing on the Moore
+  // pulse keeps ready on its historical timing (start lands in IDLE, so
+  // DONE needs no start arc) and costs nothing observable: the done PORT
+  // still fires early, which is what the testbench and the host see.
+  Value mooreDoneSignal = doneSignal;
   SmallVector<Value> childStartSignals(numChildren);
   for (unsigned i = 0; i < numChildren; ++i)
     childStartSignals[i] = fsmInst.getResult(fsmOutIdx++);
@@ -7024,8 +7093,9 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     w.startPulse.setValue(childStartSignals[w.firstChildIdx]);
 
   // Transaction-in-flight bit (also drives `ready` at module output):
-  // set on start, cleared on the FINAL done (backedge — resolved after
-  // the early-done OR below).
+  // set on start, cleared on the REGISTERED Moore done (backedge —
+  // resolved to mooreDoneSignal, deliberately NOT the early-done OR; see
+  // the comment at mooreDoneSignal's definition).
   Backedge funcDoneBE = bb.get(i1);
   Value falseConstIF = hw::ConstantOp::create(builder, loc, i1, 0);
   Backedge inFlightNextBE = bb.get(i1);
@@ -7051,44 +7121,61 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     }
   }
 
-  // Early function done: when the LAST stateful entry is a PIPELINE
-  // launch and the function returns nothing, done cuts through on the
-  // child's completion instead of waiting for the Moore DONE state.
-  // ~child_start excludes the launch cycle, where a stale done from the
-  // previous invocation may still be high. Pipelines only: their done
-  // carries the epilogue/store-tail margin (it asserts at least one
-  // cycle after the final store issues), whereas a sequential child's
-  // advance-edge done coincides with its final store cycle — cutting the
-  // MODULE-boundary done through on that edge would let the outside
-  // world observe done on the same posedge the last write commits.
-  {
-    int lastEmitted = -1;
-    for (int i = (int)numEntries - 1; i >= 0; --i) {
-      if (entryKinds[i] == -2)
-        continue;
-      lastEmitted = i;
-      break;
-    }
-    bool funcReturnsNothing =
-        funcOp.getBody().front().getTerminator()->getNumOperands() == 0;
-    // Only for a SOLO pipeline launch: with concurrent siblings in the
-    // last frame, one child's done must not cut the module done early.
-    bool lastIsSoloChild =
-        lastEmitted >= 0 &&
-        llvm::count_if(entries, [&](const FrameChild &e) {
-          return e.frameIdx == entries[lastEmitted].frameIdx && e.kind >= 0;
-        }) == 1;
-    if (lastEmitted >= 0 && entries[lastEmitted].kind == 1 &&
-        lastIsSoloChild && funcReturnsNothing) {
-      unsigned ci = (unsigned)childIndexForEntry[lastEmitted];
+  // Early function done: when the LAST stateful entry completes and the
+  // function returns nothing, done cuts through on that completion
+  // instead of waiting for the Moore DONE state. ~child_start excludes
+  // the launch cycle, where a stale done from the previous invocation
+  // may still be high. Per kind:
+  //  - kind 1 (pipeline): its done carries the epilogue/store-tail
+  //    margin (asserts at least one cycle after the final store issues).
+  //  - kind 0 (sequential): its advance-edge done coincides with the
+  //    final store cycle, so the module boundary observes done on the
+  //    same posedge the last write commits. Sound only when the loop's
+  //    results are dead — the result registers latch on that very edge,
+  //    and a consumer would read the pre-latch value (same rule as the
+  //    loop module's own early done).
+  //  - kind -1 (leaf final frame): the frame's last cycle gate IS the
+  //    completion; sound only when the frame's results are dead.
+  //  - kind 3 (barrier / flush wait) and kind 4 (dyn port access) are
+  //    DELIBERATELY excluded, though both would be sound (a barrier's
+  //    done is a live channel-idle level that only rises after the
+  //    drain's last response). They occur only in AXI kernels, whose
+  //    done is observed through the control slave's ap_done poll at a
+  //    ~6-cycle round-trip granularity — the saved cycle is invisible
+  //    there, while the netlist change is not: extending the cut to the
+  //    flush barrier moved scale_axishared's route-dominated adapter
+  //    FIFO path by -0.151 ns (527.7 -> 488.8 MHz, measured), a real
+  //    Fmax cost for a cycle nobody can see. Keeping these kinds on the
+  //    Moore path keeps every AXI kernel's RTL byte-identical.
+  //  - kind 2 (call) keeps the Moore path.
+  // Whenever a cut-through exists, the Moore DONE pulse one cycle later
+  // is MASKED: done = early | (moore & ~reg(early)). Without the mask
+  // done double-pulses, and the generated testbench counts done CYCLES
+  // to attribute memory writes to transactions — a double pulse mis-
+  // files every transaction after the first in a back-to-back run.
+  // Eligibility (earlyDoneEntry) was decided BEFORE the FSM was built —
+  // the machine's DONE state accepts start exactly when a cut-through
+  // exists. Here the `early` term itself is constructed.
+  if (earlyDoneEntry >= 0) {
+    Value early;
+    if (entries[earlyDoneEntry].kind >= 0) {
+      unsigned ci = (unsigned)childIndexForEntry[earlyDoneEntry];
       Value notStart =
           comb::createOrFoldNot(builder, loc, childStartSignals[ci]);
       Value inWait = comb::AndOp::create(
-          builder, loc, entryRunningSignals[(unsigned)lastEmitted], notStart);
-      Value early = comb::AndOp::create(builder, loc, inWait,
-                                        Value(childDoneBEs[ci]));
-      doneSignal = comb::OrOp::create(builder, loc, doneSignal, early);
+          builder, loc, entryRunningSignals[(unsigned)earlyDoneEntry],
+          notStart);
+      early = comb::AndOp::create(builder, loc, inWait,
+                                  Value(childDoneBEs[ci]));
+    } else {
+      early = entryCycleGates[earlyDoneEntry].back();
     }
+    auto earlyPrev = seq::CompRegOp::create(
+        builder, loc, early, clk, rst, falseConstIF,
+        builder.getStringAttr("early_done_sent"));
+    Value notPrev = comb::createOrFoldNot(builder, loc, earlyPrev);
+    Value moore = comb::AndOp::create(builder, loc, doneSignal, notPrev);
+    doneSignal = comb::OrOp::create(builder, loc, moore, early);
   }
 
   // Per-entry memory port mappings. Each starts with shared rdData and
@@ -8006,7 +8093,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   // its done backedge resolves against the final (early-done-OR'd)
   // signal here.
   builder.setInsertionPointToEnd(hwBody);
-  funcDoneBE.setValue(doneSignal);
+  funcDoneBE.setValue(mooreDoneSignal);
   Value readySignal = comb::createOrFoldNot(builder, loc, inFlightReg);
 
   buildHWOutput(funcOp, builder, loc, hwBody, mapping, memPortMap, readySignal,
