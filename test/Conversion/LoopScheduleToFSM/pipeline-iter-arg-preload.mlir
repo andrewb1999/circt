@@ -1,13 +1,17 @@
-// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm)" %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm{enable-pipeline-prearm=true})" %s | FileCheck %s
 
-// Iter-arg init delivery uses a feedback-register preload instead of a
-// combinational first_iter mux: the stage register that carries each
-// iter_arg's feedback is loaded with the init value on (a delayed copy
-// of) the start pulse, and every consumer reads the register output
-// directly. This keeps the 1-bit control select off the datapath — the
-// old first_iter mux fanned out across every consumer bit of every
-// iter_arg and sat in front of the accumulator carry chain on the
-// post-synthesis critical path (doitgen/atax/gesummv at 2 ns).
+// Iter-arg init delivery pre-arms the feedback registers at the
+// PREVIOUS invocation's drain instead of the launch edge: the D-mux
+// select is the drain pulse (doneComb gated off the launch cycle), the
+// clock enable ORs that pulse in, and the register's RESET VALUE is the
+// init constant so the first-ever invocation is pre-armed out of reset.
+// Every consumer reads the register output directly (no combinational
+// first_iter mux on the datapath — the old mux sat in front of the
+// accumulator carry chain on the doitgen/atax/gesummv 2 ns paths), and
+// because the inits already sit in the registers through the idle
+// window, the first issue fires IN the launch cycle: stage-0 CE is
+// (active | child_start) & cond, closing the historical dead launch
+// state.
 
 // CHECK-LABEL: hw.module @preload
 
@@ -16,19 +20,34 @@
 // CHECK: %[[NEXTI:.+]] = arith.addi %loop0_s0_r0, %c1
 // CHECK: %[[PARTIAL:.+]] = arith.addi %loop0_s0_r1, %arg0
 
-// Both feedback registers are preloaded: D input is a mux whose
-// true-arm is the init constant, and the clock enable ORs in the start
-// pulse. The induction arg feeds the loop condition combinationally, so
-// its preload depth is 0 (the raw start pulse, no delay register).
-// CHECK-DAG: %loop0_s0_r0 = seq.compreg.ce sym @loop0_s0_r0 %[[D0:.+]], %clk, %[[CE0:.+]] reset %rst
-// CHECK-DAG: %[[D0]] = comb.mux %[[START:.+]], %c0{{.*}}, %[[NEXTI]]
-// CHECK-DAG: %[[CE0]] = comb.or %{{.+}}, %[[START]]
-// CHECK-DAG: %loop0_s0_r1 = seq.compreg.ce sym @loop0_s0_r1 %[[D1:.+]], %clk, %[[CE1:.+]] reset %rst
-// CHECK-DAG: %[[D1]] = comb.mux %[[START]], %c0_i32{{.*}}, %[[PARTIAL]]
-// CHECK-DAG: %[[CE1]] = comb.or %{{.+}}, %[[START]]
+// Both feedback registers pre-arm on ONE shared drain pulse and reset
+// to their init constants.
+// CHECK-DAG: %loop0_s0_r0 = seq.compreg.ce sym @loop0_s0_r0 %[[D0:.+]], %clk, %[[CE0:.+]] reset %rst, %c0
+// CHECK-DAG: %[[D0]] = comb.mux %[[PULSE:.+]], %c0, %[[NEXTI]]
+// CHECK-DAG: %[[CE0]] = comb.or %{{.+}}, %[[PULSE]]
+// CHECK-DAG: %loop0_s0_r1 = seq.compreg.ce sym @loop0_s0_r1 %[[D1:.+]], %clk, %[[CE1:.+]] reset %rst, %c0_i32
+// CHECK-DAG: %[[D1]] = comb.mux %[[PULSE]], %c0_i32, %[[PARTIAL]]
+// CHECK-DAG: %[[CE1]] = comb.or %{{.+}}, %[[PULSE]]
 
-// No per-stage first_iter flops remain.
+// The drain pulse is a ONE-SHOT (`done_prev` limits it to the first
+// drain cycle), and the final iteration's result latches into a HOLD
+// register on that same edge — consumers read the hold, never the
+// re-armed feedback register.
+// CHECK-DAG: %loop0_done_prev = seq.compreg sym @loop0_done_prev
+// CHECK-DAG: %loop0_result_hold_0 = seq.compreg.ce sym @loop0_result_hold_0 %loop0_s1_r0, %clk, %[[PULSE]] reset %rst
+
+// The issue gate ORs the machine's REGISTERED issue_arm (an
+// fsm.variable equal to the child_start decode but read as a flop Q —
+// the combinational decode on this cone measured −164 ps on the vadd
+// class) into `active`, so the launch cycle issues stage 0. Safe under
+// stall: every stall term is stage-occupancy-gated, so stall is 0 while
+// all stage CEs are 0.
+// CHECK-DAG: comb.or %loop0_active, %{{.+}}
+// CHECK-DAG: fsm.variable "issue_arm_0"
+
+// No per-stage first_iter flops and no start-pulse delay chain remain.
 // CHECK-NOT: first_iter_s
+// CHECK-NOT: preload_start_d
 
 loopschedule.func_sequential @preload(%arg0: i32) -> i32 {
   %c0 = arith.constant 0 : index

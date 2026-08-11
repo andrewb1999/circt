@@ -24,6 +24,8 @@ namespace circt {
 
 /// Create a LoopSchedule to FSM + HW conversion pass.
 std::unique_ptr<OperationPass<ModuleOp>> createLoopScheduleToFSMPass();
+std::unique_ptr<OperationPass<ModuleOp>>
+createLoopScheduleToFSMPass(const LoopScheduleToFSMOptions &options);
 
 /// Register the LoopScheduleToFSM pass with MLIR's pass registry. Defined
 /// in `LoopScheduleToFSM.cpp` to keep the registration in a single TU and

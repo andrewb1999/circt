@@ -1,4 +1,4 @@
-// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm)" --split-input-file %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm{enable-pipeline-prearm=true})" --split-input-file %s | FileCheck %s
 
 // A frame that contains a LAUNCH is lowered by the wait-frame path, which
 // holds any at-op result a later at-op reads in a capture register: a static
@@ -34,6 +34,11 @@
 // CHECK:         seq.compreg.ce sym @loop0_f0_at0_r3_latched
 // CHECK:         comb.mux %{{.+}}, %[[IDX]], %{{.+}} : i5
 // CHECK-NOT:     loop0_f0_at0_r2_latched
+//
+// The cross-at hold shape also refuses drain-edge pre-arming (gap-9):
+// the inner pipeline reads same-frame at results, so its stage 0 cannot
+// issue in the child_start cycle — the issue gate stays plain `active`.
+// CHECK-NOT:     loop0_pip0_done_prev
 loopschedule.func_sequential @cross_at_addr(%mem: memref<32xi64>, %n: i64) {
   %c0_i64 = arith.constant 0 : i64
   %c1_i64 = arith.constant 1 : i64
@@ -100,6 +105,8 @@ loopschedule.func_sequential @cross_at_addr(%mem: memref<32xi64>, %n: i64) {
 // CHECK:         hw.module @loop0(
 // CHECK:         %[[HOLD:.+]] = seq.compreg.ce sym @loop0_f0_at0_r2_latched
 // CHECK:         comb.mux %{{.+}}, %[[HOLD]], %{{.+}} : i5
+// Same-frame reads refuse pre-arming here too.
+// CHECK-NOT:     loop0_pip0_done_prev
 loopschedule.func_sequential @cross_at_addr_far(%mem: memref<32xi64>, %n: i64) {
   %c0_i64 = arith.constant 0 : i64
   %c1_i64 = arith.constant 1 : i64

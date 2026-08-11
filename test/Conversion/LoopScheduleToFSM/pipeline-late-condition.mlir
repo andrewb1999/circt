@@ -1,4 +1,4 @@
-// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm)" %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm{enable-pipeline-prearm=true})" %s | FileCheck %s
 
 // A pipeline whose terminator condition is produced by STAGE 1 (the
 // find_first shape: the exit predicate needs the loaded data, so the
@@ -45,6 +45,14 @@
 
 // The found feedback register exists (late-updated iter_arg).
 // CHECK: seq.compreg.ce sym @loop0_s1_r1
+
+// A late condition (condStageIdx > 0) does not block drain-edge
+// pre-arming: the whole pipeline timeline shifts one cycle earlier
+// together, so the condition still evaluates over the same-iteration
+// state it always did. The issue gate ORs the registered issue_arm into
+// active, and the drain machinery emits the one-shot done_prev register.
+// CHECK: comb.or %loop0_active, %{{.+}}
+// CHECK: seq.compreg sym @loop0_done_prev
 
 module {
   loopschedule.func_sequential @ff_while(%A: memref<16xi32>, %out: memref<1xi32>, %n: i32, %target: i32) attributes {top} {

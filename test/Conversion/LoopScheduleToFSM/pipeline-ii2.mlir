@@ -1,16 +1,20 @@
-// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm)" %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm{enable-pipeline-prearm=true})" %s | FileCheck %s
 
 
-// Two-stage pipeline with II=2. CE fires every other cycle.
+// Two-stage pipeline with II=2. CE fires every other cycle. This
+// pipeline pre-arms (constant inits, solo launch), so the counter mux
+// and the CE generation both key on the ISSUE GATE (active | start):
+// the launch cycle issues with counter 0 and the counter advances to 1
+// on the next edge, seeding the II cadence off the launch cycle itself.
 // CHECK-LABEL: hw.module @pipeline_ii2
 // Counter for II=2 (1-bit counter cycling 0,1,0,1,...)
 // CHECK: seq.compreg.ce sym @loop0_ii_counter
-// Counter logic: wrap at II-1
+// Counter logic: wrap at II-1, running whenever the issue gate holds
 // CHECK: comb.icmp eq
-// CHECK: comb.mux
-// CE generation: ce_gen = (counter == 0) AND active
+// CHECK: comb.mux %[[GATE:.+]], %{{.+}}, %false
+// CE generation: ce_gen = (counter == 0) AND (active | start)
 // CHECK: comb.icmp eq
-// CHECK: comb.and
+// CHECK: comb.and %{{.+}}, %[[GATE]]
 // active_ce = ce_gen AND cond
 // CHECK: comb.and
 // Traveling CE for stage 1
@@ -20,6 +24,8 @@
 // CHECK: seq.compreg.ce sym @loop0_s0_r1
 // Stage 1 register
 // CHECK: seq.compreg.ce sym @loop0_s1_r0
+// The issue gate is active ORed with the machine's registered issue_arm.
+// CHECK: %[[GATE]] = comb.or %loop0_active, %{{.+}}
 // CHECK: hw.output
 
 // CHECK-LABEL: fsm.machine @pipeline_ii2_fsm

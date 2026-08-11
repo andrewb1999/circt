@@ -597,6 +597,262 @@ static bool isLaunchLikeOp(Operation *op) {
   return false;
 }
 
+/// The solver's SECONDARY objectives: among anchor-optimal schedules, pick
+/// the one that is cheapest in the FRAME LOWERING's actual cost model —
+/// lexicographically, FSM states first, capture registers second,
+/// determinism last.
+///
+/// Phase 1 (the simplex) minimizes the ANCHOR (the terminator) alone. Any
+/// op with slack against the anchor's binding constraints is a degenerate
+/// variable: the LP has a family of equally-optimal solutions, and the
+/// simplex returns whichever vertex its pivot order lands on. That is not
+/// a choice, it is the absence of one, and it is not stable across
+/// solver-internal changes. The phases below supply the missing criteria,
+/// each spending only the currency it actually prices:
+///
+///  A. STATES — shrink the last occupied bucket. The FSM builds a state
+///     for every cycle a real op occupies; the anchor itself is virtual
+///     (a latency-1 tail store's commit edge pushes the anchor one slot
+///     past the store, but the commit costs no state — spmv's fused tail
+///     is the existence proof). An op drifting into that virtual slot
+///     pins it down as a dead state. Moves are ALL-OR-NOTHING per bucket:
+///     if every occupant of the max bucket can drop to its dependence
+///     bound, the state disappears; if any occupant is pinned, nothing
+///     moves — a partial move would leave the state standing AND stretch
+///     the moved values' lifetimes toward it.
+///  B. REGISTERS — pull remaining slack ops TOWARD their nearest real
+///     consumer (never past any dependence, never past the makespan). A
+///     value consumed more than one cycle after production mints a
+///     `_latched` capture register downstream, so accidental-early
+///     placement is a real area cost. Terminator edges are EXCLUDED from
+///     the pull: the iter-arg registers' D inputs are combinational from
+///     their producers in whatever cycle the advance fires, so a
+///     "lifetime" against the anchor has no register semantics — pulling
+///     toward it would re-mint the phase-A dead state to save a register
+///     that does not exist.
+///  C. DETERMINISM — ops with no real consumers at all (anchor-only:
+///     zero-latency, memory-effect-free, every user the anchor or another
+///     such op) sink to ASAP. No capture can exist for them and phase A
+///     already took any state they pinned; ASAP just makes the placement
+///     a stated rule instead of a pivot-order accident.
+///
+/// Every move is bounded by the op's own dependences on both sides, and
+/// `verify()` is the backstop: on any violation the saved solution is
+/// restored verbatim and the schedule is exactly what phase 1 produced.
+static void applySecondaryScheduleObjectives(
+    ChainingSharedOperatorsProblem &problem, Operation *anchor) {
+  // Save the solution for the revert path.
+  DenseMap<Operation *, unsigned> savedStart;
+  DenseMap<Operation *, float> savedInCycle;
+  for (auto *op : problem.getOperations()) {
+    if (auto st = problem.getStartTime(op))
+      savedStart[op] = *st;
+    if (auto stc = problem.getStartTimeInCycle(op))
+      savedInCycle[op] = *stc;
+  }
+
+  // A movable op: zero-latency pure comb, never a launch, with a solved
+  // start. Everything else keeps its phase-1 placement.
+  auto movable = [&](Operation *op) {
+    if (op == anchor || isLaunchLikeOp(op) || !isMemoryEffectFree(op))
+      return false;
+    auto oprOpt = problem.getLinkedOperatorType(op);
+    return problem.getStartTime(op).has_value() && oprOpt.has_value() &&
+           problem.getLatency(*oprOpt).value_or(1) == 0;
+  };
+
+  // ASAP over every incoming dependence (SSA and auxiliary alike), or
+  // nullopt when a source lacks scheduling info.
+  auto asapOf = [&](Operation *op) -> std::optional<unsigned> {
+    unsigned asap = 0;
+    for (auto dep : problem.getDependences(op)) {
+      Operation *src = dep.getSource();
+      auto srcStart = problem.getStartTime(src);
+      auto srcOpr = problem.getLinkedOperatorType(src);
+      if (!srcStart || !srcOpr)
+        return std::nullopt;
+      asap = std::max(asap, *srcStart + problem.getLatency(*srcOpr).value_or(0));
+    }
+    return asap;
+  };
+
+  // In-cycle start at `cycle`: the latest arrival among sources whose
+  // result lands exactly there. Combinational sources chain from their own
+  // in-cycle end; latching sources deliver at their outgoing delay past the
+  // cycle edge; earlier-finishing sources impose no in-cycle bound.
+  auto inCycleAt = [&](Operation *op, unsigned cycle) {
+    float inCycle = 0.0f;
+    for (auto dep : problem.getDependences(op)) {
+      Operation *src = dep.getSource();
+      auto srcOpr = problem.getLinkedOperatorType(src);
+      auto srcStart = problem.getStartTime(src);
+      if (!srcOpr || !srcStart)
+        continue;
+      unsigned srcLat = problem.getLatency(*srcOpr).value_or(0);
+      if (*srcStart + srcLat != cycle)
+        continue;
+      float srcOut = problem.getOutgoingDelay(*srcOpr).value_or(0.0f);
+      float arrival =
+          srcLat == 0
+              ? problem.getStartTimeInCycle(src).value_or(0.0f) + srcOut
+              : srcOut;
+      inCycle = std::max(inCycle, arrival);
+    }
+    return inCycle;
+  };
+
+  auto moveTo = [&](Operation *op, unsigned cycle) {
+    problem.setStartTime(op, cycle);
+    problem.setStartTimeInCycle(op, inCycleAt(op, cycle));
+  };
+
+  // Auxiliary OUTGOING dependences (op as source) are not enumerable from
+  // the op itself; build the reverse index once.
+  DenseMap<Operation *, SmallVector<Operation *>> auxOut;
+  for (auto *op : problem.getOperations())
+    for (auto dep : problem.getDependences(op))
+      if (dep.isAuxiliary())
+        auxOut[dep.getSource()].push_back(op);
+
+  // The anchor-only class (phase C's domain, and phase B's exclusion): ops
+  // whose every user is the anchor or another member. Reverse block order
+  // resolves chains (addi -> cmpi -> terminator) in one pass.
+  DenseSet<Operation *> anchorOnly;
+  Block *block = anchor->getBlock();
+  for (Operation &opRef : llvm::reverse(*block)) {
+    Operation *op = &opRef;
+    if (!movable(op))
+      continue;
+    bool all = true;
+    for (Operation *user : op->getUsers())
+      if (user != anchor && !anchorOnly.contains(user)) {
+        all = false;
+        break;
+      }
+    if (all)
+      anchorOnly.insert(op);
+  }
+
+  bool changed = false;
+
+  // --- Phase A: states. Shrink the last occupied bucket, all-or-nothing
+  // per bucket, until an occupant is pinned.
+  for (;;) {
+    unsigned maxBucket = 0;
+    SmallVector<Operation *> occupants;
+    for (auto *op : problem.getOperations()) {
+      if (op == anchor)
+        continue;
+      auto st = problem.getStartTime(op);
+      if (!st)
+        continue;
+      if (*st > maxBucket) {
+        maxBucket = *st;
+        occupants.clear();
+      }
+      if (*st == maxBucket)
+        occupants.push_back(op);
+    }
+    if (maxBucket == 0 || occupants.empty())
+      break;
+    SmallVector<std::pair<Operation *, unsigned>> moves;
+    bool allMove = true;
+    for (Operation *op : occupants) {
+      auto asap = movable(op) ? asapOf(op) : std::nullopt;
+      if (!asap || *asap >= maxBucket) {
+        allMove = false;
+        break;
+      }
+      moves.push_back({op, *asap});
+    }
+    if (!allMove)
+      break;
+    for (auto &[op, asap] : moves)
+      moveTo(op, asap);
+    changed = true;
+  }
+
+  // Recompute the (possibly shrunk) makespan as phase B's ceiling.
+  unsigned makespan = 0;
+  for (auto *op : problem.getOperations())
+    if (op != anchor)
+      if (auto st = problem.getStartTime(op))
+        makespan = std::max(makespan, *st);
+
+  // --- Phase B: registers. Pull ops with REAL consumers toward the
+  // nearest one, so a value's lifetime stays within the one-cycle window
+  // that needs no capture register. Bounded by every outgoing dependence
+  // and by the makespan (never re-grow a bucket phase A vacated).
+  for (Operation &opRef : *block) {
+    Operation *op = &opRef;
+    if (!movable(op) || anchorOnly.contains(op))
+      continue;
+    auto curOpt = problem.getStartTime(op);
+    if (!curOpt)
+      continue;
+    unsigned upper = makespan;
+    unsigned nearestReal = UINT_MAX;
+    bool boundsOk = true;
+    for (Operation *user : op->getUsers()) {
+      auto us = problem.getStartTime(user);
+      if (!us) {
+        boundsOk = false;
+        break;
+      }
+      upper = std::min(upper, *us); // zero-latency: may share the cycle
+      if (user != anchor && !anchorOnly.contains(user))
+        nearestReal = std::min(nearestReal, *us);
+    }
+    if (!boundsOk || nearestReal == UINT_MAX)
+      continue;
+    if (auto it = auxOut.find(op); it != auxOut.end())
+      for (Operation *dst : it->second) {
+        auto ds = problem.getStartTime(dst);
+        if (!ds) {
+          boundsOk = false;
+          break;
+        }
+        upper = std::min(upper, *ds);
+      }
+    if (!boundsOk)
+      continue;
+    // Ideal: one cycle before the nearest real consumer (its data arrives
+    // combinationally valid in the consumer's read window without a
+    // capture); clamp to the hard upper bound.
+    unsigned target = std::min(upper, nearestReal > 0 ? nearestReal - 1 : 0u);
+    if (target > *curOpt) {
+      moveTo(op, target);
+      changed = true;
+    }
+  }
+
+  // --- Phase C: determinism. Anchor-only ops sink to ASAP: no real
+  // consumer means no capture register can exist, phase A already took any
+  // state they pinned, and a stated rule beats a pivot-order accident.
+  for (Operation &opRef : llvm::reverse(*block)) {
+    Operation *op = &opRef;
+    if (!anchorOnly.contains(op))
+      continue;
+    auto cur = problem.getStartTime(op);
+    auto asap = asapOf(op);
+    if (!cur || !asap || *asap >= *cur)
+      continue;
+    moveTo(op, *asap);
+    changed = true;
+  }
+
+  if (!changed)
+    return;
+  if (failed(problem.verify())) {
+    // Restore the solver's solution verbatim; the tie-break is a pure
+    // optimization and must never turn a valid schedule invalid.
+    for (auto &[op, st] : savedStart)
+      problem.setStartTime(op, st);
+    for (auto &[op, stc] : savedInCycle)
+      problem.setStartTimeInCycle(op, stc);
+  }
+}
+
 /// Partition start-times into phases by the close-after-launch-bucket rule:
 /// a bucket containing a launch-like op closes the current phase. This
 /// guarantees that sibling launches at different start times land in separate
@@ -1548,6 +1804,12 @@ LogicalResult SCFToLoopSchedulePass::solveChainingSharedOperatorsProblem(
   auto *anchor = region.back().getTerminator();
   if (failed(scheduleSimplex(problem, anchor, cycleTime)))
     return failure();
+
+  // The simplex only optimizes the anchor; complete the solution with the
+  // lowering-aware secondary objectives (states, then registers, then
+  // determinism) so the rest of the schedule is chosen by stated criteria
+  // rather than by the final simplex basis.
+  applySecondaryScheduleObjectives(problem, anchor);
 
   // Verify the solution.
   if (failed(problem.verify()))

@@ -218,7 +218,17 @@ def LoopScheduleToFSM : Pass<"lower-loopschedule-to-fsm", "mlir::ModuleOp"> {
   ];
   let options = [
     Option<"disableFlattenMemrefs", "disable-flatten-memrefs", "bool", "false",
-            "Skip the internal multi-dim memref flattening step.">
+            "Skip the internal multi-dim memref flattening step.">,
+    Option<"enablePipelinePreArm", "enable-pipeline-prearm", "bool", "true",
+            "Pre-arm eligible pipelines' iter-arg registers at the previous "
+            "invocation's drain so the first datapath cycle issues in the "
+            "launch cycle (saves one cycle per invocation). The launch-cycle "
+            "issue gate reads the machine's REGISTERED issue_arm variable — "
+            "putting the raw child_start state decode on the stage-0 "
+            "clock-enable cone instead measured −164 ps (vadd-class) / "
+            "−124 ps (matmul_tiled_n) of WNS and pushed transpose below "
+            "Vitis; the registered form leaves no bram kernel below the "
+            "Vitis Fmax it was at or above without the feature.">
   ];
 }
 

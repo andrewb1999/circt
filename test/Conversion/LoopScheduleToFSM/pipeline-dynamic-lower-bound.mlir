@@ -1,4 +1,4 @@
-// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm)" --split-input-file %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm{enable-pipeline-prearm=true})" --split-input-file %s | FileCheck %s
 
 // A launched child reads its frame-produced operands out of the
 // launch-consumer capture registers, which latch during cycle O+1 for a
@@ -19,6 +19,12 @@
 // The load is in `at 0`, the launch was SCHEDULED at `at 1`, and the IV init is
 // read at stage 0 => the pulse must wait until cycle 0 + 2. So the frame has
 // THREE cycle states and child_start fires in the last of them, not the middle.
+//
+// This shape must also REFUSE drain-edge pre-arming (gap-9): the IV init
+// is loaded fresh from the frame each iteration, so it cannot sit
+// pre-armed in the feedback register through the idle window. The stage-0
+// issue gate stays plain `active` — no `or(active, child_start)` exists.
+// CHECK-NOT: loop0_pip0_done_prev
 // CHECK-LABEL: fsm.machine @loop0_fsm
 // CHECK-SAME:    resNames = [{{.*}}"frame_cycle_0_0", "frame_cycle_0_1", "frame_cycle_0_2"]
 // CHECK:         fsm.state @FRAME_0_0 output
@@ -89,6 +95,12 @@ loopschedule.func_sequential @dyn_lower_bound(%rowptr: memref<17xi64>, %n: i64) 
 // before the frame starts. Nothing constrains the pulse, the launch keeps its
 // scheduled cycle 1, and the frame keeps two cycle states -- so every existing
 // design (all of which have static lower bounds) lowers bit-identically.
+//
+// Pre-arming is still refused here — not by the init (constant) but by
+// the launch-cycle timing bound: the pipeline body reads the same-frame
+// captured `hi` bound, whose capture register is not yet readable in the
+// cycle child_start pulses, so stage 0 cannot issue that cycle.
+// CHECK-NOT: loop0_pip0_done_prev
 
 // CHECK-LABEL: fsm.machine @loop0_fsm
 // CHECK-SAME:    resNames = [{{.*}}"frame_cycle_0_0", "frame_cycle_0_1"]

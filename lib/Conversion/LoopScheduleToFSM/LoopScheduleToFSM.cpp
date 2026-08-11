@@ -37,8 +37,11 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 #include <limits>
+
+#define DEBUG_TYPE "lower-loopschedule-to-fsm"
 
 namespace circt {
 #define GEN_PASS_DEF_LOOPSCHEDULETOFSM
@@ -775,6 +778,7 @@ struct SharedOperatorInstance {
 /// Main pass converting LoopSchedule ops to FSM + HW.
 class LoopScheduleToFSMPass
     : public circt::impl::LoopScheduleToFSMBase<LoopScheduleToFSMPass> {
+  using LoopScheduleToFSMBase::LoopScheduleToFSMBase;
 public:
   void runOnOperation() override;
 
@@ -857,7 +861,8 @@ private:
                                      ArrayRef<unsigned> launchStartOffsets,
                                      ArrayRef<unsigned> frameLatencies,
                                      bool foldLastFrame, bool condBypass,
-                                     bool entryBypass);
+                                     bool entryBypass,
+                                     ArrayRef<bool> preArmLaunches = {});
 
   /// Create linear run-once FSM for sequencing top-level function frames.
   /// frameChildKind[i]: -1 = leaf, 0 = sequential child, 1 = pipeline child,
@@ -882,7 +887,8 @@ private:
                                     ArrayRef<int> frameChildKind,
                                     ArrayRef<unsigned> entryLatencies,
                                     ArrayRef<unsigned> entryGroup,
-                                    SmallVectorImpl<int> &entryCycleOutBase);
+                                    SmallVectorImpl<int> &entryCycleOutBase,
+                                    ArrayRef<bool> preArmEntries = {});
 
   /// Recursively lower a loop node as its own hw.module.
   /// Creates the module and populates outModule. capturedVals are the
@@ -929,16 +935,41 @@ private:
                             Value opCE = {});
 
   /// Lower a pipeline as a child of a sequential loop (no FSM needed).
+  /// With `allowPreArm`, the pipeline MAY (subject to its own per-arg
+  /// analysis) pre-arm its iter-arg registers at the previous
+  /// invocation's drain edge and issue its first datapath cycle in the
+  /// launch cycle itself, saving one cycle per invocation. The caller
+  /// vouches for the frame-level timing (body-operand readiness, port
+  /// disjointness, no dynamic accesses in the frame); this function owns
+  /// the argument mechanics and falls back to the historical launch-edge
+  /// behavior when any argument cannot pre-arm.
   LogicalResult lowerPipelineChild(LoopSchedulePipelineOp pipOp,
                                    OpBuilder &builder, Location loc,
                                    Block *hwBody, IRMapping &mapping,
                                    Value clk, Value rst, Value startSignal,
                                    StringRef namePrefix, Value &doneSignal,
                                    DenseMap<Value, MemPortMapping> &memPorts,
-                                   ArrayRef<PortArgInfo> memrefArgs);
+                                   ArrayRef<PortArgInfo> memrefArgs,
+                                   bool allowPreArm = false,
+                                   Value preArmIssue = Value());
 
   /// Map from original func memref args to their hw.module port values.
   DenseMap<Value, MemPortMapping> memPortMap;
+
+  /// Pipelines that pre-armed their iter-args at the drain edge and issue
+  /// in the launch cycle (gap-9 inline half). Lets the benchmark battery
+  /// assert the eligible set without reading RTL.
+  unsigned numPreArmedPipelines = 0;
+
+  /// Whether the function being lowered touches any variable-latency
+  /// (dynamic) port anywhere — an AXI adapter, a dram engine. Pre-arming
+  /// is refused for the WHOLE function in that case: its frequency was
+  /// only measured on the BRAM population, and the campaign's byte-diff
+  /// discipline keeps every AXI netlist frozen (an AXI kernel's local-
+  /// buffer pipelines would otherwise be eligible — doitgen/conv1d_buf/
+  /// outer_product reached exactly that way). Set at `lowerFunction`
+  /// entry on the sequential path, the only path that consults it.
+  bool funcHasDynAccess = false;
 
   /// Per-function operator library analysis. Bound for the duration of
   /// `lowerFunction`. Compute ops in leaf bodies are required to carry a
@@ -2026,13 +2057,62 @@ collectReferencedConstants(LoopScheduleSequentialOp seqOp) {
 // FSM machine creation
 //===----------------------------------------------------------------------===//
 
+/// Append a REGISTERED launch-arm output to a finished machine: an
+/// `fsm.variable` (a register in the lowered machine, like first_iter)
+/// updated on EVERY transition to `nextState == launchState`, and output
+/// from every state. The result reads as a plain register Q at module
+/// level — asserted exactly in `launchState`'s cycles, i.e. it EQUALS
+/// the Moore child_start decode, but its cone starts at a flop instead
+/// of the (Vivado-re-encoded) state vector. This is what lets pre-arm
+/// issue in the launch cycle without putting a state decode on the
+/// stage-0 clock-enable cone (the −164 ps vadd-class / −124 ps
+/// matmul_tiled_n WNS regression of the combinational form; the
+/// registered-control pattern is the same one Vitis's flow-control
+/// delay pipes use). Hold cycles (a stalled launch state takes no
+/// transition) keep the variable's value — matching the held Moore
+/// decode exactly. Correct by construction: the updates enumerate the
+/// same transition list the machine executes.
+static void addRegisteredLaunchArm(fsm::MachineOp machine,
+                                   StringRef launchState, StringRef armName) {
+  auto *ctx = machine.getContext();
+  auto i1 = IntegerType::get(ctx, 1);
+  OpBuilder fb(ctx);
+  fb.setInsertionPointToStart(&machine.getBody().front());
+  Value trueVal = hw::ConstantOp::create(fb, machine.getLoc(), i1, 1);
+  Value falseVal = hw::ConstantOp::create(fb, machine.getLoc(), i1, 0);
+  auto armVar = fsm::VariableOp::create(fb, machine.getLoc(), i1,
+                                        fb.getBoolAttr(false), armName);
+
+  for (auto state : machine.getBody().getOps<fsm::StateOp>()) {
+    auto outputOp =
+        cast<fsm::OutputOp>(state.getOutput().front().getTerminator());
+    outputOp->insertOperands(outputOp->getNumOperands(), {armVar});
+    for (auto t : state.getTransitions().getOps<fsm::TransitionOp>()) {
+      Block *ab = t.ensureAction(fb);
+      fb.setInsertionPointToEnd(ab);
+      fsm::UpdateOp::create(fb, machine.getLoc(), armVar,
+                            t.getNextState() == launchState ? trueVal
+                                                            : falseVal);
+    }
+  }
+
+  auto oldType = machine.getFunctionType();
+  SmallVector<Type> resTypes(oldType.getResults());
+  resTypes.push_back(i1);
+  machine.setFunctionTypeAttr(mlir::TypeAttr::get(
+      FunctionType::get(ctx, oldType.getInputs(), resTypes)));
+  SmallVector<Attribute> resNames(machine.getResNamesAttr().getValue());
+  resNames.push_back(StringAttr::get(ctx, armName));
+  machine.setResNamesAttr(ArrayAttr::get(ctx, resNames));
+}
+
 fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
     OpBuilder &builder, Location loc, StringRef fsmName, unsigned numFrames,
     ArrayRef<unsigned> waitFrameIndices,
     ArrayRef<unsigned> launchAtOffsets,
     ArrayRef<unsigned> launchStartOffsets,
     ArrayRef<unsigned> frameLatencies, bool foldLastFrame, bool condBypass,
-    bool entryBypass) {
+    bool entryBypass, ArrayRef<bool> preArmLaunches) {
   auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
 
@@ -2550,6 +2630,16 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
 
+  // Registered launch arms for the pre-armed launches (see the helper):
+  // one extra output per pre-armed launch, appended in launch order,
+  // each equal to its child_start_<j> decode but read as a register Q.
+  for (auto [j, pa] : llvm::enumerate(preArmLaunches))
+    if (pa)
+      addRegisteredLaunchArm(machine,
+                             frameStateName(waitFrameIndices[j],
+                                            launchStartOffsets[j]),
+                             "issue_arm_" + std::to_string(j));
+
   return machine;
 }
 
@@ -2560,7 +2650,8 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
 fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
     OpBuilder &builder, Location loc, StringRef fsmName,
     ArrayRef<int> frameChildKind, ArrayRef<unsigned> entryLatencies,
-    ArrayRef<unsigned> entryGroup, SmallVectorImpl<int> &entryCycleOutBase) {
+    ArrayRef<unsigned> entryGroup, SmallVectorImpl<int> &entryCycleOutBase,
+    ArrayRef<bool> preArmEntries) {
   auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
   unsigned numFrames = frameChildKind.size();
@@ -2823,6 +2914,14 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
     fsm::TransitionOp::create(fb, loc, StringRef("IDLE"));
   }
   fb.setInsertionPointToEnd(&machine.getBody().front());
+
+  // Registered launch arms for the pre-armed entries (see the helper),
+  // appended in entry order. Each eligible entry is solo in its group,
+  // so its launch state is the group's (its own) FRAME state.
+  for (auto [ei, pa] : llvm::enumerate(preArmEntries))
+    if (pa)
+      addRegisteredLaunchArm(machine, "FRAME_" + std::to_string(ei),
+                             "issue_arm_" + std::to_string(ei));
 
   return machine;
 }
@@ -3319,6 +3418,75 @@ static unsigned firstIterArgUseOffset(loopschedule::LoopSchedulePipelineOp pipOp
   return firstUse;
 }
 
+/// Residual in-at latency of at result `resIdx`: how many cycles past the
+/// at's own offset O the value still needs before a capture register may
+/// latch it. 1 — the historical floor (capture enable at O+1, readable
+/// O+2) — unless the result is PURE COMB over (a) values stable before the
+/// frame started and (b) at least one earlier-at STATIC load result whose
+/// rd_data is combinationally live during cycle O (the load-indirection
+/// shape: `extsi(rowptr load)` at O = loadAt + 1). Then the cone settles
+/// within cycle O itself and the capture may latch at the END of O
+/// (enable = gate[O], readable O+1) — one cycle earlier.
+///
+/// The predicate is deliberately narrow: a load issued in THIS at, a
+/// multi-cycle operator anywhere in the cone, an earlier-at leaf that is
+/// not a static load, or a leaf whose data-valid cycle is not O all keep
+/// the floor at 1, so every capture outside the indirection shape — and
+/// with it every other kernel's RTL — keeps its exact historical timing.
+static unsigned
+atResultResidualLatency(loopschedule::LoopScheduleAtOp atOp, unsigned resIdx,
+                        analysis::OperatorLibraryAnalysis *operatorLibrary) {
+  auto yield =
+      cast<loopschedule::LoopScheduleYieldOp>(atOp.getBodyBlock().getTerminator());
+  if (resIdx >= yield.getNumOperands())
+    return 1;
+  bool sawLiveLoadLeaf = false;
+  SmallVector<Value> stack{yield.getOperand(resIdx)};
+  DenseSet<Value> seen;
+  while (!stack.empty()) {
+    Value v = stack.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      continue; // block argument: stable before the frame's cycles
+    if (!atOp->isAncestor(def)) {
+      // Leaf outside this at. An earlier at's result must be a static
+      // load whose rd_data is live during OUR cycle; anything defined
+      // before the frame is stable and imposes nothing.
+      auto srcAt = dyn_cast<loopschedule::LoopScheduleAtOp>(def);
+      if (!srcAt)
+        continue; // pre-frame value (frames contain only at ops)
+      if (srcAt->getParentOp() != atOp->getParentOp() ||
+          (unsigned)srcAt.getOffset() + 1 != (unsigned)atOp.getOffset())
+        return 1;
+      auto srcYield = cast<loopschedule::LoopScheduleYieldOp>(
+          srcAt.getBodyBlock().getTerminator());
+      unsigned srcIdx = cast<OpResult>(v).getResultNumber();
+      if (srcIdx >= srcYield.getNumOperands())
+        return 1;
+      Operation *producer = srcYield.getOperand(srcIdx).getDefiningOp();
+      auto load =
+          producer ? dyn_cast<loopschedule::LoadInterface>(producer)
+                   : loopschedule::LoadInterface();
+      if (!load || load.isDynamic())
+        return 1;
+      sawLiveLoadLeaf = true;
+      continue;
+    }
+    // In-at cone op: must be a pure zero-latency combinational function.
+    if (isa<loopschedule::LoopScheduleLaunchOp, loopschedule::LoadInterface,
+            loopschedule::StoreInterface, loopschedule::LoopScheduleLoadOp,
+            loopschedule::LoopScheduleStoreOp>(def) ||
+        !isMemoryEffectFree(def) ||
+        computeOpCycleLatency(def, operatorLibrary) != 0)
+      return 1;
+    for (Value operand : def->getOperands())
+      stack.push_back(operand);
+  }
+  return sawLiveLoadLeaf ? 0 : 1;
+}
+
 /// Earliest cycle within `frameOp` at which `pipOp`'s child_start may pulse
 /// without an iter_arg INIT latching a stale value.
 ///
@@ -3345,7 +3513,8 @@ static unsigned firstIterArgUseOffset(loopschedule::LoopSchedulePipelineOp pipOp
 /// child_start peephole's guard (b2).
 static unsigned
 minLegalLaunchStart(loopschedule::LoopSchedulePipelineOp pipOp,
-                    loopschedule::LoopScheduleFrameOp frameOp) {
+                    loopschedule::LoopScheduleFrameOp frameOp,
+                    analysis::OperatorLibraryAnalysis *operatorLibrary) {
   Operation *launchHolder =
       frameOp.getBodyBlock().findAncestorOpInBlock(*pipOp.getOperation());
   unsigned minStart = 0;
@@ -3362,7 +3531,17 @@ minLegalLaunchStart(loopschedule::LoopSchedulePipelineOp pipOp,
     unsigned firstUse = firstIterArgUseOffset(pipOp, argIdx);
     if (firstUse == UINT_MAX)
       continue; // never read
-    unsigned ready = (unsigned)defAt.getOffset() + 2;
+    // Register-readable at O + residual + 1: the capture latches at the
+    // end of cycle O + residual (residual 1 = the historical O+2; 0 for a
+    // pure-comb load-indirection result, whose capture latches a cycle
+    // earlier — see atResultResidualLatency).
+    unsigned residual =
+        def == defAt.getOperation()
+            ? atResultResidualLatency(
+                  defAt, cast<OpResult>(init).getResultNumber(),
+                  operatorLibrary)
+            : 1;
+    unsigned ready = (unsigned)defAt.getOffset() + residual + 1;
     minStart = std::max(minStart, ready > firstUse ? ready - firstUse : 0u);
   }
   return minStart;
@@ -3508,7 +3687,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       if (slot.pipIdx >= 0)
         offset = std::max(
             offset, minLegalLaunchStart(node.pipelineChildren[slot.pipIdx],
-                                        frames[i]));
+                                        frames[i], operatorLibrary));
       launchAtOffsets.push_back(offset);
     }
   }
@@ -3559,18 +3738,30 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   //      frame's cycle states must not touch any (port, binding) the
   //      frame's static ops drive (static addresses are held through the
   //      whole frame by the merge muxes).
+  // Alongside the peephole, the same guard data decides PRE-ARM: an
+  // eligible pipeline loads its iter-arg inits at the previous
+  // invocation's drain edge instead of the launch edge and issues its
+  // first datapath cycle IN the launch cycle (see lowerPipelineChild),
+  // saving one cycle per invocation. Eligibility here vouches for the
+  // FRAME-level timing; the callee still owns the argument mechanics and
+  // may decline. Evaluated even for launches at offset 0 (they cannot
+  // move earlier but can still pre-arm) and composed AFTER the peephole
+  // at whatever offset it chose. Gated on `enable-pipeline-prearm`
+  // (default OFF): the child_start state decode this puts on the stage-0
+  // CE cone measured −164 ps (vadd-class) / −124 ps (matmul_tiled_n) of
+  // WNS, route-dominated — see the option's description in Passes.td.
   SmallVector<unsigned> launchStartOffsets(launchAtOffsets.begin(),
                                            launchAtOffsets.end());
+  SmallVector<bool> launchPreArm(launchAtOffsets.size(), false);
   for (unsigned i = 0; i < numFrames; ++i) {
     auto &slots = node.frameLaunches[i];
     if (slots.size() != 1 || slots[0].pipIdx < 0)
       continue;
+    unsigned launchIdx = (unsigned)frameWaitIdx[i].front();
     // The scheduled offset AFTER the late-start correction above: the
     // peephole may only move a launch earlier within the window the
     // correction left legal.
-    unsigned schedOffset = launchAtOffsets[(unsigned)frameWaitIdx[i].front()];
-    if (schedOffset == 0)
-      continue;
+    unsigned schedOffset = launchAtOffsets[launchIdx];
     // (d) dynamic-latency accesses in the frame: a variable-latency access
     // (an amc.burst_copy fill, a dyn AXI load) scheduled before the child
     // carries a completion dependence the scheduler encoded as the child's
@@ -3605,8 +3796,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     LoopScheduleFrameOp frameOp = frames[i];
     Block &pipBlock = pipOp.getStagesBlock();
 
-    // (b) earliest legal start from the init-timing constraints.
+    // (b) earliest legal start from the init-timing constraints;
+    // `minStartPreArm` accumulates the one-cycle-tighter issue-at-launch
+    // bounds alongside.
     unsigned minStart = 0;
+    unsigned minStartPreArm = 0;
     bool analyzable = true;
     for (auto [argIdx, init] : llvm::enumerate(pipOp.getInits())) {
       Operation *def = init.getDefiningOp();
@@ -3682,15 +3876,31 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
             stage = (unsigned)stageAt.getOffset();
             break;
           }
-        unsigned readable = (unsigned)defAt.getOffset() + 1;
+        // In start-units: a stage at S runs in cycle start+1+S, and the
+        // capture is register-readable from cycle O + residual + 1, so
+        // start >= O + residual - S. Under PRE-ARM the stage runs one
+        // cycle earlier (start+S), so its bound is one cycle tighter.
+        unsigned residual =
+            def == defAt.getOperation()
+                ? atResultResidualLatency(
+                      defAt, cast<OpResult>(operand).getResultNumber(),
+                      operatorLibrary)
+                : 1;
+        unsigned readable = (unsigned)defAt.getOffset() + residual;
         minStart = std::max(minStart, readable > stage ? readable - stage : 0);
+        minStartPreArm = std::max(
+            minStartPreArm, readable + 1 > stage ? readable + 1 - stage : 0);
       }
     });
 
-    if (!analyzable || minStart >= schedOffset)
+    if (!analyzable)
       continue;
 
-    // (c) port disjointness over the overlap window.
+    // (c) port disjointness: pipeline stages that would overlap the
+    // frame's cycle states must not touch any (port, binding) the
+    // frame's static ops drive. Shared by the peephole (window =
+    // schedOffset - newStart) and the pre-arm decision (one more cycle
+    // of overlap: window + 1).
     DenseSet<std::pair<Value, unsigned>> framePortSet;
     for (auto atOp : frameOp.getBodyBlock().getOps<LoopScheduleAtOp>()) {
       bool isLaunchHolder = llvm::any_of(
@@ -3706,27 +3916,48 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
           framePortSet.insert({s.getMemoryValue(), getBindingPort(op)});
       });
     }
-    bool portConflict = false;
-    unsigned window = schedOffset - minStart;
-    for (auto stageAt : pipBlock.getOps<LoopScheduleAtOp>()) {
-      if ((unsigned)stageAt.getOffset() >= window)
-        continue;
-      stageAt.walk([&](Operation *op) {
-        Value mem;
-        if (auto l = dyn_cast<loopschedule::HWLoadLoweringInterface>(op))
-          mem = l.getMemoryValue();
-        else if (auto s =
-                     dyn_cast<loopschedule::HWStoreLoweringInterface>(op))
-          mem = s.getMemoryValue();
-        else
-          return;
-        if (framePortSet.contains({mem, getBindingPort(op)}))
-          portConflict = true;
-      });
+    auto portsDisjoint = [&](unsigned window) {
+      bool portConflict = false;
+      for (auto stageAt : pipBlock.getOps<LoopScheduleAtOp>()) {
+        if ((unsigned)stageAt.getOffset() >= window)
+          continue;
+        stageAt.walk([&](Operation *op) {
+          Value mem;
+          if (auto l = dyn_cast<loopschedule::HWLoadLoweringInterface>(op))
+            mem = l.getMemoryValue();
+          else if (auto s =
+                       dyn_cast<loopschedule::HWStoreLoweringInterface>(op))
+            mem = s.getMemoryValue();
+          else
+            return;
+          if (framePortSet.contains({mem, getBindingPort(op)}))
+            portConflict = true;
+        });
+      }
+      return !portConflict;
+    };
+
+    // Peephole move (earlier launch within the legal window).
+    unsigned chosenStart = schedOffset;
+    if (schedOffset > 0 && minStart < schedOffset &&
+        portsDisjoint(schedOffset - minStart)) {
+      chosenStart = minStart;
+      launchStartOffsets[launchIdx] = minStart;
     }
-    if (portConflict)
-      continue;
-    launchStartOffsets[(unsigned)frameWaitIdx[i].front()] = minStart;
+
+    // Pre-arm decision at the chosen offset. Only constant inits: a
+    // constant is cloned into the module — it cannot be a live cap_N
+    // port, whose value would change on the parent's iter_advance edge
+    // (the very edge the pre-arm latches on). Non-constant inits also
+    // subsume guard (b): a same-frame-produced init is never constant.
+    bool allInitsConstant = llvm::all_of(pipOp.getInits(), [](Value v) {
+      Operation *def = v.getDefiningOp();
+      return def && def->hasTrait<mlir::OpTrait::ConstantLike>();
+    });
+    if (enablePipelinePreArm && allInitsConstant && !funcHasDynAccess &&
+        chosenStart >= minStartPreArm &&
+        portsDisjoint(schedOffset - chosenStart + 1))
+      launchPreArm[launchIdx] = true;
   }
 
   // --- Fold a trailing iter-advance-only frame ---
@@ -3834,12 +4065,17 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   }();
 
   // --- Create FSM machine ---
+  // Every pre-armed launch (solo in its frame, but a machine may host
+  // several such frames) gets a registered issue-arm output, appended
+  // in launch order.
+  unsigned numPreArms = llvm::count(launchPreArm, true);
   std::string fsmName = node.prefix + "_fsm";
   builder.setInsertionPointToEnd(moduleOp.getBody());
   (void)createSequentialFSM(builder, loc, fsmName, numFrames, waitFrameIndices,
                             launchAtOffsets, launchStartOffsets,
                             frameLatencies, foldLastFrame, condBypass,
-                            condBypass && entryInitsReadyAtStart(seqOp));
+                            condBypass && entryInitsReadyAtStart(seqOp),
+                            launchPreArm);
 
   // --- Create FSM instance with backedges ---
   hw.setInsertionPointToEnd(hwBody);
@@ -3877,10 +4113,19 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   //               child_active_0..C-1, post_active_0..C-1,
   //               frame_cycle_<i>_<c>...
   unsigned numFsmResults = 3 + numFrames + 3 * numWaits + totalCycleOuts;
-  SmallVector<Type> resTys(numFsmResults, i1);
+  SmallVector<Type> resTys(numFsmResults + numPreArms, i1);
   auto inst = fsm::HWInstanceOp::create(
       hw, loc, resTys, hw.getStringAttr(fsmName + "_inst"),
       hw.getAttr<FlatSymbolRefAttr>(fsmName), instInputs, clk, rst);
+  // Per-launch registered issue arms, appended after the base results in
+  // launch order.
+  SmallVector<Value> fsmIssueArms(numWaits, Value());
+  {
+    unsigned armIdx = numFsmResults;
+    for (auto [j, pa] : llvm::enumerate(launchPreArm))
+      if (pa)
+        fsmIssueArms[j] = inst.getResult(armIdx++);
+  }
 
   Value fsmDone = inst.getResult(0);
   Value fsmFirstIter = inst.getResult(1);
@@ -4263,10 +4508,18 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       // capture the consumer reads whatever address the port has
       // moved to next.
       if (hasCycleGates && atOffset + 1 < fsmFrameCycleGates[frameIdx].size()) {
-        Value captureGate = comb::AndOp::create(
-            hw, loc, fsmFrameCycleGates[frameIdx][atOffset + 1],
-            notStallSeq);
         hw.setInsertionPointToEnd(hwBody);
+        // One gate per distinct enable cycle, created lazily and shared by
+        // every capture that uses it (a per-result AndOp would duplicate
+        // the common r=1 gate and churn the emitted names for nothing).
+        Value captureGateByResidual[2] = {Value(), Value()};
+        auto getCaptureGate = [&](unsigned residual) -> Value {
+          if (!captureGateByResidual[residual])
+            captureGateByResidual[residual] = comb::AndOp::create(
+                hw, loc, fsmFrameCycleGates[frameIdx][atOffset + residual],
+                notStallSeq);
+          return captureGateByResidual[residual];
+        };
         for (auto res : atOp.getResults()) {
           if (!resultNeedsCapture(res, atOffset))
             continue;
@@ -4282,15 +4535,27 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
             continue;
           if (!isa<IntegerType>(mapped.getType()))
             continue;
+          // The enable cycle is atOffset + residual: 1 for anything the
+          // value's cone only settles in during the NEXT cycle (a load's
+          // rd_data — the historical timing), 0 for a pure-comb
+          // load-indirection result that is already settled during the
+          // at's own cycle (see atResultResidualLatency). The same
+          // residual feeds minLegalLaunchStart, so a launch never samples
+          // a capture before its enable has fired.
+          unsigned residual = atResultResidualLatency(
+              atOp, res.getResultNumber(), operatorLibrary);
+          if (atOffset + residual >= fsmFrameCycleGates[frameIdx].size())
+            continue;
           Value resetVal = createZeroConstant(hw, loc, mapped.getType());
           auto regName = hw.getStringAttr(
               node.prefix + "_f" + std::to_string(frameIdx) + "_at" +
               std::to_string(atOffset) + "_r" +
               std::to_string(res.getResultNumber()) + "_latched");
           Value latched = seq::CompRegClockEnabledOp::create(
-              hw, loc, mapped, clk, captureGate, rst, resetVal, regName);
-          // Readable from atOffset + 2: the enable is atOffset + 1's gate.
-          pendingCaptures.push_back({atOffset + 2, res, latched});
+              hw, loc, mapped, clk, getCaptureGate(residual), rst, resetVal,
+              regName);
+          // Readable the cycle after the enable.
+          pendingCaptures.push_back({atOffset + residual + 1, res, latched});
         }
       }
     }
@@ -4602,17 +4867,22 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                                            clk, rst, frameChildStart,
                                            pipPrefix, pipDone,
                                            perFramePorts[frameIdx],
-                                           memrefArgs)))
+                                           memrefArgs,
+                                           launchPreArm[(unsigned)waitIdx],
+                                           fsmIssueArms[(unsigned)waitIdx])))
               return failure();
           } else {
             DenseMap<Value, MemPortMapping> slotPorts;
             for (auto &memInfo : memrefArgs)
               slotPorts[memInfo.originalArg].rdData =
                   perFramePorts[frameIdx][memInfo.originalArg].rdData;
+            // Multi-launch frames are never pre-arm-eligible (guard a),
+            // so this passes false by construction.
             if (failed(lowerPipelineChild(pipOp, hw, loc, hwBody, localMapping,
                                            clk, rst, frameChildStart,
                                            pipPrefix, pipDone, slotPorts,
-                                           memrefArgs)))
+                                           memrefArgs,
+                                           launchPreArm[(unsigned)waitIdx])))
               return failure();
             for (auto &memInfo : memrefArgs) {
               auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
@@ -5062,7 +5332,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     Block *hwBody, IRMapping &mapping, Value clk, Value rst,
     Value startSignal, StringRef namePrefix, Value &doneSignal,
     DenseMap<Value, MemPortMapping> &memPorts,
-    ArrayRef<PortArgInfo> memrefArgs) {
+    ArrayRef<PortArgInfo> memrefArgs, bool allowPreArm, Value preArmIssue) {
   // Phase 3B: before the scheduler's launch/expect pairs are inlined
   // away, snapshot the info the stall logic needs from each expect.
   // Every expect marks a point where a dynamic-latency op's result is
@@ -5214,9 +5484,32 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   activeNextBE.setValue(activeNext);
 
   uint64_t II = pipOp.getII();
+  // The issue gate: `active` historically, or `active | child_start` when
+  // this pipeline PRE-ARMS (its iter-arg registers already hold their
+  // inits from the previous invocation's drain edge, so stage 0 may
+  // issue in the launch cycle itself). Whether pre-arm applies is only
+  // known at the iter-arg preload loop below — the feedback registers
+  // must exist to analyze — so the gate is a backedge resolved there.
+  // When pre-arm is declined the backedge resolves to the plain `active`
+  // Value and the emitted IR is byte-identical to the historical form.
+  //
+  // Issuing in the launch cycle cannot race the pipeline's own stall:
+  // every stall term is stage-occupancy-gated (`stageCE[dest] & ~valid`
+  // for expects, raw stage gate & ~ready for posted stores), and during
+  // the done-held idle window and the launch cycle all stage CEs are 0,
+  // so stall is 0 by construction. The loop-module path additionally
+  // gates `startSignal` on the parent's stall (the pend latch), so a
+  // parent-stalled launch cannot issue either.
+  std::optional<Backedge> issueGateBE;
+  Value issueGate = active;
+  if (allowPreArm) {
+    assert(preArmIssue && "pre-arm requires the machine's registered arm");
+    issueGateBE = bb.get(hwBuilder.getI1Type());
+    issueGate = Value(*issueGateBE);
+  }
   Value ceGen;
   if (II == 1) {
-    ceGen = active;
+    ceGen = issueGate;
   } else {
     unsigned counterWidth = llvm::Log2_64_Ceil(II);
     Type counterType = IntegerType::get(ctx, counterWidth);
@@ -5236,13 +5529,17 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
         hwBuilder, loc, comb::ICmpPredicate::eq, counterReg, cIIMinusOne);
     Value wrapped =
         comb::MuxOp::create(hwBuilder, loc, atMax, cZero, counterPlusOne);
+    // The issue gate (not bare `active`) seeds the counter so a
+    // launch-cycle issue starts the II cadence at the launch: counter 1
+    // the cycle after the first issue, wrapping to the next issue at
+    // T + II.
     Value counterNext =
-        comb::MuxOp::create(hwBuilder, loc, active, wrapped, cZero);
+        comb::MuxOp::create(hwBuilder, loc, issueGate, wrapped, cZero);
     counterBackedge.setValue(counterNext);
 
     Value isZero = comb::ICmpOp::create(
         hwBuilder, loc, comb::ICmpPredicate::eq, counterReg, cZero);
-    ceGen = comb::AndOp::create(hwBuilder, loc, isZero, active);
+    ceGen = comb::AndOp::create(hwBuilder, loc, isZero, issueGate);
   }
 
   Value activeCE = comb::AndOp::create(hwBuilder, loc, ceGen, condEffective);
@@ -6024,72 +6321,169 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   }
 
   auto pipIterArgUpdates = loopschedule::getIterArgUpdatesInOrder(pipOp);
+
+  // --- Analysis (no mutation): per iter-arg, can it take the
+  // feedback-register preload path, and is its init a compile-time
+  // constant? Pre-arm (loading inits at the previous invocation's DRAIN
+  // edge instead of the launch edge, so stage 0 can issue in the launch
+  // cycle) is ALL-OR-NOTHING: a single launch-edge-armed argument under
+  // issue-at-launch would be read one cycle before its init lands.
+  struct IterArgPreloadInfo {
+    Value init;
+    Value feedback;
+    seq::CompRegClockEnabledOp feedbackReg;
+    unsigned feedbackStage = 0;
+    unsigned d = 0;
+    bool canPreload = false;
+    bool constantInit = false;
+  };
+  SmallVector<IterArgPreloadInfo> argInfos(numIterArgs);
+  {
+    // Simulates the preloadedRegs reuse-compat bookkeeping of the apply
+    // pass so analysis and application agree exactly.
+    DenseMap<Operation *, std::pair<Value, unsigned>> reuseSim;
+    for (unsigned i = 0; i < numIterArgs; ++i) {
+      IterArgPreloadInfo &info = argInfos[i];
+      info.init = mapping.lookup(pipOp.getInits()[i]);
+      Value termVal =
+          pipIterArgUpdates[i]
+              ? loopschedule::getIterArgPhaseResult(pipIterArgUpdates[i])
+              : Value{};
+      info.feedback = mapping.lookup(termVal);
+      // The feedback value is produced at some stage; the init must stay
+      // visible until that stage has fired at least once. If the feedback
+      // isn't a stage result (shouldn't happen for well-formed
+      // pipelines), fall back to stage 0.
+      if (auto opResult = dyn_cast<OpResult>(termVal)) {
+        if (auto stage = dyn_cast<LoopScheduleAtOp>(opResult.getOwner())) {
+          for (unsigned s = 0; s < stages.size(); ++s)
+            if (stages[s] == stage) {
+              info.feedbackStage = s;
+              break;
+            }
+        }
+      }
+
+      unsigned firstUse = firstIterArgUseOffset(pipOp, i);
+      info.d = condConeArgs.contains(i) ? 0u
+               : firstUse == UINT_MAX   ? info.feedbackStage
+                                        : firstUse;
+
+      info.feedbackReg =
+          info.feedback
+              ? info.feedback.getDefiningOp<seq::CompRegClockEnabledOp>()
+              : seq::CompRegClockEnabledOp();
+      info.canPreload = info.feedbackReg && info.d <= info.feedbackStage &&
+                        info.init != Value(iterArgBackedges[i]);
+      if (info.canPreload) {
+        if (auto it = reuseSim.find(info.feedbackReg); it != reuseSim.end())
+          info.canPreload =
+              it->second.first == info.init && it->second.second <= info.d;
+        else
+          info.canPreload = info.feedbackReg.getClockEnable() ==
+                            gatedStageCE[info.feedbackStage];
+      }
+      if (info.canPreload)
+        reuseSim[info.feedbackReg] = {info.init, info.d};
+
+      // Pre-armable only when the init is a constant: constants are
+      // cloned into the module, so the value cannot be a live cap_N port
+      // — and a cap-derived init would sample the parent's PRE-advance
+      // value, because the parent's iter_advance edge IS this pipeline's
+      // drain edge.
+      Operation *srcDef = pipOp.getInits()[i].getDefiningOp();
+      info.constantInit =
+          srcDef && srcDef->hasTrait<mlir::OpTrait::ConstantLike>();
+    }
+  }
+
+  // --- Decision.
+  bool preArm = allowPreArm;
+  for (IterArgPreloadInfo &info : argInfos)
+    preArm = preArm && info.canPreload && info.constantInit;
+
+  // --- Apply. Pre-arm mode: ONE shared drain-level pulse (resolved after
+  // the epilogue/store-tail chain below) selects the init into every
+  // feedback register through the idle window, and the register's RESET
+  // value becomes the init so the first-ever invocation is pre-armed
+  // too. The historical mode is byte-identical to before.
+  std::optional<Backedge> preArmPulseBE;
+  if (preArm && numIterArgs > 0)
+    preArmPulseBE = bb.get(hwBuilder.getI1Type());
   // Registers already preloaded: init value + pulse depth, so a second
   // iter_arg resolving to the same register can reuse the preload only
   // when it is provably compatible.
   DenseMap<Operation *, std::pair<Value, unsigned>> preloadedRegs;
   for (unsigned i = 0; i < numIterArgs; ++i) {
-    Value init = mapping.lookup(pipOp.getInits()[i]);
-    Value termVal = pipIterArgUpdates[i]
-                        ? loopschedule::getIterArgPhaseResult(pipIterArgUpdates[i])
-                        : Value{};
-    Value feedback = mapping.lookup(termVal);
-    // The feedback value is produced at some stage; the init must stay
-    // visible until that stage has fired at least once. If the feedback
-    // isn't a stage result (shouldn't happen for well-formed pipelines),
-    // fall back to stage 0.
-    unsigned feedbackStage = 0;
-    if (auto opResult = dyn_cast<OpResult>(termVal)) {
-      if (auto stage = dyn_cast<LoopScheduleAtOp>(opResult.getOwner())) {
-        for (unsigned s = 0; s < stages.size(); ++s)
-          if (stages[s] == stage) {
-            feedbackStage = s;
-            break;
-          }
-      }
-    }
-
-    unsigned firstUse = firstIterArgUseOffset(pipOp, i);
-    unsigned d = condConeArgs.contains(i) ? 0u
-                 : firstUse == UINT_MAX   ? feedbackStage
-                                          : firstUse;
-
-    auto feedbackReg =
-        feedback ? feedback.getDefiningOp<seq::CompRegClockEnabledOp>()
-                 : seq::CompRegClockEnabledOp();
-    bool canPreload =
-        feedbackReg && d <= feedbackStage && init != Value(iterArgBackedges[i]);
-    if (canPreload) {
-      if (auto it = preloadedRegs.find(feedbackReg);
-          it != preloadedRegs.end())
-        canPreload = it->second.first == init && it->second.second <= d;
-      else
-        canPreload =
-            feedbackReg.getClockEnable() == gatedStageCE[feedbackStage];
-    }
-
-    if (canPreload) {
+    IterArgPreloadInfo &info = argInfos[i];
+    if (info.canPreload) {
+      auto feedbackReg = info.feedbackReg;
       if (!preloadedRegs.count(feedbackReg)) {
-        Value pulse = getStartDelayed(d);
-        Value newD = comb::MuxOp::create(hwBuilder, loc, pulse, init,
+        assert(!preArm || info.constantInit);
+        Value pulse = preArm ? Value(*preArmPulseBE) : getStartDelayed(info.d);
+        Value newD = comb::MuxOp::create(hwBuilder, loc, pulse, info.init,
                                          feedbackReg.getInput());
         Value newCE = comb::OrOp::create(
             hwBuilder, loc, feedbackReg.getClockEnable(), pulse);
         feedbackReg.getInputMutable().assign(newD);
         feedbackReg.getClockEnableMutable().assign(newCE);
-        preloadedRegs[feedbackReg] = {init, d};
+        if (preArm)
+          feedbackReg.getResetValueMutable().assign(info.init);
+        preloadedRegs[feedbackReg] = {info.init, info.d};
       }
       iterArgBackedges[i].setValue(feedbackReg);
       continue;
     }
+    assert(!preArm && "pre-arm is all-or-nothing; fallback paths are "
+                      "launch-edge-timed and would be read early");
     Value muxed = comb::MuxOp::create(
-        hwBuilder, loc, getFirstIter(feedbackStage), init, feedback);
+        hwBuilder, loc, getFirstIter(info.feedbackStage), info.init,
+        info.feedback);
     iterArgBackedges[i].setValue(muxed);
   }
 
+  // Resolve the issue gate: pre-armed pipelines admit the launch cycle
+  // through the machine's REGISTERED issue arm (`preArmIssue` — equal to
+  // the Moore child_start decode, but a register Q, so the CE cone's
+  // sources stay flops: the combinational decode here measured −164 ps
+  // on the vadd class / −124 ps on matmul_tiled_n). Declined pipelines
+  // resolve to the plain historical `active` and the backedge leaves no
+  // trace in the emitted IR.
+  if (issueGateBE)
+    issueGateBE->setValue(
+        preArm ? comb::OrOp::create(hwBuilder, loc, active, preArmIssue)
+               : active);
+  if (preArm) {
+    ++numPreArmedPipelines;
+    LLVM_DEBUG(llvm::dbgs()
+               << "pre-armed pipeline: " << namePrefix << "\n");
+  }
+
+  // Map pipeline results. Under pre-arm the drain edge that re-arms the
+  // feedback registers with their inits is the SAME edge on which the
+  // final iteration's values are last readable — but consumers (a post
+  // frame's store, the parent's iter-arg update, an await capture) read
+  // the results one or more cycles AFTER done, when a pre-armed feedback
+  // register already holds its init again (the two-store epilogue kernel
+  // returned its output untouched exactly this way). Latch every result
+  // into a dedicated hold register on the one-shot drain pulse: the hold
+  // captures the final value on the very edge the feedback register
+  // reloads, and stays stable until the next invocation's drain. Unused
+  // holds die in canonicalization (no inner sym).
+  unsigned resultHoldIdx = 0;
   for (auto [result, termResult] :
-       llvm::zip(pipOp.getResults(), terminatorOp.getResults()))
-    mapping.map(result, mapping.lookup(termResult));
+       llvm::zip(pipOp.getResults(), terminatorOp.getResults())) {
+    Value mapped = mapping.lookup(termResult);
+    if (preArmPulseBE) {
+      Value zero = createZeroConstant(hwBuilder, loc, mapped.getType());
+      mapped = seq::CompRegClockEnabledOp::create(
+          hwBuilder, loc, mapped, clk, Value(*preArmPulseBE), rst, zero,
+          hwBuilder.getStringAttr(
+              (namePrefix + "_result_hold_" + std::to_string(resultHoldIdx++))
+                  .str()));
+    }
+    mapping.map(result, mapped);
+  }
 
   // LegUp-style epilogue done signal. Latch the loop-exit event into an
   // epilogue register, then shift it through a delay chain matching the
@@ -6184,6 +6578,29 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // first cycle any WAIT state can sample it. Registering it here only
   // cost a flat +1 cycle on every launch.
   doneSignal = doneComb;
+
+  // Pre-arm pulse: a ONE-SHOT on the drain edge. done is a LEVEL held
+  // through the idle window, and the pulse must last a single cycle
+  // because the same edge that re-arms the feedback registers also
+  // captures their final values into the result holds above — a held
+  // select would overwrite the holds with the inits one edge later. The
+  // `~issue_arm` term (the machine's registered launch bit, equal to
+  // ~child_start but a flop) keeps the launch cycle itself for the first
+  // iteration's own update (stage 0 reads Q = init combinationally at
+  // the launch and its result latches on that edge); `~done_prev` limits
+  // the pulse to the first drain cycle. Resolved here, past the
+  // store-tail chain, so arming never precedes a static store's commit.
+  if (preArmPulseBE) {
+    Value notArm = comb::createOrFoldNot(hwBuilder, loc, preArmIssue);
+    Value doneHeld =
+        comb::AndOp::create(hwBuilder, loc, doneSignal, notArm);
+    Value donePrev = seq::CompRegOp::create(
+        hwBuilder, loc, doneHeld, clk, rst, falseConst,
+        hwBuilder.getStringAttr(namePrefix + "_done_prev"));
+    Value notDonePrev = comb::createOrFoldNot(hwBuilder, loc, donePrev);
+    preArmPulseBE->setValue(
+        comb::AndOp::create(hwBuilder, loc, doneHeld, notDonePrev));
+  }
 
   // Phase 3B: resolve the stall backedge. Stall while an expect's dest
   // stage wants to consume but its done counter is empty and no done is
@@ -6731,6 +7148,21 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   auto unbindLibrary =
       llvm::make_scope_exit([&] { operatorLibrary = nullptr; });
 
+  // R7 adapter-port refusal (see the member comment): one function-scope
+  // scan up front, consulted by every pre-arm eligibility decision below.
+  funcHasDynAccess = false;
+  funcOp->walk([&](Operation *op) {
+    bool dyn = false;
+    if (auto l = dyn_cast<loopschedule::LoadInterface>(op))
+      dyn = l.isDynamic();
+    else if (auto s = dyn_cast<loopschedule::StoreInterface>(op))
+      dyn = s.isDynamic();
+    if (!dyn)
+      return WalkResult::advance();
+    funcHasDynAccess = true;
+    return WalkResult::interrupt();
+  });
+
   // --- Sequential path (supports nesting) ---
 
   IRMapping mapping;
@@ -6929,6 +7361,75 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     }
   }
 
+  // Pre-arm eligibility for function-frame inline pipelines (the gap-9
+  // inline half at the function level — vadd-class kernels and every
+  // flattened static nest). Conservative v1 guards: the pipeline must be
+  // its frame's and its group's ONLY entry, all inits compile-time
+  // constants (a constant is cloned into the module and cannot be a
+  // value that moves on any advance/drain edge), the frame must contain
+  // nothing but the launch holder (no other at ops, no dyn accesses —
+  // there is no cycle arithmetic at the function level to prove a
+  // tighter bound against, so any same-frame coupling refuses), and the
+  // pipeline body must read nothing defined in the frame outside its own
+  // launch.
+  SmallVector<bool> entryPreArm(entries.size(), false);
+  for (unsigned ei = 0; ei < entries.size(); ++ei) {
+    FrameChild e = entries[ei];
+    if (e.kind != 1 || !enablePipelinePreArm || funcHasDynAccess)
+      continue;
+    bool soloInFrame = llvm::count_if(entries, [&](const FrameChild &o) {
+                         return o.frameIdx == e.frameIdx;
+                       }) == 1;
+    bool soloInGroup =
+        llvm::count(entryGroups, entryGroups[ei]) == 1;
+    if (!soloInFrame || !soloInGroup)
+      continue;
+    LoopSchedulePipelineOp pipOp = entries[ei].pipOp;
+    bool allInitsConstant = llvm::all_of(pipOp.getInits(), [](Value v) {
+      Operation *def = v.getDefiningOp();
+      return def && def->hasTrait<mlir::OpTrait::ConstantLike>();
+    });
+    if (!allInitsConstant)
+      continue;
+    LoopScheduleFrameOp frameOp = topFrames[e.frameIdx];
+    Operation *launchHolder =
+        frameOp.getBodyBlock().findAncestorOpInBlock(*pipOp.getOperation());
+    bool frameClean = true;
+    for (auto atOp : frameOp.getBodyBlock().getOps<LoopScheduleAtOp>())
+      if (atOp.getOperation() != launchHolder)
+        frameClean = false;
+    if (frameClean)
+      frameOp.getBodyBlock().walk([&](Operation *op) {
+        if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(op))
+          return WalkResult::skip(); // the child's own body doesn't count
+        bool dyn = false;
+        if (auto l = dyn_cast<loopschedule::LoadInterface>(op))
+          dyn = l.isDynamic();
+        else if (auto s = dyn_cast<loopschedule::StoreInterface>(op))
+          dyn = s.isDynamic();
+        if (!dyn)
+          return WalkResult::advance();
+        frameClean = false;
+        return WalkResult::interrupt();
+      });
+    if (frameClean)
+      e.launchOp.getBodyBlock().walk([&](Operation *user) {
+        for (Value operand : user->getOperands()) {
+          Operation *def = operand.getDefiningOp();
+          if (!def || !frameOp->isAncestor(def))
+            continue; // block arg or pre-frame value: stable
+          Operation *defTop =
+              frameOp.getBodyBlock().findAncestorOpInBlock(*def);
+          if (defTop == launchHolder)
+            continue; // moves with the child
+          frameClean = false;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+    entryPreArm[ei] = frameClean && launchHolder;
+  }
+
   // Decide the early-done cut-through: `earlyDoneEntry` is the entry whose
   // completion the module-level done PORT will cut through on, or -1. The
   // FSM's shape does not depend on it (tx_in_flight/ready keep the Moore
@@ -6983,8 +7484,13 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   builder.setInsertionPointToEnd(moduleOp.getBody());
   SmallVector<int> entryCycleOutBase;
+  // Every pre-armed entry (solo in its frame and group, but a function
+  // may hold several such frames — atax/mm2 sequence multiple solo
+  // pipelines) gets a registered issue-arm output, appended in entry
+  // order.
+  unsigned numEntryPreArms = llvm::count(entryPreArm, true);
   createFunctionFSM(builder, loc, fsmName, entryKinds, entryLatencies,
-                    entryGroups, entryCycleOutBase);
+                    entryGroups, entryCycleOutBase, entryPreArm);
   unsigned totalEntryCycleOuts = 0;
   for (unsigned i = 0; i < entries.size(); ++i)
     if (entryCycleOutBase[i] >= 0)
@@ -7056,13 +7562,22 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   }
 
   unsigned numEntries = entries.size();
-  SmallVector<Type> fsmResultTypes(
-      1 + numChildren + numEntries + totalEntryCycleOuts, i1);
+  unsigned numFuncFsmResults = 1 + numChildren + numEntries + totalEntryCycleOuts;
+  SmallVector<Type> fsmResultTypes(numFuncFsmResults + numEntryPreArms, i1);
   auto fsmInst = fsm::HWInstanceOp::create(
       builder, loc, fsmResultTypes,
       builder.getStringAttr(fsmName + "_inst"),
       builder.getAttr<FlatSymbolRefAttr>(fsmName),
       fsmInputs, clk, rst);
+  // Per-entry registered issue arms, appended after the base results in
+  // entry order.
+  SmallVector<Value> funcIssueArms(numEntries, Value());
+  {
+    unsigned armIdx = numFuncFsmResults;
+    for (auto [ei2, pa] : llvm::enumerate(entryPreArm))
+      if (pa)
+        funcIssueArms[ei2] = fsmInst.getResult(armIdx++);
+  }
 
   // Extract FSM outputs.
   unsigned fsmOutIdx = 0;
@@ -7584,7 +8099,9 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
                                     clk, rst,
                                     childStartSignals[childIndexForEntry[ei]],
                                     pipPrefix, pipDone,
-                                    perEntryPorts[ei], memrefArgs)))
+                                    perEntryPorts[ei], memrefArgs,
+                                    entryPreArm[ei],
+                                    funcIssueArms[ei])))
         return failure();
       childDoneBEs[childIndexForEntry[ei]].setValue(pipDone);
 
@@ -8608,6 +9125,12 @@ void LoopScheduleToFSMPass::runOnOperation() {
 std::unique_ptr<OperationPass<ModuleOp>>
 circt::createLoopScheduleToFSMPass() {
   return std::make_unique<LoopScheduleToFSMPass>();
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+circt::createLoopScheduleToFSMPass(
+    const circt::LoopScheduleToFSMOptions &options) {
+  return std::make_unique<LoopScheduleToFSMPass>(options);
 }
 
 void circt::registerLoopScheduleToFSM() {

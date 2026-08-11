@@ -1,4 +1,4 @@
-// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm)" %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm{enable-pipeline-prearm=true})" %s | FileCheck %s
 
 
 // Simple single-stage II=1 pipeline: accumulates arg0 for 10 iterations.
@@ -16,6 +16,10 @@
 // CHECK: fsm.hw_instance
 // Pipeline-local active register
 // CHECK: seq.compreg.ce sym @loop0_active
+// This pipeline pre-arms (constant inits, solo launch): the issue gate
+// ORs the machine's registered issue_arm into `active`, so the first
+// iteration issues in the launch cycle instead of one cycle later.
+// CHECK: comb.or %loop0_active, %{{.+}}
 // CHECK: hw.output
 
 // CHECK-LABEL: fsm.machine @pipeline_add_fsm
