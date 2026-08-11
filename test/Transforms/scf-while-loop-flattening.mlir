@@ -231,14 +231,23 @@ func.func @depth1_noop() {
 
 // -----
 
-// Negative: inner upper bound is not a constant (comes from function arg).
+// Positive (runtime bounds): a PERFECT nest with a nest-invariant runtime
+// INNER bound flattens — the scatter_update shape, and the case Vitis's
+// auto-flattening also accepts. The wrap compare reads the held SSA
+// value, and the flattened entry condition ANDs the inner compare so a
+// zero-trip inner (`ubDyn == 0`) exits before executing anything,
+// matching the original nest.
 
-// CHECK-LABEL: func.func @noncanonical_inner
+// CHECK-LABEL: func.func @runtime_inner_bound
 // CHECK:         scf.while
+// CHECK:         %[[CO:.+]] = arith.cmpi slt, %{{.+}}, %c4
+// CHECK:         %[[CI:.+]] = arith.cmpi slt, %{{.+}}, %arg0
+// CHECK:         %[[CC:.+]] = arith.andi %[[CO]], %[[CI]]
+// CHECK:         scf.condition(%[[CC]])
 // CHECK:         do {
-// CHECK:           scf.while
-// CHECK:         }
-func.func @noncanonical_inner(%ubDyn: i32) {
+// CHECK-NOT:       scf.while
+// CHECK:           arith.cmpi sge, %{{.+}}, %arg0
+func.func @runtime_inner_bound(%ubDyn: i32) {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32
   %c4 = arith.constant 4 : i32
@@ -249,6 +258,110 @@ func.func @noncanonical_inner(%ubDyn: i32) {
   ^bb0(%i: i32):
     %rj = scf.while (%j = %c0) : (i32) -> i32 {
       %cj = arith.cmpi slt, %j, %ubDyn : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Negative (runtime bounds): an inner bound that depends on the OUTER IV
+// is not nest-invariant (spmv's `rowptr[i]` shape) — stays nested.
+
+// CHECK-LABEL: func.func @runtime_iv_dependent_bound
+// CHECK:         scf.while
+// CHECK:         do {
+// CHECK:           scf.while
+// CHECK:         }
+func.func @runtime_iv_dependent_bound() {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c4 = arith.constant 4 : i32
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c4 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %ub = arith.addi %i, %c1 : i32
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %ub : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Negative (runtime bounds): a runtime-bound nest with a POST-op (a
+// per-row epilogue store) refuses — the original epilogue runs even when
+// the inner level zero-trips, and the wrap-predicated flattened form
+// would skip it. Only PERFECT nests take the runtime path.
+
+// CHECK-LABEL: func.func @runtime_bound_post_op
+// CHECK:         scf.while
+// CHECK:         do {
+// CHECK:           scf.while
+// CHECK:         }
+func.func @runtime_bound_post_op(%ubDyn: i32, %mem: memref<4xi32>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c4 = arith.constant 4 : i32
+  %c0_idx = arith.constant 0 : index
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c4 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %ubDyn : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    } attributes {hls.pipeline}
+    memref.store %i, %mem[%c0_idx] : memref<4xi32>
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Negative (runtime bounds): sle against a runtime bound refuses in v1
+// (the exclusive normalization would have to materialize ub+1).
+
+// CHECK-LABEL: func.func @runtime_bound_sle
+// CHECK:         scf.while
+// CHECK:         do {
+// CHECK:           scf.while
+// CHECK:         }
+func.func @runtime_bound_sle(%ubDyn: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c4 = arith.constant 4 : i32
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c4 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi sle, %j, %ubDyn : i32
       scf.condition(%cj) %j : i32
     } do {
     ^bb0(%j: i32):

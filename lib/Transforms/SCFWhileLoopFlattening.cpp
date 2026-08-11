@@ -32,6 +32,22 @@
 //     iterations where the original epilogue ran. Downstream scheduling
 //     (ifOpConversion) turns the scf.if into predicated operations.
 //
+// Bounds may be CONSTANT or RUNTIME. A runtime (SSA) upper bound is
+// accepted for PERFECT nests only, under: the bound dominates the whole
+// nest (nest-invariance — a bound loaded per outer iteration, spmv's
+// rowptr, is structurally excluded), the predicate is slt/ult (already
+// exclusive, nothing to normalize), lb and step still constant, and no
+// dynamic-latency access in the nest (matching Vitis, which flattens the
+// on-chip scatter nest and disables flattening for its m_axi variant —
+// and keeping AXI netlists byte-identical here). The odometer's wrap
+// compare then reads the held SSA value, and the flattened entry
+// condition ANDs every runtime level's compare so a zero-trip inner
+// level (cols == 0) exits before executing anything — exactly the
+// original perfect nest's behavior. Almost-perfect structure with
+// runtime bounds is REFUSED: the original per-pass epilogue runs even
+// when the levels below zero-trip, but the wrap-predicated form would
+// skip it.
+//
 // LOADS used in the inner body are NOT absorbed here — a load pre-op still
 // rejects the nest. AmcLoopReperfection (which runs immediately before this
 // pass in the AMC pipeline) owns their placement: it SINKS on-chip invariant
@@ -46,6 +62,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Analysis/SCFWhileTripCountAnalysis.h"
+#include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -78,11 +95,17 @@ struct NestLevel {
   APInt lb;                // Constant lower bound (initial value).
   APInt ubNormalized;      // Exclusive upper bound after predicate
                            // normalization (sle→slt+1, ule→ult+1).
+                           // Meaningless when ubValue is set.
   APInt step;              // Constant positive step.
   arith::CmpIPredicate origPred;
   arith::AddIOp updateOp;  // `addi iv_after, step` feeding the yield.
   BlockArgument ivAfter;   // The after-region IV block argument.
   IntegerType ivType;
+  /// Non-null for a RUNTIME upper bound: the original compare's rhs, an
+  /// SSA value collectNest verifies dominates the whole nest. Only
+  /// slt/ult levels may carry one (the bound is already exclusive).
+  Value ubValue = nullptr;
+  bool isRuntime() const { return static_cast<bool>(ubValue); }
 };
 
 /// Returns true if `pred` is one of the supported comparison kinds.
@@ -150,8 +173,17 @@ static std::optional<NestLevel> matchLevel(WhileOp whileOp) {
   unsigned idx = ivBefore.getArgNumber();
 
   APInt ubConst;
-  if (!matchPattern(cmp.getRhs(), m_ConstantInt(&ubConst)))
-    return std::nullopt;
+  Value ubValue = nullptr;
+  bool constantUb = matchPattern(cmp.getRhs(), m_ConstantInt(&ubConst));
+  if (!constantUb) {
+    // Runtime upper bound: slt/ult only (already-exclusive bounds need no
+    // normalization). Nest-invariance is checked by collectNest, which
+    // knows the outermost loop.
+    if (cmp.getPredicate() != arith::CmpIPredicate::slt &&
+        cmp.getPredicate() != arith::CmpIPredicate::ult)
+      return std::nullopt;
+    ubValue = cmp.getRhs();
+  }
 
   APInt lb;
   if (!matchPattern(whileOp.getInits()[idx], m_ConstantInt(&lb)))
@@ -161,7 +193,7 @@ static std::optional<NestLevel> matchLevel(WhileOp whileOp) {
   if (!ivType)
     return std::nullopt;
   unsigned bw = ivType.getWidth();
-  if (lb.getBitWidth() != bw || ubConst.getBitWidth() != bw)
+  if (lb.getBitWidth() != bw || (constantUb && ubConst.getBitWidth() != bw))
     return std::nullopt;
 
   // Find the IV in the after region: the condition forwards before-args
@@ -200,7 +232,11 @@ static std::optional<NestLevel> matchLevel(WhileOp whileOp) {
   if (!step.isStrictlyPositive())
     return std::nullopt;
 
-  // Normalize inclusive predicates to exclusive bounds.
+  // Normalize inclusive predicates to exclusive bounds. A runtime bound
+  // is slt/ult by construction — already exclusive, nothing to compute.
+  if (!constantUb)
+    return NestLevel{whileOp, idx,  lb,     APInt::getZero(bw), step,
+                     cmp.getPredicate(), addOp, ivAfter, ivType, ubValue};
   APInt ub = ubConst;
   bool isSigned = isSignedPredicate(cmp.getPredicate());
   switch (cmp.getPredicate()) {
@@ -233,7 +269,7 @@ static std::optional<NestLevel> matchLevel(WhileOp whileOp) {
   }
 
   return NestLevel{whileOp, idx,  lb,     ub,     step,
-                   cmp.getPredicate(), addOp, ivAfter, ivType};
+                   cmp.getPredicate(), addOp, ivAfter, ivType, nullptr};
 }
 
 /// A scalar value carried through the nest's inner levels: initialized at an
@@ -310,10 +346,18 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
     if (!level)
       return std::nullopt;
 
-    // Require a non-zero constant trip count so the flattened loop isn't
-    // degenerate. (Computed locally: the public analysis only accepts
-    // single-iter-arg loops, and levels here may carry chains.)
-    {
+    if (level->isRuntime()) {
+      // A runtime bound must be nest-invariant: usable from the flattened
+      // loop's condition and wrap compares, i.e. defined above the whole
+      // nest. (spmv's per-row `rowptr[i]` bound is defined inside it and
+      // lands here.) Zero-trip degeneracy is handled dynamically by the
+      // ANDed entry condition instead of a static trip-count check.
+      if (!isDefinedAboveNest(level->ubValue, outer))
+        return std::nullopt;
+    } else {
+      // Require a non-zero constant trip count so the flattened loop isn't
+      // degenerate. (Computed locally: the public analysis only accepts
+      // single-iter-arg loops, and levels here may carry chains.)
       APInt range = level->ubNormalized - level->lb;
       if (!range.isStrictlyPositive())
         return std::nullopt;
@@ -408,6 +452,42 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
   // while, so everything landed in preOps; that's its body, not a boundary).
   info.preOps.back().clear();
   info.postOps.back().clear();
+
+  // Runtime-bound nests must be PERFECT: the wrap-predicated form skips a
+  // boundary epilogue whenever the levels below zero-trip, but the
+  // original ran it — so any pre-op, post-op, or carried chain refuses
+  // (Vitis draws the same line: it flattens the perfect scatter nest and
+  // leaves every reduction-epilogue nest alone). They must also be free
+  // of dynamic-latency accesses: the flatten changes the loop structure
+  // an AXI kernel's descriptor planning and posted-write overlap were
+  // measured on (Vitis likewise disables flattening on its m_axi
+  // variant), and this pass's byte-diff discipline keeps AXI netlists
+  // frozen.
+  if (llvm::any_of(nest, [](const NestLevel &l) { return l.isRuntime(); })) {
+    for (NestLevel lvl : nest)
+      if (lvl.loop.getInits().size() != 1)
+        return std::nullopt;
+    for (auto &ops : info.preOps)
+      if (!ops.empty())
+        return std::nullopt;
+    for (auto &ops : info.postOps)
+      if (!ops.empty())
+        return std::nullopt;
+    bool hasDynAccess = false;
+    nest.back().loop->walk([&](Operation *op) {
+      bool dyn = false;
+      if (auto l = dyn_cast<circt::loopschedule::LoadInterface>(op))
+        dyn = l.isDynamic();
+      else if (auto st = dyn_cast<circt::loopschedule::StoreInterface>(op))
+        dyn = st.isDynamic();
+      if (!dyn)
+        return WalkResult::advance();
+      hasDynAccess = true;
+      return WalkResult::interrupt();
+    });
+    if (hasDynAccess)
+      return std::nullopt;
+  }
 
   // --- Resolve extra iter-args into carried chains. ---
   // For each level's non-IV iter-args, walk the init side upward: an init
@@ -818,7 +898,16 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
   // value will be promoted to a dedicated iter-arg of the flattened while,
   // updated incrementally from the odometer's done signals (eliminating
   // the per-iteration mul/add chain that FlattenMemRefs leaves behind).
-  SmallVector<AddrCandidate> candidates = collectAddrCandidates(inner, nest);
+  // Linearized-address promotion needs every child level's RANGE as a
+  // compile-time constant (the wrap-reversal addend); with a runtime
+  // bound the body's own address arithmetic keeps working through the IV
+  // mapping — same expressions the unflattened inner body computed — so
+  // promotion is simply skipped.
+  bool anyRuntime =
+      llvm::any_of(nest, [](const NestLevel &l) { return l.isRuntime(); });
+  SmallVector<AddrCandidate> candidates;
+  if (!anyRuntime)
+    candidates = collectAddrCandidates(inner, nest);
   unsigned M = candidates.size();
 
   builder.setInsertionPoint(outer);
@@ -893,8 +982,10 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
     flat->setAttr("hls.pipeline", pipeAttr);
 
   // The flattened trip count is the product of the per-level trips;
-  // restore the metadata the per-level loops carried.
-  {
+  // restore the metadata the per-level loops carried. Unknown for a
+  // runtime-bound nest — the scheduler already handles bound-less loops
+  // (none of the unflattened runtime loops carried the attribute either).
+  if (!anyRuntime) {
     uint64_t total = 1;
     for (const NestLevel &lvl : nest) {
       APInt range = lvl.ubNormalized - lvl.lb;
@@ -917,20 +1008,41 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
     builder.setInsertionPointToStart(beforeBlock);
 
     // Rebuild the outermost condition (cmp) on the flattened iv_0 using
-    // the ORIGINAL (pre-normalization) ub constant and predicate.
+    // the ORIGINAL (pre-normalization) ub and predicate.
     const NestLevel &outerLvl = nest.front();
-    auto ubAttr = IntegerAttr::get(
-        outerLvl.ivType,
-        // Re-derive the original rhs: for slt/ult/ne it's ubNormalized; for
-        // sle/ule the normalization added 1, so subtract it to recover the
-        // original rhs.
-        (outerLvl.origPred == arith::CmpIPredicate::sle ||
-         outerLvl.origPred == arith::CmpIPredicate::ule)
-            ? outerLvl.ubNormalized - APInt(outerLvl.ivType.getWidth(), 1)
-            : outerLvl.ubNormalized);
-    auto ubCst = builder.create<arith::ConstantOp>(loc, outerLvl.ivType, ubAttr);
-    auto cond = builder.create<arith::CmpIOp>(
-        loc, outerLvl.origPred, beforeBlock->getArgument(0), ubCst);
+    Value outerUb;
+    if (outerLvl.isRuntime()) {
+      outerUb = outerLvl.ubValue;
+    } else {
+      auto ubAttr = IntegerAttr::get(
+          outerLvl.ivType,
+          // Re-derive the original rhs: for slt/ult/ne it's ubNormalized;
+          // for sle/ule the normalization added 1, so subtract it to
+          // recover the original rhs.
+          (outerLvl.origPred == arith::CmpIPredicate::sle ||
+           outerLvl.origPred == arith::CmpIPredicate::ule)
+              ? outerLvl.ubNormalized - APInt(outerLvl.ivType.getWidth(), 1)
+              : outerLvl.ubNormalized);
+      outerUb = builder.create<arith::ConstantOp>(loc, outerLvl.ivType, ubAttr);
+    }
+    Value cond = builder.create<arith::CmpIOp>(
+        loc, outerLvl.origPred, beforeBlock->getArgument(0), outerUb);
+
+    // Runtime INNER levels contribute their compare too. On every
+    // non-entry iteration a wrapped IV is back at lb (< ub whenever the
+    // loop is live), so the extra terms only bite at ENTRY — which is
+    // exactly the zero-trip case: with cols == 0, `j < cols` fails on the
+    // first evaluation and the flattened loop executes nothing, matching
+    // the original perfect nest. Constant inner levels keep their static
+    // non-zero-trip guarantee and need no term.
+    for (unsigned k = 1; k < N; ++k) {
+      const NestLevel &lvl = nest[k];
+      if (!lvl.isRuntime())
+        continue;
+      Value term = builder.create<arith::CmpIOp>(
+          loc, lvl.origPred, beforeBlock->getArgument(k), lvl.ubValue);
+      cond = builder.create<arith::AndIOp>(loc, cond, term);
+    }
 
     builder.create<ConditionOp>(loc, cond,
                                 ValueRange(beforeBlock->getArguments()));
@@ -1104,11 +1216,18 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
         break;
       }
 
-      // done_k = cmpi wrapPred(iv_next, ubNormalized)
-      auto ubCst = builder.create<arith::ConstantOp>(
-          loc, lvl.ivType, IntegerAttr::get(lvl.ivType, lvl.ubNormalized));
+      // done_k = cmpi wrapPred(iv_next, ub) — against the held SSA value
+      // for a runtime bound (it dominates the nest, so it dominates the
+      // flattened loop).
+      Value ubVal;
+      if (lvl.isRuntime()) {
+        ubVal = lvl.ubValue;
+      } else {
+        ubVal = builder.create<arith::ConstantOp>(
+            loc, lvl.ivType, IntegerAttr::get(lvl.ivType, lvl.ubNormalized));
+      }
       Value reached = builder.create<arith::CmpIOp>(
-          loc, wrapPredicate(lvl.origPred), ivNext, ubCst);
+          loc, wrapPredicate(lvl.origPred), ivNext, ubVal);
 
       Value doneHere;
       if (k == int(N) - 1) {

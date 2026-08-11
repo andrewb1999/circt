@@ -574,8 +574,15 @@ LogicalResult MachineOpConverter::dispatch() {
   nextStateItem.assignmentInState = nextStateFromState;
   nextStateItem.defaultValue = stateReg.getResult();
   nextStateCaseAssignments.push_back(nextStateItem);
-  for (auto &[_, caseMuxItem] : variableCaseMuxItems)
-    nextStateCaseAssignments.push_back(caseMuxItem);
+  // Append variable assignments in the variables' machine-body order:
+  // DenseMap iteration is pointer-ordered and made the emitted statement
+  // order flip between processes once a machine carried more than one
+  // variable (first_iter + issue_arm) — byte-unstable Verilog.
+  for (auto variableOp : machineOp.front().getOps<fsm::VariableOp>()) {
+    auto it = variableCaseMuxItems.find(variableOp);
+    if (it != variableCaseMuxItems.end())
+      nextStateCaseAssignments.push_back(it->second);
+  }
   nextStateCaseAssignments.append(outputCaseAssignments.begin(),
                                   outputCaseAssignments.end());
 
