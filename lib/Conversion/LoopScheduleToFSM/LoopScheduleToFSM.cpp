@@ -3487,6 +3487,53 @@ atResultResidualLatency(loopschedule::LoopScheduleAtOp atOp, unsigned resIdx,
   return sawLiveLoadLeaf ? 0 : 1;
 }
 
+/// True if `v` is a pure zero-latency combinational function of values
+/// stable before `frame` started: block arguments, constants, and anything
+/// defined outside the frame. The walk crosses at boundaries (at grouping
+/// is scheduling; the ops beneath are plain comb) and disqualifies on any
+/// load, store, launch, side effect, or non-zero-latency operator in the
+/// cone. Such a value holds through EVERY cycle of the frame — including
+/// WAIT states, where a launched child owns the ports and every
+/// port-derived value moves — so it needs no launch-consumer capture
+/// register and imposes no launch-timing bound. The motivating shape is
+/// the narrowed runtime bound's sign guard, select(n < 0, 0, trunc(n)),
+/// scheduled into the entry frame ahead of a solo pipeline's launch.
+static bool
+isFrameStableValue(Value v, Operation *frame,
+                   analysis::OperatorLibraryAnalysis *operatorLibrary) {
+  SmallVector<Value> stack{v};
+  DenseSet<Value> seen;
+  while (!stack.empty()) {
+    Value cur = stack.pop_back_val();
+    if (!seen.insert(cur).second)
+      continue;
+    Operation *def = cur.getDefiningOp();
+    if (!def)
+      continue; // block argument: stable before the frame's cycles
+    if (!frame->isAncestor(def))
+      continue; // defined before the frame: stable while it runs
+    if (auto at = dyn_cast<loopschedule::LoopScheduleAtOp>(def)) {
+      // A same-frame at result: the underlying yielded cone decides.
+      auto yield = cast<loopschedule::LoopScheduleYieldOp>(
+          at.getBodyBlock().getTerminator());
+      unsigned idx = cast<OpResult>(cur).getResultNumber();
+      if (idx >= yield.getNumOperands())
+        return false;
+      stack.push_back(yield.getOperand(idx));
+      continue;
+    }
+    if (isa<loopschedule::LoopScheduleLaunchOp, loopschedule::LoadInterface,
+            loopschedule::StoreInterface, loopschedule::LoopScheduleLoadOp,
+            loopschedule::LoopScheduleStoreOp>(def) ||
+        !isMemoryEffectFree(def) ||
+        computeOpCycleLatency(def, operatorLibrary) != 0)
+      return false;
+    for (Value operand : def->getOperands())
+      stack.push_back(operand);
+  }
+  return true;
+}
+
 /// Earliest cycle within `frameOp` at which `pipOp`'s child_start may pulse
 /// without an iter_arg INIT latching a stale value.
 ///
@@ -3806,6 +3853,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       Operation *def = init.getDefiningOp();
       if (!def || !frameOp->isAncestor(def))
         continue; // defined before the frame — stable, no constraint
+      if (isFrameStableValue(init, frameOp, operatorLibrary))
+        continue; // pure comb over pre-frame values: live every cycle
       auto defAt = dyn_cast<LoopScheduleAtOp>(def);
       if (!defAt) {
         analyzable = false;
@@ -3860,6 +3909,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
             frameOp.getBodyBlock().findAncestorOpInBlock(*def);
         if (defTop == launchHolder)
           continue; // inside our own launch: moves with the child
+        if (isFrameStableValue(operand, frameOp, operatorLibrary))
+          continue; // pure comb over pre-frame values: live every cycle
         auto defAt = dyn_cast_or_null<LoopScheduleAtOp>(defTop);
         // Only `at` results cross from the frame into the child; a
         // producer we cannot place in a cycle keeps the scheduled offset.
@@ -3892,7 +3943,6 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
             minStartPreArm, readable + 1 > stage ? readable + 1 - stage : 0);
       }
     });
-
     if (!analyzable)
       continue;
 
@@ -4387,7 +4437,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         if ((unsigned)otherAt.getOffset() > myOffset + 1)
           return true;
         for (auto &op : otherAt.getBodyBlock())
-          if (isa<LoopScheduleLaunchOp>(&op))
+          if (isa<LoopScheduleLaunchOp>(&op) &&
+              !isFrameStableValue(atResult, frame, operatorLibrary))
             return true;
       }
       return false;
@@ -7396,8 +7447,34 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         frameOp.getBodyBlock().findAncestorOpInBlock(*pipOp.getOperation());
     bool frameClean = true;
     for (auto atOp : frameOp.getBodyBlock().getOps<LoopScheduleAtOp>())
-      if (atOp.getOperation() != launchHolder)
-        frameClean = false;
+      if (atOp.getOperation() != launchHolder) {
+        // A sibling at that only computes pure zero-latency functions of
+        // pre-frame values — the narrowed runtime bound's sign guard is
+        // the motivating shape — is combinationally transparent: its
+        // values hold in every cycle, including the launch cycle stage 0
+        // overlaps under pre-arm, and it touches no port the overlap
+        // could contend on. Anything else keeps the refusal.
+        bool pure = true;
+        for (auto &op : atOp.getBodyBlock()) {
+          if (isa<LoopScheduleYieldOp>(&op))
+            continue;
+          if (!isMemoryEffectFree(&op) ||
+              computeOpCycleLatency(&op, operatorLibrary) != 0) {
+            pure = false;
+            break;
+          }
+        }
+        if (pure)
+          for (OpResult res : atOp->getResults())
+            if (!isFrameStableValue(res, frameOp, operatorLibrary)) {
+              pure = false;
+              break;
+            }
+        if (!pure) {
+          frameClean = false;
+          break;
+        }
+      }
     if (frameClean)
       frameOp.getBodyBlock().walk([&](Operation *op) {
         if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(op))
@@ -7422,6 +7499,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
               frameOp.getBodyBlock().findAncestorOpInBlock(*def);
           if (defTop == launchHolder)
             continue; // moves with the child
+          if (isFrameStableValue(operand, frameOp, operatorLibrary))
+            continue; // pure comb over pre-frame values: live every cycle
           frameClean = false;
           return WalkResult::interrupt();
         }
