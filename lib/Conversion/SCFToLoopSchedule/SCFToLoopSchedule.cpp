@@ -1985,6 +1985,36 @@ LoopScheduleAtOp SCFToLoopSchedulePass::emitOnePipelineStage(
   return stage;
 }
 
+/// A DRAINABLE STREAM POP: an FWFT beat consumer (dynamic, latency 0,
+/// ordered reads) on a face whose only other users are pops and BARRIER
+/// stores outside the loop — the abort/drain (amc.burst_abort) that
+/// retires whatever tail an early exit strands. Such a pop is legal in a
+/// pipelined data-dependent-exit while: the ghost iteration issues
+/// nothing new on the bus (the request is hoisted — an in-loop request is
+/// a dynamic STORE in the body and still refuses), a ghost pop merely
+/// drains one beat early, and the face's abort retires the rest before
+/// anything else touches the bundle.
+static bool isDrainableStreamPop(Operation *op, mlir::scf::WhileOp loop) {
+  auto load = dyn_cast<loopschedule::LoadInterface>(op);
+  if (!load || !load.isDynamic() || load.getLatency() != 0 ||
+      !load.readsAreOrdered())
+    return false;
+  bool sawAbort = false;
+  for (Operation *user : load.getMemoryValue().getUsers()) {
+    if (auto st = dyn_cast<loopschedule::StoreInterface>(user)) {
+      if (!st.isBarrier() || loop->isAncestor(user))
+        return false;
+      sawAbort = true;
+    } else if (auto ld = dyn_cast<loopschedule::LoadInterface>(user)) {
+      if (!(ld.isDynamic() && ld.getLatency() == 0))
+        return false;
+    } else {
+      return false;
+    }
+  }
+  return sawAbort;
+}
+
 LogicalResult
 SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
                                                   CyclicProblem &problem,
@@ -2036,6 +2066,8 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
         WalkResult dynCheck = loop.getAfter().walk([&](Operation *op) {
           if (!isDynamicLatencyOp(*op))
             return WalkResult::advance();
+          if (isDrainableStreamPop(op, loop))
+            return WalkResult::advance();
           InFlightDiagnostic diag = loop.emitOpError(
               "cannot pipeline a loop with dynamic-latency memory "
               "accesses and a late-deciding continuation");
@@ -2079,6 +2111,10 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
         WalkResult effectCheck =
             loop.getAfter().walk([&](Operation *op) {
               if (!isObservableEffect(*op) || !problem.hasOperation(op))
+                return WalkResult::advance();
+              // A drainable pop's "effect" is FIFO advance — the ghost's
+              // pop drains one beat the abort would otherwise retire.
+              if (isDrainableStreamPop(op, loop))
                 return WalkResult::advance();
               auto effectStart = problem.getStartTime(op);
               if (effectStart && *effectStart < condStart) {
