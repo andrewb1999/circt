@@ -123,6 +123,60 @@ func.func @ub_licensed(%mem: memref<1024xi32>, %acc: memref<8xi32>, %v: i32,
   return
 }
 
+// A TILED loop's bound is the ceil-div chain the affine normalizer leaves
+// behind: ub = ceil(n/16), spelled cmpi-sle / two subs / select / shrui /
+// sub-add / select with ONE shared guard. The chain itself licenses
+// nothing, but its root does: the ancestor store at %n keeps n < 1024, so
+// ub <= ceil(1023/16) = 64 -> 8 bits.
+
+// CHECK-LABEL: func.func @ceildiv_licensed
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i8
+func.func @ceildiv_licensed(%mem: memref<1024xi32>, %acc: memref<8xi32>,
+                            %v: i32, %n: i64) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  %c4 = arith.constant 4 : i64
+  loopschedule.store %v, %mem[%n : i64] : memref<1024xi32>
+  %nonpos = arith.cmpi sle, %n, %c0 : i64
+  %neg = arith.subi %c0, %n : i64
+  %dec = arith.subi %n, %c1 : i64
+  %dvd = arith.select %nonpos, %neg, %dec : i64
+  %q = arith.shrui %dvd, %c4 : i64
+  %negq = arith.subi %c0, %q : i64
+  %incq = arith.addi %q, %c1 : i64
+  %ub = arith.select %nonpos, %negq, %incq : i64
+  scf.for %i = %c0 to %ub step %c1 : i64 {
+    loopschedule.store %v, %acc[%c0 : i64] : memref<8xi32>
+  }
+  return
+}
+
+// REFUSED: the two selects carry DIFFERENT guards, so the chain is not the
+// ceil-div shape and the root's license must not transfer.
+
+// CHECK-LABEL: func.func @ceildiv_mismatched_guard
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i64
+func.func @ceildiv_mismatched_guard(%mem: memref<1024xi32>, %acc: memref<8xi32>,
+                                    %v: i32, %n: i64, %m: i64) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  %c4 = arith.constant 4 : i64
+  loopschedule.store %v, %mem[%n : i64] : memref<1024xi32>
+  %nonpos = arith.cmpi sle, %n, %c0 : i64
+  %other = arith.cmpi sle, %m, %c0 : i64
+  %neg = arith.subi %c0, %n : i64
+  %dec = arith.subi %n, %c1 : i64
+  %dvd = arith.select %nonpos, %neg, %dec : i64
+  %q = arith.shrui %dvd, %c4 : i64
+  %negq = arith.subi %c0, %q : i64
+  %incq = arith.addi %q, %c1 : i64
+  %ub = arith.select %other, %negq, %incq : i64
+  scf.for %i = %c0 to %ub step %c1 : i64 {
+    loopschedule.store %v, %acc[%c0 : i64] : memref<8xi32>
+  }
+  return
+}
+
 // REFUSED: the only access sits under an scf.if, so it may not execute and
 // licenses nothing. The loop must stay at its original width.
 

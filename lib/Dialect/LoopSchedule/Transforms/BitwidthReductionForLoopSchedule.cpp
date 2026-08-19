@@ -270,11 +270,15 @@ static std::optional<uint64_t> licensedIVBound(scf::ForOp loop) {
 /// memory but whose bound rides a hoisted burst request as a length or
 /// repeat count — the AXI stream shape. Returned as an exclusive bound on
 /// the iterates (iterate < ub <= bound), compatible with licensedIVBound's.
-static std::optional<uint64_t> licensedUbBound(scf::ForOp loop) {
-  Value ubRoot = rootBound(loop.getUpperBound());
+/// The ancestor-walk half of licensedUbBound, reusable for any VALUE: an
+/// inclusive bound b with `target <= b` in every well-defined execution,
+/// from accesses in ancestor blocks of `anchor` whose index operands are
+/// `target * S + r`.
+static std::optional<uint64_t> licensedValueBound(Operation *anchor,
+                                                  Value target) {
   std::optional<uint64_t> bound;
   auto considerIdx = [&](Value idx, uint64_t dim) {
-    auto s = matchScaledIV(idx, ubRoot);
+    auto s = matchScaledIV(idx, target);
     if (!s || dim == 0)
       return;
     uint64_t b = (dim - 1) / *s;
@@ -283,16 +287,84 @@ static std::optional<uint64_t> licensedUbBound(scf::ForOp loop) {
     bound = bound ? std::min(*bound, b) : b;
   };
 
-  Operation *cur = loop;
+  Operation *cur = anchor;
   while (Block *block = cur->getBlock()) {
     for (Operation &op : *block)
-      if (&op != loop)
+      if (&op != anchor)
         forEachAccessIndex(&op, considerIdx);
     cur = block->getParentOp();
     if (!cur || isa<func::FuncOp>(cur))
       break;
   }
   return bound;
+}
+
+/// Match the trip-count chain affine-loop-normalize + AffineToSCF's
+/// ceildiv expander + strength reduction leave behind for a tiled loop's
+/// bound `ceil(x / 2^s)`:
+///
+///   %c  = cmpi sle, %x, 0
+///   %d  = select %c, subi(0, %x), subi(%x, 1)
+///   %q  = shrui %d, s
+///   %ub = select %c, subi(0, %q), addi(%q, 1)
+///
+/// The SAME cmpi result must feed both selects. Returns (x, s) on match.
+static std::optional<std::pair<Value, unsigned>> matchCeilDivChain(Value ub) {
+  auto isZero = [](Value v) {
+    APInt c;
+    return matchPattern(v, m_ConstantInt(&c)) && c.isZero();
+  };
+  auto isOne = [](Value v) {
+    APInt c;
+    return matchPattern(v, m_ConstantInt(&c)) && c.isOne();
+  };
+  auto outer = ub.getDefiningOp<SelectOp>();
+  if (!outer)
+    return std::nullopt;
+  auto cmp = outer.getCondition().getDefiningOp<CmpIOp>();
+  if (!cmp || cmp.getPredicate() != CmpIPredicate::sle ||
+      !isZero(cmp.getRhs()))
+    return std::nullopt;
+  Value x = cmp.getLhs();
+  // True arm: 0 - q; false arm: q + 1 (either operand order).
+  auto negQ = outer.getTrueValue().getDefiningOp<SubIOp>();
+  auto incQ = outer.getFalseValue().getDefiningOp<AddIOp>();
+  if (!negQ || !incQ || !isZero(negQ.getLhs()))
+    return std::nullopt;
+  Value q = negQ.getRhs();
+  if (!((incQ.getLhs() == q && isOne(incQ.getRhs())) ||
+        (incQ.getRhs() == q && isOne(incQ.getLhs()))))
+    return std::nullopt;
+  auto shr = q.getDefiningOp<ShRUIOp>();
+  APInt shift;
+  if (!shr || !matchPattern(shr.getRhs(), m_ConstantInt(&shift)) ||
+      shift.isZero() || shift.getZExtValue() > 30)
+    return std::nullopt;
+  auto inner = shr.getLhs().getDefiningOp<SelectOp>();
+  if (!inner || inner.getCondition() != outer.getCondition())
+    return std::nullopt;
+  auto negX = inner.getTrueValue().getDefiningOp<SubIOp>();
+  auto decX = inner.getFalseValue().getDefiningOp<SubIOp>();
+  if (!negX || !decX || !isZero(negX.getLhs()) || negX.getRhs() != x ||
+      decX.getLhs() != x || !isOne(decX.getRhs()))
+    return std::nullopt;
+  return std::make_pair(x, (unsigned)shift.getZExtValue());
+}
+
+static std::optional<uint64_t> licensedUbBound(scf::ForOp loop) {
+  Value ubRoot = rootBound(loop.getUpperBound());
+  if (auto bound = licensedValueBound(loop, ubRoot))
+    return bound;
+  // A tiled loop's trip count is ceil(x / 2^s): a licensed x <= B keeps the
+  // bound at or below ceil(B / 2^s) in every well-defined execution (x <= 0
+  // yields a non-positive bound, which the sign-guarded select preserves as
+  // zero-trip).
+  if (auto chain = matchCeilDivChain(ubRoot))
+    if (auto xBound = licensedValueBound(loop, chain->first)) {
+      uint64_t s = chain->second;
+      return (*xBound + (uint64_t(1) << s) - 1) >> s;
+    }
+  return std::nullopt;
 }
 
 struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
@@ -355,15 +427,57 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
       else
         rewriter.setInsertionPointAfter(ub.getDefiningOp());
       auto loc = op.getLoc();
-      auto zeroWide = ConstantOp::create(rewriter, loc,
+      Value ubNarrow;
+      auto chain = matchCeilDivChain(rootBound(ub));
+      std::optional<uint64_t> chainRootBound =
+          chain ? licensedValueBound(op, chain->first) : std::nullopt;
+      if (chain && chainRootBound) {
+        // The bound is ceil(x / 2^s) computed by the affine expander's
+        // WIDE chain — which stays a 64-bit subi/shrui/select cone on the
+        // once-per-launch path even after the RESULT narrows (matmul's
+        // measured arg1_launch cone). Rebuild the computation narrow from
+        // a truncated x instead of truncating its result:
+        //   ub' = x <= 0 ? 0 : ((trunc(x) - 1) >> s) + 1
+        // For 1 <= x <= B the truncation is exact and this equals
+        // ceil(x/2^s); x <= 0 pins zero-trip (matching the wide chain's
+        // non-positive result); x > B is UB-licensed. The sle guard reads
+        // only x's sign-extended high cone, not a carry chain.
+        Value x = chain->first;
+        unsigned s = chain->second;
+        unsigned kx = std::max(
+            {bitwidth,
+             (unsigned)llvm::Log2_64_Ceil(*chainRootBound + 1) + 1, s + 1});
+        auto xTy = rewriter.getIntegerType(kx);
+        Value zeroX = ConstantOp::create(rewriter, loc,
                                          rewriter.getIntegerAttr(wideTy, 0));
-      auto isNeg = CmpIOp::create(rewriter, loc, CmpIPredicate::slt, ub,
-                                  zeroWide);
-      auto zeroNarrow = ConstantOp::create(
-          rewriter, loc, rewriter.getIntegerAttr(newType, 0));
-      auto ubTrunc = TruncIOp::create(rewriter, loc, newType, ub);
-      auto ubNarrow =
-          SelectOp::create(rewriter, loc, isNeg, zeroNarrow, ubTrunc);
+        Value nonPos = CmpIOp::create(rewriter, loc, CmpIPredicate::sle, x,
+                                      zeroX);
+        Value xT = TruncIOp::create(rewriter, loc, xTy, x);
+        Value oneX = ConstantOp::create(rewriter, loc,
+                                        rewriter.getIntegerAttr(xTy, 1));
+        Value dec = SubIOp::create(rewriter, loc, xT, oneX);
+        Value q = ShRUIOp::create(
+            rewriter, loc, dec,
+            ConstantOp::create(rewriter, loc,
+                               rewriter.getIntegerAttr(xTy, s)));
+        Value inc = AddIOp::create(rewriter, loc, q, oneX);
+        Value zeroXn = ConstantOp::create(rewriter, loc,
+                                          rewriter.getIntegerAttr(xTy, 0));
+        Value ceilN = SelectOp::create(rewriter, loc, nonPos, zeroXn, inc);
+        ubNarrow = kx == bitwidth
+                       ? ceilN
+                       : TruncIOp::create(rewriter, loc, newType, ceilN)
+                             .getResult();
+      } else {
+        auto zeroWide = ConstantOp::create(
+            rewriter, loc, rewriter.getIntegerAttr(wideTy, 0));
+        auto isNeg = CmpIOp::create(rewriter, loc, CmpIPredicate::slt, ub,
+                                    zeroWide);
+        auto zeroNarrow = ConstantOp::create(
+            rewriter, loc, rewriter.getIntegerAttr(newType, 0));
+        auto ubTrunc = TruncIOp::create(rewriter, loc, newType, ub);
+        ubNarrow = SelectOp::create(rewriter, loc, isNeg, zeroNarrow, ubTrunc);
+      }
 
       rewriter.setInsertionPoint(op);
       op.setUpperBound(ubNarrow);
