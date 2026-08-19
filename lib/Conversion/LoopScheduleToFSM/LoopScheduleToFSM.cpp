@@ -8312,6 +8312,21 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         done = hw::ConstantOp::create(builder, loc, i1, 1);
       childDoneBEs[childIndexForEntry[ei]].setValue(done);
 
+      // A stream-abort barrier (amc.burst_abort) registers a write-enable
+      // backedge on its face — the engine's cancel. Pulse it when this
+      // entry starts; an ordinary ctrl barrier registers none, and an
+      // unconsumed drive is inert (mergeStepMemPorts connects only
+      // registered backedge kinds, gated on this entry's running signal).
+      {
+        auto pit = perEntryPorts[ei].find(ctrlVal);
+        if (pit != perEntryPorts[ei].end()) {
+          PortDrivesRef pref =
+              portRef(pit->second, getBindingPort(entry.barrierOp));
+          if (pref.wrEn && !*pref.wrEn)
+            *pref.wrEn = childStartSignals[childIndexForEntry[ei]];
+        }
+      }
+
       // The barrier yields no values; resolve its handle to nothing so a
       // downstream await maps cleanly.
       if (entry.launchOp) {
