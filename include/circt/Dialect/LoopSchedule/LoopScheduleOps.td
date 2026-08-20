@@ -268,6 +268,54 @@ def LoopScheduleParOp : LoopScheduleOp<"par",
   let hasVerifier = 1;
 }
 
+def LoopScheduleOutlineOp : LoopScheduleOp<"outline",
+    [SingleBlockImplicitTerminator<"LoopScheduleYieldOp">, NoRegionArguments,
+     RecursiveMemoryEffects]> {
+  let summary = "Request a module/FSM boundary around a scheduled region";
+  let description = [{
+    `loopschedule.outline` marks a single-entry/single-exit run of scheduled
+    contents — a whole `loopschedule.sequential` nest, a group of steps, or
+    any mix — for OUTLINED lowering: the FSM lowering emits the region's
+    control as its own `fsm.machine` inside its own `hw.module`, instanced
+    from the enclosing machine, instead of inlining its states into the
+    function's one machine (the default).
+
+    The boundary's hardware contract is that NO combinational path crosses
+    it in either direction: the child's `done` is exported through a
+    register (costing one cycle per invocation), and `start` is
+    register-sourced on the parent side (a Moore state decode plus the
+    registered issue-arm). An outline boundary therefore never extends a
+    cross-machine decode cascade.
+
+    Capture is IMPLICIT — the region reads enclosing values directly, like
+    every non-function region op in this dialect; the lowering computes the
+    module ports at emission. Only values defined inside and used outside
+    must be yielded, becoming the op's results.
+
+    The op is a lowering-structure marker, not a scheduling construct: it
+    must not change the schedule, and a pass may ERASE it (splicing the
+    region's contents in place and forwarding the yielded values) without
+    touching the schedule underneath — see `inlineIntoParent`. It is
+    deliberately NOT canonicalized away: boundary placement is policy.
+  }];
+
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = [{ attr-dict-with-keyword $body (`:` type($results)^)? }];
+
+  let extraClassDeclaration = [{
+    mlir::Block &getBodyBlock() { return getBody().front(); }
+    /// Erase the boundary marker: splice the region's contents in place of
+    /// the op, replace each result with the corresponding yielded value and
+    /// erase the op (and its terminator). The schedule underneath is
+    /// untouched.
+    void inlineIntoParent();
+  }];
+
+  let hasVerifier = 1;
+}
+
 def LoopScheduleTerminatorOp : LoopScheduleOp<"terminator",
     [ParentOneOf<["LoopSchedulePipelineOp", "LoopScheduleSequentialOp"]>, Terminator, AttrSizedOperandSegments]> {
   let summary = "LoopSchedule dialect terminator.";
@@ -463,7 +511,7 @@ def LoopScheduleAccessOp : LoopScheduleOp<"access",
 def LoopScheduleYieldOp : LoopScheduleOp<"yield", [Pure, ReturnLike, Terminator,
     ParentOneOf<["LoopScheduleIfOp", "LoopScheduleFrameOp",
                  "LoopScheduleAtOp", "LoopScheduleLaunchOp",
-                 "LoopScheduleParOp"]>]> {
+                 "LoopScheduleParOp", "LoopScheduleOutlineOp"]>]> {
   let summary = "Terminator yielding values to the enclosing region-bearing op";
   let description = [{
     Shared terminator op. Used as the terminator of:
@@ -475,7 +523,9 @@ def LoopScheduleYieldOp : LoopScheduleOp<"yield", [Pure, ReturnLike, Terminator,
       - `loopschedule.launch`'s body region (yields child loop results,
         though the launch op's only surface result is a handle),
       - `loopschedule.par`'s body region (yields each lane's result to the
-        join; every operand must come from a distinct direct child).
+        join; every operand must come from a distinct direct child),
+      - `loopschedule.outline`'s body region (yields the values defined
+        inside the boundary that are used outside it).
 
     The verifier dispatches on the parent op + enclosing region to enforce
     the right type-matching rule.

@@ -885,6 +885,35 @@ LogicalResult LoopScheduleParOp::verify() {
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// LoopScheduleOutlineOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult LoopScheduleOutlineOp::verify() {
+  // Yielded values must be defined inside the region: the yield is the
+  // boundary's result interface, and a value already visible outside needs
+  // no forwarding (yielding it would alias an enclosing value through a
+  // module port for nothing).
+  Operation *terminator = getBodyBlock().getTerminator();
+  for (Value v : terminator->getOperands())
+    if (!getBody().isAncestor(v.getParentRegion()))
+      return terminator->emitOpError(
+          "yielded values must be defined inside the outline region");
+  return success();
+}
+
+void LoopScheduleOutlineOp::inlineIntoParent() {
+  Operation *terminator = getBodyBlock().getTerminator();
+  for (auto [result, yielded] :
+       llvm::zip(getResults(), terminator->getOperands()))
+    result.replaceAllUsesWith(yielded);
+  terminator->erase();
+  Block *parentBlock = getOperation()->getBlock();
+  parentBlock->getOperations().splice(getOperation()->getIterator(),
+                                      getBodyBlock().getOperations());
+  getOperation()->erase();
+}
+
 LogicalResult LoopScheduleYieldOp::verify() {
   Operation *parent = (*this)->getParentOp();
   TypeRange yielded = getResults().getTypes();
@@ -919,6 +948,13 @@ LogicalResult LoopScheduleYieldOp::verify() {
     if (!typesEqual(yielded, parOp.getResultTypes()))
       return emitOpError("yielded types must match parent loopschedule.par "
                          "result types");
+    return success();
+  }
+
+  if (auto outlineOp = dyn_cast<LoopScheduleOutlineOp>(parent)) {
+    if (!typesEqual(yielded, outlineOp.getResultTypes()))
+      return emitOpError("yielded types must match parent "
+                         "loopschedule.outline result types");
     return success();
   }
 
