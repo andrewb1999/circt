@@ -882,13 +882,6 @@ private:
   /// caller as the all-members-done conjunction) rises. Groups must be
   /// contiguous and ascending in entry order. Singleton groups reproduce
   /// the historical per-entry chain exactly.
-  fsm::MachineOp createFunctionFSM(OpBuilder &builder, Location loc,
-                                    StringRef fsmName,
-                                    ArrayRef<int> frameChildKind,
-                                    ArrayRef<unsigned> entryLatencies,
-                                    ArrayRef<unsigned> entryGroup,
-                                    SmallVectorImpl<int> &entryCycleOutBase,
-                                    ArrayRef<bool> preArmEntries = {});
 
   /// Structural analysis of one sequential loop level, shared by the
   /// module-outlined and (soon) inlined lowerings: everything the state
@@ -964,6 +957,9 @@ private:
     /// The level's first_iter fsm.variable, created during machine
     /// emission.
     Value fiVar;
+    /// The RESOLVED cond / cond_next values (a backedge placeholder must
+    /// never gain new uses after its setValue — read these instead).
+    Value resolvedCond, resolvedCondNext;
     std::optional<LevelWires> wires; // created by the wrapper pre-instance
   };
 
@@ -1103,6 +1099,10 @@ private:
     /// module path.
     LevelPlan *plan = nullptr;
     fsm::HWInstanceOp unifiedInst;
+    /// Filled by lowerLoopLevelBody: the values the cond / cond_next
+    /// backedges resolved to. A placeholder must never gain uses after
+    /// its setValue — hosts read these instead.
+    Value resolvedCond, resolvedCondNext;
   };
 
   /// The wrapper half of a level's lowering, shared by the module path
@@ -1132,7 +1132,9 @@ private:
       ArrayRef<PortArgInfo> memrefArgs, IRMapping &mapping,
       DenseMap<Value, MemPortMapping> &callerMemPorts,
       DenseMap<Value, MemPortMapping> &portContribution,
-      Value &spanActive, Value &exitEdge);
+      SmallVectorImpl<Value> &resultValues,
+      SmallVectorImpl<Value> &resultCombs, Value &spanActive,
+      Value &exitEdge);
 
   /// Recursively lower a loop node as its own hw.module.
   /// Creates the module and populates outModule. capturedVals are the
@@ -2887,288 +2889,6 @@ fsm::MachineOp LoopScheduleToFSMPass::createSequentialFSM(
   return machine;
 }
 
-//===----------------------------------------------------------------------===//
-// Function-level FSM (linear run-once, no loop condition)
-//===----------------------------------------------------------------------===//
-
-fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
-    OpBuilder &builder, Location loc, StringRef fsmName,
-    ArrayRef<int> frameChildKind, ArrayRef<unsigned> entryLatencies,
-    ArrayRef<unsigned> entryGroup, SmallVectorImpl<int> &entryCycleOutBase,
-    ArrayRef<bool> preArmEntries) {
-  auto *ctx = builder.getContext();
-  auto i1 = builder.getI1Type();
-  unsigned numFrames = frameChildKind.size();
-
-  // Count non-leaf frames to determine child_start outputs.
-  unsigned numChildren = 0;
-  SmallVector<int> childIndexForFrame(numFrames, -1);
-  for (unsigned i = 0; i < numFrames; ++i) {
-    if (frameChildKind[i] >= 0) {
-      childIndexForFrame[i] = numChildren;
-      numChildren++;
-    }
-  }
-
-  // Partition entries into contiguous groups (concurrent siblings of one
-  // frame). Each group's members are launched together and awaited
-  // together; the FSM takes ONE done input per group that waits.
-  struct Group {
-    unsigned first;                 // first entry index
-    SmallVector<unsigned> members;  // entry indices
-    bool hasChild = false;          // any kind >= 0 member
-    bool allStateless = true;       // every member kind == -2
-    int doneArg = -1;               // FSM input index (set below)
-  };
-  SmallVector<Group> groupList;
-  for (unsigned i = 0; i < numFrames; ++i) {
-    if (groupList.empty() || entryGroup[i] != entryGroup[groupList.back().first])
-      groupList.push_back({i, {}, false, true, -1});
-    Group &g = groupList.back();
-    g.members.push_back(i);
-    if (frameChildKind[i] >= 0)
-      g.hasChild = true;
-    if (frameChildKind[i] != -2)
-      g.allStateless = false;
-  }
-  unsigned numWaitGroups = 0;
-  for (Group &g : groupList)
-    if (g.hasChild)
-      g.doneArg = 1 + (int)numWaitGroups++;
-
-  // Multi-cycle LEAF entries (latency > 1, e.g. two same-port stores the
-  // scheduler serialized into `at 0` / `at 1`) hold their state for L
-  // cycles and expose one dedicated cycle output per cycle, mirroring the
-  // sequential FSM's frame-cycle outputs. `entryCycleOutBase[i]` is the
-  // entry's base index into that appended output region (-1 = none).
-  auto latencyOf = [&](unsigned i) -> unsigned {
-    unsigned l = i < entryLatencies.size() ? entryLatencies[i] : 1;
-    return frameChildKind[i] < 0 ? std::max(l, 1u) : 1u;
-  };
-  entryCycleOutBase.assign(numFrames, -1);
-  unsigned totalCycleOuts = 0;
-  for (unsigned i = 0; i < numFrames; ++i) {
-    if (latencyOf(i) > 1) {
-      entryCycleOutBase[i] = (int)totalCycleOuts;
-      totalCycleOuts += latencyOf(i);
-    }
-  }
-
-  // Inputs: start, group_done_0, ..., group_done_{numWaitGroups-1} (one
-  // per group that launches children; the caller supplies the group's
-  // all-members-done conjunction).
-  SmallVector<Type> inputTypes(1 + numWaitGroups, i1);
-  // Outputs: done, child_start_0..N, frame_running_0..M, then the appended
-  // per-cycle outputs of multi-cycle leaf entries.
-  SmallVector<Type> outputTypes(1 + numChildren + numFrames + totalCycleOuts,
-                                i1);
-
-  auto funcType = FunctionType::get(ctx, inputTypes, outputTypes);
-  auto machine =
-      fsm::MachineOp::create(builder, loc, fsmName, "IDLE", funcType);
-
-  // Arg names.
-  SmallVector<Attribute> argNameAttrs;
-  argNameAttrs.push_back(builder.getStringAttr("start"));
-  for (unsigned i = 0; i < numWaitGroups; ++i)
-    argNameAttrs.push_back(
-        builder.getStringAttr("group_done_" + std::to_string(i)));
-  machine.setArgNamesAttr(builder.getArrayAttr(argNameAttrs));
-
-  // Result names.
-  SmallVector<Attribute> resNameAttrs;
-  resNameAttrs.push_back(builder.getStringAttr("done"));
-  for (unsigned i = 0; i < numChildren; ++i)
-    resNameAttrs.push_back(
-        builder.getStringAttr("child_start_" + std::to_string(i)));
-  for (unsigned i = 0; i < numFrames; ++i)
-    resNameAttrs.push_back(
-        builder.getStringAttr("frame_running_" + std::to_string(i)));
-  for (unsigned i = 0; i < numFrames; ++i)
-    for (unsigned c = 0; entryCycleOutBase[i] >= 0 && c < latencyOf(i); ++c)
-      resNameAttrs.push_back(builder.getStringAttr(
-          "frame_cycle_" + std::to_string(i) + "_" + std::to_string(c)));
-  machine.setResNamesAttr(builder.getArrayAttr(resNameAttrs));
-
-  OpBuilder fb(ctx);
-  fb.setInsertionPointToEnd(&machine.getBody().front());
-
-  Value trueVal = hw::ConstantOp::create(fb, loc, i1, 1);
-  Value falseVal = hw::ConstantOp::create(fb, loc, i1, 0);
-
-  // Helper to build output vector.
-  // out[0] = done, out[1..numChildren] = child_start,
-  // out[1+numChildren..] = frame_running, then the per-cycle outputs
-  // (activeCycleOut is a GLOBAL index into that appended region, -1 none).
-  // The child-start and frame-running actives are SETS: a group state
-  // raises them for every member at once.
-  auto makeOutput = [&](bool done, ArrayRef<int> activeChildStarts,
-                        ArrayRef<int> activeFrameRunnings,
-                        int activeCycleOut = -1) -> SmallVector<Value> {
-    SmallVector<Value> vals;
-    vals.push_back(done ? trueVal : falseVal);
-    for (unsigned i = 0; i < numChildren; ++i)
-      vals.push_back(llvm::is_contained(activeChildStarts, (int)i) ? trueVal
-                                                                   : falseVal);
-    for (unsigned i = 0; i < numFrames; ++i)
-      vals.push_back(llvm::is_contained(activeFrameRunnings, (int)i)
-                         ? trueVal
-                         : falseVal);
-    for (unsigned c = 0; c < totalCycleOuts; ++c)
-      vals.push_back((int)c == activeCycleOut ? trueVal : falseVal);
-    return vals;
-  };
-
-  // States are named after the group's FIRST entry index, so singleton
-  // groups keep the historical FRAME_<i>/WAIT_<i> names. All-stateless
-  // groups get no states: successor chains skip them.
-  auto nextEmittedState = [&](unsigned g) -> std::string {
-    for (unsigned j = g + 1; j < groupList.size(); ++j)
-      if (!groupList[j].allStateless)
-        return "FRAME_" + std::to_string(groupList[j].first);
-    return "DONE";
-  };
-  int firstEmitted = -1;
-  for (unsigned g = 0; g < groupList.size(); ++g)
-    if (!groupList[g].allStateless) {
-      firstEmitted = (int)groupList[g].first;
-      break;
-    }
-
-  // --- IDLE ---
-  {
-    auto st = fsm::StateOp::create(fb, loc, "IDLE");
-    Block *ob = st.ensureOutput(fb);
-    ob->getTerminator()->erase();
-    fb.setInsertionPointToEnd(ob);
-    // NOTE: an IDLE->WAIT entry-launch bypass (starting the first child
-    // straight from IDLE) was tried and reverted: both the Mealy- and the
-    // wrapper-pulse variant reshaped the one-hot FSM enough to flip a
-    // marginal state-decode -> LUTRAM -> DSP-operand path in atax from
-    // +0.17ns to about -0.3ns at the 2ns target — one cycle per kernel
-    // invocation is not worth an Fmax cliff.
-    fsm::OutputOp::create(fb, loc, makeOutput(false, {}, {}));
-    Block *tb = &st.getTransitions().front();
-    fb.setInsertionPointToEnd(tb);
-    std::string entryTarget =
-        firstEmitted < 0 ? std::string("DONE")
-                         : "FRAME_" + std::to_string(firstEmitted);
-    fsm::TransitionOp::create(
-        fb, loc, StringRef(entryTarget),
-        [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(0)); },
-        []() {});
-  }
-  fb.setInsertionPointToEnd(&machine.getBody().front());
-
-  // --- FRAME_g and WAIT_g states (one pair per group) ---
-  for (unsigned g = 0; g < groupList.size(); ++g) {
-    Group &grp = groupList[g];
-    if (grp.allStateless)
-      continue; // stateless await-only group
-    std::string frameName = "FRAME_" + std::to_string(grp.first);
-    std::string nextState = nextEmittedState(g);
-    bool isLeaf = !grp.hasChild;
-
-    // The group's active sets: every member's child_start (non-leaf
-    // members) pulses in FRAME_g, and every member's frame_running holds
-    // through FRAME_g (+ WAIT_g).
-    SmallVector<int> groupChildStarts, groupRunnings;
-    for (unsigned i : grp.members) {
-      if (frameChildKind[i] >= 0)
-        groupChildStarts.push_back(childIndexForFrame[i]);
-      if (frameChildKind[i] != -2)
-        groupRunnings.push_back((int)i);
-    }
-
-    // FRAME_g, plus FRAME_g_C1..C{L-1} chained cycle states for multi-cycle
-    // leaf entries: frame_running stays high across the whole chain and
-    // each cycle state additionally raises its frame_cycle_<i>_<c> output,
-    // so `at K` bodies get a genuine per-cycle issue gate (two same-port
-    // stores serialized by the scheduler need K to really be cycle K).
-    // Leaf groups are always singletons (leaf entries only arise from
-    // launch-less frames), so the per-entry cycle-out model is unchanged.
-    {
-      unsigned lat = latencyOf(grp.first);
-      for (unsigned c = 0; c < lat; ++c) {
-        std::string stateName =
-            c == 0 ? frameName : frameName + "_C" + std::to_string(c);
-        std::string succ =
-            (c + 1 < lat)
-                ? frameName + "_C" + std::to_string(c + 1)
-                : (isLeaf ? nextState : "WAIT_" + std::to_string(grp.first));
-        auto st = fsm::StateOp::create(fb, loc, stateName);
-        Block *ob = st.ensureOutput(fb);
-        ob->getTerminator()->erase();
-        fb.setInsertionPointToEnd(ob);
-        int cycleSlot = entryCycleOutBase[grp.first] >= 0
-                            ? entryCycleOutBase[grp.first] + (int)c
-                            : -1;
-        fsm::OutputOp::create(
-            fb, loc,
-            makeOutput(false, isLeaf ? ArrayRef<int>{} : groupChildStarts,
-                       groupRunnings, cycleSlot));
-        Block *tb = &st.getTransitions().front();
-        fb.setInsertionPointToEnd(tb);
-        fsm::TransitionOp::create(fb, loc, StringRef(succ));
-        fb.setInsertionPointToEnd(&machine.getBody().front());
-      }
-    }
-
-    // WAIT_g (child-launching groups only): hold until the group's
-    // combined done input (all members done) rises.
-    if (!isLeaf) {
-      std::string waitName = "WAIT_" + std::to_string(grp.first);
-      auto st = fsm::StateOp::create(fb, loc, waitName);
-      Block *ob = st.ensureOutput(fb);
-      ob->getTerminator()->erase();
-      fb.setInsertionPointToEnd(ob);
-      // frame_running stays high during WAIT
-      fsm::OutputOp::create(fb, loc, makeOutput(false, {}, groupRunnings));
-      Block *tb = &st.getTransitions().front();
-      fb.setInsertionPointToEnd(tb);
-      unsigned doneArgIdx = (unsigned)grp.doneArg;
-      fsm::TransitionOp::create(
-          fb, loc, StringRef(nextState),
-          [&]() {
-            fsm::ReturnOp::create(fb, loc, machine.getArgument(doneArgIdx));
-          },
-          []() {});
-      fb.setInsertionPointToEnd(&machine.getBody().front());
-    }
-  }
-
-  // --- DONE ---
-  {
-    auto st = fsm::StateOp::create(fb, loc, "DONE");
-    Block *ob = st.ensureOutput(fb);
-    ob->getTerminator()->erase();
-    fb.setInsertionPointToEnd(ob);
-    fsm::OutputOp::create(fb, loc, makeOutput(true, {}, {}));
-    Block *tb = &st.getTransitions().front();
-    fb.setInsertionPointToEnd(tb);
-    // No start arc here, and none is needed even with the early-done
-    // cut-through: `ready` (~tx_in_flight) clears on the REGISTERED Moore
-    // done, so it rises the cycle AFTER this state — when the machine is
-    // back in IDLE — and both start protocols (the testbench's level start
-    // gated on ready, the AXI wrapper's one-shot startFire) deliver the
-    // next invocation's start there. That is the historical protocol
-    // timing, kept deliberately: it is what keeps the child-done chain out
-    // of tx_in_flight's cone (see mooreDoneSignal) and this machine's
-    // shape identical whether or not a cut-through exists.
-    fsm::TransitionOp::create(fb, loc, StringRef("IDLE"));
-  }
-  fb.setInsertionPointToEnd(&machine.getBody().front());
-
-  // Registered launch arms for the pre-armed entries (see the helper),
-  // appended in entry order. Each eligible entry is solo in its group,
-  // so its launch state is the group's (its own) FRAME state.
-  for (auto [ei, pa] : llvm::enumerate(preArmEntries))
-    if (pa)
-      addRegisteredLaunchArm(machine, "FRAME_" + std::to_string(ei),
-                             "issue_arm_" + std::to_string(ei));
-
-  return machine;
-}
 
 //===----------------------------------------------------------------------===//
 // One machine per function: inline sequential levels as states
@@ -3356,12 +3076,6 @@ void LoopScheduleToFSMPass::emitLevelStates(UnifiedFsmCtx &ctx,
   Value condArg = ctx.machine.getArgument(sl.inCond);
   Value condNextArg = ctx.machine.getArgument(sl.inCondNext);
   Value stallArg = ctx.machine.getArgument(sl.inStall);
-
-  // The level's first_iter variable.
-  fb.setInsertionPointToEnd(&ctx.machine.getBody().front());
-  plan.fiVar = fsm::VariableOp::create(fb, loc, fb.getI1Type(),
-                                       fb.getBoolAttr(true),
-                                       (pfx + "_first_iter").str());
 
   unsigned numStateFrames =
       info.foldLastFrame ? info.numFrames - 1 : info.numFrames;
@@ -3701,6 +3415,20 @@ fsm::MachineOp LoopScheduleToFSMPass::createUnifiedFSM(
   Value trueVal = hw::ConstantOp::create(fb, loc, i1, 1);
   Value falseVal = hw::ConstantOp::create(fb, loc, i1, 0);
   UnifiedFsmCtx uctx{fb, loc, machine, trueVal, falseVal, numOutputs};
+
+  // Every level's first_iter variable exists before any state does: the
+  // LAUNCHER state's entry transition updates it, and launchers are
+  // emitted before their level's own states.
+  std::function<void(LevelPlan &)> makeFiVars = [&](LevelPlan &plan) {
+    plan.fiVar = fsm::VariableOp::create(fb, loc, i1, fb.getBoolAttr(true),
+                                         plan.node->prefix + "_first_iter");
+    for (auto &c : plan.children)
+      if (c)
+        makeFiVars(*c);
+  };
+  for (auto &plan : entryPlans)
+    if (plan)
+      makeFiVars(*plan);
 
   auto nextEmittedState = [&](unsigned g) -> std::string {
     for (unsigned j = g + 1; j < groupList.size(); ++j)
@@ -4987,6 +4715,170 @@ LoopScheduleToFSMPass::analyzeLoopNode(const LoopNode &node,
   return success();
 }
 
+LogicalResult LoopScheduleToFSMPass::lowerInlineLoopLevel(
+    LevelPlan &plan, fsm::HWInstanceOp fsmInst, OpBuilder &builder,
+    Location loc, Block *hwBody, Value clk, Value rst,
+    loopschedule::LoopScheduleFuncSequentialOp funcOp,
+    ArrayRef<PortArgInfo> memrefArgs, IRMapping &mapping,
+    DenseMap<Value, MemPortMapping> &callerMemPorts,
+    DenseMap<Value, MemPortMapping> &portContribution,
+    SmallVectorImpl<Value> &resultValues, SmallVectorImpl<Value> &resultCombs,
+    Value &spanActive, Value &exitEdge) {
+  auto *ctx = builder.getContext();
+  auto i1 = builder.getI1Type();
+  OpBuilder hw(ctx);
+  hw.setInsertionPointToEnd(hwBody);
+  const LevelSlots &sl = plan.slots;
+  const LoopNodeInfo &info = plan.info;
+  assert(plan.wires && "level wires must be created before the instance");
+  auto res = [&](unsigned idx) { return fsmInst.getResult(idx); };
+
+  // The level-visible port map: the caller's shared per-memory signals
+  // (rd_data, handshakes) — the drive fields start empty and fill during
+  // frame lowering, then merge into `portContribution`.
+  DenseMap<Value, MemPortMapping> localMemPorts;
+  for (auto &memInfo : memrefArgs) {
+    auto &src = callerMemPorts[memInfo.originalArg];
+    auto &dst = localMemPorts[memInfo.originalArg];
+    dst.rdData = src.rdData;
+    dst.done = src.done;
+    dst.wrDone = src.wrDone;
+    dst.ready = src.ready;
+    dst.rdIdle = src.rdIdle;
+    dst.wrIdle = src.wrIdle;
+    for (auto &ep : src.extraPorts) {
+      PortDrives d;
+      d.rdData = ep.rdData;
+      dst.extraPorts.push_back(d);
+    }
+  }
+
+  // Level-internal backedges (latches, dyn-access plumbing) resolve in
+  // the function module's own region.
+  BackedgeBuilder bb(hw, loc);
+
+  // Per-slot done backedges: non-inlined slots alias the machine-input
+  // wires; inlined slots get local edges consumed only by the advance
+  // logic here.
+  SmallVector<Backedge> childDoneBEs;
+  {
+    unsigned w = 0;
+    for (unsigned j = 0; j < info.numWaits; ++j) {
+      if (plan.children[j])
+        childDoneBEs.push_back(bb.get(i1));
+      else
+        childDoneBEs.push_back(plan.wires->childDones[w++]);
+    }
+  }
+
+  LevelEnv env{hw,
+               builder,
+               ctx,
+               i1,
+               loc,
+               hwBody,
+               funcOp->getParentOfType<ModuleOp>(),
+               funcOp,
+               memrefArgs,
+               mapping,
+               localMemPorts,
+               bb,
+               clk,
+               rst,
+               plan.wires->cond,
+               plan.wires->condNext,
+               plan.wires->stall,
+               childDoneBEs};
+  env.fsmFirstIter = res(sl.outFirstIter);
+  env.fsmIterAdvance = res(sl.outIterAdvance);
+  for (unsigned i = 0; i < info.numFrames; ++i)
+    env.fsmFrameActives.push_back(res(sl.outFrameActiveBase + i));
+  for (unsigned j = 0; j < info.numWaits; ++j) {
+    env.fsmChildStarts.push_back(res(sl.outChildStartBase + j));
+    env.fsmChildActives.push_back(res(sl.outChildActiveBase + j));
+  }
+  Value zero1 = hw::ConstantOp::create(hw, loc, i1, 0);
+  env.fsmPostActives.assign(info.numWaits, zero1);
+  env.fsmFrameCycleGates.resize(info.numFrames);
+  for (unsigned i = 0; i < info.numFrames; ++i) {
+    if (info.frameCycleOutBase[i] < 0) {
+      env.fsmFrameCycleGates[i].push_back(env.fsmFrameActives[i]);
+    } else {
+      for (unsigned c = 0; c < info.frameLatencies[i]; ++c)
+        env.fsmFrameCycleGates[i].push_back(
+            res((unsigned)sl.outCycleBase +
+                (unsigned)info.frameCycleOutBase[i] + c));
+    }
+  }
+  env.fsmIssueArms.assign(info.numWaits, Value());
+  for (unsigned j = 0; j < info.numWaits; ++j)
+    if (sl.outIssueArm[j] >= 0)
+      env.fsmIssueArms[j] = res((unsigned)sl.outIssueArm[j]);
+  env.plan = &plan;
+  env.unifiedInst = fsmInst;
+
+  Value iterAdvanceEdge;
+  if (failed(lowerLoopLevelBody(*plan.node, plan.info, env, resultValues,
+                                resultCombs, iterAdvanceEdge)))
+    return failure();
+
+  // Map the loop's results for downstream consumers (registers — stable
+  // after the exit). Same-edge consumers use `resultCombs` instead; the
+  // caller owns that substitution.
+  auto seqOpMut = plan.node->seqOp; // op handles are cheap value copies
+  for (auto [r, v] : llvm::zip(seqOpMut.getResults(), resultValues))
+    mapping.map(r, v);
+
+  hw.setInsertionPointToEnd(hwBody);
+  // The level's merged drives are its contribution to the caller's merge.
+  for (auto &memInfo : memrefArgs) {
+    auto &mp = localMemPorts[memInfo.originalArg];
+    auto &out = portContribution[memInfo.originalArg];
+    out.rdData = mp.rdData;
+    out.addrs = mp.addrs;
+    out.wrData = mp.wrData;
+    out.wrEn = mp.wrEn;
+    out.rdEn = mp.rdEn;
+    out.extraPorts = mp.extraPorts;
+    out.done = mp.done;
+    out.wrDone = mp.wrDone;
+    out.ready = mp.ready;
+    out.rdIdle = mp.rdIdle;
+    out.wrIdle = mp.wrIdle;
+  }
+
+  // spanActive: high whenever the machine is anywhere in this level's
+  // states (frames, COND, and every launch span — pipeline WAITs and
+  // embedded children drive child_active).
+  Value span;
+  auto orInto = [&](Value v) {
+    if (!v)
+      return;
+    span = span ? comb::OrOp::create(hw, loc, span, v).getResult() : v;
+  };
+  for (Value fa : env.fsmFrameActives)
+    orInto(fa);
+  for (Value ca : env.fsmChildActives)
+    orInto(ca);
+  if (sl.outCondActive >= 0)
+    orInto(res((unsigned)sl.outCondActive));
+  spanActive = span ? span : zero1;
+
+  // The exit edge: the one cycle on which the level leaves for good.
+  // Read the RESOLVED condition values — a backedge placeholder must not
+  // gain uses after its setValue.
+  if (info.condBypass) {
+    Value notCondNext =
+        comb::createOrFoldNot(hw, loc, plan.resolvedCondNext);
+    exitEdge = comb::AndOp::create(hw, loc, iterAdvanceEdge, notCondNext);
+  } else {
+    Value notCond = comb::createOrFoldNot(hw, loc, plan.resolvedCond);
+    exitEdge = comb::AndOp::create(
+        hw, loc, res((unsigned)sl.outCondActive), notCond);
+  }
+  return success();
+}
+
 LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
     const LoopNode &node, LoopNodeInfo &info, LevelEnv &env,
     SmallVectorImpl<Value> &resultValues, SmallVectorImpl<Value> &resultCombs,
@@ -5087,7 +4979,16 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
   // WAIT.
   Value advanceRaw = fsmIterAdvance;
   unsigned lastStateFrame = foldLastFrame ? numFrames - 2 : numFrames - 1;
-  if (!frameWaitIdx[lastStateFrame].empty()) {
+  if (!frameWaitIdx[lastStateFrame].empty() && env.plan &&
+      env.plan->children[(unsigned)frameWaitIdx[lastStateFrame].front()]) {
+    // The last frame's launch is an EMBEDDED child level: its done feed
+    // (resolved below) is already the exit EDGE — the cycle the machine
+    // leaves the child span, zero-trip skip included — so it is the
+    // advance term directly, with no in-WAIT gating (there is no WAIT).
+    advanceRaw = comb::OrOp::create(
+        hw, loc, advanceRaw,
+        Value(childDoneBEs[(unsigned)frameWaitIdx[lastStateFrame].front()]));
+  } else if (!frameWaitIdx[lastStateFrame].empty()) {
     Value notFrameCycle = comb::createOrFoldNot(
         hw, loc, fsmFrameActives[lastStateFrame]);
     Value inWait = comb::AndOp::create(
@@ -5442,21 +5343,40 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
   // the corresponding launched child (after the child instance has been
   // created). Used to resolve `loopschedule.await` operands in later frames.
   DenseMap<Value, SmallVector<Value>> handleValueMap;
+  // Child results mapped comb-first for the frame-result section (so a
+  // same-edge consumer reads the advance-edge value), then remapped to
+  // their registers for every later frame. Flushed per frame iteration.
+  SmallVector<std::pair<Value, Value>> pendingResultRemaps;
+  // Register -> advance-edge comb alias for every embedded child result.
+  // Consumers that resolve through the await/handle chain end at the
+  // REGISTER; a consumer sampling on the child's own exit edge (the
+  // enclosing iter-arg feedback) must substitute the alias.
+  DenseMap<Value, Value> childResultCombAlias;
 
   // Helper: process a frame's await region. For each `loopschedule.await`
   // op, map its results to the stashed child outputs from `handleValueMap`.
   // Then forward the await-region's yield operands to the body-region
   // entry-block arguments.
-  auto processAwaitRegion = [&](LoopScheduleFrameOp frame) {
+  auto processAwaitRegion = [&](LoopScheduleFrameOp frame,
+                                bool sameEdgeFrame = false) {
     for (auto &op : frame.getAwaitBlock().getOperations()) {
       if (auto awaitOp = dyn_cast<LoopScheduleAwaitOp>(&op)) {
-        // Gather stashed child values across all handle operands.
+        // Gather stashed child values across all handle operands. A
+        // SAME-EDGE frame (the folded last frame: its ops are comb into
+        // the iter-arg D inputs, sampled on the advance edge) must read
+        // an embedded child's ADVANCE-EDGE comb alias, not the register
+        // that latches on that very edge.
         SmallVector<Value> childVals;
         for (Value h : awaitOp.getHandles()) {
           auto it = handleValueMap.find(h);
           if (it != handleValueMap.end())
-            for (Value v : it->second)
+            for (Value v : it->second) {
+              if (sameEdgeFrame)
+                if (auto aIt = childResultCombAlias.find(v);
+                    aIt != childResultCombAlias.end())
+                  v = aIt->second;
               childVals.push_back(v);
+            }
         }
         // Child values may include iter-arg passthrough results that the
         // downstream consumer doesn't want (e.g. a pipeline with
@@ -5485,11 +5405,15 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
     }
   };
 
+
   for (auto [frameIdx, frameOp] : llvm::enumerate(frames)) {
     hw.setInsertionPointToEnd(hwBody);
 
     // Resolve any awaits in the await region before lowering the body.
-    processAwaitRegion(frameOp);
+    // The folded last frame's ops feed the iter-arg D inputs sampled on
+    // the ADVANCE edge, so its awaits read comb aliases (see the lambda).
+    bool sameEdgeFrame = foldLastFrame && frameIdx + 1 == numFrames;
+    processAwaitRegion(frameOp, sameEdgeFrame);
 
     auto &slots = node.frameLaunches[frameIdx];
     if (!slots.empty()) {
@@ -5511,6 +5435,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
         Value slotChildStart = fsmChildStarts[waitIdx];
         Value slotChildActive = fsmChildActives[waitIdx];
         auto launchOp = launches[slotIdx];
+        LevelPlan *inlineChildPlan =
+            env.plan ? env.plan->children[(unsigned)waitIdx].get() : nullptr;
 
         // A blocking dynamic access (e.g. an amc.burst_copy) whose
         // completion budget ends in the state that launches this child may
@@ -5519,7 +5445,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
         // Defer the start until the stall clears, latching the pulse so it
         // is not lost mid-stall. Without an active stall this is a
         // passthrough (fire == the original pulse).
-        {
+        if (!inlineChildPlan) {
           hw.setInsertionPointToEnd(hwBody);
           Value zero1 = hw::ConstantOp::create(hw, loc, i1, 0);
           auto pendReg = seq::CompRegOp::create(
@@ -5535,7 +5461,122 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
           slotChildStart = fire;
         }
 
-        if (slot.childIdx >= 0) {
+        if (inlineChildPlan) {
+          auto &childNode = node.children[slot.childIdx];
+          auto childSeqOp = childNode.seqOp;
+          // EMBEDDED child level: its states already live in the one
+          // machine; lower its wrapper hardware here and take its port
+          // contribution under this slot's active gate.
+          DenseMap<Value, MemPortMapping> childPorts;
+          SmallVector<Value> childResultVals, childResultCombs;
+          Value childSpan, childExit;
+          if (failed(lowerInlineLoopLevel(
+                  *inlineChildPlan, env.unifiedInst, builder, loc, hwBody,
+                  clk, rst, funcOp, memrefArgs, localMapping, localMemPorts,
+                  childPorts, childResultVals, childResultCombs, childSpan,
+                  childExit)))
+            return failure();
+
+          // Same-edge visibility: THIS frame's result section must read
+          // the child's advance-edge values (the enclosing iter-arg
+          // feedback latches on the same posedge the child's registers
+          // do). Later frames read the registers; the remap below flips
+          // the mapping once this frame's comb aliases are captured.
+          for (auto [r, comb] :
+               llvm::zip(childSeqOp.getResults(), childResultCombs))
+            localMapping.map(r, comb);
+          for (auto [r, reg] :
+               llvm::zip(childSeqOp.getResults(), childResultVals))
+            pendingResultRemaps.push_back({r, reg});
+          for (auto [reg, comb] :
+               llvm::zip(childResultVals, childResultCombs))
+            childResultCombAlias[reg] = comb;
+
+          if (auto launchAt = launchOp->getParentOfType<LoopScheduleAtOp>()) {
+            auto atYield = launchAt.getYieldOp();
+            for (auto [atRes, yOperand] :
+                 llvm::zip(launchAt.getResults(), atYield.getOperands())) {
+              if (yOperand == launchOp.getHandle())
+                handleValueMap[atRes] = childResultVals;
+            }
+          }
+          handleValueMap[launchOp.getHandle()] = childResultVals;
+
+          // Done feed = the child's exit edge; a bypass entry adds the
+          // zero-trip skip (launcher cycle with a false condition — the
+          // machine leaves through the skip arm and the wrapper's
+          // advance must fire on the same edge).
+          hw.setInsertionPointToEnd(hwBody);
+          Value feed = childExit;
+          if (inlineChildPlan->info.entryBypass) {
+            Value launcher = fsmFrameCycleGates[frameIdx].back();
+            Value notCond =
+                comb::createOrFoldNot(hw, loc, inlineChildPlan->resolvedCond);
+            Value skip = comb::AndOp::create(hw, loc, launcher, notCond);
+            skip = comb::AndOp::create(hw, loc, skip, notStallSeq);
+            feed = comb::OrOp::create(hw, loc, childExit, skip);
+          }
+          childDoneBEs[waitIdx].setValue(feed);
+
+          // Mux the child's merged drives into this frame's ports under
+          // slotChildActive — the embedded states drive that gate.
+          for (auto &memInfo : memrefArgs) {
+            auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
+            bool emitWrite = memInfo.isAmcPort ? memInfo.isWrite : true;
+            Type dataType = memInfo.elementType;
+            auto &childMp = childPorts[memInfo.originalArg];
+            for (unsigned port = 0; port < memInfo.numPorts; ++port) {
+              PortDrivesRef childR = portRef(childMp, port);
+              PortDrivesRef portsR =
+                  portRef(perFramePorts[frameIdx][memInfo.originalArg], port);
+              if (portsR.addrs->size() != widths.size())
+                portsR.addrs->assign(widths.size(), Value());
+              for (auto [d, w] : llvm::enumerate(widths)) {
+                Type addrType = IntegerType::get(ctx, w);
+                Value childAddr =
+                    (d < childR.addrs->size() && (*childR.addrs)[d])
+                        ? (*childR.addrs)[d]
+                        : hw::ConstantOp::create(hw, loc, addrType, 0);
+                Value myAddr = (*portsR.addrs)[d]
+                                   ? (*portsR.addrs)[d]
+                                   : hw::ConstantOp::create(hw, loc,
+                                                            addrType, 0);
+                (*portsR.addrs)[d] = comb::MuxOp::create(
+                    hw, loc, slotChildActive, childAddr, myAddr);
+              }
+              if (memInfo.requiresRdEn) {
+                Value childRdEn = *childR.rdEn
+                                      ? *childR.rdEn
+                                      : hw::ConstantOp::create(hw, loc, i1, 0);
+                Value myRdEn = *portsR.rdEn
+                                   ? *portsR.rdEn
+                                   : hw::ConstantOp::create(hw, loc, i1, 0);
+                *portsR.rdEn = comb::MuxOp::create(hw, loc, slotChildActive,
+                                                   childRdEn, myRdEn);
+              }
+              if (emitWrite) {
+                Value childWrData =
+                    *childR.wrData
+                        ? *childR.wrData
+                        : hw::ConstantOp::create(hw, loc, dataType, 0);
+                Value childWrEn = *childR.wrEn
+                                      ? *childR.wrEn
+                                      : hw::ConstantOp::create(hw, loc, i1, 0);
+                Value myWrData =
+                    *portsR.wrData
+                        ? *portsR.wrData
+                        : hw::ConstantOp::create(hw, loc, dataType, 0);
+                Value myWrEn = *portsR.wrEn
+                                   ? *portsR.wrEn
+                                   : hw::ConstantOp::create(hw, loc, i1, 0);
+                *portsR.wrData = comb::MuxOp::create(
+                    hw, loc, slotChildActive, childWrData, myWrData);
+                *portsR.wrEn = comb::MuxOp::create(hw, loc, slotChildActive,
+                                                   childWrEn, myWrEn);
+              }
+            }
+          }
+        } else if (slot.childIdx >= 0) {
           auto &childNode = node.children[slot.childIdx];
           auto childSeqOp = childNode.seqOp;
           // Recursively create child module.
@@ -5635,6 +5676,20 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
 
           unsigned outIdx = 0;
           Value childDone = childInst.getResult(outIdx++);
+          // OUTLINE BOUNDARY CONTRACT: no combinational path crosses the
+          // module boundary. The child's done reaches the machine through
+          // a register, cleared on the launch pulse so a previous
+          // invocation's held done can never satisfy the new WAIT.
+          {
+            hw.setInsertionPointToEnd(hwBody);
+            Value zero1b = hw::ConstantOp::create(hw, loc, i1, 0);
+            Value notStart =
+                comb::createOrFoldNot(hw, loc, slotChildStart);
+            Value nextV = comb::AndOp::create(hw, loc, childDone, notStart);
+            childDone = seq::CompRegOp::create(
+                hw, loc, nextV, clk, rst, zero1b,
+                hw.getStringAttr(childNode.prefix + "_done_reg"));
+          }
           // The latch is only needed when multiple launches in this
           // frame may finish at different cycles — a single-launch
           // frame's WAIT_i samples done on the same cycle the raw
@@ -5966,10 +6021,21 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
     // point at the post-frame capture register.
     if (frameIdx == condFrameIdx) {
       auto it = frameResultComb.find(condTermVal);
-      condBE.setValue(it != frameResultComb.end()
-                          ? it->second
-                          : localMapping.lookup(condTermVal));
+      Value condV = it != frameResultComb.end()
+                        ? it->second
+                        : localMapping.lookup(condTermVal);
+      condBE.setValue(condV);
+      env.resolvedCond = condV;
+      if (env.plan)
+        env.plan->resolvedCond = condV;
     }
+
+    // Flip embedded children's results from their advance-edge comb
+    // aliases (what THIS frame's captures read) to their registers
+    // (stable for every later frame).
+    for (auto &pr : pendingResultRemaps)
+      localMapping.map(pr.first, pr.second);
+    pendingResultRemaps.clear();
   }
 
   // Resolve the FSM stall input: OR of every dynamic access's ready/done
@@ -6028,6 +6094,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
     Value feedback = combIt != frameResultComb.end()
                          ? combIt->second
                          : localMapping.lookup(termArg);
+    // The iter-arg register latches on the advance edge — the same
+    // posedge an embedded child's own result registers latch. A feedback
+    // that resolved to such a register (through the await/handle chain)
+    // would read the PREVIOUS iteration's value; substitute the child's
+    // advance-edge comb alias.
+    if (auto aliasIt = childResultCombAlias.find(feedback);
+        aliasIt != childResultCombAlias.end())
+      feedback = aliasIt->second;
     iterArgFeedbacks[i] = feedback;
     Value init = localMapping.lookup(seqOp.getInits()[i]);
     Value muxed = comb::MuxOp::create(hw, loc, fsmFirstIter, init, feedback);
@@ -6040,7 +6114,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
   // bypass pre-analysis guaranteed the slice is pure comb of iter_args
   // and loop-invariant values, so emitComputeOp only clones comb ops.
   if (!condBypass) {
-    condNextBE.setValue(hw::ConstantOp::create(hw, loc, i1, 0));
+    Value zeroCN = hw::ConstantOp::create(hw, loc, i1, 0);
+    condNextBE.setValue(zeroCN);
+    env.resolvedCondNext = zeroCN;
+    if (env.plan)
+      env.plan->resolvedCondNext = zeroCN;
   } else {
     IRMapping condNextMapping;
     std::function<Value(Value)> resolveNext = [&](Value v) -> Value {
@@ -6094,7 +6172,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                          "pre-analysis admitted a non-comb op");
       return condNextMapping.lookup(v);
     };
-    condNextBE.setValue(resolveNext(terminatorOp.getCondition()));
+    Value cnV = resolveNext(terminatorOp.getCondition());
+    condNextBE.setValue(cnV);
+    env.resolvedCondNext = cnV;
+    if (env.plan)
+      env.plan->resolvedCondNext = cnV;
   }
 
   // Map sequential op results to register values where possible.
@@ -6391,7 +6473,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   Value moduleDone = fsmDone;
   if (condBypass && resultsDead) {
     Value notCondNext =
-        comb::createOrFoldNot(hw, loc, Value(condNextBE));
+        comb::createOrFoldNot(hw, loc, env.resolvedCondNext);
     Value earlyDone =
         comb::AndOp::create(hw, loc, iterAdvanceEdge, notCondNext);
     moduleDone = comb::OrOp::create(hw, loc, fsmDone, earlyDone);
@@ -8590,23 +8672,60 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     }
   }
 
-  // Create function-level FSM.
+  // --- Loop trees and inline plans for sequential entries ---
+  // Prefixes are pre-assigned in entry order so kinds 0 and 1 keep the
+  // historical loop<N> numbering whichever path lowers them.
+  SmallVector<std::string> entryPrefix(entries.size());
+  {
+    unsigned pfxCounter = 0;
+    for (unsigned ei = 0; ei < entries.size(); ++ei)
+      if (entries[ei].kind == 0 || entries[ei].kind == 1)
+        entryPrefix[ei] = "loop" + std::to_string(pfxCounter++);
+  }
+  std::vector<LoopNode> entryNodes(entries.size());
+  SmallVector<std::unique_ptr<LevelPlan>> entryPlans(entries.size());
+  for (unsigned ei = 0; ei < entries.size(); ++ei) {
+    if (entries[ei].kind != 0)
+      continue;
+    unsigned innerCounter = 1;
+    buildLoopTree(entries[ei].seqOp, entryNodes[ei], entryPrefix[ei],
+                  innerCounter);
+    // A sequential entry embeds into the function machine when it is
+    // solo in its group (one machine cannot be in two states) and not
+    // explicitly outlined.
+    bool soloGroup = llvm::count(entryGroups, entryGroups[ei]) == 1;
+    bool forced = entries[ei].seqOp->getParentOfType<
+                      loopschedule::LoopScheduleOutlineOp>() != nullptr;
+    if (!soloGroup || forced) {
+      ++numAutoOutlined;
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[unified-fsm] outlining " << entryPrefix[ei] << ": "
+                 << (forced ? "explicit loopschedule.outline"
+                            : "concurrent siblings in one group")
+                 << "\n");
+      continue;
+    }
+    auto plan = std::make_unique<LevelPlan>();
+    if (failed(planInlineLevel(entryNodes[ei], *plan)))
+      return failure();
+    entryPlans[ei] = std::move(plan);
+  }
+
+  // Create the ONE function machine (embedded levels included).
   std::string funcName = funcOp.getName().str();
   std::string fsmName = funcName + "_fsm";
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   builder.setInsertionPointToEnd(moduleOp.getBody());
-  SmallVector<int> entryCycleOutBase;
-  // Every pre-armed entry (solo in its frame and group, but a function
-  // may hold several such frames — atax/mm2 sequence multiple solo
-  // pipelines) gets a registered issue-arm output, appended in entry
-  // order.
   unsigned numEntryPreArms = llvm::count(entryPreArm, true);
-  createFunctionFSM(builder, loc, fsmName, entryKinds, entryLatencies,
-                    entryGroups, entryCycleOutBase, entryPreArm);
+  UnifiedFsmResult ufsm;
+  createUnifiedFSM(builder, loc, fsmName, entryKinds, entryLatencies,
+                   entryGroups, entryPlans, entryPreArm, ufsm);
+  SmallVector<int> &entryCycleOutBase = ufsm.entryCycleOutBase;
   unsigned totalEntryCycleOuts = 0;
   for (unsigned i = 0; i < entries.size(); ++i)
     if (entryCycleOutBase[i] >= 0)
       totalEntryCycleOuts += entryLatencies[i];
+  (void)totalEntryCycleOuts;
 
   // Instantiate function FSM in HW module body.
   builder.setInsertionPointToEnd(hwBody);
@@ -8641,7 +8760,17 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       for (; j < entries.size() && entryGroups[j] == groupId; ++j)
         if (childIndexForEntry[j] >= 0)
           cis.push_back((unsigned)childIndexForEntry[j]);
-      if (cis.size() == 1) {
+      // The entry index of the group's single child member, for the
+      // solo-inlined check (its span lives inside the machine, which
+      // then takes no done input for the group).
+      int soloEi = -1;
+      if (cis.size() == 1)
+        for (unsigned k = i; k < j; ++k)
+          if (childIndexForEntry[k] >= 0)
+            soloEi = (int)k;
+      if (cis.size() == 1 && soloEi >= 0 && entryPlans[soloEi]) {
+        // no machine input: the embedded states ARE the wait
+      } else if (cis.size() == 1) {
         fsmInputs.push_back(Value(childDoneBEs[cis[0]]));
       } else if (cis.size() > 1) {
         auto startBE = bb.get(i1);
@@ -8673,9 +8802,41 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     }
   }
 
+  // Level machine inputs, pre-order per inlined entry: cond, cond_next,
+  // child_done per still-outlined slot, stall — the exact order
+  // layoutLevel assigned.
+  std::function<void(LevelPlan &)> wireLevel = [&](LevelPlan &plan) {
+    plan.wires.emplace(bb.get(i1), bb.get(i1), bb.get(i1));
+    fsmInputs.push_back(Value(plan.wires->cond));
+    fsmInputs.push_back(Value(plan.wires->condNext));
+    for (unsigned j = 0; j < plan.info.numWaits; ++j)
+      if (!plan.children[j]) {
+        plan.wires->childDones.push_back(bb.get(i1));
+        fsmInputs.push_back(Value(plan.wires->childDones.back()));
+      }
+    fsmInputs.push_back(Value(plan.wires->stall));
+    for (auto &c : plan.children)
+      if (c)
+        wireLevel(*c);
+  };
+  for (auto &plan : entryPlans)
+    if (plan)
+      wireLevel(*plan);
+
   unsigned numEntries = entries.size();
-  unsigned numFuncFsmResults = 1 + numChildren + numEntries + totalEntryCycleOuts;
-  SmallVector<Type> fsmResultTypes(numFuncFsmResults + numEntryPreArms, i1);
+  unsigned numFuncFsmResults = ufsm.numOutputs;
+  unsigned numArms = numEntryPreArms;
+  std::function<void(const LevelPlan &)> countArms =
+      [&](const LevelPlan &plan) {
+        numArms += (unsigned)llvm::count(plan.info.launchPreArm, true);
+        for (auto &c : plan.children)
+          if (c)
+            countArms(*c);
+      };
+  for (auto &plan : entryPlans)
+    if (plan)
+      countArms(*plan);
+  SmallVector<Type> fsmResultTypes(numFuncFsmResults + numArms, i1);
   auto fsmInst = fsm::HWInstanceOp::create(
       builder, loc, fsmResultTypes,
       builder.getStringAttr(fsmName + "_inst"),
@@ -8684,12 +8845,10 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   // Per-entry registered issue arms, appended after the base results in
   // entry order.
   SmallVector<Value> funcIssueArms(numEntries, Value());
-  {
-    unsigned armIdx = numFuncFsmResults;
-    for (auto [ei2, pa] : llvm::enumerate(entryPreArm))
-      if (pa)
-        funcIssueArms[ei2] = fsmInst.getResult(armIdx++);
-  }
+  for (unsigned ei2 = 0; ei2 < numEntries; ++ei2)
+    if (ufsm.entryIssueArmIdx[ei2] >= 0)
+      funcIssueArms[ei2] =
+          fsmInst.getResult((unsigned)ufsm.entryIssueArmIdx[ei2]);
 
   // Extract FSM outputs.
   unsigned fsmOutIdx = 0;
@@ -9030,7 +9189,6 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   };
 
   // Lower each entry.
-  unsigned loopCounter = 0;
   for (unsigned ei = 0; ei < numEntries; ++ei) {
     auto &entry = entries[ei];
     unsigned frameIdx = entry.frameIdx;
@@ -9055,14 +9213,66 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       }
     }
 
-    if (entry.kind == 0) {
-      // Sequential child: build loop tree and create child module.
-      auto seqOp = entry.seqOp;
-      std::string prefix = "loop" + std::to_string(loopCounter++);
+    if (entry.kind == 0 && entryPlans[ei]) {
+      // EMBEDDED sequential entry: its states live in the function
+      // machine; lower its wrapper hardware into this module and feed
+      // the entry's done from its exit edge.
+      LevelPlan &plan = *entryPlans[ei];
+      DenseMap<Value, MemPortMapping> contribution;
+      SmallVector<Value> childResultVals, childResultCombs;
+      Value span, exitE;
+      if (failed(lowerInlineLoopLevel(plan, fsmInst, builder, loc, hwBody,
+                                      clk, rst, funcOp, memrefArgs, mapping,
+                                      memPortMap, contribution,
+                                      childResultVals, childResultCombs,
+                                      span, exitE)))
+        return failure();
+      if (entry.launchOp) {
+        if (auto launchAt =
+                entry.launchOp->getParentOfType<LoopScheduleAtOp>()) {
+          auto atYield = launchAt.getYieldOp();
+          for (auto [atRes, yOperand] :
+               llvm::zip(launchAt.getResults(), atYield.getOperands())) {
+            if (yOperand == entry.launchOp.getHandle())
+              funcHandleValueMap[atRes] = childResultVals;
+          }
+        }
+        funcHandleValueMap[entry.launchOp.getHandle()] = childResultVals;
+      }
+      builder.setInsertionPointToEnd(hwBody);
+      Value feed = exitE;
+      if (plan.info.entryBypass) {
+        // Zero-trip skip: the machine leaves through FRAME_<g>'s skip
+        // arm; the done feed must fire on that same edge. The launcher
+        // decode is the entry's running gate minus the embedded span.
+        Value notSpan = comb::createOrFoldNot(builder, loc, span);
+        Value launcher = comb::AndOp::create(
+            builder, loc, entryRunningSignals[ei], notSpan);
+        Value notCond =
+            comb::createOrFoldNot(builder, loc, plan.resolvedCond);
+        Value skip = comb::AndOp::create(builder, loc, launcher, notCond);
+        feed = comb::OrOp::create(builder, loc, exitE, skip);
+      }
+      childDoneBEs[childIndexForEntry[ei]].setValue(feed);
+      // The level's merged drives are this entry's port contribution.
+      for (auto &memInfo : memrefArgs) {
+        auto &mp = perEntryPorts[ei][memInfo.originalArg];
+        auto &c = contribution[memInfo.originalArg];
+        mp.addrs = c.addrs;
+        mp.wrData = c.wrData;
+        mp.wrEn = c.wrEn;
+        mp.rdEn = c.rdEn;
+        mp.extraPorts = c.extraPorts;
+      }
 
-      LoopNode node;
-      unsigned innerCounter = 1;
-      buildLoopTree(seqOp, node, prefix, innerCounter);
+    } else if (entry.kind == 0) {
+      // OUTLINED sequential entry (concurrent siblings or an explicit
+      // loopschedule.outline): its own module, behind the registered
+      // handshake.
+      auto seqOp = entry.seqOp;
+      const std::string &prefix = entryPrefix[ei];
+      LoopNode &node = entryNodes[ei];
+      (void)seqOp;
 
       hw::HWModuleOp childModule;
       SmallVector<Value> childCaptured;
@@ -9157,6 +9367,19 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       // Extract child outputs.
       unsigned outIdx = 0;
       Value childDone = childInst.getResult(outIdx++);
+      // OUTLINE BOUNDARY CONTRACT: the done crosses through a register,
+      // cleared on the launch pulse so a previous invocation's held done
+      // never satisfies the new WAIT.
+      {
+        builder.setInsertionPointToEnd(hwBody);
+        Value zero1b = hw::ConstantOp::create(builder, loc, i1, 0);
+        Value notStart = comb::createOrFoldNot(
+            builder, loc, childStartSignals[childIndexForEntry[ei]]);
+        Value nextV = comb::AndOp::create(builder, loc, childDone, notStart);
+        childDone = seq::CompRegOp::create(
+            builder, loc, nextV, clk, rst, zero1b,
+            builder.getStringAttr(prefix + "_done_reg"));
+      }
       childDoneBEs[childIndexForEntry[ei]].setValue(childDone);
 
       // Map seqOp results.
@@ -9205,7 +9428,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     } else if (entry.kind == 1) {
       // Pipeline child: lower inline.
       auto pipOp = entry.pipOp;
-      std::string pipPrefix = "loop" + std::to_string(loopCounter++);
+      const std::string &pipPrefix = entryPrefix[ei];
       Value pipDone;
       if (failed(lowerPipelineChild(pipOp, builder, loc, hwBody, mapping,
                                     clk, rst,
