@@ -1,11 +1,18 @@
 // RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule,lower-loopschedule-to-fsm)" %s | FileCheck %s
 
 
-// End-to-end 1-D 3-tap stencil with shrsi-based divide.
+// End-to-end 1-D 3-tap stencil with shrsi-based divide. The loop inlines
+// into the single per-function machine as loop0_* states
+// (five cycle states FRAME_0_0..FRAME_0_4); no hw.module @loop0 remains.
 // CHECK: hw.module @stencil1d
-// CHECK: hw.instance "loop0_inst" @loop0
+// CHECK: fsm.hw_instance "stencil1d_fsm_inst" @stencil1d_fsm
 // CHECK: fsm.machine @stencil1d_fsm
-// CHECK: fsm.machine @loop0_fsm
+// CHECK: fsm.state @IDLE
+// CHECK: fsm.state @FRAME_0
+// CHECK: fsm.state @loop0_FRAME_0_0
+// CHECK: fsm.state @loop0_FRAME_0_4
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0
 
 func.func @stencil1d(%A: memref<16xi32>, %B: memref<16xi32>) attributes {top} {
   %c1 = arith.constant 1 : i32

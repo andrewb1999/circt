@@ -61,23 +61,25 @@ module {
   }
 }
 
-// CHECK: hw.module @loop0
-// FSM outputs: #3 = frame_active_0, #4..#7 = frame_cycle_0_0..3.
-// CHECK: %[[FSM:.+]]:8 = fsm.hw_instance "loop0_fsm_inst"
+// The loop now inlines into the function module: all port muxing lives in
+// @fib's body, gated by the single machine's prefixed results.
+// FSM results: #6 = loop0_frame_active_0, #7..#10 = loop0_frame_cycle_0_0..3.
+// CHECK: hw.module @fib
+// CHECK: %[[FSM:.+]]:11 = fsm.hw_instance "fib_fsm_inst" @fib_fsm
 
 // Load at cycle 0 (A[i-1]): address gated in under frame_cycle_0_0. The
 // external port is a latency-1 registered BRAM read, so the data is
 // captured one cycle after issue (frame_cycle_0_1) and consumers get a
 // live-cycle bypass mux.
-// CHECK: %[[A0:.+]] = comb.mux %[[FSM]]#4,
-// CHECK: %loop0_f0_ldcap_0 = seq.compreg.ce sym @loop0_f0_ldcap_0 %mem0_rd_data, %clk, %[[FSM]]#5
-// CHECK: %[[V0:.+]] = comb.mux %[[FSM]]#5, %mem0_rd_data, %loop0_f0_ldcap_0
+// CHECK: %[[A0:.+]] = comb.mux %[[FSM]]#7,
+// CHECK: %loop0_f0_ldcap_0 = seq.compreg.ce sym @loop0_f0_ldcap_0 %mem0_rd_data, %clk, %[[FSM]]#8
+// CHECK: %[[V0:.+]] = comb.mux %[[FSM]]#8, %mem0_rd_data, %loop0_f0_ldcap_0
 
 // Load at cycle 1 (A[i-2]): address chains over the cycle-0 address; data
 // captured at cycle 2.
-// CHECK: %[[A1:.+]] = comb.mux %[[FSM]]#5, %{{.+}}, %[[A0]]
-// CHECK: %loop0_f0_ldcap_1 = seq.compreg.ce sym @loop0_f0_ldcap_1 %mem0_rd_data, %clk, %[[FSM]]#6
-// CHECK: %[[V1:.+]] = comb.mux %[[FSM]]#6, %mem0_rd_data, %loop0_f0_ldcap_1
+// CHECK: %[[A1:.+]] = comb.mux %[[FSM]]#8, %{{.+}}, %[[A0]]
+// CHECK: %loop0_f0_ldcap_1 = seq.compreg.ce sym @loop0_f0_ldcap_1 %mem0_rd_data, %clk, %[[FSM]]#9
+// CHECK: %[[V1:.+]] = comb.mux %[[FSM]]#9, %mem0_rd_data, %loop0_f0_ldcap_1
 
 // The cycle-3 adder consumes the captured/bypassed values, never two
 // aliases of the raw rd_data wire.
@@ -87,10 +89,13 @@ module {
 // and wr_en fires only in its own cycle. Enables merge as gate-qualified
 // OR terms (concurrent-sibling-safe), addr/data keep the gate-keyed mux
 // (this port is a passive-read memref).
-// CHECK: %[[ADDR:.+]] = comb.mux %[[FSM]]#7, %{{.+}}, %[[A1]]
-// CHECK: %[[GWREN:.+]] = comb.and %[[FSM]]#3, %[[FSM]]#7
-// CHECK: comb.mux %[[FSM]]#3, %[[ADDR]],
-// CHECK: comb.mux %[[FSM]]#3, %[[SUM]],
-// CHECK: %[[WREN:.+]] = comb.or %[[GWREN]], %false
-// (done is the FSM's done OR'd with the early-done advance-edge term)
+// CHECK: %[[ADDR:.+]] = comb.mux %[[FSM]]#10, %{{.+}}, %[[A1]]
+// CHECK: %[[GWREN:.+]] = comb.and %[[FSM]]#6, %[[FSM]]#10
+// CHECK: comb.mux %[[FSM]]#6, %[[ADDR]],
+// CHECK: comb.mux %[[FSM]]#6, %[[SUM]],
+// CHECK: %[[WREN0:.+]] = comb.or %[[GWREN]], %false
+// The loop-level enable then merges up through the function-level frame
+// gate (frame_running_0, result #2) before reaching the port.
+// CHECK: %[[WRENF:.+]] = comb.and %[[FSM]]#2, %[[WREN0]]
+// CHECK: %[[WREN:.+]] = comb.or %[[WRENF]],
 // CHECK: hw.output %{{.+}}, %{{.+}}, %{{.+}}, %[[WREN]]

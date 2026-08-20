@@ -2,10 +2,20 @@
 
 
 // End-to-end 1-D convolution: inner reduction awaited by outer loop's store.
+// Both loop levels inline into the single per-function machine: the inner
+// reduction becomes loop0_loop1_* states and the outer store that awaits it
+// becomes the trailing loop0_FRAME_1 state. No per-loop hw.modules remain.
 // CHECK: hw.module @conv1d
-// CHECK: hw.instance "loop0_inst" @loop0
+// CHECK: fsm.hw_instance "conv1d_fsm_inst" @conv1d_fsm
 // CHECK: fsm.machine @conv1d_fsm
-// CHECK: fsm.machine @loop0_fsm
+// CHECK: fsm.state @IDLE
+// CHECK: fsm.state @FRAME_0
+// CHECK: fsm.state @loop0_FRAME_0
+// CHECK: fsm.state @loop0_loop1_FRAME_0_0
+// CHECK: fsm.state @loop0_loop1_FRAME_0_5
+// CHECK: fsm.state @loop0_FRAME_1
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0
 
 func.func @conv1d(%A: memref<16xi32>, %K: memref<4xi32>, %B: memref<16xi32>) attributes {top} {
   %c0 = arith.constant 0 : i32

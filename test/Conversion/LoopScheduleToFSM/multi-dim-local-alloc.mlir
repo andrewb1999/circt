@@ -2,8 +2,8 @@
 
 
 // A locally allocated 3-D memref. Verify a `seq.hlmem` of shape 2x3x4 is
-// emitted, the loop module exposes one address port per dim, and three
-// per-dim backedges resolve at the function root.
+// emitted and the inlined loop drives one address per dim, with all three
+// per-dim addresses resolving into the read/write ports at the function root.
 module {
   loopschedule.func_sequential @fill_local3d() attributes {top} {
     %c42 = arith.constant 42 : i8
@@ -48,14 +48,18 @@ module {
 
 // CHECK: hw.module @fill_local3d
 // CHECK: seq.hlmem @local_mem0 {{.*}} <2x3x4xi8>
-// CHECK: seq.read
-// CHECK: seq.write
-// CHECK: hw.instance "loop0_inst" @loop0
+// CHECK: seq.read %local_mem0[{{%.+}}, {{%.+}}, {{%.+}}] rden {{.*}} : !seq.hlmem<2x3x4xi8>
+// CHECK: seq.write %local_mem0[{{%.+}}, {{%.+}}, {{%.+}}] {{%.+}} wren {{.*}} : !seq.hlmem<2x3x4xi8>
 
-// CHECK: hw.module @loop0
-// CHECK-SAME: in %mem0_rd_data : i8
-// CHECK-SAME: out mem0_addr_0 : i1
-// CHECK-SAME: out mem0_addr_1 : i2
-// CHECK-SAME: out mem0_addr_2 : i2
-// CHECK-SAME: out mem0_wr_data : i8
-// CHECK-SAME: out mem0_wr_en : i1
+// The loop inlines into a single per-function machine (no hw.module @loop0);
+// the store data (constant 42 : i8) is muxed onto the write port under the
+// loop frame-active result in the function body.
+// CHECK: fsm.hw_instance "fill_local3d_fsm_inst" @fill_local3d_fsm
+// CHECK: %loop0_iter_arg_0 = seq.compreg.ce sym @loop0_iter_arg_0
+// CHECK: comb.mux {{%.+}}, %c42_i8, {{%.+}} : i8
+// CHECK-NOT: hw.module @loop0
+// CHECK: fsm.machine @fill_local3d_fsm
+// CHECK-SAME: argNames = ["start", "loop0_cond", "loop0_cond_next", "loop0_stall"]
+// CHECK: fsm.state @loop0_FRAME_0
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0

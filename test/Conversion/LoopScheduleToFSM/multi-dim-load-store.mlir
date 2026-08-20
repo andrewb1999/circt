@@ -2,8 +2,8 @@
 
 
 // Multi-dim memref passed in as a function argument: load + store with two
-// indices. Verify the loop module exposes one address port per dim and the
-// top-level module forwards them through.
+// indices. Verify the top-level module exposes one address port per dim and
+// the inlined loop drives per-dim addresses under the frame-active gate.
 module {
   loopschedule.func_sequential @copy2d(%arg0: memref<4x8xi32>) attributes {top} {
     %c0_i2 = arith.constant 0 : i2
@@ -53,9 +53,16 @@ module {
 // CHECK-SAME: out mem0_wr_data : i32
 // CHECK-SAME: out mem0_wr_en : i1
 
-// CHECK: hw.module @loop0
-// CHECK-SAME: in %mem0_rd_data : i32
-// CHECK-SAME: out mem0_addr_0 : i2
-// CHECK-SAME: out mem0_addr_1 : i3
-// CHECK-SAME: out mem0_wr_data : i32
-// CHECK-SAME: out mem0_wr_en : i1
+// The loop inlines into a single per-function machine (no hw.module @loop0):
+// per-dim addresses are computed in the function body and muxed onto the
+// addr ports under the loop frame-active result. The store's dim-1 index
+// (constant 1) shows up in that mux chain.
+// CHECK: fsm.hw_instance "copy2d_fsm_inst" @copy2d_fsm
+// CHECK: comb.mux {{%.+}}, %c1_i3, {{%.+}} : i3
+// CHECK-NOT: hw.module @loop0
+// CHECK: fsm.machine @copy2d_fsm
+// CHECK-SAME: argNames = ["start", "loop0_cond", "loop0_cond_next", "loop0_stall"]
+// CHECK-SAME: "loop0_frame_active_0"
+// CHECK: fsm.state @loop0_FRAME_0
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0

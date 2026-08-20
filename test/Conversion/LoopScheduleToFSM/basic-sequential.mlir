@@ -39,14 +39,18 @@ module {
   }
 }
 
+// The loop inlines into a single per-function machine: no hw.module @loop0,
+// just prefixed loop0_* states inside @count_fsm.
 // CHECK: hw.module @count
-// CHECK: hw.instance "loop0_inst" @loop0
-// CHECK: hw.module @loop0
-// CHECK: fsm.hw_instance "loop0_fsm_inst" @loop0_fsm
-// CHECK: fsm.machine @loop0_fsm
-// The loop condition is pure comb of the iter_args, so the COND bypass
-// applies: IDLE enters FRAME_0 directly and no COND state is emitted.
+// CHECK: fsm.hw_instance "count_fsm_inst" @count_fsm
+// CHECK: fsm.machine @count_fsm
 // CHECK: fsm.state @IDLE
-// CHECK-NOT: fsm.state @COND
+// The loop condition is pure comb of the iter_args, so the COND bypass
+// applies: the entry frame enters loop0_FRAME_0 directly and no loop0_COND
+// state is emitted.
 // CHECK: fsm.state @FRAME_0
+// CHECK-NOT: fsm.state @loop0_COND
+// CHECK: fsm.state @loop0_FRAME_0
+// CHECK-NOT: fsm.state @loop0_COND
 // CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0

@@ -45,11 +45,17 @@ module {
 // CHECK: seq.hlmem @local_mem0
 // CHECK: seq.read
 // CHECK: seq.write
-// CHECK: hw.instance "loop0_inst" @loop0
 
-// The loop module should have memory ports for the local mem
-// CHECK: hw.module @loop0
-// CHECK-SAME: in %mem0_rd_data : i32
-// CHECK-SAME: out mem0_addr : i3
-// CHECK-SAME: out mem0_wr_data : i32
-// CHECK-SAME: out mem0_wr_en : i1
+// The loop inlines into a single per-function machine (no hw.module @loop0);
+// the i3 store address and the store data (constant 42) are computed in the
+// function body and muxed toward the local memory ports under the loop
+// frame-active result.
+// CHECK: fsm.hw_instance "fill_local_fsm_inst" @fill_local_fsm
+// CHECK: %loop0_iter_arg_0 = seq.compreg.ce sym @loop0_iter_arg_0
+// CHECK: comb.extract {{%.+}} from 0 : (i4) -> i3
+// CHECK: comb.mux {{%.+}}, %c42_i32, {{%.+}} : i32
+// CHECK-NOT: hw.module @loop0
+// CHECK: fsm.machine @fill_local_fsm
+// CHECK: fsm.state @loop0_FRAME_0
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0

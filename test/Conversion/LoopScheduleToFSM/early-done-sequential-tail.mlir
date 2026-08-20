@@ -53,15 +53,19 @@ module {
 // Fmax on deep nests. The early term reaches only the done PORT.
 // CHECK: %[[NMOORE:.+]] = comb.xor %{{.+}}#0, %true{{.*}} : i1
 // CHECK: %[[HOLD:.+]] = comb.and %tx_in_flight, %[[NMOORE]] : i1
-// The early term: frame_running & ~child_start & child done.
+// The early term: frame_running & ~child_start & child done. The child is
+// inlined now, so its done is a computed loop-exit wire in this module, not
+// a loop0_inst.done port.
 // CHECK: %[[NSTART:.+]] = comb.xor %{{.+}}#1, %true{{.*}} : i1
 // CHECK: %[[INWAIT:.+]] = comb.and %{{.+}}#2, %[[NSTART]] : i1
-// CHECK: %[[EARLY:.+]] = comb.and %[[INWAIT]], %loop0_inst.done : i1
+// CHECK: %[[EARLY:.+]] = comb.and %[[INWAIT]], %[[CHILDDONE:.+]] : i1
 // The mask register and the single-pulse done:
 // CHECK: %early_done_sent = seq.compreg sym @early_done_sent %[[EARLY]]
 // CHECK: %[[NPREV:.+]] = comb.xor %early_done_sent, %true{{.*}} : i1
 // CHECK: %[[MOORE:.+]] = comb.and %{{.+}}#0, %[[NPREV]] : i1
 // CHECK: %[[DONE:.+]] = comb.or %[[MOORE]], %[[EARLY]] : i1
+// The child-done chain itself: loop-exit OR zero-trip, computed in-module.
+// CHECK: %[[CHILDDONE]] = comb.or %{{.+}}, %{{.+}} : i1
 // CHECK: hw.output {{.+}}, %[[DONE]] :
 
 // The function FSM keeps its historical shape — no start arc in DONE:

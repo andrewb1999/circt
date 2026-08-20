@@ -1,13 +1,19 @@
 // RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule,lower-loopschedule-to-fsm)" %s | FileCheck %s
 
 
-// End-to-end scalar-memref multiply, multi-cycle mul.
+// End-to-end scalar-memref multiply, multi-cycle mul. The loop inlines
+// into the single per-function machine as loop0_* states; the pipelined
+// mul stretches the body to six cycle states (FRAME_0_0..FRAME_0_5).
 // CHECK: hw.module @scale
-// CHECK: hw.instance "loop0_inst" @loop0
+// CHECK: fsm.hw_instance "scale_fsm_inst" @scale_fsm
+// CHECK: hw.instance "mul_pipe_i32_hw_inst_0" @int_mul_pipe_i32_l4
 // CHECK: fsm.machine @scale_fsm
-// CHECK-DAG: fsm.state @FRAME_0
-// CHECK-DAG: fsm.state @DONE
-// CHECK: fsm.machine @loop0_fsm
+// CHECK: fsm.state @IDLE
+// CHECK: fsm.state @FRAME_0
+// CHECK: fsm.state @loop0_FRAME_0_0
+// CHECK: fsm.state @loop0_FRAME_0_5
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0
 
 func.func @scale(%a: i32, %A: memref<16xi32>, %B: memref<16xi32>) attributes {top} {
   %c0 = arith.constant 0 : i32

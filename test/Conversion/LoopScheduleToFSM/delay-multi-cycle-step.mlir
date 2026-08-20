@@ -2,9 +2,10 @@
 
 
 // Hand-crafted sequential loop whose first frame has latency 3 (an `at 2`
-// store inside the frame body). The FSM should expand FRAME_0 into 3
-// sub-states, gate the inner store with the offset-2 cycle output, and
-// keep frame_active_0 high in all 3 cycles.
+// store inside the frame body). The loop inlines into the single
+// per-function machine; the FSM should expand the loop frame into 3
+// prefixed sub-states, gate the inner store with the offset-2 cycle
+// output, and keep loop0_frame_active_0 high in all 3 cycles.
 
 module {
   loopschedule.func_sequential @delay_step(%arg0: memref<16xi32>) attributes {top} {
@@ -46,12 +47,13 @@ module {
   }
 }
 
-// CHECK: fsm.machine @loop0_fsm
-// Multi-cycle frames expand into FRAME_<i>_<c> sub-states.
-// CHECK-DAG: fsm.state @FRAME_0_0
-// CHECK-DAG: fsm.state @FRAME_0_1
-// CHECK-DAG: fsm.state @FRAME_0_2
+// CHECK: fsm.machine @delay_step_fsm
+// Multi-cycle loop frames expand into prefixed loop0_FRAME_<i>_<c>
+// sub-states inside the per-function machine.
+// CHECK-DAG: fsm.state @loop0_FRAME_0_0
+// CHECK-DAG: fsm.state @loop0_FRAME_0_1
+// CHECK-DAG: fsm.state @loop0_FRAME_0_2
 // Result names should expose the per-cycle gates.
-// CHECK-DAG: frame_cycle_0_0
-// CHECK-DAG: frame_cycle_0_1
-// CHECK-DAG: frame_cycle_0_2
+// CHECK-DAG: loop0_frame_cycle_0_0
+// CHECK-DAG: loop0_frame_cycle_0_1
+// CHECK-DAG: loop0_frame_cycle_0_2

@@ -46,10 +46,16 @@ module {
 // CHECK-SAME: out mem0_addr : i5
 // CHECK-SAME: out mem0_wr_data : i32
 // CHECK-SAME: out mem0_wr_en : i1
-// CHECK: hw.instance "loop0_inst" @loop0
-// CHECK: hw.module @loop0
-// CHECK-SAME: in %mem0_rd_data : i32
-// CHECK-SAME: out mem0_addr : i5
-// CHECK-SAME: out mem0_wr_data : i32
-// CHECK-SAME: out mem0_wr_en : i1
-// CHECK: fsm.machine @loop0_fsm
+
+// The loop inlines into a single per-function machine (no hw.module @loop0);
+// the store data (constant 42) is muxed onto the write port under the loop
+// frame-active result in the function body.
+// CHECK: fsm.hw_instance "fill_fsm_inst" @fill_fsm
+// CHECK: %loop0_iter_arg_0 = seq.compreg.ce sym @loop0_iter_arg_0
+// CHECK: comb.mux {{%.+}}, %c42_i32, {{%.+}} : i32
+// CHECK-NOT: hw.module @loop0
+// CHECK: fsm.machine @fill_fsm
+// CHECK-SAME: argNames = ["start", "loop0_cond", "loop0_cond_next", "loop0_stall"]
+// CHECK: fsm.state @loop0_FRAME_0
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0

@@ -1,11 +1,19 @@
 // RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule,lower-loopschedule-to-fsm)" %s | FileCheck %s
 
 
-// End-to-end outer product: C[i,j] = x[i]*y[j].
+// End-to-end outer product: C[i,j] = x[i]*y[j]. Both loop levels inline
+// into the single per-function machine as loop0_* / loop0_loop1_* states;
+// no per-loop hw.modules remain.
 // CHECK: hw.module @outer_product
-// CHECK: hw.instance "loop0_inst" @loop0
+// CHECK: fsm.hw_instance "outer_product_fsm_inst" @outer_product_fsm
 // CHECK: fsm.machine @outer_product_fsm
-// CHECK: fsm.machine @loop0_fsm
+// CHECK: fsm.state @IDLE
+// CHECK: fsm.state @FRAME_0
+// CHECK: fsm.state @loop0_FRAME_0
+// CHECK: fsm.state @loop0_loop1_FRAME_0_0
+// CHECK: fsm.state @loop0_loop1_FRAME_0_5
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0
 
 func.func @outer_product(%x: memref<4xi32>, %y: memref<4xi32>, %C: memref<4x4xi32>) attributes {top} {
   %c0 = arith.constant 0 : i32

@@ -69,21 +69,33 @@ module {
   }
 }
 
+// Spec of the inlined lowering shape: both launched loops embed into the ONE
+// per-function machine @two_loops_fsm as prefixed loopN_* states. Each solo
+// sequential entry runs inline between its frame group and the next group, so
+// no WAIT_g states are emitted, and there are no per-loop hw.modules.
 // CHECK: hw.module @two_loops
 // CHECK: fsm.hw_instance "two_loops_fsm_inst" @two_loops_fsm
-// CHECK: hw.instance "loop0_inst" @loop0
-// CHECK: hw.instance "loop1_inst" @loop1
 
+// Machine args/results carry per-loop prefixed names.
 // CHECK: fsm.machine @two_loops_fsm
+// CHECK-SAME: argNames = ["start", "loop0_cond", "loop0_cond_next", "loop0_stall", "loop1_cond", "loop1_cond_next", "loop1_stall"]
+// CHECK-SAME: resNames = ["done", "child_start_0", "child_start_1", "frame_running_0", "frame_running_1", "frame_running_2", "loop0_first_iter", "loop0_iter_advance", "loop0_frame_active_0", "loop1_first_iter", "loop1_iter_advance", "loop1_frame_active_0"]
+
+// Full state list and the entry transition chain:
+// IDLE -> FRAME_0 -> loop0_FRAME_0 -> FRAME_1 -> loop1_FRAME_0 -> DONE.
 // CHECK: fsm.state @IDLE
+// CHECK: fsm.transition @FRAME_0
 // CHECK: fsm.state @FRAME_0
-// CHECK: fsm.state @WAIT_0
+// CHECK: fsm.transition @loop0_FRAME_0
+// CHECK: fsm.transition @FRAME_1
+// CHECK: fsm.state @loop0_FRAME_0
+// CHECK-NOT: fsm.state @WAIT
 // CHECK: fsm.state @FRAME_1
-// CHECK: fsm.state @WAIT_1
+// CHECK: fsm.transition @loop1_FRAME_0
+// CHECK: fsm.transition @DONE
+// CHECK: fsm.state @loop1_FRAME_0
+// CHECK-NOT: fsm.state @WAIT
 // CHECK: fsm.state @DONE
-
-// CHECK: hw.module @loop0
-// CHECK: fsm.machine @loop0_fsm
-
-// CHECK: hw.module @loop1
-// CHECK: fsm.machine @loop1_fsm
+// CHECK: fsm.transition @IDLE
+// CHECK-NOT: hw.module @loop
+// CHECK-NOT: fsm.machine @loop

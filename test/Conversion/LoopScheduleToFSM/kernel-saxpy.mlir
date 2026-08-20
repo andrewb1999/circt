@@ -1,14 +1,18 @@
 // RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule,lower-loopschedule-to-fsm)" %s | FileCheck %s
 
 
-// End-to-end saxpy.
+// End-to-end saxpy. The loop inlines into the single per-function machine
+// as loop0_* states (seven cycle states for the pipelined mul); the last
+// body state exits straight to DONE, so no separate WAIT state remains.
 // CHECK: hw.module @saxpy
-// CHECK: hw.instance "loop0_inst" @loop0
+// CHECK: fsm.hw_instance "saxpy_fsm_inst" @saxpy_fsm
 // CHECK: fsm.machine @saxpy_fsm
-// CHECK-DAG: fsm.state @FRAME_0
-// CHECK-DAG: fsm.state @WAIT_0
-// CHECK-DAG: fsm.state @DONE
-// CHECK: fsm.machine @loop0_fsm
+// CHECK: fsm.state @IDLE
+// CHECK: fsm.state @FRAME_0
+// CHECK: fsm.state @loop0_FRAME_0_0
+// CHECK: fsm.state @loop0_FRAME_0_6
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0
 
 func.func @saxpy(%a: i32, %x: memref<16xi32>, %y: memref<16xi32>) attributes {top} {
   %c0 = arith.constant 0 : i32

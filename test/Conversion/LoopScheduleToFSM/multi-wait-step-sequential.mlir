@@ -102,27 +102,30 @@ module {
   }
 }
 
-// The parent loop becomes loop0; its frames 1 and 2 each become a
-// child module (loop0_loop1, loop0_loop2). The parent FSM (loop0_fsm)
-// must contain BOTH WAIT_1 and WAIT_2.
+// The parent loop and BOTH nested loops inline into the single per-function
+// machine @two_children_fsm: the parent's frames become loop0_FRAME_0/1/2 and
+// each nested loop's body becomes a loop0_loopN_FRAME_0 state entered directly
+// from its launch frame — no WAIT or POST settle states, and no child modules.
+// The parent level must still expose TWO child_start / child_active pairs.
 
-// CHECK: hw.module @loop0
-// CHECK-DAG: hw.instance "loop0_loop1_inst" @loop0_loop1
-// CHECK-DAG: hw.instance "loop0_loop2_inst" @loop0_loop2
+// CHECK: hw.module @two_children
+// CHECK: fsm.hw_instance "two_children_fsm_inst" @two_children_fsm
 
-// CHECK: fsm.machine @loop0_fsm
-// Two child_done inputs and two child_start / post_active outputs.
-// CHECK-DAG: child_done_0
-// CHECK-DAG: child_done_1
-// CHECK-DAG: child_start_0
-// CHECK-DAG: child_start_1
-// CHECK-DAG: post_active_0
-// CHECK-DAG: post_active_1
-// CHECK-DAG: fsm.state @FRAME_0
-// CHECK-DAG: fsm.state @FRAME_1
-// CHECK-DAG: fsm.state @WAIT_1
-// CHECK-DAG: fsm.state @FRAME_2
-// CHECK-DAG: fsm.state @WAIT_2
+// CHECK: fsm.machine @two_children_fsm
+// Per-level condition inputs for the parent and both nested loops.
+// CHECK-SAME: argNames = ["start", "loop0_cond", "loop0_cond_next", "loop0_stall", "loop0_loop1_cond", "loop0_loop1_cond_next", "loop0_loop1_stall", "loop0_loop2_cond", "loop0_loop2_cond_next", "loop0_loop2_stall"]
+// Two child_start / child_active result pairs on the parent level.
+// CHECK-SAME: "loop0_child_start_0", "loop0_child_start_1", "loop0_child_active_0", "loop0_child_active_1"
 
-// CHECK: hw.module @loop0_loop1
-// CHECK: hw.module @loop0_loop2
+// CHECK: fsm.state @FRAME_0
+// CHECK: fsm.state @loop0_FRAME_0
+// CHECK: fsm.state @loop0_FRAME_1
+// CHECK-NOT: WAIT
+// CHECK: fsm.state @loop0_loop1_FRAME_0
+// CHECK-NOT: WAIT
+// CHECK: fsm.state @loop0_FRAME_2
+// CHECK-NOT: WAIT
+// CHECK: fsm.state @loop0_loop2_FRAME_0
+// CHECK-NOT: WAIT
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0

@@ -2,13 +2,18 @@
 
 
 // End-to-end vector add: SCF -> LoopSchedule -> FSM + HW.
+// The loop inlines into the single per-function machine as prefixed
+// loop0_* states; the last body state exits straight to DONE, so no
+// separate WAIT state (and no hw.module @loop0) remains.
 // CHECK: hw.module @vadd
-// CHECK: hw.instance "loop0_inst" @loop0
+// CHECK: fsm.hw_instance "vadd_fsm_inst" @vadd_fsm
 // CHECK: fsm.machine @vadd_fsm
-// CHECK-DAG: fsm.state @FRAME_0
-// CHECK-DAG: fsm.state @WAIT_0
-// CHECK-DAG: fsm.state @DONE
-// CHECK: fsm.machine @loop0_fsm
+// CHECK: fsm.state @IDLE
+// CHECK: fsm.state @FRAME_0
+// CHECK: fsm.state @loop0_FRAME_0_0
+// CHECK: fsm.state @loop0_FRAME_0_2
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0
 
 func.func @vadd(%a: memref<16xi32>, %b: memref<16xi32>, %c: memref<16xi32>) attributes {top} {
   %c0 = arith.constant 0 : i32

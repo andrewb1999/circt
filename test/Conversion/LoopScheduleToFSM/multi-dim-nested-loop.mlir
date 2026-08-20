@@ -1,9 +1,10 @@
 // RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},lower-loopschedule-to-fsm{disable-flatten-memrefs=true})" %s | FileCheck %s
 
 
-// Two nested sequential loops over an 8x8 memref. Verify per-dim address
-// ports flow through both the outer and inner loop hw.modules and that the
-// child instance per-dim address muxes wire up correctly.
+// Two nested sequential loops over an 8x8 memref. Both loop levels inline
+// into one per-function machine; verify the top module still exposes per-dim
+// address ports and the inner store's per-dim address muxes wire up (dim 0
+// from the outer loop's frame register, gated by the inner frame-active).
 module {
   loopschedule.func_sequential @nested2d(%arg0: memref<8x8xi32>) attributes {top} {
     %c0_i32 = arith.constant 0 : i32
@@ -73,11 +74,24 @@ module {
 // CHECK-SAME: out mem0_addr_0 : i3
 // CHECK-SAME: out mem0_addr_1 : i3
 
-// CHECK: hw.module @loop0
-// CHECK-SAME: out mem0_addr_0 : i3
-// CHECK-SAME: out mem0_addr_1 : i3
-// CHECK: hw.instance "loop0_loop1_inst" @loop0_loop1
+// Both loop levels keep their own iteration registers in the function module.
+// CHECK: fsm.hw_instance "nested2d_fsm_inst" @nested2d_fsm
+// CHECK-DAG: %loop0_iter_arg_0 = seq.compreg.ce sym @loop0_iter_arg_0
+// CHECK-DAG: %loop0_loop1_iter_arg_0 = seq.compreg.ce sym @loop0_loop1_iter_arg_0
+// The inner store's dim-0 address comes from the outer loop's frame register,
+// muxed under the inner-loop frame-active result.
+// CHECK: comb.mux {{%.+}}, %loop0_frame0_r1, {{%.+}} : i3
+// CHECK-NOT: hw.module @loop0
 
-// CHECK: hw.module @loop0_loop1
-// CHECK-SAME: out mem0_addr_0 : i3
-// CHECK-SAME: out mem0_addr_1 : i3
+// One machine carries both loop levels as prefixed states with per-level
+// args/results.
+// CHECK: fsm.machine @nested2d_fsm
+// CHECK-SAME: "loop0_cond"
+// CHECK-SAME: "loop0_loop1_cond"
+// CHECK-SAME: "loop0_frame_active_0"
+// CHECK-SAME: "loop0_loop1_frame_active_0"
+// CHECK: fsm.state @loop0_FRAME_0
+// CHECK: fsm.state @loop0_FRAME_1
+// CHECK: fsm.state @loop0_loop1_FRAME_0
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0

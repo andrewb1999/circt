@@ -1,12 +1,19 @@
 // RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule,lower-loopschedule-to-fsm)" %s | FileCheck %s
 
 
-// End-to-end gemv: nested loops, outer awaits inner launch.
+// End-to-end gemv: nested loops, outer awaits inner launch. Both loop
+// levels inline into the single per-function machine as loop0_* /
+// loop0_loop1_* states; no per-loop hw.modules remain.
 // CHECK: hw.module @gemv
-// CHECK: hw.instance "loop0_inst" @loop0
+// CHECK: fsm.hw_instance "gemv_fsm_inst" @gemv_fsm
 // CHECK: fsm.machine @gemv_fsm
-// CHECK-DAG: fsm.state @DONE
-// CHECK: fsm.machine @loop0_fsm
+// CHECK: fsm.state @IDLE
+// CHECK: fsm.state @FRAME_0
+// CHECK: fsm.state @loop0_FRAME_0
+// CHECK: fsm.state @loop0_loop1_FRAME_0_0
+// CHECK: fsm.state @loop0_loop1_FRAME_0_6
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0
 
 func.func @gemv(%A: memref<4x4xi32>, %x: memref<4xi32>, %y: memref<4xi32>) attributes {top} {
   %c0 = arith.constant 0 : i32

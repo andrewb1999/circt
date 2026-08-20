@@ -26,8 +26,10 @@
 //
 // `%hi` (at-result 3) is the control: it is read by the launched child, which
 // runs during WAIT_0 with the port handed over, so IT still gets a hold.
+// The loop now inlines into the function module itself (no hw.module @loop0);
+// the hold registers and muxes live in @cross_at_addr's body, gated by the
+// machine's loop0_frame_cycle_* results.
 // CHECK-LABEL: hw.module @cross_at_addr(
-// CHECK:         hw.module @loop0(
 // CHECK-NOT:     loop0_f0_at0_r2_latched
 // CHECK:         %[[IDX:.+]] = arith.trunci %{{.+}} : i64 to i5
 // CHECK-NOT:     loop0_f0_at0_r2_latched
@@ -39,6 +41,7 @@
 // the inner pipeline reads same-frame at results, so its stage 0 cannot
 // issue in the child_start cycle — the issue gate stays plain `active`.
 // CHECK-NOT:     loop0_pip0_done_prev
+// CHECK:         fsm.machine @cross_at_addr_fsm
 loopschedule.func_sequential @cross_at_addr(%mem: memref<32xi64>, %n: i64) {
   %c0_i64 = arith.constant 0 : i64
   %c1_i64 = arith.constant 1 : i64
@@ -102,11 +105,11 @@ loopschedule.func_sequential @cross_at_addr(%mem: memref<32xi64>, %n: i64) {
 // register becomes readable. The register must still be there; the fix
 // narrows who may read it, it does not delete the mechanism.
 // CHECK-LABEL: hw.module @cross_at_addr_far(
-// CHECK:         hw.module @loop0(
 // CHECK:         %[[HOLD:.+]] = seq.compreg.ce sym @loop0_f0_at0_r2_latched
 // CHECK:         comb.mux %{{.+}}, %[[HOLD]], %{{.+}} : i5
 // Same-frame reads refuse pre-arming here too.
 // CHECK-NOT:     loop0_pip0_done_prev
+// CHECK:         fsm.machine @cross_at_addr_far_fsm
 loopschedule.func_sequential @cross_at_addr_far(%mem: memref<32xi64>, %n: i64) {
   %c0_i64 = arith.constant 0 : i64
   %c1_i64 = arith.constant 1 : i64

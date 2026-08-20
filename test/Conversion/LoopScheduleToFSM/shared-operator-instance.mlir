@@ -69,9 +69,11 @@ loopschedule.func_sequential @shared(%m: memref<8xi32>)
     loopschedule.return
   }
 
-// One shared instance in the loop module: operands are muxes selected by
+// One shared instance, now living in the single function module (loops no
+// longer get their own hw.module): the operand ports are muxes selected by
 // the users' frame gates, and only ONE multiplier is instantiated.
-// CHECK: hw.module @loop0
-// CHECK: comb.mux
-// CHECK: hw.instance "mul_pipe_i32_hw_inst_0" @int_mul_pipe_i32_l4
-// CHECK-NOT: hw.instance "mul_pipe_i32_hw_inst_1"
+// CHECK: hw.module @shared
+// CHECK: hw.instance "mul_pipe_i32_hw_inst_0" @int_mul_pipe_i32_l4({{.*}}lhs: %[[LHS:[0-9]+]]: i32, rhs: %[[RHS:[0-9]+]]: i32)
+// CHECK-DAG: %[[LHS]] = comb.mux
+// CHECK-DAG: %[[RHS]] = comb.mux
+// CHECK-NOT: hw.instance "mul_pipe_i32_hw_inst

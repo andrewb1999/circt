@@ -1,13 +1,17 @@
 // RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule,lower-loopschedule-to-fsm)" %s | FileCheck %s
 
 
-// End-to-end memref copy.
+// End-to-end memref copy. The loop inlines into the single per-function
+// machine: no hw.module @loop0, just prefixed loop0_* states in @copy_fsm.
 // CHECK: hw.module @copy
-// CHECK: hw.instance "loop0_inst" @loop0
+// CHECK: fsm.hw_instance "copy_fsm_inst" @copy_fsm
 // CHECK: fsm.machine @copy_fsm
-// CHECK-DAG: fsm.state @FRAME_0
-// CHECK-DAG: fsm.state @DONE
-// CHECK: fsm.machine @loop0_fsm
+// CHECK: fsm.state @IDLE
+// CHECK: fsm.state @FRAME_0
+// CHECK: fsm.state @loop0_FRAME_0_0
+// CHECK: fsm.state @loop0_FRAME_0_1
+// CHECK: fsm.state @DONE
+// CHECK-NOT: hw.module @loop0
 
 func.func @copy(%a: memref<16xi32>, %b: memref<16xi32>) attributes {top} {
   %c0 = arith.constant 0 : i32
