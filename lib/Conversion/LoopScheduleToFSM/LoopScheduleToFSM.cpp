@@ -919,6 +919,221 @@ private:
   /// bypass). Pure analysis: emits nothing.
   LogicalResult analyzeLoopNode(const LoopNode &node, LoopNodeInfo &info);
 
+  //===------------------------------------------------------------------===//
+  // One machine per function: inline sequential levels as states
+  //===------------------------------------------------------------------===//
+
+  /// A level's slice of the unified machine's interface — global argument
+  /// and result indices assigned by the layout pass.
+  struct LevelSlots {
+    unsigned inCond = 0, inCondNext = 0, inStall = 0;
+    /// Per wait slot: machine input index of child_done, or -1 for an
+    /// INLINED sequential child (its span replaces the WAIT state, so
+    /// nothing consumes a done).
+    SmallVector<int> inChildDone;
+    unsigned outFirstIter = 0, outIterAdvance = 0;
+    /// Only allocated when the level keeps a COND state (!entryBypass):
+    /// high exactly in <prefix>_COND, so the wrapper can form the
+    /// non-bypass exit edge (in-COND AND !cond).
+    int outCondActive = -1;
+    unsigned outFrameActiveBase = 0;   // numFrames consecutive slots
+    unsigned outChildStartBase = 0;    // numWaits consecutive slots
+    unsigned outChildActiveBase = 0;   // numWaits consecutive slots
+    int outCycleBase = -1;             // totalCycleOuts consecutive slots
+    SmallVector<int> outIssueArm;      // per wait slot; appended post-hoc
+  };
+
+  /// Backedges the wrapper feeds into the unified machine for one level.
+  struct LevelWires {
+    Backedge cond, condNext, stall;
+    SmallVector<Backedge> childDones; // per NON-inlined wait slot, in slot order
+    LevelWires(Backedge c, Backedge cn, Backedge st)
+        : cond(c), condNext(cn), stall(st) {}
+  };
+
+  /// Recursive plan for one inlined sequential level: its structural
+  /// analysis, which of its child slots inline in turn, and its machine
+  /// slice. Owned per kind-0 function entry that lowers inline.
+  struct LevelPlan {
+    const LoopNode *node = nullptr;
+    LoopNodeInfo info;
+    /// Per wait slot: the child's own plan when it is an INLINED
+    /// sequential child; null for pipelines and outlined children.
+    SmallVector<std::unique_ptr<LevelPlan>> children;
+    LevelSlots slots;
+    /// The level's first_iter fsm.variable, created during machine
+    /// emission.
+    Value fiVar;
+    std::optional<LevelWires> wires; // created by the wrapper pre-instance
+  };
+
+  /// One continuation transition to take when a level exits (its
+  /// enclosing schedule's "what happens after me"). `guard` may be null
+  /// (unguarded fallback); both callbacks build IR in machine scope.
+  struct ExitCont {
+    std::string target;
+    std::function<Value(OpBuilder &, Location)> guard;
+  };
+  using ExitConts = SmallVector<ExitCont, 2>;
+
+  /// Machine-emission context for the unified function machine.
+  struct UnifiedFsmCtx {
+    OpBuilder &fb;
+    Location loc;
+    fsm::MachineOp machine;
+    Value trueVal, falseVal;
+    unsigned numOutputs = 0;
+    /// Emit one state whose output vector is all-false except the listed
+    /// (slot, value) assignments; `transitions` fills the transition
+    /// block.
+    void emitState(StringRef name,
+                   ArrayRef<std::pair<unsigned, Value>> assigns,
+                   llvm::function_ref<void(Block *)> transitions);
+  };
+
+  /// Decide, per wait slot of `node`, whether the sequential child
+  /// inlines (solo slot in its frame, launched at the frame's last
+  /// cycle, not wrapped in loopschedule.outline) and recurse; fills
+  /// `plan`. Outlined slots keep null child plans.
+  LogicalResult planInlineLevel(const LoopNode &node, LevelPlan &plan);
+
+  /// Count of sequential children that kept their own module because the
+  /// one-machine form cannot express them (concurrent siblings, launches
+  /// before the frame's last cycle) or an explicit loopschedule.outline
+  /// asked for the boundary.
+  unsigned numAutoOutlined = 0;
+
+  /// Assign machine argument/result indices for `plan` and its inlined
+  /// descendants (pre-order), appending names to the manifests.
+  void layoutLevel(LevelPlan &plan, OpBuilder &b,
+                   SmallVectorImpl<Attribute> &argNames,
+                   SmallVectorImpl<Attribute> &resNames,
+                   unsigned &numInputs, unsigned &numOutputs);
+
+  /// Emit the entry arms for `plan` into the LAUNCHER state's transition
+  /// block: with the entry bypass, straight into <prefix>_FRAME_0 on the
+  /// level's cond (plus the zero-trip exit arms); without it, into
+  /// <prefix>_COND. `extraGuard` (nullable) is ANDed into every arm —
+  /// the launcher's own !stall when the launcher is a level frame state.
+  void emitLevelEntry(UnifiedFsmCtx &ctx, LevelPlan &plan, Block *tb,
+                      llvm::function_ref<Value(OpBuilder &, Location)>
+                          extraGuard,
+                      const ExitConts &exits);
+
+  /// Emit the level's own states (COND / FRAME_i(_c) / WAIT_i) into the
+  /// unified machine, prefixed with the node's prefix. `spanSlots` are
+  /// output indices driven high in EVERY state of the level's span
+  /// (ancestors' child_active and the function's frame_running).
+  /// `exits` is the continuation when the level's loop condition fails.
+  void emitLevelStates(UnifiedFsmCtx &ctx, LevelPlan &plan,
+                       ArrayRef<unsigned> spanSlots, const ExitConts &exits);
+
+  /// Function-level result of building the unified machine: where every
+  /// function-scoped signal landed in the machine's interface.
+  struct UnifiedFsmResult {
+    unsigned numInputs = 0;
+    unsigned numOutputs = 0;
+    // outputs: done is result 0; then child_start per child index, then
+    // frame_running per entry, then per-entry cycle outs, then the level
+    // slices (recorded in each entry's LevelPlan).
+    SmallVector<int> entryCycleOutBase;   // per entry; -1 = none
+    SmallVector<int> entryIssueArmIdx;    // per entry; -1 = none
+    /// Per waiting group IN GROUP ORDER: true when the machine takes a
+    /// group_done input for it (skipped for a solo inlined entry). The
+    /// caller mirrors this order when assembling instance inputs.
+    SmallVector<bool> groupTakesDone;
+  };
+
+  /// Build the ONE machine for the function: the run-once group walk of
+  /// createFunctionFSM plus, for each solo kind-0 entry with a plan in
+  /// `entryPlans`, the entry's whole loop nest embedded as states. Level
+  /// input backedge wiring is the caller's job (order: start, group
+  /// dones, then each inlined entry's levels pre-order: cond, cond_next,
+  /// child_done per non-inlined slot, stall).
+  fsm::MachineOp createUnifiedFSM(
+      OpBuilder &builder, Location loc, StringRef fsmName,
+      ArrayRef<int> frameChildKind, ArrayRef<unsigned> entryLatencies,
+      ArrayRef<unsigned> entryGroup,
+      MutableArrayRef<std::unique_ptr<LevelPlan>> entryPlans,
+      ArrayRef<bool> preArmEntries, UnifiedFsmResult &out);
+
+  /// Signals one inlined level's wrapper logic reads off the unified
+  /// machine instance (its LevelSlots resolved against the instance),
+  /// plus the level's input backedges to resolve.
+  struct LevelSignals {
+    Value firstIter, iterAdvance;
+    Value condActive;                  // null when entryBypass
+    SmallVector<Value> frameActives;
+    SmallVector<Value> childStarts;
+    SmallVector<Value> childActives;
+    SmallVector<SmallVector<Value>> frameCycleGates; // per frame
+    SmallVector<Value> issueArms;      // per wait slot (null when none)
+    LevelWires *wires = nullptr;
+    /// Launcher-state decode: the gate of the parent state that hosts
+    /// this level's entry (used for the zero-trip advance term).
+    Value launcherGate;
+  };
+
+  /// Everything the level-body lowering needs from its host, module or
+  /// inline. The signal values are the host machine's outputs for this
+  /// level; the backedges are the machine inputs the body resolves.
+  struct LevelEnv {
+    OpBuilder &hw;           // hardware emission builder (module body)
+    OpBuilder &builder;      // module-scope builder (child module creation)
+    mlir::MLIRContext *ctx;
+    Type i1;
+    Location loc;
+    Block *hwBody;
+    ModuleOp moduleOp;
+    loopschedule::LoopScheduleFuncSequentialOp funcOp;
+    ArrayRef<PortArgInfo> memrefArgs;
+    IRMapping &localMapping;
+    DenseMap<Value, MemPortMapping> &localMemPorts;
+    BackedgeBuilder &bb;
+    Value clk, rst;
+    Backedge condBE, condNextBE, stallBE;
+    MutableArrayRef<Backedge> childDoneBEs;
+    Value fsmFirstIter, fsmIterAdvance;
+    SmallVector<Value> fsmFrameActives, fsmChildStarts, fsmChildActives,
+        fsmPostActives;
+    SmallVector<SmallVector<Value>> fsmFrameCycleGates;
+    SmallVector<Value> fsmIssueArms;
+    /// Inline hosting only: the level's plan (whose children may inline
+    /// in turn) and the unified machine instance. Null/empty on the
+    /// module path.
+    LevelPlan *plan = nullptr;
+    fsm::HWInstanceOp unifiedInst;
+  };
+
+  /// The wrapper half of a level's lowering, shared by the module path
+  /// and the inline path: iter-arg registers, frame bodies, per-frame
+  /// port merge, cond/cond_next/stall resolution. On return
+  /// `localMemPorts` holds the level's merged port drives,
+  /// `resultValues` the loop results (registers where possible),
+  /// `resultCombs` their combinational aliases (valid on the advance
+  /// edge — what a same-edge consumer must read), and
+  /// `iterAdvanceEdge` the per-trip advance edge.
+  LogicalResult lowerLoopLevelBody(const LoopNode &node,
+                                   LoopNodeInfo &info, LevelEnv &env,
+                                   SmallVectorImpl<Value> &resultValues,
+                                   SmallVectorImpl<Value> &resultCombs,
+                                   Value &iterAdvanceEdgeOut);
+
+  /// Lower one inlined level's hardware into the FUNCTION module: iter
+  /// arg registers, per-frame lowering, port-merge contribution, stall
+  /// resolution — the wrapper half of what lowerLoopNodeAsModule does,
+  /// re-hosted. Returns (via `exitEdge`) the one-cycle edge on which the
+  /// level exits for good — what a parent consumes as its advance/done
+  /// term.
+  LogicalResult lowerInlineLoopLevel(
+      LevelPlan &plan, fsm::HWInstanceOp fsmInst, OpBuilder &builder,
+      Location loc, Block *hwBody, Value clk, Value rst,
+      loopschedule::LoopScheduleFuncSequentialOp funcOp,
+      ArrayRef<PortArgInfo> memrefArgs, IRMapping &mapping,
+      DenseMap<Value, MemPortMapping> &callerMemPorts,
+      DenseMap<Value, MemPortMapping> &portContribution,
+      Value &spanActive, Value &exitEdge);
+
   /// Recursively lower a loop node as its own hw.module.
   /// Creates the module and populates outModule. capturedVals are the
   /// external values the caller must wire as inputs when instantiating.
@@ -2956,6 +3171,686 @@ fsm::MachineOp LoopScheduleToFSMPass::createFunctionFSM(
 }
 
 //===----------------------------------------------------------------------===//
+// One machine per function: inline sequential levels as states
+//===----------------------------------------------------------------------===//
+
+void LoopScheduleToFSMPass::UnifiedFsmCtx::emitState(
+    StringRef name, ArrayRef<std::pair<unsigned, Value>> assigns,
+    llvm::function_ref<void(Block *)> transitions) {
+  fb.setInsertionPointToEnd(&machine.getBody().front());
+  auto st = fsm::StateOp::create(fb, loc, name);
+  Block *ob = st.ensureOutput(fb);
+  ob->getTerminator()->erase();
+  fb.setInsertionPointToEnd(ob);
+  SmallVector<Value> v(numOutputs, falseVal);
+  for (auto &kv : assigns)
+    v[kv.first] = kv.second;
+  fsm::OutputOp::create(fb, loc, v);
+  if (transitions)
+    transitions(&st.getTransitions().front());
+  fb.setInsertionPointToEnd(&machine.getBody().front());
+}
+
+LogicalResult LoopScheduleToFSMPass::planInlineLevel(const LoopNode &node,
+                                                     LevelPlan &plan) {
+  plan.node = &node;
+  if (failed(analyzeLoopNode(node, plan.info)))
+    return failure();
+  plan.children.clear();
+  plan.children.resize(plan.info.numWaits);
+  for (unsigned i = 0; i < plan.info.numFrames; ++i) {
+    auto &slots = node.frameLaunches[i];
+    for (auto [k, slot] : llvm::enumerate(slots)) {
+      if (slot.childIdx < 0)
+        continue; // pipeline: stays a wait slot
+      unsigned j = (unsigned)plan.info.frameWaitIdx[i][k];
+      const LoopNode &child = node.children[slot.childIdx];
+      // A sequential child inlines only when the machine can BE the
+      // child: solo launch in its frame, fired at the frame's last cycle
+      // (otherwise the parent frame's remaining cycles would run
+      // concurrently with the child — one machine cannot be in two
+      // states), and not explicitly outlined.
+      bool solo = slots.size() == 1;
+      bool lastCycle = plan.info.launchStartOffsets[j] + 1 ==
+                       plan.info.frameLatencies[i];
+      bool forced =
+          child.seqOp->getParentOfType<loopschedule::LoopScheduleOutlineOp>() !=
+          nullptr;
+      if (!solo || !lastCycle || forced) {
+        ++numAutoOutlined;
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[unified-fsm] outlining " << child.prefix << ": "
+                   << (forced ? "explicit loopschedule.outline"
+                       : !solo ? "concurrent siblings in one frame"
+                               : "launch before the frame's last cycle")
+                   << "\n");
+        continue;
+      }
+      auto childPlan = std::make_unique<LevelPlan>();
+      if (failed(planInlineLevel(child, *childPlan)))
+        return failure();
+      plan.children[j] = std::move(childPlan);
+    }
+  }
+  return success();
+}
+
+void LoopScheduleToFSMPass::layoutLevel(LevelPlan &plan, OpBuilder &b,
+                                        SmallVectorImpl<Attribute> &argNames,
+                                        SmallVectorImpl<Attribute> &resNames,
+                                        unsigned &numInputs,
+                                        unsigned &numOutputs) {
+  StringRef pfx = plan.node->prefix;
+  auto arg = [&](const Twine &n) {
+    argNames.push_back(b.getStringAttr(pfx + "_" + n.str()));
+    return numInputs++;
+  };
+  auto res = [&](const Twine &n) {
+    resNames.push_back(b.getStringAttr(pfx + "_" + n.str()));
+    return numOutputs++;
+  };
+  auto &sl = plan.slots;
+  sl.inCond = arg("cond");
+  sl.inCondNext = arg("cond_next");
+  sl.inChildDone.assign(plan.info.numWaits, -1);
+  for (unsigned j = 0; j < plan.info.numWaits; ++j)
+    if (!plan.children[j])
+      sl.inChildDone[j] = (int)arg("child_done_" + Twine(j));
+  sl.inStall = arg("stall");
+  sl.outFirstIter = res("first_iter");
+  sl.outIterAdvance = res("iter_advance");
+  sl.outCondActive = plan.info.entryBypass ? -1 : (int)res("cond_active");
+  sl.outFrameActiveBase = numOutputs;
+  for (unsigned i = 0; i < plan.info.numFrames; ++i)
+    res("frame_active_" + Twine(i));
+  sl.outChildStartBase = numOutputs;
+  for (unsigned j = 0; j < plan.info.numWaits; ++j)
+    res("child_start_" + Twine(j));
+  sl.outChildActiveBase = numOutputs;
+  for (unsigned j = 0; j < plan.info.numWaits; ++j)
+    res("child_active_" + Twine(j));
+  sl.outCycleBase = plan.info.totalCycleOuts ? (int)numOutputs : -1;
+  for (unsigned i = 0; i < plan.info.numFrames; ++i)
+    if (plan.info.frameCycleOutBase[i] >= 0)
+      for (unsigned c = 0; c < plan.info.frameLatencies[i]; ++c)
+        res("frame_cycle_" + Twine(i) + "_" + Twine(c));
+  sl.outIssueArm.assign(plan.info.numWaits, -1);
+  for (auto &child : plan.children)
+    if (child)
+      layoutLevel(*child, b, argNames, resNames, numInputs, numOutputs);
+}
+
+/// State-name helpers shared by emission and the wrapper (the names are
+/// the contract between them).
+static std::string levelFrameStateName(StringRef pfx,
+                                       ArrayRef<unsigned> frameLats,
+                                       unsigned i, unsigned c) {
+  std::string base = (pfx + "_FRAME_" + Twine(i)).str();
+  if (frameLats[i] <= 1)
+    return base;
+  return base + "_" + std::to_string(c);
+}
+
+void LoopScheduleToFSMPass::emitLevelEntry(
+    UnifiedFsmCtx &ctx, LevelPlan &plan, Block *tb,
+    llvm::function_ref<Value(OpBuilder &, Location)> extraGuard,
+    const ExitConts &exits) {
+  OpBuilder &fb = ctx.fb;
+  Location loc = ctx.loc;
+  StringRef pfx = plan.node->prefix;
+  Value condArg = ctx.machine.getArgument(plan.slots.inCond);
+  fb.setInsertionPointToEnd(tb);
+  auto composeGuard = [&](ArrayRef<Value> terms) -> Value {
+    Value g;
+    for (Value t : terms)
+      if (t)
+        g = g ? comb::AndOp::create(fb, loc, g, t).getResult() : t;
+    return g;
+  };
+  if (!plan.info.entryBypass) {
+    // Into the level's COND state; the condition decides there.
+    fsm::TransitionOp::create(
+        fb, loc, StringRef((pfx + "_COND").str()),
+        [&]() {
+          Value e = extraGuard ? extraGuard(fb, loc) : Value();
+          fsm::ReturnOp::create(fb, loc,
+                                e ? e : Value(ctx.trueVal));
+        },
+        [&]() { fsm::UpdateOp::create(fb, loc, plan.fiVar, ctx.trueVal); });
+    return;
+  }
+  // Entry bypass: straight into FRAME_0 on cond; zero-trip takes the
+  // exit continuations.
+  fsm::TransitionOp::create(
+      fb, loc,
+      StringRef(levelFrameStateName(pfx, plan.info.frameLatencies, 0, 0)),
+      [&]() {
+        Value e = extraGuard ? extraGuard(fb, loc) : Value();
+        fsm::ReturnOp::create(fb, loc, composeGuard({e, condArg}));
+      },
+      [&]() { fsm::UpdateOp::create(fb, loc, plan.fiVar, ctx.falseVal); });
+  Value notCond = comb::createOrFoldNot(fb, loc, condArg);
+  for (const ExitCont &ec : exits) {
+    fsm::TransitionOp::create(
+        fb, loc, StringRef(ec.target),
+        [&]() {
+          Value e = extraGuard ? extraGuard(fb, loc) : Value();
+          Value g = ec.guard ? ec.guard(fb, loc) : Value();
+          fsm::ReturnOp::create(fb, loc, composeGuard({e, notCond, g}));
+        },
+        []() {});
+    // Re-establish insertion after nested builders.
+    fb.setInsertionPointToEnd(tb);
+  }
+}
+
+void LoopScheduleToFSMPass::emitLevelStates(UnifiedFsmCtx &ctx,
+                                            LevelPlan &plan,
+                                            ArrayRef<unsigned> spanSlots,
+                                            const ExitConts &exits) {
+  OpBuilder &fb = ctx.fb;
+  Location loc = ctx.loc;
+  StringRef pfx = plan.node->prefix;
+  const LoopNodeInfo &info = plan.info;
+  const LevelSlots &sl = plan.slots;
+  Value condArg = ctx.machine.getArgument(sl.inCond);
+  Value condNextArg = ctx.machine.getArgument(sl.inCondNext);
+  Value stallArg = ctx.machine.getArgument(sl.inStall);
+
+  // The level's first_iter variable.
+  fb.setInsertionPointToEnd(&ctx.machine.getBody().front());
+  plan.fiVar = fsm::VariableOp::create(fb, loc, fb.getI1Type(),
+                                       fb.getBoolAttr(true),
+                                       (pfx + "_first_iter").str());
+
+  unsigned numStateFrames =
+      info.foldLastFrame ? info.numFrames - 1 : info.numFrames;
+  auto frameName = [&](unsigned i, unsigned c) {
+    return levelFrameStateName(pfx, info.frameLatencies, i, c);
+  };
+  auto waitName = [&](unsigned i) {
+    return (pfx + "_WAIT_" + Twine(i)).str();
+  };
+
+  // Base assignments common to every state of the level: the span slots
+  // (ancestors' child_active, the function's frame_running) and the
+  // level's own first_iter.
+  auto baseAssigns = [&]() {
+    SmallVector<std::pair<unsigned, Value>> a;
+    for (unsigned s : spanSlots)
+      a.push_back({s, ctx.trueVal});
+    a.push_back({sl.outFirstIter, plan.fiVar});
+    return a;
+  };
+
+  auto notStallOf = [&](OpBuilder &b, Location l) {
+    return comb::createOrFoldNot(b, l, stallArg);
+  };
+  auto composeGuard = [&](OpBuilder &b, Location l,
+                          ArrayRef<Value> terms) -> Value {
+    Value g;
+    for (Value t : terms)
+      if (t)
+        g = g ? comb::AndOp::create(b, l, g, t).getResult() : t;
+    return g;
+  };
+
+  // Continuations for "the level's LAST state-frame completed": loop
+  // back, or leave through `exits`. Every arm carries the level's
+  // !stall; the caller's exit guards compose on top.
+  auto loopBackConts = [&]() -> ExitConts {
+    ExitConts conts;
+    if (!info.condBypass) {
+      conts.push_back({(pfx + "_COND").str(),
+                       [&](OpBuilder &b, Location l) -> Value {
+                         return notStallOf(b, l);
+                       }});
+      return conts;
+    }
+    conts.push_back({frameName(0, 0),
+                     [&, condNextArg](OpBuilder &b, Location l) -> Value {
+                       return composeGuard(b, l,
+                                           {notStallOf(b, l), condNextArg});
+                     }});
+    for (const ExitCont &ec : exits) {
+      auto ecGuard = ec.guard;
+      conts.push_back(
+          {ec.target, [&, condNextArg, ecGuard](OpBuilder &b,
+                                                Location l) -> Value {
+             Value ncn = comb::createOrFoldNot(b, l, condNextArg);
+             Value g = ecGuard ? ecGuard(b, l) : Value();
+             return composeGuard(b, l, {notStallOf(b, l), ncn, g});
+           }});
+    }
+    return conts;
+  };
+
+  // --- COND (only without the entry bypass) ---
+  if (!info.entryBypass) {
+    auto a = baseAssigns();
+    a.push_back({(unsigned)sl.outCondActive, ctx.trueVal});
+    ctx.emitState((pfx + "_COND").str(), a, [&](Block *tb) {
+      fb.setInsertionPointToEnd(tb);
+      fsm::TransitionOp::create(
+          fb, loc, StringRef(frameName(0, 0)),
+          [&]() { fsm::ReturnOp::create(fb, loc, condArg); },
+          [&]() {
+            fsm::UpdateOp::create(fb, loc, plan.fiVar, ctx.falseVal);
+          });
+      for (const ExitCont &ec : exits) {
+        fsm::TransitionOp::create(
+            fb, loc, StringRef(ec.target),
+            [&]() {
+              Value notCond = comb::createOrFoldNot(fb, loc, condArg);
+              Value g = ec.guard ? ec.guard(fb, loc) : Value();
+              fsm::ReturnOp::create(fb, loc,
+                                    composeGuard(fb, loc, {notCond, g}));
+            },
+            []() {});
+        fb.setInsertionPointToEnd(tb);
+      }
+    });
+  }
+
+  // --- FRAME_i cycle states (+ WAIT_i / embedded child levels) ---
+  for (unsigned i = 0; i < numStateFrames; ++i) {
+    bool isLast = (i + 1 == numStateFrames);
+    unsigned L = info.frameLatencies[i];
+    auto &waitIdx = info.frameWaitIdx[i];
+    bool frameHasLaunch = !waitIdx.empty();
+    // The frame's single INLINED child, if any (planInlineLevel
+    // guarantees solo + last-cycle for inlined children).
+    LevelPlan *inlineChild =
+        frameHasLaunch && waitIdx.size() == 1 &&
+                plan.children[(unsigned)waitIdx.front()]
+            ? plan.children[(unsigned)waitIdx.front()].get()
+            : nullptr;
+    unsigned inlineJ = inlineChild ? (unsigned)waitIdx.front() : 0;
+
+    SmallVector<SmallVector<unsigned>> startsPerCycle(L), livesPerCycle(L);
+    for (int j : waitIdx) {
+      unsigned o = info.launchStartOffsets[(unsigned)j];
+      if (o < L)
+        startsPerCycle[o].push_back((unsigned)j);
+      for (unsigned c = o; c < L; ++c)
+        livesPerCycle[c].push_back((unsigned)j);
+    }
+    SmallVector<unsigned> allLaunches;
+    for (int j : waitIdx)
+      allLaunches.push_back((unsigned)j);
+
+    // Continuation after this frame: the next frame, or the loop-back
+    // set for the last state-frame.
+    auto afterFrame = [&]() -> ExitConts {
+      if (!isLast)
+        return {{frameName(i + 1, 0),
+                 [&](OpBuilder &b, Location l) -> Value {
+                   return notStallOf(b, l);
+                 }}};
+      return loopBackConts();
+    };
+
+    for (unsigned c = 0; c < L; ++c) {
+      bool isLastCycle = (c + 1 == L);
+      bool iterAdv = isLast && isLastCycle && !frameHasLaunch;
+      auto a = baseAssigns();
+      a.push_back({sl.outFrameActiveBase + i, ctx.trueVal});
+      if (iterAdv)
+        a.push_back({sl.outIterAdvance, ctx.trueVal});
+      for (unsigned j : startsPerCycle[c])
+        a.push_back({sl.outChildStartBase + j, ctx.trueVal});
+      for (unsigned j : livesPerCycle[c])
+        a.push_back({sl.outChildActiveBase + j, ctx.trueVal});
+      if (info.frameCycleOutBase[i] >= 0) {
+        unsigned base = (unsigned)sl.outCycleBase +
+                        (unsigned)info.frameCycleOutBase[i];
+        a.push_back({base + c, ctx.trueVal});
+      }
+      if (inlineChild && isLastCycle)
+        // The launcher cycle: the child's inits latch on this edge.
+        a.push_back({inlineChild->slots.outFirstIter, ctx.trueVal});
+
+      ctx.emitState(frameName(i, c), a, [&](Block *tb) {
+        fb.setInsertionPointToEnd(tb);
+        if (!isLastCycle) {
+          fsm::TransitionOp::create(
+              fb, loc, StringRef(frameName(i, c + 1)),
+              [&]() { fsm::ReturnOp::create(fb, loc, notStallOf(fb, loc)); },
+              []() {});
+          return;
+        }
+        if (inlineChild) {
+          // Enter the child's states directly (the launch hop is gone);
+          // the child's exits continue with this frame's continuation.
+          emitLevelEntry(ctx, *inlineChild, tb, notStallOf, afterFrame());
+          return;
+        }
+        if (frameHasLaunch) {
+          fsm::TransitionOp::create(
+              fb, loc, StringRef(waitName(i)),
+              [&]() { fsm::ReturnOp::create(fb, loc, notStallOf(fb, loc)); },
+              []() {});
+          return;
+        }
+        for (const ExitCont &ec : afterFrame()) {
+          fsm::TransitionOp::create(
+              fb, loc, StringRef(ec.target),
+              [&]() {
+                Value g = ec.guard ? ec.guard(fb, loc) : Value();
+                fsm::ReturnOp::create(fb, loc,
+                                      g ? g : Value(ctx.trueVal));
+              },
+              []() {});
+          fb.setInsertionPointToEnd(tb);
+        }
+      });
+    }
+
+    if (inlineChild) {
+      // The child's whole span drives this level's child_active slot (the
+      // frame-merge gate that holds this frame's addresses through the
+      // child), plus everything the parent span drives.
+      SmallVector<unsigned> childSpan(spanSlots.begin(), spanSlots.end());
+      childSpan.push_back(sl.outChildActiveBase + inlineJ);
+      emitLevelStates(ctx, *inlineChild, childSpan, afterFrame());
+      continue;
+    }
+    if (!frameHasLaunch)
+      continue;
+
+    // WAIT_i for pipeline / outlined children: exit on all dones.
+    auto allDonesGuard = [&, allLaunches](OpBuilder &b,
+                                          Location l) -> Value {
+      Value g;
+      for (unsigned j : allLaunches) {
+        assert(sl.inChildDone[j] >= 0 && "inlined child kept a WAIT");
+        Value d = ctx.machine.getArgument((unsigned)sl.inChildDone[j]);
+        g = g ? comb::AndOp::create(b, l, g, d).getResult() : d;
+      }
+      return g;
+    };
+    {
+      auto a = baseAssigns();
+      for (unsigned j : allLaunches)
+        a.push_back({sl.outChildActiveBase + j, ctx.trueVal});
+      ctx.emitState(waitName(i), a, [&](Block *tb) {
+        fb.setInsertionPointToEnd(tb);
+        for (const ExitCont &ec : afterFrame()) {
+          fsm::TransitionOp::create(
+              fb, loc, StringRef(ec.target),
+              [&]() {
+                Value dones = allDonesGuard(fb, loc);
+                Value g = ec.guard ? ec.guard(fb, loc) : Value();
+                fsm::ReturnOp::create(fb, loc,
+                                      composeGuard(fb, loc, {dones, g}));
+              },
+              []() {});
+          fb.setInsertionPointToEnd(tb);
+        }
+      });
+    }
+  }
+
+  // Registered issue arms for pre-armed launches (pipelines only).
+  for (auto [j, pa] : llvm::enumerate(info.launchPreArm))
+    if (pa)
+      plan.slots.outIssueArm[j] = -2; // marked; appended after all states
+}
+
+fsm::MachineOp LoopScheduleToFSMPass::createUnifiedFSM(
+    OpBuilder &builder, Location loc, StringRef fsmName,
+    ArrayRef<int> frameChildKind, ArrayRef<unsigned> entryLatencies,
+    ArrayRef<unsigned> entryGroup,
+    MutableArrayRef<std::unique_ptr<LevelPlan>> entryPlans,
+    ArrayRef<bool> preArmEntries, UnifiedFsmResult &out) {
+  auto *ctx = builder.getContext();
+  auto i1 = builder.getI1Type();
+  unsigned numFrames = frameChildKind.size();
+
+  unsigned numChildren = 0;
+  SmallVector<int> childIndexForFrame(numFrames, -1);
+  for (unsigned i = 0; i < numFrames; ++i)
+    if (frameChildKind[i] >= 0)
+      childIndexForFrame[i] = (int)numChildren++;
+
+  struct Group {
+    unsigned first;
+    SmallVector<unsigned> members;
+    bool hasChild = false;
+    bool allStateless = true;
+    int doneArg = -1;
+    LevelPlan *inlinePlan = nullptr; // solo kind-0 member lowered inline
+  };
+  SmallVector<Group> groupList;
+  for (unsigned i = 0; i < numFrames; ++i) {
+    if (groupList.empty() ||
+        entryGroup[i] != entryGroup[groupList.back().first])
+      groupList.push_back({i, {}, false, true, -1, nullptr});
+    Group &g = groupList.back();
+    g.members.push_back(i);
+    if (frameChildKind[i] >= 0)
+      g.hasChild = true;
+    if (frameChildKind[i] != -2)
+      g.allStateless = false;
+  }
+  for (Group &g : groupList)
+    if (g.members.size() == 1 && entryPlans[g.first])
+      g.inlinePlan = entryPlans[g.first].get();
+
+  // A group takes a done input when it waits on children the machine
+  // does not itself contain.
+  out.groupTakesDone.clear();
+  unsigned numWaitGroups = 0;
+  for (Group &g : groupList) {
+    if (!g.hasChild)
+      continue;
+    bool takes = g.inlinePlan == nullptr;
+    out.groupTakesDone.push_back(takes);
+    if (takes)
+      g.doneArg = 1 + (int)numWaitGroups++;
+  }
+
+  auto latencyOf = [&](unsigned i) -> unsigned {
+    unsigned l = i < entryLatencies.size() ? entryLatencies[i] : 1;
+    return frameChildKind[i] < 0 ? std::max(l, 1u) : 1u;
+  };
+  out.entryCycleOutBase.assign(numFrames, -1);
+  unsigned totalCycleOuts = 0;
+  for (unsigned i = 0; i < numFrames; ++i)
+    if (latencyOf(i) > 1) {
+      out.entryCycleOutBase[i] = (int)totalCycleOuts;
+      totalCycleOuts += latencyOf(i);
+    }
+
+  // --- Layout ---
+  SmallVector<Attribute> argNames, resNames;
+  unsigned numInputs = 0, numOutputs = 0;
+  argNames.push_back(builder.getStringAttr("start"));
+  numInputs = 1 + numWaitGroups;
+  for (unsigned i = 0; i < numWaitGroups; ++i)
+    argNames.push_back(
+        builder.getStringAttr("group_done_" + std::to_string(i)));
+  resNames.push_back(builder.getStringAttr("done"));
+  for (unsigned i = 0; i < numChildren; ++i)
+    resNames.push_back(
+        builder.getStringAttr("child_start_" + std::to_string(i)));
+  for (unsigned i = 0; i < numFrames; ++i)
+    resNames.push_back(
+        builder.getStringAttr("frame_running_" + std::to_string(i)));
+  numOutputs = 1 + numChildren + numFrames + totalCycleOuts;
+  for (unsigned i = 0; i < numFrames; ++i)
+    for (unsigned c = 0; out.entryCycleOutBase[i] >= 0 && c < latencyOf(i);
+         ++c)
+      resNames.push_back(builder.getStringAttr(
+          "frame_cycle_" + std::to_string(i) + "_" + std::to_string(c)));
+  for (auto &plan : entryPlans)
+    if (plan)
+      layoutLevel(*plan, builder, argNames, resNames, numInputs, numOutputs);
+  out.numInputs = numInputs;
+  out.numOutputs = numOutputs;
+
+  SmallVector<Type> inputTypes(numInputs, i1), outputTypes(numOutputs, i1);
+  auto funcType = FunctionType::get(ctx, inputTypes, outputTypes);
+  auto machine =
+      fsm::MachineOp::create(builder, loc, fsmName, "IDLE", funcType);
+  machine.setArgNamesAttr(builder.getArrayAttr(argNames));
+  machine.setResNamesAttr(builder.getArrayAttr(resNames));
+
+  OpBuilder fb(ctx);
+  fb.setInsertionPointToEnd(&machine.getBody().front());
+  Value trueVal = hw::ConstantOp::create(fb, loc, i1, 1);
+  Value falseVal = hw::ConstantOp::create(fb, loc, i1, 0);
+  UnifiedFsmCtx uctx{fb, loc, machine, trueVal, falseVal, numOutputs};
+
+  auto nextEmittedState = [&](unsigned g) -> std::string {
+    for (unsigned j = g + 1; j < groupList.size(); ++j)
+      if (!groupList[j].allStateless)
+        return "FRAME_" + std::to_string(groupList[j].first);
+    return "DONE";
+  };
+  int firstEmitted = -1;
+  for (unsigned g = 0; g < groupList.size(); ++g)
+    if (!groupList[g].allStateless) {
+      firstEmitted = (int)groupList[g].first;
+      break;
+    }
+
+  // --- IDLE ---
+  // (See the reverted IDLE->WAIT bypass note in the git history: entry
+  // stays a plain start-guarded arc into the first frame.)
+  uctx.emitState("IDLE", {}, [&](Block *tb) {
+    fb.setInsertionPointToEnd(tb);
+    std::string entryTarget = firstEmitted < 0
+                                  ? std::string("DONE")
+                                  : "FRAME_" + std::to_string(firstEmitted);
+    fsm::TransitionOp::create(
+        fb, loc, StringRef(entryTarget),
+        [&]() { fsm::ReturnOp::create(fb, loc, machine.getArgument(0)); },
+        []() {});
+  });
+
+  // --- FRAME_g / WAIT_g (or embedded levels) per group ---
+  for (unsigned g = 0; g < groupList.size(); ++g) {
+    Group &grp = groupList[g];
+    if (grp.allStateless)
+      continue;
+    std::string frameNameS = "FRAME_" + std::to_string(grp.first);
+    std::string nextState = nextEmittedState(g);
+    bool isLeaf = !grp.hasChild;
+
+    SmallVector<std::pair<unsigned, Value>> groupAssignsBase;
+    SmallVector<unsigned> groupRunningSlots;
+    for (unsigned i : grp.members) {
+      if (frameChildKind[i] >= 0)
+        groupAssignsBase.push_back(
+            {1u + (unsigned)childIndexForFrame[i], trueVal});
+      if (frameChildKind[i] != -2)
+        groupRunningSlots.push_back(1 + numChildren + i);
+    }
+    for (unsigned s : groupRunningSlots)
+      groupAssignsBase.push_back({s, trueVal});
+
+    unsigned lat = latencyOf(grp.first);
+    for (unsigned c = 0; c < lat; ++c) {
+      std::string stateName =
+          c == 0 ? frameNameS : frameNameS + "_C" + std::to_string(c);
+      std::string succ =
+          (c + 1 < lat)
+              ? frameNameS + "_C" + std::to_string(c + 1)
+              : (isLeaf ? nextState : "WAIT_" + std::to_string(grp.first));
+      SmallVector<std::pair<unsigned, Value>> a;
+      for (auto &kv : groupAssignsBase) {
+        // Leaf groups do not pulse child starts (there are none).
+        a.push_back(kv);
+      }
+      if (out.entryCycleOutBase[grp.first] >= 0) {
+        unsigned base = 1 + numChildren + numFrames +
+                        (unsigned)out.entryCycleOutBase[grp.first];
+        a.push_back({base + c, trueVal});
+      }
+      if (grp.inlinePlan && c + 1 == lat)
+        a.push_back({grp.inlinePlan->slots.outFirstIter, trueVal});
+      uctx.emitState(stateName, a, [&](Block *tb) {
+        fb.setInsertionPointToEnd(tb);
+        if (c + 1 == lat && grp.inlinePlan) {
+          emitLevelEntry(uctx, *grp.inlinePlan, tb, nullptr,
+                         {{nextState, nullptr}});
+          return;
+        }
+        fsm::TransitionOp::create(fb, loc, StringRef(succ));
+      });
+    }
+
+    if (grp.inlinePlan) {
+      SmallVector<unsigned> span(groupRunningSlots.begin(),
+                                 groupRunningSlots.end());
+      emitLevelStates(uctx, *grp.inlinePlan, span,
+                      {{nextState, nullptr}});
+      continue;
+    }
+    if (!isLeaf) {
+      std::string waitNameS = "WAIT_" + std::to_string(grp.first);
+      SmallVector<std::pair<unsigned, Value>> a;
+      for (unsigned s : groupRunningSlots)
+        a.push_back({s, trueVal});
+      unsigned doneArgIdx = (unsigned)grp.doneArg;
+      uctx.emitState(waitNameS, a, [&](Block *tb) {
+        fb.setInsertionPointToEnd(tb);
+        fsm::TransitionOp::create(
+            fb, loc, StringRef(nextState),
+            [&]() {
+              fsm::ReturnOp::create(fb, loc,
+                                    machine.getArgument(doneArgIdx));
+            },
+            []() {});
+      });
+    }
+  }
+
+  // --- DONE ---
+  uctx.emitState("DONE", {{0u, trueVal}}, [&](Block *tb) {
+    fb.setInsertionPointToEnd(tb);
+    // No start arc: ready clears on the registered Moore done, so the
+    // next start lands in IDLE (historical protocol timing; keeps the
+    // child-done chain out of tx_in_flight's cone).
+    fsm::TransitionOp::create(fb, loc, StringRef("IDLE"));
+  });
+
+  // --- Registered issue arms ---
+  // Function entries first (entry order), then every level's pre-armed
+  // launches (pre-order) — each appends one machine output.
+  out.entryIssueArmIdx.assign(numFrames, -1);
+  unsigned armOut = numOutputs;
+  for (auto [ei, pa] : llvm::enumerate(preArmEntries))
+    if (pa) {
+      addRegisteredLaunchArm(machine, "FRAME_" + std::to_string(ei),
+                             "issue_arm_" + std::to_string(ei));
+      out.entryIssueArmIdx[ei] = (int)armOut++;
+    }
+  std::function<void(LevelPlan &)> armLevel = [&](LevelPlan &plan) {
+    for (auto [j, pa] : llvm::enumerate(plan.info.launchPreArm))
+      if (pa) {
+        addRegisteredLaunchArm(
+            machine,
+            levelFrameStateName(plan.node->prefix,
+                                plan.info.frameLatencies,
+                                plan.info.waitFrameIndices[j],
+                                plan.info.launchStartOffsets[j]),
+            (plan.node->prefix + "_issue_arm_" + Twine(j)).str());
+        plan.slots.outIssueArm[j] = (int)armOut++;
+      }
+    for (auto &child : plan.children)
+      if (child)
+        armLevel(*child);
+  };
+  for (auto &plan : entryPlans)
+    if (plan)
+      armLevel(*plan);
+
+  return machine;
+}
+
+//===----------------------------------------------------------------------===//
 // Loop module creation helpers
 //===----------------------------------------------------------------------===//
 
@@ -4092,172 +4987,48 @@ LoopScheduleToFSMPass::analyzeLoopNode(const LoopNode &node,
   return success();
 }
 
-LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
-    const LoopNode &node, OpBuilder &builder, Location loc,
-    loopschedule::LoopScheduleFuncSequentialOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
-    IRMapping &parentMapping,
-    hw::HWModuleOp &outModule,
-    SmallVectorImpl<Value> &capturedVals) {
-  // `sharedOperators` / `instanceUniquer` are scoped to the hw.module
-  // CURRENTLY being emitted, and this function runs mid-emission of the
-  // caller's module. Save the caller's in-progress state and restore it on
-  // exit: the child's clear-and-populate must never leak back — a caller
-  // op emitted after this returns would join a shared operator instance
-  // living inside the CHILD module's region (invalid cross-region IR; the
-  // nested-stream two_nests regression), and instance names would collide.
-  auto savedShared = std::move(sharedOperators);
-  auto savedUniquer = std::move(instanceUniquer);
-  auto restoreScopes = llvm::make_scope_exit([&] {
-    sharedOperators = std::move(savedShared);
-    instanceUniquer = std::move(savedUniquer);
-  });
-
-  auto *ctx = builder.getContext();
+LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
+    const LoopNode &node, LoopNodeInfo &info, LevelEnv &env,
+    SmallVectorImpl<Value> &resultValues, SmallVectorImpl<Value> &resultCombs,
+    Value &iterAdvanceEdgeOut) {
+  OpBuilder &hw = env.hw;
+  OpBuilder &builder = env.builder;
+  auto *ctx = env.ctx;
+  Type i1 = env.i1;
+  Location loc = env.loc;
+  Block *hwBody = env.hwBody;
+  ModuleOp moduleOp = env.moduleOp;
+  auto funcOp = env.funcOp;
+  ArrayRef<PortArgInfo> memrefArgs = env.memrefArgs;
+  IRMapping &localMapping = env.localMapping;
+  DenseMap<Value, MemPortMapping> &localMemPorts = env.localMemPorts;
+  BackedgeBuilder &bb = env.bb;
+  Value clk = env.clk, rst = env.rst;
+  Backedge condBE = env.condBE, condNextBE = env.condNextBE,
+           stallBE = env.stallBE;
+  MutableArrayRef<Backedge> childDoneBEs = env.childDoneBEs;
+  Value fsmFirstIter = env.fsmFirstIter;
+  Value fsmIterAdvance = env.fsmIterAdvance;
+  ArrayRef<Value> fsmFrameActives = env.fsmFrameActives;
+  ArrayRef<Value> fsmChildStarts = env.fsmChildStarts;
+  ArrayRef<Value> fsmChildActives = env.fsmChildActives;
+  ArrayRef<Value> fsmPostActives = env.fsmPostActives;
+  ArrayRef<SmallVector<Value>> fsmFrameCycleGates = env.fsmFrameCycleGates;
+  ArrayRef<Value> fsmIssueArms = env.fsmIssueArms;
   auto seqOp = node.seqOp;
-  auto i1 = builder.getI1Type();
-
-  // --- Collect captured values and constants ---
-  SmallVector<Value> captured = collectCapturedValues(seqOp);
-  capturedVals.assign(captured.begin(), captured.end());
-
-  SmallVector<Operation *> referencedConsts = collectReferencedConstants(seqOp);
-
-  // Collect result types.
-  SmallVector<Type> resultTypes;
-  for (auto result : seqOp.getResults())
-    resultTypes.push_back(result.getType());
-
-  // --- Create the hw.module for this loop ---
-  IRMapping localMapping;
-  DenseMap<Value, MemPortMapping> localMemPorts;
-  unsigned clkIdx, rstIdx, startIdx;
-
-  auto moduleOp = dyn_cast<ModuleOp>(builder.getBlock()->getParentOp());
-  if (!moduleOp)
-    moduleOp = builder.getBlock()->getParentOp()->getParentOfType<ModuleOp>();
-  builder.setInsertionPointToEnd(moduleOp.getBody());
-
-  auto hwMod = createLoopModule(builder, loc, node.prefix, captured, memrefArgs,
-                                 resultTypes, localMapping, localMemPorts,
-                                 clkIdx, rstIdx, startIdx);
-  outModule = hwMod;
-
-  Block *hwBody = hwMod.getBodyBlock();
-  Value clk = hwBody->getArgument(clkIdx);
-  Value rst = hwBody->getArgument(rstIdx);
-  Value startSignal = hwBody->getArgument(startIdx);
-
-  // Reset the per-hw.module instance-name uniquer so generated `hw.instance`
-  // sym_names don't collide across nested loop modules.
-  instanceUniquer.clear();
-  sharedOperators.clear();
-
-  // Clone referenced constants into the module body.
-  OpBuilder hw(ctx);
-  hw.setInsertionPointToEnd(hwBody);
-  for (auto *constOp : referencedConsts) {
-    hw.clone(*constOp, localMapping);
-  }
-
-  // --- Structural analysis (frames, launches, fold/bypass decisions) ---
-  LoopNodeInfo info;
-  if (failed(analyzeLoopNode(node, info)))
-    return failure();
   auto &frames = info.frames;
   auto terminatorOp = info.terminatorOp;
   unsigned numFrames = info.numFrames;
   auto &bodyMultiAccess = info.bodyMultiAccess;
-  auto &waitFrameIndices = info.waitFrameIndices;
-  auto &launchAtOffsets = info.launchAtOffsets;
   auto &frameWaitIdx = info.frameWaitIdx;
-  unsigned numWaits = info.numWaits;
   auto &frameLatencies = info.frameLatencies;
-  auto &frameCycleOutBase = info.frameCycleOutBase;
-  unsigned totalCycleOuts = info.totalCycleOuts;
-  auto &launchStartOffsets = info.launchStartOffsets;
   auto &launchPreArm = info.launchPreArm;
   bool foldLastFrame = info.foldLastFrame;
   bool condBypass = info.condBypass;
-
-  // --- Create FSM machine ---
-  // Every pre-armed launch (solo in its frame, but a machine may host
-  // several such frames) gets a registered issue-arm output, appended
-  // in launch order.
-  unsigned numPreArms = llvm::count(launchPreArm, true);
-  std::string fsmName = node.prefix + "_fsm";
-  builder.setInsertionPointToEnd(moduleOp.getBody());
-  (void)createSequentialFSM(builder, loc, fsmName, numFrames, waitFrameIndices,
-                            launchAtOffsets, launchStartOffsets,
-                            frameLatencies, foldLastFrame, condBypass,
-                            condBypass && entryInitsReadyAtStart(seqOp),
-                            launchPreArm);
-
-  // --- Create FSM instance with backedges ---
-  hw.setInsertionPointToEnd(hwBody);
-  BackedgeBuilder bb(hw, loc);
-
-  Backedge condBE = bb.get(i1);
-  // cond re-evaluated on the iter_arg feedback wires; resolved after the
-  // feedback values exist (constant 0 when the bypass is off).
-  Backedge condNextBE = bb.get(i1);
-
-  // One backedge per wait step for its child_done input.
-  SmallVector<Backedge> childDoneBEs;
-  childDoneBEs.reserve(numWaits);
-  for (unsigned j = 0; j < numWaits; ++j)
-    childDoneBEs.push_back(bb.get(i1));
-
-  // Stall input: OR of the per-dynamic-access ready/done stall terms
-  // collected while lowering frame bodies (resolved below).
-  Backedge stallBE = bb.get(i1);
+  unsigned numWaits = info.numWaits;
+  (void)numWaits;
   SmallVector<Value> seqStallTerms;
   unsigned seqDynCounter = 0;
-
-  // Build instance inputs: start, cond, cond_next, child_done_0..C-1,
-  // stall.
-  SmallVector<Value> instInputs;
-  instInputs.push_back(startSignal);
-  instInputs.push_back(Value(condBE));
-  instInputs.push_back(Value(condNextBE));
-  for (auto &be : childDoneBEs)
-    instInputs.push_back(Value(be));
-  instInputs.push_back(Value(stallBE));
-
-  // Result types: done, first_iter, iter_advance,
-  //               frame_active_0..N-1, child_start_0..C-1,
-  //               child_active_0..C-1, post_active_0..C-1,
-  //               frame_cycle_<i>_<c>...
-  unsigned numFsmResults = 3 + numFrames + 3 * numWaits + totalCycleOuts;
-  SmallVector<Type> resTys(numFsmResults + numPreArms, i1);
-  auto inst = fsm::HWInstanceOp::create(
-      hw, loc, resTys, hw.getStringAttr(fsmName + "_inst"),
-      hw.getAttr<FlatSymbolRefAttr>(fsmName), instInputs, clk, rst);
-  // Per-launch registered issue arms, appended after the base results in
-  // launch order.
-  SmallVector<Value> fsmIssueArms(numWaits, Value());
-  {
-    unsigned armIdx = numFsmResults;
-    for (auto [j, pa] : llvm::enumerate(launchPreArm))
-      if (pa)
-        fsmIssueArms[j] = inst.getResult(armIdx++);
-  }
-
-  Value fsmDone = inst.getResult(0);
-  Value fsmFirstIter = inst.getResult(1);
-  Value fsmIterAdvance = inst.getResult(2);
-  SmallVector<Value> fsmFrameActives(numFrames);
-  for (unsigned i = 0; i < numFrames; ++i)
-    fsmFrameActives[i] = inst.getResult(3 + i);
-  SmallVector<Value> fsmChildStarts(numWaits);
-  for (unsigned j = 0; j < numWaits; ++j)
-    fsmChildStarts[j] = inst.getResult(3 + numFrames + j);
-  SmallVector<Value> fsmChildActives(numWaits);
-  for (unsigned j = 0; j < numWaits; ++j)
-    fsmChildActives[j] = inst.getResult(3 + numFrames + numWaits + j);
-  SmallVector<Value> fsmPostActives(numWaits);
-  for (unsigned j = 0; j < numWaits; ++j)
-    fsmPostActives[j] = inst.getResult(3 + numFrames + 2 * numWaits + j);
-
   // SR-latch every raw child_done so concurrent launches that finish at
   // different cycles all contribute to the WAIT_i AND guard. The latch
   // sets on the raw done (covers both level-held pip_done and
@@ -4300,21 +5071,6 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     nextBE.setValue(fed);
     return fed;
   };
-  // Per-frame per-cycle gates. For single-cycle frames the gate vector
-  // contains just the frame's overall frame_active signal; for multi-cycle
-  // frames it contains the L_i dedicated frame_cycle_<i>_<c> outputs.
-  unsigned cycleOutOffset = 3 + numFrames + 3 * numWaits;
-  SmallVector<SmallVector<Value>> fsmFrameCycleGates(numFrames);
-  for (unsigned i = 0; i < numFrames; ++i) {
-    if (frameCycleOutBase[i] < 0) {
-      fsmFrameCycleGates[i].push_back(fsmFrameActives[i]);
-    } else {
-      for (unsigned c = 0; c < frameLatencies[i]; ++c)
-        fsmFrameCycleGates[i].push_back(inst.getResult(
-            cycleOutOffset + (unsigned)frameCycleOutBase[i] + c));
-    }
-  }
-
   // While stalled (a dynamic access waiting on ready/done), everything
   // that advances with the FSM must hold — the FSM freezes its state, and
   // the module-side registers freeze via CE &= notStall.
@@ -5342,19 +6098,27 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   }
 
   // Map sequential op results to register values where possible.
-  SmallVector<Value> resultValues;
   for (auto [idx, result] : llvm::enumerate(seqOp.getResults())) {
     Value termResult = terminatorOp.getResults()[idx];
     bool mapped = false;
     for (unsigned j = 0; j < iterArgPhaseResults.size(); ++j) {
       if (termResult == iterArgPhaseResults[j]) {
         resultValues.push_back(iterArgRegs[j]);
+        // The value the register latches ON the advance edge — what a
+        // same-edge consumer (an enclosing loop's iter-arg feedback)
+        // must read instead of the pre-edge register Q.
+        resultCombs.push_back(iterArgFeedbacks[j]);
         mapped = true;
         break;
       }
     }
-    if (!mapped)
-      resultValues.push_back(localMapping.lookup(termResult));
+    if (!mapped) {
+      Value v = localMapping.lookup(termResult);
+      resultValues.push_back(v);
+      auto combIt = frameResultComb.find(termResult);
+      resultCombs.push_back(combIt != frameResultComb.end() ? combIt->second
+                                                            : v);
+    }
   }
 
   // --- Merge per-frame memory ports ---
@@ -5403,6 +6167,210 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       localMemPorts[memInfo.originalArg].rdEn =
           mergedMemPorts[memInfo.originalArg].rdEn;
   }
+
+  iterAdvanceEdgeOut = iterAdvanceEdge;
+  return success();
+}
+
+LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
+    const LoopNode &node, OpBuilder &builder, Location loc,
+    loopschedule::LoopScheduleFuncSequentialOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
+    IRMapping &parentMapping,
+    hw::HWModuleOp &outModule,
+    SmallVectorImpl<Value> &capturedVals) {
+  // `sharedOperators` / `instanceUniquer` are scoped to the hw.module
+  // CURRENTLY being emitted, and this function runs mid-emission of the
+  // caller's module. Save the caller's in-progress state and restore it on
+  // exit: the child's clear-and-populate must never leak back — a caller
+  // op emitted after this returns would join a shared operator instance
+  // living inside the CHILD module's region (invalid cross-region IR; the
+  // nested-stream two_nests regression), and instance names would collide.
+  auto savedShared = std::move(sharedOperators);
+  auto savedUniquer = std::move(instanceUniquer);
+  auto restoreScopes = llvm::make_scope_exit([&] {
+    sharedOperators = std::move(savedShared);
+    instanceUniquer = std::move(savedUniquer);
+  });
+
+  auto *ctx = builder.getContext();
+  auto seqOp = node.seqOp;
+  auto i1 = builder.getI1Type();
+
+  // --- Collect captured values and constants ---
+  SmallVector<Value> captured = collectCapturedValues(seqOp);
+  capturedVals.assign(captured.begin(), captured.end());
+
+  SmallVector<Operation *> referencedConsts = collectReferencedConstants(seqOp);
+
+  // Collect result types.
+  SmallVector<Type> resultTypes;
+  for (auto result : seqOp.getResults())
+    resultTypes.push_back(result.getType());
+
+  // --- Create the hw.module for this loop ---
+  IRMapping localMapping;
+  DenseMap<Value, MemPortMapping> localMemPorts;
+  unsigned clkIdx, rstIdx, startIdx;
+
+  auto moduleOp = dyn_cast<ModuleOp>(builder.getBlock()->getParentOp());
+  if (!moduleOp)
+    moduleOp = builder.getBlock()->getParentOp()->getParentOfType<ModuleOp>();
+  builder.setInsertionPointToEnd(moduleOp.getBody());
+
+  auto hwMod = createLoopModule(builder, loc, node.prefix, captured, memrefArgs,
+                                 resultTypes, localMapping, localMemPorts,
+                                 clkIdx, rstIdx, startIdx);
+  outModule = hwMod;
+
+  Block *hwBody = hwMod.getBodyBlock();
+  Value clk = hwBody->getArgument(clkIdx);
+  Value rst = hwBody->getArgument(rstIdx);
+  Value startSignal = hwBody->getArgument(startIdx);
+
+  // Reset the per-hw.module instance-name uniquer so generated `hw.instance`
+  // sym_names don't collide across nested loop modules.
+  instanceUniquer.clear();
+  sharedOperators.clear();
+
+  // Clone referenced constants into the module body.
+  OpBuilder hw(ctx);
+  hw.setInsertionPointToEnd(hwBody);
+  for (auto *constOp : referencedConsts) {
+    hw.clone(*constOp, localMapping);
+  }
+
+  // --- Structural analysis (frames, launches, fold/bypass decisions) ---
+  LoopNodeInfo info;
+  if (failed(analyzeLoopNode(node, info)))
+    return failure();
+  auto &frames = info.frames;
+  auto terminatorOp = info.terminatorOp;
+  unsigned numFrames = info.numFrames;
+  auto &bodyMultiAccess = info.bodyMultiAccess;
+  auto &waitFrameIndices = info.waitFrameIndices;
+  auto &launchAtOffsets = info.launchAtOffsets;
+  auto &frameWaitIdx = info.frameWaitIdx;
+  unsigned numWaits = info.numWaits;
+  auto &frameLatencies = info.frameLatencies;
+  auto &frameCycleOutBase = info.frameCycleOutBase;
+  unsigned totalCycleOuts = info.totalCycleOuts;
+  auto &launchStartOffsets = info.launchStartOffsets;
+  auto &launchPreArm = info.launchPreArm;
+  bool foldLastFrame = info.foldLastFrame;
+  bool condBypass = info.condBypass;
+
+  // --- Create FSM machine ---
+  // Every pre-armed launch (solo in its frame, but a machine may host
+  // several such frames) gets a registered issue-arm output, appended
+  // in launch order.
+  unsigned numPreArms = llvm::count(launchPreArm, true);
+  std::string fsmName = node.prefix + "_fsm";
+  builder.setInsertionPointToEnd(moduleOp.getBody());
+  (void)createSequentialFSM(builder, loc, fsmName, numFrames, waitFrameIndices,
+                            launchAtOffsets, launchStartOffsets,
+                            frameLatencies, foldLastFrame, condBypass,
+                            condBypass && entryInitsReadyAtStart(seqOp),
+                            launchPreArm);
+
+  // --- Create FSM instance with backedges ---
+  hw.setInsertionPointToEnd(hwBody);
+  BackedgeBuilder bb(hw, loc);
+
+  Backedge condBE = bb.get(i1);
+  // cond re-evaluated on the iter_arg feedback wires; resolved after the
+  // feedback values exist (constant 0 when the bypass is off).
+  Backedge condNextBE = bb.get(i1);
+
+  // One backedge per wait step for its child_done input.
+  SmallVector<Backedge> childDoneBEs;
+  childDoneBEs.reserve(numWaits);
+  for (unsigned j = 0; j < numWaits; ++j)
+    childDoneBEs.push_back(bb.get(i1));
+
+  // Stall input: OR of the per-dynamic-access ready/done stall terms
+  // collected while lowering frame bodies (resolved below).
+  Backedge stallBE = bb.get(i1);
+  SmallVector<Value> seqStallTerms;
+  unsigned seqDynCounter = 0;
+
+  // Build instance inputs: start, cond, cond_next, child_done_0..C-1,
+  // stall.
+  SmallVector<Value> instInputs;
+  instInputs.push_back(startSignal);
+  instInputs.push_back(Value(condBE));
+  instInputs.push_back(Value(condNextBE));
+  for (auto &be : childDoneBEs)
+    instInputs.push_back(Value(be));
+  instInputs.push_back(Value(stallBE));
+
+  // Result types: done, first_iter, iter_advance,
+  //               frame_active_0..N-1, child_start_0..C-1,
+  //               child_active_0..C-1, post_active_0..C-1,
+  //               frame_cycle_<i>_<c>...
+  unsigned numFsmResults = 3 + numFrames + 3 * numWaits + totalCycleOuts;
+  SmallVector<Type> resTys(numFsmResults + numPreArms, i1);
+  auto inst = fsm::HWInstanceOp::create(
+      hw, loc, resTys, hw.getStringAttr(fsmName + "_inst"),
+      hw.getAttr<FlatSymbolRefAttr>(fsmName), instInputs, clk, rst);
+  // Per-launch registered issue arms, appended after the base results in
+  // launch order.
+  SmallVector<Value> fsmIssueArms(numWaits, Value());
+  {
+    unsigned armIdx = numFsmResults;
+    for (auto [j, pa] : llvm::enumerate(launchPreArm))
+      if (pa)
+        fsmIssueArms[j] = inst.getResult(armIdx++);
+  }
+
+  Value fsmDone = inst.getResult(0);
+  Value fsmFirstIter = inst.getResult(1);
+  Value fsmIterAdvance = inst.getResult(2);
+  SmallVector<Value> fsmFrameActives(numFrames);
+  for (unsigned i = 0; i < numFrames; ++i)
+    fsmFrameActives[i] = inst.getResult(3 + i);
+  SmallVector<Value> fsmChildStarts(numWaits);
+  for (unsigned j = 0; j < numWaits; ++j)
+    fsmChildStarts[j] = inst.getResult(3 + numFrames + j);
+  SmallVector<Value> fsmChildActives(numWaits);
+  for (unsigned j = 0; j < numWaits; ++j)
+    fsmChildActives[j] = inst.getResult(3 + numFrames + numWaits + j);
+  SmallVector<Value> fsmPostActives(numWaits);
+  for (unsigned j = 0; j < numWaits; ++j)
+    fsmPostActives[j] = inst.getResult(3 + numFrames + 2 * numWaits + j);
+
+  // --- Level body (shared with the inline path) ---
+  // Per-frame per-cycle gates. For single-cycle frames the gate vector
+  // contains just the frame's overall frame_active signal; for multi-cycle
+  // frames it contains the L_i dedicated frame_cycle_<i>_<c> outputs.
+  unsigned cycleOutOffset = 3 + numFrames + 3 * numWaits;
+  SmallVector<SmallVector<Value>> fsmFrameCycleGates(numFrames);
+  for (unsigned i = 0; i < numFrames; ++i) {
+    if (frameCycleOutBase[i] < 0) {
+      fsmFrameCycleGates[i].push_back(fsmFrameActives[i]);
+    } else {
+      for (unsigned c = 0; c < frameLatencies[i]; ++c)
+        fsmFrameCycleGates[i].push_back(inst.getResult(
+            cycleOutOffset + (unsigned)frameCycleOutBase[i] + c));
+    }
+  }
+
+  LevelEnv env{hw,       builder,  ctx,      i1,          loc,
+               hwBody,   moduleOp, funcOp,   memrefArgs,  localMapping,
+               localMemPorts,      bb,       clk,         rst,
+               condBE,   condNextBE,         stallBE,     childDoneBEs};
+  env.fsmFirstIter = fsmFirstIter;
+  env.fsmIterAdvance = fsmIterAdvance;
+  env.fsmFrameActives = fsmFrameActives;
+  env.fsmChildStarts = fsmChildStarts;
+  env.fsmChildActives = fsmChildActives;
+  env.fsmPostActives = fsmPostActives;
+  env.fsmFrameCycleGates = fsmFrameCycleGates;
+  env.fsmIssueArms = fsmIssueArms;
+  SmallVector<Value> resultValues, resultCombs;
+  Value iterAdvanceEdge;
+  if (failed(lowerLoopLevelBody(node, info, env, resultValues, resultCombs,
+                                iterAdvanceEdge)))
+    return failure();
 
   // --- Build module output ---
   hw.setInsertionPointToEnd(hwBody);
