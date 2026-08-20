@@ -890,6 +890,35 @@ private:
                                     SmallVectorImpl<int> &entryCycleOutBase,
                                     ArrayRef<bool> preArmEntries = {});
 
+  /// Structural analysis of one sequential loop level, shared by the
+  /// module-outlined and (soon) inlined lowerings: everything the state
+  /// graph and the wrapper need that is computable from the SCHEDULE
+  /// alone, before any hardware is emitted.
+  struct LoopNodeInfo {
+    SmallVector<LoopScheduleFrameOp> frames;
+    LoopScheduleTerminatorOp terminatorOp;
+    unsigned numFrames = 0;
+    /// (port, binding) pairs accessed more than once across the body.
+    llvm::DenseSet<std::pair<Value, unsigned>> bodyMultiAccess;
+    SmallVector<unsigned> waitFrameIndices;
+    SmallVector<unsigned> launchAtOffsets;
+    SmallVector<SmallVector<int>> frameWaitIdx;
+    unsigned numWaits = 0;
+    SmallVector<unsigned> frameLatencies;
+    SmallVector<int> frameCycleOutBase;
+    unsigned totalCycleOuts = 0;
+    SmallVector<unsigned> launchStartOffsets;
+    SmallVector<bool> launchPreArm;
+    bool foldLastFrame = false;
+    bool condBypass = false;
+    bool entryBypass = false;
+  };
+
+  /// Fill `info` for `node` (frames, launch slots, per-frame latencies,
+  /// the early-start/pre-arm decisions, the last-frame fold and the COND
+  /// bypass). Pure analysis: emits nothing.
+  LogicalResult analyzeLoopNode(const LoopNode &node, LoopNodeInfo &info);
+
   /// Recursively lower a loop node as its own hw.module.
   /// Creates the module and populates outModule. capturedVals are the
   /// external values the caller must wire as inputs when instantiating.
@@ -3594,75 +3623,12 @@ minLegalLaunchStart(loopschedule::LoopSchedulePipelineOp pipOp,
   return minStart;
 }
 
-LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
-    const LoopNode &node, OpBuilder &builder, Location loc,
-    loopschedule::LoopScheduleFuncSequentialOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
-    IRMapping &parentMapping,
-    hw::HWModuleOp &outModule,
-    SmallVectorImpl<Value> &capturedVals) {
-  // `sharedOperators` / `instanceUniquer` are scoped to the hw.module
-  // CURRENTLY being emitted, and this function runs mid-emission of the
-  // caller's module. Save the caller's in-progress state and restore it on
-  // exit: the child's clear-and-populate must never leak back — a caller
-  // op emitted after this returns would join a shared operator instance
-  // living inside the CHILD module's region (invalid cross-region IR; the
-  // nested-stream two_nests regression), and instance names would collide.
-  auto savedShared = std::move(sharedOperators);
-  auto savedUniquer = std::move(instanceUniquer);
-  auto restoreScopes = llvm::make_scope_exit([&] {
-    sharedOperators = std::move(savedShared);
-    instanceUniquer = std::move(savedUniquer);
-  });
-
-  auto *ctx = builder.getContext();
+LogicalResult
+LoopScheduleToFSMPass::analyzeLoopNode(const LoopNode &node,
+                                       LoopNodeInfo &info) {
   auto seqOp = node.seqOp;
-  auto i1 = builder.getI1Type();
-
-  // --- Collect captured values and constants ---
-  SmallVector<Value> captured = collectCapturedValues(seqOp);
-  capturedVals.assign(captured.begin(), captured.end());
-
-  SmallVector<Operation *> referencedConsts = collectReferencedConstants(seqOp);
-
-  // Collect result types.
-  SmallVector<Type> resultTypes;
-  for (auto result : seqOp.getResults())
-    resultTypes.push_back(result.getType());
-
-  // --- Create the hw.module for this loop ---
-  IRMapping localMapping;
-  DenseMap<Value, MemPortMapping> localMemPorts;
-  unsigned clkIdx, rstIdx, startIdx;
-
-  auto moduleOp = dyn_cast<ModuleOp>(builder.getBlock()->getParentOp());
-  if (!moduleOp)
-    moduleOp = builder.getBlock()->getParentOp()->getParentOfType<ModuleOp>();
-  builder.setInsertionPointToEnd(moduleOp.getBody());
-
-  auto hwMod = createLoopModule(builder, loc, node.prefix, captured, memrefArgs,
-                                 resultTypes, localMapping, localMemPorts,
-                                 clkIdx, rstIdx, startIdx);
-  outModule = hwMod;
-
-  Block *hwBody = hwMod.getBodyBlock();
-  Value clk = hwBody->getArgument(clkIdx);
-  Value rst = hwBody->getArgument(rstIdx);
-  Value startSignal = hwBody->getArgument(startIdx);
-
-  // Reset the per-hw.module instance-name uniquer so generated `hw.instance`
-  // sym_names don't collide across nested loop modules.
-  instanceUniquer.clear();
-  sharedOperators.clear();
-
-  // Clone referenced constants into the module body.
-  OpBuilder hw(ctx);
-  hw.setInsertionPointToEnd(hwBody);
-  for (auto *constOp : referencedConsts) {
-    hw.clone(*constOp, localMapping);
-  }
-
+  auto &frames = info.frames;
   // --- Collect frames ---
-  SmallVector<LoopScheduleFrameOp> frames;
   for (auto &op : seqOp.getScheduleBlock().getOperations())
     if (auto frameOp = dyn_cast<LoopScheduleFrameOp>(&op))
       frames.push_back(frameOp);
@@ -3672,8 +3638,17 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
 
   auto terminatorOp =
       cast<LoopScheduleTerminatorOp>(seqOp.getScheduleBlock().getTerminator());
+  info.terminatorOp = terminatorOp;
 
   unsigned numFrames = frames.size();
+  info.numFrames = numFrames;
+  auto &bodyMultiAccess = info.bodyMultiAccess;
+  auto &waitFrameIndices = info.waitFrameIndices;
+  auto &launchAtOffsets = info.launchAtOffsets;
+  auto &frameLatencies = info.frameLatencies;
+  auto &frameCycleOutBase = info.frameCycleOutBase;
+  auto &launchStartOffsets = info.launchStartOffsets;
+  auto &launchPreArm = info.launchPreArm;
 
   // Port contention is a BODY-global property, not per-frame: the frames
   // share each port's address/rd_data wires, so two frames that each make a
@@ -3683,7 +3658,6 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // access's data). Compute the multi-access set across ALL frames and use
   // it for every frame's SeqPortMuxCtx so each such access gets the
   // gate-muxed drive and the data-valid capture register.
-  llvm::DenseSet<std::pair<Value, unsigned>> bodyMultiAccess;
   {
     llvm::DenseMap<std::pair<Value, unsigned>, unsigned> counts;
     // Walk EVERY region of each frame: await-frames keep their post-await
@@ -3702,9 +3676,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // global wait indices for frame i's launches; `launchAtOffsets[j]`
   // carries launch j's at-offset (= cycle within its frame where
   // child_start pulses).
-  SmallVector<unsigned> waitFrameIndices;
-  SmallVector<unsigned> launchAtOffsets;
-  SmallVector<SmallVector<int>> frameWaitIdx(numFrames);
+  auto &frameWaitIdx = info.frameWaitIdx;
+  frameWaitIdx.assign(numFrames, {});
   for (unsigned i = 0; i < numFrames; ++i) {
     for (auto &slot : node.frameLaunches[i]) {
       frameWaitIdx[i].push_back((int)waitFrameIndices.size());
@@ -3738,13 +3711,13 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
       launchAtOffsets.push_back(offset);
     }
   }
-  unsigned numWaits = waitFrameIndices.size();
+  info.numWaits = waitFrameIndices.size();
 
   // --- Compute per-frame latencies ---
   // A frame's latency is max(computed latency from its body, max launch
   // at-offset + 1). Frames with no launches use the body-derived
   // latency; frames with launches extend to cover their latest launch.
-  SmallVector<unsigned> frameLatencies(numFrames, 1);
+  frameLatencies.assign(numFrames, 1);
   for (unsigned i = 0; i < numFrames; ++i) {
     frameLatencies[i] = computeFrameLatency(frames[i]);
     for (int j : frameWaitIdx[i])
@@ -3752,8 +3725,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
                                     launchAtOffsets[(unsigned)j] + 1);
   }
   // Per-frame base index in the FSM's appended cycle-output region.
-  SmallVector<int> frameCycleOutBase(numFrames, -1);
-  unsigned totalCycleOuts = 0;
+  frameCycleOutBase.assign(numFrames, -1);
+  unsigned &totalCycleOuts = info.totalCycleOuts;
+  totalCycleOuts = 0;
   for (unsigned i = 0; i < numFrames; ++i) {
     if (frameLatencies[i] > 1) {
       frameCycleOutBase[i] = (int)totalCycleOuts;
@@ -3797,9 +3771,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // (default OFF): the child_start state decode this puts on the stage-0
   // CE cone measured −164 ps (vadd-class) / −124 ps (matmul_tiled_n) of
   // WNS, route-dominated — see the option's description in Passes.td.
-  SmallVector<unsigned> launchStartOffsets(launchAtOffsets.begin(),
-                                           launchAtOffsets.end());
-  SmallVector<bool> launchPreArm(launchAtOffsets.size(), false);
+  launchStartOffsets.assign(launchAtOffsets.begin(),
+                            launchAtOffsets.end());
+  launchPreArm.assign(launchAtOffsets.size(), false);
   for (unsigned i = 0; i < numFrames; ++i) {
     auto &slots = node.frameLaunches[i];
     if (slots.size() != 1 || slots[0].pipIdx < 0)
@@ -4022,7 +3996,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // the loop condition (COND consumes it from a state that would no
   // longer exist), launches children, spans multiple cycles, or touches
   // memory.
-  bool foldLastFrame = false;
+  bool &foldLastFrame = info.foldLastFrame;
   if (numFrames >= 2 && frameWaitIdx[numFrames - 1].empty() &&
       frameLatencies[numFrames - 1] == 1) {
     LoopScheduleFrameOp lastFrame = frames[numFrames - 1];
@@ -4068,7 +4042,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
         return false;
     return true;
   };
-  bool condBypass = [&]() -> bool {
+  info.condBypass = [&]() -> bool {
     SmallVector<Value> stack{terminatorOp.getCondition()};
     DenseSet<Value> visited;
     while (!stack.empty()) {
@@ -4113,6 +4087,97 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
     }
     return true;
   }();
+
+  info.entryBypass = info.condBypass && entryInitsReadyAtStart(seqOp);
+  return success();
+}
+
+LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
+    const LoopNode &node, OpBuilder &builder, Location loc,
+    loopschedule::LoopScheduleFuncSequentialOp funcOp, ArrayRef<PortArgInfo> memrefArgs,
+    IRMapping &parentMapping,
+    hw::HWModuleOp &outModule,
+    SmallVectorImpl<Value> &capturedVals) {
+  // `sharedOperators` / `instanceUniquer` are scoped to the hw.module
+  // CURRENTLY being emitted, and this function runs mid-emission of the
+  // caller's module. Save the caller's in-progress state and restore it on
+  // exit: the child's clear-and-populate must never leak back — a caller
+  // op emitted after this returns would join a shared operator instance
+  // living inside the CHILD module's region (invalid cross-region IR; the
+  // nested-stream two_nests regression), and instance names would collide.
+  auto savedShared = std::move(sharedOperators);
+  auto savedUniquer = std::move(instanceUniquer);
+  auto restoreScopes = llvm::make_scope_exit([&] {
+    sharedOperators = std::move(savedShared);
+    instanceUniquer = std::move(savedUniquer);
+  });
+
+  auto *ctx = builder.getContext();
+  auto seqOp = node.seqOp;
+  auto i1 = builder.getI1Type();
+
+  // --- Collect captured values and constants ---
+  SmallVector<Value> captured = collectCapturedValues(seqOp);
+  capturedVals.assign(captured.begin(), captured.end());
+
+  SmallVector<Operation *> referencedConsts = collectReferencedConstants(seqOp);
+
+  // Collect result types.
+  SmallVector<Type> resultTypes;
+  for (auto result : seqOp.getResults())
+    resultTypes.push_back(result.getType());
+
+  // --- Create the hw.module for this loop ---
+  IRMapping localMapping;
+  DenseMap<Value, MemPortMapping> localMemPorts;
+  unsigned clkIdx, rstIdx, startIdx;
+
+  auto moduleOp = dyn_cast<ModuleOp>(builder.getBlock()->getParentOp());
+  if (!moduleOp)
+    moduleOp = builder.getBlock()->getParentOp()->getParentOfType<ModuleOp>();
+  builder.setInsertionPointToEnd(moduleOp.getBody());
+
+  auto hwMod = createLoopModule(builder, loc, node.prefix, captured, memrefArgs,
+                                 resultTypes, localMapping, localMemPorts,
+                                 clkIdx, rstIdx, startIdx);
+  outModule = hwMod;
+
+  Block *hwBody = hwMod.getBodyBlock();
+  Value clk = hwBody->getArgument(clkIdx);
+  Value rst = hwBody->getArgument(rstIdx);
+  Value startSignal = hwBody->getArgument(startIdx);
+
+  // Reset the per-hw.module instance-name uniquer so generated `hw.instance`
+  // sym_names don't collide across nested loop modules.
+  instanceUniquer.clear();
+  sharedOperators.clear();
+
+  // Clone referenced constants into the module body.
+  OpBuilder hw(ctx);
+  hw.setInsertionPointToEnd(hwBody);
+  for (auto *constOp : referencedConsts) {
+    hw.clone(*constOp, localMapping);
+  }
+
+  // --- Structural analysis (frames, launches, fold/bypass decisions) ---
+  LoopNodeInfo info;
+  if (failed(analyzeLoopNode(node, info)))
+    return failure();
+  auto &frames = info.frames;
+  auto terminatorOp = info.terminatorOp;
+  unsigned numFrames = info.numFrames;
+  auto &bodyMultiAccess = info.bodyMultiAccess;
+  auto &waitFrameIndices = info.waitFrameIndices;
+  auto &launchAtOffsets = info.launchAtOffsets;
+  auto &frameWaitIdx = info.frameWaitIdx;
+  unsigned numWaits = info.numWaits;
+  auto &frameLatencies = info.frameLatencies;
+  auto &frameCycleOutBase = info.frameCycleOutBase;
+  unsigned totalCycleOuts = info.totalCycleOuts;
+  auto &launchStartOffsets = info.launchStartOffsets;
+  auto &launchPreArm = info.launchPreArm;
+  bool foldLastFrame = info.foldLastFrame;
+  bool condBypass = info.condBypass;
 
   // --- Create FSM machine ---
   // Every pre-armed launch (solo in its frame, but a machine may host
