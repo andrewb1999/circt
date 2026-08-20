@@ -448,6 +448,17 @@ LogicalResult MachineOpConverter::dispatch() {
       b, loc, nextStateWireRead, clock, reset,
       /*reset value=*/encoding->encode(machineOp.getInitialStateOp()),
       "state_reg");
+  // Pin the synthesized encoding to ONE-HOT. Vivado re-encodes extracted
+  // FSMs by state count, and once a machine grows past its small-FSM
+  // threshold it flips to a binary encoding whose next-state decode is a
+  // deeper cone on every transition guard — measured post-route on the
+  // one-machine-per-function lowering: matmul_tiled_n/axishared 403 MHz
+  // one-hot against 379 binary, with the binary worst path a
+  // state-bit-to-state-bit decode the router was already replicating.
+  sv::addSVAttributes(stateReg,
+                      sv::SVAttributeAttr::get(b.getContext(), "fsm_encoding",
+                                               "\"one_hot\"",
+                                               /*emitAsComment=*/false));
 
   llvm::DenseMap<VariableOp, sv::RegOp> variableNextStateWires;
   for (auto variableOp : machineOp.front().getOps<fsm::VariableOp>()) {
