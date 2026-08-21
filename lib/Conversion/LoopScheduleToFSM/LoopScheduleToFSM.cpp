@@ -1220,7 +1220,9 @@ private:
                                    DenseMap<Value, MemPortMapping> &memPorts,
                                    ArrayRef<PortArgInfo> memrefArgs,
                                    bool allowPreArm = false,
-                                   Value preArmIssue = Value());
+                                   Value preArmIssue = Value(),
+                                   const llvm::DenseSet<Value>
+                                       *launchStableRoots = nullptr);
 
   /// Map from original func memref args to their hw.module port values.
   DenseMap<Value, MemPortMapping> memPortMap;
@@ -5918,7 +5920,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                                            perFramePorts[frameIdx],
                                            memrefArgs,
                                            launchPreArm[(unsigned)waitIdx],
-                                           fsmIssueArms[(unsigned)waitIdx])))
+                                           fsmIssueArms[(unsigned)waitIdx],
+                                           &launchStableRoots)))
               return failure();
           } else {
             DenseMap<Value, MemPortMapping> slotPorts;
@@ -5931,7 +5934,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                                            clk, rst, frameChildStart,
                                            pipPrefix, pipDone, slotPorts,
                                            memrefArgs,
-                                           launchPreArm[(unsigned)waitIdx])))
+                                           launchPreArm[(unsigned)waitIdx],
+                                           Value(), &launchStableRoots)))
               return failure();
             for (auto &memInfo : memrefArgs) {
               auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
@@ -6811,7 +6815,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     Block *hwBody, IRMapping &mapping, Value clk, Value rst,
     Value startSignal, StringRef namePrefix, Value &doneSignal,
     DenseMap<Value, MemPortMapping> &memPorts,
-    ArrayRef<PortArgInfo> memrefArgs, bool allowPreArm, Value preArmIssue) {
+    ArrayRef<PortArgInfo> memrefArgs, bool allowPreArm, Value preArmIssue,
+    const llvm::DenseSet<Value> *launchStableRoots) {
   // Phase 3B: before the scheduler's launch/expect pairs are inlined
   // away, snapshot the info the stall logic needs from each expect.
   // Every expect marks a point where a dynamic-latency op's result is
@@ -7603,8 +7608,23 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     // results, which corresponds to the register operand at the same index.
     if (stageIdx == condStageIdx) {
       auto condResult = cast<OpResult>(condTermVal);
-      condValueBE.setValue(
-          mapping.lookup(regOp.getOperand(condResult.getResultNumber())));
+      Value condResolved =
+          mapping.lookup(regOp.getOperand(condResult.getResultNumber()));
+      // The pipeline's exit compare can carry a launch-invariant bound
+      // cone (matmul's 64-bit sign-guarded `n` select — 8 LOOKAHEAD8 of
+      // it, the synthesis worst path) combinationally into pip_done and
+      // the WAIT guard. Same frontier registration as the sequential
+      // levels' conditions, same zero-latency argument: the scalar is
+      // stable before start, and no pipeline launches (pre-armed or
+      // not) earlier than one cycle after it.
+      if (launchStableRoots) {
+        DenseMap<Value, Value> pipBoundRegCache;
+        unsigned pipBoundRegCounter = 0;
+        registerLaunchInvariantFrontier(condResolved, builder, hwBody, clk,
+                                        rst, *launchStableRoots, namePrefix,
+                                        pipBoundRegCache, pipBoundRegCounter);
+      }
+      condValueBE.setValue(condResolved);
       // Refresh the local condValue handle: BackedgeBuilder's RAUW updates
       // the underlying placeholder's uses, but the local Value snapshot still
       // points at the (now-orphaned) cast op.
@@ -9501,6 +9521,14 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     return success();
   };
 
+  // Launch-stable roots for the function-level pipelines' bound-cone
+  // registration: the scalar inputs as this module sees them.
+  llvm::DenseSet<Value> funcLaunchStableRoots;
+  for (auto arg : funcOp.getArguments())
+    if (!isa<MemRefType>(arg.getType()) && hw::isHWValueType(arg.getType()))
+      if (Value m = mapping.lookupOrNull(arg))
+        funcLaunchStableRoots.insert(m);
+
   // Lower each entry.
   for (unsigned ei = 0; ei < numEntries; ++ei) {
     auto &entry = entries[ei];
@@ -9749,7 +9777,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
                                     pipPrefix, pipDone,
                                     perEntryPorts[ei], memrefArgs,
                                     entryPreArm[ei],
-                                    funcIssueArms[ei])))
+                                    funcIssueArms[ei],
+                                    &funcLaunchStableRoots)))
         return failure();
       childDoneBEs[childIndexForEntry[ei]].setValue(pipDone);
 
