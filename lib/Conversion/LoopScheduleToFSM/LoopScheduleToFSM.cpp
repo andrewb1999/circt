@@ -1113,6 +1113,29 @@ private:
   /// `resultCombs` their combinational aliases (valid on the advance
   /// edge — what a same-edge consumer must read), and
   /// `iterAdvanceEdge` the per-trip advance edge.
+  /// Register the LAUNCH-INVARIANT frontier of a condition cone. Ops
+  /// whose operands transitively reach only the function's scalar
+  /// inputs (`roots`) and constants are stable for the whole
+  /// transaction; where such a stable subtree of nontrivial depth meets
+  /// a non-stable consumer inside `v`'s cone, a free-running register
+  /// is inserted and the cone's uses are rewritten to read it. Uses
+  /// OUTSIDE the cone are untouched.
+  ///
+  /// ZERO-LATENCY ARGUMENT: the register is free-running over
+  /// transaction-stable inputs — its D is valid during the start cycle
+  /// and its Q from the next cycle; the earliest consumer of any
+  /// condition is a FRAME-state transition guard, at least one full
+  /// cycle after start (IDLE's only exit is the start arc, and DONE has
+  /// no start arc, so back-to-back invocations keep the window). No
+  /// enable, no state, no schedule interaction — cycle counts cannot
+  /// move; the 84-config bit-exactness gate is the proof.
+  void registerLaunchInvariantFrontier(Value v, OpBuilder &hw, Block *hwBody,
+                                       Value clk, Value rst,
+                                       const llvm::DenseSet<Value> &roots,
+                                       StringRef pfx,
+                                       DenseMap<Value, Value> &regCache,
+                                       unsigned &regCounter);
+
   LogicalResult lowerLoopLevelBody(const LoopNode &node,
                                    LoopNodeInfo &info, LevelEnv &env,
                                    SmallVectorImpl<Value> &resultValues,
@@ -4879,6 +4902,94 @@ LogicalResult LoopScheduleToFSMPass::lowerInlineLoopLevel(
   return success();
 }
 
+void LoopScheduleToFSMPass::registerLaunchInvariantFrontier(
+    Value v, OpBuilder &hw, Block *hwBody, Value clk, Value rst,
+    const llvm::DenseSet<Value> &roots, StringRef pfx,
+    DenseMap<Value, Value> &regCache, unsigned &regCounter) {
+  // stable[value]  : pure function of roots/constants (transaction-stable)
+  // depth[value]   : number of non-constant ops in its stable subtree
+  DenseMap<Value, bool> stable;
+  DenseMap<Value, unsigned> depth;
+  std::function<bool(Value)> classify = [&](Value val) -> bool {
+    if (auto it = stable.find(val); it != stable.end())
+      return it->second;
+    // Guard against cycles (backedge placeholders) while recursing.
+    stable[val] = false;
+    Operation *def = val.getDefiningOp();
+    bool ok = false;
+    unsigned d = 0;
+    if (roots.contains(val)) {
+      ok = true;
+    } else if (def && def->hasTrait<mlir::OpTrait::ConstantLike>()) {
+      ok = true;
+    } else if (def && def->getNumRegions() == 0 && def->getNumResults() == 1 &&
+               isMemoryEffectFree(def) &&
+               (isa<comb::CombDialect>(def->getDialect()) ||
+                isa<arith::ArithDialect>(def->getDialect()))) {
+      ok = true;
+      for (Value o : def->getOperands()) {
+        if (!classify(o)) {
+          ok = false;
+          break;
+        }
+        d = std::max(d, depth.lookup(o));
+      }
+      if (ok)
+        d += 1;
+    }
+    stable[val] = ok;
+    depth[val] = d;
+    return ok;
+  };
+
+  // Walk the cone from v through NON-stable ops, collecting the frontier:
+  // stable values consumed by non-stable ops (or v itself when stable).
+  llvm::SetVector<Value> frontier;
+  llvm::SmallVector<Operation *> coneOps;
+  llvm::DenseSet<Operation *> visited;
+  std::function<void(Value)> walk = [&](Value val) {
+    if (classify(val)) {
+      frontier.insert(val);
+      return;
+    }
+    Operation *def = val.getDefiningOp();
+    // The cone is pure combinational logic. Anything else — machine
+    // instances, registers (including a bound register a previous slice
+    // already inserted), memory ports — is an OPAQUE LEAF: walking
+    // through it would pull unrelated hardware into the rewrite (a
+    // previous run's compreg had its own D rewritten to itself this
+    // way).
+    if (!def || def->getNumRegions() != 0 ||
+        !(isa<comb::CombDialect>(def->getDialect()) ||
+          isa<arith::ArithDialect>(def->getDialect())) ||
+        !visited.insert(def).second)
+      return;
+    coneOps.push_back(def);
+    for (Value o : def->getOperands())
+      walk(o);
+  };
+  walk(v);
+
+  for (Value f : frontier) {
+    // A trivial subtree (the raw scalar, or one op over it) gains
+    // nothing from a flop; the deep carry-chain cones are the target.
+    if (depth.lookup(f) < 2)
+      continue;
+    Value &reg = regCache[f];
+    if (!reg) {
+      OpBuilder::InsertionGuard g(hw);
+      hw.setInsertionPointToEnd(hwBody);
+      Value resetVal = createZeroConstant(hw, f.getLoc(), f.getType());
+      reg = seq::CompRegOp::create(
+          hw, f.getLoc(), f, clk, rst, resetVal,
+          hw.getStringAttr(pfx + "_bound_reg_" +
+                           std::to_string(regCounter++)));
+    }
+    for (Operation *op : coneOps)
+      op->replaceUsesOfWith(f, reg);
+  }
+}
+
 LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
     const LoopNode &node, LoopNodeInfo &info, LevelEnv &env,
     SmallVectorImpl<Value> &resultValues, SmallVectorImpl<Value> &resultCombs,
@@ -4921,6 +5032,17 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
   (void)numWaits;
   SmallVector<Value> seqStallTerms;
   unsigned seqDynCounter = 0;
+  // Launch-stable roots for guard-cone registration: the function's
+  // scalar inputs as this level sees them (module block args at the
+  // function level; capture ports on the outlined-module path — both
+  // held stable for the whole transaction).
+  llvm::DenseSet<Value> launchStableRoots;
+  for (auto arg : funcOp.getArguments())
+    if (!isa<MemRefType>(arg.getType()) && hw::isHWValueType(arg.getType()))
+      if (Value m = localMapping.lookupOrNull(arg))
+        launchStableRoots.insert(m);
+  DenseMap<Value, Value> boundRegCache;
+  unsigned boundRegCounter = 0;
   // SR-latch every raw child_done so concurrent launches that finish at
   // different cycles all contribute to the WAIT_i AND guard. The latch
   // sets on the raw done (covers both level-held pip_done and
@@ -6024,6 +6146,9 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
       Value condV = it != frameResultComb.end()
                         ? it->second
                         : localMapping.lookup(condTermVal);
+      registerLaunchInvariantFrontier(condV, hw, hwBody, clk, rst,
+                                      launchStableRoots, node.prefix,
+                                      boundRegCache, boundRegCounter);
       condBE.setValue(condV);
       env.resolvedCond = condV;
       if (env.plan)
@@ -6173,10 +6298,187 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
       return condNextMapping.lookup(v);
     };
     Value cnV = resolveNext(terminatorOp.getCondition());
-    condNextBE.setValue(cnV);
-    env.resolvedCondNext = cnV;
+    registerLaunchInvariantFrontier(cnV, hw, hwBody, clk, rst,
+                                    launchStableRoots, node.prefix,
+                                    boundRegCache, boundRegCounter);
+
+    // --- REGISTERED EXIT FLAG ---
+    // cnV rides the transition guards combinationally: increment ->
+    // runtime-bound compare -> guard -> the replicated one-hot state
+    // bit, the measured post-route worst path on every axishared row
+    // this cone binds. Register it one iteration EARLY instead: on the
+    // edge iter-args latch fb(args), load cond(fb(fb(args))) — the exact
+    // value the comb cnV would compute during the following iteration —
+    // and on the loop-entry edge (first_iter, inits latching) load cnV
+    // itself, which at that moment evaluates over the inits through the
+    // first_iter mux. Same CE as the iter-arg registers, so the flag
+    // moves precisely when they do (stalls included) and the guard's
+    // value sequence is UNCHANGED — cycle counts cannot move; the
+    // 84-config bit-exactness gate is the proof.
+    //
+    // The double substitution needs each cond-reachable iter-arg's
+    // FEEDBACK slice to be re-lowerable comb (the IV's `i + step`
+    // always is). An iter-arg fed by a load or a child level cannot be
+    // re-evaluated; if the cond reaches one, keep the comb cnV for this
+    // loop — correctness never depends on the flag.
+    auto feedbackSliceIsComb = [&](unsigned k) -> bool {
+      SmallVector<Value> stack{iterArgPhaseResults[k]};
+      DenseSet<Value> seen;
+      while (!stack.empty()) {
+        Value v = stack.pop_back_val();
+        if (!v || !seen.insert(v).second)
+          continue;
+        if (auto barg = dyn_cast<BlockArgument>(v)) {
+          Block *owner = barg.getOwner();
+          if (owner == &seqOp.getScheduleBlock())
+            continue; // substituted with a built HW value
+          if (auto ownerFrame =
+                  dyn_cast<LoopScheduleFrameOp>(owner->getParentOp())) {
+            stack.push_back(
+                ownerFrame.getAwaitYield().getOperands()[barg.getArgNumber()]);
+            continue;
+          }
+          continue; // defined above the loop — an existing HW mapping
+        }
+        Operation *def = v.getDefiningOp();
+        if (!def || !seqOp->isAncestor(def))
+          continue;
+        if (auto defFrame = dyn_cast<LoopScheduleFrameOp>(def)) {
+          stack.push_back(cast<LoopScheduleYieldOp>(
+                              defFrame.getBodyBlock().getTerminator())
+                              .getOperands()[cast<OpResult>(v)
+                                                 .getResultNumber()]);
+          continue;
+        }
+        if (auto defAt = dyn_cast<LoopScheduleAtOp>(def)) {
+          stack.push_back(defAt.getYieldOp()
+                              .getOperands()[cast<OpResult>(v)
+                                                 .getResultNumber()]);
+          continue;
+        }
+        if (def->getNumRegions() != 0 || !isMemoryEffectFree(def) ||
+            !(isa<comb::CombDialect>(def->getDialect()) ||
+              isa<arith::ArithDialect>(def->getDialect()) ||
+              def->hasTrait<mlir::OpTrait::ConstantLike>()))
+          return false;
+        for (Value o : def->getOperands())
+          stack.push_back(o);
+      }
+      return true;
+    };
+
+    // Generic re-lowering of a schedule-level slice with iter-args
+    // substituted by `iterVals` (existing HW values).
+    auto makeResolver = [&](ArrayRef<Value> iterVals, IRMapping &m,
+                            bool &ok) {
+      std::function<Value(Value)> resolver = [&, iterVals](Value v) -> Value {
+        if (!ok)
+          return Value();
+        if (Value mm = m.lookupOrNull(v))
+          return mm;
+        if (auto barg = dyn_cast<BlockArgument>(v)) {
+          Block *owner = barg.getOwner();
+          if (owner == &seqOp.getScheduleBlock()) {
+            Value f = iterVals[barg.getArgNumber()];
+            if (!f) {
+              ok = false;
+              return Value();
+            }
+            m.map(v, f);
+            return f;
+          }
+          if (auto ownerFrame =
+                  dyn_cast<LoopScheduleFrameOp>(owner->getParentOp())) {
+            Value r = resolver(
+                ownerFrame.getAwaitYield().getOperands()[barg.getArgNumber()]);
+            if (r)
+              m.map(v, r);
+            return r;
+          }
+          Value mm = localMapping.lookup(v);
+          m.map(v, mm);
+          return mm;
+        }
+        Operation *def = v.getDefiningOp();
+        if (!seqOp->isAncestor(def)) {
+          Value mm = localMapping.lookup(v);
+          m.map(v, mm);
+          return mm;
+        }
+        if (auto defFrame = dyn_cast<LoopScheduleFrameOp>(def)) {
+          Value r = resolver(cast<LoopScheduleYieldOp>(
+                                 defFrame.getBodyBlock().getTerminator())
+                                 .getOperands()[cast<OpResult>(v)
+                                                    .getResultNumber()]);
+          if (r)
+            m.map(v, r);
+          return r;
+        }
+        if (auto defAt = dyn_cast<LoopScheduleAtOp>(def)) {
+          Value r = resolver(defAt.getYieldOp()
+                                 .getOperands()[cast<OpResult>(v)
+                                                    .getResultNumber()]);
+          if (r)
+            m.map(v, r);
+          return r;
+        }
+        for (Value o : def->getOperands())
+          if (!resolver(o))
+            return Value();
+        hw.setInsertionPointToEnd(hwBody);
+        if (failed(emitComputeOp(def, hw, m, moduleOp, clk, rst,
+                                 /*opCE=*/{}))) {
+          ok = false;
+          return Value();
+        }
+        return m.lookup(v);
+      };
+      return resolver;
+    };
+
+    Value condNextDrive = cnV;
+    {
+      bool flagOk = true;
+      // fb2[k]: the feedback slice re-lowered over the CURRENT feedbacks
+      // — the value iter-arg k holds after the NEXT advance. Built
+      // lazily for the cond-reachable iter-args only.
+      SmallVector<Value> iterArgFF(iterArgFeedbacks.size(), Value());
+      IRMapping ffMap;
+      auto resolveFF = makeResolver(iterArgFeedbacks, ffMap, flagOk);
+      for (unsigned k = 0; k < iterArgFeedbacks.size() && flagOk; ++k) {
+        if (!feedbackSliceIsComb(k))
+          continue; // left null; only fatal if the cond reaches it
+        if (!iterArgFeedbacks[k])
+          continue;
+        iterArgFF[k] = resolveFF(iterArgPhaseResults[k]);
+      }
+      Value cnFF;
+      if (flagOk) {
+        IRMapping ff2Map;
+        auto resolveCondFF = makeResolver(iterArgFF, ff2Map, flagOk);
+        cnFF = resolveCondFF(terminatorOp.getCondition());
+      }
+      if (flagOk && cnFF) {
+        registerLaunchInvariantFrontier(cnFF, hw, hwBody, clk, rst,
+                                        launchStableRoots, node.prefix,
+                                        boundRegCache, boundRegCounter);
+        hw.setInsertionPointToEnd(hwBody);
+        Value d = comb::MuxOp::create(hw, loc, fsmFirstIter, cnV, cnFF);
+        Value zeroF = hw::ConstantOp::create(hw, loc, i1, 0);
+        condNextDrive = seq::CompRegClockEnabledOp::create(
+            hw, loc, d, clk, ce, rst, zeroF,
+            hw.getStringAttr(node.prefix + "_cond_next_reg"));
+      } else {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[exit-flag] " << node.prefix
+                   << ": cond reaches a non-comb feedback; keeping the "
+                      "combinational cond_next\n");
+      }
+    }
+    condNextBE.setValue(condNextDrive);
+    env.resolvedCondNext = condNextDrive;
     if (env.plan)
-      env.plan->resolvedCondNext = cnV;
+      env.plan->resolvedCondNext = condNextDrive;
   }
 
   // Map sequential op results to register values where possible.
@@ -6374,6 +6676,17 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   Backedge stallBE = bb.get(i1);
   SmallVector<Value> seqStallTerms;
   unsigned seqDynCounter = 0;
+  // Launch-stable roots for guard-cone registration: the function's
+  // scalar inputs as this level sees them (module block args at the
+  // function level; capture ports on the outlined-module path — both
+  // held stable for the whole transaction).
+  llvm::DenseSet<Value> launchStableRoots;
+  for (auto arg : funcOp.getArguments())
+    if (!isa<MemRefType>(arg.getType()) && hw::isHWValueType(arg.getType()))
+      if (Value m = localMapping.lookupOrNull(arg))
+        launchStableRoots.insert(m);
+  DenseMap<Value, Value> boundRegCache;
+  unsigned boundRegCounter = 0;
 
   // Build instance inputs: start, cond, cond_next, child_done_0..C-1,
   // stall.
