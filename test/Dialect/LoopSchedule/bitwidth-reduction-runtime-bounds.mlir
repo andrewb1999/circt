@@ -193,16 +193,44 @@ func.func @under_if_refused(%mem: memref<1024xi32>, %v: i32, %n: i64, %p: i1) {
   return
 }
 
-// REFUSED: a runtime LOWER bound cannot preserve the zero-trip compare
-// (lo >= hi is well-defined and carries no UB license).
+// A loop with BOTH bounds runtime (spmv's inner loop: k = rowptr[i] to
+// rowptr[i+1]) narrows through its OWN accesses: every executed iterate
+// indexes the face, so |k| is licensed below the extent — including the
+// first iterate, which IS the lower bound. What the license cannot
+// decide is EMPTINESS (lo >= hi executes nothing and both bounds are
+// unlicensed garbage under truncation), so emptiness is decided ONCE at
+// full width and the narrow ub collapses onto the narrow lb for the
+// empty case: nonempty = lo <s hi; lb' = trunc(lo);
+// ub' = nonempty ? trunc(hi) : lb'. This used to be a refusal; the
+// zero-trip property the refusal protected is carried by the select.
 
-// CHECK-LABEL: func.func @nonconst_lb_refused
-// CHECK:         scf.for %{{.+}} = %arg2 to %arg3 step %{{.+}} : i64
-func.func @nonconst_lb_refused(%mem: memref<1024xi32>, %v: i32, %lo: i64,
-                               %hi: i64) {
+// CHECK-LABEL: func.func @nonconst_lb_licensed
+// CHECK:         %[[NE:.+]] = arith.cmpi slt, %arg2, %arg3 : i64
+// CHECK:         %[[LBN:.+]] = arith.trunci %arg2 : i64 to i12
+// CHECK:         %[[UBT:.+]] = arith.trunci %arg3 : i64 to i12
+// CHECK:         %[[UBN:.+]] = arith.select %[[NE]], %[[UBT]], %[[LBN]] : i12
+// CHECK:         scf.for %{{.+}} = %[[LBN]] to %[[UBN]] step %{{.+}} : i12
+func.func @nonconst_lb_licensed(%mem: memref<1024xi32>, %v: i32, %lo: i64,
+                                %hi: i64) {
   %c1 = arith.constant 1 : i64
   scf.for %i = %lo to %hi step %c1 : i64 {
     loopschedule.store %v, %mem[%i : i64] : memref<1024xi32>
+  }
+  return
+}
+
+// REFUSED: a runtime lower bound with NO access in the loop's own body —
+// nothing licenses the iterate, so it stays wide (the accumulator-only
+// shape; the store's index here is a CONSTANT, not the IV).
+
+// CHECK-LABEL: func.func @nonconst_lb_unlicensed_refused
+// CHECK:         scf.for %{{.+}} = %arg2 to %arg3 step %{{.+}} : i64
+func.func @nonconst_lb_unlicensed_refused(%mem: memref<1024xi32>, %v: i32,
+                                          %lo: i64, %hi: i64) {
+  %c1 = arith.constant 1 : i64
+  %c0 = arith.constant 0 : i64
+  scf.for %i = %lo to %hi step %c1 : i64 {
+    loopschedule.store %v, %mem[%c0 : i64] : memref<1024xi32>
   }
   return
 }

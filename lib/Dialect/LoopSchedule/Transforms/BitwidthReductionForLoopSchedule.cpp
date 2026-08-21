@@ -234,13 +234,18 @@ static void forEachAccessIndex(Operation *op,
   }
 }
 
-static std::optional<uint64_t> licensedIVBound(scf::ForOp loop) {
+static std::optional<uint64_t> licensedIVBound(scf::ForOp loop,
+                                               bool allowRuntimeLb = false) {
   Value iv = loop.getInductionVar();
 
   std::optional<uint64_t> bound;
   // An access at `iv * S + r`, r >= 0, is out of bounds once
   // iv * S >= dim, so every well-defined iterate satisfies
-  // iv <= (dim - 1) / S.
+  // iv <= (dim - 1) / S. The same access bounds the NEGATIVE side for
+  // free: iv * S + r >= 0 requires iv >= -r/S, and any in-bounds r is
+  // below dim, so |iv| <= (dim - 1) / S <= b in every well-defined
+  // iteration — the signed width the callers derive from `b` covers
+  // both sides.
   auto considerIdx = [&](Value idx, uint64_t dim) {
     auto s = matchScaledIV(idx, iv);
     if (!s || dim == 0)
@@ -250,8 +255,16 @@ static std::optional<uint64_t> licensedIVBound(scf::ForOp loop) {
   };
 
   APInt outerLb;
-  if (!matchPattern(loop.getLowerBound(), m_ConstantInt(&outerLb)))
-    return std::nullopt;
+  if (!matchPattern(loop.getLowerBound(), m_ConstantInt(&outerLb))) {
+    if (!allowRuntimeLb)
+      return std::nullopt;
+    // RUNTIME lower bound: the bound math above never used lb, but the
+    // guaranteed-block analysis keys on it — restrict to the loop's own
+    // top-level block, which executes on every iteration by definition.
+    for (Operation &op : *loop.getBody())
+      forEachAccessIndex(&op, considerIdx);
+    return bound;
+  }
   SmallVector<Block *> blocks;
   collectGuaranteedBlocks(loop.getBody(), outerLb,
                           rootBound(loop.getUpperBound()), blocks);
@@ -448,12 +461,63 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
       if (!wideTy)
         return failure();
       APInt lbCst, stepCst;
-      if (!matchPattern(op.getLowerBound(), m_ConstantInt(&lbCst)) ||
-          lbCst.isNegative() || lbCst.getActiveBits() > 32)
+      bool runtimeLb =
+          !matchPattern(op.getLowerBound(), m_ConstantInt(&lbCst));
+      if (!runtimeLb && (lbCst.isNegative() || lbCst.getActiveBits() > 32))
         return failure();
       if (!matchPattern(op.getStep(), m_ConstantInt(&stepCst)) ||
           !stepCst.isStrictlyPositive() || stepCst.getActiveBits() > 32)
         return failure();
+      if (runtimeLb) {
+        // BOTH bounds runtime (spmv's inner loop: k = rowptr[i] to
+        // rowptr[i+1]). The iterate is licensed by the loop's OWN
+        // accesses alone — `k*S + r` in bounds pins every executed
+        // iterate, including the first (= lb), to |k| <= b, and hence
+        // a nonempty loop's ub to at most b + step. The one thing the
+        // license cannot decide is EMPTINESS: when lb >= ub no access
+        // executes and both bounds are unlicensed garbage under
+        // truncation. So emptiness is decided ONCE at full width —
+        // loop-invariant, scheduled into the enclosing frame beside
+        // the bound loads, and captured like any frame value — and the
+        // narrow ub collapses onto the narrow lb for the empty case:
+        //
+        //   nonempty = lb <s ub                    (wide, once)
+        //   lb' = trunc(lb)
+        //   ub' = nonempty ? trunc(ub) : lb'       (empty -> zero-trip)
+        //
+        // Nonempty executions have exact truncations (licensed range),
+        // so the per-iteration narrow guard replicates the wide one;
+        // empty executions get lb' == ub' regardless of the garbage.
+        uint64_t step = stepCst.getZExtValue();
+        auto bound = licensedIVBound(op, /*allowRuntimeLb=*/true);
+        if (!bound)
+          return failure();
+        uint64_t maxVal = *bound + step - 1;
+        unsigned bitwidth = llvm::Log2_64_Ceil(maxVal + 1) + 1;
+        if (bitwidth >= wideTy.getWidth())
+          return failure();
+        auto newType = rewriter.getIntegerType(bitwidth);
+        auto loc = op.getLoc();
+        rewriter.setInsertionPoint(op);
+        Value lb = op.getLowerBound();
+        Value ub = op.getUpperBound();
+        Value nonempty =
+            CmpIOp::create(rewriter, loc, CmpIPredicate::slt, lb, ub);
+        Value lbN = TruncIOp::create(rewriter, loc, newType, lb);
+        Value ubT = TruncIOp::create(rewriter, loc, newType, ub);
+        Value ubN = SelectOp::create(rewriter, loc, nonempty, ubT, lbN);
+        op.setLowerBound(lbN);
+        op.setUpperBound(ubN);
+        op.setStep(ConstantOp::create(
+            rewriter, loc, rewriter.getIntegerAttr(newType, (int64_t)step)));
+        auto induction = op.getInductionVar();
+        induction.setType(newType);
+        rewriter.setInsertionPointToStart(&op.getRegion().front());
+        auto newExt =
+            arith::ExtSIOp::create(rewriter, loc, wideTy, induction);
+        rewriter.replaceAllUsesExcept(induction, newExt.getOut(), newExt);
+        return success();
+      }
       auto bound = licensedIVBound(op);
       if (auto ubBound = licensedUbBound(op))
         bound = bound ? std::min(*bound, *ubBound) : ubBound;
