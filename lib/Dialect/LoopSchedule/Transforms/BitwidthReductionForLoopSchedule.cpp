@@ -299,6 +299,9 @@ static std::optional<uint64_t> licensedValueBound(Operation *anchor,
   return bound;
 }
 
+static std::optional<std::pair<Value, unsigned>>
+matchCanonicalCeilDivChain(Value ub);
+
 /// Match the trip-count chain affine-loop-normalize + AffineToSCF's
 /// ceildiv expander + strength reduction leave behind for a tiled loop's
 /// bound `ceil(x / 2^s)`:
@@ -309,7 +312,60 @@ static std::optional<uint64_t> licensedValueBound(Operation *anchor,
 ///   %ub = select %c, subi(0, %q), addi(%q, 1)
 ///
 /// The SAME cmpi result must feed both selects. Returns (x, s) on match.
+///
+/// ALSO matches the pass's OWN rebuilt form (narrowLicensedCeilDivChains
+/// / the loop rebuild), so a loop whose bound rides an already-narrowed
+/// chain still licenses through it:
+///   %ub = ext(select(cmpi sle x, 0; 0; addi(shrui(subi(trunc(x), 1), s), 1)))
 static std::optional<std::pair<Value, unsigned>> matchCeilDivChain(Value ub) {
+  // Peel a value-preserving extension the rebuild leaves on top.
+  while (true) {
+    if (auto ext = ub.getDefiningOp<ExtSIOp>())
+      ub = ext.getIn();
+    else if (auto ext = ub.getDefiningOp<ExtUIOp>())
+      ub = ext.getIn();
+    else
+      break;
+  }
+  if (auto sel = ub.getDefiningOp<SelectOp>()) {
+    APInt c;
+    auto cmp = sel.getCondition().getDefiningOp<CmpIOp>();
+    bool zeroTrue = matchPattern(sel.getTrueValue(), m_ConstantInt(&c)) &&
+                    c.isZero();
+    if (cmp && cmp.getPredicate() == CmpIPredicate::sle && zeroTrue &&
+        matchPattern(cmp.getRhs(), m_ConstantInt(&c)) && c.isZero()) {
+      Value x = cmp.getLhs();
+      auto inc = sel.getFalseValue().getDefiningOp<AddIOp>();
+      auto isOneC = [](Value v) {
+        APInt k;
+        return matchPattern(v, m_ConstantInt(&k)) && k.isOne();
+      };
+      if (inc) {
+        Value q = isOneC(inc.getRhs()) ? inc.getLhs()
+                  : isOneC(inc.getLhs()) ? inc.getRhs()
+                                         : Value();
+        if (auto shr = q ? q.getDefiningOp<ShRUIOp>() : ShRUIOp()) {
+          APInt sh;
+          if (matchPattern(shr.getRhs(), m_ConstantInt(&sh)) &&
+              !sh.isZero() && sh.getZExtValue() <= 30) {
+            if (auto dec = shr.getLhs().getDefiningOp<SubIOp>()) {
+              Value lhs = dec.getLhs();
+              if (auto tr = lhs.getDefiningOp<TruncIOp>())
+                lhs = tr.getIn();
+              if (lhs == x && isOneC(dec.getRhs()))
+                return std::make_pair(x, (unsigned)sh.getZExtValue());
+            }
+          }
+        }
+      }
+    }
+  }
+  return matchCanonicalCeilDivChain(ub);
+}
+
+/// The canonical expander shape (doc above).
+static std::optional<std::pair<Value, unsigned>>
+matchCanonicalCeilDivChain(Value ub) {
   auto isZero = [](Value v) {
     APInt c;
     return matchPattern(v, m_ConstantInt(&c)) && c.isZero();
@@ -898,9 +954,113 @@ protected:
 };
 } // namespace
 
+/// Narrow every LICENSED ceil-div chain in the function, wherever it
+/// stands. The loop-bound path below rebuilds the chain when it IS a
+/// loop's upper bound; but the same expander-shaped chain also feeds
+/// request repeat counts and (post-normalization) loop-bound SELECTS
+/// directly, where only its CONSUMERS were being narrowed — leaving the
+/// 64-bit subi/shrui/select head combinational on the once-per-launch
+/// path (matmul's measured arg1_launch carry cone; on a retiming target
+/// the tool redistributes but cannot shrink it). Rebuild:
+///   chain' = ext(x <= 0 ? 0 : ((trunc(x) - 1) >> s) + 1)
+/// For 1 <= x <= B this equals the wide chain exactly; for x <= 0 the
+/// wide chain's value is NON-POSITIVE and every licensed consumer (a
+/// clamped request count, a loop bound guarded by slt) treats it as
+/// zero-trip, which 0 preserves; x > B is UB-licensed — the same
+/// argument the loop-bound rebuild already stands on.
+static void narrowLicensedCeilDivChains(Operation *funcOp) {
+  SmallVector<SelectOp> candidates;
+  funcOp->walk([&](SelectOp sel) { candidates.push_back(sel); });
+  for (SelectOp sel : candidates) {
+    Value res = sel.getResult();
+    auto wideTy = dyn_cast<IntegerType>(res.getType());
+    if (!wideTy || wideTy.getWidth() <= 16)
+      continue; // already narrow: nothing worth a rewrite
+    auto chain = matchCeilDivChain(res);
+    if (!chain)
+      continue;
+    Value x = chain->first;
+    unsigned shift = chain->second;
+    // License the chain's ROOT when an access bounds it directly; else
+    // license the RESULT — the ceil-div count itself rides a hoisted
+    // burst request as a repeat count with an honest dim/stride bound
+    // (the matmul shape: nothing indexes on n, but ceil(n/16) is the
+    // request's tile count). result <= Br gives x <= Br * 2^s in every
+    // execution that observes the chain; unobserved executions are the
+    // same zero-trip/UB territory the loop-bound rebuild stands on.
+    unsigned kx;
+    if (auto rootBoundOpt = licensedValueBound(sel, x)) {
+      kx = std::max((unsigned)llvm::Log2_64_Ceil(*rootBoundOpt + 1) + 1,
+                    shift + 1);
+    } else {
+      // Result licensing by CONSUMER: the count rides a burst request as
+      // a dyn count / repeat operand with an honest dim/stride bound. n
+      // is a function scalar, so for any n whose execution reaches the
+      // request the bound holds function-wide; an n that reaches no
+      // request is the zero-trip territory the sign guard already pins
+      // (chain value <= 0 -> 0).
+      std::optional<uint64_t> resBound;
+      // The request-operand narrowing has already run, so the request
+      // typically consumes the chain THROUGH a trunc/ext alias — follow
+      // value-preserving casts to the licensing access.
+      SmallVector<Value> aliases{res};
+      for (unsigned ai = 0; ai < aliases.size(); ++ai)
+        for (Operation *user : aliases[ai].getUsers()) {
+          if (isa<TruncIOp, ExtSIOp, ExtUIOp>(user)) {
+            aliases.push_back(user->getResult(0));
+            continue;
+          }
+          Value alias = aliases[ai];
+          forEachAccessIndex(user, [&](Value idx, uint64_t dim) {
+            auto scale = matchScaledIV(idx, alias);
+            if (!scale || dim == 0)
+              return;
+            uint64_t b = (dim - 1) / *scale;
+            if (b == 0)
+              return;
+            resBound = resBound ? std::min(*resBound, b) : b;
+          });
+        }
+      if (!resBound)
+        continue;
+      kx = (unsigned)llvm::Log2_64_Ceil(*resBound + 1) + shift + 1;
+    }
+    if (kx >= wideTy.getWidth())
+      continue;
+    OpBuilder b(sel);
+    auto loc = sel.getLoc();
+    auto xTy = b.getIntegerType(kx);
+    Value zeroWide =
+        ConstantOp::create(b, loc, b.getIntegerAttr(wideTy, 0));
+    Value nonPos =
+        CmpIOp::create(b, loc, CmpIPredicate::sle, x, zeroWide);
+    Value xT = TruncIOp::create(b, loc, xTy, x);
+    Value one = ConstantOp::create(b, loc, b.getIntegerAttr(xTy, 1));
+    Value dec = SubIOp::create(b, loc, xT, one);
+    Value q = ShRUIOp::create(
+        b, loc, dec,
+        ConstantOp::create(b, loc, b.getIntegerAttr(xTy, shift)));
+    Value inc = AddIOp::create(b, loc, q, one);
+    Value zeroN =
+        ConstantOp::create(b, loc, b.getIntegerAttr(xTy, 0));
+    Value ceilN = SelectOp::create(b, loc, nonPos, zeroN, inc);
+    // kx carries a sign-headroom bit, so the value is non-negative and
+    // either extension is exact; sext keeps signed consumers literal.
+    Value wide = ExtSIOp::create(b, loc, wideTy, ceilN);
+    res.replaceAllUsesWith(wide);
+  }
+}
+
 void BitwidthReductionForLoopSchedule::runOnOperation() {
   auto op = getOperation();
   auto &context = getContext();
+
+  // Free-standing licensed ceil-div chains FIRST, while the canonical
+  // expander shape is still intact (the narrowing patterns below rewrite
+  // the arms with mixed-width trunc/ext pairs that defeat the matcher).
+  // The loop patterns then license THROUGH the rebuilt form —
+  // matchCeilDivChain recognizes both shapes.
+  narrowLicensedCeilDivChains(op);
 
   // Minimize SCFFor iteration argument bitwidth to enable further bitwidth
   // reduction
