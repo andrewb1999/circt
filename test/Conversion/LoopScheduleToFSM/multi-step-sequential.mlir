@@ -78,7 +78,7 @@ module {
 
 // Machine args/results carry per-loop prefixed names.
 // CHECK: fsm.machine @two_loops_fsm
-// CHECK-SAME: argNames = ["start", "loop0_cond", "loop0_cond_next", "loop0_stall", "loop1_cond", "loop1_cond_next", "loop1_stall"]
+// CHECK-SAME: argNames = ["start", "loop0_cond_entry", "loop0_cond_next", "loop0_stall", "loop1_cond_entry", "loop1_cond_next", "loop1_stall"]
 // CHECK-SAME: resNames = ["done", "child_start_0", "child_start_1", "frame_running_0", "frame_running_1", "frame_running_2", "loop0_first_iter", "loop0_iter_advance", "loop0_frame_active_0", "loop1_first_iter", "loop1_iter_advance", "loop1_frame_active_0"]
 
 // Full state list and the entry transition chain:

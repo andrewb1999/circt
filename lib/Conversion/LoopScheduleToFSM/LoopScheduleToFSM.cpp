@@ -919,7 +919,16 @@ private:
   /// A level's slice of the unified machine's interface — global argument
   /// and result indices assigned by the layout pass.
   struct LevelSlots {
-    unsigned inCond = 0, inCondNext = 0, inStall = 0;
+    /// `cond` exists only for levels that keep a COND state
+    /// (!entryBypass) — a bypass level's per-iteration decision is the
+    /// registered cond_next, and its ENTRY decision is `cond_entry`:
+    /// the condition evaluated over the INITS, computed once in the
+    /// wrapper (launch-invariant for constant inits, so the frontier
+    /// registration turns it into a flop) instead of the iter-arg-mux
+    /// compare that used to close timing in every cycle's guard cone.
+    int inCond = -1;
+    int inCondEntry = -1;
+    unsigned inCondNext = 0, inStall = 0;
     /// Per wait slot: machine input index of child_done, or -1 for an
     /// INLINED sequential child (its span replaces the WAIT state, so
     /// nothing consumes a done).
@@ -938,10 +947,10 @@ private:
 
   /// Backedges the wrapper feeds into the unified machine for one level.
   struct LevelWires {
-    Backedge cond, condNext, stall;
+    Backedge cond, condEntry, condNext, stall;
     SmallVector<Backedge> childDones; // per NON-inlined wait slot, in slot order
-    LevelWires(Backedge c, Backedge cn, Backedge st)
-        : cond(c), condNext(cn), stall(st) {}
+    LevelWires(Backedge c, Backedge ce, Backedge cn, Backedge st)
+        : cond(c), condEntry(ce), condNext(cn), stall(st) {}
   };
 
   /// Recursive plan for one inlined sequential level: its structural
@@ -959,7 +968,7 @@ private:
     Value fiVar;
     /// The RESOLVED cond / cond_next values (a backedge placeholder must
     /// never gain new uses after its setValue — read these instead).
-    Value resolvedCond, resolvedCondNext;
+    Value resolvedCond, resolvedCondNext, resolvedCondEntry;
     std::optional<LevelWires> wires; // created by the wrapper pre-instance
   };
 
@@ -1089,6 +1098,10 @@ private:
     Value clk, rst;
     Backedge condBE, condNextBE, stallBE;
     MutableArrayRef<Backedge> childDoneBEs;
+    /// Inline bypass levels only: the machine's cond_entry input — the
+    /// condition over the INITS, resolved by the body (null on the
+    /// module path, whose machine keeps the plain cond entry).
+    Backedge *condEntryBE = nullptr;
     Value fsmFirstIter, fsmIterAdvance;
     SmallVector<Value> fsmFrameActives, fsmChildStarts, fsmChildActives,
         fsmPostActives;
@@ -2995,7 +3008,10 @@ void LoopScheduleToFSMPass::layoutLevel(LevelPlan &plan, OpBuilder &b,
     return numOutputs++;
   };
   auto &sl = plan.slots;
-  sl.inCond = arg("cond");
+  if (plan.info.entryBypass)
+    sl.inCondEntry = (int)arg("cond_entry");
+  else
+    sl.inCond = (int)arg("cond");
   sl.inCondNext = arg("cond_next");
   sl.inChildDone.assign(plan.info.numWaits, -1);
   for (unsigned j = 0; j < plan.info.numWaits; ++j)
@@ -3043,7 +3059,9 @@ void LoopScheduleToFSMPass::emitLevelEntry(
   OpBuilder &fb = ctx.fb;
   Location loc = ctx.loc;
   StringRef pfx = plan.node->prefix;
-  Value condArg = ctx.machine.getArgument(plan.slots.inCond);
+  Value condArg = ctx.machine.getArgument(
+      plan.info.entryBypass ? (unsigned)plan.slots.inCondEntry
+                            : (unsigned)plan.slots.inCond);
   fb.setInsertionPointToEnd(tb);
   auto composeGuard = [&](ArrayRef<Value> terms) -> Value {
     Value g;
@@ -3098,7 +3116,8 @@ void LoopScheduleToFSMPass::emitLevelStates(UnifiedFsmCtx &ctx,
   StringRef pfx = plan.node->prefix;
   const LoopNodeInfo &info = plan.info;
   const LevelSlots &sl = plan.slots;
-  Value condArg = ctx.machine.getArgument(sl.inCond);
+  Value condArg =
+      sl.inCond >= 0 ? ctx.machine.getArgument((unsigned)sl.inCond) : Value();
   Value condNextArg = ctx.machine.getArgument(sl.inCondNext);
   Value stallArg = ctx.machine.getArgument(sl.inStall);
 
@@ -4841,6 +4860,7 @@ LogicalResult LoopScheduleToFSMPass::lowerInlineLoopLevel(
       env.fsmIssueArms[j] = res((unsigned)sl.outIssueArm[j]);
   env.plan = &plan;
   env.unifiedInst = fsmInst;
+  env.condEntryBE = &plan.wires->condEntry;
 
   Value iterAdvanceEdge;
   if (failed(lowerLoopLevelBody(*plan.node, plan.info, env, resultValues,
@@ -5634,8 +5654,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
           Value feed = childExit;
           if (inlineChildPlan->info.entryBypass) {
             Value launcher = fsmFrameCycleGates[frameIdx].back();
-            Value notCond =
-                comb::createOrFoldNot(hw, loc, inlineChildPlan->resolvedCond);
+            Value notCond = comb::createOrFoldNot(
+                hw, loc, inlineChildPlan->resolvedCondEntry);
             Value skip = comb::AndOp::create(hw, loc, launcher, notCond);
             skip = comb::AndOp::create(hw, loc, skip, notStallSeq);
             feed = comb::OrOp::create(hw, loc, childExit, skip);
@@ -6248,6 +6268,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
     env.resolvedCondNext = zeroCN;
     if (env.plan)
       env.plan->resolvedCondNext = zeroCN;
+    if (env.condEntryBE) {
+      env.condEntryBE->setValue(zeroCN); // COND-state level: entry via cond
+      if (env.plan)
+        env.plan->resolvedCondEntry = env.resolvedCond;
+    }
   } else {
     IRMapping condNextMapping;
     std::function<Value(Value)> resolveNext = [&](Value v) -> Value {
@@ -6483,6 +6508,45 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
     env.resolvedCondNext = condNextDrive;
     if (env.plan)
       env.plan->resolvedCondNext = condNextDrive;
+
+    // THE ENTRY DECISION, over the INITS. A bypass level's launcher arms
+    // used to read the shared per-iteration cond — a compare through the
+    // iter-arg mux whose cone had to close timing in EVERY cycle's guard
+    // even though entry reads it once. cond_entry is the same slice with
+    // iter-args mapped to their inits: for constant inits it is
+    // launch-invariant and the frontier registration below turns the
+    // whole decision into a flop; for frame-produced inits it is a
+    // per-invocation value the capture machinery already holds. In the
+    // launcher state first_iter is high, so the old comb cond evaluated
+    // over the inits there — the value sequence at the guard is
+    // unchanged by construction.
+    if (env.condEntryBE) {
+      Value ceV;
+      {
+        bool ok = true;
+        SmallVector<Value> initVals;
+        for (Value init : seqOp.getInits())
+          initVals.push_back(localMapping.lookup(init));
+        IRMapping ceMap;
+        auto resolveEntry = makeResolver(initVals, ceMap, ok);
+        ceV = resolveEntry(terminatorOp.getCondition());
+        if (!ok || !ceV)
+          ceV = Value();
+      }
+      if (ceV) {
+        registerLaunchInvariantFrontier(ceV, hw, hwBody, clk, rst,
+                                        launchStableRoots, node.prefix,
+                                        boundRegCache, boundRegCounter);
+      } else {
+        // The slice resisted re-lowering over the inits (should not
+        // happen under the bypass guarantee); a constant-false entry
+        // would break the loop, so fall back to the resolved comb cond.
+        ceV = env.resolvedCond;
+      }
+      env.condEntryBE->setValue(ceV);
+      if (env.plan)
+        env.plan->resolvedCondEntry = ceV;
+    }
   }
 
   // Map sequential op results to register values where possible.
@@ -9139,8 +9203,11 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   // child_done per still-outlined slot, stall — the exact order
   // layoutLevel assigned.
   std::function<void(LevelPlan &)> wireLevel = [&](LevelPlan &plan) {
-    plan.wires.emplace(bb.get(i1), bb.get(i1), bb.get(i1));
-    fsmInputs.push_back(Value(plan.wires->cond));
+    plan.wires.emplace(bb.get(i1), bb.get(i1), bb.get(i1), bb.get(i1));
+    if (plan.info.entryBypass)
+      fsmInputs.push_back(Value(plan.wires->condEntry));
+    else
+      fsmInputs.push_back(Value(plan.wires->cond));
     fsmInputs.push_back(Value(plan.wires->condNext));
     for (unsigned j = 0; j < plan.info.numWaits; ++j)
       if (!plan.children[j]) {
@@ -9590,7 +9657,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         Value launcher = comb::AndOp::create(
             builder, loc, entryRunningSignals[ei], notSpan);
         Value notCond =
-            comb::createOrFoldNot(builder, loc, plan.resolvedCond);
+            comb::createOrFoldNot(builder, loc, plan.resolvedCondEntry);
         Value skip = comb::AndOp::create(builder, loc, launcher, notCond);
         feed = comb::OrOp::create(builder, loc, exitE, skip);
       }

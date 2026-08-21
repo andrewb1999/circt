@@ -55,7 +55,7 @@ module {
 // CHECK: comb.mux {{%.+}}, %c42_i32, {{%.+}} : i32
 // CHECK-NOT: hw.module @loop0
 // CHECK: fsm.machine @fill_fsm
-// CHECK-SAME: argNames = ["start", "loop0_cond", "loop0_cond_next", "loop0_stall"]
+// CHECK-SAME: argNames = ["start", "loop0_cond_entry", "loop0_cond_next", "loop0_stall"]
 // CHECK: fsm.state @loop0_FRAME_0
 // CHECK: fsm.state @DONE
 // CHECK-NOT: hw.module @loop0

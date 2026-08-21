@@ -113,7 +113,7 @@ module {
 
 // CHECK: fsm.machine @two_children_fsm
 // Per-level condition inputs for the parent and both nested loops.
-// CHECK-SAME: argNames = ["start", "loop0_cond", "loop0_cond_next", "loop0_stall", "loop0_loop1_cond", "loop0_loop1_cond_next", "loop0_loop1_stall", "loop0_loop2_cond", "loop0_loop2_cond_next", "loop0_loop2_stall"]
+// CHECK-SAME: argNames = ["start", "loop0_cond_entry", "loop0_cond_next", "loop0_stall", "loop0_loop1_cond_entry", "loop0_loop1_cond_next", "loop0_loop1_stall", "loop0_loop2_cond_entry", "loop0_loop2_cond_next", "loop0_loop2_stall"]
 // Two child_start / child_active result pairs on the parent level.
 // CHECK-SAME: "loop0_child_start_0", "loop0_child_start_1", "loop0_child_active_0", "loop0_child_active_1"
 

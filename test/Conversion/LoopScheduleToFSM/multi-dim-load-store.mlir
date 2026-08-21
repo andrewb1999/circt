@@ -61,7 +61,7 @@ module {
 // CHECK: comb.mux {{%.+}}, %c1_i3, {{%.+}} : i3
 // CHECK-NOT: hw.module @loop0
 // CHECK: fsm.machine @copy2d_fsm
-// CHECK-SAME: argNames = ["start", "loop0_cond", "loop0_cond_next", "loop0_stall"]
+// CHECK-SAME: argNames = ["start", "loop0_cond_entry", "loop0_cond_next", "loop0_stall"]
 // CHECK-SAME: "loop0_frame_active_0"
 // CHECK: fsm.state @loop0_FRAME_0
 // CHECK: fsm.state @DONE

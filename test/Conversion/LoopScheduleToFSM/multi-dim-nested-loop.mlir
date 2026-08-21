@@ -86,8 +86,8 @@ module {
 // One machine carries both loop levels as prefixed states with per-level
 // args/results.
 // CHECK: fsm.machine @nested2d_fsm
-// CHECK-SAME: "loop0_cond"
-// CHECK-SAME: "loop0_loop1_cond"
+// CHECK-SAME: "loop0_cond_entry"
+// CHECK-SAME: "loop0_loop1_cond_entry"
 // CHECK-SAME: "loop0_frame_active_0"
 // CHECK-SAME: "loop0_loop1_frame_active_0"
 // CHECK: fsm.state @loop0_FRAME_0
