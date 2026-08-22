@@ -4,53 +4,74 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 
+# The Trace backend uses ';' as the connection-string separator on Windows.
+_TRACE_SEP = ";" if os.name == "nt" else ":"
+
 import pytest
 
 from esiaccel.cosim.pytest import cosim_test
 
-from .conftest import (HW_DIR, SW_DIR, check_lines, get_runtime_root,
-                       require_tool)
+from .conftest import (HW_DIR, SW_DIR, build_cpp_test, check_lines,
+                       get_runtime_root, require_tool, run_probe)
+
+LOOPBACK_PROBES = [
+    ("depth_constant", ["depth: 0x5", "depth_constant ok"]),
+    ("loopback_i8", ["loopback_i8 ok: 0x5a"]),
+    ("struct_func", ["struct_func ok: b=-7 x=-6 y=-7"]),
+    ("odd_struct_func",
+     ["odd_struct_func ok: a=2749 b=-20 p=10 q=-5 r0=4 r1=6"]),
+    ("array_func", ["array_func ok: -3 -2"]),
+    ("serial_coord_translate", ["serial_coord_translate ok"]),
+]
+
+LOOPBACK_TYPED_PROBES = [
+    ("depth_constant", ["depth: 0x5", "depth_constant ok"]),
+    ("loopback_i8", ["loopback_i8 ok: 0x5a"]),
+    ("sint4_loopback", ["sint4_loopback ok: pos=5 neg=-3"]),
+    ("struct_func", ["struct_func ok: b=-7 x=-6 y=-7"]),
+    ("odd_struct_func",
+     ["odd_struct_func ok: a=2749 b=-20 p=10 q=-5 r0=4 r1=6"]),
+    ("array_func", ["array_func ok: -3 -2"]),
+    ("serial_coord_translate", ["serial_coord_translate ok"]),
+]
 
 
-@cosim_test(HW_DIR / "loopback.py")
-@pytest.mark.parametrize("mode", ["from_manifest", "from_accel"])
-def test_loopback_cpp_codegen(mode: str, tmp_path: Path, host: str, port: int,
-                              sources_dir: Path) -> None:
+def _build_loopback_codegen(tmp_path: Path, host: str, port: int) -> Path:
+  """Run live-connection codegen and build the loopback_test binary.
+
+  This test deliberately uses ``esiaccel.codegen --platform cosim`` (live
+  connection) rather than ``--file`` (offline manifest) to exercise that
+  codegen path.
+  """
   require_tool("cmake")
+  require_tool("ninja")
 
   runtime_root = get_runtime_root()
 
   include_dir = tmp_path / "include"
   generated_dir = include_dir / "loopback"
   generated_dir.mkdir(parents=True, exist_ok=True)
-  if mode == "from_manifest":
-    # Codegen was already run automatically; copy the generated code.
-    codegen_src = sources_dir / "generated"
-    if codegen_src.exists():
-      for item in codegen_src.iterdir():
-        if item.is_file():
-          shutil.copy(item, generated_dir)
-  else:
-    # Generate from live cosim connection instead.
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "esiaccel.codegen",
-            "--platform",
-            "cosim",
-            "--connection",
-            f"{host}:{port}",
-            "--output-dir",
-            str(generated_dir),
-        ],
-        check=True,
-    )
+
+  subprocess.run(
+      [
+          sys.executable,
+          "-m",
+          "esiaccel.codegen",
+          "--platform",
+          "cosim",
+          "--connection",
+          f"{host}:{port}",
+          "--output-dir",
+          str(generated_dir),
+      ],
+      check=True,
+  )
 
   # Verify generated header content (LOOPBACK-H checks).
   header_path = generated_dir / "LoopbackIP.h"
@@ -66,14 +87,17 @@ def test_loopback_cpp_codegen(mode: str, tmp_path: Path, host: str, port: int,
       "} // namespace esi_system",
   ])
 
-  build_dir = tmp_path / f"loopback-build-{mode}"
+  build_dir = tmp_path / "loopback-build"
   result = subprocess.run(
       [
           "cmake",
+          "-G",
+          "Ninja",
           "-S",
           str(SW_DIR),
           "-B",
           str(build_dir),
+          "-DCMAKE_BUILD_TYPE=Release",
           f"-DLOOPBACK_GENERATED_DIR={include_dir}",
           f"-DESI_RUNTIME_ROOT={runtime_root}",
       ],
@@ -86,8 +110,10 @@ def test_loopback_cpp_codegen(mode: str, tmp_path: Path, host: str, port: int,
       f"--- stderr ---\n{result.stderr}")
 
   result = subprocess.run(
-      ["cmake", "--build",
-       str(build_dir), "--target", "loopback_test"],
+      [
+          "cmake", "--build",
+          str(build_dir), "--target", "loopback_test", "--config", "Release"
+      ],
       capture_output=True,
       text=True,
   )
@@ -96,58 +122,25 @@ def test_loopback_cpp_codegen(mode: str, tmp_path: Path, host: str, port: int,
       f"--- stdout ---\n{result.stdout}\n"
       f"--- stderr ---\n{result.stderr}")
 
-  LOOPBACK_EXPECTED = [
-      "depth: 0x5",
-      "loopback i8 ok: 0x5a",
-      "struct func ok: b=-7 x=-6 y=-7",
-      "odd struct func ok: a=2749 b=-20 p=10 q=-5 r0=4 r1=6",
-      "array func ok: -3 -2",
-  ]
-
-  LOOPBACK_TYPED_EXPECTED = LOOPBACK_EXPECTED[:1] + [
-      "loopback i8 ok: 0x5a",
-      "sint4 loopback ok: pos=5 neg=-3",
-      "struct func ok: b=-7 x=-6 y=-7",
-      "odd struct func ok: a=2749 b=-20 p=10 q=-5 r0=4 r1=6",
-      "array func ok: -3 -2",
-  ]
-
-  # Run the C++ test binary and verify output (CPP-TEST checks).
-  result = subprocess.run(
-      [str(build_dir / "loopback_test"), "cosim", f"{host}:{port}"],
-      check=True,
-      capture_output=True,
-      text=True,
-  )
-  check_lines(result.stdout, LOOPBACK_EXPECTED)
-
-  # Also build and run the typed-port variant (loopback_typed_test) which
-  # exercises TypedWritePort, TypedReadPort, and TypedFunction wrappers.
-  # Only done for a single codegen mode to avoid redundant work.
-  if mode == "from_manifest":
-    result = subprocess.run(
-        ["cmake", "--build",
-         str(build_dir), "--target", "loopback_typed_test"],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, (
-        f"cmake build (typed) failed (rc={result.returncode}):\n"
-        f"--- stdout ---\n{result.stdout}\n"
-        f"--- stderr ---\n{result.stderr}")
-
-    result = subprocess.run(
-        [str(build_dir / "loopback_typed_test"), "cosim", f"{host}:{port}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    check_lines(result.stdout, LOOPBACK_TYPED_EXPECTED)
+  return build_dir / "loopback_test"
 
 
 @cosim_test(HW_DIR / "loopback.py")
-class TestLoopbackQuery:
+class TestLoopback:
   """Tests for esiquery against the loopback design."""
+
+  def test_loopback_cpp_codegen(self, tmp_path: Path, host: str,
+                                port: int) -> None:
+    """Build against live-connection codegen and run all probes."""
+    binary = _build_loopback_codegen(tmp_path, host, port)
+    for probe, expected in LOOPBACK_PROBES:
+      run_probe(binary, host, port, probe, expected)
+
+  def test_loopback_typed_cpp_codegen(self, host: str, port: int,
+                                      sources_dir: Path) -> None:
+    binary = build_cpp_test(sources_dir, "loopback_typed_test", "loopback")
+    for probe, expected in LOOPBACK_TYPED_PROBES:
+      run_probe(binary, host, port, probe, expected)
 
   def test_loopback_query_info(self, sources_dir: Path) -> None:
     """Verify esiquery info output against the generated manifest
@@ -156,7 +149,7 @@ class TestLoopbackQuery:
     manifest = sources_dir / "esi_system_manifest.json"
     assert manifest.exists(), "Manifest not found"
     result = subprocess.run(
-        ["esiquery", "trace", f"w:{manifest}", "info"],
+        ["esiquery", "trace", f"w{_TRACE_SEP}{manifest}", "info"],
         check=True,
         capture_output=True,
         text=True,
@@ -179,7 +172,7 @@ class TestLoopbackQuery:
     manifest = sources_dir / "esi_system_manifest.json"
     assert manifest.exists(), "Manifest not found"
     result = subprocess.run(
-        ["esiquery", "trace", f"w:{manifest}", "hier"],
+        ["esiquery", "trace", f"w{_TRACE_SEP}{manifest}", "hier"],
         check=True,
         capture_output=True,
         text=True,

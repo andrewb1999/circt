@@ -28,7 +28,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/LogicalResult.h"
 
 namespace circt {
 #define GEN_PASS_DEF_LOWERLTLTOCORE
@@ -166,40 +166,34 @@ struct LTLOrOpConversion : public OpConversionPattern<ltl::OrOp> {
   }
 };
 
+struct LTLIntersectOpConversion : public OpConversionPattern<ltl::IntersectOp> {
+  using OpConversionPattern<ltl::IntersectOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ltl::IntersectOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Can only lower boolean intersects to comb ops; booleans are
+    // instantaneous matches, so intersection is conjunction.
+    if (!isa<IntegerType>(op->getOperandTypes()[0]) ||
+        !isa<IntegerType>(op->getOperandTypes()[1]))
+      return failure();
+    auto loc = op.getLoc();
+    // Explicit twoState value to disambiguate builders
+    auto andOp =
+        comb::AndOp::create(rewriter, loc, adaptor.getOperands(), false);
+    rewriter.replaceOp(op, andOp);
+    return success();
+  }
+};
+
 struct LTLPastOpConversion : public OpConversionPattern<ltl::PastOp> {
-  LTLPastOpConversion(MLIRContext *context, bool assumeFirstClock)
-      : OpConversionPattern<ltl::PastOp>(context),
-        assumeFirstClock(assumeFirstClock) {}
+  using OpConversionPattern<ltl::PastOp>::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(ltl::PastOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value clock;
-    if (!adaptor.getClk()) {
-      if (!assumeFirstClock)
-        return failure();
-      // Find the first clock, looking at inputs then at to_clock operations
-      auto module = op->getParentOfType<HWModuleOp>();
-      std::optional<size_t> clockArgNum;
-      for (auto &port : module.getPortList()) {
-        if (port.isInput() && isa<seq::ClockType>(port.type)) {
-          clockArgNum = port.argNum;
-          break;
-        }
-      }
-      if (clockArgNum) {
-        clock = module.getArgumentForInput(*clockArgNum);
-      } else {
-        // If there are no clock ports, we try to_clock operations
-        auto toClockOps = module.getOps<seq::ToClockOp>();
-        if (toClockOps.empty())
-          return failure();
-        clock = (*toClockOps.begin()).getResult();
-      }
-    } else {
-      clock = seq::ToClockOp::create(rewriter, op.getLoc(), adaptor.getClk());
-    }
-
+    Value clock =
+        seq::ToClockOp::create(rewriter, op.getLoc(), adaptor.getClk());
     Value cur = adaptor.getInput();
     Value ce =
         hw::ConstantOp::create(rewriter, op.getLoc(), rewriter.getI1Type(), 1);
@@ -209,9 +203,62 @@ struct LTLPastOpConversion : public OpConversionPattern<ltl::PastOp> {
     rewriter.replaceOp(op, shiftreg);
     return success();
   }
-
-  bool assumeFirstClock;
 };
+
+// Sample `input` on the requested clock edge.
+static Value createRegister(Value input, Value clock, ltl::ClockEdge edge,
+                            bool initialValue, OpBuilder &builder,
+                            Operation *contextOp) {
+  assert(edge != ltl::ClockEdge::Both && "both-edge clock not supported");
+  auto clockSignal = clock;
+  if (edge == ltl::ClockEdge::Neg)
+    clockSignal =
+        comb::createOrFoldNot(builder, contextOp->getLoc(), clockSignal);
+  auto seqClock =
+      builder.createOrFold<seq::ToClockOp>(contextOp->getLoc(), clockSignal);
+
+  auto loc = contextOp->getLoc();
+  auto initial = seq::createConstantInitialValue(
+      builder, loc, builder.getIntegerAttr(builder.getI1Type(), initialValue));
+  return seq::CompRegOp::create(builder, loc, input, seqClock,
+                                /*reset=*/Value{},
+                                /*rstValue=*/Value{}, initial)
+      .getResult();
+}
+
+static void lowerTemporalLTLToCore(hw::HWModuleOp module) {
+  SmallVector<Operation *> assertionsAndAssumptions;
+  module->walk([&](Operation *op) {
+    if (isa<verif::AssertOp, verif::AssumeOp>(op))
+      assertionsAndAssumptions.push_back(op);
+  });
+
+  for (auto *op : assertionsAndAssumptions) {
+    Value property = op->getOperand(0);
+    // Only lower a clocked atom when it is the direct property of an assertion
+    // or assumption. The startup `dontCare` guard is property-level and cannot
+    // be composed correctly through nested LTL operations.
+    auto atom = property.getDefiningOp<ltl::ClockedAtomOp>();
+    if (!atom || atom.getEdge() == ltl::ClockEdge::Both)
+      continue;
+
+    OpBuilder builder(op);
+    auto sampled =
+        createRegister(atom.getInput(), atom.getClock(), atom.getEdge(),
+                       /*initialValue=*/false, builder, atom);
+
+    auto constFalse =
+        hw::ConstantOp::create(builder, op->getLoc(), builder.getI1Type(), 0);
+    // `dontCare` is true while `sampled` only contains its initial value. The
+    // first real clock edge clears it and makes the sampled value observable.
+    auto dontCare = createRegister(constFalse, atom.getClock(), atom.getEdge(),
+                                   /*initialValue=*/true, builder, op);
+    auto guardedProperty =
+        comb::OrOp::create(builder, op->getLoc(), dontCare, sampled,
+                           /*twoState=*/false);
+    op->setOperand(0, guardedProperty);
+  }
+}
 
 } // namespace
 
@@ -229,23 +276,9 @@ struct LowerLTLToCorePass
 
 // Simply applies the conversion patterns defined above
 void LowerLTLToCorePass::runOnOperation() {
-  // Emit an explicit error for unsupported past ops, rather than a confusing
-  // 'failed to legalize' error
-  if (!assumeFirstClock) {
-    auto res = getOperation().walk([&](ltl::PastOp op) {
-      if (!op.getClk()) {
-        op.emitError(
-            "ltl.past operations without a clock operand are not supported.");
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-    if (res.wasInterrupted())
-      return signalPassFailure();
-  }
+  lowerTemporalLTLToCore(getOperation());
 
-  // Set target dialects: We don't want to see any ltl or verif that might
-  // come from an AssertProperty left in the result
+  // Preserve operations that require an LTL-aware downstream backend.
   ConversionTarget target(getContext());
   target.addLegalDialect<hw::HWDialect>();
   target.addLegalDialect<comb::CombDialect>();
@@ -278,6 +311,7 @@ void LowerLTLToCorePass::runOnOperation() {
   target.addDynamicallyLegalOp<ltl::NotOp>(isLegal);
   target.addDynamicallyLegalOp<ltl::AndOp>(isLegal);
   target.addDynamicallyLegalOp<ltl::OrOp>(isLegal);
+  target.addDynamicallyLegalOp<ltl::IntersectOp>(isLegal);
 
   // Create type converters, mostly just to convert an ltl property to a bool
   mlir::TypeConverter converter;
@@ -315,9 +349,9 @@ void LowerLTLToCorePass::runOnOperation() {
   // Create the operation rewrite patters
   RewritePatternSet patterns(&getContext());
   patterns.add<HasBeenResetOpConversion, LTLImplicationConversion,
-               LTLNotConversion, LTLAndOpConversion, LTLOrOpConversion>(
+               LTLNotConversion, LTLAndOpConversion, LTLOrOpConversion,
+               LTLIntersectOpConversion, LTLPastOpConversion>(
       converter, patterns.getContext());
-  patterns.add<LTLPastOpConversion>(patterns.getContext(), assumeFirstClock);
   // Apply the conversions
   if (failed(
           applyPartialConversion(getOperation(), target, std::move(patterns))))

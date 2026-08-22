@@ -16,6 +16,7 @@
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/LayerSet.h"
 #include "circt/Dialect/FIRRTL/NLATable.h"
+#include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/HW/InnerSymbolNamespace.h"
 #include "circt/Dialect/HW/InnerSymbolTable.h"
@@ -283,7 +284,7 @@ static void invalidateOutputs(ImplicitLocOpBuilder &builder, Value value,
       builder.create<RefDefineOp>(value, refSend.getResult());
 
       // Invalidate the underlying wire.
-      auto invalid = tieOffCache.getInvalid(underlyingType);
+      auto invalid = InvalidValueOp::create(builder, underlyingType);
       MatchingConnectOp::create(builder, targetWire.getResult(), invalid);
       return;
     }
@@ -303,7 +304,7 @@ static void invalidateOutputs(ImplicitLocOpBuilder &builder, Value value,
     builder.create<RefDefineOp>(value, forceableRef);
 
     // Invalidate the underlying wire.
-    auto invalid = tieOffCache.getInvalid(underlyingType);
+    auto invalid = InvalidValueOp::create(builder, underlyingType);
     MatchingConnectOp::create(builder, targetWire, invalid);
     return;
   }
@@ -337,7 +338,7 @@ static void invalidateOutputs(ImplicitLocOpBuilder &builder, Value value,
 
   // Create InvalidValueOp for FIRRTLBaseType.
   if (auto baseType = type_dyn_cast<FIRRTLBaseType>(type)) {
-    auto invalid = tieOffCache.getInvalid(baseType);
+    auto invalid = InvalidValueOp::create(builder, baseType);
     ConnectOp::create(builder, value, invalid);
     return;
   }
@@ -1055,7 +1056,7 @@ struct ExtmoduleInstanceRemover : public OpReduction<firrtl::InstanceOp> {
       if (info.isOutput()) {
         // Tie off output ports using TieOffCache.
         if (auto baseType = dyn_cast<firrtl::FIRRTLBaseType>(info.type)) {
-          auto inv = tieOffCache.getInvalid(baseType);
+          auto inv = InvalidValueOp::create(builder, baseType);
           firrtl::ConnectOp::create(builder, wire, inv);
         } else if (auto propType = dyn_cast<firrtl::PropertyType>(info.type)) {
           auto unknown = tieOffCache.getUnknown(propType);
@@ -1746,7 +1747,7 @@ struct ResetDisconnector : public OpReduction<RegResetOp> {
         builder, regResetOp.getResult().getType(), regResetOp.getClockVal(),
         regResetOp.getNameAttr(), regResetOp.getNameKindAttr(),
         regResetOp.getAnnotationsAttr(), regResetOp.getInnerSymAttr(),
-        regResetOp.getForceableAttr());
+        regResetOp.getForceableAttr(), regResetOp.getInitialAttr());
 
     regResetOp.getResult().replaceAllUsesWith(regOp.getResult());
     if (regResetOp.getForceable())
@@ -1828,17 +1829,39 @@ struct ModuleNameSanitizer : OpReduction<firrtl::CircuitOp> {
 
   LogicalResult rewrite(firrtl::CircuitOp circuitOp) override {
 
+    // Analyses used to aid the rewrite.
     firrtl::InstanceGraph iGraph(circuitOp);
+    NLATable nlaTable(circuitOp);
+    SymbolTable symTable(circuitOp);
+    CircuitNamespace ns(circuitOp);
 
-    auto *circuitName = nameGenerator.getNextName();
-    iGraph.getTopLevelModule().setName(circuitName);
-    circuitOp.setName(circuitName);
+    // Rename symbols and NLAs.
+    auto renameModule = [&](firrtl::FModuleLike mod,
+                            StringAttr newName) -> LogicalResult {
+      StringAttr oldName = mod.getModuleNameAttr();
+      if (failed(symTable.rename(mod, newName)))
+        return failure();
+      nlaTable.renameModule(oldName, newName);
+      return success();
+    };
+
+    // Set the top-modulefirst so that the circuit gets the first metasyntactic
+    // name, i.e., "Foo".
+    auto topModule = iGraph.getTopLevelModule();
+    auto *ctx = circuitOp.getContext();
+    if (!reduce::MetasyntacticNameGenerator::isMetasyntacticName(
+            topModule.getModuleName())) {
+      auto newTopName = StringAttr::get(ctx, nameGenerator.getNextName(ns));
+      if (failed(renameModule(topModule, newTopName)))
+        return failure();
+      circuitOp.setName(newTopName.getValue());
+    }
 
     for (auto *node : iGraph) {
       auto module = node->getModule<firrtl::FModuleLike>();
 
       bool shouldReplacePorts = false;
-      SmallVector<Attribute> newNames;
+      SmallVector<Attribute> newPortNames;
       if (auto fmodule = dyn_cast<firrtl::FModuleOp>(*module)) {
         portNameIndex = 0;
         // TODO: The namespace should be unnecessary. However, some FIRRTL
@@ -1858,32 +1881,44 @@ struct ModuleNameSanitizer : OpReduction<firrtl::CircuitOp> {
                              .Default([&](auto a) {
                                return ns.newName(Twine(getPortName()));
                              });
-          newNames.push_back(StringAttr::get(circuitOp.getContext(), newName));
+          newPortNames.push_back(StringAttr::get(ctx, newName));
         }
         fmodule->setAttr("portNames",
-                         ArrayAttr::get(fmodule.getContext(), newNames));
+                         ArrayAttr::get(fmodule.getContext(), newPortNames));
       }
 
       if (module == iGraph.getTopLevelModule())
         continue;
-      auto newName =
-          StringAttr::get(circuitOp.getContext(), nameGenerator.getNextName());
-      module.setName(newName);
+      // Skip renaming if the module already has a metasyntactic name.
+      if (reduce::MetasyntacticNameGenerator::isMetasyntacticName(
+              module.getModuleName()))
+        continue;
+      auto newName = StringAttr::get(ctx, nameGenerator.getNextName(ns));
+      if (failed(renameModule(module, newName)))
+        return failure();
       for (auto *use : node->uses()) {
         auto useOp = use->getInstance();
         if (auto instanceOp = dyn_cast<firrtl::InstanceOp>(*useOp)) {
-          instanceOp.setModuleName(newName);
+          // SymbolTable::rename already updated the moduleName
+          // FlatSymbolRefAttr on all InstanceOps.  Only the debug instance name
+          // and port names need manual fixup here.
           instanceOp.setName(newName);
           if (shouldReplacePorts)
-            instanceOp.setPortNamesAttr(
-                ArrayAttr::get(circuitOp.getContext(), newNames));
+            instanceOp.setPortNamesAttr(ArrayAttr::get(ctx, newPortNames));
+        } else if (auto instanceChoiceOp =
+                       dyn_cast<firrtl::InstanceChoiceOp>(*useOp)) {
+          if (instanceChoiceOp.getDefaultTargetAttr().getAttr() == newName)
+            instanceChoiceOp.setName(newName);
+          if (shouldReplacePorts)
+            instanceChoiceOp.setPortNamesAttr(
+                ArrayAttr::get(ctx, newPortNames));
         } else if (auto objectOp = dyn_cast<firrtl::ObjectOp>(*useOp)) {
-          // ObjectOp stores the class name in its result type, so we need to
-          // create a new ClassType with the new name and set it on the result.
+          // ObjectOp stores the class name in its result type.  Result types
+          // are not updated by SymbolTable::rename (AttrTypeReplacer is called
+          // with replaceTypes=false), so we must patch the ClassType manually.
           auto oldClassType = objectOp.getType();
           auto newClassType = firrtl::ClassType::get(
-              circuitOp.getContext(), FlatSymbolRefAttr::get(newName),
-              oldClassType.getElements());
+              ctx, FlatSymbolRefAttr::get(newName), oldClassType.getElements());
           objectOp.getResult().setType(newClassType);
           objectOp.setName(newName);
         }
@@ -2524,6 +2559,34 @@ struct LayerDisable : public OpReduction<CircuitOp> {
   DenseMap<uint64_t, SymbolRefAttr> symbolRefAttrMap;
 };
 
+/// A reduction pattern that removes initialized layer entries
+/// from the FIRRTL module operations.
+struct LayerEnableRemover : public OpReduction<FModuleOp> {
+  void matches(FModuleOp moduleOp,
+               llvm::function_ref<void(uint64_t, uint64_t)> addMatch) override {
+
+    auto layers = moduleOp.getLayersAttr();
+    for (size_t i = 0, e = layers.size(); i != e; ++i)
+      addMatch(1, i);
+  }
+
+  LogicalResult rewriteMatches(FModuleOp moduleOp,
+                               ArrayRef<uint64_t> matches) override {
+
+    llvm::SmallDenseSet<uint64_t, 4> removed(matches.begin(), matches.end());
+    SmallVector<Attribute> newLayers;
+    auto layers = moduleOp.getLayersAttr();
+    for (size_t i = 0, e = layers.size(); i != e; ++i)
+      if (!removed.contains(i))
+        newLayers.push_back(layers[i]);
+
+    moduleOp.setLayersAttr(ArrayAttr::get(moduleOp.getContext(), newLayers));
+    return success();
+  }
+
+  std::string getName() const override { return "firrtl-layer-enable-remover"; }
+};
+
 } // namespace
 
 /// A reduction pattern that removes elements from FIRRTL list create
@@ -2600,6 +2663,16 @@ struct ExtmoduleConventionRemover : public OpReduction<FExtModuleOp> {
   bool isOneShot() const override { return true; }
 };
 
+struct IMDCEPortReduction : public PassReduction {
+  IMDCEPortReduction(MLIRContext *context)
+      : PassReduction(
+            context, firrtl::createIMDeadCodeElim({/*removePortsOnly=*/true})) {
+  }
+  std::string getName() const override {
+    return "firrtl-imdeadcodeelim-remove-ports";
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Reduction Registration
 //===----------------------------------------------------------------------===//
@@ -2617,6 +2690,7 @@ void firrtl::FIRRTLReducePatternDialectInterface::populateReducePatterns(
   patterns.add<AnnotationRemover, 32>();
   patterns.add<ModuleSwapper, 31>();
   patterns.add<LayerDisable, 30>(getContext());
+  patterns.add<LayerEnableRemover, 30>();
   patterns.add<PassReduction, 29>(
       getContext(),
       firrtl::createDropName({/*preserveMode=*/PreserveValues::None}), false,
@@ -2638,9 +2712,7 @@ void firrtl::FIRRTLReducePatternDialectInterface::populateReducePatterns(
                                   true, true);
   patterns.add<PassReduction, 19>(getContext(), firrtl::createInliner());
   patterns.add<PassReduction, 18>(getContext(), firrtl::createIMConstProp());
-  patterns.add<PassReduction, 17>(
-      getContext(),
-      firrtl::createRemoveUnusedPorts({/*ignoreDontTouch=*/true}));
+  patterns.add<IMDCEPortReduction, 17>(getContext());
   patterns.add<NodeSymbolRemover, 16>();
   patterns.add<PassReduction, 15>(getContext(), firrtl::createIMDeadCodeElim());
   patterns.add<ConnectForwarder, 14>();

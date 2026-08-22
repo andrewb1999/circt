@@ -13,11 +13,7 @@
 #ifndef CIRCT_DIALECT_RTG_IR_RTGVISITORS_H
 #define CIRCT_DIALECT_RTG_IR_RTGVISITORS_H
 
-#include "circt/Dialect/RTG/IR/RTGISAAssemblyOpInterfaces.h"
-#include "circt/Dialect/RTG/IR/RTGOpInterfaces.h"
 #include "circt/Dialect/RTG/IR/RTGOps.h"
-#include "circt/Dialect/RTG/IR/RTGTypeInterfaces.h"
-#include "circt/Dialect/RTG/IR/RTGTypes.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 namespace circt {
@@ -42,7 +38,7 @@ public:
             // Labels
             StringToLabelOp, LabelUniqueDeclOp, LabelOp,
             // Registers
-            VirtualRegisterOp,
+            VirtualRegisterOp, RegisterToIndexOp, IndexToRegisterOp,
             // RTG tests
             TestOp, TargetOp, YieldOp, ValidateOp, TestSuccessOp, TestFailureOp,
             // Integers
@@ -68,8 +64,11 @@ public:
             SpaceOp, StringDataOp, SegmentOp,
             // String ops
             StringConcatOp, IntFormatOp, ImmediateFormatOp, RegisterFormatOp,
+            StringToASCIIArrayOp,
             // Misc ops
-            CommentOp, ConstraintOp, RandomScopeOp>(
+            CommentOp, ConstraintOp, RandomScopeOp,
+            // Effect handler ops
+            EffectOp, WithHandlersOp, PerformOp, ResumeOp>(
             [&](auto expr) -> ResultType {
               return thisCast->visitOp(expr, args...);
             })
@@ -143,6 +142,8 @@ public:
   HANDLE(TestSuccessOp, Unhandled);
   HANDLE(TestFailureOp, Unhandled);
   HANDLE(VirtualRegisterOp, Unhandled);
+  HANDLE(RegisterToIndexOp, Unhandled);
+  HANDLE(IndexToRegisterOp, Unhandled);
   HANDLE(IntToImmediateOp, Unhandled);
   HANDLE(ConcatImmediateOp, Unhandled);
   HANDLE(SliceImmediateOp, Unhandled);
@@ -158,70 +159,12 @@ public:
   HANDLE(ImmediateFormatOp, Unhandled);
   HANDLE(RegisterFormatOp, Unhandled);
   HANDLE(StringToLabelOp, Unhandled);
+  HANDLE(StringToASCIIArrayOp, Unhandled);
   HANDLE(RandomScopeOp, Unhandled);
-#undef HANDLE
-};
-
-/// This helps visit TypeOp nodes.
-template <typename ConcreteType, typename ResultType = void,
-          typename... ExtraArgs>
-class RTGTypeVisitor {
-public:
-  ResultType dispatchTypeVisitor(Type type, ExtraArgs... args) {
-    auto *thisCast = static_cast<ConcreteType *>(this);
-    return TypeSwitch<Type, ResultType>(type)
-        .template Case<ImmediateType, SequenceType, SetType, BagType, DictType,
-                       MapType, LabelType, IndexType, IntegerType>(
-            [&](auto expr) -> ResultType {
-              return thisCast->visitType(expr, args...);
-            })
-        .template Case<ContextResourceTypeInterface>(
-            [&](auto expr) -> ResultType {
-              return thisCast->visitContextResourceType(expr, args...);
-            })
-        .Default([&](auto expr) -> ResultType {
-          if (&type.getDialect() ==
-              type.getContext()->getLoadedDialect<RTGDialect>())
-            return visitInvalidType(type, args...);
-
-          return thisCast->visitExternalType(type, args...);
-        });
-  }
-
-  /// This callback is invoked on any RTG types not handled properly by the
-  /// TypeSwitch.
-  ResultType visitInvalidType(Type type, ExtraArgs... args) {
-    llvm::errs() << "Unknown RTG type: " << type << "\n";
-    abort();
-  }
-
-  /// This callback is invoked on any types that are not
-  /// handled by the concrete visitor.
-  ResultType visitUnhandledType(Type type, ExtraArgs... args);
-
-  ResultType visitContextResourceType(ContextResourceTypeInterface type,
-                                      ExtraArgs... args) {
-    return static_cast<ConcreteType *>(this)->visitUnhandledType(type, args...);
-  }
-
-  ResultType visitExternalType(Type type, ExtraArgs... args) {
-    return ResultType();
-  }
-
-#define HANDLE(TYPETYPE, TYPEKIND)                                             \
-  ResultType visitType(TYPETYPE type, ExtraArgs... args) {                     \
-    return static_cast<ConcreteType *>(this)->visit##TYPEKIND##Type(type,      \
-                                                                    args...);  \
-  }
-
-  HANDLE(ImmediateType, Unhandled);
-  HANDLE(SequenceType, Unhandled);
-  HANDLE(SetType, Unhandled);
-  HANDLE(BagType, Unhandled);
-  HANDLE(DictType, Unhandled);
-  HANDLE(IndexType, Unhandled);
-  HANDLE(IntegerType, Unhandled);
-  HANDLE(LabelType, Unhandled);
+  HANDLE(EffectOp, Unhandled);
+  HANDLE(WithHandlersOp, Unhandled);
+  HANDLE(PerformOp, Unhandled);
+  HANDLE(ResumeOp, Unhandled);
 #undef HANDLE
 };
 

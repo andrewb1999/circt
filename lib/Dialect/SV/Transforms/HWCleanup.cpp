@@ -17,6 +17,7 @@
 #include "circt/Dialect/SV/SVAttributes.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
+#include "circt/Support/ProceduralRegionTrait.h"
 #include "mlir/Pass/Pass.h"
 
 namespace circt {
@@ -50,9 +51,8 @@ struct AlwaysLikeOpInfo : public llvm::DenseMapInfo<Operation *> {
     // Trivially the same.
     if (lhs == rhs)
       return true;
-    // Filter out tombstones and empty ops.
-    if (lhs == getTombstoneKey() || lhs == getEmptyKey() ||
-        rhs == getTombstoneKey() || rhs == getEmptyKey())
+    // Filter out null ops.
+    if (!lhs || !rhs)
       return false;
     // Compare attributes.
     if (lhs->getName() != rhs->getName() ||
@@ -144,7 +144,7 @@ void HWCleanupPass::runOnOperation() {
 /// Recursively process all of the regions in the specified op, dispatching to
 /// graph or procedural processing as appropriate.
 void HWCleanupPass::runOnRegionsInOp(Operation &op) {
-  if (op.hasTrait<sv::ProceduralRegion>()) {
+  if (op.hasTrait<ProceduralRegion>()) {
     for (auto &region : op.getRegions())
       runOnProceduralRegion(region);
   } else {

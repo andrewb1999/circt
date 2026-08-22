@@ -13,9 +13,9 @@
 #ifndef CIRCT_DIALECT_FIRRTL_FIRRTLEXPRESSIONS_TD
 #define CIRCT_DIALECT_FIRRTL_FIRRTLEXPRESSIONS_TD
 
-include "FIRRTLDialect.td"
-include "FIRRTLTypes.td"
-include "FIRRTLEnums.td"
+include "circt/Dialect/FIRRTL/FIRRTLDialect.td"
+include "circt/Dialect/FIRRTL/FIRRTLTypes.td"
+include "circt/Dialect/FIRRTL/FIRRTLEnums.td"
 include "circt/Dialect/HW/HWAttributesNaming.td"
 include "circt/Dialect/HW/HWOpInterfaces.td"
 include "circt/Dialect/HW/HWTypes.td"
@@ -39,7 +39,7 @@ class FIRRTLExprOp<string mnemonic, list<Trait> traits = []> :
     /// Infer the return type of this operation.
     static FIRRTLType inferReturnType(ValueRange operands,
                                       mlir::DictionaryAttr attrs,
-                                      mlir::OpaqueProperties properties,
+                                      mlir::PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc);
   }];
@@ -59,7 +59,7 @@ class FIRRTLExprOp<string mnemonic, list<Trait> traits = []> :
                                           std::optional<Location> loc,
                                           ValueRange operands,
                                           DictionaryAttr attrs,
-                                          mlir::OpaqueProperties properties,
+                                          mlir::PropertyRef properties,
                                           mlir::RegionRange regions,
                                           SmallVectorImpl<Type> &results) {
       auto type = inferReturnType(operands, attrs, properties, regions, loc);
@@ -282,7 +282,7 @@ class BaseSubfieldOp<string name, Type btype, Type rtype> : FIRRTLExprOp<name> {
 
     static FIRRTLType inferReturnType(ValueRange operands,
                                       mlir::DictionaryAttr attrs,
-                                      mlir::OpaqueProperties properties,
+                                      mlir::PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -343,7 +343,7 @@ def SubindexOp : FIRRTLExprOp<"subindex"> {
 
     static FIRRTLType inferReturnType(ValueRange operands,
                                       mlir::DictionaryAttr attrs,
-                                      mlir::OpaqueProperties properties,
+                                      mlir::PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -385,7 +385,7 @@ def OpenSubindexOp : FIRRTLExprOp<"opensubindex"> {
 
     static FIRRTLType inferReturnType(ValueRange operands,
                                       mlir::DictionaryAttr attrs,
-                                      mlir::OpaqueProperties properties,
+                                      mlir::PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -427,7 +427,7 @@ def SubaccessOp : FIRRTLExprOp<"subaccess"> {
                                       std::optional<Location> loc);
 
     static FIRRTLType inferReturnType(ValueRange operands, DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -535,7 +535,7 @@ def TagExtractOp : FIRRTLExprOp<"tagextract", [InferTypeOpInterface]> {
 
     static FIRRTLType inferReturnType(ValueRange operands,
                                       DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -608,7 +608,7 @@ class BinaryPrimOp<string mnemonic, Type lhsType, Type rhsType, Type resultType,
     /// Infer the return type of this operation.
     static FIRRTLType inferReturnType(ValueRange operands,
                                       mlir::DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc
                                       ) {
@@ -740,7 +740,7 @@ class UnaryPrimOp<string mnemonic, Type srcType, Type resultType,
     /// Infer the return type of this operation.
     static FIRRTLType inferReturnType(ValueRange operands,
                                       mlir::DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc
                                       ) {
@@ -817,7 +817,7 @@ def BitsPrimOp : PrimOp<"bits"> {
 
     static FIRRTLType inferReturnType(ValueRange operands,
                                       DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -843,7 +843,7 @@ def HeadPrimOp : PrimOp<"head"> {
 
     static FIRRTLType inferReturnType(ValueRange operands,
                                       DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -870,7 +870,7 @@ def MuxPrimOp : PrimOp<"mux"> {
 
     static FIRRTLType inferReturnType(ValueRange operands,
                                       DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -903,7 +903,7 @@ def PadPrimOp : PrimOp<"pad"> {
 
     static FIRRTLType inferReturnType(ValueRange operands,
                                       DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -927,7 +927,7 @@ class ShiftPrimOp<string mnemonic> : PrimOp<mnemonic> {
 
     static FIRRTLType inferReturnType(ValueRange operands,
                                       DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -975,7 +975,7 @@ def TailPrimOp : PrimOp<"tail"> {
 
     static FIRRTLType inferReturnType(ValueRange operands,
                                       DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -1203,7 +1203,7 @@ def ObjectSubfieldOp : FIRRTLOp<"object.subfield",
 
     static Type inferReturnType(ValueRange operands,
                                 mlir::DictionaryAttr attrs,
-                                mlir::OpaqueProperties properties,
+                                mlir::PropertyRef properties,
                                 mlir::RegionRange regions,
                                 std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -1471,6 +1471,91 @@ def StringConcatOp : FIRRTLOp<"string.concat", [Pure, SameOperandsAndResultType]
   let hasCanonicalizer = 1;
 }
 
+def PropEqOp : FIRRTLOp<"prop.eq", [Pure, AllTypesMatch<["lhs", "rhs"]>]> {
+  let summary = "Compare two property values for equality";
+  let description = [{
+    Compares two property values (String, Bool, or Integer) of the same type
+    for equality, producing a boolean result.
+
+    Example:
+    ```mlir
+    %result = firrtl.prop.eq %lhs, %rhs : !firrtl.string
+    ```
+  }];
+
+  let arguments = (ins AnyTypeOf<[StringType, BoolType, FIntegerType]>:$lhs,
+                       AnyTypeOf<[StringType, BoolType, FIntegerType]>:$rhs);
+  let results = (outs BoolType:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs)";
+
+  let hasFolder = 1;
+}
+
+class BoolBinaryPrimOp<string mnemonic, list<Trait> traits = []> :
+    BinaryPrimOp<mnemonic, BoolType, BoolType, BoolType,
+                 [Pure, SameOperandsAndResultType] # traits> {
+  // We use the standard inferReturnTypes from SameOperandsAndResultType.
+  let inferReturnTypesDecl = "";
+
+  // We use a static inferType that always returns BoolType.
+  let inferType = "getBoolType";
+
+  // Define getBoolType inline in ODS.
+  let firrtlExtraClassDeclaration = [{
+    static BoolType getBoolType(FIRRTLType lhs,
+                                FIRRTLType rhs,
+                                std::optional<Location> loc) {
+      return BoolType::get(lhs.getContext());
+    }
+  }];
+
+  // Use a simple `lhs, rhs : type` format (matching the FIRRTL property op
+  // convention) rather than the BinaryPrimOp `(lhstype, rhstype) -> restype`.
+  let assemblyFormat = "$lhs `,` $rhs attr-dict";
+
+  let hasFolder = 1;
+}
+
+def BoolAndOp : BoolBinaryPrimOp<"bool.and", [Commutative]> {
+  let summary = "Bitwise AND of two boolean property values";
+  let description = [{
+    Computes the bitwise AND of two boolean property values, returning a boolean
+    result.
+
+    Example:
+    ```mlir
+    %result = firrtl.bool.and %lhs, %rhs
+    ```
+  }];
+}
+
+def BoolOrOp : BoolBinaryPrimOp<"bool.or", [Commutative]> {
+  let summary = "Bitwise OR of two boolean property values";
+  let description = [{
+    Computes the bitwise OR of two boolean property values, returning a boolean
+    result.
+
+    Example:
+    ```mlir
+    %result = firrtl.bool.or %lhs, %rhs
+    ```
+  }];
+}
+
+def BoolXorOp : BoolBinaryPrimOp<"bool.xor", [Commutative]> {
+  let summary = "Bitwise XOR of two boolean property values";
+  let description = [{
+    Computes the bitwise XOR of two boolean property values, returning a boolean
+    result.  NOT can be lowered as `xor(a, true)`.
+
+    Example:
+    ```mlir
+    %result = firrtl.bool.xor %lhs, %rhs
+    ```
+  }];
+}
+
 def UnknownValueOp : FIRRTLOp<"unknown", [
   Pure,
   DeclareOpInterfaceMethods<SymbolUserOpInterface>,
@@ -1592,7 +1677,7 @@ def RefSubOp : FIRRTLExprOp<"ref.sub"> {
 
     static FIRRTLType inferReturnType(ValueRange operands,
                                       mlir::DictionaryAttr attrs,
-                                      mlir::OpaqueProperties properties,
+                                      mlir::PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
       Adaptor adaptor(operands, attrs, properties, regions);
@@ -1738,18 +1823,19 @@ def LTLEventuallyIntrinsicOp : UnaryLTLIntrinsicOp<"eventually">;
 def LTLPastIntrinsicOp : LTLIntrinsicOp<"past"> {
   let arguments = (ins NonConstUInt1Type:$input,
                        I64Attr:$delay,
-                       Optional<ClockType>:$clock);
+                       ClockType:$clock);
   let assemblyFormat = [{
-    $input `,` $delay (`,` $clock^)? attr-dict `:`
+    $input `,` $delay `,` $clock attr-dict `:`
     functional-type(operands, results)
   }];
 }
 
 // Clocking
 def LTLClockIntrinsicOp : LTLIntrinsicOp<"clock"> {
-  let arguments = (ins NonConstUInt1Type:$input, ClockType:$clock);
+  let arguments = (ins NonConstUInt1Type:$input, EventControlAttr:$edge,
+                       ClockType:$clock);
   let assemblyFormat = [{
-    $input `,` $clock attr-dict `:` functional-type(operands, results)
+    $input `,` $edge $clock attr-dict `:` functional-type(operands, results)
   }];
 }
 
@@ -1857,7 +1943,7 @@ def DomainSubfieldOp : FIRRTLOp<"domain.subfield", [
 
     static Type inferReturnType(ValueRange operands,
                                 mlir::DictionaryAttr attrs,
-                                mlir::OpaqueProperties properties,
+                                mlir::PropertyRef properties,
                                 mlir::RegionRange regions,
                                 std::optional<Location> loc);
 

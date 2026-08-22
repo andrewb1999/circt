@@ -1,12 +1,11 @@
-// RUN: circt-opt %s --synth-structural-hash | FileCheck %s
+// RUN: circt-opt %s --pass-pipeline='builtin.module(any(synth-structural-hash))' | FileCheck %s
 
 // CHECK-LABEL: hw.module @test_structural_hash
 hw.module @test_structural_hash(in %a: i2, in %b: i2, in %c: i2, out out1: i2,
-                                out out2: i2, out out3: i2, out out4: i2, out out5: i2, out out6: i2, out out7: i2) {
+                                out out2: i2, out out3: i2, out out4: i2, out out7: i2) {
   // CHECK:      %[[VAL0:.+]] = synth.aig.and_inv %a, %b : i2
   // CHECK-NEXT: %[[VAL1:.+]] = synth.aig.and_inv %a, not %b, not %c : i2
-  // CHECK-NEXT: %[[VAL2:.+]] = synth.mig.maj_inv %a, not %b, not %c : i2
-  // CHECK-NEXT: hw.output %[[VAL0]], %[[VAL0]], %[[VAL1]], %[[VAL1]], %[[VAL2]], %[[VAL2]], %[[VAL0]]
+  // CHECK-NEXT: hw.output %[[VAL0]], %[[VAL0]], %[[VAL1]], %[[VAL1]], %[[VAL0]]
 
   // These two operations are equivalent and should be CSE'd
   %0 = synth.aig.and_inv %a, %b : i2
@@ -16,17 +15,13 @@ hw.module @test_structural_hash(in %a: i2, in %b: i2, in %c: i2, out out1: i2,
   %2 = synth.aig.and_inv %a, not %b, not %c : i2
   %3 = synth.aig.and_inv not %b, %a, not %c : i2
 
-  // The same applies to maj_inv operations
-  %4 = synth.mig.maj_inv %a, not %b, not %c : i2
-  %5 = synth.mig.maj_inv not %c, not %b, %a : i2
-
-  // Inverted chain that should be CSE'd (regardless of and_inv/maj_inv)
+  // Inverted chain that should be CSE'd.
   %6 = synth.aig.and_inv not %b : i2
-  %7 = synth.mig.maj_inv not %6 : i2
-  %8 = synth.mig.maj_inv not %7 : i2
+  %7 = synth.aig.and_inv not %6 : i2
+  %8 = synth.aig.and_inv not %7 : i2
   %9 = synth.aig.and_inv not %8, %a : i2
 
-  hw.output %0, %1, %2, %3, %4, %5, %9 : i2, i2, i2, i2, i2, i2, i2
+  hw.output %0, %1, %2, %3, %9 : i2, i2, i2, i2, i2
 }
 
 hw.module.extern @cycle(in %b: i2, out out1: i2)
@@ -48,3 +43,99 @@ hw.module @port_removal(in %a: i2) {
   // CHECK-NEXT: hw.output
   %0 = synth.aig.and_inv not %a : i2
 }
+
+// CHECK-LABEL: func.func @test_func
+func.func @test_func(%a: i2, %b: i2) -> (i2, i2) {
+  // CHECK-NEXT: %[[VAL0:.+]] = synth.aig.and_inv %arg0, %arg1 : i2
+  // CHECK-NEXT: return %[[VAL0]], %[[VAL0]]
+  %0 = synth.aig.and_inv %a, %b : i2
+  %1 = synth.aig.and_inv %b, %a : i2
+  return %0, %1 : i2, i2
+}
+
+// CHECK-LABEL: func.func @nested_blocks
+func.func @nested_blocks(%a: i1, %b: i1, %cond: i1) -> (i1, i1) {
+  // CHECK:      scf.if
+  // CHECK:        %[[THEN:.+]] = synth.aig.and_inv not %[[A:.+]], %[[B:.+]] : i1
+  // CHECK-NEXT:   scf.yield %[[THEN]], %[[THEN]] : i1, i1
+  // CHECK:      } else {
+  // CHECK-NEXT:   %[[ELSE:.+]] = synth.aig.and_inv not %[[A]], %[[B]] : i1
+  // CHECK-NEXT:   scf.yield %[[ELSE]], %[[ELSE]] : i1, i1
+  // CHECK-NEXT: }
+  %r:2 = scf.if %cond -> (i1, i1) {
+    %0 = synth.aig.and_inv not %a, %b : i1
+    %1 = synth.aig.and_inv %b, not %a : i1
+    scf.yield %0, %1 : i1, i1
+  } else {
+    %notA = synth.aig.and_inv not %a : i1
+    %fromNot = synth.aig.and_inv %notA, %b : i1
+    %commuted = synth.aig.and_inv %b, not %a : i1
+    scf.yield %fromNot, %commuted : i1, i1
+  }
+  return %r#0, %r#1 : i1, i1
+}
+
+// CHECK-LABEL: hw.module @xor_inv_hash
+hw.module @xor_inv_hash(in %a: i1, in %b: i1, in %c: i1, out o0: i1, out o1: i1) {
+  // CHECK: %[[X:.+]] = synth.xor_inv %a, not %b, %c : i1
+  // CHECK-NEXT: hw.output %[[X]], %[[X]] : i1, i1
+  %0 = synth.xor_inv %a, not %b, %c : i1
+  %1 = synth.xor_inv %c, %a, not %b : i1
+  hw.output %0, %1 : i1, i1
+}
+
+// CHECK-LABEL: hw.module @dot_ordered
+hw.module @dot_ordered(in %x: i1, in %y: i1, in %z: i1, out o0: i1, out o1: i1, out o2: i1) {
+  // Make sure that the two dot operations are not CSE'd since they have different operand orders.
+  // CHECK: %[[D0:.+]] = synth.dot not %x, %y, %z : i1
+  // CHECK-NEXT: %[[D1:.+]] = synth.dot %y, not %x, %z : i1
+  // CHECK-NEXT: hw.output %[[D0]], %[[D1]], %[[D0]] : i1, i1, i1
+  %0 = synth.dot not %x, %y, %z : i1
+  %1 = synth.dot %y, not %x, %z : i1
+  %notX = synth.aig.and_inv not %x : i1
+  %2 = synth.dot %notX, %y, %z : i1
+  hw.output %0, %1, %2 : i1, i1, i1
+}
+
+// CHECK-LABEL: hw.module @majority_commutative
+hw.module @majority_commutative(in %x: i1, in %y: i1, in %z: i1, out o0: i1, out o1: i1) {
+  // majority is permutation invariant so these should be CSE'd to the same op
+  // CHECK: %[[M0:.+]] = synth.majority %x, not %y, %z : i1
+  // CHECK-NEXT: hw.output %[[M0]], %[[M0]] : i1, i1
+  %0 = synth.majority %x, not %y, %z : i1
+  %1 = synth.majority not %y, %x, %z : i1
+  hw.output %0, %1 : i1, i1
+}
+
+// CHECK-LABEL: hw.module @onehot_commutative
+hw.module @onehot_commutative(in %x: i1, in %y: i1, in %z: i1, out o0: i1, out o1: i1) {
+  // onehot is permutation invariant so these should be CSE'd to the same op
+  // CHECK: %[[O0:.+]] = synth.onehot %x, not %y, %z : i1
+  // CHECK-NEXT: hw.output %[[O0]], %[[O0]] : i1, i1
+  %0 = synth.onehot %x, not %y, %z : i1
+  %1 = synth.onehot not %y, %x, %z : i1
+  hw.output %0, %1 : i1, i1
+}
+
+// CHECK-LABEL: hw.module @mux_inv_ordered
+hw.module @mux_inv_ordered(in %c: i1, in %a: i1, in %b: i1, out o0: i1, out o1: i1, out o2: i1) {
+  // CHECK: %[[M0:.+]] = synth.mux_inv %c, %a, %b : i1
+  // CHECK-NEXT: %[[M1:.+]] = synth.mux_inv %a, %c, %b : i1
+  // CHECK-NEXT: hw.output %[[M0]], %[[M1]], %[[M0]] : i1, i1, i1
+  %0 = synth.mux_inv %c, %a, %b : i1
+  %1 = synth.mux_inv %a, %c, %b : i1
+  %notC = synth.aig.and_inv not %c : i1
+  %2 = synth.mux_inv not %notC, %a, %b : i1
+  hw.output %0, %1, %2 : i1, i1, i1
+}
+
+// CHECK-LABEL: hw.module @gamble_commutative
+hw.module @gamble_commutative(in %x: i1, in %y: i1, in %z: i1, out o0: i1, out o1: i1) {
+  // gamble is permutation invariant so these should be CSE'd to the same op
+  // CHECK: %[[G0:.+]] = synth.gamble %x, not %y, %z : i1
+  // CHECK-NEXT: hw.output %[[G0]], %[[G0]] : i1, i1
+  %0 = synth.gamble %x, not %y, %z : i1
+  %1 = synth.gamble not %y, %x, %z : i1
+  hw.output %0, %1 : i1, i1
+}
+

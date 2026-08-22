@@ -133,7 +133,7 @@ def SnoopValidReadyOp : ESI_Physical_Op<"snoop.vr", [InferTypeOpInterface]> {
                                           std::optional<Location> loc,
                                           ValueRange operands,
                                           DictionaryAttr attrs,
-                                          mlir::OpaqueProperties properties,
+                                          mlir::PropertyRef properties,
                                           mlir::RegionRange regions,
                                           SmallVectorImpl<Type> &results);
   }];
@@ -163,7 +163,7 @@ def SnoopTransactionOp : ESI_Physical_Op<"snoop.xact", [InferTypeOpInterface]> {
                                           std::optional<Location> loc,
                                           ValueRange operands,
                                           DictionaryAttr attrs,
-                                          mlir::OpaqueProperties properties,
+                                          mlir::PropertyRef properties,
                                           mlir::RegionRange regions,
                                           SmallVectorImpl<Type> &results);
   }];
@@ -207,11 +207,17 @@ def UnwrapValidReadyOp : ESI_Op<"unwrap.vr", [
   let arguments = (ins ChannelType:$chanInput, I1:$ready);
   let results = (outs AnyType:$rawOutput, I1:$valid);
   let hasCustomAssemblyFormat = 1;
+  let hasCanonicalizeMethod = 1;
   let hasVerifier = 1;
 
   let builders = [
     OpBuilder<(ins "mlir::Value":$inChan, "mlir::Value":$ready)>
   ];
+
+  let extraClassDeclaration = [{
+    static LogicalResult mergeAndErase(UnwrapValidReadyOp, WrapValidReadyOp,
+                                       PatternRewriter&);
+  }];
 }
 
 def WrapFIFOOp : ESI_Op<"wrap.fifo", [
@@ -526,11 +532,15 @@ def WindowFieldType : ESI_Type<"WindowField"> {
     For lists, there are two possible encodings:
       - Parallel (default): a 'last' field to the struct to indicate that the
       end of the list is this frame.  If 'numItems' is specified for a list, a
-      '<fieldName>_size' (representing the number of valid items in the array)
-      field will be added to the struct.  When `<fieldName>_size` is less than
-      'numItems', `last` MUST be true meaning that all frames must be full
-      except for the last one. This format matches typical on-chip hardware
-      streaming interfaces but is terribly inefficient for serial links.
+      '<fieldName>_size' field will be added to the struct representing the
+      number of valid items in this frame, encoded as `(number of valid items -
+      1)`.  The number of valid items is always at least one, so a full frame
+      has `<fieldName>_size` == 'numItems' - 1 and the field is only
+      clog2('numItems') bits wide.  When `<fieldName>_size` is less than
+      'numItems' - 1 (i.e. the frame is not full), `last` MUST be true, meaning
+      that all frames must be full except for the last one. The parallel
+      encoding matches typical on-chip hardware streaming interfaces but is
+      terribly inefficient for serial links.
       - Serial (bulk transfer): in this encoding, there must be a 'header' frame
       immediately preceding the frame which contains the list field. That frame
       must include a special 'count' field which indicates how many items of the
@@ -540,6 +550,11 @@ def WindowFieldType : ESI_Type<"WindowField"> {
       the last transfer, the header should set the count to zero. This method
       allows for efficient transfers over serial links (no 'last' or '_size'
       fields) without requiring knowledge of the total list size up front.
+
+    Note: list types with zero bitwidth are supported merely so one does not
+    have to special case elsewhere. It is not recommended to actually use them
+    as there is no special casing here either: in the serial encoding, N data
+    frames will still be transmitted!
   }];
   let mnemonic = "window.field";
 
@@ -556,7 +571,7 @@ def WindowFieldType : ESI_Type<"WindowField"> {
   let genVerifyDecl = 1;
 }
 
-def WrapWindow : ESI_Physical_Op<"window.wrap", [Pure]> {
+def WrapWindow : ESI_Physical_Op<"window.wrap", [Pure, OperatesOnESITypes]> {
   let summary = "wrap a union into a data window";
 
   let arguments = (ins AnyType:$frame);
@@ -572,6 +587,7 @@ def WrapWindow : ESI_Physical_Op<"window.wrap", [Pure]> {
 
 def UnwrapWindow : ESI_Physical_Op<"window.unwrap", [
       Pure,
+      OperatesOnESITypes,
       DeclareOpInterfaceMethods<InferTypeOpInterface>
   ]> {
   let summary = "unwrap a data window into a union";

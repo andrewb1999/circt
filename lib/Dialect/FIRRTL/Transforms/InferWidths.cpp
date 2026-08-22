@@ -332,19 +332,9 @@ namespace {
 // itself.
 template <typename T>
 struct InternedSlotInfo : DenseMapInfo<T *> {
-  static T *getEmptyKey() {
-    auto *pointer = llvm::DenseMapInfo<void *>::getEmptyKey();
-    return static_cast<T *>(pointer);
-  }
-  static T *getTombstoneKey() {
-    auto *pointer = llvm::DenseMapInfo<void *>::getTombstoneKey();
-    return static_cast<T *>(pointer);
-  }
   static unsigned getHashValue(const T *val) { return mlir::hash_value(*val); }
   static bool isEqual(const T *lhs, const T *rhs) {
-    auto empty = getEmptyKey();
-    auto tombstone = getTombstoneKey();
-    if (lhs == empty || rhs == empty || lhs == tombstone || rhs == tombstone)
+    if (!lhs || !rhs)
       return lhs == rhs;
     return *lhs == *rhs;
   }
@@ -1544,7 +1534,8 @@ LogicalResult InferenceMapping::mapOperation(Operation *op) {
       })
 
       // Handle operations whose output width matches the input width.
-      .Case<NotPrimOp, AsSIntPrimOp, AsUIntPrimOp, ConstCastOp>(
+      .Case<NotPrimOp, AsSIntPrimOp, AsUIntPrimOp, ConstCastOp,
+            UnsafeDomainCastOp>(
           [&](auto op) { setExpr(op.getResult(), getExpr(op.getInput())); })
       .Case<mlir::UnrealizedConversionCastOp>(
           [&](auto op) { setExpr(op.getResult(0), getExpr(op.getOperand(0))); })
@@ -2036,7 +2027,8 @@ namespace {
 /// of variables and constraints to be solved later.
 class InferenceTypeUpdate {
 public:
-  InferenceTypeUpdate(InferenceMapping &mapping) : mapping(mapping) {}
+  InferenceTypeUpdate(InferenceMapping &mapping, bool warnOnTruncation)
+      : mapping(mapping), warnOnTruncation(warnOnTruncation) {}
 
   LogicalResult update(CircuitOp op);
   FailureOr<bool> updateOperation(Operation *op);
@@ -2045,6 +2037,7 @@ public:
 
 private:
   const InferenceMapping &mapping;
+  const bool warnOnTruncation;
 };
 
 } // namespace
@@ -2097,6 +2090,9 @@ FailureOr<bool> InferenceTypeUpdate::updateOperation(Operation *op) {
     auto lhsWidth = lhsType.getBitWidthOrSentinel();
     auto rhsWidth = rhsType.getBitWidthOrSentinel();
     if (lhsWidth >= 0 && rhsWidth >= 0 && lhsWidth < rhsWidth) {
+      if (warnOnTruncation)
+        con.emitWarning() << "RHS width " << rhsWidth << " exceeds LHS width "
+                          << lhsWidth << ", inserting implicit truncation";
       OpBuilder builder(op);
       auto trunc = builder.createOrFold<TailPrimOp>(con.getLoc(), con.getSrc(),
                                                     rhsWidth - lhsWidth);
@@ -2279,6 +2275,7 @@ FIRRTLBaseType InferenceTypeUpdate::updateType(FieldRef fieldRef,
 namespace {
 class InferWidthsPass
     : public circt::firrtl::impl::InferWidthsBase<InferWidthsPass> {
+  using Base::Base;
   void runOnOperation() override;
 };
 } // namespace
@@ -2300,6 +2297,7 @@ void InferWidthsPass::runOnOperation() {
     return signalPassFailure();
 
   // Update the types with the inferred widths.
-  if (failed(InferenceTypeUpdate(mapping).update(getOperation())))
+  if (failed(InferenceTypeUpdate(mapping, warnOnTruncation)
+                 .update(getOperation())))
     return signalPassFailure();
 }

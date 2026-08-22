@@ -7,15 +7,18 @@ from .common import (AppID, Clock, Input, InputChannel, Output, OutputChannel,
 from .constructs import AssignableSignal, Mux, Wire
 from .module import (generator, modparams, Module, ModuleLikeBuilderBase,
                      PortProxyBase)
-from .signals import (BitsSignal, BundleSignal, ChannelSignal, ClockSignal,
+from .signals import (BitsSignal, BundleSignal, ChannelSignal, ClockSignal, Or,
                       Signal, _FromCirctValue, UIntSignal)
-from .support import clog2, optional_dict_to_dict_attr, get_user_loc
+from .support import (clog2, optional_dict_to_optional_dict_attr, get_user_loc,
+                      optional_dict_to_dict_attr)
 from .system import System
-from .types import (Any, Bits, Bundle, BundledChannel, Channel,
-                    ChannelDirection, StructType, Type, UInt, _FromCirctType)
+from .types import (Any, Array, Bits, Bundle, BundledChannel, Channel,
+                    ChannelDirection, ChannelSignaling, List as EsiListType,
+                    StructType, Type, Window, UInt, _FromCirctType)
 
 from .circt import ir
 from .circt.dialects import esi as raw_esi, hw, msft
+from .circt.support import attribute_to_var
 
 import inspect
 from pathlib import Path
@@ -127,15 +130,20 @@ class _RequestConnection:
   def service_port(self) -> hw.InnerRefAttr:
     return hw.InnerRefAttr.get(self.decl.symbol, self._name)
 
-  def __call__(self, appid: AppID, type: Optional[Bundle] = None):
+  def __call__(self,
+               appid: AppID,
+               type: Optional[Bundle] = None,
+               options: Optional[Dict[str, object]] = None):
     if type is None:
       type = self.type
     self.decl._materialize_service_decl()
     return _FromCirctValue(
-        raw_esi.RequestConnectionOp(type._type,
-                                    self.service_port,
-                                    appid._appid,
-                                    loc=get_user_loc()).toClient)
+        raw_esi.RequestConnectionOp(
+            type._type,
+            self.service_port,
+            appid._appid,
+            options=optional_dict_to_optional_dict_attr(options),
+            loc=get_user_loc()).toClient)
 
 
 def Cosim(decl: ServiceDecl, clk, rst):
@@ -180,6 +188,16 @@ class _OutputBundleSetter(AssignableSignal):
     self.type: Bundle = _FromCirctType(req.toClient.type)
     self.port = hw.InnerRefAttr(req.servicePort).name.value
     self._bundle_to_replace: Optional[ir.OpResult] = old_value_to_replace
+
+  @property
+  def options(self) -> Dict[str, object]:
+    """Return the request-specific options set at the `esi.service.req` /
+    `esi.service.req(..., options=...)` call site, as a plain dict. Returns
+    an empty dict when no options were set. Service-implementation generators
+    can inspect these options to influence how the request is fulfilled."""
+    if "options" not in self.req.attributes:
+      return {}
+    return attribute_to_var(ir.DictAttr(self.req.attributes["options"]))
 
   def add_record(self,
                  channel_assignments: Optional[Dict] = None,
@@ -652,6 +670,40 @@ class _HostMem(ServiceDecl):
   def __init__(self):
     super().__init__(self.__class__)
 
+  @staticmethod
+  def read_req_burst_type(length_width: int = 64) -> StructType:
+    """Burst (list) read request type: struct{address, tag, length}. 'length'
+    selects how many list items to read from the host, returned as a windowed
+    list (used by 'read_list'; the single-message 'read' has no 'length'
+    field). 'length_width' sets the bit width of the unsigned 'length' field --
+    the 'read_list' service port accepts any width."""
+    return StructType([
+        ("address", UInt(64)),
+        ("tag", _HostMem.TagType),
+        ("length", UInt(length_width)),
+    ])
+
+  @staticmethod
+  def read_window(list_element: Type, num_items: int) -> Window:
+    """Parallel window framing a list read response on the wire: a window over
+    struct{tag, data: list<list_element>} carrying 'num_items' items per frame
+    (plus the auto-added '<data>_size' and 'last' fields)."""
+    into = StructType([("tag", _HostMem.TagType),
+                       ("data", EsiListType(list_element))])
+    return Window("HostMemReadResp", into,
+                  [Window.Frame(None, ["tag", ("data", num_items)])])
+
+  @staticmethod
+  def write_window(list_element: Type, num_items: int) -> Window:
+    """Parallel window framing a list write request on the wire: a window over
+    struct{address, tag, data: list<list_element>} carrying 'num_items' items
+    per frame (plus the auto-added '<data>_size' and 'last' fields). The items
+    are written to sequential addresses starting at 'address'."""
+    into = StructType([("address", UInt(64)), ("tag", _HostMem.TagType),
+                       ("data", EsiListType(list_element))])
+    return Window("HostMemWriteReq", into,
+                  [Window.Frame(None, ["address", "tag", ("data", num_items)])])
+
   def write_req_bundle_type(self, data_type: Type) -> Bundle:
     """Build a write request bundle type for the given data type."""
     write_req_type = StructType([
@@ -684,28 +736,42 @@ class _HostMem(ServiceDecl):
             "data": data,
         }), valid)
 
-  def write(self, appid: AppID, req: ChannelSignal) -> ChannelSignal:
-    """Create a write request to the host memory out of a request channel."""
-    # Extract the data type from the request channel and call the helper to get
-    # the write bundle type for the req channel.
-    write_bundle_type = self.write_req_bundle_type(req.type.inner_type.data)
-    bundle = self.write_from_bundle(appid, write_bundle_type)
+  def write(self,
+            appid: AppID,
+            req: ChannelSignal,
+            options: Optional[Dict[str, object]] = None) -> ChannelSignal:
+    """Create a write request to host memory out of a request channel.
+
+    'req' is a struct{address, tag, data} channel for a single-message write, or
+    a windowed channel (a parallel window over struct{address, tag, data: list},
+    see 'write_window') for a burst/list write. Returns the 'ackTag' response
+    channel."""
+    # Build the write bundle type directly from the request channel's type so
+    # both single-message structs and windowed (list) requests are accepted.
+    write_bundle_type = Bundle([
+        BundledChannel("req", ChannelDirection.FROM, req.type.inner_type),
+        BundledChannel("ackTag", ChannelDirection.TO, _HostMem.TagType),
+    ])
+    bundle = self.write_from_bundle(appid, write_bundle_type, options=options)
     resp = bundle.unpack(req=req)['ackTag']
     return resp
 
-  def write_from_bundle(self, appid: AppID,
-                        write_bundle_type: Bundle) -> BundleSignal:
+  def write_from_bundle(
+      self,
+      appid: AppID,
+      write_bundle_type: Bundle,
+      options: Optional[Dict[str, object]] = None) -> BundleSignal:
     self._materialize_service_decl()
 
     return cast(
         BundleSignal,
         _FromCirctValue(
-            raw_esi.RequestConnectionOp(write_bundle_type._type,
-                                        hw.InnerRefAttr.get(
-                                            self.symbol,
-                                            ir.StringAttr.get("write")),
-                                        appid._appid,
-                                        loc=get_user_loc()).toClient))
+            raw_esi.RequestConnectionOp(
+                write_bundle_type._type,
+                hw.InnerRefAttr.get(self.symbol, ir.StringAttr.get("write")),
+                appid._appid,
+                options=optional_dict_to_optional_dict_attr(options),
+                loc=get_user_loc()).toClient))
 
   def read_bundle_type(self, resp_type: Type) -> Bundle:
     """Build a read bundle type for the given data type."""
@@ -719,28 +785,79 @@ class _HostMem(ServiceDecl):
     ])
     return read_bundle_type
 
-  def read_from_bundle(self, appid: AppID,
-                       read_bundle_type: Bundle) -> BundleSignal:
+  def read_from_bundle(
+      self,
+      appid: AppID,
+      read_bundle_type: Bundle,
+      options: Optional[Dict[str, object]] = None) -> BundleSignal:
     """Request a connection based for a given read bundle type."""
+    self._materialize_service_decl()
+
     return cast(
         BundleSignal,
         _FromCirctValue(
-            raw_esi.RequestConnectionOp(read_bundle_type._type,
-                                        hw.InnerRefAttr.get(
-                                            self.symbol,
-                                            ir.StringAttr.get("read")),
-                                        appid._appid,
-                                        loc=get_user_loc()).toClient))
+            raw_esi.RequestConnectionOp(
+                read_bundle_type._type,
+                hw.InnerRefAttr.get(self.symbol, ir.StringAttr.get("read")),
+                appid._appid,
+                options=optional_dict_to_optional_dict_attr(options),
+                loc=get_user_loc()).toClient))
 
-  def read(self, appid: AppID, req: ChannelSignal,
-           data_type: Type) -> ChannelSignal:
-    """Create a read request to the host memory out of a request channel and
-    return the response channel with the specified data type."""
-
+  def read_list_from_bundle(
+      self,
+      appid: AppID,
+      read_bundle_type: Bundle,
+      options: Optional[Dict[str, object]] = None) -> BundleSignal:
+    """Request a 'read_list' (burst) connection for a given read bundle type."""
     self._materialize_service_decl()
 
+    return cast(
+        BundleSignal,
+        _FromCirctValue(
+            raw_esi.RequestConnectionOp(
+                read_bundle_type._type,
+                hw.InnerRefAttr.get(self.symbol,
+                                    ir.StringAttr.get("read_list")),
+                appid._appid,
+                options=optional_dict_to_optional_dict_attr(options),
+                loc=get_user_loc()).toClient))
+
+  def read(self,
+           appid: AppID,
+           req: ChannelSignal,
+           data_type: Type,
+           options: Optional[Dict[str, object]] = None) -> ChannelSignal:
+    """Create a single-message read request to host memory out of a request
+    channel and return the response channel (struct{tag, data: data_type}). To
+    read a list, use 'read_list'."""
+
     read_bundle_type = self.read_bundle_type(data_type)
-    bundle_sig = self.read_from_bundle(appid, read_bundle_type)
+    bundle_sig = self.read_from_bundle(appid, read_bundle_type, options=options)
+    resp = bundle_sig.unpack(req=req)['resp']
+    return resp
+
+  def read_list(self,
+                appid: AppID,
+                req: ChannelSignal,
+                element_type: Type,
+                num_items: int,
+                options: Optional[Dict[str, object]] = None) -> ChannelSignal:
+    """Create a burst (list) read of host memory. 'req' is a channel of
+    'read_req_burst_type()' ({address, tag, length}), where the request's
+    'length' is the number of list items to read starting at 'address'; the
+    items are returned as a list. To receive the list, the client requests a
+    *windowed channel*: the response is a window over struct{tag, data:
+    list<element_type>} carrying 'num_items' items per frame (see
+    'read_window'), consumed frame by frame."""
+
+    resp_type = _HostMem.read_window(element_type, num_items)
+    read_bundle_type = Bundle([
+        BundledChannel("req", ChannelDirection.FROM, req.type.inner_type),
+        BundledChannel("resp", ChannelDirection.TO, resp_type),
+    ])
+    bundle_sig = self.read_list_from_bundle(appid,
+                                            read_bundle_type,
+                                            options=options)
     resp = bundle_sig.unpack(req=req)['resp']
     return resp
 
@@ -758,30 +875,36 @@ class _ChannelService(ServiceDecl):
   def __init__(self):
     super().__init__(self.__class__)
 
-  def from_host(self, name: AppID, type: Type) -> ChannelSignal:
+  def from_host(self,
+                name: AppID,
+                type: Type,
+                options: Optional[Dict[str, object]] = None) -> ChannelSignal:
     bundle_type = Bundle(
         [BundledChannel("data", ChannelDirection.TO, Channel(type))])
     self._materialize_service_decl()
-    from_host = raw_esi.RequestConnectionOp(bundle_type._type,
-                                            hw.InnerRefAttr.get(
-                                                self.symbol,
-                                                ir.StringAttr.get("from_host")),
-                                            name._appid,
-                                            loc=get_user_loc())
+    from_host = raw_esi.RequestConnectionOp(
+        bundle_type._type,
+        hw.InnerRefAttr.get(self.symbol, ir.StringAttr.get("from_host")),
+        name._appid,
+        options=optional_dict_to_optional_dict_attr(options),
+        loc=get_user_loc())
     from_host = _FromCirctValue(from_host.toClient)
     assert isinstance(from_host, BundleSignal)
     return from_host.unpack()["data"]
 
-  def to_host(self, name: AppID, chan: ChannelSignal) -> None:
+  def to_host(self,
+              name: AppID,
+              chan: ChannelSignal,
+              options: Optional[Dict[str, object]] = None) -> None:
     bundle_type = Bundle(
         [BundledChannel("data", ChannelDirection.FROM, chan.type)])
     self._materialize_service_decl()
-    to_host = raw_esi.RequestConnectionOp(bundle_type._type,
-                                          hw.InnerRefAttr.get(
-                                              self.symbol,
-                                              ir.StringAttr.get("to_host")),
-                                          name._appid,
-                                          loc=get_user_loc())
+    to_host = raw_esi.RequestConnectionOp(
+        bundle_type._type,
+        hw.InnerRefAttr.get(self.symbol, ir.StringAttr.get("to_host")),
+        name._appid,
+        options=optional_dict_to_optional_dict_attr(options),
+        loc=get_user_loc())
     to_host = _FromCirctValue(to_host.toClient)
     assert isinstance(to_host, BundleSignal)
     to_host.unpack(data=chan)
@@ -800,7 +923,10 @@ class _FuncService(ServiceDecl):
   def __init__(self):
     super().__init__(self.__class__)
 
-  def get(self, name: AppID, bundle_type: Bundle) -> BundleSignal:
+  def get(self,
+          name: AppID,
+          bundle_type: Bundle,
+          options: Optional[Dict[str, object]] = None) -> BundleSignal:
     """Treat any bi-directional bundle as a function by getting a proper
     function bundle with the appropriate types, then renaming the channels to
     match the 'bundle_type'. Returns a bundle signal of type 'bundle_type'."""
@@ -827,14 +953,21 @@ class _FuncService(ServiceDecl):
     # Get the function channels and wire them up to create the non-function
     # bundle 'bundle_type'.
     from_channel = Wire(from_channel_bc.channel)
-    arg_channel = self.get_call_chans(name, to_channel_bc.channel, from_channel)
+    arg_channel = self.get_call_chans(name,
+                                      to_channel_bc.channel,
+                                      from_channel,
+                                      options=options)
     ret_bundle, from_chans = bundle_type.pack(
         **{to_channel_bc.name: arg_channel})
     from_channel.assign(from_chans[from_channel_bc.name])
     return ret_bundle
 
-  def get_call_chans(self, name: AppID, arg_type: Type,
-                     result: Signal) -> ChannelSignal:
+  def get_call_chans(
+      self,
+      name: AppID,
+      arg_type: Type,
+      result: Signal,
+      options: Optional[Dict[str, object]] = None) -> ChannelSignal:
     """Expose a function to the ESI system. Arguments:
       'name' is an AppID which is the function name.
       'arg_type' is the type of the argument to the function.
@@ -849,12 +982,12 @@ class _FuncService(ServiceDecl):
         BundledChannel("result", ChannelDirection.FROM, result.type)
     ])
     self._materialize_service_decl()
-    func_call = raw_esi.RequestConnectionOp(bundle._type,
-                                            hw.InnerRefAttr.get(
-                                                self.symbol,
-                                                ir.StringAttr.get("call")),
-                                            name._appid,
-                                            loc=get_user_loc())
+    func_call = raw_esi.RequestConnectionOp(
+        bundle._type,
+        hw.InnerRefAttr.get(self.symbol, ir.StringAttr.get("call")),
+        name._appid,
+        options=optional_dict_to_optional_dict_attr(options),
+        loc=get_user_loc())
     to_funcs = _FromCirctValue(func_call.toClient).unpack(result=result)
     return to_funcs['arg']
 
@@ -872,29 +1005,36 @@ class _CallService(ServiceDecl):
   def __init__(self):
     super().__init__(self.__class__)
 
-  def call(self, name: AppID, arg: ChannelSignal,
-           result_type: Type) -> ChannelSignal:
+  def call(self,
+           name: AppID,
+           arg: ChannelSignal,
+           result_type: Type,
+           options: Optional[Dict[str, object]] = None) -> ChannelSignal:
     """Call a function with the given argument. 'arg' must be a ChannelSignal
     with the argument value."""
     func_bundle = Bundle([
         BundledChannel("arg", ChannelDirection.FROM, arg.type),
         BundledChannel("result", ChannelDirection.TO, result_type)
     ])
-    call_bundle = self.get(name, func_bundle)
+    call_bundle = self.get(name, func_bundle, options=options)
     bundle_rets = call_bundle.unpack(arg=arg)
     return bundle_rets['result']
 
-  def get(self, name: AppID, func_type: Bundle) -> BundleSignal:
+  def get(self,
+          name: AppID,
+          func_type: Bundle,
+          options: Optional[Dict[str, object]] = None) -> BundleSignal:
     """Expose a bundle to the host as a function. Bundle _must_ have 'arg' and
     'result' channels going FROM the server and TO the server, respectively."""
     self._materialize_service_decl()
 
     func_call = _FromCirctValue(
-        raw_esi.RequestConnectionOp(func_type._type,
-                                    hw.InnerRefAttr.get(
-                                        self.symbol, ir.StringAttr.get("call")),
-                                    name._appid,
-                                    loc=get_user_loc()).toClient)
+        raw_esi.RequestConnectionOp(
+            func_type._type,
+            hw.InnerRefAttr.get(self.symbol, ir.StringAttr.get("call")),
+            name._appid,
+            options=optional_dict_to_optional_dict_attr(options),
+            loc=get_user_loc()).toClient)
     assert isinstance(func_call, BundleSignal)
     return func_call
 
@@ -917,15 +1057,19 @@ class _Telemetry(ServiceDecl):
   def __init__(self):
     super().__init__(self.__class__)
 
-  def report_signal(self, clk: ClockSignal, rst: BitsSignal, name: AppID,
-                    data: Signal) -> None:
+  def report_signal(self,
+                    clk: ClockSignal,
+                    rst: BitsSignal,
+                    name: AppID,
+                    data: Signal,
+                    options: Optional[Dict[str, object]] = None) -> None:
     """Report a value to the telemetry service. 'data' is the value to report."""
     bundle_type = Bundle([
         BundledChannel("get", ChannelDirection.TO, Bits(0)),
         BundledChannel("data", ChannelDirection.FROM, data.type)
     ])
 
-    report_bundle = self.report(name, bundle_type)
+    report_bundle = self.report(name, bundle_type, options=options)
     get_valid_wire = Wire(Bits(1))
     data_channel, data_ready = Channel(data.type).wrap(data, get_valid_wire)
     data_channel = data_channel.buffer(clk, rst, stages=1)
@@ -947,7 +1091,25 @@ class TelemetryMMIO(ServiceImplementation):
   region. Each client request is assigned a register in the MMIO space. When a
   read request is received for the assigned address, it gets routed to the
   assigned client. When a write request is received, it is discarded. The
-  assignment table is stored in the manifest."""
+  assignment table is stored in the manifest.
+
+  **REQUIREMENTS.** Both are needed to make the response merge safe:
+
+  1. The `MMIO` service implementation this connects to must not issue a read
+     command while a previous read's response is still outstanding.
+  2. Every telemetry client must assert its `data` channel's `valid` only in
+     response to a `get`. `Telemetry.report_signal` does this; a client which
+     holds `valid` high permanently -- legal ESI, and the natural way to
+     express an always-available counter -- does not.
+
+  Given both, each command is demuxed to exactly one client and at most one
+  client is offering a response at a time, so the responses can be merged with
+  `ChannelMergeOneValid` instead of arbitrated -- which keeps the response path
+  from building a combinational cone across every telemetry client.
+
+  Nothing here enforces either, and violating either loses responses. Note (2)
+  is not specific to this merge: `ChannelMux2` is fixed-priority, so under an
+  arbiter a permanently-valid client starves every client behind it."""
 
   clk = Clock()
   rst = Reset()
@@ -1004,7 +1166,13 @@ class TelemetryMMIO(ServiceImplementation):
       bundle_wire.assign(bundle)
       client_data_channels.append(
           bundle_froms["data"].transform(lambda m: m.as_bits(64)))
-    resp_channel = ChannelMux(client_data_channels)
+    # The demux above routes each command to exactly one client, so -- given
+    # both requirements in this class' docs -- at most one client is offering a
+    # response at a time and no arbitration is needed to merge them.
+    resp_channel = ChannelMergeOneValid(client_data_channels,
+                                        ports.clk,
+                                        ports.rst,
+                                        instance_name="telemetry_resp_merge")
     data_resp_channel.assign(resp_channel)
     return True
 
@@ -1202,6 +1370,170 @@ def ChannelMux(input_channels: List[ChannelSignal]) -> ChannelSignal:
 
 
 @modparams
+def ChannelMergeOneValidMod(channel_type: Channel, num_inputs: int,
+                            register_output: bool):
+  """Build the N:1 one-valid channel merge module. See the
+  `ChannelMergeOneValid` convenience function for the user-facing entry point
+  and the precondition it requires."""
+
+  assert num_inputs >= 2, "ChannelMergeOneValidMod requires at least two inputs"
+  inner = channel_type.inner_type
+  width = inner.bitwidth
+  if width is None:
+    raise TypeError(
+        f"ChannelMergeOneValid requires a fixed-width payload; got {inner}")
+
+  class ChannelMergeOneValidImpl(Module):
+    clk = Clock()
+    rst = Reset()
+
+    inputs = Input(Array(channel_type, num_inputs))
+    output = Output(channel_type)
+
+    @generator
+    def build(ports) -> None:
+      # A single `ready`, broadcast to every input. This is the entire point of
+      # the module: no input's `ready` depends on any other input's `valid`, so
+      # there is no combinational coupling between the inputs at all.
+      in_ready = Wire(Bits(1), name="in_ready")
+
+      valids: List[BitsSignal] = []
+      datas: List[BitsSignal] = []
+      for i in range(num_inputs):
+        data_i, valid_i = ports.inputs[i].unwrap(in_ready)
+        valids.append(valid_i)
+        if width > 0:
+          datas.append(data_i.bitcast(Bits(width)))
+
+      merged_valid = Or(*valids)
+
+      if width > 0:
+        # The payload is read out of an array indexed by a binary encode of the
+        # one-hot `valid` vector. Left as a single array select so the synthesis
+        # tool can pick a structure for the target device. Selecting rather than
+        # OR-ing the payloads together also bounds the damage if the contract is
+        # broken: the output is always some input's payload, never a mixture.
+        def or_reduce(bits: List[BitsSignal]) -> BitsSignal:
+          return bits[0] if len(bits) == 1 else Or(*bits)
+
+        # Bit `k` of the index is set for exactly those inputs whose number has
+        # bit `k` set, so a one-hot `valid` encodes to the valid input's index.
+        sel_width = clog2(num_inputs)
+        sel_bits = [
+            or_reduce([valids[i]
+                       for i in range(num_inputs)
+                       if (i >> k) & 1])
+            for k in reversed(range(sel_width))
+        ]
+        sel = sel_bits[0]
+        if len(sel_bits) > 1:
+          sel = BitsSignal.concat(sel_bits)
+          sel.name = "merge_sel"
+        # The array is exactly `num_inputs` long: under the contract `sel` only
+        # ever resolves to a valid input's index, so it is always in range.
+        data_array = Array(Bits(width), num_inputs)(datas)
+        data_array.name = "merge_data"
+        merged_bits = data_array[sel]
+      else:
+        # Zero-width payload: there is nothing to select.
+        merged_bits = Bits(0)(0)
+
+      out_chan, out_ready = channel_type.wrap(merged_bits.bitcast(inner),
+                                              merged_valid)
+      if register_output:
+        # One skid buffer on the output. `ESI_PipelineStage` drives its
+        # `a_ready` from flops, so after this every input's `ready` is a flop
+        # output -- which is what takes the merge off the critical path.
+        out_chan = out_chan.buffer(ports.clk, ports.rst, stages=1)
+      ports.output = out_chan
+      in_ready.assign(out_ready)
+
+  return ChannelMergeOneValidImpl
+
+
+def ChannelMergeOneValid(input_channels: List[ChannelSignal],
+                         clk: ClockSignal,
+                         rst: Signal,
+                         *,
+                         register_output: bool = True,
+                         appid: Optional[AppID] = None,
+                         instance_name: Optional[str] = None) -> ChannelSignal:
+  """Merge N channels into one, given that at most one of them ever has a
+  message to offer at a time.
+
+  **Contract: at most one input may be valid in any given cycle.** The caller
+  must arrange this. In a request/response fabric it takes two things: at most
+  one request in flight (e.g. a `MaxOutstandingLimiter(1)`), *and* every client
+  asserting its reply's `valid` only in response to a request. The second is
+  easy to miss -- a channel may legally hold `valid` high forever, so an
+  always-available counter breaks the contract by itself.
+  `Telemetry.report_signal` drives its data `valid` from the `get` channel's;
+  hand-written clients must do likewise.
+
+  Given the contract, no arbitration is needed:
+
+  * `valid` = OR over the inputs' `valid`.
+  * `data`  = the valid input's payload, read out of an array indexed by a
+    binary encode of the `valid` vector.
+  * `ready` = the output's `ready`, broadcast unchanged to every input.
+
+  Broadcasting `ready` is the entire win: no input's `ready` depends on any
+  other input's `valid`, and with `register_output` it is a flop output.
+
+  Violating the contract is lossy but does not corrupt data: every valid input
+  completes its handshake, only one beat is emitted, and the rest are dropped.
+  The payload is selected rather than OR-ed, so the output is always some
+  input's payload, never a bitwise mixture of several.
+
+  TODO: flag the dropped-message case with an `sv.assert.concurrent`. Not
+  currently possible from PyCDE: the SV dialect's Python bindings do not expose
+  the `EventControl` enum needed to build the op's `event` attribute.
+
+  TODO: take the select as an optional *input*, driven from the request side
+  (for an MMIO processor, the same select that drives the command demux, one
+  cycle earlier and already registered). That would make both requirements
+  structural rather than documented -- an unselected input is never readied, so
+  holding `valid` high is harmless -- and is cheaper, since a registered select
+  deletes the encoder from the response path instead of adding to it.
+
+  Arguments:
+    input_channels: the channels to merge. All must share the same type.
+    clk, rst: clock and reset.
+    register_output: insert one skid buffer on the output (recommended; adds
+      one cycle of latency and makes every input's `ready` a flop output).
+    appid: optional `AppID` for the instance.
+    instance_name: optional instance name.
+  """
+
+  assert len(input_channels) > 0
+  if len(input_channels) == 1:
+    return input_channels[0]
+
+  channel_type = input_channels[0].type
+  for c in input_channels:
+    if c.type != channel_type:
+      raise TypeError("All ChannelMergeOneValid inputs must have the same "
+                      f"type; got {channel_type} and {c.type}")
+  # The merge is built directly out of `unwrap(ready)`/`wrap(data, valid)` and
+  # broadcasts a single `ready` to every input, which is only meaningful for
+  # ValidReady. Under FIFO signaling the broadcast signal is `rden`, so one
+  # output beat would pop *every* input FIFO and silently discard N-1
+  # messages. Reject it rather than elaborate wrong hardware.
+  if channel_type.signaling != ChannelSignaling.ValidReady:
+    raise TypeError("ChannelMergeOneValid requires ValidReady channels; got "
+                    f"{channel_type}")
+
+  mod = ChannelMergeOneValidMod(channel_type, len(input_channels),
+                                register_output)
+  inst = mod(clk=clk,
+             rst=rst,
+             inputs=Array(channel_type, len(input_channels))(input_channels),
+             appid=appid,
+             instance_name=instance_name)
+  return inst.output
+
+
+@modparams
 def Mailbox(type):
   """Constructs a module which stores an ESI message until it is read. Acts as a
   sink -- always accepts new messages, dropping the current unread one if
@@ -1235,3 +1567,746 @@ def Mailbox(type):
       ports.valid = valid
 
   return Mailbox
+
+
+@modparams
+def ListWindowToParallel(serial_window_type: Window):
+  """Build a module which converts a 'serial' (bulk-transfer) window of a
+  struct-with-a-list into a 'parallel' one. The serial window is expected to
+  consist of a single 'header' frame containing the static struct fields plus
+  the list `count`, followed by `ceil(count/items_per_frame)` 'data' frames each
+  carrying `items_per_frame` list items. The parallel output produces one
+  message per list item, replicating the static fields and asserting the `last`
+  field on the final item of the list.
+
+  `serial_window_type` must be a Window produced by `Window.serial_of`; the
+  `into_type`, `count_bitwidth`, and `items_per_frame` variables are derived
+  from it automatically.
+  """
+
+  from .types import List as ListType, StructType
+
+  # Derive into_type (the underlying struct) directly from the window.
+  into_type = serial_window_type.into
+
+  # The underlying type must be a struct (Window.serial_of wraps non-struct
+  # types in a single-field struct, so the .into is always a StructType).
+  if not isinstance(into_type, StructType):
+    raise ValueError(
+        "ListWindowToParallel requires a serial window over a struct type; "
+        f"got into-type {into_type}")
+
+  # Collect static and list field names from the underlying struct. There must
+  # be exactly one list field.
+  static_field_names: List[str] = []
+  list_field_name: Optional[str] = None
+  list_element_type: Optional[Type] = None
+  for name, ftype in into_type.fields:
+    if isinstance(ftype, ListType):
+      if list_field_name is not None:
+        raise ValueError("ListWindowToParallel requires exactly one list field")
+      list_field_name = name
+      list_element_type = ftype.element_type
+    else:
+      static_field_names.append(name)
+  if list_field_name is None:
+    raise ValueError("ListWindowToParallel requires exactly one list field")
+  count_field_name = f"{list_field_name}_count"
+  # Per the ESI spec, list types of zero bitwidth are supported (so callers
+  # need not special-case). With zero-width data, the per-item buffer
+  # register and forward/buffer mux are skipped: there is nothing to
+  # store or select between, and seq.CompReg disallows zero-width types.
+  data_is_zero = list_element_type.bitwidth == 0
+
+  # The serial window must have exactly two frames: a header frame followed
+  # by a data frame. The frame names are captured here (rather than hardcoded)
+  # so the build logic below indexes the union with the same names the window
+  # type was constructed with.
+  frames = serial_window_type.frames
+  if len(frames) != 2:
+    raise ValueError(
+        "ListWindowToParallel requires a serial window with exactly 2 frames "
+        f"(header followed by data); got {len(frames)}")
+  header_frame, data_frame = frames[0], frames[1]
+  header_frame_name = header_frame.name
+  data_frame_name = data_frame.name
+  if header_frame_name is None or data_frame_name is None:
+    raise ValueError(
+        "ListWindowToParallel requires both serial-window frames to have "
+        f"names; got header={header_frame_name!r}, data={data_frame_name!r}")
+
+  # The header frame must contain all of the static struct fields plus a
+  # 3-tuple (list_field, 0, count_bitwidth) carrying the bulk-transfer count.
+  # Note: Window.frames returns each member as a tuple (name, num_items[,
+  # bulk_count_width]); plain strings are also allowed in user-constructed
+  # frames, so we accept both forms.
+  header_static_names = []
+  count_bitwidth: Optional[int] = None
+  for member in header_frame.members:
+    if isinstance(member, str):
+      header_static_names.append(member)
+      continue
+    if not isinstance(member, tuple):
+      raise ValueError(
+          f"ListWindowToParallel: unsupported header member {member!r}")
+    if len(member) == 3 and member[0] == list_field_name and \
+       member[2] is not None and member[2] > 0:
+      if count_bitwidth is not None:
+        raise ValueError(
+            "ListWindowToParallel: header frame has multiple bulk-count "
+            f"entries for list field {list_field_name!r}")
+      count_bitwidth = member[2]
+    elif len(member) >= 2 and \
+         (member[1] is None or member[1] == 0) and \
+         (len(member) < 3 or not member[2]):
+      # Static field encoded as (name, None) or (name, 0).
+      header_static_names.append(member[0])
+    else:
+      raise ValueError(
+          "ListWindowToParallel: unexpected member "
+          f"{member!r} in header frame; expected static fields plus the "
+          f"bulk-count entry for list field {list_field_name!r}")
+  if count_bitwidth is None:
+    raise ValueError(
+        "ListWindowToParallel: header frame is missing the bulk-count entry "
+        f"for list field {list_field_name!r}; ensure the serial window was "
+        "produced by Window.serial_of")
+  if set(header_static_names) != set(static_field_names):
+    raise ValueError(
+        "ListWindowToParallel: header frame static fields "
+        f"{header_static_names} do not match the struct's static fields "
+        f"{static_field_names}")
+
+  # The data frame must contain exactly the list field as a 2-tuple
+  # (list_field, items_per_frame).
+  if len(data_frame.members) != 1:
+    raise ValueError(
+        "ListWindowToParallel: data frame must contain exactly one member "
+        f"(the list field); got {data_frame.members}")
+  data_member = data_frame.members[0]
+  if not (isinstance(data_member, tuple) and len(data_member) == 2 and
+          data_member[0] == list_field_name and data_member[1] is not None):
+    raise ValueError(
+        "ListWindowToParallel: data frame member must be a 2-tuple "
+        f"({list_field_name!r}, items_per_frame); got {data_member!r}")
+  items_per_frame = data_member[1]
+
+  if items_per_frame != 1:
+    raise NotImplementedError(
+        "ListWindowToParallel currently only supports items_per_frame=1, "
+        f"got {items_per_frame}")
+
+  parallel_window_type = Window.default_of(into_type)
+  parallel_lowered = parallel_window_type.lowered_type
+
+  class ListWindowToParallel(Module):
+    """Converts a 'serial' or 'bulk' window into a list to a 'parallel' one."""
+
+    clk = Clock()
+    rst = Reset()
+
+    serial_in = InputChannel(serial_window_type)
+    parallel_out = OutputChannel(parallel_window_type)
+
+    @generator
+    def build(ports):
+      from .seq import DownCounter
+
+      # State machine for serial-to-parallel conversion. Per the ESI spec, the
+      # serial encoding may transmit a list across multiple bursts, each of
+      # which is a header (with a non-zero count of items) followed by `count`
+      # data frames. The list ends only when a header with count==0 is
+      # received -- reaching the end of an individual burst's count does NOT
+      # imply the end of the list. To correctly drive the parallel-side
+      # `last` field, we therefore peek the next header before emitting the
+      # final item of each burst.
+      #
+      # State encoding (2 bits):
+      #   0 (S_WAIT)     - waiting for a header (start of a list, or
+      #                    discarding a count==0 terminator with no preceding
+      #                    items).
+      #   1 (S_EMIT)     - emitting items 1..count-1 of the current burst in
+      #                    lockstep with serial_in. The count-th (last) item
+      #                    of the burst is consumed silently into a buffer
+      #                    register instead of being emitted, so we can
+      #                    determine its `last` flag from the next header.
+      #   2 (S_PEEK)     - waiting for and consuming the next header so we
+      #                    can decide whether the buffered item is the last
+      #                    of the entire list (next count == 0) or just the
+      #                    last of a burst (next count > 0).
+      #   3 (S_EMIT_BUF) - emitting the buffered last-of-burst item with the
+      #                    `last` flag set iff the just-peeked header carried
+      #                    count==0.
+      S_WAIT = Bits(2)(0)
+      S_EMIT = Bits(2)(1)
+      S_PEEK = Bits(2)(2)
+      S_EMIT_BUF = Bits(2)(3)
+
+      state_wire = Wire(Bits(2))
+      in_wait = state_wire == S_WAIT
+      in_emit = state_wire == S_EMIT
+      in_peek = state_wire == S_PEEK
+      in_emit_buf = state_wire == S_EMIT_BUF
+
+      # ----- Input handshake -----
+      serial_ready_wire = Wire(Bits(1))
+      serial_window_sig, serial_valid = ports.serial_in.unwrap(
+          serial_ready_wire)
+      serial_union = serial_window_sig.unwrap()
+
+      # Header / data variant overlays of the serial union. The valid one is
+      # determined by the sender's framing; we only read each variant in the
+      # appropriate state. Variant names come from the window type's frame
+      # names captured above.
+      header_struct = serial_union[header_frame_name]
+      data_struct = serial_union[data_frame_name]
+
+      # ----- Counters -----
+      zero = UInt(count_bitwidth)(0)
+      # `remaining` counts the items of the current burst not yet consumed: it
+      # is loaded with the burst's count when a header is accepted and
+      # decremented as items are emitted. The last item of a burst is therefore
+      # `remaining == 1`, a comparison against a *constant* on a registered
+      # value.
+      #
+      # Counting down is ~2x cheaper than the best up-counter formulation
+      # (`emitted == count_minus_1`), and much better than the naive one
+      # (`emitted + 1 == count`), and the decrement itself only ever feeds the
+      # register input, never the comparison.
+      #
+      # Predeclared as a Wire so it can be used in handshake/state expressions
+      # before its driver is built.
+      remaining_wire = Wire(UInt(count_bitwidth))
+
+      # ----- Header acceptance -----
+      # Headers are accepted whenever we are in S_WAIT or S_PEEK and serial_in
+      # is valid. The count field is latched on every header accept (we need
+      # the peeked terminator's count to compute `out_last`). Static fields
+      # are latched only on the *first* header of a list (S_WAIT accepts):
+      # per the ESI spec they are constant within a list, but a peeked
+      # terminator may carry stale/zero values, so we must not let it
+      # overwrite the registers used to construct the buffered item's
+      # parallel output.
+      #
+      # All FSM-advancing events below are qualified by `serial_xact`
+      # (valid AND ready), not by `serial_valid` alone, so a beat that the
+      # producer is presenting while we are back-pressured is not
+      # "consumed" by latching/state-transitioning multiple times.
+      hdr_xact = (in_wait | in_peek) & serial_valid
+      first_hdr_xact = in_wait & serial_valid
+
+      static_regs: Dict[str, Signal] = {}
+      for name in static_field_names:
+        static_regs[name] = header_struct[name].reg(ports.clk,
+                                                    ports.rst,
+                                                    ce=first_hdr_xact,
+                                                    name=f"static_{name}")
+
+      new_count = header_struct[count_field_name].as_uint(count_bitwidth)
+      count_reg = new_count.reg(ports.clk,
+                                ports.rst,
+                                ce=hdr_xact,
+                                rst_value=0,
+                                name="count")
+      cur_count = count_reg.as_uint(count_bitwidth)
+      # In S_EMIT, the item consumed when `remaining == 1` is the burst's last.
+      is_last_of_burst = remaining_wire == UInt(count_bitwidth)(1)
+
+      # ----- Buffered item -----
+      # Latch the last data item of a burst into a register before peeking
+      # the next header. Gated by serial_xact so a back-pressured beat is
+      # only latched once. With zero-width data there is nothing to
+      # buffer (and seq.CompReg rejects zero-width types), so out_item
+      # just forwards the (zero-width) data_item in every state.
+      data_item = data_struct[list_field_name][0]
+      consume_burst_last = in_emit & is_last_of_burst & serial_valid
+      if data_is_zero:
+        out_item = data_item
+      else:
+        buf_item = data_item.reg(ports.clk,
+                                 ports.rst,
+                                 ce=consume_burst_last,
+                                 name="buf_item")
+
+        # ----- Parallel output construction -----
+        # In S_EMIT we forward the live data_item; in S_EMIT_BUF we emit the
+        # buffered item. `last` is only ever set in S_EMIT_BUF, and only when
+        # the header just consumed by S_PEEK had count==0.
+        out_item = Mux(in_emit_buf, data_item, buf_item)
+      out_last = in_emit_buf & (cur_count == zero)
+
+      parallel_fields = {name: static_regs[name] for name in static_field_names}
+      parallel_fields[list_field_name] = out_item
+      parallel_fields["last"] = out_last
+      parallel_struct = parallel_lowered(parallel_fields)
+      parallel_window = parallel_window_type.wrap(parallel_struct)
+
+      # parallel_out is valid in two situations:
+      # - S_EMIT, with serial_in valid, for non-last-of-burst items (the
+      #   last-of-burst item is silently consumed into buf_item instead).
+      # - S_EMIT_BUF, where the buffered item is always available.
+      out_valid = (in_emit & serial_valid & ~is_last_of_burst) | in_emit_buf
+
+      out_chan, out_ready = Channel(parallel_window_type).wrap(
+          parallel_window, out_valid)
+      ports.parallel_out = out_chan
+
+      # serial_in.ready policy (per state):
+      #   - S_WAIT / S_PEEK:           always 1. Header consumes do not
+      #     drive parallel_out (out_valid==0 in these states), so gating by
+      #     out_ready would deadlock against any downstream that derives
+      #     ready as a function of valid -- the converter would never
+      #     accept the first header of a list.
+      #   - S_EMIT, last-of-burst:     always 1. The beat is silently
+      #     latched into buf_item (out_valid==0), so gating by out_ready
+      #     would similarly deadlock.
+      #   - S_EMIT, non-last-of-burst: gated by out_ready; the beat is
+      #     being forwarded to parallel_out, so consume in lockstep.
+      #   - S_EMIT_BUF:                always 0. We are not consuming
+      #     serial_in this cycle (we're emitting buf_item), and a spurious
+      #     ready would also drop the next list's incoming beat sitting on
+      #     serial_in.
+      serial_ready_wire.assign((in_wait | in_peek) |
+                               (in_emit & (is_last_of_burst | out_ready)))
+
+      # ----- Transactions -----
+      emit_normal_xact = in_emit & serial_valid & ~is_last_of_burst & out_ready
+      emit_buf_xact = in_emit_buf & out_ready
+
+      # ----- remaining counter -----
+      # Load the burst's item count when a header is accepted; decrement on
+      # each non-last emit. The two enables are mutually exclusive (they
+      # require different states), so `DownCounter`'s load-over-decrement
+      # priority never comes into play. The counter never *decrements* to 0:
+      # decrement is gated by `~is_last_of_burst`, i.e. `remaining != 1`.
+      # (`remaining` may still be loaded with 0 for count==0 terminators.)
+      # Not cleared on `emit_buf_xact`: by then the peeked header's `hdr_xact`
+      # has already loaded the next burst's count.
+      remaining_counter = DownCounter(count_bitwidth)(
+          clk=ports.clk,
+          rst=ports.rst,
+          load=hdr_xact,
+          load_value=new_count,
+          decrement=emit_normal_xact,
+          instance_name="remaining")
+      remaining_wire.assign(remaining_counter.out)
+
+      # ----- State transitions -----
+      # The conditions below are mutually exclusive (each requires a specific
+      # current state), so the order of the chained Muxes does not matter.
+      #   S_WAIT     -> S_EMIT      on hdr_xact & new_count != 0
+      #   S_WAIT     -> S_WAIT      on hdr_xact & new_count == 0 (terminator
+      #                                                           or empty
+      #                                                           list).
+      #   S_EMIT     -> S_PEEK      on consume_last
+      #   S_PEEK     -> S_EMIT_BUF  on hdr_xact (next header consumed)
+      #   S_EMIT_BUF -> S_EMIT      on emit_buf_xact & cur_count != 0
+      #   S_EMIT_BUF -> S_WAIT      on emit_buf_xact & cur_count == 0
+      new_count_zero = new_count == zero
+      cur_count_zero = cur_count == zero
+
+      # Per-state next-state expressions, selected by the current state.
+      # Each branch only needs to consider the events relevant to that
+      # state, since the multi-input Mux is indexed by state_wire (no
+      # need to gate guards with in_<state>). fsm.Machine was considered
+      # here, but it is geared toward Moore-style FSMs whose outputs are
+      # decoded from named states; this FSM's outputs are derived from
+      # the in_<state> wires used pervasively above, so a direct state-
+      # indexed Mux is simpler.
+      next_in_wait = Mux(hdr_xact & ~new_count_zero, S_WAIT, S_EMIT)
+      next_in_emit = Mux(consume_burst_last, S_EMIT, S_PEEK)
+      next_in_peek = Mux(hdr_xact, S_PEEK, S_EMIT_BUF)
+      # S_EMIT_BUF: stay until emit_buf_xact, then go to S_WAIT if the
+      # peeked terminator carried count==0, else back to S_EMIT.
+      next_in_emit_buf = Mux(emit_buf_xact, S_EMIT_BUF,
+                             Mux(cur_count_zero, S_EMIT, S_WAIT))
+      next_state = Mux(state_wire, next_in_wait, next_in_emit, next_in_peek,
+                       next_in_emit_buf)
+
+      state_reg = next_state.reg(ports.clk,
+                                 ports.rst,
+                                 rst_value=0,
+                                 name="state")
+      state_wire.assign(state_reg)
+
+  return ListWindowToParallel
+
+
+@modparams
+def ListWindowToSerial(parallel_window_type: Window,
+                       count_bitwidth: int = 16,
+                       items_per_frame: int = 1,
+                       fifo_depth: int = 64,
+                       meta_fifo_depth: Optional[int] = None):
+  """Build a module which converts a 'parallel' window of a struct-with-a-list
+  back into a 'serial' (burst-transfer) window. Each parallel input message
+  carries one list item plus the static struct fields and a `last` flag marking
+  the final item of the list.
+
+  Items are buffered in a data FIFO of `fifo_depth` entries; per-burst
+  metadata (static fields, item count, end-of-list flag) is buffered in a
+  separate metadata FIFO of `meta_fifo_depth` entries. The output side emits
+  one burst transfer per metadata entry: a header frame (carrying the static
+  fields and the burst's item count) followed by `count` data frames; if the
+  metadata entry is flagged as the end of the list, an additional header
+  frame with `count==0` is emitted afterwards as the terminator (per the ESI
+  WindowField serial-encoding spec).
+
+  Because metadata is queued (rather than held in a single register), the
+  input side does NOT back-pressure the producer once `last` is observed --
+  it remains free to accept the next list's items, so multiple lists may be
+  in flight at any given time. A burst transfer is closed (and a metadata
+  entry pushed) either when the producer asserts `last` (end-of-list) or
+  when the data FIFO would otherwise fill (split-on-full back-pressure
+  relief). This means the supported list length is unbounded -- not
+  constrained by `fifo_depth` -- and lists do not need to wait for each
+  other to drain.
+
+  `parallel_window_type` must be a Window produced by `Window.default_of`;
+  the `into_type` is derived from it automatically.
+  """
+
+  from .types import List as ListType, StructType
+
+  if items_per_frame != 1:
+    raise NotImplementedError(
+        "ListWindowToSerial currently only supports items_per_frame=1, "
+        f"got {items_per_frame}")
+  if fifo_depth < 1:
+    raise ValueError(f"fifo_depth must be >= 1, got {fifo_depth}")
+  if fifo_depth >= (1 << count_bitwidth):
+    raise ValueError(
+        f"fifo_depth ({fifo_depth}) must fit in count_bitwidth "
+        f"({count_bitwidth}) bits since the per-burst count is at most "
+        "fifo_depth")
+  if meta_fifo_depth is None:
+    meta_fifo_depth = max(2, fifo_depth // 4)
+  if meta_fifo_depth < 2:
+    raise ValueError(f"meta_fifo_depth must be >= 2, got {meta_fifo_depth}")
+
+  # Derive into_type (the underlying struct) directly from the window.
+  into_type = parallel_window_type.into
+
+  static_field_names: List[str] = []
+  list_field_name: Optional[str] = None
+  list_element_type: Optional[Type] = None
+  for name, ftype in into_type.fields:
+    if isinstance(ftype, ListType):
+      if list_field_name is not None:
+        raise ValueError("ListWindowToSerial requires exactly one list field")
+      list_field_name = name
+      list_element_type = ftype.element_type
+    else:
+      static_field_names.append(name)
+  if list_field_name is None:
+    raise ValueError("ListWindowToSerial requires exactly one list field")
+
+  serial_window_type = Window.serial_of(into_type, count_bitwidth,
+                                        items_per_frame)
+  serial_lowered = serial_window_type.lowered_type
+  count_field_name = f"{list_field_name}_count"
+
+  # The serial-window lowered type is a union of {header_struct, data_struct}.
+  serial_variants = {n: t for (n, t, _) in serial_lowered.fields}
+  header_struct_type = serial_variants["header"]
+  data_struct_type = serial_variants["data"]
+
+  # The data FIFO carries one list element per slot. When the element type
+  # has zero bitwidth (per the ESI spec, supported to avoid special-casing
+  # callers), the FIFO is omitted entirely: SeqFIFO disallows zero-bitwidth
+  # types, and there is nothing to actually store -- only the per-burst
+  # item count carried in the metadata FIFO matters.
+  data_elem_type = list_element_type
+  data_is_zero = data_elem_type.bitwidth == 0
+
+  # Burst-count counter width: must hold values 0..fifo_depth.
+  bc_bitwidth = max(1, (fifo_depth + 1).bit_length())
+
+  # Metadata FIFO entry: a complete header (static fields + count) plus an
+  # is_last flag indicating whether this burst ends the current list (and
+  # therefore should be followed by a count==0 terminator footer).
+  meta_entry_type = StructType([
+      ("hdr", header_struct_type),
+      ("is_last", Bits(1)),
+  ])
+
+  class ListWindowToSerial(Module):
+    """Converts a 'parallel' window of a list into a 'serial' (burst-transfer)
+    window using paired data + metadata FIFOs. Multiple lists may be in
+    flight simultaneously; lists of arbitrary length are supported by
+    splitting them across multiple burst transfers (each with its own
+    header), with a final count==0 terminator header per list (per the ESI
+    serial-encoding spec).
+    """
+
+    clk = Clock()
+    rst = Reset()
+
+    parallel_in = InputChannel(parallel_window_type)
+    serial_out = OutputChannel(serial_window_type)
+
+    @generator
+    def build(ports):
+      from .seq import Counter, DownCounter, FIFO as SeqFIFO
+      from .constructs import ControlReg
+
+      one_bc = UInt(bc_bitwidth)(1)
+      depth_bc = UInt(bc_bitwidth)(fifo_depth)
+
+      # ===== Input side: split into (data, metadata) FIFOs. =====
+      par_ready_wire = Wire(Bits(1))
+      par_window, par_valid = ports.parallel_in.unwrap(par_ready_wire)
+      par_struct = par_window.unwrap()
+      par_last = par_struct["last"]
+      par_item = par_struct[list_field_name]
+
+      data_fifo = (None if data_is_zero else SeqFIFO(data_elem_type, fifo_depth,
+                                                     ports.clk, ports.rst))
+      meta_fifo = SeqFIFO(meta_entry_type, meta_fifo_depth, ports.clk,
+                          ports.rst)
+
+      # par_ready: require space in BOTH FIFOs unconditionally (a meta push
+      # may happen on any par_xact, and computing whether one is needed
+      # this cycle would require par_xact -> par_ready -> par_xact comb
+      # loop). The slight throughput penalty is acceptable since meta_fifo
+      # drains at the bulk-transfer rate. With no data FIFO (zero-width
+      # elements), only meta_fifo backpressures.
+      if data_is_zero:
+        par_ready_wire.assign(~meta_fifo.full)
+      else:
+        par_ready_wire.assign(~data_fifo.full & ~meta_fifo.full)
+      par_xact = par_valid & par_ready_wire
+      par_xact_last = par_xact & par_last
+
+      if not data_is_zero:
+        data_fifo.push(par_item, par_xact)
+
+      # Track whether we're currently mid-list (i.e. have seen at least one
+      # item of the current list but not yet its `last`). `at_list_start`
+      # fires on the first par_xact of a new list -- that's where we latch
+      # the static fields the spec says should remain constant.
+      in_list = ControlReg(ports.clk,
+                           ports.rst,
+                           asserts=[par_xact & ~par_last],
+                           resets=[par_xact_last],
+                           name="in_list")
+      at_list_start = par_xact & ~in_list
+
+      # Latch static fields at the start of each list. The spec says these
+      # fields are constant within a list, but we don't trust the producer
+      # blindly: we capture once and then compare for mismatches below.
+      latched_static: Dict[str, Signal] = {}
+      for name in static_field_names:
+        f = par_struct[name]
+        latched_static[name] = f.reg(ports.clk,
+                                     ports.rst,
+                                     ce=at_list_start,
+                                     name=f"latched_{name}")
+
+      # Effective static fields used for the meta entry: on at_list_start
+      # the register hasn't captured yet (it updates at end-of-cycle), so
+      # forward this cycle's value. This matters for single-item lists
+      # where at_list_start and par_xact_last coincide.
+      def effective_static(name: str) -> Signal:
+        return Mux(at_list_start, latched_static[name], par_struct[name])
+
+      # Mismatch detection: on every par_xact except the very first item
+      # of a list, any static field that differs from what we latched at
+      # the start of the list is a spec violation. Count the cycles in
+      # which any field mismatches and report via telemetry.
+      mismatch_any = Bits(1)(0)
+      for name in static_field_names:
+        # `!=` works for any peer-typed Signals.
+        diff = par_struct[name] != latched_static[name]
+        mismatch_any = mismatch_any | diff
+      mismatch_event = par_xact & in_list & mismatch_any
+
+      mismatch_bitwidth = 32
+      mismatch_counter = Counter(mismatch_bitwidth)(clk=ports.clk,
+                                                    rst=ports.rst,
+                                                    clear=Bits(1)(0),
+                                                    increment=mismatch_event)
+      Telemetry.report_signal(
+          ports.clk,
+          ports.rst,
+          AppID("listStaticFieldMismatches"),
+          mismatch_counter.out,
+      )
+
+      # Per-burst item counter: counts items pushed into data_fifo so far
+      # for the current (in-progress) burst. burst_count_wire is the
+      # registered value BEFORE this cycle's push, so the count of items
+      # *including* this cycle's push is burst_count_wire + 1.
+      burst_count_wire = Wire(UInt(bc_bitwidth))
+      next_burst_count = (burst_count_wire + one_bc).as_uint(bc_bitwidth)
+
+      # Push a meta entry whenever a burst boundary occurs:
+      #   - par_xact_last: end-of-list (is_last=1).
+      #   - drain_split:   non-last xact that fills the data FIFO. Without
+      #                    this, a long list with no `last` would stall
+      #                    once data_fifo fills. is_last=0.
+      # The two are mutually exclusive (drain_split requires ~par_last).
+      drain_split = par_xact & ~par_last & (next_burst_count == depth_bc)
+      meta_push_xact = par_xact_last | drain_split
+
+      # Build the meta entry: count snapshot plus the static fields we
+      # latched at the start of the current list (rather than trusting
+      # whatever the producer happens to be presenting at the boundary
+      # cycle).
+      hdr_fields: Dict[str, Signal] = {
+          name: effective_static(name) for name in static_field_names
+      }
+      hdr_fields[count_field_name] = next_burst_count.as_bits(count_bitwidth)
+      hdr_value = header_struct_type(hdr_fields)
+      meta_entry_value = meta_entry_type({
+          "hdr": hdr_value,
+          "is_last": par_xact_last,
+      })
+      meta_fifo.push(meta_entry_value, meta_push_xact)
+
+      # Burst counter: increment on each par_xact, clear on meta_push_xact.
+      # That cycle's item is the last of the burst, and the next burst starts at
+      # 0 so clear needs to override increment.
+      burst_counter = Counter(bc_bitwidth,
+                              increment_on_clear=False)(clk=ports.clk,
+                                                        rst=ports.rst,
+                                                        clear=meta_push_xact,
+                                                        increment=par_xact)
+      burst_count_wire.assign(burst_counter.out)
+
+      # ===== Output side: drain meta + data FIFOs into serial frames. =====
+      # State (2 bits):
+      #   S_IDLE   - waiting for a meta entry; pop one to start a burst.
+      #   S_HDR    - emit the latched header.
+      #   S_DATA   - emit `count` data frames.
+      #   S_FOOTER - emit a count==0 terminator (only if cur_is_last).
+      S_IDLE = Bits(2)(0)
+      S_HDR = Bits(2)(1)
+      S_DATA = Bits(2)(2)
+      S_FOOTER = Bits(2)(3)
+
+      state_wire = Wire(Bits(2))
+      in_idle = state_wire == S_IDLE
+      in_hdr = state_wire == S_HDR
+      in_data = state_wire == S_DATA
+      in_footer = state_wire == S_FOOTER
+
+      # Pop one meta entry when we're idle and meta is available; latch it
+      # into cur_meta so it's stable through HDR/DATA/FOOTER states.
+      meta_pop_rden = Wire(Bits(1))
+      meta_value = meta_fifo.pop(meta_pop_rden)
+      meta_avail = ~meta_fifo.empty
+      arm_burst = in_idle & meta_avail
+      meta_pop_rden.assign(arm_burst)
+
+      cur_meta = meta_value.reg(ports.clk,
+                                ports.rst,
+                                ce=arm_burst,
+                                name="cur_meta")
+      cur_hdr = cur_meta["hdr"]
+      cur_count = cur_hdr[count_field_name].as_uint(count_bitwidth)
+      cur_is_last = cur_meta["is_last"]
+
+      # Footer struct: same static fields as the latched header, count=0.
+      footer_fields: Dict[str, Signal] = {
+          name: cur_hdr[name] for name in static_field_names
+      }
+      footer_fields[count_field_name] = Bits(count_bitwidth)(0)
+      footer_value = header_struct_type(footer_fields)
+
+      # Per-burst counter. `remaining_wire` is driven by the `DownCounter`
+      # instantiated below -- it is predeclared here only because the handshake
+      # and state expressions between here and there need it. Counting down
+      # makes the "last item" test a comparison against a constant on a
+      # registered value, rather than `emitted + 1 == count` -- which would put
+      # a `count_bitwidth`-wide adder and equality inside a single-cycle loop
+      # (the result gates `out_ready`, the state transitions and the counter's
+      # own enables). See the matching comment in `ListWindowToParallel`.
+      #
+      # The test is `== 1` rather than the counter's `is_zero` because the
+      # counter is loaded with the burst's count as it appears in the header.
+      # Loading `count - 1` to use `is_zero` would buy nothing -- both are
+      # compares against a constant -- and would need a subtract on the load
+      # path plus a special case for the `count == 0` terminator.
+      remaining_wire = Wire(UInt(count_bitwidth))
+      last_item_in_burst = remaining_wire == UInt(count_bitwidth)(1)
+
+      # Data FIFO pop. With no data FIFO (zero-width elements), there is
+      # nothing to pop or wait on: data_value is a constant zero-width
+      # struct, and data_valid is unconditionally true.
+      if data_is_zero:
+        data_pop_rden = None
+        data_struct_value = Bits(0)(0).bitcast(data_struct_type)
+        data_valid = Bits(1)(1)
+      else:
+        data_pop_rden = Wire(Bits(1))
+        data_value = data_fifo.pop(data_pop_rden)
+        data_struct_value = data_struct_type({list_field_name: [data_value]})
+        data_valid = ~data_fifo.empty
+
+      # Output union variants.
+      header_union = serial_lowered(("header", cur_hdr))
+      footer_union = serial_lowered(("header", footer_value))
+      data_union = serial_lowered(("data", data_struct_value))
+
+      # Mux the union by current state. The S_IDLE slot is don't-care
+      # since out_valid is deasserted there; we plug in data_union to
+      # avoid an extra distinct constant.
+      out_union = Mux(state_wire, data_union, header_union, data_union,
+                      footer_union)
+      out_window = serial_window_type.wrap(out_union)
+
+      # out_valid:
+      #   - S_HDR / S_FOOTER: always (driven from registers).
+      #   - S_DATA:           when the next item is queued in data_fifo.
+      out_valid = in_hdr | in_footer | (in_data & data_valid)
+      out_chan, out_ready = Channel(serial_window_type).wrap(
+          out_window, out_valid)
+      ports.serial_out = out_chan
+
+      # Transactions.
+      hdr_xact = in_hdr & out_ready
+      data_xact = in_data & data_valid & out_ready
+      burst_done = data_xact & last_item_in_burst
+      footer_xact = in_footer & out_ready
+      if not data_is_zero:
+        data_pop_rden.assign(data_xact)
+
+      # Remaining-counter: load the burst's item count when the burst is armed
+      # (from the same combinational value `cur_meta` latches, so the load and
+      # `cur_hdr` stay in step), and decrement on every non-last data xact.
+      # `arm_burst` and `data_xact` require different states, so the load-over-
+      # decrement priority never comes into play, and the decrement is gated by
+      # `~last_item_in_burst` so the saturation at zero is never reached.
+      remaining_counter = DownCounter(count_bitwidth)(
+          clk=ports.clk,
+          rst=ports.rst,
+          load=arm_burst,
+          load_value=meta_value["hdr"][count_field_name].as_uint(
+              count_bitwidth),
+          decrement=data_xact & ~last_item_in_burst,
+          instance_name="remaining")
+      remaining_wire.assign(remaining_counter.out)
+
+      # Per-state next-state expressions, selected by the current state.
+      # Transitions:
+      #   S_IDLE   -> S_HDR    on arm_burst
+      #   S_HDR    -> S_DATA   on hdr_xact (cur_count is always >= 1, since
+      #                        meta is only pushed on a real boundary that
+      #                        includes at least one item).
+      #   S_DATA   -> S_FOOTER on burst_done & cur_is_last
+      #   S_DATA   -> S_IDLE   on burst_done & ~cur_is_last
+      #   S_FOOTER -> S_IDLE   on footer_xact
+      next_in_idle = Mux(arm_burst, S_IDLE, S_HDR)
+      next_in_hdr = Mux(hdr_xact, S_HDR, S_DATA)
+      next_in_data = Mux(burst_done, S_DATA, Mux(cur_is_last, S_IDLE, S_FOOTER))
+      next_in_footer = Mux(footer_xact, S_FOOTER, S_IDLE)
+      next_state = Mux(state_wire, next_in_idle, next_in_hdr, next_in_data,
+                       next_in_footer)
+      state_reg = next_state.reg(ports.clk,
+                                 ports.rst,
+                                 rst_value=0,
+                                 name="state")
+      state_wire.assign(state_reg)
+
+  return ListWindowToSerial

@@ -152,6 +152,36 @@ firrtl.module @PropertyStringOps() {
   %3 = firrtl.string.concat %0, %1, %2 : !firrtl.string
 }
 
+// CHECK-LABEL: firrtl.module @PropertyPropEq
+firrtl.module @PropertyPropEq() {
+  %0 = firrtl.string "hello"
+  %1 = firrtl.string "world"
+
+  // CHECK: firrtl.prop.eq %0, %1 : !firrtl.string
+  %2 = firrtl.prop.eq %0, %1 : !firrtl.string
+
+  %3 = firrtl.bool true
+  %4 = firrtl.bool false
+
+  // CHECK: firrtl.prop.eq %3, %4 : !firrtl.bool
+  %5 = firrtl.prop.eq %3, %4 : !firrtl.bool
+
+  %6 = firrtl.integer 42
+  %7 = firrtl.integer 0
+
+  // CHECK: firrtl.prop.eq %6, %7 : !firrtl.integer
+  %8 = firrtl.prop.eq %6, %7 : !firrtl.integer
+
+  // CHECK: firrtl.bool.and %3, %4
+  %9 = firrtl.bool.and %3, %4
+
+  // CHECK: firrtl.bool.or %3, %4
+  %10 = firrtl.bool.or %3, %4
+
+  // CHECK: firrtl.bool.xor %3, %4
+  %11 = firrtl.bool.xor %3, %4
+}
+
 // CHECK-LABEL: firrtl.module @PropertyListOps
 firrtl.module @PropertyListOps() {
   %0 = firrtl.integer 0
@@ -204,6 +234,19 @@ firrtl.extmodule @SimulationTopWithProps(
   out success: !firrtl.uint<1>,
   in someProp: !firrtl.string,
   out anotherProp: !firrtl.integer
+)
+
+// Simulation targets may have additional ports that are composed only
+// of non-hardware types
+firrtl.simulation @mySimulationTestWithPropAgg, @SimulationTopWithPropAgg {}
+
+firrtl.extmodule @SimulationTopWithPropAgg(
+  in clock: !firrtl.clock,
+  in init: !firrtl.uint<1>,
+  out done: !firrtl.uint<1>,
+  out success: !firrtl.uint<1>,
+  out status: !firrtl.openbundle<flag: bool, label: string>,
+  out listOfProps: !firrtl.openvector<string, 2>
 )
 
 firrtl.module @Contracts(in %a: !firrtl.uint<42>, in %b: !firrtl.bundle<x: uint<1337>>) {
@@ -395,6 +438,44 @@ firrtl.module @WireDomainOperands(
 
   // CHECK: %w_multi = firrtl.wire domains[%A, %B] : !firrtl.uint<16> domains[!firrtl.domain<@ClockDomain()>, !firrtl.domain<@PowerDomain(name: !firrtl.string, voltage: !firrtl.integer, alwaysOn: !firrtl.bool)>]
   %w_multi = firrtl.wire domains[%A, %B] : !firrtl.uint<16> domains[!firrtl.domain<@ClockDomain()>, !firrtl.domain<@PowerDomain(name: !firrtl.string, voltage: !firrtl.integer, alwaysOn: !firrtl.bool)>]
+}
+
+// In a class body.
+// CHECK-LABEL: firrtl.class @AssertInClass
+firrtl.class @AssertInClass(in %cond : !firrtl.bool) {
+  // CHECK-NEXT: %0 = firrtl.string "must be true"
+  // CHECK-NEXT: firrtl.property_assert %cond, %0 : !firrtl.bool
+  %0 = firrtl.string "must be true"
+  firrtl.property_assert %cond, %0 : !firrtl.bool
+}
+
+// In a module body.
+// CHECK-LABEL: firrtl.module @AssertInModule
+firrtl.module @AssertInModule(in %cond : !firrtl.bool) {
+  // CHECK-NEXT: %0 = firrtl.string "module invariant"
+  // CHECK-NEXT: firrtl.property_assert %cond, %0 : !firrtl.bool
+  %0 = firrtl.string "module invariant"
+  firrtl.property_assert %cond, %0 : !firrtl.bool
+}
+
+// Round-trip test for the `initial` time-zero simulation value attribute on
+// `firrtl.reg` and `firrtl.regreset`.
+// CHECK-LABEL: firrtl.module @RegInitial
+firrtl.module @RegInitial(in %clock: !firrtl.clock, in %reset: !firrtl.uint<1>,
+                          in %d: !firrtl.uint<8>, out %q: !firrtl.uint<8>) {
+  // CHECK: %r = firrtl.reg %clock {initial = 5 : ui8} : !firrtl.clock, !firrtl.uint<8>
+  %r = firrtl.reg %clock {initial = 5 : ui8} : !firrtl.clock, !firrtl.uint<8>
+  firrtl.matchingconnect %r, %d : !firrtl.uint<8>
+
+  %c7 = firrtl.constant 7 : !firrtl.uint<8>
+  // CHECK: %s = firrtl.regreset %clock, %reset, %c7_ui8 {initial = 0 : ui8}
+  %s = firrtl.regreset %clock, %reset, %c7 {initial = 0 : ui8} : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<8>, !firrtl.uint<8>
+
+  // Signed register with signed initial value.
+  // CHECK: %t = firrtl.reg %clock {initial = -1 : si8} : !firrtl.clock, !firrtl.sint<8>
+  %t = firrtl.reg %clock {initial = -1 : si8} : !firrtl.clock, !firrtl.sint<8>
+
+  firrtl.matchingconnect %q, %r : !firrtl.uint<8>
 }
 
 }

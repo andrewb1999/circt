@@ -15,6 +15,7 @@
 
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/Synth/SynthOpInterfaces.h"
 #include "circt/Dialect/Synth/SynthOps.h"
 #include "circt/Dialect/Synth/Transforms/CutRewriter.h"
 #include "circt/Dialect/Synth/Transforms/SynthPasses.h"
@@ -55,60 +56,42 @@ using namespace circt::synth;
 namespace {
 enum class EquivResult { Proved, Disproved, Unknown };
 
-std::unique_ptr<IncrementalSATSolver>
-createFunctionalReductionSATSolver(llvm::StringRef backend) {
-  if (backend == "auto") {
-    if (auto solver = createCadicalSATSolver())
-      return solver;
-    return createZ3SATSolver();
-  }
-  if (backend == "cadical")
-    return createCadicalSATSolver();
-  if (backend == "z3")
-    return createZ3SATSolver();
-  return {};
-}
-
 class FunctionalReductionSATBuilder {
 public:
   FunctionalReductionSATBuilder(IncrementalSATSolver &solver,
                                 llvm::DenseMap<Value, int> &satVars,
-                                llvm::DenseSet<Value> &encodedValues,
-                                int &nextFreshVar);
+                                llvm::DenseSet<Value> &encodedValues);
 
-  EquivResult verify(Value lhs, Value rhs);
+  // If inverted, negates rhs in the SAT encoding to check lhs == NOT(rhs).
+  EquivResult verify(Value lhs, Value rhs, bool inverted);
 
 private:
   int getOrCreateVar(Value value);
   // Create a fresh SAT variable for an intermediate Boolean subexpression that
   // does not correspond to an MLIR value.
   int createAuxVar();
-  int getLiteral(Value value, bool inverted = false);
-  void addAndClauses(int outVar, llvm::ArrayRef<int> inputLits);
-  void addOrClauses(int outVar, llvm::ArrayRef<int> inputLits);
-  void addXorClauses(int outVar, int lhsLit, int rhsLit);
-  void addParityClauses(int outVar, llvm::ArrayRef<int> inputLits);
-  void addMajorityClauses(int outVar, llvm::ArrayRef<int> inputLits);
+  SmallVector<int> getOperandVars(ValueRange operands);
   void encodeValue(Value value);
 
   IncrementalSATSolver &solver;
   llvm::DenseMap<Value, int> &satVars;
   llvm::DenseSet<Value> &encodedValues;
-  int &nextFreshVar;
 };
 
 static bool isFunctionalReductionSimulatableOp(Operation *op) {
-  return isa<aig::AndInverterOp, mig::MajorityInverterOp, comb::AndOp,
-             comb::OrOp, comb::XorOp>(op);
+  return isa<BooleanLogicOpInterface, comb::AndOp, comb::OrOp, comb::XorOp>(op);
 }
 
-EquivResult FunctionalReductionSATBuilder::verify(Value lhs, Value rhs) {
+EquivResult FunctionalReductionSATBuilder::verify(Value lhs, Value rhs,
+                                                  bool inverted) {
   encodeValue(lhs);
   encodeValue(rhs);
 
   int lhsVar = getOrCreateVar(lhs);
   int rhsVar = getOrCreateVar(rhs);
 
+  if (inverted)
+    rhsVar = -rhsVar;
   // Check the two halves of the XOR miter separately. If either assignment is
   // satisfiable, the solver found a distinguishing input pattern.
   solver.assume(lhsVar);
@@ -136,133 +119,15 @@ int FunctionalReductionSATBuilder::getOrCreateVar(Value value) {
   return it->second;
 }
 
-int FunctionalReductionSATBuilder::createAuxVar() {
-  int freshVar = ++nextFreshVar;
-  solver.reserveVars(freshVar);
-  return freshVar;
-}
+int FunctionalReductionSATBuilder::createAuxVar() { return solver.newVar(); }
 
-int FunctionalReductionSATBuilder::getLiteral(Value value, bool inverted) {
-  int lit = getOrCreateVar(value);
-  return inverted ? -lit : lit;
-}
-
-void FunctionalReductionSATBuilder::addAndClauses(
-    int outVar, llvm::ArrayRef<int> inputLits) {
-  // Tseitin encoding (https://en.wikipedia.org/wiki/Tseytin_transformation)
-  // for `outVar <=> and(inputLits)`. This keeps the CNF linear in the gate size
-  // while preserving satisfiability.
-  for (int lit : inputLits)
-    solver.addClause({-outVar, lit});
-
-  SmallVector<int> clause;
-  for (int lit : inputLits)
-    clause.push_back(-lit);
-  clause.push_back(outVar);
-  solver.addClause(clause);
-}
-
-void FunctionalReductionSATBuilder::addOrClauses(
-    int outVar, llvm::ArrayRef<int> inputLits) {
-  // Encode `outVar <=> or(inputLits)`.
-  //
-  // `(-lit v outVar)` for each input enforces `lit -> outVar`, i.e. any true
-  // input forces the OR result high.
-  for (int lit : inputLits)
-    solver.addClause({-lit, outVar});
-
-  SmallVector<int> clause;
-  clause.reserve(inputLits.size() + 1);
-  // `(-outVar v lit0 v lit1 ...)` enforces `outVar -> (lit0 v lit1 ...)`.
-  // Together these clauses make `outVar` exactly the OR of the inputs.
-  clause.push_back(-outVar);
-  clause.append(inputLits.begin(), inputLits.end());
-  solver.addClause(clause);
-}
-
-void FunctionalReductionSATBuilder::addXorClauses(int outVar, int lhsLit,
-                                                  int rhsLit) {
-  // Encode `outVar <=> (lhsLit xor rhsLit)` with the four satisfying rows of
-  // the 2-input XOR truth table. This is the standard definitional CNF for a
-  // binary XOR.
-  solver.addClause({-lhsLit, -rhsLit, -outVar});
-  solver.addClause({lhsLit, rhsLit, -outVar});
-  solver.addClause({lhsLit, -rhsLit, outVar});
-  solver.addClause({-lhsLit, rhsLit, outVar});
-}
-
-void FunctionalReductionSATBuilder::addParityClauses(
-    int outVar, llvm::ArrayRef<int> inputLits) {
-  assert(!inputLits.empty() && "parity requires at least one input");
-  if (inputLits.size() == 1) {
-    solver.addClause({-outVar, inputLits.front()});
-    solver.addClause({outVar, -inputLits.front()});
-    return;
-  }
-
-  int accumulatedLit = inputLits.front();
-  // Variadic XOR does not have a compact direct CNF encoding like AND/OR, so
-  // encode it as a chain of binary XORs and give each intermediate result its
-  // own auxiliary SAT variable.
-  for (auto [index, lit] : llvm::enumerate(inputLits.drop_front())) {
-    bool isLast = index + 2 == inputLits.size();
-    int outLit = isLast ? outVar : createAuxVar();
-    addXorClauses(outLit, accumulatedLit, lit);
-    accumulatedLit = outLit;
-  }
-}
-
-static void enumerateLiteralSubsets(
-    llvm::ArrayRef<int> inputLits, size_t subsetSize,
-    llvm::function_ref<void(llvm::ArrayRef<int>)> callback) {
-  SmallVector<int> subset;
-  subset.reserve(subsetSize);
-  std::function<void(size_t, size_t)> visit = [&](size_t start,
-                                                  size_t remaining) {
-    if (remaining == 0) {
-      callback(subset);
-      return;
-    }
-    for (size_t i = start; i + remaining <= inputLits.size(); ++i) {
-      subset.push_back(inputLits[i]);
-      visit(i + 1, remaining - 1);
-      subset.pop_back();
-    }
-  };
-  visit(0, subsetSize);
-}
-
-void FunctionalReductionSATBuilder::addMajorityClauses(
-    int outVar, llvm::ArrayRef<int> inputLits) {
-  assert(inputLits.size() % 2 == 1 &&
-         "majority requires an odd number of inputs");
-  size_t threshold = inputLits.size() / 2 + 1;
-
-  // If any threshold-sized subset is all true, the majority output must be
-  // true as well. For 5 inputs, these are all 3-input subsets.
-  enumerateLiteralSubsets(inputLits, threshold,
-                          [&](llvm::ArrayRef<int> subset) {
-                            SmallVector<int> clause;
-                            clause.reserve(subset.size() + 1);
-                            for (int lit : subset)
-                              clause.push_back(-lit);
-                            clause.push_back(outVar);
-                            solver.addClause(clause);
-                          });
-
-  // Conversely, if any threshold-sized subset is all false, the majority
-  // output must be false. Writing that implication in positive-literal form is
-  // equivalent to `outVar ->` not(all literals in the subset are false).
-  // For example with 3-input majority, `(-outVar v a v b)` prevents
-  // `outVar = 1` when both `a` and `b` are 0.
-  enumerateLiteralSubsets(inputLits, threshold,
-                          [&](llvm::ArrayRef<int> subset) {
-                            SmallVector<int> clause;
-                            clause.reserve(subset.size() + 1);
-                            clause.push_back(-outVar);
-                            clause.append(subset.begin(), subset.end());
-                            solver.addClause(clause);
-                          });
+SmallVector<int>
+FunctionalReductionSATBuilder::getOperandVars(ValueRange operands) {
+  SmallVector<int> vars;
+  vars.reserve(operands.size());
+  for (auto operand : operands)
+    vars.push_back(getOrCreateVar(operand));
+  return vars;
 }
 
 void FunctionalReductionSATBuilder::encodeValue(Value value) {
@@ -309,36 +174,28 @@ void FunctionalReductionSATBuilder::encodeValue(Value value) {
 
     encodedValues.insert(current);
     int outVar = getOrCreateVar(current);
+    auto addClause = [&](llvm::ArrayRef<int> clause) {
+      solver.addClause(clause);
+    };
 
-    SmallVector<int> inputLits;
-    inputLits.reserve(op->getNumOperands());
     TypeSwitch<Operation *>(op)
-        .Case<aig::AndInverterOp>([&](auto andOp) {
-          for (auto [input, inverted] :
-               llvm::zip(andOp.getInputs(), andOp.getInverted()))
-            inputLits.push_back(getLiteral(input, inverted));
-          addAndClauses(outVar, inputLits);
-        })
-        .Case<mig::MajorityInverterOp>([&](auto majOp) {
-          for (auto [input, inverted] :
-               llvm::zip(majOp.getInputs(), majOp.getInverted()))
-            inputLits.push_back(getLiteral(input, inverted));
-          addMajorityClauses(outVar, inputLits);
+        .Case<BooleanLogicOpInterface>([&](auto logicOp) {
+          auto inputVars = getOperandVars(logicOp.getInputs());
+          logicOp.emitCNF(outVar, inputVars, addClause,
+                          [&]() { return createAuxVar(); });
         })
         .Case<comb::AndOp>([&](auto andOp) {
-          for (auto input : andOp.getInputs())
-            inputLits.push_back(getLiteral(input));
-          addAndClauses(outVar, inputLits);
+          auto inputLits = getOperandVars(andOp.getInputs());
+          circt::addAndClauses(outVar, inputLits, addClause);
         })
         .Case<comb::OrOp>([&](auto orOp) {
-          for (auto input : orOp.getInputs())
-            inputLits.push_back(getLiteral(input));
-          addOrClauses(outVar, inputLits);
+          auto inputLits = getOperandVars(orOp.getInputs());
+          circt::addOrClauses(outVar, inputLits, addClause);
         })
         .Case<comb::XorOp>([&](auto xorOp) {
-          for (auto input : xorOp.getInputs())
-            inputLits.push_back(getLiteral(input));
-          addParityClauses(outVar, inputLits);
+          auto inputLits = getOperandVars(xorOp.getInputs());
+          circt::addParityClauses(outVar, inputLits, addClause,
+                                  [&]() { return createAuxVar(); });
         })
         .Default(
             [](Operation *) { llvm_unreachable("unexpected supported op"); });
@@ -389,7 +246,7 @@ private:
   // Test transformation helpers.
   static Attribute getTestEquivClass(Value value);
   static bool matchesTestEquivClass(Value lhs, Value rhs);
-  EquivResult verifyEquivalence(Value lhs, Value rhs);
+  EquivResult verifyEquivalence(Value lhs, Value rhs, bool inverted);
 
   // Module being processed
   hw::HWModuleOp module;
@@ -409,28 +266,27 @@ private:
   // Simulation signatures: value -> APInt simulation result
   llvm::DenseMap<Value, llvm::APInt> simSignatures;
 
-  // Equivalence candidates: groups of values with identical simulation
-  // signatures
-  SmallVector<SmallVector<Value>> equivCandidates;
+  // Equivalence candidates: groups of values with identical or inverted
+  // simulation signatures, tracked with an inversion flag
+  SmallVector<SmallVector<std::pair<Value, bool>>> equivCandidates;
 
-  // Proven equivalences: representative -> proven equivalent members.
-  llvm::MapVector<Value, SmallVector<Value>> provenEquivalences;
+  // Proven equivalences: representative -> proven equivalent members with
+  // inversion flag indicating whether the member is inverted relative to
+  // representative
+  llvm::MapVector<Value, SmallVector<std::pair<Value, bool>>>
+      provenEquivalences;
 
   std::unique_ptr<IncrementalSATSolver> satSolver;
   std::unique_ptr<FunctionalReductionSATBuilder> satBuilder;
   llvm::DenseMap<Value, int> satVars;
   llvm::DenseSet<Value> encodedValues;
-  // Monotonic counter for auxiliary SAT variables introduced by definitional
-  // CNF encodings, currently used for variadic XOR.
-  int nextFreshVar = 0;
   Stats stats;
 };
 
 FunctionalReductionSATBuilder::FunctionalReductionSATBuilder(
     IncrementalSATSolver &solver, llvm::DenseMap<Value, int> &satVars,
-    llvm::DenseSet<Value> &encodedValues, int &nextFreshVar)
-    : solver(solver), satVars(satVars), encodedValues(encodedValues),
-      nextFreshVar(nextFreshVar) {}
+    llvm::DenseSet<Value> &encodedValues)
+    : solver(solver), satVars(satVars), encodedValues(encodedValues) {}
 
 Attribute FunctionalReductionSolver::getTestEquivClass(Value value) {
   Operation *op = value.getDefiningOp();
@@ -445,7 +301,9 @@ bool FunctionalReductionSolver::matchesTestEquivClass(Value lhs, Value rhs) {
   return lhsClass && rhsClass && lhsClass == rhsClass;
 }
 
-EquivResult FunctionalReductionSolver::verifyEquivalence(Value lhs, Value rhs) {
+EquivResult FunctionalReductionSolver::verifyEquivalence(Value lhs, Value rhs,
+                                                         bool inverted) {
+
   if (testTransformation) {
     if (matchesTestEquivClass(lhs, rhs))
       return EquivResult::Proved;
@@ -454,7 +312,7 @@ EquivResult FunctionalReductionSolver::verifyEquivalence(Value lhs, Value rhs) {
   assert(satBuilder && "SAT builder must be initialized before verification");
   // SAT-based equivalence checking builds a miter for the two candidate nodes
   // and proves that no input assignment can make them differ.
-  return satBuilder->verify(lhs, rhs);
+  return satBuilder->verify(lhs, rhs, inverted);
 }
 
 void FunctionalReductionSolver::initializeSATState() {
@@ -465,11 +323,10 @@ void FunctionalReductionSolver::initializeSATState() {
   satVars.reserve(allValues.size());
   for (auto [index, value] : llvm::enumerate(allValues))
     satVars[value] = index + 1;
-  nextFreshVar = allValues.size();
   satSolver->reserveVars(allValues.size());
 
   satBuilder = std::make_unique<FunctionalReductionSATBuilder>(
-      *satSolver, satVars, encodedValues, nextFreshVar);
+      *satSolver, satVars, encodedValues);
 }
 
 //===----------------------------------------------------------------------===//
@@ -477,6 +334,14 @@ void FunctionalReductionSolver::initializeSATState() {
 //===----------------------------------------------------------------------===//
 
 void FunctionalReductionSolver::collectValues() {
+
+  // Seed zero constants so nodes can be merged
+  // if input IR does not contain constants already.
+  OpBuilder builder(module.getContext());
+  builder.setInsertionPointToStart(module.getBodyBlock());
+  auto i1Type = builder.getIntegerType(1);
+  hw::ConstantOp::create(builder, module.getLoc(), i1Type, 0);
+
   // Collect block arguments (primary inputs) that are i1
   for (auto arg : module.getBodyBlock()->getArguments()) {
     if (arg.getType().isInteger(1)) {
@@ -486,7 +351,7 @@ void FunctionalReductionSolver::collectValues() {
   }
 
   // Walk operations and collect i1 results
-  // - AIG/MIG operations: add to allValues for simulation
+  // - AIG operations: add to allValues for simulation
   // - Unknown operations: treat as inputs (assign random patterns)
   module.walk([&](Operation *op) {
     for (auto result : op->getResults()) {
@@ -545,11 +410,10 @@ llvm::APInt FunctionalReductionSolver::simulateValue(Value v) {
   if (!op)
     return simSignatures.at(v);
   return llvm::TypeSwitch<Operation *, llvm::APInt>(op)
-      .Case<mig::MajorityInverterOp, aig::AndInverterOp>([&](auto op) {
-        SmallVector<llvm::APInt> inputSigs;
-        for (auto input : op.getInputs())
-          inputSigs.push_back(simSignatures.at(input));
-        return op.evaluate(inputSigs);
+      .Case<BooleanLogicOpInterface>([&](auto op) {
+        return op.evaluateBooleanLogic([&](unsigned i) -> const APInt & {
+          return simSignatures.at(op.getInput(i));
+        });
       })
       .Case<comb::AndOp>([&](auto op) {
         APInt result = APInt::getAllOnes(numPatterns);
@@ -585,16 +449,28 @@ llvm::APInt FunctionalReductionSolver::simulateValue(Value v) {
 //===----------------------------------------------------------------------===//
 
 void FunctionalReductionSolver::buildEquivalenceClasses() {
-  // Map from signature to list of values
-  llvm::MapVector<llvm::APInt, SmallVector<Value>> sigGroups;
-
-  for (auto value : allValues)
-    sigGroups[simSignatures.at(value)].push_back(value);
+  // Map from canonical signature to list of {value, inverted pairs}
+  // Inverted signals share the same canonical signature since inversion
+  // is zero cost in synthesis
+  llvm::MapVector<llvm::APInt, SmallVector<std::pair<Value, bool>>> sigGroups;
+  for (auto value : allValues) {
+    auto signature = simSignatures.at(value);
+    bool inverted = false;
+    if (signature.isNegative()) {
+      inverted = true;
+      signature.flipAllBits();
+    }
+    sigGroups[signature].push_back({value, inverted});
+  }
 
   // Build equivalence candidates for groups with >1 member.
+  // Re-normalize so inverted is relative to representative (first member)
   for (auto &[hash, members] : sigGroups) {
     if (members.size() <= 1)
       continue;
+    bool repInverted = members.front().second;
+    for (auto &[_, inv] : members)
+      inv ^= repInverted;
     equivCandidates.push_back(std::move(members));
   }
   stats.numEquivClasses = equivCandidates.size();
@@ -619,14 +495,18 @@ void FunctionalReductionSolver::verifyCandidates() {
   for (auto &members : equivCandidates) {
     if (members.empty())
       continue;
-    auto representative = members.front();
+    auto [representative, repInversion] = members.front();
+    assert(!repInversion && "representative must not be inverted");
+    (void)repInversion;
     auto &provenMembers = provenEquivalences[representative];
-    // Representative is the canonical node for this class.
-    for (auto member : llvm::ArrayRef<Value>(members).drop_front()) {
-      EquivResult result = verifyEquivalence(representative, member);
+    // Representative is the canonical node for this class. Members can be
+    // inverted relative to the representative, tracked by the inversion flag
+    for (auto [member, inverted] :
+         llvm::ArrayRef<std::pair<Value, bool>>(members).drop_front()) {
+      EquivResult result = verifyEquivalence(representative, member, inverted);
       if (result == EquivResult::Proved) {
         stats.numProvedEquiv++;
-        provenMembers.push_back(member);
+        provenMembers.push_back({member, inverted});
       } else if (result == EquivResult::Disproved) {
         stats.numDisprovedEquiv++;
         // TODO: Refine equivalence classes based on counterexamples from SAT
@@ -650,22 +530,153 @@ void FunctionalReductionSolver::mergeEquivalentNodes() {
   if (provenEquivalences.empty())
     return;
 
+  // Build all replacement IR first, then perform use rewrites in a second
+  // phase. This keeps `isBeforeInBlock` queries anchored to the final block
+  // order instead of an order that is still being mutated by insertion.
+  struct PlannedMember {
+    Value original;
+    bool inverted;
+    aig::AndInverterOp operandInverter;
+  };
+  struct MergeRewritePlan {
+    Value representative;
+    SmallVector<PlannedMember> members;
+    // Members which are at risk of reaching their representative
+    SmallVector<PlannedMember> reachableMembers;
+    synth::ChoiceOp choice;
+    aig::AndInverterOp choiceNot;
+  };
+
   mlir::OpBuilder builder(module.getContext());
-  for (auto &provenEquivSet : provenEquivalences) {
+  auto replaceDominatedUses =
+      [](Value from, Value to,
+         llvm::function_ref<bool(Operation *)> shouldReplaceOwner) {
+        auto *defOp = to.getDefiningOp();
+        assert(defOp && "replacement value must be defined by an operation");
+        from.replaceUsesWithIf(to, [&](OpOperand &use) {
+          auto *user = use.getOwner();
+          // Restrict rewrites to uses after the replacement value's definition
+          // in the same block so merging cannot introduce use-before-def edges
+          // or SSA cycles.
+          return shouldReplaceOwner(user) &&
+                 user->getBlock() == defOp->getBlock();
+        });
+      };
+
+  DenseSet<Value> reachable;
+  auto visitFrom = [&](Value start) {
+    SmallVector<Value> stack;
+    stack.push_back(start);
+    while (!stack.empty()) {
+      Value current = stack.pop_back_val();
+      if (!reachable.insert(current).second)
+        continue;
+      for (Operation *user : current.getUsers())
+        if (isLogicNetworkOp(user))
+          for (Value result : user->getResults())
+            stack.push_back(result);
+    }
+  };
+
+  SmallVector<MergeRewritePlan> rewritePlans;
+  rewritePlans.reserve(provenEquivalences.size());
+  for (auto provenEquivSet : provenEquivalences) {
     auto &[representative, members] = provenEquivSet;
     if (members.empty())
       continue;
+    // Mark all values reachable from representative before checking members.
+    visitFrom(representative);
+
+    // Greedily filter for members that can create a cycle with representative
+    SmallVector<std::pair<Value, bool>> safeMembers;
+    SmallVector<PlannedMember> plannedReachable;
+    for (auto [member, inverted] : members) {
+      if (reachable.count(member)) {
+        plannedReachable.push_back({member, inverted, {}});
+        continue;
+      }
+      visitFrom(member); // Visit users
+      safeMembers.push_back({member, inverted});
+    }
+
+    if (safeMembers.empty())
+      continue;
+
+    builder.setInsertionPointAfterValue(safeMembers.back().first);
+
     SmallVector<Value> operands;
-    operands.reserve(members.size() + 1);
+    operands.reserve(safeMembers.size() + 1);
     operands.push_back(representative);
-    operands.append(members);
-    builder.setInsertionPointAfterValue(members.back());
+
+    SmallVector<PlannedMember> plannedMembers;
+    plannedMembers.reserve(safeMembers.size());
+    bool hasInvertedMember = false;
+    for (auto [member, inverted] : safeMembers) {
+      auto &planned =
+          plannedMembers.emplace_back(PlannedMember{member, inverted, {}});
+      if (!inverted) {
+        operands.push_back(member);
+        continue;
+      }
+      hasInvertedMember = true;
+      // If the member is inverted relative to the representative, we
+      // create an inverter for the choice operand
+      planned.operandInverter =
+          aig::AndInverterOp::create(builder, member.getLoc(), member, true);
+      operands.push_back(planned.operandInverter.getResult());
+    }
+
     auto choice = synth::ChoiceOp::create(builder, representative.getLoc(),
                                           representative.getType(), operands);
-    stats.numMergedNodes += members.size() + 1;
-    representative.replaceAllUsesExcept(choice, choice);
-    for (auto value : members)
-      value.replaceAllUsesExcept(choice, choice);
+
+    // If there is an inverted member, we need to create an inverter for the
+    // choice result as well
+    auto choiceNot = !hasInvertedMember
+                         ? nullptr
+                         : aig::AndInverterOp::create(builder, choice.getLoc(),
+                                                      choice, true);
+
+    stats.numMergedNodes += safeMembers.size() + 1;
+    rewritePlans.push_back({representative, std::move(plannedMembers),
+                            std::move(plannedReachable), choice, choiceNot});
+  }
+
+  for (auto &plan : rewritePlans) {
+    auto replaceValue = [&](const PlannedMember &member) {
+      if (member.inverted)
+        replaceDominatedUses(member.original, plan.choiceNot,
+                             [&](Operation *user) {
+                               // Do not rewrite the freshly created operand
+                               // inverter or the choice result inverter. This
+                               // avoids creating an immediate cycle when
+                               // merging an inverted node into its
+                               // representative.
+                               return user != member.operandInverter &&
+                                      user != plan.choiceNot.getOperation();
+                             });
+      else
+        replaceDominatedUses(member.original, plan.choice,
+                             [&](Operation *user) {
+                               return user != plan.choice.getOperation();
+                             });
+    };
+
+    replaceDominatedUses(
+        plan.representative, plan.choice,
+        [&](Operation *user) { return user != plan.choice.getOperation(); });
+    for (const auto &member : plan.members)
+      replaceValue(member);
+
+    // Reachable members are redundant here so either replace their uses with
+    // choice or erase if they have no uses left.
+    for (auto &member : plan.reachableMembers) {
+      member.original.replaceUsesWithIf(plan.choice, [&](OpOperand &use) {
+        auto *user = use.getOwner();
+        return user->getBlock() == plan.choice->getBlock();
+      });
+      if (member.original.use_empty())
+        member.original.getDefiningOp()->erase();
+    }
   }
 
   LLVM_DEBUG(llvm::dbgs() << "FunctionalReduction: Merged "
@@ -722,6 +733,13 @@ FunctionalReductionSolver::run() {
   // Phase 4: Merge equivalent nodes
   mergeEquivalentNodes();
 
+  // Re-sort after merging to restore topological order after choice insertion.
+  if (failed(circt::synth::topologicallySortLogicNetwork(module))) {
+    module->emitError()
+        << "FunctionalReduction: Failed to topologically sort logic network";
+    return failure();
+  }
+
   LLVM_DEBUG(llvm::dbgs() << "FunctionalReduction: Complete. Stats:\n"
                           << "  Equivalence classes: " << stats.numEquivClasses
                           << "\n"
@@ -767,7 +785,7 @@ struct FunctionalReductionPass
 
     std::unique_ptr<IncrementalSATSolver> satSolver;
     if (!testTransformation) {
-      satSolver = createFunctionalReductionSATSolver(this->satSolver);
+      satSolver = createSATSolver(this->satSolver);
       if (!satSolver) {
         module.emitError() << "unsupported or unavailable SAT solver '"
                            << this->satSolver

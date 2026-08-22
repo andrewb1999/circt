@@ -19,6 +19,7 @@
 #include "circt/Dialect/Sim/SimDialect.h"
 #include "circt/Dialect/Sim/SimTypes.h"
 #include "circt/Support/BuilderUtils.h"
+#include "circt/Support/ProceduralRegionTrait.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/SymbolTable.h"
@@ -39,6 +40,8 @@ namespace sim {
 /// Returns the value operand of a value formatting operation.
 /// Returns a null value for all other operations.
 static inline mlir::Value getFormattedValue(mlir::Operation *fmtOp) {
+  if (auto fmt = llvm::dyn_cast_or_null<circt::sim::FormatStringOp>(fmtOp))
+    return fmt.getValue();
   if (auto fmt = llvm::dyn_cast_or_null<circt::sim::FormatBinOp>(fmtOp))
     return fmt.getValue();
   if (auto fmt = llvm::dyn_cast_or_null<circt::sim::FormatDecOp>(fmtOp))

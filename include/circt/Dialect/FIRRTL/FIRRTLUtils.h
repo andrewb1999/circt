@@ -16,6 +16,7 @@
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 namespace circt {
 namespace hw {
@@ -24,8 +25,13 @@ struct InnerSymbolNamespace;
 
 namespace firrtl {
 /// Emit a connect between two values.
-void emitConnect(OpBuilder &builder, Location loc, Value lhs, Value rhs);
-void emitConnect(ImplicitLocOpBuilder &builder, Value lhs, Value rhs);
+void emitConnect(OpBuilder &builder, Location loc, Value lhs, Value rhs,
+                 bool warnOnTruncation = false);
+void emitConnect(ImplicitLocOpBuilder &builder, Value lhs, Value rhs,
+                 bool warnOnTruncation = false);
+void emitConnect(ImplicitLocOpBuilder &builder, Value lhs, Value rhs,
+                 llvm::function_ref<Location()> getDiagLoc,
+                 bool warnOnTruncation = false);
 
 /// Utiility for generating a constant attribute.
 IntegerAttr getIntAttr(Type type, const APInt &value);
@@ -63,9 +69,6 @@ Value getModuleScopedDriver(Value val, bool lookThroughWires,
 class TieOffCache {
 public:
   TieOffCache(ImplicitLocOpBuilder &builder) : builder(builder) {}
-
-  /// Get or create an InvalidValueOp for the given base type.
-  Value getInvalid(FIRRTLBaseType type);
 
   /// Get or create an UnknownValueOp for the given property type.
   Value getUnknown(PropertyType type);
@@ -341,13 +344,6 @@ parseFormatString(mlir::OpBuilder &builder, mlir::Location loc,
                   llvm::ArrayRef<mlir::Value> specOperands,
                   mlir::StringAttr &formatStringResult,
                   llvm::SmallVectorImpl<mlir::Value> &operands);
-
-//===----------------------------------------------------------------------===//
-// File utilities
-//===----------------------------------------------------------------------===//
-
-/// Truncate `a` to the common prefix of `a` and `b`.
-void makeCommonPrefix(SmallString<64> &a, StringRef b);
 
 //===----------------------------------------------------------------------===//
 // Object related utilities

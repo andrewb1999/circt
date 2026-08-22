@@ -19,6 +19,7 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/MLIRContext.h"
@@ -544,12 +545,17 @@ static FrozenRewritePatternSet loadPatterns(MLIRContext &context) {
 static LogicalResult
 getReachableStates(llvm::SetVector<size_t> &visitableStates,
                    HWModuleOp moduleOp, size_t currentStateIndex,
-                   SmallVector<seq::CompRegOp> registers, OpBuilder opBuilder,
-                   bool isInitialState) {
+                   SmallVector<seq::CompRegOp> registers) {
+
+  // Clone into an isolated mlir::ModuleOp to avoid violating symbol uniqueness
+  // verifier conditions (which would violate pattern invariants)
+  mlir::OwningOpRef<mlir::ModuleOp> analysisModule =
+      mlir::ModuleOp::create(moduleOp.getLoc());
+  OpBuilder b(moduleOp.getContext());
+  b.setInsertionPointToStart(analysisModule->getBody());
 
   IRMapping mapping;
-  auto clonedBody =
-      llvm::dyn_cast<HWModuleOp>(opBuilder.clone(*moduleOp, mapping));
+  auto clonedBody = llvm::dyn_cast<HWModuleOp>(b.clone(*moduleOp, mapping));
 
   llvm::MapVector<Value, int> stateMap =
       intToRegMap(registers, currentStateIndex);
@@ -563,11 +569,10 @@ getReachableStates(llvm::SetVector<size_t> &visitableStates,
     Operation *clonedRegOp = clonedRegValue.getDefiningOp();
     auto reg = cast<seq::CompRegOp>(clonedRegOp);
     Type constantType = reg.getType();
-    IntegerAttr constantAttr =
-        opBuilder.getIntegerAttr(constantType, constStateValue);
-    opBuilder.setInsertionPoint(clonedRegOp);
+    IntegerAttr constantAttr = b.getIntegerAttr(constantType, constStateValue);
+    b.setInsertionPoint(clonedRegOp);
     auto otherStateConstant =
-        hw::ConstantOp::create(opBuilder, reg.getLoc(), constantAttr);
+        hw::ConstantOp::create(b, reg.getLoc(), constantAttr);
     // If the register input is self-referential (input == output), use the
     // constant we're replacing it with. Otherwise, the value would become
     // dangling after we erase the register.
@@ -579,9 +584,21 @@ getReachableStates(llvm::SetVector<size_t> &visitableStates,
     clonedRegValue.replaceAllUsesWith(otherStateConstant.getResult());
     reg.erase();
   }
-  opBuilder.setInsertionPointToEnd(clonedBody.front().getBlock());
-  auto newOutput = hw::OutputOp::create(opBuilder, output.getLoc(), values);
+  b.setInsertionPointToEnd(clonedBody.front().getBlock());
+  auto newOutput = hw::OutputOp::create(b, output.getLoc(), values);
   output.erase();
+
+  // Update the module type to match the new hw.output operands to avoid
+  // violating verifier conditions
+  SmallVector<hw::ModulePort> newPorts;
+  for (hw::ModulePort p : clonedBody.getHWModuleType().getPorts())
+    if (p.dir == hw::ModulePort::Direction::Input)
+      newPorts.push_back(p);
+  for (auto [i, val] : llvm::enumerate(values))
+    newPorts.push_back({b.getStringAttr("out" + std::to_string(i)),
+                        val.getType(), hw::ModulePort::Direction::Output});
+  clonedBody.setHWModuleType(hw::ModuleType::get(b.getContext(), newPorts));
+
   FrozenRewritePatternSet frozenPatterns = loadPatterns(*moduleOp.getContext());
 
   SmallVector<Operation *> opsToProcess;
@@ -613,7 +630,7 @@ getReachableStates(llvm::SetVector<size_t> &visitableStates,
     visitableStates.insert(i);
   }
 
-  clonedBody.erase();
+  // Cloned body is destroyed when analysisModule goes out of scope
   return success();
 }
 
@@ -869,14 +886,6 @@ public:
       }
       outputRegion.front().eraseArguments(
           [](BlockArgument arg) { return true; });
-      FrozenRewritePatternSet patterns(opBuilder.getContext());
-      config.setScope(&outputRegion);
-
-      bool changed = false;
-      if (failed(applyOpPatternsGreedily(opsToProcess, patterns, config,
-                                         &changed)))
-        return failure();
-      opBuilder.setInsertionPoint(stateOp);
       // hw.module uses graph regions that allow cycles (e.g., registers feeding
       // back into themselves). By this point we've replaced all registers with
       // constants, but cycles in purely combinational logic (e.g., cyclic
@@ -887,11 +896,18 @@ public:
             << "cannot convert module with combinational cycles to FSM";
         return failure();
       }
+      FrozenRewritePatternSet patterns(opBuilder.getContext());
+      config.setScope(&outputRegion);
+
+      bool changed = false;
+      if (failed(applyOpPatternsGreedily(opsToProcess, patterns, config,
+                                         &changed)))
+        return failure();
+      opBuilder.setInsertionPoint(stateOp);
       Region &transitionRegion = stateOp.getTransitions();
       llvm::SetVector<size_t> visitableStates;
       if (failed(getReachableStates(visitableStates, moduleOp,
-                                    currentStateIndex, registers, opBuilder,
-                                    currentStateIndex == initialStateIndex)))
+                                    currentStateIndex, registers)))
         return failure();
       for (size_t j : visitableStates) {
         StateOp toState;
@@ -998,6 +1014,14 @@ public:
           clonedRegValue.replaceAllUsesWith(constantOp.getResult());
           clonedRegOp->erase();
         }
+        // Sort before running patterns to avoid violating dominance and
+        // therefore pattern invariants
+        bool guardSorted = sortTopologically(&newGuardBlock);
+        if (!guardSorted) {
+          moduleOp.emitError()
+              << "cannot convert module with combinational cycles to FSM";
+          return failure();
+        }
         Region &actionRegion = transitionOp.getAction();
         if (!variableRegs.empty()) {
           Block *actionBlock = opBuilder.createBlock(&actionRegion);
@@ -1040,6 +1064,15 @@ public:
             clonedRegOp->erase();
           }
 
+          // Sort before running patterns to avoid violating dominance and
+          // therefore pattern invariants
+          bool actionSorted = sortTopologically(&actionRegion.front());
+          if (!actionSorted) {
+            moduleOp.emitError()
+                << "cannot convert module with combinational cycles to FSM";
+            return failure();
+          }
+
           GreedyRewriteConfig config;
           SmallVector<Operation *> opsToProcess;
           actionRegion.walk([&](Operation *op) { opsToProcess.push_back(op); });
@@ -1049,27 +1082,8 @@ public:
           if (failed(applyOpPatternsGreedily(opsToProcess, frozenPatterns,
                                              config, &changed)))
             return failure();
-
-          // hw.module uses graph regions that allow cycles. By this point
-          // we've replaced all registers with constants, but cycles in purely
-          // combinational logic may still exist.
-          bool actionSorted = sortTopologically(&actionRegion.front());
-          if (!actionSorted) {
-            moduleOp.emitError()
-                << "cannot convert module with combinational cycles to FSM";
-            return failure();
-          }
         }
 
-        // hw.module uses graph regions that allow cycles. By this point
-        // we've replaced all registers with constants, but cycles in purely
-        // combinational logic may still exist.
-        bool guardSorted = sortTopologically(&newGuardBlock);
-        if (!guardSorted) {
-          moduleOp.emitError()
-              << "cannot convert module with combinational cycles to FSM";
-          return failure();
-        }
         SmallVector<Operation *> outputOps;
         stateOp.getOutput().walk(
             [&](Operation *op) { outputOps.push_back(op); });

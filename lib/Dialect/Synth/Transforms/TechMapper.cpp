@@ -12,18 +12,20 @@
 //
 // The pass uses a cut-based algorithm with priority cuts and NPN canonical
 // forms for efficient pattern matching. It processes HWModuleOp instances with
-// "hw.techlib.info" attributes as technology library patterns and maps
+// "synth.mapping_cost" attributes as technology library patterns and maps
 // non-library modules to optimal gate implementations based on area and timing
 // optimization strategies.
 //
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/Synth/SynthAttributes.h"
 #include "circt/Dialect/Synth/Transforms/CutRewriter.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Threading.h"
 #include "mlir/Support/WalkResult.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include <atomic>
@@ -112,7 +114,8 @@ struct TechLibraryPattern : public CutRewritePattern {
   /// Match the cut set against this library primitive
   std::optional<MatchResult> match(CutEnumerator &enumerator,
                                    const Cut &cut) const override {
-    if (!cut.getNPNClass().equivalentOtherThanPermutation(npnClass))
+    if (!cut.getNPNClass(enumerator.getOptions().npnTable)
+             .equivalentOtherThanPermutation(npnClass))
       return std::nullopt;
 
     return MatchResult(area, delay);
@@ -132,7 +135,8 @@ struct TechLibraryPattern : public CutRewritePattern {
     const auto &network = enumerator.getLogicNetwork();
     // Create a new instance of the module
     SmallVector<unsigned> permutedInputIndices;
-    cut.getPermutatedInputIndices(npnClass, permutedInputIndices);
+    cut.getPermutatedInputIndices(enumerator.getOptions().npnTable, npnClass,
+                                  permutedInputIndices);
 
     SmallVector<Value> inputs;
     inputs.reserve(permutedInputIndices.size());
@@ -174,54 +178,75 @@ namespace {
 struct TechMapperPass : public impl::TechMapperBase<TechMapperPass> {
   using TechMapperBase<TechMapperPass>::TechMapperBase;
 
+  LogicalResult initialize(MLIRContext *context) override {
+    (void)context;
+    npnTable = std::make_shared<const NPNTable>();
+    return success();
+  }
+
   void runOnOperation() override {
     auto module = getOperation();
 
     SmallVector<std::unique_ptr<CutRewritePattern>> libraryPatterns;
 
     unsigned maxInputSize = 0;
-    // Consider modules with the "hw.techlib.info" attribute as library
+    // Consider modules with the "synth.mapping_cost" attribute as library
     // modules.
-    // TODO: This attribute should be replaced with a more structured
-    // representation of technology library information. Specifically, we should
-    // have a dedicated operation for technology library.
     SmallVector<hw::HWModuleOp> nonLibraryModules;
     for (auto hwModule : module.getOps<hw::HWModuleOp>()) {
-      auto techInfo =
-          hwModule->getAttrOfType<DictionaryAttr>("hw.techlib.info");
-      if (!techInfo) {
-        // If the module does not have the techlib info, it is not a library
-        // TODO: Run mapping only when the module is under the specific
-        // hierarchy.
+
+      auto mappingCost =
+          hwModule->getAttrOfType<MappingCostAttr>("synth.mapping_cost");
+      if (!mappingCost) {
         nonLibraryModules.push_back(hwModule);
         continue;
       }
 
-      // Get area and delay attributes
-      auto areaAttr = techInfo.getAs<FloatAttr>("area");
-      auto delayAttr = techInfo.getAs<ArrayAttr>("delay");
-      if (!areaAttr || !delayAttr) {
-        mlir::emitError(hwModule.getLoc())
-            << "Library module " << hwModule.getModuleName()
-            << " must have 'area'(float) and 'delay' (2d array to represent "
-               "input-output pair delay) attributes";
+      double area = mappingCost.getArea().getValue().convertToDouble();
+
+      StringAttr outputName;
+      hw::ModulePortInfo ports(hwModule.getPortList());
+      for (const auto &port : ports.getOutputs()) {
+        if (outputName) {
+          hwModule.emitError(
+              "Modules with multiple outputs are not supported yet");
+          signalPassFailure();
+          return;
+        }
+        outputName = port.name;
+      }
+      if (!outputName) {
+        hwModule.emitError("expected library module to have an output");
         signalPassFailure();
         return;
       }
 
-      double area = areaAttr.getValue().convertToDouble();
+      auto arcs = mappingCost.getArcs();
+
+      SmallVector<hw::PortInfo> inputPorts;
+      for (const auto &port : hwModule.getPortList()) {
+        if (!port.isInput())
+          continue;
+        inputPorts.push_back(port);
+      }
+
+      if (arcs.size() != inputPorts.size()) {
+        hwModule.emitError(
+            "synth.mapping_cost arcs do not match module inputs");
+        signalPassFailure();
+        return;
+      }
 
       SmallVector<DelayType> delay;
-      for (auto delayValue : delayAttr) {
-        auto delayArray = cast<ArrayAttr>(delayValue);
-        for (auto delayElement : delayArray) {
-          // FIXME: Currently we assume delay is given as integer attributes,
-          // this should be replaced once we have a proper cell op with
-          // dedicated timing attributes with units.
-          delay.push_back(
-              cast<mlir::IntegerAttr>(delayElement).getValue().getZExtValue());
-        }
+      for (auto attr : arcs) {
+        auto arc = cast<LinearTimingArcAttr>(attr);
+
+        // TechMapper currently preserves the old integer per-pin delay model.
+        // The sensitivity, polarity, and input capacitance fields are carried
+        // in the attribute for future load-aware mapping.
+        delay.push_back(static_cast<DelayType>(arc.getIntrinsic()));
       }
+
       // Compute NPN Class for the module.
       auto npnClass = getNPNClassFromModule(hwModule);
       if (failed(npnClass)) {
@@ -250,6 +275,7 @@ struct TechMapperPass : public impl::TechMapperBase<TechMapperPass> {
     options.maxCutInputSize = maxInputSize;
     options.maxCutSizePerRoot = maxCutsPerRoot;
     options.attachDebugTiming = test;
+    options.npnTable = npnTable.get();
     std::atomic<uint64_t> numCutsCreatedCount = 0;
     std::atomic<uint64_t> numCutSetsCreatedCount = 0;
     std::atomic<uint64_t> numCutsRewrittenCount = 0;
@@ -275,6 +301,9 @@ struct TechMapperPass : public impl::TechMapperBase<TechMapperPass> {
     numCutSetsCreated += numCutSetsCreatedCount;
     numCutsRewritten += numCutsRewrittenCount;
   }
+
+private:
+  std::shared_ptr<const NPNTable> npnTable;
 };
 
 } // namespace

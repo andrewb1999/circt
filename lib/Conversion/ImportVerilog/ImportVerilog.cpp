@@ -28,9 +28,11 @@
 
 #include "slang/analysis/AnalysisManager.h"
 #include "slang/diagnostics/DiagnosticClient.h"
+#include "slang/diagnostics/Diagnostics.h"
 #include "slang/driver/Driver.h"
 #include "slang/parsing/Preprocessor.h"
 #include "slang/syntax/SyntaxPrinter.h"
+#include "slang/syntax/SyntaxTree.h"
 #include "slang/util/VersionInfo.h"
 
 using namespace mlir;
@@ -170,11 +172,6 @@ private:
 namespace llvm {
 template <>
 struct DenseMapInfo<slang::BufferID> {
-  static slang::BufferID getEmptyKey() { return slang::BufferID(); }
-  static slang::BufferID getTombstoneKey() {
-    return slang::BufferID(UINT32_MAX - 1, ""sv);
-    // UINT32_MAX is already used by `BufferID::getPlaceholder`.
-  }
   static unsigned getHashValue(slang::BufferID id) {
     return llvm::hash_value(id.getId());
   }
@@ -228,6 +225,8 @@ LogicalResult ImportDriver::prepareDriver(SourceMgr &sourceMgr) {
   // source text in memory. At a later stage we'll want to extend slang's
   // SourceManager such that it can contain non-owned buffers. This will do
   // for now.
+  driver.sourceManager.setDisableProximatePaths(
+      !options.makeLocationPathsProximate);
   DenseSet<StringRef> seenBuffers;
   for (unsigned i = 0, e = sourceMgr.getNumBuffers(); i < e; ++i) {
     const llvm::MemoryBuffer *mlirBuffer = sourceMgr.getMemoryBuffer(i + 1);
@@ -260,6 +259,8 @@ LogicalResult ImportDriver::prepareDriver(SourceMgr &sourceMgr) {
       return failure();
 
   // Populate the driver options.
+  driver.addStandardArgs();
+
   driver.options.excludeExts.insert(options.excludeExts.begin(),
                                     options.excludeExts.end());
   driver.options.ignoreDirectives = options.ignoreDirectives;
@@ -270,17 +271,17 @@ LogicalResult ImportDriver::prepareDriver(SourceMgr &sourceMgr) {
   driver.options.librariesInheritMacros = options.librariesInheritMacros;
 
   driver.options.timeScale = options.timeScale;
-  driver.options.compilationFlags.emplace(
-      slang::ast::CompilationFlags::AllowUseBeforeDeclare,
-      options.allowUseBeforeDeclare);
-  driver.options.compilationFlags.emplace(
-      slang::ast::CompilationFlags::IgnoreUnknownModules,
-      options.ignoreUnknownModules);
-  driver.options.compilationFlags.emplace(
-      slang::ast::CompilationFlags::LintMode,
-      options.mode == ImportVerilogOptions::Mode::OnlyLint);
-  driver.options.compilationFlags.emplace(
-      slang::ast::CompilationFlags::DisableInstanceCaching, false);
+  driver.options
+      .compilationFlags[slang::ast::CompilationFlags::AllowUseBeforeDeclare] =
+      options.allowUseBeforeDeclare;
+  driver.options
+      .compilationFlags[slang::ast::CompilationFlags::IgnoreUnknownModules] =
+      options.ignoreUnknownModules;
+  driver.options.compilationFlags[slang::ast::CompilationFlags::LintMode] =
+      options.mode == ImportVerilogOptions::Mode::OnlyLint;
+  driver.options
+      .compilationFlags[slang::ast::CompilationFlags::DisableInstanceCaching] =
+      false;
   driver.options.topModules = options.topModules;
   driver.options.paramOverrides = options.paramOverrides;
 
@@ -288,6 +289,16 @@ LogicalResult ImportDriver::prepareDriver(SourceMgr &sourceMgr) {
   driver.options.warningOptions = options.warningOptions;
 
   driver.options.singleUnit = options.singleUnit;
+
+  // Parse pass through options.
+  if (!options.slangArgs.empty()) {
+    SmallVector<const char *> slangArgs;
+    slangArgs.push_back("slang"); // dummy program name
+    for (const auto &arg : options.slangArgs)
+      slangArgs.push_back(arg.c_str());
+    if (!driver.parseCommandLine(slangArgs.size(), slangArgs.data()))
+      return failure();
+  }
 
   return success(driver.processOptions());
 }
@@ -299,6 +310,23 @@ LogicalResult ImportDriver::importVerilog(ModuleOp module) {
   auto parseTimer = ts.nest("Verilog parser");
   bool parseSuccess = driver.parseAllSources();
   parseTimer.stop();
+
+  // If we were only supposed to parse the input, gather the parse diagnostics
+  // and report them here, then return without elaborating. This mirrors
+  // slang-driver's `--parse-only`: errors that only surface during elaboration
+  // or IR conversion (unknown modules, constraint blocks, ...) don't run, so
+  // this succeeds on such inputs while still flagging genuine syntax errors.
+  // The module is left empty.
+  if (options.mode == ImportVerilogOptions::Mode::OnlyParse) {
+    slang::Diagnostics parseDiags;
+    for (const auto &tree : driver.sourceLoader.getLibraryMaps())
+      parseDiags.append_range(tree->diagnostics());
+    for (const auto &tree : driver.syntaxTrees)
+      parseDiags.append_range(tree->diagnostics());
+    parseDiags.sort(driver.sourceManager);
+    driver.diagEngine.issue(parseDiags);
+    return success(parseSuccess && driver.diagEngine.getNumErrors() == 0);
+  }
 
   // Elaborate the input.
   auto compileTimer = ts.nest("Verilog elaboration");
@@ -459,9 +487,13 @@ void circt::populateVerilogToMoorePipeline(OpPassManager &pm) {
   pm.addPass(mlir::createSymbolDCEPass());
 
   {
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(moore::createSimplifyRefsPass());
+  }
+
+  {
     // Perform module-specific transformations.
     auto &modulePM = pm.nest<moore::SVModuleOp>();
-    modulePM.addPass(moore::createSimplifyRefsPass());
     // TODO: Enable the following once it not longer interferes with @(...)
     // event control checks. The introduced dummy variables make the event
     // control observe a static local variable that never changes, instead of

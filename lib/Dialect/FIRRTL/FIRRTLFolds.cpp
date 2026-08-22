@@ -1657,6 +1657,75 @@ void StringConcatOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.insert<FlattenStringConcat, MergeAdjacentStringConstants>(context);
 }
 
+//===----------------------------------------------------------------------===//
+// PropEqOp
+//===----------------------------------------------------------------------===//
+
+OpFoldResult PropEqOp::fold(FoldAdaptor adaptor) {
+  auto lhsAttr = adaptor.getLhs();
+  auto rhsAttr = adaptor.getRhs();
+  if (!lhsAttr || !rhsAttr)
+    return {};
+
+  return BoolAttr::get(getContext(), lhsAttr == rhsAttr);
+}
+
+//===----------------------------------------------------------------------===//
+// Boolean Property Ops
+//===----------------------------------------------------------------------===//
+
+// Helper to extract the bool value from a BoolAttr.
+static std::optional<bool> getBoolValue(Attribute attr) {
+  if (auto boolAttr = dyn_cast_or_null<BoolAttr>(attr))
+    return boolAttr.getValue();
+  return std::nullopt;
+}
+
+OpFoldResult BoolAndOp::fold(FoldAdaptor adaptor) {
+  auto lhs = getBoolValue(adaptor.getLhs());
+  auto rhs = getBoolValue(adaptor.getRhs());
+  if (lhs && rhs)
+    return BoolAttr::get(getContext(), *lhs && *rhs);
+  // AND with false is always false.
+  if ((lhs && !*lhs) || (rhs && !*rhs))
+    return BoolAttr::get(getContext(), false);
+  // AND with true is identity.
+  if (lhs && *lhs)
+    return getRhs();
+  if (rhs && *rhs)
+    return getLhs();
+  return {};
+}
+
+OpFoldResult BoolOrOp::fold(FoldAdaptor adaptor) {
+  auto lhs = getBoolValue(adaptor.getLhs());
+  auto rhs = getBoolValue(adaptor.getRhs());
+  if (lhs && rhs)
+    return BoolAttr::get(getContext(), *lhs || *rhs);
+  // OR with true is always true.
+  if ((lhs && *lhs) || (rhs && *rhs))
+    return BoolAttr::get(getContext(), true);
+  // OR with false is identity.
+  if (lhs && !*lhs)
+    return getRhs();
+  if (rhs && !*rhs)
+    return getLhs();
+  return {};
+}
+
+OpFoldResult BoolXorOp::fold(FoldAdaptor adaptor) {
+  auto lhs = getBoolValue(adaptor.getLhs());
+  auto rhs = getBoolValue(adaptor.getRhs());
+  if (lhs && rhs)
+    return BoolAttr::get(getContext(), *lhs ^ *rhs);
+  // XOR with false is identity.
+  if (lhs && !*lhs)
+    return getRhs();
+  if (rhs && !*rhs)
+    return getLhs();
+  return {};
+}
+
 OpFoldResult BitCastOp::fold(FoldAdaptor adaptor) {
   auto op = (*this);
   // BitCast is redundant if input and result types are same.
@@ -1778,7 +1847,12 @@ static OpFoldResult foldMux(OpTy op, typename OpTy::FoldAdaptor adaptor) {
       // mux(cond, cst, cst) -> cst
       if (highCst->getBitWidth() == lowCst->getBitWidth() &&
           *highCst == *lowCst)
-        return getIntAttr(op.getType(), *highCst);
+        // Ensure that this has an integer representation.  This specifically
+        // avoids problems with clocks.
+        if (auto intType = type_dyn_cast<IntType>(op.getType()))
+          if (intType.hasWidth() &&
+              (unsigned)intType.getWidthOrSentinel() == highCst->getBitWidth())
+            return getIntAttr(op.getType(), *highCst);
       // mux(cond, 1, 0) -> cond
       if (highCst->isOne() && lowCst->isZero() &&
           op.getType() == op.getSel().getType())
@@ -2657,6 +2731,17 @@ OpFoldResult UninferredResetCastOp::fold(FoldAdaptor adaptor) {
 }
 
 namespace {
+// Returns true if replacing a register that has an initial value with a
+// foldedValue does not change the initial behavior.
+bool preservesInitial(Operation *reg, IntegerAttr initial,
+                      std::optional<APInt> foldedValue = std::nullopt) {
+  if (!initial)
+    return true;
+  if (!foldedValue)
+    return false;
+  return initial.getValue() == *foldedValue;
+}
+
 // A register with constant reset and all connection to either itself or the
 // same constant, must be replaced by the constant.
 struct FoldResetMux : public mlir::OpRewritePattern<RegResetOp> {
@@ -2698,6 +2783,11 @@ struct FoldResetMux : public mlir::OpRewritePattern<RegResetOp> {
 
     // Ok, we know we are doing the transformation.
 
+    // Bail if replacing the register with the constant would change its
+    // time-zero simulation value.
+    if (!preservesInitial(reg, reg.getInitialAttr(), constOp.getValue()))
+      return failure();
+
     // Make sure the constant dominates all users.
     if (constOp != &con->getBlock()->front())
       constOp->moveBefore(&con->getBlock()->front());
@@ -2727,6 +2817,15 @@ canonicalizeRegResetWithOneReset(RegResetOp reg, PatternRewriter &rewriter) {
   auto resetValue = reg.getResetValue();
   if (reg.getType(0) != resetValue.getType())
     return failure();
+
+  // Bail if replacing the register with the constant would change its
+  // time-zero simulation value.
+  if (auto constOp = dyn_cast_or_null<ConstantOp>(resetValue.getDefiningOp())) {
+    if (!preservesInitial(reg, reg.getInitialAttr(), constOp.getValue()))
+      return failure();
+  } else if (!preservesInitial(reg, reg.getInitialAttr())) {
+    return failure();
+  }
 
   // Ignore 'passthrough'.
   (void)dropWrite(rewriter, reg->getResult(0), {});
@@ -3578,6 +3677,12 @@ static LogicalResult foldHiddenReset(RegOp reg, PatternRewriter &rewriter) {
 
   // Ok, we know we are doing the transformation.
 
+  // If we would fold the register to a constant, ensure the time-zero
+  // simulation value is preserved.
+  if (constReg &&
+      !preservesInitial(reg, reg.getInitialAttr(), constOp.getValue()))
+    return failure();
+
   // Make sure the constant dominates all users.
   if (constOp != &con->getBlock()->front())
     constOp->moveBefore(&con->getBlock()->front());
@@ -3587,8 +3692,8 @@ static LogicalResult foldHiddenReset(RegOp reg, PatternRewriter &rewriter) {
     auto newReg = replaceOpWithNewOpAndCopyName<RegResetOp>(
         rewriter, reg, reg.getResult().getType(), reg.getClockVal(),
         mux.getSel(), mux.getHigh(), reg.getNameAttr(), reg.getNameKindAttr(),
-        reg.getAnnotationsAttr(), reg.getInnerSymAttr(),
-        reg.getForceableAttr());
+        reg.getAnnotationsAttr(), reg.getInnerSymAttr(), reg.getForceableAttr(),
+        reg.getInitialAttr());
     newReg->setDialectAttrs(attrs);
   }
   auto pt = rewriter.saveInsertionPoint();

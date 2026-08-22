@@ -117,7 +117,8 @@ static ValueField getValueField(Value value) {
     }
     auto baseVF = getValueField(base);
 
-    auto structType = dyn_cast<hw::StructType>(se.getInput().getType());
+    auto structType =
+        hw::type_dyn_cast<hw::StructType>(se.getInput().getType());
     if (!structType)
       return {value, 0, value};
 
@@ -403,9 +404,6 @@ bool Deseq::analyzeProcess() {
                  << use.getOwner()->getLoc() << "\n");
       return false;
     }
-    if (!seenDrives.insert(driveOp).second)
-      continue;
-
     // We can only deal with conditional drives.
     if (!driveOp.getEnable()) {
       LLVM_DEBUG(llvm::dbgs()
@@ -416,13 +414,17 @@ bool Deseq::analyzeProcess() {
 
     // We can only deal with the process result being used as drive value or
     // condition.
-    if (use.getOperandNumber() != 1 && use.getOperandNumber() != 2) {
+    // `llhd.drv` operands are: signal (0), value (1), time (2), enable (3).
+    if (use.getOperandNumber() != 1 && use.getOperandNumber() != 3) {
       LLVM_DEBUG(llvm::dbgs()
                  << "Skipping " << process.getLoc()
                  << ": feeds drive operand that is neither value nor enable: "
                  << driveOp << "\n");
       return false;
     }
+
+    if (!seenDrives.insert(driveOp).second)
+      continue;
 
     driveInfos.push_back(DriveInfo(driveOp));
   }
@@ -1126,9 +1128,10 @@ bool Deseq::matchDriveClock(
 /// `drive.clock`.
 bool Deseq::matchDriveClockAndReset(
     DriveInfo &drive, ArrayRef<std::pair<DNFTerm, ValueEntry>> valueTable) {
-  // We need exactly three entries in the value table to represent a register
-  // with reset.
-  if (valueTable.size() != 3) {
+  // We need two or three entries in the value table to represent a register
+  // with reset. A table with two entries means that the clock edge while reset
+  // is inactive has no drive, which is a hold.
+  if (valueTable.size() != 2 && valueTable.size() != 3) {
     LLVM_DEBUG(llvm::dbgs() << "- Aborting: two trigger value table has "
                             << valueTable.size() << " entries\n");
     return false;
@@ -1175,7 +1178,8 @@ bool Deseq::matchDriveClockAndReset(
     auto clockIt = llvm::find_if(valueTable, [&](auto &pair) {
       return pair.first == clockWithoutEnable || pair.first == clockWithEnable;
     });
-    if (clockIt == valueTable.end())
+    bool clockHolds = clockIt == valueTable.end();
+    if (clockHolds && valueTable.size() != 2)
       continue;
 
     // Ensure that `/rst` and `/clk&rst` set the register to the same reset
@@ -1194,17 +1198,24 @@ bool Deseq::matchDriveClockAndReset(
 
     drive.clock.clock = triggers[clockIdx].getProjected();
     drive.clock.risingEdge = !negClock;
-    if (clockIt->first == clockWithEnable)
-      drive.clock.enable = drive.op.getEnable();
     drive.clock.value = drive.op.getValue();
-    if (!clockIt->second.isUnknown())
-      drive.clock.value = clockIt->second.value;
+    if (clockHolds) {
+      drive.clock.enable = drive.op.getEnable();
+    } else {
+      if (clockIt->first == clockWithEnable)
+        drive.clock.enable = drive.op.getEnable();
+      if (!clockIt->second.isUnknown())
+        drive.clock.value = clockIt->second.value;
+    }
 
     LLVM_DEBUG({
       llvm::dbgs() << "  - Matched " << (negClock ? "neg" : "pos")
                    << "edge clock ";
       drive.clock.clock.printAsOperand(llvm::dbgs(), OpPrintingFlags());
-      llvm::dbgs() << " -> " << clockIt->second;
+      if (clockHolds)
+        llvm::dbgs() << " -> hold";
+      else
+        llvm::dbgs() << " -> " << clockIt->second;
       if (drive.clock.enable)
         llvm::dbgs() << " (with enable)";
       llvm::dbgs() << "\n";

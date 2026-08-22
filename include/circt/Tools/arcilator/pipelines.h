@@ -114,6 +114,10 @@ void populateArcStateAllocationPipeline(
 // Lower the arcs and update functions to LLVM. This pipeline lowers modules to
 // LLVM IR.
 struct ArcToLLVMOptions : mlir::PassPipelineOptions<ArcToLLVMOptions> {
+  Option<bool> noGenerateDriver{
+      *this, "no-generate-driver",
+      llvm::cl::desc("Don't emit a simulation driver function for each model"),
+      llvm::cl::init(false)};
   Option<bool> noRuntime{
       *this, "no-runtime",
       llvm::cl::desc("Don't emit calls to the runtime library"),
@@ -126,6 +130,10 @@ struct ArcToLLVMOptions : mlir::PassPipelineOptions<ArcToLLVMOptions> {
   Option<std::string> traceFileName{
       *this, "trace-file", llvm::cl::desc("Output file for signal traces"),
       llvm::cl::init("")};
+  Option<bool> bufferizeArrays{
+      *this, "bufferize-arrays",
+      llvm::cl::desc("Bufferize arrays before lowering to LLVM"),
+      llvm::cl::init(true)};
 };
 void populateArcToLLVMPipeline(mlir::OpPassManager &pm,
                                const ArcToLLVMOptions &options = {});

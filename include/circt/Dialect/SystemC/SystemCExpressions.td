@@ -10,6 +10,15 @@
 //
 //===----------------------------------------------------------------------===//
 
+#ifndef CIRCT_DIALECT_SYSTEMC_SYSTEMCEXPRESSIONS_TD
+#define CIRCT_DIALECT_SYSTEMC_SYSTEMCEXPRESSIONS_TD
+
+include "circt/Dialect/SystemC/SystemCDialect.td"
+include "circt/Dialect/SystemC/SystemCTypes.td"
+include "mlir/Dialect/EmitC/IR/EmitCTypes.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+
 def SignalReadOp : SystemCOp<"signal.read", [Pure,
                                              InferTypeOpInterface]> {
   let summary = "Returns the current value of a signal or port.";
@@ -31,7 +40,7 @@ def SignalReadOp : SystemCOp<"signal.read", [Pure,
                                           std::optional<Location> loc,
                                           ValueRange operands,
                                           DictionaryAttr attrs,
-                                          mlir::OpaqueProperties properties,
+                                          mlir::PropertyRef properties,
                                           mlir::RegionRange regions,
                                           SmallVectorImpl<Type> &results) {
       results.push_back(systemc::getSignalBaseType(operands[0].getType()));
@@ -115,3 +124,5 @@ def MemberAccessOp : SystemCOp<"cpp.member_access", [Pure]> {
     functional-type($object, $result)
   }];
 }
+
+#endif // CIRCT_DIALECT_SYSTEMC_SYSTEMCEXPRESSIONS_TD

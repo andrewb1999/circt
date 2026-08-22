@@ -85,6 +85,16 @@ hw.module @Sequences(in %clk: i1, in %a: i1, in %b: i1) {
   %d5 = ltl.delay %a, 1 : i1
   sv.assert_property %d5 : !ltl.sequence
 
+  // CHECK: assert property (@(posedge clk) ##4 a);
+  %cd0 = ltl.clocked_delay %a, posedge %clk, 4, 0 : i1
+  sv.assert_property %cd0 : !ltl.sequence
+  // CHECK: assert property (@(negedge clk) ##[5:6] a);
+  %cd1 = ltl.clocked_delay %a, negedge %clk, 5, 1 : i1
+  sv.assert_property %cd1 : !ltl.sequence
+  // CHECK: assert property (@(edge clk) ##[7:$] a);
+  %cd2 = ltl.clocked_delay %a, edge %clk, 7 : i1
+  sv.assert_property %cd2 : !ltl.sequence
+
   // CHECK: assert property (a ##0 a);
   %c0 = ltl.concat %a, %a : i1, i1
   sv.assert_property %c0 : !ltl.sequence
@@ -97,6 +107,10 @@ hw.module @Sequences(in %clk: i1, in %a: i1, in %b: i1) {
   // CHECK: assert property (##4 a ##[5:6] a ##[7:$] a);
   %c3 = ltl.concat %d1, %d2, %d3 : !ltl.sequence, !ltl.sequence, !ltl.sequence
   sv.assert_property %c3 : !ltl.sequence
+  // CHECK: assert property (a ##0 (@(posedge clk) ##4 b));
+  %cd3 = ltl.clocked_delay %b, posedge %clk, 4, 0 : i1
+  %c4 = ltl.concat %a, %cd3 : i1, !ltl.sequence
+  sv.assert_property %c4 : !ltl.sequence
 
   // CHECK: assert property (a and ##0 a);
   %g0 = ltl.and %a, %d0 : i1, !ltl.sequence
@@ -165,6 +179,9 @@ hw.module @Sequences(in %clk: i1, in %a: i1, in %b: i1) {
   // CHECK: assert property (b ##0 (@(posedge clk) a));
   %k4 = ltl.concat %b, %k0 : i1, !ltl.sequence
   sv.assert_property %k4 : !ltl.sequence
+  // CHECK: assert property (@(edge clk) @(posedge clk) ##4 b);
+  %k5 = ltl.clock %cd3, edge %clk : !ltl.sequence
+  sv.assert_property %k5 : !ltl.sequence
 }
 
 // CHECK-LABEL: module Properties
@@ -196,6 +213,19 @@ hw.module @Properties(in %clk: i1, in %a: i1, in %b: i1) {
   // CHECK: assert property (s_eventually a);
   %e0 = ltl.eventually %a : i1
   sv.assert_property %e0 : !ltl.property
+
+  // Emit `not(eventually(not(x)))` as `always x` (case A, cancelling nots).
+  // CHECK: assert property (always a);
+  %ag0 = ltl.not %a : i1
+  %ag1 = ltl.eventually %ag0 : !ltl.property
+  %ag2 = ltl.not %ag1 : !ltl.property
+  sv.assert_property %ag2 : !ltl.property
+
+  // Emit `not(eventually(x))` as `always not x` (case B, quantifier pull-up).
+  // CHECK: assert property (always not a);
+  %ag3 = ltl.eventually %a : i1
+  %ag4 = ltl.not %ag3 : !ltl.property
+  sv.assert_property %ag4 : !ltl.property
 
   // CHECK: assert property (@(posedge clk) a |-> b);
   // CHECK: assert property (@(posedge clk) a ##1 b |-> (@(negedge b) not a));
@@ -242,6 +272,52 @@ hw.module @Precedence(in %a: i1, in %b: i1) {
   %u0 = ltl.until %a, %b : i1, i1
   %u1 = ltl.and %u0, %a : !ltl.property, i1
   sv.assert_property %u1 : !ltl.property
+
+  // `always` sugar precedence. The inner value under `always` gets Qualifier
+  // context (case A) or Unary context (case B, because it sits under the
+  // synthesized `not`). `until` has Until precedence, which is tighter than
+  // Qualifier but looser than Unary, so it differentiates the two.
+  // CHECK: assert property (always a until b);
+  // CHECK: assert property (always not (a until b));
+  %ag0 = ltl.not %u0 : !ltl.property
+  %ag1 = ltl.eventually %ag0 : !ltl.property
+  %ag2 = ltl.not %ag1 : !ltl.property
+  sv.assert_property %ag2 : !ltl.property
+  %ag3 = ltl.eventually %u0 : !ltl.property
+  %ag4 = ltl.not %ag3 : !ltl.property
+  sv.assert_property %ag4 : !ltl.property
+
+  // `always ...` returns Qualifier precedence, so wrapping it in a tighter
+  // context adds parens.
+  // CHECK: assert property ((always a) and b);
+  // CHECK: assert property (b and (always not a));
+  %ag5 = ltl.not %a : i1
+  %ag6 = ltl.eventually %ag5 : !ltl.property
+  %ag7 = ltl.not %ag6 : !ltl.property
+  %ag8 = ltl.and %ag7, %b : !ltl.property, i1
+  sv.assert_property %ag8 : !ltl.property
+  %ag9 = ltl.eventually %a : i1
+  %ag10 = ltl.not %ag9 : !ltl.property
+  %ag11 = ltl.and %b, %ag10 : i1, !ltl.property
+  sv.assert_property %ag11 : !ltl.property
+}
+
+// CHECK-LABEL: module WeakAndStrongSequences
+hw.module @WeakAndStrongSequences(in %a: i1, in %b: i1, in %c: i1, in %d: i1) {
+  // CHECK: assert property (weak (a ##1 b ##0 c ##1 d));
+  %a0 = ltl.delay %b, 1, 0 : i1
+  %a1 = ltl.delay %d, 1, 0 : i1
+  %a2 = ltl.concat %a, %a0 : i1, !ltl.sequence
+  %a3 = ltl.concat %c, %a1 : i1, !ltl.sequence
+  %a4 = ltl.concat %a2, %a3 : !ltl.sequence, !ltl.sequence
+  %ws = ltl.weak %a4 : !ltl.sequence
+  sv.assert_property %ws : !ltl.property
+
+  // CHECK: assert property (strong (b ##1 c ##1 d));
+  %b0 = ltl.delay %c, 1, 0 : i1
+  %b1 = ltl.concat %b, %b0, %a1 : i1, !ltl.sequence, !ltl.sequence
+  %ss = ltl.strong %b1 : !ltl.sequence
+  sv.assert_property %ss : !ltl.property
 }
 
 // CHECK-LABEL: module SystemVerilogSpecExamples

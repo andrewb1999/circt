@@ -2,16 +2,17 @@
 // RUN: circt-opt %s --arc-allocate-state=trace-taps=true  | FileCheck %s --check-prefixes=CHECK,TAPS
 
 // CHECK-LABEL: arc.model @test
+// CHECK-SAME:  storageBytes 5815
 // NOTAPS-NOT:  traceTaps
 // TAPS-SAME:   traceTaps [#arc.trace_tap<i16, 0, ["foo", "bar"]>, #arc.trace_tap<i1, 2, ["baz"]>]
 arc.model @test io !hw.modty<input x : i1, output y : i1> {
 ^bb0(%arg0: !arc.storage):
-  // CHECK-NEXT: ([[PTR:%.+]]: !arc.storage<5799>):
+  // CHECK-NEXT: ([[PTR:%.+]]: !arc.storage):
 
-  // CHECK-NEXT: arc.alloc_storage [[PTR]][16] : (!arc.storage<5799>) -> !arc.storage<1159>
+  // CHECK-NEXT: arc.alloc_storage [[PTR]][32], 1159
   // CHECK-NEXT: arc.initial {
   arc.initial {
-    // CHECK-NEXT: [[SUBPTR:%.+]] = arc.storage.get [[PTR]][16] : !arc.storage<5799> -> !arc.storage<1159>
+    // CHECK-NEXT: [[SUBPTR:%.+]] = arc.storage.get [[PTR]][32] : !arc.storage -> !arc.storage
     %0 = arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<i1>
     arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<i8>
     arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<i16>
@@ -31,11 +32,11 @@ arc.model @test io !hw.modty<input x : i1, output y : i1> {
     // CHECK-NEXT: scf.execute_region {
     scf.execute_region {
       arc.state_read %0 : <i1>
-      // CHECK-NEXT: [[SUBPTR:%.+]] = arc.storage.get [[PTR]][16] : !arc.storage<5799> -> !arc.storage<1159>
-      // CHECK-NEXT: [[STATE:%.+]] = arc.storage.get [[SUBPTR]][0] : !arc.storage<1159> -> !arc.state<i1>
+      // CHECK-NEXT: [[SUBPTR:%.+]] = arc.storage.get [[PTR]][32] : !arc.storage -> !arc.storage
+      // CHECK-NEXT: [[STATE:%.+]] = arc.storage.get [[SUBPTR]][0] : !arc.storage -> !arc.state<i1>
       // CHECK-NEXT: arc.state_read [[STATE]] : <i1>
       arc.state_read %1 : <i1>
-      // CHECK-NEXT: [[STATE:%.+]] = arc.storage.get [[SUBPTR]][1158] : !arc.storage<1159> -> !arc.state<i1>
+      // CHECK-NEXT: [[STATE:%.+]] = arc.storage.get [[SUBPTR]][1158] : !arc.storage -> !arc.state<i1>
       // CHECK-NEXT: arc.state_read [[STATE]] : <i1>
       scf.yield
       // CHECK-NEXT: scf.yield
@@ -44,10 +45,10 @@ arc.model @test io !hw.modty<input x : i1, output y : i1> {
   }
   // CHECK-NEXT: }
 
-  // CHECK-NEXT: arc.alloc_storage [[PTR]][1184] : (!arc.storage<5799>) -> !arc.storage<4609>
+  // CHECK-NEXT: arc.alloc_storage [[PTR]][1200], 4609
   // CHECK-NEXT: arc.initial {
   arc.initial {
-    // CHECK-NEXT: [[SUBPTR:%.+]] = arc.storage.get [[PTR]][1184] : !arc.storage<5799> -> !arc.storage<4609>
+    // CHECK-NEXT: [[SUBPTR:%.+]] = arc.storage.get [[PTR]][1200] : !arc.storage -> !arc.storage
     arc.alloc_memory %arg0 : (!arc.storage) -> !arc.memory<4 x i1, i1>
     arc.alloc_memory %arg0 : (!arc.storage) -> !arc.memory<4 x i8, i1>
     arc.alloc_memory %arg0 : (!arc.storage) -> !arc.memory<4 x i16, i1>
@@ -71,18 +72,18 @@ arc.model @test io !hw.modty<input x : i1, output y : i1> {
   }
   // CHECK-NEXT: }
 
-  // CHECK-NEXT: arc.alloc_storage %arg0[5794] : (!arc.storage<5799>) -> !arc.storage<2>
+  // CHECK-NEXT: arc.alloc_storage %arg0[5810], 2
   // CHECK-NEXT: arc.initial {
   arc.initial {
     arc.root_input "x", %arg0 : (!arc.storage) -> !arc.state<i1>
     arc.root_output "y", %arg0 : (!arc.storage) -> !arc.state<i1>
-    // CHECK-NEXT: [[SUBPTR:%.+]] = arc.storage.get [[PTR]][5794] : !arc.storage<5799> -> !arc.storage<2>
+    // CHECK-NEXT: [[SUBPTR:%.+]] = arc.storage.get [[PTR]][5810] : !arc.storage -> !arc.storage
     // CHECK-NEXT: arc.root_input "x", [[SUBPTR]] {offset = 0 : i32}
     // CHECK-NEXT: arc.root_output "y", [[SUBPTR]] {offset = 1 : i32}
   }
   // CHECK-NEXT: }
 
-  // CHECK-NEXT: arc.alloc_storage [[PTR]][5796] : (!arc.storage<5799>) -> !arc.storage<3>
+  // CHECK-NEXT: arc.alloc_storage [[PTR]][5812], 3
   // CHECK-NEXT: arc.initial {
   arc.initial {
     %cstCAFE = hw.constant 0xCAFE: i16
@@ -102,19 +103,62 @@ arc.model @test io !hw.modty<input x : i1, output y : i1> {
 }
 
 // CHECK-LABEL: arc.model @StructPadding
-// CHECK-NEXT: !arc.storage<12>
+// CHECK-SAME:  storageBytes 28
 arc.model @StructPadding io !hw.modty<> {
 ^bb0(%arg0: !arc.storage):
-  // This !hw.struct is only 11 bits wide, but mapped to an !llvm.struct, each
+  // This !hw.struct is only 19 bits wide, but mapped to an !llvm.struct, each
   // field gets byte-aligned.
   arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<!hw.struct<tag: i5, sign_ext: i1, offset: i3, size: i2>>
 }
 
 // CHECK-LABEL: arc.model @ArrayPadding
-// CHECK-NEXT: !arc.storage<12>
+// CHECK-SAME:  storageBytes 28
 arc.model @ArrayPadding io !hw.modty<> {
 ^bb0(%arg0: !arc.storage):
   // This !hw.array is only 18 bits wide, but mapped to an !llvm.array, each
   // element gets aligned to the next power-of-two.
   arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<!hw.array<2xi9>>
+}
+
+// CHECK-LABEL: arc.model @UnionMaxVariant
+// CHECK-SAME:  storageBytes 32
+arc.model @UnionMaxVariant io !hw.modty<> {
+^bb0(%arg0: !arc.storage):
+  // A !hw.union is sized by its largest variant, not the sum of its variants,
+  // so this allocates 8 bytes for the i64 rather than 9 for both fields.
+  arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<!hw.union<small: i8, big: i64>>
+}
+
+// CHECK-LABEL: arc.model @UnionVariantPadding
+// CHECK-SAME:  storageBytes 26
+arc.model @UnionVariantPadding io !hw.modty<> {
+^bb0(%arg0: !arc.storage):
+  // Like struct fields and array elements, each variant is widened to a byte
+  // and aligned to a power of two: the i9 maps to 16 bits, giving 2 bytes.
+  arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<!hw.union<x: i9, y: i3>>
+}
+
+// CHECK-LABEL: arc.model @UnionOffset
+// CHECK-SAME:  storageBytes 41
+arc.model @UnionOffset io !hw.modty<> {
+^bb0(%arg0: !arc.storage):
+  // An explicit per-variant bit offset is honored when sizing the union: the
+  // i8 sits at bit 64, requiring 9 bytes of storage.
+  arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<!hw.union<x: i8 offset 64, y: i8>>
+}
+
+// CHECK-LABEL: arc.model @UnionNested
+// CHECK-SAME:  storageBytes 28
+arc.model @UnionNested io !hw.modty<> {
+^bb0(%arg0: !arc.storage):
+  // Variant widths are computed recursively, so the larger struct variant of
+  // two i16 fields determines the 4-byte size.
+  arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<!hw.union<x: !hw.struct<a: i16, b: i16>, y: i8>>
+}
+
+// Check that we always allocate some bytes for the header
+// CHECK-LABEL: arc.model @HeaderOnly
+// CHECK-SAME:  storageBytes {{[1-9]}}
+arc.model @HeaderOnly io !hw.modty<> {
+  ^bb0(%arg0: !arc.storage):
 }

@@ -21,7 +21,7 @@ endmodule
 module Foo;
   mailbox a;
   string b;
-  // expected-error @below {{value of type 'string' cannot be assigned to type 'mailbox'}}
+  // expected-error @below {{value of type 'string' cannot be assigned to type 'mailbox#(untyped)'}}
   initial a = b;
 endmodule
 
@@ -138,18 +138,6 @@ module Foo;
 endmodule
 
 // -----
-function Foo;
-  // expected-error @below {{unsupported format specifier `%l`}}
-  $write("%l");
-endfunction
-
-// -----
-function Foo;
-  // expected-error @below {{string format specifier with width not supported}}
-  $write("%42s", "foo");
-endfunction
-
-// -----
 function time Foo;
   // expected-error @below {{time value is larger than 18446744073709549568 fs}}
   return 100000s;
@@ -183,6 +171,20 @@ module Foo;
   string b;
   // expected-error @below {{expected integer argument for `$past`}}
   assert property (@(posedge a) $past(b));
+endmodule
+
+// -----
+module Foo;
+  logic a, clk;
+  // expected-error @below {{sampled value functions are only supported with posedge clocks}}
+  assert property (@(negedge clk) $rose(a));
+endmodule
+
+// -----
+module Foo;
+  logic a, clk1, clk2;
+  // expected-error @below {{sampled value functions with multiple event triggers are not supported}}
+  assert property (@(posedge clk1 or posedge clk2) $rose(a));
 endmodule
 
 // -----
@@ -223,41 +225,12 @@ module Foo;
 endmodule
 
 // -----
-// Cross-module hierarchical references can produce null port values that must
-// not crash during instance creation. This is an error in the hierarchical
-// reference resolution code that actually needs fixing. This test guards
-// against a regression to this being a crash.
-module HierRefTop(input i, output o);
-  // expected-error @below {{unsupported port}}
-  HierRefA A();
-  HierRefB B();
-  assign A.i = i;
-  assign o = B.o;
-endmodule
-module HierRefA;
-  wire i, y;
-  assign B.x = !i;
-  assign y = !B.y;
-endmodule
-module HierRefB;
-  wire x, y, o;
-  assign y = x, o = A.y;
-endmodule
-
-// -----
 module Foo;
   reg i;
   wire o;
   // expected-error @below {{unsupported delay with rise/fall/turn-off}}
   assign #(1, 2) o = i;
 endmodule
-
-// -----
-function Foo;
-  logic [1:0] a;
-  // expected-error @below {{unsupported system call `$fwrite`}}
-  $fwrite(32'h0, "%x", a);
-endfunction
 
 // -----
 module Foo;
@@ -331,4 +304,91 @@ module Foo;
 
   // expected-error @below {{'always' procedure does not advance time and so will create a simulation deadlock}}
   always a = ~a;
+endmodule
+
+// -----
+
+module drive_strength_prim;
+    logic A, B, Q;
+    // expected-error @below {{primitive instances with explicit drive strengths are not supported.}}
+    and (pull0, strong1) a (Q, A, B);
+endmodule
+
+// -----
+
+module multi_delay_input_prim;
+    logic A, B, Q;
+    // expected-error @below {{only n-input primitives that specify a single delay are currently supported.}}
+    and #(5, 5) a (Q, A, B);
+endmodule
+
+
+// -----
+
+module multi_delay_noutput_prim;
+    wire A, Q;
+    // expected-error @below {{only n-output primitives that specify a single delay are currently supported.}}
+    not #(5, 5) n (Q, A);
+endmodule
+
+// -----
+
+module unsupported_prim(inout A, inout B);
+    // expected-error @below {{unsupported instance of primitive `tran`}}
+    tran u1 (A, B);
+endmodule
+
+// -----
+
+module ReadMemAssoc;
+  logic [7:0] amem[int];
+  initial begin
+    // expected-error @below {{unsupported: $readmem into associative array}}
+    $readmemh("mem.data", amem);
+  end
+endmodule
+
+// -----
+
+module ReadMemDynamic;
+  logic [7:0] dmem [];
+  initial begin
+    // expected-error @below {{unsupported: $readmem into dynamic array}}
+    $readmemh("mem.data", dmem);
+  end
+endmodule
+
+// -----
+
+module ReadMemIndexedSelect;
+  logic [7:0] mem [0:255];
+  int i;
+  initial begin
+    // expected-error @below {{unsupported: indexed part-select on $readmem memory}}
+    $readmemh("mem.data", mem[i+:8]);
+  end
+endmodule
+
+// -----
+
+module Foo(inout [9000:0] x);
+endmodule
+
+module Bar;
+  wire [41:0] y;
+  // expected-error @below {{inout port `x` expects '!moore.ref<l9001>' but is connected to '!moore.ref<l42>'}}
+  Foo foo(y);
+endmodule
+
+// -----
+
+typedef struct packed { logic x; logic y; } Pair;
+
+module Foo(inout Pair p);
+endmodule
+
+module Bar;
+  wire [1:0] y;
+  // expected-error @below {{inout port `p` expects '!moore.ref<struct<{x: l1, y: l1}>>' but is connected to '!moore.ref<l2>'}}
+  Foo foo(y);
 endmodule

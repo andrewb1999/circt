@@ -30,14 +30,14 @@ def FormatStringType : SimTypeDef<"FormatString"> {
 def DynamicStringType : SimTypeDef<"DynamicString"> {
   let mnemonic = "dstring";
 
-  let summary = "String type with variable length"; 
+  let summary = "String type with variable length";
   let description = [{
-    The dynamic string type represents a string with a variable length that is 
+    The dynamic string type represents a string with a variable length that is
     only known at runtime. The contents of the string are held as an array of
-    `i8` bytes. The interpretation of these bytes as a concrete character 
-    encoding is undefined, but treating the bytes as a UTF-8 string is 
+    `i8` bytes. The interpretation of these bytes as a concrete character
+    encoding is undefined, but treating the bytes as a UTF-8 string is
     recommended. A string's length must fit into an `i64`.
-    
+
     Even though practical lowerings of this type likely have to hold the string
     contents in dynamically-allocated heap memory, *this type has value
     semantics*. If the same string SSA value is passed to multiple users, any
@@ -47,9 +47,9 @@ def DynamicStringType : SimTypeDef<"DynamicString"> {
 
 def QueueType : SimTypeDef<"Queue"> {
   let mnemonic = "queue";
-  let summary = "a queue type"; 
+  let summary = "a queue type";
   let description = [{
-    An ordered container of elements with an optional upper bound 
+    An ordered container of elements with an optional upper bound
     on the number of elements that it can hold. If this bound is 0, then the
     queue has unrestricted capacity.
 
@@ -69,6 +69,30 @@ def QueueType : SimTypeDef<"Queue"> {
     AttrBuilderWithInferredContext<
       (ins "Type":$elementType, "unsigned":$bound), [{
         return $_get(elementType.getContext(), elementType, bound);
+      }]>
+  ];
+}
+
+def AssocArrayType : SimTypeDef<"AssocArray"> {
+  let mnemonic = "assoc_array";
+  let summary = "an associative array type";
+  let description = [{
+    An associative array (hash map) type. Even though practical lowerings of
+    this type likely have to hold the contents in dynamically-allocated heap
+    memory, *this type has value semantics*.
+  }];
+
+  let parameters = (ins
+    "::mlir::Type":$elementType,
+    "::mlir::Type":$indexType
+  );
+  let assemblyFormat = [{
+    `<` $elementType `,` $indexType `>`
+  }];
+  let builders = [
+    AttrBuilderWithInferredContext<
+      (ins "Type":$elementType, "Type":$indexType), [{
+        return $_get(elementType.getContext(), elementType, indexType);
       }]>
   ];
 }
@@ -109,6 +133,19 @@ def DPIFunctionType : SimTypeDef<"DPIFunction"> {
     /// On failure, emits diagnostics on the given op and returns failure.
     mlir::LogicalResult verify(llvm::function_ref<mlir::InFlightDiagnostic()> emitError) const;
   }];
+}
+
+def OutputStreamType : SimTypeDef<"OutputStream"> {
+  let summary = "a type representing an output stream";
+  let description = [{
+    Represents a simulation output stream resource.
+    This type models the existence of a stream resource at the Sim dialect level,
+    while leaving its concrete representation to the lowering backend. Backends may
+    realize this as a file descriptor, object handle, pointer, or any other target-
+    specific resource representation.
+  }];
+
+  let mnemonic = "output_stream";
 }
 
 #endif // CIRCT_DIALECT_SIM_SIMTYPES_TD

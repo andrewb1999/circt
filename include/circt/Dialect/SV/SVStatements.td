@@ -10,14 +10,25 @@
 //
 //===----------------------------------------------------------------------===//
 
+#ifndef CIRCT_DIALECT_SV_SVSTATEMENTS_TD
+#define CIRCT_DIALECT_SV_SVSTATEMENTS_TD
+
+include "circt/Dialect/Emit/EmitOpInterfaces.td"
+include "circt/Dialect/HW/HWAttributesNaming.td"
+include "circt/Dialect/HW/HWOpInterfaces.td"
+include "circt/Dialect/HW/HWTypes.td"
+include "circt/Dialect/SV/SVAttributes.td"
+include "circt/Dialect/SV/SVDialect.td"
+include "circt/Dialect/SV/SVEnums.td"
+include "circt/Dialect/SV/SVTypes.td"
+include "circt/Support/ProceduralRegionTrait.td"
+include "mlir/Interfaces/CallInterfaces.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/RegionKindInterface.td"
-include "mlir/Interfaces/FunctionInterfaces.td"
-include "mlir/Interfaces/CallInterfaces.td"
-include "mlir/Interfaces/ControlFlowInterfaces.td"
-include "circt/Dialect/Emit/EmitOpInterfaces.td"
-include "circt/Dialect/HW/HWOpInterfaces.td"
 
 //===----------------------------------------------------------------------===//
 // Control flow like-operations
@@ -48,6 +59,7 @@ def OrderedOutputOp : SVOp<"ordered", [SingleBlock, NoTerminator, NoRegionArgume
 def IfDefOp : SVOp<"ifdef", [
     NoRegionArguments,
     NonProceduralOp,
+    NonProceduralRegion,
     GraphRegionNoTerminator,
     DeclareOpInterfaceMethods<SymbolUserOpInterface>
 ]> {
@@ -190,21 +202,6 @@ def IfOp : SVOp<"if", [SingleBlock, NoTerminator, NoRegionArguments,
     }
   }];
 }
-
-// Edge behavior enum for always block.  See SV Spec 9.4.2.
-
-/// AtPosEdge triggers on a rise from 0 to 1/X/Z, or X/Z to 1.
-def AtPosEdge: I32EnumAttrCase<"AtPosEdge", 0, "posedge">;
-/// AtNegEdge triggers on a drop from 1 to 0/X/Z, or X/Z to 0.
-def AtNegEdge: I32EnumAttrCase<"AtNegEdge", 1, "negedge">;
-/// AtEdge(v) is syntactic sugar for "AtPosEdge(v) or AtNegEdge(v)".
-def AtEdge   : I32EnumAttrCase<"AtEdge", 2, "edge">;
-
-def EventControlAttr : I32EnumAttr<"EventControl", "edge control trigger",
-                                   [AtPosEdge, AtNegEdge, AtEdge]> {
-  let cppNamespace = "circt::sv";
-}
-
 
 def AlwaysOp : SVOp<"always", [SingleBlock, NoTerminator, NoRegionArguments,
                                RecursiveMemoryEffects, RecursivelySpeculatable,
@@ -513,6 +510,19 @@ def AliasOp : SVOp<"alias"> {
   let hasVerifier = 1;
 }
 
+def WriteOp : SVOp<"write", [ProceduralOp]> {
+  let summary = "'$write' statement";
+
+  let arguments = (ins StrAttr:$format_string,
+                       Variadic<AnyType>:$substitutions);
+  let results = (outs);
+
+  let assemblyFormat = [{
+    $format_string attr-dict (`(` $substitutions^ `)` `:`
+    qualified(type($substitutions)))?
+  }];
+}
+
 def FWriteOp : SVOp<"fwrite", [ProceduralOp]> {
   let summary = "'$fwrite' statement";
 
@@ -543,6 +553,22 @@ def FFlushOp : SVOp<"fflush", [ProceduralOp]> {
   let assemblyFormat = [{
      (`fd` $fd^)? attr-dict
   }];
+}
+
+def FCloseOp : SVOp<"fclose", [ProceduralOp]> {
+  let summary = "'$fclose' statement";
+
+  let description = [{
+    The $fclose system task closes the file associated with the specified file
+    descriptor.
+
+    See IEEE 1800-2023 Section 21.3.4.
+  }];
+
+  let arguments = (ins I32:$fd);
+  let results = (outs);
+
+  let assemblyFormat = "$fd attr-dict";
 }
 
 def VerbatimOp : SVOp<"verbatim", [
@@ -1216,3 +1242,5 @@ def ReserveNamesOp : SVOp<"reserve_names", [
     $reservedNames attr-dict
   }];
 }
+
+#endif // CIRCT_DIALECT_SV_SVSTATEMENTS_TD

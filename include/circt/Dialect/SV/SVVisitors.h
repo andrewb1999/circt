@@ -32,7 +32,7 @@ public:
             IndexedPartSelectInOutOp, IndexedPartSelectOp, StructFieldInOutOp,
             ConstantXOp, ConstantZOp, ConstantStrOp, MacroRefExprOp,
             MacroRefExprSEOp, UnpackedArrayCreateOp, UnpackedOpenArrayCastOp,
-            SFormatFOp,
+            SFormatFOp, ConcatStrOp,
             // Declarations.
             RegOp, WireOp, LogicOp, LocalParamOp, XMROp, XMRRefOp,
             // Control flow.
@@ -40,8 +40,9 @@ public:
             AlwaysCombOp, AlwaysFFOp, InitialOp, CaseOp,
             // Other Statements.
             AssignOp, BPAssignOp, PAssignOp, ForceOp, ReleaseOp, AliasOp,
-            FWriteOp, FFlushOp, SystemFunctionOp, VerbatimOp, MacroRefOp,
-            FuncCallOp, FuncCallProceduralOp, ReturnOp, IncludeOp, MacroErrorOp,
+            WriteOp, FWriteOp, FFlushOp, FCloseOp, SystemFunctionOp, VerbatimOp,
+            MacroRefOp, FuncCallOp, FuncCallProceduralOp, ReturnOp, IncludeOp,
+            MacroErrorOp,
             // Type declarations.
             InterfaceOp, SVVerbatimSourceOp, InterfaceSignalOp,
             InterfaceModportOp, InterfaceInstanceOp, GetModportOp,
@@ -61,7 +62,7 @@ public:
             // Memory loading tasks
             ReadMemOp,
             // Generate statements
-            GenerateOp, GenerateCaseOp,
+            GenerateOp, GenerateCaseOp, GenerateForOp,
             // For statements
             ForOp,
             // Sampled value functiions
@@ -116,6 +117,7 @@ public:
   HANDLE(UnpackedArrayCreateOp, Unhandled);
   HANDLE(UnpackedOpenArrayCastOp, Unhandled);
   HANDLE(SFormatFOp, Unhandled);
+  HANDLE(ConcatStrOp, Unhandled);
 
   // Control flow.
   HANDLE(OrderedOutputOp, Unhandled);
@@ -135,8 +137,10 @@ public:
   HANDLE(ForceOp, Unhandled);
   HANDLE(ReleaseOp, Unhandled);
   HANDLE(AliasOp, Unhandled);
+  HANDLE(WriteOp, Unhandled);
   HANDLE(FWriteOp, Unhandled);
   HANDLE(FFlushOp, Unhandled);
+  HANDLE(FCloseOp, Unhandled);
   HANDLE(SystemFunctionOp, Unhandled);
   HANDLE(FuncCallProceduralOp, Unhandled);
   HANDLE(FuncCallOp, Unhandled);
@@ -195,6 +199,7 @@ public:
   // Generate statements
   HANDLE(GenerateOp, Unhandled);
   HANDLE(GenerateCaseOp, Unhandled);
+  HANDLE(GenerateForOp, Unhandled);
 
   // For loop.
   HANDLE(ForOp, Unhandled);

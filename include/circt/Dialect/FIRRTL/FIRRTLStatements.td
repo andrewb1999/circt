@@ -13,10 +13,10 @@
 #ifndef CIRCT_DIALECT_FIRRTL_FIRRTLSTATEMENTS_TD
 #define CIRCT_DIALECT_FIRRTL_FIRRTLSTATEMENTS_TD
 
-include "FIRRTLDialect.td"
-include "FIRRTLEnums.td"
-include "FIRRTLOpInterfaces.td"
-include "FIRRTLTypes.td"
+include "circt/Dialect/FIRRTL/FIRRTLDialect.td"
+include "circt/Dialect/FIRRTL/FIRRTLEnums.td"
+include "circt/Dialect/FIRRTL/FIRRTLOpInterfaces.td"
+include "circt/Dialect/FIRRTL/FIRRTLTypes.td"
 include "circt/Dialect/HW/HWAttributesNaming.td"
 include "circt/Dialect/HW/HWTypes.td"
 include "mlir/IR/SymbolInterfaces.td"
@@ -368,6 +368,33 @@ def PropAssignOp : FIRRTLOp<"propassign", [FConnectLike, SameTypeOperands,
       return ConnectBehaviorKind::StaticSingleConnect;
     }
   }];
+}
+
+def PropertyAssertOp : FIRRTLOp<"property_assert",
+    [ParentOneOf<["FModuleOp", "ClassOp"]>]> {
+  let summary = "Assert that a boolean property holds";
+  let description = [{
+    Asserts that the boolean property `$condition` is true. If the condition
+    is statically known to be false, a compile-time error is raised. Otherwise
+    the assertion is lowered to the OM evaluator for runtime checking.
+
+    Example:
+    ```mlir
+    firrtl.property_assert %cond, %message : !firrtl.bool
+    ```
+  }];
+
+  let arguments = (ins
+    BoolType:$condition,
+    StringType:$message
+  );
+  let results = (outs);
+
+  let assemblyFormat = [{
+    $condition `,` $message attr-dict `:` type($condition)
+  }];
+
+  let hasVerifier = 1;
 }
 
 def ForceOp : FIRRTLOp<"force", [SameTypeOperands]> {

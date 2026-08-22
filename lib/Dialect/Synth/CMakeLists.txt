@@ -5,7 +5,9 @@
 ##===----------------------------------------------------------------------===//
 
 add_circt_dialect_library(CIRCTSynth
+  SynthAttributes.cpp
   SynthDialect.cpp
+  SynthOpInterfaces.cpp
   SynthOps.cpp
 
   ADDITIONAL_HEADER_DIRS
@@ -13,6 +15,9 @@ add_circt_dialect_library(CIRCTSynth
 
   DEPENDS
   MLIRSynthIncGen
+  MLIRSynthOpInterfacesIncGen
+  CIRCTSynthEnumsIncGen
+  CIRCTSynthAttrIncGen
 
   LINK_COMPONENTS
   Support
@@ -20,6 +25,7 @@ add_circt_dialect_library(CIRCTSynth
   LINK_LIBS PUBLIC
   MLIRIR
   CIRCTHW
+  CIRCTComb
   CIRCTSupport
 )
 

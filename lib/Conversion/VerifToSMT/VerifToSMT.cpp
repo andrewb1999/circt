@@ -8,6 +8,7 @@
 
 #include "circt/Conversion/VerifToSMT.h"
 #include "circt/Conversion/HWToSMT.h"
+#include "circt/Dialect/Debug/DebugOps.h"
 #include "circt/Dialect/Seq/SeqTypes.h"
 #include "circt/Dialect/Verif/VerifOps.h"
 #include "circt/Support/Namespace.h"
@@ -20,6 +21,7 @@
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
 namespace circt {
@@ -36,6 +38,52 @@ using namespace hw;
 //===----------------------------------------------------------------------===//
 
 namespace {
+llvm::SmallDenseMap<unsigned, StringAttr> collectDebugNames(Block &block) {
+  llvm::SmallDenseMap<unsigned, StringAttr> debugNames;
+  for (auto arg : block.getArguments()) {
+    for (auto *user : arg.getUsers()) {
+      auto varOp = dyn_cast<debug::VariableOp>(user);
+      if (!varOp)
+        continue;
+      auto name = varOp.getNameAttr();
+      if (name.getValue().empty())
+        continue;
+      debugNames.try_emplace(arg.getArgNumber(), name);
+      break;
+    }
+  }
+  return debugNames;
+}
+
+static void attachDebugVariables(
+    OpBuilder &builder, Location loc, ArrayRef<Type> originalTypes,
+    ValueRange values,
+    const llvm::SmallDenseMap<unsigned, StringAttr> &debugNames) {
+  for (auto [argIndex, value] : llvm::enumerate(values)) {
+    if (isa<seq::ClockType>(originalTypes[argIndex]))
+      continue;
+    auto it = debugNames.find(argIndex);
+    if (it == debugNames.end())
+      continue;
+    debug::VariableOp::create(builder, loc, it->second, value,
+                              /*scope=*/Value{});
+  }
+}
+
+static void attachTraceRecords(
+    OpBuilder &builder, Location loc, Value step, ArrayRef<Type> originalTypes,
+    ValueRange values,
+    const llvm::SmallDenseMap<unsigned, StringAttr> &debugNames) {
+  for (auto [argIndex, value] : llvm::enumerate(values)) {
+    if (isa<seq::ClockType>(originalTypes[argIndex]))
+      continue;
+    auto it = debugNames.find(argIndex);
+    if (it == debugNames.end())
+      continue;
+    verif::BMCTraceOp::create(builder, loc, step, it->second, value);
+  }
+}
+
 /// Lower a verif::AssertOp operation with an i1 operand to a smt::AssertOp,
 /// negated to check for unsatisfiability.
 struct VerifAssertOpConversion : OpConversionPattern<verif::AssertOp> {
@@ -393,6 +441,7 @@ struct VerifBoundedModelCheckingOpConversion
     if (failed(typeConverter->convertTypes(
             op.getCircuit().front().back().getOperandTypes(), circuitOutputTy)))
       return failure();
+    auto debugNames = collectDebugNames(op.getCircuit().front());
     if (failed(rewriter.convertRegionTypes(&op.getInit(), *typeConverter)))
       return failure();
     if (failed(rewriter.convertRegionTypes(&op.getLoop(), *typeConverter)))
@@ -462,6 +511,13 @@ struct VerifBoundedModelCheckingOpConversion
     size_t regStartIdx = oldCircuitInputTy.size() - numRegs;
     SmallVector<Value> inputDecls;
     SmallVector<int> clockIndexes;
+    auto getNameAttr = [&](unsigned argIndex, bool isReg) {
+      if (auto it = debugNames.find(argIndex); it != debugNames.end())
+        return it->second;
+      auto fallback = isReg ? ("reg_" + Twine(argIndex - regStartIdx)).str()
+                            : ("input_" + Twine(argIndex)).str();
+      return rewriter.getStringAttr(fallback);
+    };
     for (auto [curIndex, oldTy, newTy] :
          llvm::enumerate(oldCircuitInputTy, circuitInputTy)) {
       if (isa<seq::ClockType>(oldTy)) {
@@ -481,20 +537,20 @@ struct VerifBoundedModelCheckingOpConversion
           continue;
         }
       }
-      // Give a meaningful name prefix based on the argument's role.
-      std::string name;
-      if (curIndex >= regStartIdx)
-        name = ("reg_" + Twine(curIndex - regStartIdx)).str();
-      else
-        name = ("input_" + Twine(curIndex)).str();
       inputDecls.push_back(smt::DeclareFunOp::create(
-          rewriter, loc, newTy, rewriter.getStringAttr(name)));
+          rewriter, loc, newTy,
+          getNameAttr(curIndex, curIndex >= regStartIdx)));
     }
 
     auto numStateArgs = initVals.size() - initIndex;
     // Add the rest of the init vals (state args)
     for (; initIndex < initVals.size(); ++initIndex)
       inputDecls.push_back(initVals[initIndex]);
+
+    attachDebugVariables(
+        rewriter, loc, oldCircuitInputTy,
+        ValueRange(inputDecls).take_front(circuitFuncOp.getNumArguments()),
+        debugNames);
 
     Value lowerBound =
         arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
@@ -514,6 +570,13 @@ struct VerifBoundedModelCheckingOpConversion
     auto forOp = scf::ForOp::create(
         rewriter, loc, lowerBound, upperBound, step, inputDecls,
         [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
+          attachDebugVariables(
+              builder, loc, oldCircuitInputTy,
+              iterArgs.take_front(circuitFuncOp.getNumArguments()), debugNames);
+          attachTraceRecords(
+              builder, loc, i, oldCircuitInputTy,
+              iterArgs.take_front(circuitFuncOp.getNumArguments()), debugNames);
+
           // Drop existing assertions
           smt::PopOp::create(builder, loc, 1);
           smt::PushOp::create(builder, loc, 1);
@@ -601,9 +664,8 @@ struct VerifBoundedModelCheckingOpConversion
             if (isa<seq::ClockType>(oldTy)) {
               newDecls.push_back(loopVals[loopIndex++]);
             } else {
-              auto name = ("input_" + Twine(inputIdx)).str();
               newDecls.push_back(smt::DeclareFunOp::create(
-                  builder, loc, newTy, builder.getStringAttr(name)));
+                  builder, loc, newTy, getNameAttr(inputIdx, false)));
             }
           }
 
@@ -649,6 +711,11 @@ struct VerifBoundedModelCheckingOpConversion
           // Add the rest of the loop state args
           for (; loopIndex < loopVals.size(); ++loopIndex)
             newDecls.push_back(loopVals[loopIndex]);
+
+          attachDebugVariables(
+              builder, loc, oldCircuitInputTy,
+              ValueRange(newDecls).take_front(circuitFuncOp.getNumArguments()),
+              debugNames);
 
           newDecls.push_back(violated);
 
@@ -696,8 +763,10 @@ void circt::populateVerifToSMTConversionPatterns(
 void ConvertVerifToSMTPass::runOnOperation() {
   ConversionTarget target(getContext());
   target.addIllegalDialect<verif::VerifDialect>();
-  target.addLegalDialect<smt::SMTDialect, arith::ArithDialect, scf::SCFDialect,
+  target.addLegalDialect<debug::DebugDialect, smt::SMTDialect,
+                         arith::ArithDialect, scf::SCFDialect,
                          func::FuncDialect>();
+  target.addLegalOp<verif::BMCTraceOp>();
   target.addLegalOp<UnrealizedConversionCastOp>();
 
   // Check BMC ops contain only one assertion (done outside pattern to avoid

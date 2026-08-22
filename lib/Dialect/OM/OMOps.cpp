@@ -15,6 +15,7 @@
 #include "circt/Dialect/OM/OMUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
@@ -131,6 +132,9 @@ static ParseResult parseClassFieldsList(OpAsmParser &parser,
 }
 
 static ParseResult parseClassLike(OpAsmParser &parser, OperationState &state) {
+  // Parse the optional symbol visibility.
+  (void)mlir::impl::parseOptionalVisibilityKeyword(parser, state.attributes);
+
   // Parse the Class symbol name.
   StringAttr symName;
   if (parser.parseSymbolName(symName, mlir::SymbolTable::getSymbolAttrName(),
@@ -185,9 +189,16 @@ static ParseResult parseClassLike(OpAsmParser &parser, OperationState &state) {
 }
 
 static void printClassLike(ClassLike classLike, OpAsmPrinter &printer) {
+  printer << " ";
+
+  // Print the optional symbol visibility.
+  StringRef visibilityAttrName = SymbolTable::getVisibilityAttrName();
+  if (auto visibility =
+          classLike->getAttrOfType<StringAttr>(visibilityAttrName))
+    printer << visibility.getValue() << ' ';
+
   // Print the Class symbol name.
-  printer << " @";
-  printer << classLike.getSymName();
+  printer.printSymbolName(classLike.getSymName());
 
   // Retrieve the formal parameter names and values.
   auto argNames = SmallVector<StringRef>(
@@ -221,9 +232,9 @@ static void printClassLike(ClassLike classLike, OpAsmPrinter &printer) {
   }
 
   // Print the optional attribute dictionary.
-  SmallVector<StringRef> elidedAttrs{classLike.getSymNameAttrName(),
-                                     classLike.getFormalParamNamesAttrName(),
-                                     "fieldTypes", "fieldNames"};
+  SmallVector<StringRef> elidedAttrs{
+      classLike.getSymNameAttrName(), classLike.getFormalParamNamesAttrName(),
+      visibilityAttrName, "fieldTypes", "fieldNames"};
   printer.printOptionalAttrDictWithKeyword(classLike.getOperation()->getAttrs(),
                                            elidedAttrs);
 
@@ -276,9 +287,9 @@ std::optional<Type> getClassLikeFieldType(ClassLike classLike,
   DictionaryAttr fieldTypes = mlir::cast<DictionaryAttr>(
       classLike.getOperation()->getAttr("fieldTypes"));
   Attribute type = fieldTypes.get(name);
-  if (!type)
-    return std::nullopt;
-  return cast<TypeAttr>(type).getValue();
+  if (auto field = dyn_cast_or_null<TypeAttr>(type))
+    return field.getValue();
+  return std::nullopt;
 }
 
 void replaceClassLikeFieldTypes(ClassLike classLike,
@@ -335,7 +346,10 @@ void circt::om::ClassOp::print(OpAsmPrinter &printer) {
 LogicalResult circt::om::ClassOp::verify() { return verifyClassLike(*this); }
 
 LogicalResult circt::om::ClassOp::verifyRegions() {
-  auto fieldsOp = cast<ClassFieldsOp>(this->getBodyBlock()->getTerminator());
+  auto fieldsOp =
+      dyn_cast_or_null<ClassFieldsOp>(this->getBodyBlock()->getTerminator());
+  if (!fieldsOp)
+    return this->emitOpError("expected terminator to be ClassFieldsOp");
 
   // The number of results matches the number of terminator operands.
   if (fieldsOp.getNumOperands() != this->getFieldNames().size()) {
@@ -351,9 +365,14 @@ LogicalResult circt::om::ClassOp::verifyRegions() {
   for (auto [fieldName, terminatorOperandType] :
        llvm::zip(this->getFieldNames(), fieldsOp.getOperandTypes())) {
 
-    if (terminatorOperandType ==
-        cast<TypeAttr>(types.get(cast<StringAttr>(fieldName))).getValue())
-      continue;
+    auto fieldNameAttr = dyn_cast_or_null<StringAttr>(fieldName);
+    if (!fieldNameAttr)
+      return this->emitOpError("field name is not a StringAttr");
+
+    if (auto fieldType = types.get(fieldNameAttr))
+      if (auto typeAttr = dyn_cast<TypeAttr>(fieldType))
+        if (typeAttr.getValue() == terminatorOperandType)
+          continue;
 
     auto diag = this->emitOpError()
                 << "returns different field types than its terminator";
@@ -526,34 +545,44 @@ void circt::om::ObjectOp::build(::mlir::OpBuilder &odsBuilder,
   return build(odsBuilder, odsState,
                om::ClassType::get(odsBuilder.getContext(),
                                   mlir::FlatSymbolRefAttr::get(classOp)),
-               classOp.getNameAttr(), actualParams);
+               mlir::FlatSymbolRefAttr::get(classOp.getNameAttr()),
+               actualParams);
+}
+
+static FailureOr<ClassLike>
+verifyClassLikeSymbolUser(Operation *op, SymbolTableCollection &symbolTable,
+                          ClassType resultType, StringAttr className) {
+  StringAttr resultClassName = resultType.getClassName().getAttr();
+  if (resultClassName != className)
+    return op->emitOpError("result type (")
+           << resultClassName << ") does not match referred to class ("
+           << className << ')';
+
+  auto classDef = dyn_cast_or_null<ClassLike>(
+      symbolTable.lookupNearestSymbolFrom(op, className));
+  if (!classDef)
+    return op->emitOpError("refers to non-existant class (")
+           << className << ')';
+  return classDef;
 }
 
 LogicalResult
 circt::om::ObjectOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  // Verify the result type is the same as the referred-to class.
-  StringAttr resultClassName = getResult().getType().getClassName().getAttr();
-  StringAttr className = getClassNameAttr();
-  if (resultClassName != className)
-    return emitOpError("result type (")
-           << resultClassName << ") does not match referred to class ("
-           << className << ')';
-
-  // Verify the referred to ClassOp exists.
-  auto classDef = dyn_cast_or_null<ClassLike>(
-      symbolTable.lookupNearestSymbolFrom(*this, className));
-  if (!classDef)
-    return emitOpError("refers to non-existant class (") << className << ')';
+  auto classDef =
+      verifyClassLikeSymbolUser((*this), symbolTable, getResult().getType(),
+                                getClassNameAttr().getAttr());
+  if (failed(classDef))
+    return failure();
 
   auto actualTypes = getActualParams().getTypes();
-  auto formalTypes = classDef.getBodyBlock()->getArgumentTypes();
+  auto formalTypes = classDef->getBodyBlock()->getArgumentTypes();
 
   // Verify the actual parameter list matches the formal parameter list.
   if (actualTypes.size() != formalTypes.size()) {
     auto error = emitOpError(
         "actual parameter list doesn't match formal parameter list");
-    error.attachNote(classDef.getLoc())
-        << "formal parameters: " << classDef.getBodyBlock()->getArguments();
+    error.attachNote(classDef->getLoc())
+        << "formal parameters: " << classDef->getBodyBlock()->getArguments();
     error.attachNote(getLoc()) << "actual parameters: " << getActualParams();
     return error;
   }
@@ -565,6 +594,81 @@ circt::om::ObjectOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
              << actualTypes[i] << ") doesn't match formal parameter type ("
              << formalTypes[i] << ')';
     }
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ObjectFieldOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+circt::om::ObjectFieldOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto classType = getObject().getType();
+  auto className = classType.getClassName().getAttr();
+
+  // Verify the referred-to class exists.
+  auto classDef = dyn_cast_or_null<ClassLike>(
+      symbolTable.lookupNearestSymbolFrom(*this, className));
+  if (!classDef)
+    return emitOpError("class ") << className << " was not found";
+
+  // Verify the field exists in the class.
+  auto fieldName = getFieldAttr();
+  std::optional<Type> fieldType = classDef.getFieldType(fieldName);
+  if (!fieldType) {
+    auto diag = emitOpError("referenced non-existent field ") << fieldName;
+    diag.attachNote(classDef.getLoc()) << "class defined here";
+    return diag;
+  }
+
+  // Verify the result type matches the field type.
+  if (getResult().getType() != fieldType.value())
+    return emitOpError("expected type ")
+           << getResult().getType() << ", but accessed field has type "
+           << fieldType.value();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ElaboratedObjectOp
+//===----------------------------------------------------------------------===//
+
+void circt::om::ElaboratedObjectOp::build(OpBuilder &odsBuilder,
+                                          OperationState &odsState,
+                                          om::ClassLike classOp,
+                                          ValueRange fieldValues) {
+  return build(odsBuilder, odsState,
+               om::ClassType::get(
+                   odsBuilder.getContext(),
+                   mlir::FlatSymbolRefAttr::get(classOp.getSymNameAttr())),
+               mlir::FlatSymbolRefAttr::get(classOp.getSymNameAttr()),
+               fieldValues);
+}
+
+LogicalResult circt::om::ElaboratedObjectOp::verifySymbolUses(
+    SymbolTableCollection &symbolTable) {
+  auto classDef =
+      verifyClassLikeSymbolUser((*this), symbolTable, getResult().getType(),
+                                getClassNameAttr().getAttr());
+  if (failed(classDef))
+    return failure();
+
+  auto fieldNames = classDef->getFieldNames();
+  auto fieldValues = getFieldValues();
+  if (fieldValues.size() != fieldNames.size())
+    return emitOpError("field value list doesn't match class field list, "
+                       "expected ")
+           << fieldNames.size() << " values but got " << fieldValues.size();
+
+  for (auto [fieldName, fieldValue] : llvm::zip(fieldNames, fieldValues)) {
+    Type expectedType =
+        classDef->getFieldType(cast<StringAttr>(fieldName)).value();
+    if (fieldValue.getType() != expectedType)
+      return emitOpError("field value type for ")
+             << cast<StringAttr>(fieldName) << " (" << fieldValue.getType()
+             << ") doesn't match class field type (" << expectedType << ')';
   }
 
   return success();
@@ -640,55 +744,112 @@ PathCreateOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
 }
 
 //===----------------------------------------------------------------------===//
+// IntegerBinaryOp (arithmetic)
+//===----------------------------------------------------------------------===//
+
+static APSInt getAPSIntForOMIntegerAttr(circt::om::IntegerAttr attr) {
+  auto value = attr.getValue();
+  if (value.getType().isSignedInteger())
+    return value.getAPSInt();
+
+  // OM integers use signed semantics, but their underlying IntegerAttr may be
+  // signless. Construct an APSInt with signed interpretation explicitly instead
+  // of calling IntegerAttr::getAPSInt(), which asserts for signless integers.
+  return APSInt(value.getValue(), /*isUnsigned=*/false);
+}
+
+using IntegerBinaryFn =
+    llvm::function_ref<FailureOr<APSInt>(const APSInt &, const APSInt &)>;
+
+static OpFoldResult foldIntegerBinaryArithmetic(Attribute lhsAttr,
+                                                Attribute rhsAttr,
+                                                IntegerBinaryFn evaluate) {
+  auto lhs = dyn_cast_or_null<circt::om::IntegerAttr>(lhsAttr);
+  auto rhs = dyn_cast_or_null<circt::om::IntegerAttr>(rhsAttr);
+  if (!lhs || !rhs)
+    return {};
+  // Extend values if necessary to match bitwidth. Most interesting arithmetic
+  // on APSInt asserts that both operands are the same bitwidth, but the
+  // IntegerAttrs we are working with may have used the smallest necessary
+  // bitwidth to represent the number they hold, and won't necessarily match.
+  APSInt lhsVal = getAPSIntForOMIntegerAttr(lhs);
+  APSInt rhsVal = getAPSIntForOMIntegerAttr(rhs);
+  if (lhsVal.getBitWidth() > rhsVal.getBitWidth())
+    rhsVal = rhsVal.extend(lhsVal.getBitWidth());
+  else if (rhsVal.getBitWidth() > lhsVal.getBitWidth())
+    lhsVal = lhsVal.extend(rhsVal.getBitWidth());
+
+  // Perform arbitrary precision signed integer binary arithmetic.
+  auto result = evaluate(lhsVal, rhsVal);
+  if (failed(result))
+    return {};
+
+  // Return the result as a new om::IntegerAttr.
+  auto *ctx = lhsAttr.getContext();
+  return circt::om::IntegerAttr::get(
+      ctx, mlir::IntegerAttr::get(ctx, result.value()));
+}
+
+//===----------------------------------------------------------------------===//
 // IntegerAddOp
 //===----------------------------------------------------------------------===//
 
-FailureOr<llvm::APSInt>
-IntegerAddOp::evaluateIntegerOperation(const llvm::APSInt &lhs,
-                                       const llvm::APSInt &rhs) {
-  return success(lhs + rhs);
+OpFoldResult IntegerAddOp::fold(FoldAdaptor adaptor) {
+  return foldIntegerBinaryArithmetic(
+      adaptor.getLhs(), adaptor.getRhs(),
+      [](const APSInt &lhs, const APSInt &rhs) { return success(lhs + rhs); });
 }
 
 //===----------------------------------------------------------------------===//
 // IntegerMulOp
 //===----------------------------------------------------------------------===//
 
-FailureOr<llvm::APSInt>
-IntegerMulOp::evaluateIntegerOperation(const llvm::APSInt &lhs,
-                                       const llvm::APSInt &rhs) {
-  return success(lhs * rhs);
+OpFoldResult IntegerMulOp::fold(FoldAdaptor adaptor) {
+  return foldIntegerBinaryArithmetic(
+      adaptor.getLhs(), adaptor.getRhs(),
+      [](const APSInt &lhs, const APSInt &rhs) { return success(lhs * rhs); });
 }
 
 //===----------------------------------------------------------------------===//
 // IntegerShrOp
 //===----------------------------------------------------------------------===//
 
-FailureOr<llvm::APSInt>
-IntegerShrOp::evaluateIntegerOperation(const llvm::APSInt &lhs,
-                                       const llvm::APSInt &rhs) {
-  // Check non-negative constraint from operation semantics.
-  if (!rhs.isNonNegative())
-    return emitOpError("shift amount must be non-negative");
-  // Check size constraint from implementation detail of using getExtValue.
-  if (!rhs.isRepresentableByInt64())
-    return emitOpError("shift amount must be representable in 64 bits");
-  return success(lhs >> rhs.getExtValue());
+OpFoldResult IntegerShrOp::fold(FoldAdaptor adaptor) {
+  return foldIntegerBinaryArithmetic(
+      adaptor.getLhs(), adaptor.getRhs(),
+      [&](const APSInt &lhs, const APSInt &rhs) -> FailureOr<APSInt> {
+        // Check non-negative constraint from operation semantics.
+        if (!rhs.isNonNegative())
+          return (emitOpError("shift amount must be non-negative"), failure());
+        // Check size constraint from implementation detail of using
+        // getExtValue.
+        if (!rhs.isRepresentableByInt64())
+          return (emitOpError("shift amount must be representable in 64 bits"),
+                  failure());
+        return success(lhs >> rhs.getExtValue());
+      });
 }
 
 //===----------------------------------------------------------------------===//
 // IntegerShlOp
 //===----------------------------------------------------------------------===//
 
-FailureOr<llvm::APSInt>
-IntegerShlOp::evaluateIntegerOperation(const llvm::APSInt &lhs,
-                                       const llvm::APSInt &rhs) {
-  // Check non-negative constraint from operation semantics.
-  if (!rhs.isNonNegative())
-    return emitOpError("shift amount must be non-negative");
-  // Check size constraint from implementation detail of using getExtValue.
-  if (!rhs.isRepresentableByInt64())
-    return emitOpError("shift amount must be representable in 64 bits");
-  return success(lhs << rhs.getExtValue());
+OpFoldResult IntegerShlOp::fold(FoldAdaptor adaptor) {
+  return foldIntegerBinaryArithmetic(
+      adaptor.getLhs(), adaptor.getRhs(),
+      [&](const APSInt &lhs, const APSInt &rhs) -> FailureOr<APSInt> {
+        // Check non-negative constraint from operation semantics.
+        if (!rhs.isNonNegative())
+          return (emitOpError("shift amount must be non-negative"), failure());
+        // Check size constraint from implementation detail of using
+        // getExtValue.
+        if (!rhs.isRepresentableByInt64())
+          return (emitOpError("shift amount must be representable in 64 bits"),
+                  failure());
+        int64_t shiftAmt = rhs.getExtValue();
+        // Extend lhs to lhsWidth + shiftAmt bits so no bits are truncated.
+        return success(lhs.extend(lhs.getBitWidth() + shiftAmt) << shiftAmt);
+      });
 }
 
 //===----------------------------------------------------------------------===//
@@ -697,8 +858,12 @@ IntegerShlOp::evaluateIntegerOperation(const llvm::APSInt &lhs,
 
 OpFoldResult StringConcatOp::fold(FoldAdaptor adaptor) {
   // Fold single-operand concat to just the operand.
-  if (getStrings().size() == 1)
+  if (getStrings().size() == 1) {
+    if (auto strAttr = adaptor.getStrings()[0])
+      return strAttr;
+
     return getStrings()[0];
+  }
 
   // Check if all operands are constant strings before accumulating.
   if (!llvm::all_of(adaptor.getStrings(), [](Attribute operand) {
@@ -829,6 +994,139 @@ void StringConcatOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                                  MLIRContext *context) {
   results.insert<FlattenOMStringConcat, MergeAdjacentOMStringConstants>(
       context);
+}
+
+//===----------------------------------------------------------------------===//
+// PropEqOp
+//===----------------------------------------------------------------------===//
+
+static FailureOr<mlir::Attribute>
+evaluateBinaryEquality(mlir::Attribute lhsAttr, mlir::Attribute rhsAttr) {
+  auto resultType = mlir::IntegerType::get(lhsAttr.getContext(), 1);
+
+  // String equality.
+  if (auto lhs = dyn_cast<mlir::StringAttr>(lhsAttr))
+    if (auto rhs = dyn_cast<mlir::StringAttr>(rhsAttr))
+      return mlir::Attribute(
+          mlir::IntegerAttr::get(resultType, lhs == rhs ? 1 : 0));
+
+  // OM integer equality (arbitrary precision).
+  if (auto lhs = dyn_cast<circt::om::IntegerAttr>(lhsAttr))
+    if (auto rhs = dyn_cast<circt::om::IntegerAttr>(rhsAttr)) {
+      APSInt lhsVal = getAPSIntForOMIntegerAttr(lhs);
+      APSInt rhsVal = getAPSIntForOMIntegerAttr(rhs);
+      if (lhsVal.getBitWidth() > rhsVal.getBitWidth())
+        rhsVal = rhsVal.extend(lhsVal.getBitWidth());
+      else if (rhsVal.getBitWidth() > lhsVal.getBitWidth())
+        lhsVal = lhsVal.extend(rhsVal.getBitWidth());
+      return mlir::Attribute(
+          mlir::IntegerAttr::get(resultType, lhsVal == rhsVal ? 1 : 0));
+    }
+
+  // Boolean (i1) equality.
+  if (auto lhs = dyn_cast<mlir::IntegerAttr>(lhsAttr))
+    if (auto rhs = dyn_cast<mlir::IntegerAttr>(rhsAttr))
+      return mlir::Attribute(
+          mlir::IntegerAttr::get(resultType, lhs == rhs ? 1 : 0));
+
+  return failure();
+}
+
+OpFoldResult PropEqOp::fold(FoldAdaptor adaptor) {
+  auto lhsAttr = adaptor.getLhs();
+  auto rhsAttr = adaptor.getRhs();
+  if (!lhsAttr || !rhsAttr)
+    return {};
+
+  auto result = evaluateBinaryEquality(lhsAttr, rhsAttr);
+  if (failed(result))
+    return {};
+
+  return *result;
+}
+
+//===----------------------------------------------------------------------===//
+// IntegerAndOp / IntegerOrOp / IntegerXorOp
+//===----------------------------------------------------------------------===//
+
+static OpFoldResult foldIntegerBitwise(Attribute lhsAttr, Attribute rhsAttr,
+                                       IntegerBinaryFn evaluate) {
+  auto lhsInt = dyn_cast_or_null<mlir::IntegerAttr>(lhsAttr);
+  auto rhsInt = dyn_cast_or_null<mlir::IntegerAttr>(rhsAttr);
+  if (!lhsInt || !rhsInt)
+    return {};
+  APSInt lhsVal(lhsInt.getValue());
+  APSInt rhsVal(rhsInt.getValue());
+  auto result = evaluate(lhsVal, rhsVal);
+  if (failed(result))
+    return {};
+  return mlir::IntegerAttr::get(
+      lhsInt.getType(), result->extOrTrunc(lhsInt.getValue().getBitWidth()));
+}
+
+// Returns true if attr is an IntegerAttr whose value is all-zeros.
+static bool isZeroInt(Attribute a) {
+  auto i = dyn_cast_or_null<mlir::IntegerAttr>(a);
+  return i && i.getValue().isZero();
+}
+
+// Returns true if attr is an IntegerAttr whose value is all-ones.
+static bool isAllOnesInt(Attribute a) {
+  auto i = dyn_cast_or_null<mlir::IntegerAttr>(a);
+  return i && i.getValue().isAllOnes();
+}
+
+OpFoldResult IntegerAndOp::fold(FoldAdaptor adaptor) {
+  if (auto result = foldIntegerBitwise(
+          adaptor.getLhs(), adaptor.getRhs(),
+          [](const APSInt &lhs, const APSInt &rhs) {
+            return success(APSInt(lhs & rhs, /*isUnsigned=*/false));
+          }))
+    return result;
+  // AND with all-zeros is always zero.
+  if (isZeroInt(adaptor.getLhs()) || isZeroInt(adaptor.getRhs()))
+    return mlir::IntegerAttr::get(getResult().getType(),
+                                  APInt::getZero(getType().getWidth()));
+  // AND with all-ones is identity.
+  if (isAllOnesInt(adaptor.getLhs()))
+    return getRhs();
+  if (isAllOnesInt(adaptor.getRhs()))
+    return getLhs();
+  return {};
+}
+
+OpFoldResult IntegerOrOp::fold(FoldAdaptor adaptor) {
+  if (auto result = foldIntegerBitwise(
+          adaptor.getLhs(), adaptor.getRhs(),
+          [](const APSInt &lhs, const APSInt &rhs) {
+            return success(APSInt(lhs | rhs, /*isUnsigned=*/false));
+          }))
+    return result;
+  // OR with all-ones is always all-ones.
+  if (isAllOnesInt(adaptor.getLhs()) || isAllOnesInt(adaptor.getRhs()))
+    return mlir::IntegerAttr::get(getResult().getType(),
+                                  APInt::getAllOnes(getType().getWidth()));
+  // OR with all-zeros is identity.
+  if (isZeroInt(adaptor.getLhs()))
+    return getRhs();
+  if (isZeroInt(adaptor.getRhs()))
+    return getLhs();
+  return {};
+}
+
+OpFoldResult IntegerXorOp::fold(FoldAdaptor adaptor) {
+  if (auto result = foldIntegerBitwise(
+          adaptor.getLhs(), adaptor.getRhs(),
+          [](const APSInt &lhs, const APSInt &rhs) {
+            return success(APSInt(lhs ^ rhs, /*isUnsigned=*/false));
+          }))
+    return result;
+  // XOR with all-zeros is identity.
+  if (isZeroInt(adaptor.getLhs()))
+    return getRhs();
+  if (isZeroInt(adaptor.getRhs()))
+    return getLhs();
+  return {};
 }
 
 //===----------------------------------------------------------------------===//

@@ -10,6 +10,7 @@
 ##===----------------------------------------------------------------------===//
 
 add_subdirectory(Arc)
+add_subdirectory(AXI4)
 add_subdirectory(Calyx)
 add_subdirectory(Comb)
 add_subdirectory(Datapath)
@@ -32,6 +33,7 @@ add_subdirectory(MSFT)
 add_subdirectory(OM)
 add_subdirectory(OpLib)
 add_subdirectory(Pipeline)
+add_subdirectory(Probe)
 add_subdirectory(RTG)
 if (CIRCT_INCLUDE_TESTS)
   add_subdirectory(RTGTest)

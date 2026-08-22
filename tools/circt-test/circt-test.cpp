@@ -29,6 +29,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Threading.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
@@ -307,12 +308,24 @@ LogicalResult RunnerSuite::resolve() {
   // If the user has provided a concrete list of runners to use, mark all other
   // runners as to be ignored.
   if (opts.runners.getNumOccurrences() > 0) {
+    // Strip leading backslashes from runner names to handle lit shell escaping.
+    // This allows test files to use `-r \verilator` to prevent lit substitution
+    // while still matching the actual runner name "verilator".
+    SmallVector<std::string> normalizedRunners;
+    for (const auto &name : opts.runners) {
+      StringRef runnerName = name;
+      if (runnerName.starts_with("\\"))
+        normalizedRunners.push_back(runnerName.substr(1).str());
+      else
+        normalizedRunners.push_back(name);
+    }
+
     for (auto &runner : runners)
-      if (!llvm::is_contained(opts.runners, runner.name))
+      if (!llvm::is_contained(normalizedRunners, runner.name))
         runner.ignore = true;
 
     // Produce errors if the user listed any runners that don't exist.
-    for (auto &name : opts.runners) {
+    for (const auto &name : normalizedRunners) {
       if (!llvm::is_contained(
               llvm::map_range(runners,
                               [](auto &runner) { return runner.name; }),
@@ -1260,21 +1273,21 @@ static LogicalResult executeWithHandler(MLIRContext *context,
   TestSuite suite(context, opts.listIgnored);
   if (failed(suite.discoverInModule(*module)))
     return failure();
-  if (suite.tests.empty()) {
+  if (suite.tests.empty())
     llvm::errs() << "no tests discovered\n";
-    return success();
-  }
 
-  // Apply filters.
-  applyFilters(suite, includeFilters, excludeFilters);
-  if (suite.tests.empty()) {
-    llvm::errs() << "all tests excluded by filters\n";
-    return success();
+  if (!suite.tests.empty()) {
+    // Apply filters.
+    applyFilters(suite, includeFilters, excludeFilters);
+    if (suite.tests.empty())
+      llvm::errs() << "all tests excluded by filters\n";
   }
 
   // List all tests in the input and exit if requested.
   if (opts.listTests)
     return listTests(suite);
+  if (suite.tests.empty())
+    return success();
   llvm::errs() << "running " << suite.tests.size() << " tests\n";
 
   // Create the output directory where we keep all the run data.
@@ -1517,6 +1530,7 @@ int main(int argc, char **argv) {
   registry.insert<mlir::arith::ArithDialect>();
   registry.insert<mlir::cf::ControlFlowDialect>();
   registry.insert<mlir::scf::SCFDialect>();
+  registry.insert<mlir::ub::UBDialect>();
   circt::registerAllDialects(registry);
 
   // Hide default LLVM options, other than for this tool.

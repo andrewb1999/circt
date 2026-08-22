@@ -85,7 +85,7 @@ def GenericLutMapper : CutRewriterPassBase<"synth-generic-lut-mapper",
   let dependentDialects = ["comb::CombDialect"];
 }
 
-def LowerVariadic : Pass<"synth-lower-variadic", "hw::HWModuleOp"> {
+def LowerVariadic : Pass<"synth-lower-variadic"> {
   let summary = "Lower variadic operations to binary operations";
   let description = [{
     This pass lowers variadic operations to binary operations using a
@@ -107,7 +107,7 @@ def LowerVariadic : Pass<"synth-lower-variadic", "hw::HWModuleOp"> {
   ];
 }
 
-def LowerWordToBits : Pass<"synth-lower-word-to-bits", "hw::HWModuleOp"> {
+def LowerWordToBits : Pass<"synth-lower-word-to-bits"> {
   let summary = "Lower multi-bit AndInverter to single-bit ones";
   let dependentDialects = ["comb::CombDialect"];
   let statistics = [
@@ -219,7 +219,7 @@ class ExternalSolverPass<string name> : Pass<name, "hw::HWModuleOp"> {
   ];
 
   let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect",
-                           "circt::seq::SeqDialect"];
+                           "circt::seq::SeqDialect", "circt::verif::VerifDialect"];
 }
 
 def AIGERRunner : ExternalSolverPass<"synth-aiger-runner"> {
@@ -254,17 +254,17 @@ def ABCRunner : ExternalSolverPass<"synth-abc-runner"> {
   ];
 }
 
-def StructuralHash : Pass<"synth-structural-hash", "hw::HWModuleOp"> {
+def StructuralHash : Pass<"synth-structural-hash"> {
   let summary = "Structural hashing (CSE) for Synth operations";
   let description = [{
     This pass performs aggressive structural hashing-based CSE for Synth dialect
-    operations (AIG/MIG), domain-specific to AIG/MIG operations to enable operand
+    operations, domain-specific to AIG operations to enable operand
     reordering based on structural properties and inversion flag consideration
     for canonicalization.
   }];
 }
 
-def MaximumAndCover : Pass<"synth-maximum-and-cover", "hw::HWModuleOp"> {
+def MaximumAndCover : Pass<"synth-maximum-and-cover"> {
   let summary = "Maximum And Cover for And-Inverter";
   let description = [{
     This pass performs maximum AND-cover optimization by collapsing single-fanout
@@ -330,6 +330,37 @@ def FunctionalReduction : Pass<"synth-functional-reduction", "hw::HWModuleOp"> {
               "Number of nodes merged due to functional equivalence">
   ];
   let dependentDialects = ["synth::SynthDialect"];
+}
+
+def ExactSynthesis : Pass<"synth-exact-synthesis"> {
+  let summary = "Rewrite small comb.truth_table ops with exact synthesis";
+  let description = [{
+    This pass exact-synthesizes small single-bit `comb.truth_table` operations
+    into Synth IR using a SAT-based minimum-area search. Unsupported or
+    unsolved truth tables are left unchanged. The allowed primitive list
+    controls the internal nodes selected by the SAT search. Direct constants,
+    projections, and polarity inversions are handled as helper cases; an
+    output inversion is materialized as `synth.aig.and_inv` and does not count
+    against the area limit.
+  }];
+  let options = [
+    ListOption<"allowedOps", "allowed-ops", "std::string",
+               "Allowed BooleanLogicOpInterface primitives, written as "
+               "'operation-name:arity' entries such as "
+               "'synth.aig.and_inv:2'. May be specified multiple times.">,
+    Option<"maxInputs", "max-inputs", "unsigned", "6",
+           "Maximum number of truth-table inputs to synthesize">,
+    Option<"maxArea", "max-area", "unsigned", "32",
+           "Maximum number of internal nodes to search">,
+    Option<"satSolver", "sat-solver", "std::string", "\"auto\"",
+           "SAT solver backend to use: auto, z3, or cadical">
+  ];
+  let statistics = [
+    Statistic<"numSolved", "solved", "Number of truth tables synthesized">,
+    Statistic<"numUnsolved", "unsolved",
+              "Number of truth tables left unchanged">
+  ];
+  let dependentDialects = ["hw::HWDialect", "synth::SynthDialect"];
 }
 
 #endif // CIRCT_DIALECT_SYNTH_TRANSFORMS_PASSES_TD

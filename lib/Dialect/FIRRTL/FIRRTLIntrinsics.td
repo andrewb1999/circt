@@ -260,7 +260,7 @@ def CirctLTLPast : FIRRTLIntrinsic {
     | Argument | Type    | Description               |
     | -------- | ------- | ------------------------- |
     | in       | UInt<1> | input boolean             |
-    | clock    | Clock   | clock for delay; optional |
+    | clock    | Clock   | clock for delay           |
 
     | Result | Type    | Description            |
     | ------ | ------- | ---------------------- |
@@ -273,6 +273,10 @@ def CirctLTLClock : FIRRTLIntrinsic {
   let description = [{
     Associates a clock with a boolean or sequence. This is used to indicate the
     clock domain in which a property is evaluated.
+
+    | Parameter | Type   | Description                                  |
+    | --------- | ------ | -------------------------------------------- |
+    | edge      | string | clock edge: `posedge`, `negedge`, or `edge` |
 
     | Argument | Type    | Description               |
     | -------- | ------- | ------------------------- |

@@ -39,13 +39,16 @@ namespace circt {
 /// `Driver::addStandardArgs()` for some inspiration on how to expose these on
 /// the command line.
 struct ImportVerilogOptions {
-  /// Limit importing to linting or parsing only.
+  /// Limit importing to linting, parsing, or elaboration only.
   enum class Mode {
-    /// Only lint the input, without elaboration and lowering to CIRCT IR.
+    /// Only lint the input.
     OnlyLint,
-    /// Only parse and elaborate the input, without mapping to CIRCT IR.
+    /// Only parse the input syntax and report parse diagnostics.
     OnlyParse,
-    /// Perform a full import and mapping to CIRCT IR.
+    /// Parse and elaborate the input and convert it to Moore dialect ops,
+    /// without running any transformation passes.
+    OnlyImport,
+    /// Perform a full import and mapping to the core dialects.
     Full
   };
   Mode mode = Mode::Full;
@@ -131,6 +134,10 @@ struct ImportVerilogOptions {
   /// A list of paths in which to suppress warnings.
   std::vector<std::string> suppressWarningsPaths;
 
+  /// If true, make paths for source file debug locations relative to the
+  /// current working directory. Otherwise, leave them unchanged.
+  bool makeLocationPathsProximate = true;
+
   //===--------------------------------------------------------------------===//
   // File lists
   //===--------------------------------------------------------------------===//
@@ -144,6 +151,12 @@ struct ImportVerilogOptions {
 
   /// A list of command files to process for compilation.
   std::vector<std::string> commandFiles;
+
+  //===--------------------------------------------------------------------===//
+  // Misc slang options
+  //===--------------------------------------------------------------------===//
+  /// A list of arbitrary arguments to pass to the Slang CLI.
+  std::vector<std::string> slangArgs;
 };
 
 /// Parse files in a source manager as Verilog source code and populate the

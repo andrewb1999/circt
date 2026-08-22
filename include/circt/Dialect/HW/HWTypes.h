@@ -16,9 +16,11 @@
 
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/HW/HWTypeInterfaces.h"
+#include "mlir/IR/DialectInterface.h"
 #include "mlir/Interfaces/MemorySlotInterfaces.h"
 
 #include "circt/Support/LLVM.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Types.h"
 
@@ -31,6 +33,32 @@ struct ModulePort {
   mlir::Type type;
   Direction dir;
 };
+
+struct HWModulePortTypeInterface
+    : public mlir::DialectInterface::Base<HWModulePortTypeInterface> {
+  HWModulePortTypeInterface(mlir::Dialect *dialect) : Base(dialect) {}
+
+  /// Return failure if `type` is not valid for a module port with the given
+  /// direction. Dialects can implement this to restrict non-HW-value handle
+  /// types in HW module signatures.
+  virtual mlir::LogicalResult verifyHWModulePortType(
+      llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
+      ModulePort::Direction direction, mlir::Type type) const {
+    return mlir::success();
+  }
+};
+
+/// Interface for dialects to classify their types as valid probe payloads.
+struct ProbeTypeDialectInterface
+    : public mlir::DialectInterface::Base<ProbeTypeDialectInterface> {
+  ProbeTypeDialectInterface(mlir::Dialect *dialect) : Base(dialect) {}
+
+  virtual bool isValidProbeElementType(mlir::Type type) const = 0;
+};
+
+/// Return true if `type` is a valid probe payload. Builtin integer types are
+/// always valid; other types are classified by their owning dialect.
+bool isValidProbeElementType(mlir::Type type);
 
 static bool operator==(const ModulePort &a, const ModulePort &b) {
   return a.dir == b.dir && a.name == b.name && a.type == b.type;
@@ -104,6 +132,44 @@ struct OffsetFieldInfo {
 } // namespace hw
 } // namespace circt
 
+namespace mlir {
+/// Expose the field names and types of struct and union types to the generic
+/// attribute and type walking and replacement infrastructure. This allows
+/// walkers to recurse into the fields of `!hw.struct` and `!hw.union` types,
+/// and replacers such as `mlir::AttrTypeReplacer` to replace types nested
+/// within the fields.
+template <>
+struct AttrTypeSubElementHandler<circt::hw::detail::FieldInfo> {
+  static void walk(const circt::hw::detail::FieldInfo &param,
+                   AttrTypeImmediateSubElementWalker &walker) {
+    walker.walk(param.name);
+    walker.walk(param.type);
+  }
+  static circt::hw::detail::FieldInfo
+  replace(const circt::hw::detail::FieldInfo &param,
+          AttrSubElementReplacements &attrRepls,
+          TypeSubElementReplacements &typeRepls) {
+    return {cast<StringAttr>(attrRepls.take_front(1)[0]),
+            typeRepls.take_front(1)[0]};
+  }
+};
+template <>
+struct AttrTypeSubElementHandler<circt::hw::detail::OffsetFieldInfo> {
+  static void walk(const circt::hw::detail::OffsetFieldInfo &param,
+                   AttrTypeImmediateSubElementWalker &walker) {
+    walker.walk(param.name);
+    walker.walk(param.type);
+  }
+  static circt::hw::detail::OffsetFieldInfo
+  replace(const circt::hw::detail::OffsetFieldInfo &param,
+          AttrSubElementReplacements &attrRepls,
+          TypeSubElementReplacements &typeRepls) {
+    return {cast<StringAttr>(attrRepls.take_front(1)[0]),
+            typeRepls.take_front(1)[0], param.offset};
+  }
+};
+} // namespace mlir
+
 #define GET_TYPEDEF_CLASSES
 #include "circt/Dialect/HW/HWTypes.h.inc"
 
@@ -137,6 +203,19 @@ int64_t getBitWidth(mlir::Type type);
 /// InOutType.  Unlike isHWValueType, this is not conservative, it only returns
 /// false on known InOut types, rather than any unknown types.
 bool hasHWInOutType(mlir::Type type);
+
+/// Convert an APInt value into a nested aggregate attribute matching the given
+/// HWAggregateType. Returns failure() if the type is not an HWAggregateType or
+/// recursively contains a type other than HWAggregateType or IntegerType.
+LogicalResult apIntToAggregateAttr(mlir::Type aggregateType,
+                                   const APInt &intVal, ArrayAttr &result);
+
+/// Convert an ArrayAttr into an APInt value matching the given type.
+/// The type is used to determine the bit width of the resulting APInt.
+/// Returns failure() if the attribute recursively contains anything other than
+/// ArrayAttr or IntegerAttr.
+LogicalResult aggregateAttrToAPInt(mlir::Type type, ArrayAttr attr,
+                                   APInt &result);
 
 template <typename... BaseTy>
 bool type_isa(Type type) {

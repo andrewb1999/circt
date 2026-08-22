@@ -75,7 +75,7 @@ class ESIType:
   @property
   def bit_width(self) -> int:
     """Size of this type, in bits. Negative for unbounded types."""
-    assert False, "unimplemented"
+    return self.cpp_type.bit_width
 
   @property
   def max_size(self) -> int:
@@ -112,10 +112,6 @@ class ChannelType(ESIType):
   def _init_from_cpp(self, cpp_type: cpp.ChannelType):
     super()._init_from_cpp(cpp_type)
     self.inner_type = _get_esi_type(cpp_type.inner)
-
-  @property
-  def bit_width(self) -> int:
-    return self.inner_type.bit_width
 
   @property
   def inner(self) -> "ESIType":
@@ -172,21 +168,18 @@ class VoidType(ESIType):
 
   def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
     if obj is not None:
-      return (False, f"void type cannot must represented by None, not {obj}")
+      return (False, f"void type must be represented by None, not {obj}")
     return (True, None)
 
-  @property
-  def bit_width(self) -> int:
-    return 8
-
   def serialize(self, obj) -> bytearray:
-    # By convention, void is represented by a single byte of value 0.
-    return bytearray([0])
+    # Void carries no logical data. Transports that require a non-empty
+    # payload are responsible for adding their own placeholder byte.
+    return bytearray()
 
   def deserialize(self, data: bytearray) -> Tuple[object, bytearray]:
-    if len(data) == 0:
-      raise ValueError(f"void type cannot be represented by {data}")
-    return (None, data[1:])
+    # Transports that pad empty messages to one byte strip that byte before
+    # invoking deserialize, so we consume nothing here.
+    return (None, data)
 
 
 __esi_mapping[cpp.VoidType] = VoidType
@@ -199,10 +192,6 @@ class AnyType(ESIType):
 
   def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
     return (False, "any type is not supported for host communication")
-
-  @property
-  def bit_width(self) -> int:
-    return -1
 
   def serialize(self, obj) -> bytearray:
     raise ValueError("any type cannot be serialized")
@@ -229,10 +218,6 @@ class BitsType(ESIType):
       return (False, f"wrong size: {len(obj)}")
     return (True, None)
 
-  @property
-  def bit_width(self) -> int:
-    return self.cpp_type.width
-
   def serialize(self, obj: Union[bytearray, bytes, List[int]]) -> bytearray:
     if isinstance(obj, bytearray):
       return obj
@@ -251,10 +236,6 @@ class IntType(ESIType):
 
   def __init__(self, id: str, width: int):
     self._init_from_cpp(cpp.IntegerType(id, width))
-
-  @property
-  def bit_width(self) -> int:
-    return self.cpp_type.width
 
 
 class UIntType(IntType):
@@ -326,13 +307,6 @@ class StructType(ESIType):
     # For wrap_cpp path, we need to convert C++ fields back to Python
     self.fields = [(name, _get_esi_type(ty)) for (name, ty) in cpp_type.fields]
 
-  @property
-  def bit_width(self) -> int:
-    widths = [ty.bit_width for (_, ty) in self.fields]
-    if any([w < 0 for w in widths]):
-      return -1
-    return sum(widths)
-
   def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
     fields_count = 0
     if not isinstance(obj, dict):
@@ -386,10 +360,6 @@ class ArrayType(ESIType):
     self.element_type = _get_esi_type(cpp_type.element)
     self.size = cpp_type.size
 
-  @property
-  def bit_width(self) -> int:
-    return self.element_type.bit_width * self.size
-
   def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
     if not isinstance(obj, list):
       return (False, f"must be a list, not {type(obj)}")
@@ -419,6 +389,154 @@ class ArrayType(ESIType):
 __esi_mapping[cpp.ArrayType] = ArrayType
 
 
+class ListType(ESIType):
+
+  def __init__(self, id: str, element_type: "ESIType"):
+    self._init_from_cpp(cpp.ListType(id, element_type.cpp_type))
+
+  def _init_from_cpp(self, cpp_type: cpp.ListType):
+    super()._init_from_cpp(cpp_type)
+    self.element_type = _get_esi_type(cpp_type.element)
+
+  @property
+  def supports_host(self) -> Tuple[bool, Optional[str]]:
+    return (False, "list types require an enclosing window encoding")
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    if not isinstance(obj, list):
+      return (False, f"must be a list, not {type(obj)}")
+    for (idx, element) in enumerate(obj):
+      valid, reason = self.element_type.is_valid(element)
+      if not valid:
+        return (False, f"invalid element {idx}: {reason}")
+    return (True, None)
+
+  def serialize(self, obj) -> bytearray:
+    raise ValueError("list type cannot be serialized without a window")
+
+  def deserialize(self, data: bytearray) -> Tuple[object, bytearray]:
+    raise ValueError("list type cannot be deserialized without a window")
+
+
+__esi_mapping[cpp.ListType] = ListType
+
+
+class WindowType(ESIType):
+
+  _HOST_UNSUPPORTED_REASON = (
+      "window types require into/lowered translation and are not yet "
+      "supported for host communication")
+
+  class Field(NamedTuple):
+    name: str
+    num_items: int
+    bulk_count_width: int
+
+  class Frame(NamedTuple):
+    name: str
+    fields: List["WindowType.Field"]
+
+  def __init__(self, id: str, name: str, into_type: "ESIType",
+               lowered_type: "ESIType", frames: List["WindowType.Frame"]):
+    cpp_frames = [
+        cpp.WindowFrame(frame.name, [
+            cpp.WindowField(field.name, field.num_items, field.bulk_count_width)
+            for field in frame.fields
+        ])
+        for frame in frames
+    ]
+    self._init_from_cpp(
+        cpp.WindowType(id, name, into_type.cpp_type, lowered_type.cpp_type,
+                       cpp_frames))
+
+  def _init_from_cpp(self, cpp_type: cpp.WindowType):
+    super()._init_from_cpp(cpp_type)
+    self.name = cpp_type.name
+    self.into_type = _get_esi_type(cpp_type.into)
+    self.lowered_type = _get_esi_type(cpp_type.lowered)
+    self.frames = [
+        WindowType.Frame(frame.name, [
+            WindowType.Field(field.name, field.num_items,
+                             field.bulk_count_width) for field in frame.fields
+        ]) for frame in cpp_type.frames
+    ]
+
+  @property
+  def supports_host(self) -> Tuple[bool, Optional[str]]:
+    return (False, self._HOST_UNSUPPORTED_REASON)
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    return (False, self._HOST_UNSUPPORTED_REASON)
+
+  def serialize(self, obj) -> bytearray:
+    raise ValueError(self._HOST_UNSUPPORTED_REASON)
+
+  def deserialize(self, data: bytearray) -> Tuple[object, bytearray]:
+    raise ValueError(self._HOST_UNSUPPORTED_REASON)
+
+
+__esi_mapping[cpp.WindowType] = WindowType
+
+
+class UnionType(ESIType):
+
+  def __init__(self, id: str, fields: List[Tuple[str, "ESIType"]]):
+    cpp_fields = [(name, field_type.cpp_type) for name, field_type in fields]
+    self._init_from_cpp(cpp.UnionType(id, cpp_fields))
+
+  def _init_from_cpp(self, cpp_type: cpp.UnionType):
+    """Initialize instance attributes from a C++ type object."""
+    super()._init_from_cpp(cpp_type)
+    self.fields = [(name, _get_esi_type(ty)) for (name, ty) in cpp_type.fields]
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    if not isinstance(obj, dict):
+      return (False, "must be a dict with exactly one field")
+    if len(obj) != 1:
+      return (False, f"union must have exactly 1 active field, got {len(obj)}")
+    field_names = {name for name, _ in self.fields}
+    active_name = next(iter(obj))
+    if active_name not in field_names:
+      return (False, f"unknown field '{active_name}' in union")
+    for (fname, ftype) in self.fields:
+      if fname == active_name:
+        return ftype.is_valid(obj[active_name])
+    return (False, f"unknown field '{active_name}' in union")
+
+  def serialize(self, obj) -> bytearray:
+    if not isinstance(obj, dict) or len(obj) != 1:
+      raise ValueError("union value must be a dict with exactly one field")
+    active_name = next(iter(obj))
+    for (fname, ftype) in self.fields:
+      if fname == active_name:
+        field_bytes = ftype.serialize(obj[active_name])
+        # In a packed union, padding is at LSB (beginning of byte stream)
+        # and field data is at MSB (end of byte stream).
+        union_bytes = (self.bit_width + 7) // 8
+        pad_len = union_bytes - len(field_bytes)
+        if pad_len > 0:
+          return bytearray(pad_len) + field_bytes
+        return field_bytes
+    raise ValueError(f"unknown field '{active_name}' in union")
+
+  def deserialize(self, data: bytearray) -> Tuple[Dict[str, Any], bytearray]:
+    union_bytes = (self.bit_width + 7) // 8
+    union_data = data[:union_bytes]
+    remaining = data[union_bytes:]
+    result = {}
+    for (fname, ftype) in self.fields:
+      # In a packed union, field data is at MSB (end of byte stream).
+      # Skip the LSB padding to reach each field's data.
+      field_bytes = (ftype.bit_width + 7) // 8
+      pad_len = union_bytes - field_bytes
+      (fval, _) = ftype.deserialize(bytearray(union_data[pad_len:]))
+      result[fname] = fval
+    return (result, remaining)
+
+
+__esi_mapping[cpp.UnionType] = UnionType
+
+
 class TypeAlias(ESIType):
 
   def __init__(self, id: str, name: str, inner_type: "ESIType"):
@@ -428,10 +546,6 @@ class TypeAlias(ESIType):
     super()._init_from_cpp(cpp_type)
     self.name = cpp_type.name
     self.inner_type = _get_esi_type(cpp_type.inner)
-
-  @property
-  def bit_width(self) -> int:
-    return self.inner_type.bit_width
 
   def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
     return self.inner_type.is_valid(obj)
@@ -457,6 +571,8 @@ class Port:
     self.owner = owner
     self.cpp_port = cpp_port
     self.type = _get_esi_type(cpp_port.type)
+    win = cpp_port.windowType
+    self.window_type = _get_esi_type(win) if win is not None else None
 
   def connect(self, buffer_size: Optional[int] = None):
     (supports_host, reason) = self.type.supports_host
@@ -605,8 +721,12 @@ class FunctionPort(BundlePort):
 
   def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
     super().__init__(owner, cpp_port)
-    self.arg_type = self.write_port("arg").type
-    self.result_type = self.read_port("result").type
+    arg_port = self.write_port("arg")
+    self.arg_type = arg_port.type
+    self.arg_window_type = arg_port.window_type
+    result_port = self.read_port("result")
+    self.result_type = result_port.type
+    self.result_window_type = result_port.window_type
     self.connected = False
 
   def connect(self):
@@ -648,8 +768,12 @@ class CallbackPort(BundlePort):
 
   def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
     super().__init__(owner, cpp_port)
-    self.arg_type = self.read_port("arg").type
-    self.result_type = self.write_port("result").type
+    arg_port = self.read_port("arg")
+    self.arg_type = arg_port.type
+    self.arg_window_type = arg_port.window_type
+    result_port = self.write_port("result")
+    self.result_type = result_port.type
+    self.result_window_type = result_port.window_type
     self.connected = False
 
   def connect(self, cb: Callable[[Any], Any]):
@@ -695,7 +819,9 @@ class ToHostPort(BundlePort):
 
   def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
     super().__init__(owner, cpp_port)
-    self.data_type = self.read_port("data").type
+    data_port = self.read_port("data")
+    self.data_type = data_port.type
+    self.data_window_type = data_port.window_type
     self.connected = False
 
   def connect(self):
@@ -713,7 +839,9 @@ class FromHostPort(BundlePort):
 
   def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
     super().__init__(owner, cpp_port)
-    self.data_type = self.write_port("data").type
+    data_port = self.write_port("data")
+    self.data_type = data_port.type
+    self.data_window_type = data_port.window_type
     self.connected = False
 
   def connect(self):

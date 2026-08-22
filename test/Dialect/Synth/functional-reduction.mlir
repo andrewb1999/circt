@@ -22,44 +22,93 @@ hw.module @test_mixed(in %a: i1, in %b: i1, in %c: i1, in %d: i1, out out1: i1, 
 hw.module @test_supported_ops(in %a: i1, in %b: i1, in %c: i1,
                               out out0: i1, out out1: i1,
                               out out2: i1, out out3: i1,
-                              out out4: i1, out out5: i1,
-                              out out6: i1, out out7: i1) {
-  // CHECK: %[[FALSE:.+]] = hw.constant false
+                              out out4: i1, out out5: i1) {
   // CHECK: %[[OR0:.+]] = comb.or %a, %b, %c
   // CHECK: %[[OR1:.+]] = comb.or %c, %b, %a
   // CHECK-NEXT: %[[ORCHOICE:.+]] = synth.choice %[[OR0]], %[[OR1]] : i1
-  // CHECK: %[[AND0:.+]] = comb.and %a, %b
-  // CHECK: %[[AND1:.+]] = synth.mig.maj_inv %a, %b, %[[FALSE]]
-  // CHECK-NEXT: %[[ANDCHOICE:.+]] = synth.choice %[[AND0]], %[[AND1]] : i1
   // CHECK: %[[XOR0:.+]] = comb.xor %a, %b
   // CHECK: %[[XOR1:.+]] = comb.xor %b, %a
   // CHECK-NEXT: %[[XORCHOICE:.+]] = synth.choice %[[XOR0]], %[[XOR1]] : i1
-  // CHECK: %[[MAJ0:.+]] = synth.mig.maj_inv %a, %b, %c
-  // CHECK: %[[CXOR:.+]] = comb.and %c, %[[XORCHOICE]]
-  // CHECK: %[[MAJ1:.+]] = comb.or %[[ANDCHOICE]], %[[CXOR]]
-  // CHECK-NEXT: %[[MAJCHOICE:.+]] = synth.choice %[[MAJ0]], %[[MAJ1]] : i1
-  // CHECK: hw.output %[[ORCHOICE]], %[[ORCHOICE]], %[[ANDCHOICE]], %[[ANDCHOICE]], %[[XORCHOICE]], %[[XORCHOICE]], %[[MAJCHOICE]], %[[MAJCHOICE]] : i1, i1, i1, i1, i1, i1, i1, i1
-  %false = hw.constant false
+  // CHECK: %[[AND0:.+]] = comb.and %a, %b
+  // CHECK: %[[AND1:.+]] = comb.and %b, %a
+  // CHECK-NEXT: %[[ANDCHOICE:.+]] = synth.choice %[[AND0]], %[[AND1]] : i1
+  // CHECK: hw.output %[[ORCHOICE]], %[[ORCHOICE]], %[[XORCHOICE]], %[[XORCHOICE]], %[[ANDCHOICE]], %[[ANDCHOICE]] : i1, i1, i1, i1, i1, i1
   %0 = comb.or %a, %b, %c {synth.test.fc_equiv_class = 2} : i1
   %1 = comb.or %c, %b, %a {synth.test.fc_equiv_class = 2} : i1
-  %2 = comb.and %a, %b {synth.test.fc_equiv_class = 3} : i1
-  %3 = synth.mig.maj_inv %a, %b, %false {synth.test.fc_equiv_class = 3} : i1
-  %4 = comb.xor %a, %b {synth.test.fc_equiv_class = 4} : i1
-  %5 = comb.xor %b, %a {synth.test.fc_equiv_class = 4} : i1
-  %6 = synth.mig.maj_inv %a, %b, %c {synth.test.fc_equiv_class = 5} : i1
-  %7 = comb.and %c, %4 : i1
-  %8 = comb.or %2, %7 {synth.test.fc_equiv_class = 5} : i1
-  hw.output %0, %1, %2, %3, %4, %5, %6, %8 : i1, i1, i1, i1, i1, i1, i1, i1
+  %2 = comb.xor %a, %b {synth.test.fc_equiv_class = 4} : i1
+  %3 = comb.xor %b, %a {synth.test.fc_equiv_class = 4} : i1
+  %4 = comb.and %a, %b {synth.test.fc_equiv_class = 5} : i1
+  %5 = comb.and %b, %a {synth.test.fc_equiv_class = 5} : i1
+  hw.output %0, %1, %2, %3, %4, %5 : i1, i1, i1, i1, i1, i1
 }
 
-// CHECK-LABEL: hw.module @test_five_input_mig
-hw.module @test_five_input_mig(in %a: i1, in %b: i1, in %c: i1, in %d: i1,
-                               in %e: i1, out out0: i1, out out1: i1) {
-  // CHECK: %[[M0:.+]] = synth.mig.maj_inv %a, %b, %c, %d, %e
-  // CHECK: %[[M1:.+]] = synth.mig.maj_inv %e, %d, %c, %b, %a
-  // CHECK-NEXT: %[[CHOICE:.+]] = synth.choice %[[M0]], %[[M1]] : i1
-  // CHECK: hw.output %[[CHOICE]], %[[CHOICE]] : i1, i1
-  %0 = synth.mig.maj_inv %a, %b, %c, %d, %e {synth.test.fc_equiv_class = 6} : i1
-  %1 = synth.mig.maj_inv %e, %d, %c, %b, %a {synth.test.fc_equiv_class = 6} : i1
+// CHECK-LABEL: hw.module @test_inversion_equiv
+hw.module @test_inversion_equiv(in %a: i1, in %b: i1, out out0: i1, out out1: i1) {
+  // CHECK: %[[AND:.+]] = synth.aig.and_inv not %a, not %b
+  // CHECK: %[[OR:.+]] = comb.or %a, %b
+  // CHECK: %[[NOTMEMBER:.+]] = synth.aig.and_inv not %[[OR]]
+  // CHECK: %[[CHOICE:.+]] = synth.choice %[[AND]], %[[NOTMEMBER]] : i1
+  // CHECK: %[[CHOICENOT:.+]] = synth.aig.and_inv not %[[CHOICE]]
+  // CHECK: hw.output %[[CHOICE]], %[[CHOICENOT]]
+  %0 = synth.aig.and_inv not %a, not %b {synth.test.fc_equiv_class = 10} : i1
+  %1 = comb.or %a, %b {synth.test.fc_equiv_class = 10} : i1
   hw.output %0, %1 : i1, i1
 }
+
+// CHECK-LABEL: hw.module @test_no_ssa_cycle
+hw.module @test_no_ssa_cycle(in %a: i1, in %b: i1,
+                             out out0: i1, out out1: i1, out out2: i1, out out3: i1) {
+// CHECK: %[[AB:.+]] = synth.aig.and_inv %a, %b
+// CHECK: %[[BA:.+]] = synth.aig.and_inv %b, %a
+// CHECK: %[[CHOICE:.+]] = synth.choice %[[AB]], %[[BA]]
+// CHECK: %[[TEST:.+]] = synth.aig.and_inv not %[[CHOICE]], not %[[CHOICE]]
+// CHECK: hw.output %[[CHOICE]], %[[CHOICE]], %[[TEST]], %[[CHOICE]]
+  %ab = synth.aig.and_inv %a, %b {synth.test.fc_equiv_class = 7} : i1
+  %aba = synth.aig.and_inv %ab, %a {synth.test.fc_equiv_class = 7} : i1
+  %test = synth.aig.and_inv not %ab, not %aba {synth.test.fc_equiv_class = 8} : i1
+  %ba = synth.aig.and_inv %b, %a {synth.test.fc_equiv_class = 7} : i1
+  hw.output %ab, %aba, %test, %ba : i1, i1, i1, i1
+}
+
+// CHECK-LABEL: hw.module @test_xor_inv_equiv
+hw.module @test_xor_inv_equiv(in %a: i1, in %b: i1, out out0: i1, out out1: i1) {
+  // CHECK: %[[XOR_INV:.+]] = synth.xor_inv %a, %b
+  // CHECK: %[[XOR:.+]] = comb.xor %b, %a
+  // CHECK: %[[CHOICE:.+]] = synth.choice %[[XOR_INV]], %[[XOR]] : i1
+  // CHECK: hw.output %[[CHOICE]], %[[CHOICE]] : i1, i1
+  %0 = synth.xor_inv %a, %b {synth.test.fc_equiv_class = 11} : i1
+  %1 = comb.xor %b, %a {synth.test.fc_equiv_class = 11} : i1
+  hw.output %0, %1 : i1, i1
+}
+
+// CHECK-LABEL: hw.module @test_reachable_erased
+hw.module @test_reachable_erased(in %a: i1, in %b: i1, out out0: i1, out out1: i1) {
+  // CHECK: %[[AB:.+]] = synth.aig.and_inv %a, %b
+  // CHECK: %[[BA:.+]] = synth.aig.and_inv %b, %a
+  // CHECK: %[[CHOICE:.+]] = synth.choice %[[AB]], %[[BA]]
+  // CHECK-NOT: synth.aig.and_inv %[[CHOICE]], %a
+  // CHECK: hw.output %[[CHOICE]], %[[CHOICE]]
+  %ab  = synth.aig.and_inv %a, %b {synth.test.fc_equiv_class = 7} : i1
+  %aba = synth.aig.and_inv %ab, %a {synth.test.fc_equiv_class = 7} : i1
+  %ba  = synth.aig.and_inv %b, %a {synth.test.fc_equiv_class = 7} : i1
+  hw.output %ab, %aba : i1, i1
+}
+
+// CHECK-LABEL: hw.module @test_mux_inv_equiv
+hw.module @test_mux_inv_equiv(in %c: i1, in %a: i1, in %b: i1, out out0: i1, out out1: i1) {
+  // CHECK: %[[MUX:.+]] = synth.mux_inv %c, %a, %b
+  // CHECK: %[[CA:.+]] = synth.aig.and_inv %c, %a
+  // CHECK: %[[CB:.+]] = synth.aig.and_inv not %c, %b
+  // CHECK: %[[OR:.+]] = synth.aig.and_inv not %[[CA]], not %[[CB]]
+  // CHECK: %[[RESULT:.+]] = synth.aig.and_inv not %[[OR]]
+  // CHECK: %[[CHOICE:.+]] = synth.choice %[[MUX]], %[[RESULT]] : i1
+  // CHECK: hw.output %[[CHOICE]], %[[CHOICE]] : i1, i1
+  %0 = synth.mux_inv %c, %a, %b {synth.test.fc_equiv_class = 12} : i1
+  %1 = synth.aig.and_inv %c, %a : i1
+  %2 = synth.aig.and_inv not %c, %b : i1
+  %3 = synth.aig.and_inv not %1, not %2 : i1
+  %4 = synth.aig.and_inv not %3 {synth.test.fc_equiv_class = 12} : i1
+  hw.output %0, %4 : i1, i1
+}
+
+

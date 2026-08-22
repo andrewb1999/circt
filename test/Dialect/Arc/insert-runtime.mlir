@@ -1,5 +1,5 @@
 // RUN: circt-opt %s --arc-insert-runtime --split-input-file | FileCheck %s --check-prefixes=CHECK,NOARGS
-// RUN: circt-opt %s --arc-insert-runtime="trace-file=tcf.abc extra-args='debug;bar'" --split-input-file | FileCheck %s --check-prefixes=CHECK,RTARGS
+// RUN: circt-opt %s --arc-insert-runtime="trace-file=C:\tcf.abc extra-args='debug;bar'" --split-input-file | FileCheck %s --check-prefixes=CHECK,RTARGS
 
 // CHECK-DAG: llvm.func @arcRuntimeIR_allocInstance(!llvm.ptr, !llvm.ptr) -> (!llvm.ptr {llvm.align = 16 : i64, llvm.noalias, llvm.nonnull, llvm.noundef})
 // CHECK-DAG: llvm.func @arcRuntimeIR_deleteInstance(!llvm.ptr)
@@ -8,29 +8,29 @@
 
 arc.runtime.model @noTouchy "dontTouch" numStateBytes 4
 
-arc.model @counter io !hw.modty<input clk : i1, output o : i8> {
-^bb0(%arg0: !arc.storage<4>):
+arc.model @counter io !hw.modty<input clk : i1, output o : i8> storageBytes 4 {
+^bb0(%arg0: !arc.storage):
     %c1_i8 = hw.constant 1 : i8
-    %in_clk = arc.root_input "clk", %arg0 {offset = 0 : i32} : (!arc.storage<4>) -> !arc.state<i1>
-    %0 = arc.alloc_state %arg0 {offset = 1 : i32} : (!arc.storage<4>) -> !arc.state<i8>
-    %1 = arc.alloc_state %arg0 {offset = 2 : i32} : (!arc.storage<4>) -> !arc.state<i1>
-    %out_o = arc.root_output "o", %arg0 {offset = 3 : i32} : (!arc.storage<4>) -> !arc.state<i8>
-    %2 = arc.storage.get %arg0[0] : !arc.storage<4> -> !arc.state<i1>
+    %in_clk = arc.root_input "clk", %arg0 {offset = 0 : i32} : (!arc.storage) -> !arc.state<i1>
+    %0 = arc.alloc_state %arg0 {offset = 1 : i32} : (!arc.storage) -> !arc.state<i8>
+    %1 = arc.alloc_state %arg0 {offset = 2 : i32} : (!arc.storage) -> !arc.state<i1>
+    %out_o = arc.root_output "o", %arg0 {offset = 3 : i32} : (!arc.storage) -> !arc.state<i8>
+    %2 = arc.storage.get %arg0[0] : !arc.storage -> !arc.state<i1>
     %3 = arc.state_read %2 : <i1>
-    %4 = arc.storage.get %arg0[2] : !arc.storage<4> -> !arc.state<i1>
+    %4 = arc.storage.get %arg0[2] : !arc.storage -> !arc.state<i1>
     %5 = arc.state_read %4 : <i1>
     arc.state_write %4 = %3 : <i1>
     %6 = comb.xor %5, %3 : i1
     %7 = comb.and %6, %3 : i1
     scf.if %7 {
-        %11 = arc.storage.get %arg0[1] : !arc.storage<4> -> !arc.state<i8>
+        %11 = arc.storage.get %arg0[1] : !arc.storage -> !arc.state<i8>
         %12 = arc.state_read %11 : <i8>
         %13 = comb.add %12, %c1_i8 : i8
         arc.state_write %11 = %13 : <i8>
     }
-    %8 = arc.storage.get %arg0[1] : !arc.storage<4> -> !arc.state<i8>
+    %8 = arc.storage.get %arg0[1] : !arc.storage -> !arc.state<i8>
     %9 = arc.state_read %8 : <i8>
-    %10 = arc.storage.get %arg0[3] : !arc.storage<4> -> !arc.state<i8>
+    %10 = arc.storage.get %arg0[3] : !arc.storage -> !arc.state<i8>
     arc.state_write %10 = %9 : <i8>
 }
 
@@ -42,7 +42,7 @@ func.func @main() {
   %step = arith.constant 1 : index
 
   // NOARGS-LABEL: arc.sim.instantiate @counter as %arg0 runtime @arcRuntimeModel_counter()
-  // RTARGS-LABEL: arc.sim.instantiate @counter as %arg0 runtime @arcRuntimeModel_counter("traceFile=tcf.abc;debug;bar")
+  // RTARGS-LABEL: arc.sim.instantiate @counter as %arg0 runtime @arcRuntimeModel_counter("traceFile=\22C:\\\\tcf.abc\22;debug;bar")
   arc.sim.instantiate @counter as %model {
     // CHECK: [[RTINST:%.*]] = builtin.unrealized_conversion_cast %arg0 : !arc.sim.instance<@counter> to !llvm.ptr
     scf.for %i = %lb to %ub step %step {
@@ -60,9 +60,9 @@ func.func @main() {
     }
   }
 
-  // NOARGS-LABEL: arc.sim.instantiate @counter as %arg0 runtime @arcRuntimeModel_counter("foo")
-  // RTARGS-LABEL: arc.sim.instantiate @counter as %arg0 runtime @arcRuntimeModel_counter("foo;traceFile=tcf_1.abc;debug;bar")
-  arc.sim.instantiate @counter as %model runtime ("foo") {
+  // NOARGS-LABEL: arc.sim.instantiate @counter as %arg0 runtime @arcRuntimeModel_counter("workDir=\22./myWorkDir\22;traceFile=overrides.vcd")
+  // RTARGS-LABEL: arc.sim.instantiate @counter as %arg0 runtime @arcRuntimeModel_counter("traceFile=\22C:\\\\tcf.abc\22;workDir=\22./myWorkDir\22;traceFile=overrides.vcd;debug;bar")
+  arc.sim.instantiate @counter as %model runtime ("workDir=\22./myWorkDir\22;traceFile=overrides.vcd") {
     // CHECK: [[RTINST:%.*]] = builtin.unrealized_conversion_cast %arg0 : !arc.sim.instance<@counter> to !llvm.ptr
     // CHECK-NEXT: llvm.call @arcRuntimeIR_onEval([[RTINST]])
     // CHECK-NEXT: arc.sim.step
@@ -87,28 +87,28 @@ func.func @main() {
 // CHECK: arc.runtime.model @arcRuntimeModel_counter "counter" numStateBytes 4
 // CHECK-NOT: llvm.func @arcRuntimeIR_
 
-arc.model @counter io !hw.modty<input clk : i1, output o : i8> {
-^bb0(%arg0: !arc.storage<4>):
+arc.model @counter io !hw.modty<input clk : i1, output o : i8> storageBytes 4 {
+^bb0(%arg0: !arc.storage):
     %c1_i8 = hw.constant 1 : i8
-    %in_clk = arc.root_input "clk", %arg0 {offset = 0 : i32} : (!arc.storage<4>) -> !arc.state<i1>
-    %0 = arc.alloc_state %arg0 {offset = 1 : i32} : (!arc.storage<4>) -> !arc.state<i8>
-    %1 = arc.alloc_state %arg0 {offset = 2 : i32} : (!arc.storage<4>) -> !arc.state<i1>
-    %out_o = arc.root_output "o", %arg0 {offset = 3 : i32} : (!arc.storage<4>) -> !arc.state<i8>
-    %2 = arc.storage.get %arg0[0] : !arc.storage<4> -> !arc.state<i1>
+    %in_clk = arc.root_input "clk", %arg0 {offset = 0 : i32} : (!arc.storage) -> !arc.state<i1>
+    %0 = arc.alloc_state %arg0 {offset = 1 : i32} : (!arc.storage) -> !arc.state<i8>
+    %1 = arc.alloc_state %arg0 {offset = 2 : i32} : (!arc.storage) -> !arc.state<i1>
+    %out_o = arc.root_output "o", %arg0 {offset = 3 : i32} : (!arc.storage) -> !arc.state<i8>
+    %2 = arc.storage.get %arg0[0] : !arc.storage -> !arc.state<i1>
     %3 = arc.state_read %2 : <i1>
-    %4 = arc.storage.get %arg0[2] : !arc.storage<4> -> !arc.state<i1>
+    %4 = arc.storage.get %arg0[2] : !arc.storage -> !arc.state<i1>
     %5 = arc.state_read %4 : <i1>
     arc.state_write %4 = %3 : <i1>
     %6 = comb.xor %5, %3 : i1
     %7 = comb.and %6, %3 : i1
     scf.if %7 {
-        %11 = arc.storage.get %arg0[1] : !arc.storage<4> -> !arc.state<i8>
+        %11 = arc.storage.get %arg0[1] : !arc.storage -> !arc.state<i8>
         %12 = arc.state_read %11 : <i8>
         %13 = comb.add %12, %c1_i8 : i8
         arc.state_write %11 = %13 : <i8>
     }
-    %8 = arc.storage.get %arg0[1] : !arc.storage<4> -> !arc.state<i8>
+    %8 = arc.storage.get %arg0[1] : !arc.storage -> !arc.state<i8>
     %9 = arc.state_read %8 : <i8>
-    %10 = arc.storage.get %arg0[3] : !arc.storage<4> -> !arc.state<i8>
+    %10 = arc.storage.get %arg0[3] : !arc.storage -> !arc.state<i8>
     arc.state_write %10 = %9 : <i8>
 }

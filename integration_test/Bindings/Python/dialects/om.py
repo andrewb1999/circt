@@ -19,17 +19,17 @@ with Context() as ctx, Location.unknown():
       %1 = om.constant "Component.inst1.foo" : !om.string
       om.class.fields %1 : !om.string
     }
-    
+
     om.class @comp(
         %inst1_propOut_bore: !om.class.type<@node>,
         %inst2_propOut_bore: !om.class.type<@node>) -> (field2: !om.class.type<@node>, field3: !om.class.type<@node>) {
       om.class.fields %inst1_propOut_bore, %inst2_propOut_bore : !om.class.type<@node>, !om.class.type<@node>
     }
-    
+
     om.class  @Client() -> (client_omnode_0_OMIROut: !om.class.type<@comp>, node0_OMIROut : !om.class.type<@node>, node1_OMIROut : !om.class.type<@node>) {
       %0 = om.object @node() : () -> !om.class.type<@node>
       %2 = om.object @comp(%0, %0) : (!om.class.type<@node>, !om.class.type<@node>) -> !om.class.type<@comp>
-    
+
       om.class.fields %2, %0, %0 : !om.class.type<@comp>, !om.class.type<@node>, !om.class.type<@node>
     }
 
@@ -67,7 +67,7 @@ with Context() as ctx, Location.unknown():
     hw.module @Root(in %clock: i1) {
       %0 = sv.wire sym @x : !hw.inout<i1>
     }
-    
+
     om.class @Paths(%basepath: !om.frozenbasepath) -> (path: !om.frozenpath, deleted: !om.frozenpath) {
       %0 = om.frozenbasepath_create %basepath "Foo/bar"
       %1 = om.frozenpath_create reference %0 "Bar/baz:Baz>w"
@@ -88,10 +88,10 @@ with Context() as ctx, Location.unknown():
 
     om.class @IntegerBinaryArithmeticObjectsDelayed() -> (result: !om.integer) {
       %0 = om.object @Class1(%5) : (!om.integer) -> !om.class.type<@Class1>
-      %1 = om.object.field %0, [@value] : (!om.class.type<@Class1>) -> !om.integer
+      %1 = om.object.field %0["value"] : (!om.class.type<@Class1>) -> !om.integer
 
       %2 = om.object @Class2() : () -> !om.class.type<@Class2>
-      %3 = om.object.field %2, [@value] : (!om.class.type<@Class2>) -> !om.integer
+      %3 = om.object.field %2["value"] : (!om.class.type<@Class2>) -> !om.integer
 
       %5 = om.integer.add %1, %3 : !om.integer
       om.class.fields %5 : !om.integer
@@ -146,21 +146,21 @@ print("field:", obj.get_field_loc("field"))
 
 # CHECK: child.foo: 14
 print("child.foo: ", obj.child.foo)
-# CHECK: child.foo.loc loc("-":{{.*}}:{{.*}})
+# CHECK: child.foo.loc loc(fused
 print("child.foo.loc", obj.child.get_field_loc("foo"))
 # CHECK: ('Root', 'x')
 print(obj.reference)
 
 for (name, field) in obj:
-  # location from om.class.field @child, %0 : !om.class.type<@Child>
+  # location from om.class.field "child"
   # CHECK: name: child, field: <circt.dialects.om.Object object
-  # CHECK-SAME: loc: loc("-":{{.*}}:{{.*}})
-  # location from om.class.field @field, %param : !om.integer
+  # CHECK-SAME: loc: loc(fused
+  # location from om.class.field "field"
   # CHECK: name: field, field: 42
   # CHECK-SAME: loc: loc("-":{{.*}}:{{.*}})
-  # location from om.class.field @reference, %sym : !om.ref
+  # location from om.class.field "reference"
   # CHECK: name: reference, field: ('Root', 'x')
-  # CHECK-SAME: loc: loc("-":{{.*}}:{{.*}})
+  # CHECK-SAME: loc: loc(fused
   loc = obj.get_field_loc(name)
   print(f"name: {name}, field: {field}, loc: {loc}")
 
@@ -310,3 +310,51 @@ with Context() as ctx:
   print(f"out4 (constant bool): {obj.out4}")
   # CHECK: out5 (unknown bool): Unknown(i1)
   print(f"out5 (unknown bool): {obj.out5}")
+
+# Test om.property_assert evaluation.
+
+with Context() as ctx, Location.unknown():
+  circt.register_dialects(ctx)
+
+  module = Module.parse("""
+  module {
+    om.class @AssertTrue() -> () {
+      %true = om.constant true
+      %message = om.constant "should not fail" : !om.string
+      om.property_assert %true, %message : i1
+      om.class.fields
+    }
+    om.class @AssertFalse() -> () {
+      %false = om.constant false
+      %message = om.constant "condition is false" : !om.string
+      om.property_assert %false, %message : i1
+      om.class.fields
+    }
+    om.class @AssertUnknown(%cond: i1) -> () {
+      %message = om.constant "unknown condition" : !om.string
+      om.property_assert %cond, %message : i1
+      om.class.fields
+    }
+  }
+  """)
+
+  evaluator = om.Evaluator(module)
+  i1_type = Type.parse("i1")
+
+  # Passing assertion should succeed silently.
+  obj = evaluator.instantiate("AssertTrue")
+  # CHECK: AssertTrue: passed
+  print("AssertTrue: passed")
+
+  # Failing assertion should raise ValueError.
+  try:
+    obj = evaluator.instantiate("AssertFalse")
+  except ValueError as e:
+    # CHECK: OM property assertion failed: condition is false
+    # CHECK: unable to instantiate object, see previous error(s)
+    print(e)
+
+  # Unknown condition should not raise an error (best-effort).
+  obj = evaluator.instantiate("AssertUnknown", om.Unknown(i1_type))
+  # CHECK: AssertUnknown(unknown): passed
+  print("AssertUnknown(unknown): passed")

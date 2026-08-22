@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Analysis/FIRRTLInstanceInfo.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotationHelper.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLDialect.h"
@@ -20,13 +21,15 @@
 #include "circt/Dialect/HW/InnerSymbolNamespace.h"
 #include "circt/Dialect/OM/OMAttributes.h"
 #include "circt/Dialect/OM/OMOps.h"
+#include "circt/Support/ConversionPatternSet.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Threading.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 
 namespace circt {
@@ -41,44 +44,6 @@ using namespace circt;
 using namespace circt::firrtl;
 
 namespace {
-
-static bool shouldCreateClassImpl(igraph::InstanceGraphNode *node) {
-  auto moduleLike = node->getModule<FModuleLike>();
-  if (!moduleLike)
-    return false;
-
-  if (isa<firrtl::ClassLike>(moduleLike.getOperation()))
-    return true;
-
-  // Always create a class for public modules.
-  if (moduleLike.isPublic())
-    return true;
-
-  // Create a class for modules with property ports.
-  bool hasClassPorts = llvm::any_of(moduleLike.getPorts(), [](PortInfo port) {
-    return isa<PropertyType>(port.type);
-  });
-
-  if (hasClassPorts)
-    return true;
-
-  // Create a class for modules that instantiate classes or modules with
-  // property ports.
-  for (auto *instance : *node) {
-    // ObjectOp instantiates a class directly and always requires a class.
-    // Note: if combined with the check below, this has the same result (as
-    // objects always have one result, even if they have no ports).
-    if (instance->getInstance<firrtl::ObjectOp>())
-      return true;
-    // There is an instance with property ports.
-    if (auto op = instance->getInstance<FInstanceLike>())
-      for (auto result : op->getResults())
-        if (type_isa<PropertyType>(result.getType()))
-          return true;
-  }
-
-  return false;
-}
 
 /// Helper class which holds a hierarchical path op reference and a pointer to
 /// to the targeted operation.
@@ -166,8 +131,9 @@ struct PathInfoTable {
     }
   }
 
-  // The table mapping DistinctAttrs to PathInfo structs.
-  DenseMap<DistinctAttr, PathInfo> table;
+  // The table mapping DistinctAttrs to PathInfo structs.  This will be iterated
+  // over, so ensure stability.
+  llvm::MapVector<DistinctAttr, PathInfo> table;
 
 private:
   // Module name attributes indicating modules whose base path input should
@@ -219,6 +185,7 @@ private:
                              SymbolTable &symbolTable);
 
   // Predicate to check if a module-like needs a Class to be created.
+  bool shouldCreateClass(igraph::ModuleOpInterface modOp);
   bool shouldCreateClass(StringAttr modName);
 
   // Create an OM Class op from a FIRRTL Class op.
@@ -250,8 +217,11 @@ private:
       Operation *op, const PathInfoTable &pathInfoTable,
       const DenseMap<StringAttr, firrtl::ClassType> &classTypeTable);
 
-  // State to memoize repeated calls to shouldCreateClass.
-  DenseMap<StringAttr, bool> shouldCreateClassMemo;
+  // Cached pointer to the InstanceInfo analysis, set in runOnOperation.
+  InstanceInfo *instanceInfo = nullptr;
+
+  // Cached pointer to the InstanceGraph analysis, set in runOnOperation.
+  InstanceGraph *instanceGraph = nullptr;
 
   // State used while creating the optional 'ports' list of RtlPort objects.
   SmallVector<RtlPortsInfo> rtlPortsToCreate;
@@ -768,9 +738,18 @@ LogicalResult LowerClassesPass::processPaths(
     PathInfoTable &pathInfoTable, SymbolTable &symbolTable) {
   auto circuit = getOperation();
 
-  // Collect the path declarations and owning modules.
+  // Collect the path declarations, owning modules, and containing modules.  An
+  // owning module is the lowest `FModuleOp` ancestor of a path.  This can be
+  // null if there are multiple lowest ancestors.  The containing module is the
+  // exact `FModuleLike` op that is the parent op of the path.  This may be a
+  // class op.
+  //
+  // Store one path op for each containing module, purely for diagnostic
+  // purposes if we need to generate an error.
   OwningModuleCache owningModuleCache(instanceGraph);
   DenseMap<DistinctAttr, FModuleOp> owningModules;
+  DenseMap<DistinctAttr, StringAttr> containingModules;
+  DenseMap<StringAttr, PathOp> containingModuleToPathOp;
   std::vector<Operation *> declarations;
   auto result = circuit.walk([&](Operation *op) {
     if (auto pathOp = dyn_cast<PathOp>(op)) {
@@ -792,6 +771,13 @@ LogicalResult LowerClassesPass::processPaths(
             << owningModule.getModuleNameAttr();
         return WalkResult::interrupt();
       }
+      // Record the FModuleLike that physically contains this path op.
+      auto container = pathOp->getParentOfType<FModuleLike>();
+      assert(container && "path op with a non-null owning module must be "
+                          "inside an FModuleLike");
+      auto containerName = container.getModuleNameAttr();
+      containingModules.try_emplace(target, containerName);
+      containingModuleToPathOp.try_emplace(containerName, pathOp);
     }
     return WalkResult::advance();
   });
@@ -803,45 +789,149 @@ LogicalResult LowerClassesPass::processPaths(
                               pathInfoTable, symbolTable, owningModules)))
     return failure();
 
-  // For each module that will be passing through a base path, compute its
-  // descendants that need this base path passed through.
-  for (auto rootModule : pathInfoTable.getAltBasePathRoots()) {
-    InstanceGraphNode *node = instanceGraph.lookup(rootModule);
+  // ---------------------------------------------------------------------------
+  // Update FModuleLikes with alt base passthrough information.  The end result
+  // of this is that every path from every alt base path root to the path op
+  // user gets marked for a new port.
+  //
+  // For each alt base path root, R, do a DFS to determine the descendant
+  // modules that it instantiates.  Then, do a reverse DFS from the containing
+  // FModuleLike for each path op P, only visiting descendants of R.
+  //
+  // There are two main error cases to consider:
+  //
+  //   1. a path is unreachable from its root,
+  //   2. a module along the path from a path to a root is instantiated by any
+  //      module that is unreachable from the root.
+  //
+  // As an example, the following shows both of these errors cases. R1 and R2
+  // are roots in module A.  P1 is a path in module C referencing R1.  P2 is a
+  // path in module D referencing R2.  The instantiation of module C by X and B
+  // by Y are both illegal by case (2).  Module D is illegal by case (1).
+  //
+  //                      X <-+
+  //                           \
+  //     A { R1, R2 } <-- B <-- C { P1(R1) }
+  //                     /
+  //                Y <-+
+  //
+  //                            D { P2(R2) }
+  //
+  // See `lower-classes-errors.mlir` for the circuit above.
+  // ---------------------------------------------------------------------------
+  // Step 1: Populate a map of R -> [P].
+  llvm::MapVector<StringAttr, SetVector<StringAttr>> rootToContainingMods;
+  for (const auto &[distinctAttr, pathInfo] : pathInfoTable.table) {
+    if (!pathInfo.altBasePathModule)
+      continue;
+    auto it = containingModules.find(distinctAttr);
+    assert(it != containingModules.end() &&
+           "path info entry with non-null altBasePathModule must have a "
+           "recorded containing FModuleLike");
+    rootToContainingMods[pathInfo.altBasePathModule].insert(it->second);
+  }
 
-    // Do a depth first traversal of the instance graph from rootModule,
-    // looking for descendants that need to be passed through.
-    auto start = llvm::df_begin(node);
-    auto end = llvm::df_end(node);
-    auto it = start;
-    while (it != end) {
-      // Nothing to do for the root module.
-      if (it == start) {
-        ++it;
+  // Step 2: Mark all paths for each (R, P) pair.  Accumulate errors.
+  InstancePathCache instancePathCache(instanceGraph);
+  bool failed = false;
+  for (auto &[altRoot, containingMods] : rootToContainingMods) {
+    InstanceGraphNode *rootNode = instanceGraph.lookup(altRoot);
+
+    // Step 2.a: For each P, use InstancePathCache to get all paths from R down
+    // to P.  An empty result means P is not reachable from R (error case 1).
+    // Collect the set of all InstanceGraphNodes that appear on any path.
+    SetVector<InstanceGraphNode *> markedNodes;
+    markedNodes.insert(rootNode);
+    // Track one reachable containing module to use as error attribution for
+    // case (2).  Any reachable P will do.
+    PathOp reachablePathOp;
+    for (StringAttr start : containingMods) {
+      auto startMod = instanceGraph.lookup(start)->getModule<FModuleLike>();
+      auto paths = instancePathCache.getRelativePaths(startMod, rootNode);
+
+      // Report error case (1): P is not reachable from R.
+      if (paths.empty()) {
+        PathOp pathOp = containingModuleToPathOp.lookup(start);
+        assert(pathOp && "every containing module name recorded in "
+                         "rootToContainingMods must have a representative "
+                         "path op");
+        auto diag = pathOp->emitOpError()
+                    << "in module " << start
+                    << " cannot be lowered because the module is not reachable "
+                       "from module "
+                    << altRoot << " which contains the target";
+        auto *pathInfoIt = pathInfoTable.table.find(pathOp.getTargetAttr());
+        assert(pathInfoIt != pathInfoTable.table.end() &&
+               pathInfoIt->second.loc.has_value() &&
+               "a path op being processed here must have a PathInfo entry "
+               "with a recorded tracked-op location");
+        diag.attachNote(pathInfoIt->second.loc.value())
+            << "path targets this operation in module " << altRoot;
+        failed = true;
         continue;
       }
 
-      // If we aren't creating a class for this child, skip this hierarchy.
-      if (!shouldCreateClass(
-              it->getModule<FModuleLike>().getModuleNameAttr())) {
-        it = it.skipChildren();
-        continue;
+      // Record this as a reachable P for use in case (2) error attribution.
+      if (!reachablePathOp)
+        reachablePathOp = containingModuleToPathOp.lookup(start);
+
+      // Collect every module that appears on any path from R to P into
+      // markedNodes, and mark each for alt base path passthrough.
+      InstanceGraphNode *startNode = instanceGraph.lookup(start);
+      if (markedNodes.insert(startNode))
+        pathInfoTable.addAltBasePathPassthrough(
+            startNode->getModule().getModuleNameAttr(), altRoot);
+      for (auto path : paths) {
+        for (auto inst : path) {
+          auto *node = instanceGraph.lookup(
+              inst->getParentOfType<FModuleLike>().getModuleNameAttr());
+          if (markedNodes.insert(node))
+            pathInfoTable.addAltBasePathPassthrough(
+                node->getModule().getModuleNameAttr(), altRoot);
+        }
       }
+    }
 
-      // If we are at a leaf, nothing to do.
-      if (it->begin() == it->end()) {
-        ++it;
+    // Step 2.b: Check error case (2): walk every marked node and report any
+    // use whose parent is outside the marked set.
+    if (!reachablePathOp)
+      continue;
+    auto *pathInfoIt =
+        pathInfoTable.table.find(reachablePathOp.getTargetAttr());
+    assert(pathInfoIt != pathInfoTable.table.end() &&
+           pathInfoIt->second.loc.has_value() &&
+           "a path op being processed here must have a PathInfo entry "
+           "with a recorded tracked-op location");
+    StringAttr containing =
+        reachablePathOp->getParentOfType<FModuleLike>().getModuleNameAttr();
+    for (InstanceGraphNode *node : markedNodes) {
+      if (node == rootNode)
         continue;
+      for (InstanceRecord *use : node->uses()) {
+        if (markedNodes.contains(use->getParent()))
+          continue;
+        auto diag = reachablePathOp->emitOpError()
+                    << "in module " << containing
+                    << " cannot be lowered because there is an instantiation "
+                       "of module "
+                    << use->getTarget()->getModule().getModuleNameAttr()
+                    << " in module "
+                    << use->getParent()->getModule().getModuleNameAttr()
+                    << " which is not instantiated by module " << altRoot
+                    << " which contains the target";
+        diag.attachNote(pathInfoIt->second.loc.value())
+            << "the path op targets this operation in module " << altRoot;
+        diag.attachNote(use->getInstance()->getLoc())
+            << "the problematic instantiation of module "
+            << use->getTarget()->getModule().getModuleNameAttr()
+            << " in module "
+            << use->getParent()->getModule().getModuleNameAttr() << " is here";
+        failed = true;
       }
-
-      // Track state for this passthrough.
-      StringAttr passthroughModule = it->getModule().getModuleNameAttr();
-      pathInfoTable.addAltBasePathPassthrough(passthroughModule, rootModule);
-
-      ++it;
     }
   }
 
-  return success();
+  return failure(failed);
 }
 
 /// Lower FIRRTL Class and Object ops to OM Class and Object ops
@@ -852,28 +942,17 @@ void LowerClassesPass::runOnOperation() {
   // Get the CircuitOp.
   CircuitOp circuit = getOperation();
 
-  // Get the InstanceGraph and SymbolTable.
-  InstanceGraph &instanceGraph = getAnalysis<InstanceGraph>();
+  // Get the InstanceGraph, InstanceInfo, and SymbolTable.
+  instanceGraph = &getAnalysis<InstanceGraph>();
+  instanceInfo = &getAnalysis<InstanceInfo>();
   SymbolTable &symbolTable = getAnalysis<SymbolTable>();
 
   hw::InnerSymbolNamespaceCollection namespaces;
   HierPathCache cache(circuit, symbolTable);
 
-  // Fill `shouldCreateClassMemo`.
-  for (auto *node : instanceGraph)
-    if (auto moduleLike = node->getModule<firrtl::FModuleLike>())
-      shouldCreateClassMemo.insert({moduleLike.getModuleNameAttr(), false});
-
-  parallelForEach(circuit.getContext(), instanceGraph,
-                  [&](igraph::InstanceGraphNode *node) {
-                    if (auto moduleLike = node->getModule<FModuleLike>())
-                      shouldCreateClassMemo[moduleLike.getModuleNameAttr()] =
-                          shouldCreateClassImpl(node);
-                  });
-
   // Rewrite all path annotations into inner symbol targets.
   PathInfoTable pathInfoTable;
-  if (failed(processPaths(instanceGraph, namespaces, cache, pathInfoTable,
+  if (failed(processPaths(*instanceGraph, namespaces, cache, pathInfoTable,
                           symbolTable))) {
     signalPassFailure();
     return;
@@ -885,12 +964,12 @@ void LowerClassesPass::runOnOperation() {
   // erasure.
   DenseMap<StringAttr, firrtl::ClassType> classTypeTable;
   SmallVector<FModuleLike> modulesToErasePortsFrom;
-  for (auto *node : instanceGraph) {
+  for (auto *node : *instanceGraph) {
     auto moduleLike = node->getModule<firrtl::FModuleLike>();
     if (!moduleLike)
       continue;
 
-    if (shouldCreateClass(moduleLike.getModuleNameAttr())) {
+    if (shouldCreateClass(moduleLike)) {
       auto omClass = createClass(moduleLike, pathInfoTable, intraPassMutex);
       auto &classLoweringState = loweringState.classLoweringStateTable[omClass];
       // For external modules with the same defname, the same omClass is reused.
@@ -913,7 +992,7 @@ void LowerClassesPass::runOnOperation() {
           continue;
         // Get the referenced module.
         auto module = instance->getTarget()->getModule<FModuleLike>();
-        if (module && shouldCreateClass(module.getModuleNameAttr())) {
+        if (module && shouldCreateClass(module)) {
           auto targetSym = getInnerRefTo(
               {inst, 0}, [&](FModuleLike module) -> hw::InnerSymbolNamespace & {
                 return namespaces[module];
@@ -953,10 +1032,10 @@ void LowerClassesPass::runOnOperation() {
   // Completely erase Class module-likes, and remove from the InstanceGraph.
   for (auto &[omClass, state] : loweringState.classLoweringStateTable) {
     if (isa<firrtl::ClassLike>(state.moduleLike.getOperation())) {
-      InstanceGraphNode *node = instanceGraph.lookup(state.moduleLike);
+      InstanceGraphNode *node = instanceGraph->lookup(state.moduleLike);
       for (auto *use : llvm::make_early_inc_range(node->uses()))
         use->erase();
-      instanceGraph.erase(node);
+      instanceGraph->erase(node);
       state.moduleLike.erase();
     }
   }
@@ -970,7 +1049,7 @@ void LowerClassesPass::runOnOperation() {
   // Update Object creation ops in Classes or Modules in parallel.
   if (failed(
           mlir::failableParallelForEach(ctx, objectContainers, [&](auto *op) {
-            return updateInstances(op, instanceGraph, loweringState,
+            return updateInstances(op, *instanceGraph, loweringState,
                                    pathInfoTable, intraPassMutex);
           })))
     return signalPassFailure();
@@ -994,9 +1073,12 @@ void LowerClassesPass::runOnOperation() {
 }
 
 // Predicate to check if a module-like needs a Class to be created.
+bool LowerClassesPass::shouldCreateClass(igraph::ModuleOpInterface modOp) {
+  return instanceInfo->moduleContainsProperties(modOp);
+}
+
 bool LowerClassesPass::shouldCreateClass(StringAttr modName) {
-  // Return a memoized result.
-  return shouldCreateClassMemo.at(modName);
+  return shouldCreateClass(instanceGraph->lookup(modName)->getModule());
 }
 
 void checkAddContainingModulePorts(bool hasContainingModule, OpBuilder builder,
@@ -1124,6 +1206,8 @@ om::ClassLike LowerClassesPass::createClass(FModuleLike moduleLike,
     loweredClassOp = convertClass(moduleLike, builder, className + suffix,
                                   formalParamNames, hasContainingModule);
   }
+
+  SymbolTable::setSymbolVisibility(loweredClassOp, moduleLike.getVisibility());
 
   return loweredClassOp;
 }
@@ -1462,13 +1546,10 @@ updateInstanceInClass(InstanceOp firrtlInstance, hw::HierPathOp hierPath,
     if (!isa<PropertyType>(result.getType()))
       continue;
 
-    // The path to the field is just this output's name.
-    auto objectFieldPath = builder.getArrayAttr({FlatSymbolRefAttr::get(
-        firrtlInstance.getPortNameAttr(result.getResultNumber()))});
-
     // Create the field access.
     auto objectField = om::ObjectFieldOp::create(
-        builder, object.getLoc(), result.getType(), object, objectFieldPath);
+        builder, object.getLoc(), result.getType(), object,
+        firrtlInstance.getPortNameAttr(result.getResultNumber()));
 
     result.replaceAllUsesWith(objectField);
   }
@@ -1639,6 +1720,19 @@ struct BoolConstantOpConversion : public OpConversionPattern<BoolConstantOp> {
   }
 };
 
+struct PropertyAssertOpConversion
+    : public OpConversionPattern<firrtl::PropertyAssertOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(firrtl::PropertyAssertOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<om::PropertyAssertOp>(
+        op, adaptor.getCondition(), adaptor.getMessage());
+    return success();
+  }
+};
+
 struct DoubleConstantOpConversion
     : public OpConversionPattern<DoubleConstantOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -1760,6 +1854,26 @@ struct StringConcatOpConversion
     return success();
   }
 };
+
+struct PropEqOpConversion : public OpConversionPattern<firrtl::PropEqOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(firrtl::PropEqOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<om::PropEqOp>(op, adaptor.getLhs(),
+                                              adaptor.getRhs());
+    return success();
+  }
+};
+
+template <typename FIRRTLOp, typename OMOp>
+static LogicalResult binaryOpConversion(FIRRTLOp op,
+                                        typename FIRRTLOp::Adaptor adaptor,
+                                        ConversionPatternRewriter &rewriter) {
+  rewriter.replaceOpWithNewOp<OMOp>(op, adaptor.getLhs(), adaptor.getRhs());
+  return success();
+}
 
 struct PathOpConversion : public OpConversionPattern<firrtl::PathOp> {
 
@@ -1933,11 +2047,9 @@ struct ObjectSubfieldOpConversion
     if (element.direction == Direction::In)
       return failure();
 
-    auto field = FlatSymbolRefAttr::get(element.name);
-    auto path = rewriter.getArrayAttr({field});
     auto type = typeConverter->convertType(element.type);
     rewriter.replaceOpWithNewOp<om::ObjectFieldOp>(op, type, adaptor.getInput(),
-                                                   path);
+                                                   element.name);
     return success();
   }
 
@@ -2033,7 +2145,7 @@ struct ObjectFieldOpConversion : public OpConversionPattern<om::ObjectFieldOp> {
       return failure();
 
     rewriter.replaceOpWithNewOp<om::ObjectFieldOp>(
-        op, type, adaptor.getObject(), adaptor.getFieldPathAttr());
+        op, type, adaptor.getObject(), adaptor.getFieldAttr());
 
     return success();
   }
@@ -2213,7 +2325,7 @@ static void populateTypeConverter(TypeConverter &converter) {
 }
 
 static void populateRewritePatterns(
-    RewritePatternSet &patterns, TypeConverter &converter,
+    ConversionPatternSet &patterns, TypeConverter &converter,
     const PathInfoTable &pathInfoTable,
     const DenseMap<StringAttr, firrtl::ClassType> &classTypeTable) {
   patterns.add<FIntegerConstantOpConversion>(converter, patterns.getContext());
@@ -2233,12 +2345,17 @@ static void populateRewritePatterns(
   patterns.add<ListCreateOpConversion>(converter, patterns.getContext());
   patterns.add<ListConcatOpConversion>(converter, patterns.getContext());
   patterns.add<BoolConstantOpConversion>(converter, patterns.getContext());
+  patterns.add<PropertyAssertOpConversion>(converter, patterns.getContext());
   patterns.add<DoubleConstantOpConversion>(converter, patterns.getContext());
   patterns.add<IntegerAddOpConversion>(converter, patterns.getContext());
   patterns.add<IntegerMulOpConversion>(converter, patterns.getContext());
   patterns.add<IntegerShrOpConversion>(converter, patterns.getContext());
   patterns.add<IntegerShlOpConversion>(converter, patterns.getContext());
   patterns.add<StringConcatOpConversion>(converter, patterns.getContext());
+  patterns.add<PropEqOpConversion>(converter, patterns.getContext());
+  patterns.add(binaryOpConversion<firrtl::BoolAndOp, om::IntegerAndOp>);
+  patterns.add(binaryOpConversion<firrtl::BoolOrOp, om::IntegerOrOp>);
+  patterns.add(binaryOpConversion<firrtl::BoolXorOp, om::IntegerXorOp>);
   patterns.add<UnrealizedConversionCastOpConversion>(converter,
                                                      patterns.getContext());
   patterns.add<UnknownValueOpConversion>(converter, patterns.getContext());
@@ -2254,7 +2371,7 @@ LogicalResult LowerClassesPass::dialectConversion(
   TypeConverter typeConverter;
   populateTypeConverter(typeConverter);
 
-  RewritePatternSet patterns(&getContext());
+  ConversionPatternSet patterns(&getContext(), typeConverter);
   populateRewritePatterns(patterns, typeConverter, pathInfoTable,
                           classTypeTable);
 

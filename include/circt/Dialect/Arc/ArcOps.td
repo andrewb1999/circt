@@ -10,6 +10,7 @@
 #define CIRCT_DIALECT_ARC_ARCOPS_TD
 
 include "circt/Dialect/Arc/ArcDialect.td"
+include "circt/Dialect/Arc/ArcAttributes.td"
 include "circt/Dialect/Arc/ArcInterfaces.td"
 include "circt/Dialect/Arc/ArcTypes.td"
 include "circt/Dialect/HW/HWTypes.td"
@@ -113,7 +114,7 @@ def DefineOp : ArcOp<"define", [
 
 def OutputOp : ArcOp<"output", [
   Terminator,
-  ParentOneOf<["DefineOp", "LutOp", "ClockDomainOp", "ExecuteOp"]>,
+  ParentOneOf<["DefineOp", "LutOp", "ExecuteOp"]>,
   Pure,
   ReturnLike
 ]> {
@@ -425,47 +426,11 @@ def MemoryWriteOp : ArcOp<"memory_write", [
   let arguments = (ins
     MemoryType:$memory,
     AnyInteger:$address,
-    Optional<I1>:$enable,
     AnyInteger:$data
   );
   let assemblyFormat = [{
-    $memory `[` $address `]` `,` $data (`if` $enable^)?
-    attr-dict `:` type($memory)
+    $memory `[` $address `]` `,` $data attr-dict `:` type($memory)
   }];
-  let hasFolder = 1;
-  let hasCanonicalizeMethod = 1;
-}
-
-//===----------------------------------------------------------------------===//
-// Trigger Grouping
-//===----------------------------------------------------------------------===//
-
-def ClockDomainOp : ArcOp<"clock_domain", [
-  IsolatedFromAbove,
-  RegionKindInterface,
-  RecursiveMemoryEffects,
-  SingleBlockImplicitTerminator<"arc::OutputOp">
-]> {
-  let summary = "a clock domain";
-
-  let arguments = (ins Variadic<AnyType>:$inputs, ClockType:$clock);
-  let results = (outs Variadic<AnyType>:$outputs);
-  let regions = (region SizedRegion<1>:$body);
-
-  let assemblyFormat = [{
-    ` ` `(` $inputs `)` `clock` $clock attr-dict `:`
-    functional-type($inputs, results) $body
-  }];
-
-  let extraClassDeclaration = [{
-    static mlir::RegionKind getRegionKind(unsigned index) {
-      return mlir::RegionKind::Graph;
-    }
-    mlir::Block &getBodyBlock() { return getBody().front(); }
-  }];
-
-  let hasRegionVerifier = 1;
-  let hasCanonicalizeMethod = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -518,10 +483,12 @@ def AllocMemoryOp : ArcOp<"alloc_memory", [MemoryEffects<[MemAlloc]>]> {
 
 def AllocStorageOp : ArcOp<"alloc_storage", [MemoryEffects<[MemAlloc]>]> {
   let summary = "Allocate contiguous storage space from a larger storage space";
-  let arguments = (ins StorageType:$input, OptionalAttr<I32Attr>:$offset);
+  let arguments = (ins StorageType:$input,
+                       UI32Attr:$size,
+                       OptionalAttr<I32Attr>:$offset);
   let results = (outs StorageType:$output);
   let assemblyFormat = [{
-    $input (`[` $offset^ `]`)? attr-dict `:` functional-type($input, $output)
+    $input (`[` $offset^ `]`)? `,` $size attr-dict
   }];
 }
 
@@ -551,7 +518,8 @@ def RootOutputOp : ArcOp<"root_output", [
 // Storage Access
 //===----------------------------------------------------------------------===//
 
-def AllocatableType : AnyTypeOf<[StateType, MemoryType, StorageType]>;
+def AllocatableType : AnyTypeOf<[StateType, MemoryType, StorageType,
+                                 ArrayRefType]>;
 
 def StorageGetOp : ArcOp<"storage.get", [Pure]> {
   let summary = "Access an allocated state, memory, or storage slice";
@@ -593,19 +561,17 @@ def StateWriteOp : ArcOp<"state_write", [
   let arguments = (ins
     StateType:$state,
     AnyType:$value,
-    Optional<I1>:$condition,
     OptionalAttr<FlatSymbolRefAttr>:$traceTapModel,
     OptionalAttr<UI64Attr>:$traceTapIndex);
   let assemblyFormat = [{
-    $state `=` $value (`if` $condition^)?
+    $state `=` $value
     (`tap` $traceTapModel`[`$traceTapIndex^`]` )? attr-dict `:` type($state)
   }];
   let hasVerifier = true;
   let builders = [
     OpBuilder<(ins  "mlir::Value":$state,
-                    "mlir::Value":$value,
-                    "mlir::Value":$condition), [{
-      build($_builder, $_state, state, value, condition,
+                    "mlir::Value":$value), [{
+      build($_builder, $_state, state, value,
               mlir::FlatSymbolRefAttr{}, mlir::IntegerAttr{});
     }]>
   ];
@@ -619,10 +585,422 @@ def CurrentTimeOp : ArcOp<"current_time", [
     Reads the current simulation time from the model's storage. The time is
     represented as an `i64` value in femtoseconds.
   }];
-  let arguments = (ins StorageType:$storage);
+  let arguments = (ins ContextType:$arcContext);
   let results = (outs I64:$time);
+  let assemblyFormat = [{ $arcContext attr-dict }];
+}
+
+def TerminateOp : ArcOp<"terminate", [
+  MemoryEffects<[MemWrite]>
+]> {
+  let summary = "Request simulation termination";
+  let description = [{
+    Sets a termination flag in the model's context.
+    It unconditionally writes 1 for success or 2 for failure.
+    This allows the simulation to exit gracefully after the current
+    evaluation cycle.
+  }];
+
+  let arguments = (ins
+    ContextType:$arcContext,
+    BoolAttr:$success
+  );
+
+  let assemblyFormat = [{ $arcContext `,` $success attr-dict }];
+}
+
+def GetNextWakeupOp : ArcOp<"get_next_wakeup", [
+  MemoryEffects<[MemRead]>
+]> {
+  let summary = "Read the model's next wakeup time";
+  let description = [{
+    Reads the next wakeup time from the model's context. The time is an
+    absolute timestamp in femtoseconds, not a duration relative to the current
+    simulation time. A wakeup at the current time requests an immediate
+    re-evaluation in the same time step; a value of `UINT64_MAX` indicates that
+    no wakeup is pending.
+  }];
+  let arguments = (ins ContextType:$arcContext);
+  let results = (outs I64:$time);
+  let assemblyFormat = [{ $arcContext attr-dict }];
+}
+
+def SetNextWakeupOp : ArcOp<"set_next_wakeup", [
+  MemoryEffects<[MemWrite]>
+]> {
+  let summary = "Set the model's next wakeup time";
+  let description = [{
+    Writes the next wakeup time into the model's storage. The time is
+    represented as an `i64` value in femtoseconds. The model's eval body
+    establishes the slot at `UINT64_MAX` ("no wakeup pending") on entry, and
+    process suspension code lowers the value to the earliest scheduled
+    wakeup over the course of an evaluation.
+  }];
+  let arguments = (ins ContextType:$arcContext, I64:$time);
+  let assemblyFormat = [{ $arcContext `,` $time attr-dict }];
+}
+
+//===----------------------------------------------------------------------===//
+// Context
+//===----------------------------------------------------------------------===//
+
+def AsContextOp : ArcOp<"as_context", [Pure]> {
+  let summary = "Derive context from a root storage or instance handle";
+  let description = [{
+    Retrieve a runtime handle to the context of a model's instance from either
+    the instance's root storage or a specialized simulation instance handle.
+  }];
+  let arguments = (ins AnyTypeOf<[StorageType, SimModelInstance]>:$input);
+  let results = (outs ContextType:$arcContext);
+  let assemblyFormat = [{ $input attr-dict `:` qualified(type($input)) }];
+}
+
+def InferredContextOp : ArcOp<"inferred_context", [Pure]> {
+  let summary = "Get the inferred runtime context";
+  let description = [{
+    Retrieve a runtime handle to the context of the model instance currently
+    being executed. This can be used in situations where the concrete context
+    is not yet available or in the body of functions that are called by one or
+    several models.
+  }];
+  let results = (outs ContextType:$arcContext);
+  let assemblyFormat = [{ attr-dict }];
+}
+
+//===----------------------------------------------------------------------===//
+// Coroutines
+//===----------------------------------------------------------------------===//
+
+def CoroutineDefineOp : ArcOp<"coroutine.define", [
+  FunctionOpInterface,
+  IsolatedFromAbove,
+  Symbol,
+]> {
+  let summary = "Coroutine definition";
+  let description = [{
+    Define a coroutine. Coroutines are suspendable functions that are entered at
+    their entry block or re-entered at a resume block. Local state and values
+    are persisted by an opaque state held by the caller, alongside an opaque
+    program counter value indicating at which point the coroutine should be
+    resumed.
+
+    Coroutines can be suspended by the `arc.coroutine.yield` terminator, which
+    returns control and local state back to the caller. The caller can then
+    re-enter the coroutine by passing that control and local state back into the
+    coroutine. Coroutines can be finished by the `arc.coroutine.return` and
+    `arc.coroutine.halt` terminators, which return control back to the caller
+    with a corresponding program counter indicating return or halt.
+
+    Arguments are passed to the coroutine upon each entry. The entry block's
+    arguments hold the values supplied by the caller on the first call. Each
+    block targeted by a suspension op must have its first arguments match the
+    coroutine's function type. On resumption, those arguments are bound to the
+    values supplied by the caller and may differ from the values passed on prior
+    entries.
+
+    Results are returned from the coroutine upon each suspension. Each of the
+    terminators must provide a set of values to be yielded back to the caller
+    upon suspension.
+
+    The local state of a coroutine is represented by `!arc.coroutine_state<@A>`,
+    and the program counter for resuming by `!arc.coroutine_pc<@A>`. These types
+    are opaque and are expanded to a concrete union/struct of local state and a
+    concrete integer PC via a lowering. These types are only used on coroutine
+    calls; coroutine definitions define them implicitly by values carried across
+    resume points.
+
+    To nest coroutines, a coroutine definition can call another coroutine and
+    carry the `!arc.coroutine_state` and `!arc.coroutine_pc` of that call as
+    local state across its own suspension points.
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    TypeAttrOf<FunctionType>:$function_type,
+    OptionalAttr<DictArrayAttr>:$arg_attrs,
+    OptionalAttr<DictArrayAttr>:$res_attrs
+  );
+  let results = (outs);
+  let regions = (region MinSizedRegion<1>:$body);
+  let hasCustomAssemblyFormat = 1;
+
+  let builders = [
+    OpBuilder<(ins "mlir::StringAttr":$sym_name,
+                   "mlir::TypeAttr":$function_type), [{
+      build($_builder, $_state, sym_name, function_type, mlir::ArrayAttr(),
+            mlir::ArrayAttr());
+    }]>,
+    OpBuilder<(ins "mlir::StringRef":$sym_name,
+                   "mlir::FunctionType":$function_type), [{
+      build($_builder, $_state,
+            $_builder.getStringAttr(sym_name),
+            mlir::TypeAttr::get(function_type),
+            mlir::ArrayAttr(), mlir::ArrayAttr());
+    }]>,
+  ];
+
+  let extraClassDeclaration = [{
+    /// Returns the argument types of this coroutine.
+    mlir::ArrayRef<mlir::Type> getArgumentTypes() {
+      return getFunctionType().getInputs();
+    }
+
+    /// Returns the result types of this coroutine.
+    mlir::ArrayRef<mlir::Type> getResultTypes() {
+      return getFunctionType().getResults();
+    }
+
+    mlir::Region *getCallableRegion() { return &getBody(); }
+  }];
+}
+
+// A coroutine state/PC type whose `coroutine` parameter matches the enclosing
+// op's `callee` symbol attribute.
+class CoroutineTypeOfCallee<ArcTypeDef baseType> : ConfinedType<baseType, [
+  CPred<"::llvm::cast<" # baseType.cppType # ">($_self).getCoroutine() == "
+        "($_op).getAttrOfType<::mlir::FlatSymbolRefAttr>(\"callee\")">
+], baseType.summary # " bound to the op's callee symbol", baseType.cppType>;
+
+def CoroutineStateOfCallee : CoroutineTypeOfCallee<CoroutineStateType>;
+def CoroutinePCOfCallee : CoroutineTypeOfCallee<CoroutinePCType>;
+
+def CoroutineCallOp : ArcOp<"coroutine.call", [
+  CallOpInterface,
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+]> {
+  let summary = "Call a coroutine";
+  let description = [{
+    Call an `arc.coroutine.define`. The coroutine is resumed at the point
+    indicated by the `pc` operand, and local state is restored from the `state`
+    operand. The `args` are passed into the coroutine and may differ between
+    subsequent re-entries. When the coroutine suspends or finishes, control is
+    transferred back to the caller and the call op returns the coroutine's
+    resume program counter, resume state, and the values yielded back from the
+    coroutine as results.
+
+    Passing a `return` or `halt` program counter to the callee results in
+    undefined behavior. These program counter values indicate that the coroutine
+    has finished or suspended forever, respectively, and the coroutine must not
+    be re-entered in either case.
+
+    The caller is responsible for interpreting the program counter returned from
+    the coroutine. A `return` indicates that the coroutine is finished and
+    control shall continue in the parent. A `halt` indicates that the coroutine
+    suspends forever, and the parent should also return `halt` if it is a
+    coroutine itself. Any other value indicates that the callee has suspended
+    and expects to be re-entered at a later point, and the caller must suspend
+    itself and re-enter the callee if it is a coroutine itself.
+  }];
+  let arguments = (ins
+    FlatSymbolRefAttr:$callee,
+    CoroutineStateOfCallee:$state,
+    CoroutinePCOfCallee:$pc,
+    Variadic<AnyType>:$args
+  );
+  let results = (outs
+    CoroutineStateOfCallee:$resumeState,
+    CoroutinePCOfCallee:$resumePC,
+    Variadic<AnyType>:$results
+  );
   let assemblyFormat = [{
-    $storage attr-dict `:` qualified(type($storage))
+    $callee `(` $state `,` $pc (`,` $args^)? `)` attr-dict
+    `:` functional-type(operands, results)
+  }];
+
+  let extraClassDeclaration = [{
+    operand_range getArgOperands() {
+      return getArgs();
+    }
+    MutableOperandRange getArgOperandsMutable() {
+      return getArgsMutable();
+    }
+
+    mlir::CallInterfaceCallable getCallableForCallee() {
+      return (*this)->getAttrOfType<mlir::SymbolRefAttr>("callee");
+    }
+
+    void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
+      (*this)->setAttr(getCalleeAttrName(),
+                       llvm::cast<mlir::SymbolRefAttr>(callee));
+    }
+
+    /// CallOpInterface requires ArgAndResultAttrsOpInterface. Call sites
+    /// don't carry these attributes, so stub them out as no-ops.
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
+  }];
+}
+
+def CoroutineInstanceOp : ArcOp<"coroutine.instance", [
+  CallOpInterface,
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+  HasParent<"hw::HWModuleOp">,
+  PredOpTrait<"`sensitivityMask` has one bit per argument",
+    CPred<"$sensitivityMask.size() == $args.size()">>,
+]> {
+  let summary = "Continuously run a coroutine in an hw.module";
+  let description = [{
+    Execute a coroutine concurrently in an `hw.module`. The program counter and
+    state of the coroutine are held implicitly by the instance and passed into
+    the coroutine when executed next. The values yielded by the coroutine are
+    produced as results of the instance.
+
+    The callee must produce two additional trailing results that steer
+    scheduling and are *not* exposed as results of the instance op:
+
+    - An observe bitmask as its second-to-last result, an integer with one bit
+      per coroutine argument. A set bit requests that the instance re-enter the
+      coroutine whenever the corresponding argument changes value, on top of the
+      time-based wakeup. The dynamic returned mask is AND-combined with the
+      `sensitivityMask` attribute. Only arguments with the corresponding static
+      sensitivity bit set are checked for changes.
+    - A wakeup time as its last result value, used to schedule the next
+      time-based execution.
+  }];
+  let arguments = (ins
+    FlatSymbolRefAttr:$callee,
+    Variadic<AnyType>:$args,
+    DenseBoolArrayAttr:$sensitivityMask
+  );
+  let results = (outs Variadic<AnyType>:$results);
+  let assemblyFormat = [{
+    $callee `(` $args `)` `sensitive` $sensitivityMask attr-dict `:` functional-type(operands, results)
+  }];
+
+  let extraClassDeclaration = [{
+    operand_range getArgOperands() {
+      return getArgs();
+    }
+    MutableOperandRange getArgOperandsMutable() {
+      return getArgsMutable();
+    }
+
+    mlir::CallInterfaceCallable getCallableForCallee() {
+      return (*this)->getAttrOfType<mlir::SymbolRefAttr>("callee");
+    }
+
+    void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
+      (*this)->setAttr(getCalleeAttrName(),
+                       llvm::cast<mlir::SymbolRefAttr>(callee));
+    }
+
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
+  }];
+}
+
+def CoroutineYieldOp : ArcOp<"coroutine.yield", [
+  AttrSizedOperandSegments,
+  DeclareOpInterfaceMethods<BranchOpInterface>,
+  HasParent<"CoroutineDefineOp">,
+  Terminator,
+]> {
+  let summary = "Suspend a coroutine and request resumption at a block";
+  let description = [{
+    Suspend a coroutine. Control is transferred back to the caller, alongside
+    a program counter value indicating the destination block, and the local
+    state needed to restore the values live across the yield op. Additionally,
+    the yield operands are returned to the caller and must match the result
+    types of the coroutine.
+
+    The destination block's first arguments must match the coroutine's function
+    type. On resumption, those arguments are bound to the values supplied by the
+    caller. The remaining arguments of the destination block are bound to the
+    destination operands of the yield op.
+  }];
+  let arguments = (ins
+    Variadic<AnyType>:$yieldOperands,
+    Variadic<AnyType>:$destOperands
+  );
+  let successors = (successor AnySuccessor:$dest);
+  let assemblyFormat = [{
+    (` ` `(` $yieldOperands^ `:` type($yieldOperands) `)` `,`)?
+    $dest (`(` $destOperands^ `:` type($destOperands) `)`)?
+    attr-dict
+  }];
+  let hasVerifier = 1;
+}
+
+def CoroutineReturnOp : ArcOp<"coroutine.return", [
+  HasParent<"CoroutineDefineOp">,
+  Terminator,
+]> {
+  let summary = "Return from a coroutine";
+  let description = [{
+    Returns control from a coroutine to the caller, yielding back a special
+    sentinel program counter value indicating that the coroutine has run to
+    completion. Additionally, the yield operands are returned to the caller and
+    must match the result types of the coroutine.
+  }];
+  let arguments = (ins Variadic<AnyType>:$yieldOperands);
+  let assemblyFormat = [{
+    ($yieldOperands^ `:` type($yieldOperands))? attr-dict
+  }];
+  let hasVerifier = 1;
+}
+
+def CoroutineHaltOp : ArcOp<"coroutine.halt", [
+  HasParent<"CoroutineDefineOp">,
+  Terminator,
+]> {
+  let summary = "Halt a coroutine permanently";
+  let description = [{
+    Halts execution of a coroutine forever. Control effectively gets stuck
+    indefinitely at the halt operation, also preventing all callers from making
+    progress. Yields back a special sentinel program counter value to the caller
+    which the caller must translate into either halting itself if it is a
+    coroutine, or arranging for the coroutine to never be re-entered again.
+  }];
+  let arguments = (ins Variadic<AnyType>:$yieldOperands);
+  let assemblyFormat = [{
+    ($yieldOperands^ `:` type($yieldOperands))? attr-dict
+  }];
+  let hasVerifier = 1;
+}
+
+class CoroutinePCBase<string mnemonic> : ArcOp<mnemonic, [Pure]> {
+  let summary = "Check whether a coroutine PC is a sentinel value";
+  let arguments = (ins CoroutinePCType:$pc);
+  let results = (outs I1:$result);
+  let assemblyFormat = [{
+    $pc `:` type($pc) attr-dict
+  }];
+}
+def CoroutinePCIsReturnOp : CoroutinePCBase<"coroutine.pc_is_return">;
+def CoroutinePCIsHaltOp : CoroutinePCBase<"coroutine.pc_is_halt">;
+
+def CoroutineUndefinedStateOp : ArcOp<"coroutine.undefined_state", [Pure]> {
+  let summary = "Create an undefined initial coroutine state";
+  let description = [{
+    Produces an undefined `!arc.coroutine_state` value. A coroutine establishes
+    its local state on first entry and never reads the state passed on that
+    first call, such that any initial state value will do. This op provides such
+    a value to seed the very first call into a coroutine.
+  }];
+  let results = (outs CoroutineStateType:$state);
+  let assemblyFormat = [{
+    `:` type($state) attr-dict
+  }];
+}
+
+def CoroutineStartPCOp : ArcOp<"coroutine.start_pc", [Pure]> {
+  let summary = "Create the start sentinel coroutine program counter";
+  let description = [{
+    Produces the special `start` sentinel `!arc.coroutine_pc` value. Passing
+    this program counter to an `arc.coroutine.call` enters the coroutine for the
+    first time, executing its body from the entry block. This op provides such a
+    value to seed the very first call into a coroutine.
+  }];
+  let results = (outs CoroutinePCType:$pc);
+  let assemblyFormat = [{
+    `:` type($pc) attr-dict
   }];
 }
 
@@ -757,22 +1135,6 @@ def SimEmitValueOp : ArcOp<"sim.emit"> {
   let assemblyFormat = [{ $valueName `,` $value attr-dict `:` type($value) }];
 }
 
-def SimGetTimeOp : ArcOp<"sim.get_time", [
-  MemoryEffects<[MemRead]>,
-  DeclareOpInterfaceMethods<SymbolUserOpInterface>
-]> {
-  let summary = "Gets the current simulation time of the model instance";
-  let description = [{
-    Gets the current simulation time of the given model instance. The time is
-    represented as an `i64` value in femtoseconds.
-  }];
-  let arguments = (ins SimModelInstance:$instance);
-  let results = (outs I64:$time);
-  let assemblyFormat = [{
-    $instance attr-dict `:` qualified(type($instance))
-  }];
-}
-
 def SimSetTimeOp : ArcOp<"sim.set_time", [
   MemoryEffects<[MemWrite]>,
   DeclareOpInterfaceMethods<SymbolUserOpInterface>
@@ -814,6 +1176,7 @@ def ModelOp : ArcOp<"model", [
   }];
   let arguments = (ins SymbolNameAttr:$sym_name,
                        TypeAttrOf<ModuleType>:$io,
+                       OptionalAttr<UI32Attr>:$storageBytes,
                        OptionalAttr<FlatSymbolRefAttr>:$initialFn,
                        OptionalAttr<FlatSymbolRefAttr>:$finalFn,
                        OptionalAttr<TraceTapArrayAttr>:$traceTaps);
@@ -821,6 +1184,7 @@ def ModelOp : ArcOp<"model", [
 
   let assemblyFormat = [{
     $sym_name `io` $io
+    (`storageBytes` $storageBytes^)?
     (`initializer` $initialFn^)?
     (`finalizer` $finalFn^)?
     (`traceTaps` $traceTaps^)?
@@ -1056,6 +1420,148 @@ def RuntimeModelOp : ArcOp<"runtime.model", [
   let assemblyFormat = [{
     $sym_name $name `numStateBytes` $numStateBytes
     (`traceTaps` $traceTaps^)? attr-dict
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// ArrayRef ops
+//===----------------------------------------------------------------------===//
+//
+// Ops that deal with bufferized arrays. The !hw.array type has value semantics;
+// the !arc.arrayref type is the equivalent but with reference semantics.
+
+def ArrayRefAllocOp : ArcOp<"arrayref.alloc", []> {
+  let summary = "array allocation";
+  let description = [{
+    Allocates an array on the stack. If `init` is set, the array is initialized
+    to this value. Otherwise the array's contents are undefined.
+  }];
+  let arguments = (ins OptionalAttr<ArrayAttr>:$init);
+  let results = (outs ArrayRefType:$output);
+  let assemblyFormat = "attr-dict (`init` `(` $init^ `)`)? `:` type($output)";
+  let hasVerifier = 1;
+}
+
+def ArrayRefGetOp : ArcOp<"arrayref.get", [
+  MemoryEffects<[MemRead]>,
+  TypesMatchWith<"array element type matches the result type", "input", "value",
+                 "cast<ArrayRefType>($_self).getElementType()">
+]> {
+  let summary = "array get";
+  let description = [{
+    Loads a single value from an arrayref.
+  }];
+  let arguments = (ins ArrayRefType:$input, Index:$index);
+  let results = (outs AnyType:$value);
+  let assemblyFormat = [{
+    $input `[` $index `]` attr-dict `:` type($input) `->` type($value)
+  }];
+}
+
+def ArrayRefInjectOp : ArcOp<"arrayref.inject", [
+  MemoryEffects<[MemRead, MemWrite]>,
+  AllTypesMatch<["input", "output"]>,
+  TypesMatchWith<"element type matches input element type", "input", "element",
+                 "cast<ArrayRefType>($_self).getElementType()">
+]> {
+  let summary = "array inject";
+  let description = [{
+    Stores a single value into an arrayref.
+  }];
+  let arguments = (ins ArrayRefType:$input, Index:$index, AnyType:$element);
+  let results = (outs ArrayRefType:$output);
+  let assemblyFormat = [{
+    $input `[` $index `]` `,` $element attr-dict `:` type($input) `,` type($element) `->` type($output)
+  }];
+}
+
+def ArrayRefSliceOp : ArcOp<"arrayref.slice", [
+  Pure,
+  AllElementTypesMatch<["input", "output"]>
+]> {
+  let summary = "array slice";
+  let description = [{
+    Slices an array into a sub-array, returning a view into the original array.
+  }];
+  let arguments = (ins ArrayRefType:$input, Index:$lowIndex);
+  let results = (outs ArrayRefType:$output);
+  let assemblyFormat = [{
+    $input`[`$lowIndex`]` attr-dict `:` functional-type($input, $output)
+  }];
+}
+
+def ArrayRefCopyOp : ArcOp<"arrayref.copy", [
+  MemoryEffects<[MemRead, MemWrite]>,
+  SameOperandsAndResultType,
+]> {
+  let summary = "array copy";
+  let description = [{
+    Copies the content of one array into another array. Returns the input array.
+  }];
+  let arguments = (ins ArrayRefType:$input, ArrayRefType:$source);
+  let results = (outs ArrayRefType:$output);
+  let assemblyFormat = [{
+    $input `=` $source attr-dict `:` type($input)
+  }];
+}
+
+def ArrayRefCreateOp : ArcOp<"arrayref.create", [
+  MemoryEffects<[MemWrite]>,
+  AllTypesMatch<["input", "output"]>,
+  TypesMatchWith<"operand types match element type",
+                 "output", "elements", "SmallVector<Type, 2>("
+                 "cast<ArrayRefType>($_self).getNumElements(), "
+                 "cast<ArrayRefType>($_self).getElementType())">
+]> {
+  let summary = "array create";
+  let description = [{
+    Creates an array from a list of values. The values are ordered from
+    most significant to least significant (the same as `hw.array_create`).
+
+    The `input` array is populated with `elements` and is returned.
+  }];
+  let arguments = (ins ArrayRefType:$input, Variadic<AnyType>:$elements);
+  let results = (outs ArrayRefType:$output);
+  let assemblyFormat = [{
+    $input `=` $elements attr-dict `:` type($output)
+  }];
+}
+
+def ArrayRefFromArrayOp : ArcOp<"arrayref.from_array", [
+  MemoryEffects<[MemWrite]>,
+  AllTypesMatch<["input", "output"]>,
+  TypesMatchWith<"array type matches output type",
+                 "array", "output",
+                 "ArrayRefType::get("
+                   "cast<hw::ArrayType>($_self).getElementType(), "
+                   "cast<hw::ArrayType>($_self).getNumElements())">
+]> {
+  let summary = "arrayref from array";
+  let description = [{
+    Populates an arrayref with the elements of an array.
+  }];
+  let arguments = (ins ArrayRefType:$input, ArrayType:$array);
+  let results = (outs ArrayRefType:$output);
+  let assemblyFormat = [{
+    $input `=` $array attr-dict `:` type($output) `,` type($array)
+  }];
+}
+
+def ArrayRefToArrayOp : ArcOp<"arrayref.to_array", [
+  TypesMatchWith<"array type matches result type",
+                 "input", "result",
+                 "hw::ArrayType::get("
+                   "cast<ArrayRefType>($_self).getElementType(), "
+                   "cast<ArrayRefType>($_self).getNumElements())">
+]> {
+  let summary = "arrayref to array";
+  let description = [{
+    Creates an array from an arrayref.
+  }];
+  let arguments = (ins ArrayRefType:$input);
+  let results = (outs ArrayType:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` functional-type($input, $result)
   }];
 }
 

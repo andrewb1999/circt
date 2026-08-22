@@ -463,13 +463,15 @@ hw.module @test_sformatf(in %a : i8) {
   %0 = sv.sformatf "foo%d"(%a) : i8
 }
 
-// CHECK-LABEL: hw.module @test_fflush(in %a : i32) {
+// CHECK-LABEL: hw.module @test_fflush_and_fclose(in %a : i32) {
 // CHECK: sv.fflush
 // CHECK-NEXT: sv.fflush fd %a
-hw.module @test_fflush(in %a : i32) {
+// CHECK-NEXT: sv.fclose %a
+hw.module @test_fflush_and_fclose(in %a : i32) {
   sv.initial {
     sv.fflush
     sv.fflush fd %a
+    sv.fclose %a
   }
 }
 
@@ -500,4 +502,41 @@ sv.verbatim.source @VerbatimTestModule.v<WIDTH: i32 = 8> attributes {
 // CHECK-SAME:    }
 sv.verbatim.module @VerbatimTestModule<WIDTH: i32 = 8>(in %clk: i1, out out: i1) attributes {
   source = @VerbatimTestModule.v
+}
+
+// CHECK-LABEL: hw.module @test_write(in %c0 : i32, in %c1 : i8) {
+// CHECK: sv.write "stdout"
+// CHECK-NEXT: sv.write "%d"(%c0) : i32
+// CHECK-NEXT: sv.write "%d %d"(%c0, %c1) : i32, i8
+hw.module @test_write(in %c0 : i32, in %c1 : i8) {
+  sv.initial {
+    sv.write "stdout"
+    sv.write "%d"(%c0) : i32
+    sv.write "%d %d"(%c0, %c1) : i32, i8
+  }
+}
+
+// CHECK-LABEL: hw.module @test_generate_for
+hw.module @test_generate_for() {
+  // CHECK: sv.generate "foo_loop" : {
+  sv.generate "foo_loop" : {
+    // CHECK: sv.generate.for %i : i32 = 0 : i32 to 10 : i32 step 1 : i32 name "gen_blk" {
+    sv.generate.for %i : i32 = 0 to 10 : i32 step 1 name "gen_blk" {
+      sv.initial {
+        sv.write "val = %d"(%i) : i32
+      }
+    }
+  }
+  hw.output
+}
+
+// CHECK-LABEL: hw.module @test_concat_str
+hw.module @test_concat_str(out o : !hw.string) {
+  // CHECK: sv.constantStr "foo"
+  // CHECK: sv.constantStr "bar"
+  // CHECK: sv.concat_str({{[^)]*}}) : !hw.string
+  %a = sv.constantStr "foo"
+  %b = sv.constantStr "bar"
+  %c = sv.concat_str (%a, %b) : !hw.string
+  hw.output %c : !hw.string
 }

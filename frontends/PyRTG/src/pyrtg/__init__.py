@@ -11,9 +11,10 @@ from .rtg import rtg
 from .rtgtest import rtgtest
 from .scf import scf
 from .index import index
+from .arith import arith
 from .sets import Set, SetType
 from .strings import String, StringType
-from .integers import Integer, IntegerType, Bool, BoolType
+from .integers import Integer, IntegerType
 from .bags import Bag, BagType
 from .sequences import sequence, Sequence, SequenceType, RandomizedSequence, RandomizedSequenceType
 from .configs import config, Param, PythonParam, Config
@@ -22,6 +23,9 @@ from .resources import IntegerRegister, IntegerRegisterType, FloatRegister, Floa
 from .arrays import Array, ArrayType
 from .contexts import CPUCore, CPUCoreType
 from .control_flow import If, Else, EndIf, For, Foreach
+from .effects import (Continuation, ContinuationType, VoidType,
+                      EffectDeclaration, effect, perform, effect_handler,
+                      HandlerScope)
 from .tuples import Tuple, TupleType
 from .memories import Memory, MemoryType, MemoryBlock, MemoryBlockType
 from .instructions import instruction, Instruction, SideEffect

@@ -2959,7 +2959,7 @@ firrtl.circuit "SimulationPortType3" {
 
 firrtl.circuit "SimulationExtraHardwarePort" {
   firrtl.extmodule @SimulationExtraHardwarePort()
-  // expected-error @below {{op target @Foo port 4 may only be a property type, got '!firrtl.uint<8>' instead}}
+  // expected-error @below {{op target @Foo port 4 contains hardware types: '!firrtl.uint<8>'}}
   firrtl.simulation @foo, @Foo {}
   // expected-note @below {{target defined here}}
   firrtl.extmodule @Foo(
@@ -2968,6 +2968,22 @@ firrtl.circuit "SimulationExtraHardwarePort" {
     out done: !firrtl.uint<1>,
     out success: !firrtl.uint<1>,
     in extra: !firrtl.uint<8>
+  )
+}
+
+// -----
+
+firrtl.circuit "SimulationExtraHardwareInBundlePort" {
+  firrtl.extmodule @SimulationExtraHardwareInBundlePort()
+  // expected-error @below {{op target @Foo port 4 contains hardware types: '!firrtl.openbundle<x: uint<8>>'}}
+  firrtl.simulation @foo, @Foo {}
+  // expected-note @below {{target defined here}}
+  firrtl.extmodule @Foo(
+    in clock: !firrtl.clock,
+    in init: !firrtl.uint<1>,
+    out done: !firrtl.uint<1>,
+    out success: !firrtl.uint<1>,
+    out extra: !firrtl.openbundle<x: uint<8>>
   )
 }
 
@@ -3517,5 +3533,30 @@ firrtl.circuit "WireDomainTypeWithAssociation" {
   ) {
     // expected-error @below {{of domain type must not have domain associations}}
     %w = firrtl.wire domains[%A] : !firrtl.domain<@ClockDomain()> domains[!firrtl.domain<@ClockDomain()>]
+  }
+}
+
+// -----
+
+// property_assert with statically-false condition reports error.
+firrtl.circuit "PropAssertFalseInClass" {
+  firrtl.module @PropAssertFalseInClass() {}
+  firrtl.class @C() {
+    %false = firrtl.bool false
+    %msg = firrtl.string "invariant violated"
+    // expected-error @below {{property assertion is statically false}}
+    firrtl.property_assert %false, %msg : !firrtl.bool
+  }
+}
+
+// -----
+
+// property_assert with statically-false condition in a module body reports error.
+firrtl.circuit "PropAssertFalseInModule" {
+  firrtl.module @PropAssertFalseInModule() {
+    %false = firrtl.bool false
+    %msg = firrtl.string "module invariant violated"
+    // expected-error @below {{property assertion is statically false}}
+    firrtl.property_assert %false, %msg : !firrtl.bool
   }
 }

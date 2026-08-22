@@ -15,6 +15,7 @@ include "circt/Dialect/Seq/SeqTypes.td"
 include "circt/Dialect/Sim/SimDialect.td"
 include "circt/Dialect/Sim/SimOpInterfaces.td"
 include "circt/Dialect/Sim/SimTypes.td"
+include "circt/Support/ProceduralRegionTrait.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
@@ -221,6 +222,33 @@ def FormatLiteralOp : SimOp<"fmt.literal", [Pure, ConstantLike]> {
   let hasFolder = true;
 }
 
+def FormatStringOp : SimOp<"fmt.string",
+  [Pure, DeclareOpInterfaceMethods<SimValueFormatter>]
+> {
+  let summary = "Dynamic string format specifier";
+  let description = [{
+    Format the given dynamic string value.
+
+    If `specifierWidth` is present and larger than the string length, the
+    result is padded to that width using `paddingChar`. By default, strings are
+    right-aligned and padded with spaces.
+  }];
+
+  let arguments = (ins DynamicStringType:$value,
+    DefaultValuedAttr<BoolAttr,"false">:$isLeftAligned,
+    DefaultValuedAttr<I8Attr,"32">:$paddingChar,
+    OptionalAttr<I32Attr>:$specifierWidth);
+  let results = (outs FormatStringType:$result);
+
+  let assemblyFormat = [{
+    $value
+    (`isLeftAligned` $isLeftAligned^)?
+    (`paddingChar` $paddingChar^)?
+    (`specifierWidth` $specifierWidth^)?
+    attr-dict `:` qualified(type($value))
+  }];
+}
+
 def FormatHexOp : SimOp<"fmt.hex",
   [Pure, DeclareOpInterfaceMethods<SimValueFormatter>]
 > {
@@ -232,6 +260,11 @@ def FormatHexOp : SimOp<"fmt.hex",
     length required to print the maximum value of the argument's
     type. Zero width values will produce the empty string.
     No further prefix will be added.
+
+    An optional `specifierWidth` overrides this default field width; a
+    `specifierWidth` of 0 disables padding entirely and prints the value in its
+    minimal representation. This mirrors the SystemVerilog `%h`, `%0h`, and
+    `%<N>h` specifiers.
   }];
 
 
@@ -265,6 +298,11 @@ def FormatOctOp : SimOp<"fmt.oct",
     length required to print the maximum value of the argument's
     type. Zero width values will produce the empty string.
     No further prefix will be added.
+
+    An optional `specifierWidth` overrides this default field width; a
+    `specifierWidth` of 0 disables padding entirely and prints the value in its
+    minimal representation. This mirrors the SystemVerilog `%o`, `%0o`, and
+    `%<N>o` specifiers.
   }];
 
 
@@ -296,6 +334,11 @@ def FormatBinOp : SimOp<"fmt.bin",
     The printed value will be left-padded with '0' up to the number
     of bits of the argument's type. Zero width values will produce
     the empty string. No further prefix will be added.
+
+    An optional `specifierWidth` overrides this default field width; a
+    `specifierWidth` of 0 disables padding entirely and prints the value in its
+    minimal representation. This mirrors the SystemVerilog `%b`, `%0b`, and
+    `%<N>b` specifiers.
   }];
 
   let arguments = (ins AnyInteger:$value,
@@ -419,6 +462,11 @@ def FormatDecOp : SimOp<"fmt.dec",
     padded to the same width. Zero width values will produce
     a single '0'.
 
+    An optional `specifierWidth` overrides this default field width; a
+    `specifierWidth` of 0 disables padding entirely and prints the value in its
+    minimal representation. This mirrors the SystemVerilog `%d`, `%0d`, and
+    `%<N>d` specifiers.
+
     Backends are recommended to not exceed the required amount of padding.
   }];
 
@@ -438,25 +486,6 @@ def FormatDecOp : SimOp<"fmt.dec",
     (`specifierWidth` $specifierWidth^)?
     (`signed` $isSigned^)?
     attr-dict `:` qualified(type($value))
-  }];
-
-  let extraClassDeclaration = [{
-      static inline unsigned getDecimalWidth(unsigned bits, bool isSigned) {
-        if (bits == 0)
-          return 1;
-        if (bits == 1)
-          return isSigned ? 2 : 1;
-
-        if (isSigned)
-          bits--;
-
-        // Should be precise up until bits = 13301
-        // log(2) / log(10) + epsilon
-        const double baseConversionFactor = 0.30103;
-        unsigned digits = std::ceil(bits * baseConversionFactor);
-
-        return isSigned ? digits + 1 : digits;
-      }
   }];
 }
 
@@ -482,6 +511,16 @@ def FormatCharOp : SimOp<"fmt.char",
   let hasFolder = true;
 
   let assemblyFormat = "$value attr-dict `:` qualified(type($value))";
+}
+
+def FormatCurrentTimeOp : SimOp<"fmt.current_time", [Pure]> {
+  let summary = "Simulation time format specifier";
+  let description = [{
+    Format string fragment that resolves to the current simulation time when
+    printed. The textual representation is implementation defined.
+  }];
+  let results = (outs FormatStringType:$result);
+  let assemblyFormat = "attr-dict";
 }
 
 def FormatHierPathOp : SimOp<"fmt.hier_path", [Pure]> {
@@ -546,7 +585,7 @@ def FormatStringConcatOp : SimOp<"fmt.concat", [Pure]> {
   }];
 }
 
-def PrintFormattedOp : SimOp<"print"> {
+def PrintFormattedOp : SimOp<"print", [NonProceduralOp]> {
   let summary = "Print a formatted string on a given clock and condition";
   let description = [{
     Evaluate a format string and print it to the simulation console on the
@@ -561,23 +600,85 @@ def PrintFormattedOp : SimOp<"print"> {
   let arguments = (ins
     FormatStringType:$input,
     ClockType:$clock,
-    I1:$condition
+    I1:$condition,
+    Optional<OutputStreamType>:$stream
   );
+  let builders = [
+    OpBuilder<(ins
+      "Value":$input,
+      "Value":$clock,
+      "Value":$condition
+    ), [{
+      build($_builder, $_state, input, clock, condition, mlir::Value());
+    }]>
+  ];
   let hasCanonicalizeMethod = true;
-  let assemblyFormat = "$input `on` $clock `if` $condition attr-dict";
+  let assemblyFormat = "$input `on` $clock `if` $condition (`to` $stream^)? attr-dict";
 }
 
-def PrintFormattedProcOp : SimOp<"proc.print"> {
+def PrintFormattedProcOp : SimOp<"proc.print", [ProceduralOp]> {
   let summary = "Print a formatted string within a procedural region";
   let description = [{
     Evaluate a format string and print it to the simulation console.
 
     This operation must be within a procedural region.
   }];
-  let arguments = (ins FormatStringType:$input);
-  let hasVerifier = true;
+  let arguments = (ins
+    FormatStringType:$input,
+    Optional<OutputStreamType>:$stream
+  );
+  let builders = [
+    OpBuilder<(ins
+      "Value":$input
+    ), [{
+      build($_builder, $_state, input, mlir::Value());
+    }]>
+  ];
   let hasCanonicalizeMethod = true;
-  let assemblyFormat = "$input attr-dict";
+  let assemblyFormat = "$input (`to` $stream^)? attr-dict";
+}
+
+def GetFileOp : SimOp<"get_file", [ProceduralOp]> {
+  let summary = "Get an output stream for a formatted file name";
+  let description = [{
+    Resolves a file name from a `!sim.fstring` value, immediately creates the
+    corresponding file, and returns an output stream resource that can be
+    consumed by `sim.proc.print`. The file-name format string should be
+    constructed using `sim.fmt.*` operations, just like any other Sim
+    format-string value.
+
+    This operation has an immediate side effect: executing it creates the file,
+    even if the returned stream is never subsequently consumed.
+
+    The concrete runtime representation and lifetime management of the returned
+    stream are backend-defined.
+  }];
+
+  let arguments = (ins FormatStringType:$fileName);
+  let results = (outs OutputStreamType:$result);
+  let assemblyFormat = "$fileName attr-dict";
+}
+
+def StdoutStreamOp : SimOp<"stdout_stream", [Pure]> {
+  let summary = "The standard output stream";
+  let description = [{
+    Returns a reference to the standard output stream, which can be consumed
+    by `sim.print` or `sim.proc.print`.
+  }];
+
+  let results = (outs OutputStreamType:$result);
+  let assemblyFormat = "attr-dict";
+}
+
+def StderrStreamOp : SimOp<"stderr_stream", [Pure]> {
+  let summary = "The standard error stream";
+  let description = [{
+    Returns a reference to the standard error stream, which can be consumed
+    by `sim.print` or `sim.proc.print`.
+  }];
+
+  let results = (outs OutputStreamType:$result);
+  let assemblyFormat = "attr-dict";
 }
 
 //===----------------------------------------------------------------------===//
@@ -647,13 +748,13 @@ def IntToStringOp: SimOp<"string.int_to_string", [Pure]> {
   let description = [{
     Converts an integer value to a string following Verilog semantics, where
     string literals are represented as right-aligned bitvectors.
-    
+
     The operation reads the integer byte-by-byte, interpreting each non-zero
     byte as an ASCII character. Zero-valued bytes are skipped and
     not included in the output string. See Sec 6.16 of the standard saying
-    "A string variable shall not contain the special character "\0". 
+    "A string variable shall not contain the special character "\0".
     Assigning the value 0 to a string character shall be ignored"
-    
+
     Example:
       Consider the hex value 0x00_00_00_48_00_00_6C_6F
       Reading from MSB to LSB and filtering out null bytes:
@@ -669,6 +770,32 @@ def IntToStringOp: SimOp<"string.int_to_string", [Pure]> {
   let hasFolder = true;
 
   let assemblyFormat = "$input attr-dict `:` qualified(type($input))";
+}
+
+def StringToIntOp : SimOp<"string.string_to_int", [Pure]> {
+  let summary = "Convert a string into an integer";
+  let description = [{
+    Packs the characters of a string into a big-endian bit sequence, one
+    byte per character, with the last character forming the
+    least-significant bits of the sequence. That sequence is then fit to
+    the result width: zero-extended on the most-significant end if the
+    result is wider, or truncated from the most-significant end if it is
+    narrower.
+  }];
+  let arguments = (ins DynamicStringType:$input);
+  let results = (outs AnyInteger:$result);
+
+  let assemblyFormat = "$input attr-dict `:` qualified(type($result))";
+}
+
+def FormatToStringOp : SimOp<"string.format_to_string", [ProceduralOp]> {
+  let summary = "Create a dynamic string by evaluating a format string";
+  let description = [{
+    Evaluates a format string and produces the result as a dynamic string.
+  }];
+  let arguments = (ins FormatStringType:$fmtstring);
+  let results = (outs DynamicStringType:$result);
+  let assemblyFormat = "$fmtstring attr-dict";
 }
 
 def StringGetOp : SimOp<"string.get", [Pure]> {
@@ -697,13 +824,40 @@ def StringGetOp : SimOp<"string.get", [Pure]> {
   let assemblyFormat = "$str `[` $index `]` attr-dict";
 }
 
+def SimStringCmpPredicateAttr : I64EnumAttr<
+    "StringCmpPredicate", "String comparison predicate",
+    [I64EnumAttrCase<"eq", 0>, I64EnumAttrCase<"ne", 1>,
+    I64EnumAttrCase<"lt", 2>, I64EnumAttrCase<"le", 3>,
+    I64EnumAttrCase<"gt", 4>, I64EnumAttrCase<"ge", 5>]> {
+  let cppNamespace = "circt::sim";
+}
+
+def StringCmpOp : SimOp<"string.cmp", [Pure]> {
+  let summary = "Compare two dynamic strings";
+  let description = [{
+    Compares two dynamic string values using the specified predicates and returns
+    a 1-bit boolean result.
+
+    Equality predicates (`eq`, `ne`) test whether the strings have identical
+    content. Relational predicates (`lt`, `le`, `gt`, `ge`) compare strings
+    lexicographically, byte by byte, following the ordering of byte value.
+  }];
+  let arguments = (ins
+    SimStringCmpPredicateAttr:$predicate,
+    DynamicStringType:$lhs,
+    DynamicStringType:$rhs
+  );
+  let results = (outs I1:$result);
+  let assemblyFormat = "$predicate $lhs `,` $rhs attr-dict `:` type($lhs)";
+}
+
 //===----------------------------------------------------------------------===//
 // Queues
 //===----------------------------------------------------------------------===//
 
-def QueueCmpPredicateAttr : I64EnumAttr<
-    "QueueCmpPredicate",
-    "queue.cmp comparison predicate",
+def UArrayCmpPredicateAttr : I64EnumAttr<
+    "UArrayCmpPredicate",
+    "unpacked-array-like container comparison predicate",
     [I64EnumAttrCase<"eq", 0>,
       I64EnumAttrCase<"ne", 1>]> {
   let cppNamespace = "circt::sim";
@@ -718,7 +872,7 @@ def QueueCmpOp : SimOp<"queue.cmp", [Pure, Commutative, SameTypeOperands]> {
     Comparing for equality and inequality are both supported.
   }];
 
-  let arguments = (ins QueueCmpPredicateAttr:$predicate, QueueType:$lhs, QueueType:$rhs);
+  let arguments = (ins UArrayCmpPredicateAttr:$predicate, QueueType:$lhs, QueueType:$rhs);
   let results = (outs I1:$result);
 
   let assemblyFormat = "$predicate $lhs `,` $rhs attr-dict `:` type($lhs)";
@@ -771,7 +925,7 @@ TypesMatchWith<"queue and element types must match",
 AllTypesMatch<["queue", "outQueue"]>]> {
   let summary = "Push an element to the front of a queue";
   let description = [{
-    Adds an element to the front of the queue. If the queue is a bounded 
+    Adds an element to the front of the queue. If the queue is a bounded
     queue which is full, then this will erase the final element of the queue,
     as to keep the queue within-bounds.
   }];
@@ -809,7 +963,7 @@ AllTypesMatch<["queue", "outQueue"]>]> {
   let summary = "Removes the first element of a queue";
   let description = [{
     Removes an element from the front of a queue.
-    
+
     If the queue is empty, this has no effect, and the value of `popped`
     will be the same as obtained by reading a non-existent array element
     from an array with the same element type,
@@ -929,7 +1083,7 @@ def QueueResizeOp : SimOp<"queue.resize", [Pure]> {
   let description = [{
     Converts between two queues with different bounds, but the same element
     type.
-    
+
     If $result has a smaller bound than the size of $input, elements at the end
     of the queue will be discarded to ensure it fits within the space provided.
   }];
@@ -985,10 +1139,171 @@ def QueueConcatOp : SimOp<"queue.concat", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
+// Associative array operations
+//===----------------------------------------------------------------------===//
+
+def AssocArrayEmptyOp : SimOp<"assoc_array.empty", [Pure]> {
+  let summary = "Creates an empty associative array";
+  let description = [{
+    Creates an empty associative array, which is the default value for a
+    variable holding an associative array.
+  }];
+  let arguments = (ins);
+  let results = (outs AssocArrayType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
+def AssocArrayGetOp : SimOp<"assoc_array.get", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">,
+    TypesMatchWith<"array and result types must match",
+      "array", "result", "cast<AssocArrayType>($_self).getElementType()">]> {
+  let summary = "Reads an element from an associative array";
+  let description = [{
+    Returns the element stored at $index. If no entry exists for $index, the
+    returned value is unspecified; use `assoc_array.exists` to distinguish a
+    missing entry from a stored value.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = "$array `[` $index `]` attr-dict `:` type($array)";
+}
+
+def AssocArraySetOp : SimOp<"assoc_array.set", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">,
+    TypesMatchWith<"array and value types must match",
+      "array", "value", "cast<AssocArrayType>($_self).getElementType()">,
+    AllTypesMatch<["array", "outArray"]>]> {
+  let summary = "Writes an element into an associative array";
+  let description = [{
+    Returns an updated associative array with $value stored at $index,
+    creating the entry if it did not already exist.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index, AnyType:$value);
+  let results = (outs AssocArrayType:$outArray);
+  let assemblyFormat = "$array `[` $index `]` `=` $value attr-dict `:` type($array)";
+}
+
+def AssocArrayDeleteOp : SimOp<"assoc_array.delete", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">,
+    AllTypesMatch<["array", "outArray"]>]> {
+  let summary = "Deletes an entry from an associative array";
+  let description = [{
+    Returns an updated associative array with the entry at $index removed.
+    Deleting an entry that does not exist returns the array unchanged.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index);
+  let results = (outs AssocArrayType:$outArray);
+  let assemblyFormat = "`index` $index `of` $array attr-dict `:` type($array)";
+}
+
+def AssocArraySizeOp : SimOp<"assoc_array.size", [Pure]> {
+  let summary = "Number of entries in an associative array";
+  let description = [{
+    Returns the number of entries stored in the associative array. An empty
+    array has size 0.
+  }];
+  let arguments = (ins AssocArrayType:$array);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$array attr-dict `:` type($array)";
+}
+
+def AssocArrayCmpOp : SimOp<"assoc_array.cmp",
+    [Pure, Commutative, SameTypeOperands]> {
+  let summary = "Compares two associative arrays";
+  let description = [{
+    Carries out a comparison on two associative arrays. Two associative
+    arrays are equal if they have the same set of keys and each key maps to
+    an equal value in both arrays.
+
+    Comparing for equality and inequality are both supported.
+  }];
+
+  let arguments = (ins UArrayCmpPredicateAttr:$predicate, AssocArrayType:$lhs, AssocArrayType:$rhs);
+  let results = (outs I1:$result);
+
+  let assemblyFormat = "$predicate $lhs `,` $rhs attr-dict `:` type($lhs)";
+}
+
+def AssocArrayExistsOp : SimOp<"assoc_array.exists", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">]> {
+  let summary = "Checks whether an entry exists in an associative array";
+  let description = [{
+    Returns a nonzero value if an entry exists at $index, and 0 otherwise.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$index `in` $array attr-dict `:` type($array)";
+}
+
+def AssocArrayFirstOp : SimOp<"assoc_array.first", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">]> {
+  let summary = "Finds the first (lowest) index in an associative array";
+  let description = [{
+    Finds the smallest index that has an entry in the array. If the array is
+    not empty, $found is nonzero and $index is that index. Otherwise $found
+    is 0 and $index is unspecified.
+  }];
+  let arguments = (ins AssocArrayType:$array);
+  let results = (outs I32:$found, AnyType:$index);
+  let assemblyFormat = "$array attr-dict `:` type($array)";
+}
+
+def AssocArrayLastOp : SimOp<"assoc_array.last", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">]> {
+  let summary = "Finds the last (highest) index in an associative array";
+  let description = [{
+    Finds the largest index that has an entry in the array. If the array is
+    not empty, $found is nonzero and $index is that index. Otherwise $found
+    is 0 and $index is unspecified.
+  }];
+  let arguments = (ins AssocArrayType:$array);
+  let results = (outs I32:$found, AnyType:$index);
+  let assemblyFormat = "$array attr-dict `:` type($array)";
+}
+
+def AssocArrayNextOp : SimOp<"assoc_array.next", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">,
+    TypesMatchWith<"array and nextIndex types must match",
+      "array", "nextIndex", "cast<AssocArrayType>($_self).getIndexType()">]> {
+  let summary = "Finds the next index in an associative array";
+  let description = [{
+    Finds the smallest index strictly greater than $index. If such an entry
+    exists, $found is nonzero and $nextIndex is that index. Otherwise $found
+    is 0 and $nextIndex is $index, unchanged.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index);
+  let results = (outs I32:$found, AnyType:$nextIndex);
+  let assemblyFormat = "$array `[` $index `]` attr-dict `:` type($array)";
+}
+
+def AssocArrayPrevOp : SimOp<"assoc_array.prev", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">,
+    TypesMatchWith<"array and prevIndex types must match",
+      "array", "prevIndex", "cast<AssocArrayType>($_self).getIndexType()">]> {
+  let summary = "Finds the previous index in an associative array";
+  let description = [{
+    Finds the largest index strictly smaller than $index. If such an entry
+    exists, $found is nonzero and $prevIndex is that index. Otherwise $found
+    is 0 and $prevIndex is $index, unchanged.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index);
+  let results = (outs I32:$found, AnyType:$prevIndex);
+  let assemblyFormat = "$array `[` $index `]` attr-dict `:` type($array)";
+}
+
+//===----------------------------------------------------------------------===//
 // Simulation Control
 //===----------------------------------------------------------------------===//
 
-def ClockedTerminateOp : SimOp<"clocked_terminate"> {
+def ClockedTerminateOp : SimOp<"clocked_terminate", [NonProceduralOp]> {
   let summary = "Terminate the simulation";
   let description = [{
     Implements the semantics of `sim.terminate` if the given condition is true
@@ -1007,7 +1322,7 @@ def ClockedTerminateOp : SimOp<"clocked_terminate"> {
   }];
 }
 
-def ClockedPauseOp : SimOp<"clocked_pause"> {
+def ClockedPauseOp : SimOp<"clocked_pause", [NonProceduralOp]> {
   let summary = "Pause the simulation";
   let description = [{
     Implements the semantics of `sim.pause` if the given condition is true on
@@ -1024,7 +1339,7 @@ def ClockedPauseOp : SimOp<"clocked_pause"> {
   }];
 }
 
-def TerminateOp : SimOp<"terminate"> {
+def TerminateOp : SimOp<"terminate", [ProceduralOp]> {
   let summary = "Terminate the simulation";
   let description = [{
     Terminate the simulation with a success or failure exit code. Depending on
@@ -1054,7 +1369,7 @@ def TerminateOp : SimOp<"terminate"> {
   }];
 }
 
-def PauseOp : SimOp<"pause"> {
+def PauseOp : SimOp<"pause", [ProceduralOp]> {
   let summary = "Pause the simulation";
   let description = [{
     Interrupt the simulation and give control back to the user in case of an
@@ -1074,6 +1389,161 @@ def PauseOp : SimOp<"pause"> {
   let assemblyFormat = [{
     custom<KeywordBool>($verbose, "\"verbose\"" , "\"quiet\"") attr-dict
   }];
+}
+
+def TriggeredOp : SimOp<"triggered", [
+    SingleBlock, NoTerminator, NonProceduralOp, ProceduralRegion]> {
+  let summary = "A procedural region triggered on a clock edge";
+  let description = [{
+    A procedural region that executes on the rising edge of the given clock.
+    An optional 1-bit condition can be provided to guard execution of the
+    region on that clock edge.
+  }];
+
+  let arguments = (ins ClockType:$clock, Optional<I1>:$condition);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = [{
+    $clock (`if` $condition^)? $body attr-dict
+  }];
+
+  let extraClassDeclaration = [{
+    Block *getBodyBlock() { return &getBody().front(); }
+  }];
+
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins
+      "Value":$clock,
+      CArg<"Value", "mlir::Value()">:$condition)>,
+    OpBuilder<(ins
+      "Value":$clock,
+      "Value":$condition,
+      "llvm::function_ref<void()>":$bodyCtor)>,
+    OpBuilder<(ins
+      "Value":$clock,
+      "llvm::function_ref<void()>":$bodyCtor), [{
+      return build($_builder, $_state, clock, mlir::Value(), bodyCtor);
+    }]>
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// File I/O
+//===----------------------------------------------------------------------===//
+
+def SVFOpenModeRead : I32EnumAttrCase<"Read", 0, "r">;
+def SVFOpenModeWrite : I32EnumAttrCase<"Write", 1, "w">;
+def SVFOpenModeAppend : I32EnumAttrCase<"Append", 2, "a">;
+def SVFOpenModeReadUpdate : I32EnumAttrCase<"ReadUpdate", 3, "r_update">;
+def SVFOpenModeWriteUpdate : I32EnumAttrCase<"WriteUpdate", 4, "w_update">;
+def SVFOpenModeAppendUpdate : I32EnumAttrCase<"AppendUpdate", 5, "a_update">;
+
+def SVFOpenModeAttr : I32EnumAttr<"SVFOpenMode", "SV file open mode",
+    [SVFOpenModeRead, SVFOpenModeWrite, SVFOpenModeAppend,
+     SVFOpenModeReadUpdate, SVFOpenModeWriteUpdate, SVFOpenModeAppendUpdate]> {
+  let cppNamespace = "circt::sim";
+}
+
+def SVFOpenOp : SimOp<"sv.fopen", [ProceduralOp]> {
+  let summary = "Open a file and return a file descriptor";
+  let description = [{
+    Implements the SystemVerilog `$fopen` system function.
+    See IEEE 1800-2017 § 21.3.1 "Opening and closing files".
+  }];
+
+  let arguments = (ins DynamicStringType:$fileName, OptionalAttr<SVFOpenModeAttr>:$mode);
+  let results = (outs I32:$fd);
+  let assemblyFormat = "$fileName (`mode` `=` $mode^)? attr-dict";
+}
+
+def SVFCloseOp : SimOp<"sv.fclose", [ProceduralOp]> {
+  let summary = "Close a file descriptor";
+  let description = [{
+    Implements the SystemVerilog `$fclose` system function.
+    See IEEE 1800-2017 § 21.3.1 "Opening and closing files".
+  }];
+
+  let arguments = (ins I32:$fd);
+  let assemblyFormat = "$fd attr-dict";
+}
+
+def SVChannelToOutputStreamOp : SimOp<"sv.channel_to_output_stream", [ProceduralOp]> {
+  let summary = "Cast a SV file descriptor or multichannel descriptor to an output stream";
+  let description = [{
+    Casts a SystemVerilog output channel (an integer returned by `sv.fopen`,
+    or a predefined channel such as stdout (`32'h8000_0001`) or stderr
+    (`32'h8000_0002`)) to an `!sim.output_stream`.
+    The input must represent a valid SystemVerilog file descriptor or
+    multichannel descriptor, which can be used for writing. Otherwise,
+    this operation causes undefined behavior.
+
+    See IEEE 1800-2017 § 21.3.1 "Opening and closing files".
+  }];
+  let arguments = (ins I32:$channel);
+  let results = (outs OutputStreamType:$stream);
+  let assemblyFormat = "$channel attr-dict";
+}
+
+def SVFFlushAllOp : SimOp<"sv.fflush_all", [ProceduralOp]> {
+  let summary = "Flush all open files";
+  let description = [{
+    Implements the SystemVerilog `$fflush` system tasks when called with no
+    arguments, which flushes all files opened by `sim.sv.fopen`.
+
+    See IEEE 1800-2017 § 21.3.6 "Flushing output".
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
+def SVReadMemOp : SimOp<"sv.readmem", [AttrSizedOperandSegments, ProceduralOp,
+    AllTypesMatch<["memory", "result"]>]> {
+  let summary = "Load a memory from a file as with $readmemb/$readmemh";
+  let description = [{
+    Takes the current contents of a memory and returns the contents updated
+    with the data read from a file, following the file format of the
+    SystemVerilog `$readmemb`/`$readmemh` system tasks (IEEE 1800-2017
+    § 21.4). Addresses for which the file holds no data keep their input
+    value. If `isBinary` is set the file contains binary words, otherwise
+    hexadecimal.
+
+    `dimLows` and `dimDescending` record the declared low bound and direction
+    of every unpacked dimension of the memory (outermost first).
+    `sliceLeft`/`sliceRight` narrow the addressable window of the highest
+    dimension. When `enumValues` is present, loaded words are checked against
+    it and the load stops with an error on the first mismatch.
+  }];
+  let arguments = (ins
+    DynamicStringType:$filename,
+    AnyTypeOf<[ArrayType, QueueType]>:$memory,
+    DefaultValuedAttr<BoolAttr, "false">:$isBinary,
+    Optional<I32>:$startAddr,
+    Optional<I32>:$finishAddr,
+    Optional<I32>:$sliceLeft,
+    Optional<I32>:$sliceRight,
+    DenseI64ArrayAttr:$dimLows,
+    DenseBoolArrayAttr:$dimDescending,
+    OptionalAttr<DenseI64ArrayAttr>:$enumValues
+  );
+  let results = (outs AnyTypeOf<[ArrayType, QueueType]>:$result);
+  let assemblyFormat = [{
+    $filename `,` $memory
+    (`start` `=` $startAddr^)? (`finish` `=` $finishAddr^)?
+    (`slice` `` `[` $sliceLeft^ `,` $sliceRight `]`)?
+    attr-dict `:` type($memory)
+  }];
+  let hasVerifier = 1;
+}
+
+def FlushOp : SimOp<"flush", [ProceduralOp]> {
+  let summary = "Flush a output stream";
+  let description = [{
+    Flushes the output buffer of an output stream.
+    This ensures that any buffered data is written to the file immediately.
+  }];
+
+  let arguments = (ins OutputStreamType:$stream);
+  let assemblyFormat = "$stream attr-dict";
 }
 
 #endif // CIRCT_DIALECT_SIM_SIMOPS_TD

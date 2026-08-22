@@ -52,7 +52,8 @@ toCadicalConfigName(CadicalSATSolverOptions::CadicalSolverConfig config) {
 class CadicalSATSolver : public IncrementalSATSolver {
 public:
   explicit CadicalSATSolver(const CadicalSATSolverOptions &options) {
-    if (options.config != CadicalSolverConfig::Default) {
+    if (options.config !=
+        CadicalSATSolverOptions::CadicalSolverConfig::Default) {
       bool configured = solver.configure(toCadicalConfigName(options.config));
       assert(configured && "invalid CaDiCaL configuration");
       (void)configured;
@@ -94,6 +95,12 @@ public:
     }
     solver.clause(lits.data(), lits.size());
   }
+  int newVar() override {
+    int var = solver.declare_one_more_variable();
+    if (var > maxVariable)
+      maxVariable = var;
+    return var;
+  }
 
 private:
   mutable CaDiCaL::Solver solver;
@@ -120,6 +127,7 @@ public:
   Result solve(llvm::ArrayRef<int> assumptions) override;
   int val(int v) const override;
   void reserveVars(int maxVar) override;
+  int newVar() override;
 
 private:
   void clearSolveScope();
@@ -200,6 +208,13 @@ void Z3SATSolver::reserveVars(int maxVar) {
   maxVariable = maxVar;
 }
 
+int Z3SATSolver::newVar() {
+  int var = newVariable();
+  if (var > maxVariable)
+    maxVariable = var;
+  return var;
+}
+
 void Z3SATSolver::clearSolveScope() {
   if (!solveScopeActive)
     return;
@@ -248,6 +263,105 @@ void Z3SATSolver::addClauseInternal(llvm::ArrayRef<int> lits) {
 
 } // namespace
 
+void addAndClauses(int outVar, llvm::ArrayRef<int> inputLits,
+                   llvm::function_ref<void(llvm::ArrayRef<int>)> addClause) {
+  for (int lit : inputLits)
+    addClause({-outVar, lit});
+
+  llvm::SmallVector<int> clause;
+  clause.reserve(inputLits.size() + 1);
+  for (int lit : inputLits)
+    clause.push_back(-lit);
+  clause.push_back(outVar);
+  addClause(clause);
+}
+
+void addOrClauses(int outVar, llvm::ArrayRef<int> inputLits,
+                  llvm::function_ref<void(llvm::ArrayRef<int>)> addClause) {
+  for (int lit : inputLits)
+    addClause({-lit, outVar});
+
+  llvm::SmallVector<int> clause;
+  clause.reserve(inputLits.size() + 1);
+  clause.push_back(-outVar);
+  clause.append(inputLits.begin(), inputLits.end());
+  addClause(clause);
+}
+
+void addXorClauses(int outVar, int lhsLit, int rhsLit,
+                   llvm::function_ref<void(llvm::ArrayRef<int>)> addClause) {
+  addClause({-lhsLit, -rhsLit, -outVar});
+  addClause({lhsLit, rhsLit, -outVar});
+  addClause({lhsLit, -rhsLit, outVar});
+  addClause({-lhsLit, rhsLit, outVar});
+}
+
+void addParityClauses(int outVar, llvm::ArrayRef<int> inputLits,
+                      llvm::function_ref<void(llvm::ArrayRef<int>)> addClause,
+                      llvm::function_ref<int()> newVar) {
+  assert(!inputLits.empty() && "parity requires at least one input");
+  if (inputLits.size() == 1) {
+    addClause({-outVar, inputLits.front()});
+    addClause({outVar, -inputLits.front()});
+    return;
+  }
+
+  int accumulatedLit = inputLits.front();
+  for (auto [index, lit] : llvm::enumerate(inputLits.drop_front())) {
+    bool isLast = index + 2 == inputLits.size();
+    int outLit = isLast ? outVar : newVar();
+    addXorClauses(outLit, accumulatedLit, lit, addClause);
+    accumulatedLit = outLit;
+  }
+}
+
+void addAtMostOneClauses(
+    llvm::ArrayRef<int> inputLits,
+    llvm::function_ref<void(llvm::ArrayRef<int>)> addClause,
+    llvm::function_ref<int()> newVar) {
+  if (inputLits.size() < 2)
+    return;
+
+  // Emit the clause encoding `lhs => rhs`.
+  auto imply = [&](int lhs, int rhs) { addClause({-lhs, rhs}); };
+
+  // Use a sequential-ladder encoding for the at-most-one constraint; see
+  // Carsten Sinz, "Towards an Optimal CNF Encoding of Boolean Cardinality
+  // Constraints", CP 2005.
+  //
+  // `ladder[i]` means "at least one of `inputLits[0]` through `inputLits[i]`
+  // is true".
+  // We use these helper variables to remember when an earlier choice was made.
+  llvm::SmallVector<int, 8> ladder(inputLits.size() - 1);
+  for (int &var : ladder)
+    var = newVar();
+
+  imply(inputLits.front(), ladder.front());
+  for (unsigned i = 1, e = inputLits.size() - 1; i < e; ++i) {
+    // If `inputLits[i]` is true, remember that one of `inputLits[0..i]` is
+    // true.
+    imply(inputLits[i], ladder[i]);
+    // If an earlier variable was already true, keep that fact true for the
+    // larger range `inputLits[0..i]`.
+    imply(ladder[i - 1], ladder[i]);
+    // If `ladder[i - 1]` is true, then some earlier variable was true, so
+    // `inputLits[i]` must be false since at most one variable can be true.
+    imply(ladder[i - 1], -inputLits[i]);
+  }
+
+  // If `ladder.back()` is true, then some earlier variable was true, so the
+  // last variable must be false.
+  imply(ladder.back(), -inputLits.back());
+}
+
+void addExactlyOneClauses(
+    llvm::ArrayRef<int> inputLits,
+    llvm::function_ref<void(llvm::ArrayRef<int>)> addClause,
+    llvm::function_ref<int()> newVar) {
+  addClause(inputLits);
+  addAtMostOneClauses(inputLits, addClause, newVar);
+}
+
 std::unique_ptr<IncrementalSATSolver> createZ3SATSolver() {
 #if LLVM_WITH_Z3
   return std::make_unique<Z3SATSolver>();
@@ -265,9 +379,21 @@ createCadicalSATSolver(const CadicalSATSolverOptions &options) {
 #endif
 }
 
+std::unique_ptr<IncrementalSATSolver> createSATSolver(llvm::StringRef backend) {
+  if (backend == "auto") {
+    if (auto solver = createCadicalSATSolver())
+      return solver;
+    return createZ3SATSolver();
+  }
+  if (backend == "cadical")
+    return createCadicalSATSolver();
+  if (backend == "z3")
+    return createZ3SATSolver();
+  return {};
+}
+
 bool hasIncrementalSATSolverBackend() {
-  return static_cast<bool>(createCadicalSATSolver()) ||
-         static_cast<bool>(createZ3SATSolver());
+  return static_cast<bool>(createSATSolver());
 }
 
 } // namespace circt

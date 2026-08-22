@@ -19,8 +19,10 @@
 #endif
 
 #include <cassert>
+#include <cctype>
 #include <iostream>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 using namespace circt::arc::runtime;
@@ -102,8 +104,9 @@ ModelInstance::~ModelInstance() {
 
 std::filesystem::path
 ModelInstance::getTraceFilePath(const std::string &suffix) {
-  if (traceFileArg.has_value())
-    return std::filesystem::path(*traceFileArg);
+  auto it = arguments.find(kArgKeyTraceFile);
+  if (it != arguments.end() && it->second.has_value())
+    return workDir / std::filesystem::path(*it->second);
 
   std::string saneName;
   if (modelInfo->modelName)
@@ -115,7 +118,7 @@ ModelInstance::getTraceFilePath(const std::string &suffix) {
   saneName += '_';
   saneName += std::to_string(instanceID);
   saneName += suffix;
-  return std::filesystem::current_path() / std::filesystem::path(saneName);
+  return workDir / std::filesystem::path(saneName);
 }
 
 void ModelInstance::onEval(ArcState *mutableState) {
@@ -148,55 +151,185 @@ uint64_t *ModelInstance::swapTraceBuffer() {
   return traceEncoder->dispatch(state->traceBufferSize);
 }
 
-// Try to parse argument with "`key`=`value`" syntax
-static bool parseKeyValueArg(const std::string_view &input, std::string &key,
-                             std::string &value) {
-  key.clear();
-  value.clear();
-  auto eqPos = input.find('=');
-  if (eqPos == std::string_view::npos || eqPos == 0)
-    return false;
-  key = input.substr(0, eqPos);
-  value = input.substr(eqPos + 1);
-  return true;
+// Parse the argument string into a map of key to optional value.
+// Flags (bare keys without '=') map to std::nullopt. Keys occurring later
+// override identical earlier keys. Quoted values (key="...") may contain ';'
+// and support \" and \\ escape sequences. Malformed tokens are warned and
+// skipped.
+static std::map<std::string, std::optional<std::string>>
+parseArgsToMap(std::string_view argStr) {
+  std::map<std::string, std::optional<std::string>> result;
+
+  enum class State { Key, AfterEq, Unquoted, Quoted, Escape, AfterQuote, Skip };
+  State state = State::Key;
+
+  std::string key;
+  std::string value;
+  bool hasValue = false;
+
+  auto warn = [&](const char *msg) {
+    std::cerr << "[ArcRuntime] WARNING: Malformed runtime argument: " << msg;
+    if (!key.empty())
+      std::cerr << " for key \"" << key << "\"";
+    std::cerr << ", ignoring\n";
+  };
+
+  auto commit = [&] {
+    result[std::move(key)] =
+        hasValue ? std::optional(std::move(value)) : std::nullopt;
+    key.clear();
+    value.clear();
+    hasValue = false;
+    state = State::Key;
+  };
+
+  auto skipToNext = [&] {
+    key.clear();
+    value.clear();
+    hasValue = false;
+    state = State::Skip;
+  };
+
+  for (size_t i = 0; i <= argStr.size(); ++i) {
+    const bool atEnd = (i == argStr.size());
+    const char c = atEnd ? '\0' : argStr[i];
+
+    switch (state) {
+    case State::Key:
+      if (atEnd || c == ';') {
+        if (!key.empty())
+          commit();
+      } else if (std::isgraph(static_cast<unsigned char>(c)) && c != '"' &&
+                 c != '=') {
+        key += c;
+      } else if (c == '=' && !key.empty()) {
+        hasValue = true;
+        state = State::AfterEq;
+      } else {
+        warn("Invalid key");
+        skipToNext();
+      }
+      break;
+
+    case State::AfterEq:
+      if (c == '"' && !atEnd) {
+        state = State::Quoted;
+      } else if (atEnd || c == ';') {
+        commit(); // empty value
+      } else {
+        value += c;
+        state = State::Unquoted;
+      }
+      break;
+
+    case State::Unquoted:
+      if (atEnd || c == ';') {
+        commit();
+      } else if (c == '"') {
+        warn("Unquoted value contains forbidden character '\"'");
+        skipToNext();
+      } else {
+        value += c;
+      }
+      break;
+
+    case State::Quoted:
+      if (atEnd) {
+        warn("Unterminated quoted value");
+        skipToNext();
+      } else if (c == '"') {
+        state = State::AfterQuote;
+      } else if (c == '\\') {
+        state = State::Escape;
+      } else {
+        value += c;
+      }
+      break;
+
+    case State::Escape:
+      if (atEnd) {
+        warn("Truncated escape sequence in quoted value");
+        skipToNext();
+      } else if (c == '"' || c == '\\') {
+        value += c;
+        state = State::Quoted;
+      } else {
+        warn("Invalid escape sequence in quoted value");
+        skipToNext();
+      }
+      break;
+
+    case State::AfterQuote:
+      if (atEnd || c == ';') {
+        commit();
+      } else {
+        warn("Unexpected content after closing quote");
+        skipToNext();
+      }
+      break;
+
+    case State::Skip:
+      if (!atEnd && c == ';')
+        state = State::Key;
+      break;
+    }
+  }
+
+  return result;
 }
 
 void ModelInstance::parseArgs(const char *args) {
   if (!args)
     return;
-
-  // Split the argument string at semicolon delimiters
   auto argStr = std::string_view(args);
-  if (argStr.empty())
-    return;
-  std::vector<std::string_view> options;
-  size_t start = 0;
-  size_t end = 0;
+  arguments = parseArgsToMap(argStr);
+  if (arguments.count(kArgKeyDebug))
+    verbose = true;
 
-  while ((end = argStr.find(";", start)) != std::string_view::npos) {
-    options.push_back(argStr.substr(start, end - start));
-    start = end + 1;
-  }
-  if (start <= argStr.size())
-    options.push_back(argStr.substr(start));
-
-  std::string key;
-  std::string value;
-
-  // Parse the individual options
-  for (auto &option : options) {
-
-    if (option == "debug") {
-      verbose = true;
-    } else if (option == "vcd") {
-      traceMode = TraceMode::VCD;
-    } else if (option == "fst") {
-      traceMode = TraceMode::FST;
-    } else if (parseKeyValueArg(option, key, value) && !value.empty()) {
-      if (key == "traceFile")
-        traceFileArg = value;
+  // Dump arguments
+  if (verbose) {
+    std::cout << "[ArcRuntime] Argument string for instance ID " << instanceID
+              << ": " << argStr << std::endl;
+    std::cout << "[ArcRuntime] Parsed argument(s):" << std::endl;
+    for (const auto &[key, value] : arguments) {
+      std::cout << "[ArcRuntime]   " << key;
+      if (value.has_value())
+        std::cout << " = \"" << *value << "\"";
+      std::cout << std::endl;
     }
   }
+
+  // Initialize workDir. A relative argument is resolved against the process
+  // working directory; an absolute argument replaces it entirely.
+  std::error_code ec;
+  workDir = std::filesystem::current_path(ec);
+  if (ec) {
+    std::cerr << "[ArcRuntime] WARNING: Could not determine current working "
+                 "directory: "
+              << ec.message() << std::endl;
+    workDir.clear();
+  }
+  auto workDirIt = arguments.find(kArgKeyWorkDir);
+  if (workDirIt != arguments.end() && workDirIt->second.has_value()) {
+    workDir /= *workDirIt->second;
+    workDir = workDir.lexically_normal();
+
+    // Create the working directory if it does not exist yet.
+    std::filesystem::create_directories(workDir, ec);
+    if (ec)
+      std::cerr << "[ArcRuntime] WARNING: Could not create working directory \""
+                << workDir.string() << "\": " << ec.message() << std::endl;
+  }
+
+  if (verbose)
+    std::cout << "[ArcRuntime] Working directory for instance ID " << instanceID
+              << ": " << workDir.string() << std::endl;
+
+  // Select Trace Mode
+  if (arguments.count(kArgKeyVcd))
+    traceMode = TraceMode::VCD;
+  if (arguments.count(kArgKeyFst))
+    traceMode = TraceMode::FST;
 }
 
 } // namespace circt::arc::runtime::impl

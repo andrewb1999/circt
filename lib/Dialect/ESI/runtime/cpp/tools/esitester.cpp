@@ -23,10 +23,13 @@
 #include "esi/CLI.h"
 #include "esi/Manifest.h"
 #include "esi/Services.h"
+#include "esi/TypedPorts.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <iostream>
 #include <map>
@@ -53,7 +56,10 @@ static void dmaTest(AcceleratorConnection *, Accelerator *,
                     const std::vector<uint32_t> &widths, bool read, bool write);
 static void bandwidthTest(AcceleratorConnection *, Accelerator *,
                           const std::vector<uint32_t> &widths,
-                          uint32_t xferCount, bool read, bool write);
+                          uint32_t xferCount, bool read, bool write,
+                          bool checkData);
+static uint8_t esitesterDataByte(uint32_t index, size_t byte);
+static uint8_t enginePatternByte(uint32_t index, size_t byte, size_t bitWidth);
 static void loopbackAddTest(AcceleratorConnection *, Accelerator *,
                             uint32_t iterations, bool pipeline);
 static void aggregateHostmemBandwidthTest(AcceleratorConnection *,
@@ -70,11 +76,16 @@ static void coordTranslateTest(AcceleratorConnection *, Accelerator *,
 static void serialCoordTranslateTest(AcceleratorConnection *, Accelerator *,
                                      uint32_t xTrans, uint32_t yTrans,
                                      uint32_t numCoords, size_t batchSizeLimit);
+static void autoSerialCoordTranslateTest(AcceleratorConnection *, Accelerator *,
+                                         uint32_t xTrans, uint32_t yTrans,
+                                         uint32_t numCoords);
 static void channelTest(AcceleratorConnection *, Accelerator *,
                         uint32_t iterations);
+static void resetTest(AcceleratorConnection *, Accelerator *);
 
 // Default widths and default widths string for CLI help text.
-constexpr std::array<uint32_t, 5> defaultWidths = {32, 64, 128, 256, 512};
+constexpr std::array<uint32_t, 8> defaultWidths = {24,  32,  64,  72,
+                                                   128, 256, 512, 534};
 static std::string defaultWidthsStr() {
   std::string s;
   for (size_t i = 0; i < defaultWidths.size(); ++i) {
@@ -207,6 +218,7 @@ int main(int argc, const char *argv[]) {
                            "Number of transfers to perform");
   bool bandwidthRead = false;
   bool bandwidthWrite = false;
+  bool bandwidthCheckData = false;
   std::vector<uint32_t> bandwidthWidths(defaultWidths.begin(),
                                         defaultWidths.end());
   bandwidthSub->add_option("--widths", bandwidthWidths,
@@ -215,6 +227,8 @@ int main(int argc, const char *argv[]) {
   bandwidthSub->add_flag("-w,--write", bandwidthWrite,
                          "Enable bandwidth write");
   bandwidthSub->add_flag("-r,--read", bandwidthRead, "Enable bandwidth read");
+  bandwidthSub->add_flag("--check-data", bandwidthCheckData,
+                         "Verify every transferred payload byte");
 
   CLI::App *hostmembwSub =
       cli.add_subcommand("hostmembw", "Run the host memory bandwidth test");
@@ -296,11 +310,29 @@ int main(int argc, const char *argv[]) {
                    "Coordinates per header (default 240, max 65535)")
       ->check(CLI::Range(1u, 0xFFFFu));
 
+  CLI::App *autoSerialCoordTranslateSub = cli.add_subcommand(
+      "auto_serial_coords",
+      "Test AutoSerialCoordTranslator (uses ListWindowToParallel/Serial "
+      "converters under the hood)");
+  uint32_t autoCoordXTrans = 10;
+  uint32_t autoCoordYTrans = 20;
+  uint32_t autoCoordNumItems = 5;
+  autoSerialCoordTranslateSub->add_option("-x,--x-translation", autoCoordXTrans,
+                                          "X translation amount (default 10)");
+  autoSerialCoordTranslateSub->add_option("-y,--y-translation", autoCoordYTrans,
+                                          "Y translation amount (default 20)");
+  autoSerialCoordTranslateSub->add_option(
+      "-n,--num-coords", autoCoordNumItems,
+      "Number of random coordinates (default 5)");
+
   CLI::App *channelTestSub = cli.add_subcommand(
       "channel", "Test ChannelService to_host and from_host");
   uint32_t channelIters = 10;
   channelTestSub->add_option("-i,--iters", channelIters,
                              "Number of loopback iterations (default 10)");
+
+  CLI::App *resetSub = cli.add_subcommand(
+      "reset", "Test the design reset feature (telemetry clears after reset)");
 
   if (int rc = cli.esiParse(argc, argv))
     return rc;
@@ -327,7 +359,7 @@ int main(int argc, const char *argv[]) {
       dmaTest(acc, accel, dmaWidths, dmaRead, dmaWrite);
     } else if (*bandwidthSub) {
       bandwidthTest(acc, accel, bandwidthWidths, xferCount, bandwidthRead,
-                    bandwidthWrite);
+                    bandwidthWrite, bandwidthCheckData);
     } else if (*hostmembwSub) {
       hostmemBandwidthTest(acc, accel, hmBwCount, hmBwWidths, hmBwRead,
                            hmBwWrite);
@@ -345,8 +377,13 @@ int main(int argc, const char *argv[]) {
     } else if (*serialCoordTranslateSub) {
       serialCoordTranslateTest(acc, accel, coordXTrans, coordYTrans,
                                coordNumItems, serialBatchSize);
+    } else if (*autoSerialCoordTranslateSub) {
+      autoSerialCoordTranslateTest(acc, accel, autoCoordXTrans, autoCoordYTrans,
+                                   autoCoordNumItems);
     } else if (*channelTestSub) {
       channelTest(acc, accel, channelIters);
+    } else if (*resetSub) {
+      resetTest(acc, accel);
     }
 
     acc->disconnect();
@@ -383,7 +420,6 @@ static void callbackTest(AcceleratorConnection *conn, Accelerator *accel,
   std::atomic<uint32_t> callbackCount = 0;
   callPort->connect(
       [conn, &callbackCount](const MessageData &data) mutable -> MessageData {
-        callbackCount.fetch_add(1);
         conn->getLogger().debug(
             [&](std::string &subsystem, std::string &msg,
                 std::unique_ptr<std::map<std::string, std::any>> &details) {
@@ -393,6 +429,7 @@ static void callbackTest(AcceleratorConnection *conn, Accelerator *accel,
               details->emplace("data", data);
             });
         std::cout << "callback: " << *data.as<uint64_t>() << std::endl;
+        callbackCount.fetch_add(1);
         return MessageData();
       },
       true);
@@ -410,6 +447,27 @@ static void callbackTest(AcceleratorConnection *conn, Accelerator *accel,
     }
     if (callbackCount.load() <= i)
       throw std::runtime_error("Callback test failed. No callback received");
+  }
+}
+
+static void checkBurstCommandRegisters(services::MMIO::MMIORegion &mmio,
+                                       uint64_t address, uint64_t flits) {
+  struct RegisterExpectation {
+    uint32_t offset;
+    uint64_t expected;
+    const char *name;
+  };
+  const RegisterExpectation expectations[] = {
+      {0x00, 0, "flits_left"},
+      {0x08, address, "start_addr"},
+      {0x10, flits, "flits_total"},
+  };
+  for (const auto &[offset, expected, name] : expectations) {
+    uint64_t actual = mmio.read(offset);
+    if (actual != expected)
+      throw std::runtime_error("BurstCommand MMIO readback for " +
+                               std::string(name) + " failed: expected " +
+                               toHex(expected) + ", got " + toHex(actual));
   }
 }
 
@@ -436,14 +494,19 @@ static void hostmemWriteTest(Accelerator *acc,
         "hostmem write test failed. No writemem child found");
   auto &writeMemPorts = writeMemChildIter->second->getPorts();
 
-  auto cmdPortIter = writeMemPorts.find(AppID("cmd", width));
-  if (cmdPortIter == writeMemPorts.end())
+  // The MMIO command surface lives in a nested 'mmio[width]' submodule
+  // (BurstCommand -> MmioRegistry), exposing its 'cmd' port at
+  // writemem[width]/mmio[width]/cmd.
+  AppIDPath cmdPath;
+  BundlePort *cmdPortBundle = acc->resolvePort(
+      {AppID("writemem", width), AppID("mmio", width), AppID("cmd")}, cmdPath);
+  if (!cmdPortBundle)
     throw std::runtime_error(
-        "hostmem write test failed. No (cmd,width) MMIO port");
-  auto *cmdMMIO = cmdPortIter->second.getAs<services::MMIO::MMIORegion>();
+        "hostmem write test failed. No mmio[width]/cmd MMIO port");
+  auto *cmdMMIO = cmdPortBundle->getAs<services::MMIO::MMIORegion>();
   if (!cmdMMIO)
     throw std::runtime_error(
-        "hostmem write test failed. (cmd,width) port not MMIO");
+        "hostmem write test failed. mmio[width]/cmd port not MMIO");
 
   auto issuedPortIter = writeMemPorts.find(AppID("addrCmdIssued"));
   if (issuedPortIter == writeMemPorts.end())
@@ -470,9 +533,11 @@ static void hostmemWriteTest(Accelerator *acc,
   for (size_t i = 0, e = 9; i < e; ++i)
     dataPtr[i] = 0xFFFFFFFFFFFFFFFFull;
   region.flush();
-  cmdMMIO->write(0x10, reinterpret_cast<uint64_t>(region.getDevicePtr()));
+  uint64_t devPtr = reinterpret_cast<uint64_t>(region.getDevicePtr());
+  cmdMMIO->write(0x08, devPtr);
+  cmdMMIO->write(0x10, 1);
+  checkBurstCommandRegisters(*cmdMMIO, devPtr, 1);
   cmdMMIO->write(0x18, 1);
-  cmdMMIO->write(0x20, 1);
   bool done = false;
   for (int i = 0; i < 100; ++i) {
     auto issued = addrCmdIssuedPort->readInt();
@@ -503,15 +568,20 @@ static void hostmemReadTest(Accelerator *acc,
         "hostmem read test failed. No readmem child found");
 
   auto &readMemPorts = readMemChildIter->second->getPorts();
-  auto addrCmdPortIter = readMemPorts.find(AppID("cmd", width));
-  if (addrCmdPortIter == readMemPorts.end())
+  // The MMIO command surface lives in a nested 'mmio[width]' submodule
+  // (BurstCommand -> MmioRegistry), exposing its 'cmd' port at
+  // readmem[width]/mmio[width]/cmd.
+  AppIDPath addrCmdPath;
+  BundlePort *addrCmdPortBundle = acc->resolvePort(
+      {AppID("readmem", width), AppID("mmio", width), AppID("cmd")},
+      addrCmdPath);
+  if (!addrCmdPortBundle)
     throw std::runtime_error(
-        "hostmem read test failed. No AddressCommand MMIO port");
-  auto *addrCmdMMIO =
-      addrCmdPortIter->second.getAs<services::MMIO::MMIORegion>();
+        "hostmem read test failed. No mmio[width]/cmd MMIO port");
+  auto *addrCmdMMIO = addrCmdPortBundle->getAs<services::MMIO::MMIORegion>();
   if (!addrCmdMMIO)
     throw std::runtime_error(
-        "hostmem read test failed. AddressCommand port not MMIO");
+        "hostmem read test failed. mmio[width]/cmd port not MMIO");
 
   auto lastReadPortIter = readMemPorts.find(AppID("lastReadLSB"));
   if (lastReadPortIter == readMemPorts.end())
@@ -549,9 +619,11 @@ static void hostmemReadTest(Accelerator *acc,
     dataPtr[0] = 0x12345678ull << i;
     dataPtr[1] = 0xDEADBEEFull << i;
     region.flush();
-    addrCmdMMIO->write(0x10, reinterpret_cast<uint64_t>(region.getDevicePtr()));
+    uint64_t devPtr = reinterpret_cast<uint64_t>(region.getDevicePtr());
+    addrCmdMMIO->write(0x08, devPtr);
+    addrCmdMMIO->write(0x10, 1);
+    checkBurstCommandRegisters(*addrCmdMMIO, devPtr, 1);
     addrCmdMMIO->write(0x18, 1);
-    addrCmdMMIO->write(0x20, 1);
     bool done = false;
     for (int waitLoop = 0; waitLoop < 100; ++waitLoop) {
       auto issued = addrCmdIssuedPort->readInt();
@@ -634,19 +706,27 @@ static void dmaReadTest(AcceleratorConnection *conn, Accelerator *acc,
   outPort.connect();
 
   size_t xferCount = 24;
-  uint64_t last = 0;
   MessageData data;
   toHostMMIO->write(0, xferCount);
-  for (size_t i = 0; i < xferCount; ++i) {
+  const size_t wireBytes = (width + 7) / 8;
+  for (size_t index = 0; index < xferCount; ++index) {
     outPort.read(data);
-    if (width == 64) {
-      uint64_t val = *data.as<uint64_t>();
-      if (val < last)
-        throw std::runtime_error("dma read test failed. Out of order data");
-      last = val;
+    if (data.getSize() != wireBytes)
+      throw std::runtime_error("dma read test failed. Expected " +
+                               std::to_string(wireBytes) + " bytes, got " +
+                               std::to_string(data.getSize()));
+    for (size_t byte = 0; byte < wireBytes; ++byte) {
+      uint8_t expected =
+          enginePatternByte(static_cast<uint32_t>(index), byte, width);
+      if (data.getBytes()[byte] != expected)
+        throw std::runtime_error(
+            "dma read test failed. Data mismatch at item " +
+            std::to_string(index) + " byte " + std::to_string(byte) +
+            ": expected " + toHex(expected) + ", got " +
+            toHex(data.getBytes()[byte]));
     }
     logger.debug("esitester",
-                 "Cycle count [" + std::to_string(i) + "] = 0x" + data.toHex());
+                 "Payload [" + std::to_string(index) + "] = 0x" + data.toHex());
   }
   outPort.disconnect();
   std::cout << "  DMA read test for " << width << " bits passed" << std::endl;
@@ -678,9 +758,7 @@ static void dmaWriteTest(AcceleratorConnection *conn, Accelerator *acc,
   writePort.connect();
 
   size_t xferCount = 24;
-  uint8_t *data = new uint8_t[width];
-  for (size_t i = 0; i < width / 8; ++i)
-    data[i] = 0;
+  std::vector<uint8_t> data((width + 7) / 8, 0);
   fromHostMMIO->read(8);
   fromHostMMIO->write(0, xferCount);
   for (size_t i = 1; i < xferCount + 1; ++i) {
@@ -688,7 +766,7 @@ static void dmaWriteTest(AcceleratorConnection *conn, Accelerator *acc,
     bool successWrite;
     size_t attempts = 0;
     do {
-      successWrite = writePort.tryWrite(MessageData(data, width / 8));
+      successWrite = writePort.tryWrite(MessageData(data.data(), data.size()));
       if (!successWrite) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
@@ -708,7 +786,6 @@ static void dmaWriteTest(AcceleratorConnection *conn, Accelerator *acc,
     }
   }
   writePort.disconnect();
-  delete[] data;
   std::cout << "  DMA write test for " << width << " bits passed" << std::endl;
 }
 
@@ -735,10 +812,44 @@ static void dmaTest(AcceleratorConnection *conn, Accelerator *acc,
 
 //
 // DMA bandwidth test
-//
+
+static size_t engineWireBytes(size_t bitWidth) { return (bitWidth + 7) / 8; }
+
+static uint8_t enginePatternByte(uint32_t index, size_t byte, size_t bitWidth) {
+  uint8_t value = esitesterDataByte(index, byte);
+  const size_t tailBits = bitWidth % 8;
+  if (tailBits != 0 && byte + 1 == engineWireBytes(bitWidth))
+    value &= (uint8_t(1) << tailBits) - 1;
+  return value;
+}
+
+static std::vector<uint8_t> enginePatternBytes(uint32_t index,
+                                               size_t bitWidth) {
+  std::vector<uint8_t> bytes(engineWireBytes(bitWidth));
+  for (size_t byte = 0; byte < bytes.size(); ++byte)
+    bytes[byte] = enginePatternByte(index, byte, bitWidth);
+  return bytes;
+}
+
+static uint64_t enginePayloadFold(uint32_t index, size_t bitWidth) {
+  const size_t numChunks = (bitWidth + 63) / 64;
+  uint64_t fold = 0;
+  for (size_t chunkIndex = 0; chunkIndex < numChunks; ++chunkIndex) {
+    uint64_t chunk = 0;
+    for (size_t byteInChunk = 0; byteInChunk < 8; ++byteInChunk) {
+      const size_t byteIndex = chunkIndex * 8 + byteInChunk;
+      if (byteIndex < engineWireBytes(bitWidth))
+        chunk |= uint64_t(enginePatternByte(index, byteIndex, bitWidth))
+                 << (8 * byteInChunk);
+    }
+    const unsigned rotate = (8 * chunkIndex) % 64;
+    fold ^= rotate ? ((chunk << rotate) | (chunk >> (64 - rotate))) : chunk;
+  }
+  return fold;
+}
 
 static void bandwidthReadTest(AcceleratorConnection *conn, Accelerator *acc,
-                              size_t width, size_t xferCount) {
+                              size_t width, size_t xferCount, bool checkData) {
 
   AppIDPath lastPath;
   BundlePort *toHostMMIOPort =
@@ -760,19 +871,57 @@ static void bandwidthReadTest(AcceleratorConnection *conn, Accelerator *acc,
                                std::to_string(xferCount) + " x " +
                                std::to_string(width) + " bit transfers");
   MessageData data;
+  size_t sizeMismatches = 0;
+  size_t dataMismatches = 0;
+  size_t firstMismatchItem = 0;
+  size_t firstMismatchByte = 0;
+  uint8_t firstExpected = 0;
+  uint8_t firstActual = 0;
   auto start = std::chrono::high_resolution_clock::now();
   toHostMMIO->write(0, xferCount);
-  for (size_t i = 0; i < xferCount; ++i) {
+  for (size_t index = 0; index < xferCount; ++index) {
     outPort.read(data);
+    if (checkData) {
+      const size_t wireBytes = engineWireBytes(width);
+      if (data.getSize() != wireBytes) {
+        ++sizeMismatches;
+      } else {
+        for (size_t byte = 0; byte < wireBytes; ++byte) {
+          const uint8_t expected =
+              enginePatternByte(static_cast<uint32_t>(index), byte, width);
+          if (data.getBytes()[byte] != expected) {
+            if (dataMismatches == 0) {
+              firstMismatchItem = index;
+              firstMismatchByte = byte;
+              firstExpected = expected;
+              firstActual = data.getBytes()[byte];
+            }
+            ++dataMismatches;
+          }
+        }
+      }
+    }
     logger.debug(
-        [i, &data](std::string &subsystem, std::string &msg,
-                   std::unique_ptr<std::map<std::string, std::any>> &details) {
+        [index,
+         &data](std::string &subsystem, std::string &msg,
+                std::unique_ptr<std::map<std::string, std::any>> &details) {
           subsystem = "esitester";
-          msg = "Cycle count [" + std::to_string(i) + "] = 0x" + data.toHex();
+          msg = "Payload [" + std::to_string(index) + "] = 0x" + data.toHex();
         });
   }
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::high_resolution_clock::now() - start);
+  outPort.disconnect();
+  if (checkData && sizeMismatches != 0)
+    throw std::runtime_error(
+        "bandwidth read data mismatch: " + std::to_string(sizeMismatches) +
+        " payload(s) had the wrong wire size");
+  if (checkData && dataMismatches != 0)
+    throw std::runtime_error(
+        "bandwidth read data mismatch: " + std::to_string(dataMismatches) +
+        " bytes wrong; first at item " + std::to_string(firstMismatchItem) +
+        " byte " + std::to_string(firstMismatchByte) + ": expected " +
+        toHex(firstExpected) + ", got " + toHex(firstActual));
   double bytesPerSec =
       (double)xferCount * (width / 8.0) * 1e6 / (double)duration.count();
   logger.info("esitester",
@@ -780,10 +929,12 @@ static void bandwidthReadTest(AcceleratorConnection *conn, Accelerator *acc,
                   std::to_string(width) + " bit transfers in " +
                   std::to_string(duration.count()) + " microseconds");
   logger.info("esitester", "    bandwidth: " + formatBandwidth(bytesPerSec));
+  if (checkData)
+    logger.info("esitester", "    data integrity: passed");
 }
 
 static void bandwidthWriteTest(AcceleratorConnection *conn, Accelerator *acc,
-                               size_t width, size_t xferCount) {
+                               size_t width, size_t xferCount, bool checkData) {
 
   AppIDPath lastPath;
   BundlePort *fromHostMMIOPort =
@@ -794,6 +945,24 @@ static void bandwidthWriteTest(AcceleratorConnection *conn, Accelerator *acc,
   auto *fromHostMMIO = fromHostMMIOPort->getAs<services::MMIO::MMIORegion>();
   if (!fromHostMMIO)
     throw std::runtime_error("bandwidth test failed. MMIO port is not MMIO");
+  services::TelemetryService::Metric *checksumPort = nullptr;
+  if (checkData) {
+    auto fromHostChild = acc->getChildren().find(AppID("fromhostdma", width));
+    if (fromHostChild == acc->getChildren().end())
+      throw std::runtime_error("bandwidth test failed. No fromhostdma[" +
+                               std::to_string(width) + "] found");
+    auto checksumIter =
+        fromHostChild->second->getPorts().find(AppID("fromHostChecksum"));
+    if (checksumIter == fromHostChild->second->getPorts().end())
+      throw std::runtime_error(
+          "bandwidth write data check failed. fromHostChecksum missing");
+    checksumPort =
+        checksumIter->second.getAs<services::TelemetryService::Metric>();
+    if (!checksumPort)
+      throw std::runtime_error("bandwidth write data check failed. "
+                               "fromHostChecksum not telemetry");
+    checksumPort->connect();
+  }
   lastPath.clear();
   BundlePort *inPortBundle =
       acc->resolvePort({AppID("fromhostdma", width), AppID("in")}, lastPath);
@@ -804,23 +973,64 @@ static void bandwidthWriteTest(AcceleratorConnection *conn, Accelerator *acc,
   logger.info("esitester", "Starting write bandwidth test with " +
                                std::to_string(xferCount) + " x " +
                                std::to_string(width) + " bit transfers");
-  std::vector<uint8_t> dataVec(width / 8);
-  for (size_t i = 0; i < width / 8; ++i)
+  std::vector<uint8_t> dataVec(engineWireBytes(width));
+  for (size_t i = 0; i < dataVec.size(); ++i)
     dataVec[i] = i;
   MessageData data(dataVec);
+  uint64_t expectedChecksum = 0;
   auto start = std::chrono::high_resolution_clock::now();
+  fromHostMMIO->read(8);
   fromHostMMIO->write(0, xferCount);
-  for (size_t i = 0; i < xferCount; ++i) {
+  for (size_t index = 0; index < xferCount; ++index) {
+    if (checkData) {
+      data =
+          MessageData(enginePatternBytes(static_cast<uint32_t>(index), width));
+      expectedChecksum ^=
+          enginePayloadFold(static_cast<uint32_t>(index), width);
+    }
     outPort.write(data);
     logger.debug(
-        [i, &data](std::string &subsystem, std::string &msg,
-                   std::unique_ptr<std::map<std::string, std::any>> &details) {
+        [index,
+         &data](std::string &subsystem, std::string &msg,
+                std::unique_ptr<std::map<std::string, std::any>> &details) {
           subsystem = "esitester";
-          msg = "Cycle count [" + std::to_string(i) + "] = 0x" + data.toHex();
+          msg = "Payload [" + std::to_string(index) + "] = 0x" + data.toHex();
         });
   }
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::high_resolution_clock::now() - start);
+  if (checkData) {
+    std::vector<uint8_t> expectedLast;
+    if (xferCount != 0)
+      expectedLast =
+          enginePatternBytes(static_cast<uint32_t>(xferCount - 1), width);
+    uint64_t expectedLastValue = 0;
+    if (!expectedLast.empty())
+      std::memcpy(&expectedLastValue, expectedLast.data(),
+                  std::min(expectedLast.size(), sizeof(expectedLastValue)));
+    bool complete = xferCount == 0;
+    uint64_t lastReadValue = 0;
+    for (size_t attempt = 0; !complete && attempt < 5000; ++attempt) {
+      lastReadValue = fromHostMMIO->read(8);
+      if (lastReadValue == expectedLastValue) {
+        complete = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!complete)
+      throw std::runtime_error(
+          "bandwidth write data check timed out waiting for completion: "
+          "expected final payload " +
+          toHex(expectedLastValue) + ", got " + toHex(lastReadValue));
+    const uint64_t actualChecksum = checksumPort->readInt();
+    if (actualChecksum != expectedChecksum)
+      throw std::runtime_error(
+          "bandwidth write data mismatch: checksum expected " +
+          toHex(expectedChecksum) + ", got " + toHex(actualChecksum));
+  }
+  if (checkData)
+    outPort.disconnect();
   double bytesPerSec =
       (double)xferCount * (width / 8.0) * 1e6 / (double)duration.count();
   logger.info("esitester",
@@ -828,17 +1038,64 @@ static void bandwidthWriteTest(AcceleratorConnection *conn, Accelerator *acc,
                   std::to_string(width) + " bit transfers in " +
                   std::to_string(duration.count()) + " microseconds");
   logger.info("esitester", "    bandwidth: " + formatBandwidth(bytesPerSec));
+  if (checkData)
+    logger.info("esitester", "    data integrity: passed");
 }
 
 static void bandwidthTest(AcceleratorConnection *conn, Accelerator *acc,
                           const std::vector<uint32_t> &widths,
-                          uint32_t xferCount, bool read, bool write) {
+                          uint32_t xferCount, bool read, bool write,
+                          bool checkData) {
   if (read)
     for (uint32_t w : widths)
-      bandwidthReadTest(conn, acc, w, xferCount);
+      bandwidthReadTest(conn, acc, w, xferCount, checkData);
   if (write)
     for (uint32_t w : widths)
-      bandwidthWriteTest(conn, acc, w, xferCount);
+      bandwidthWriteTest(conn, acc, w, xferCount, checkData);
+}
+
+// Fixed 64-bit seed for the hostmem burst data pattern; must match
+// _ESITESTER_SEQ_SEED in esiaccel/esitester.py.
+static constexpr uint64_t kEsitesterSeqSeed = 0x5A5A5A5A5A5A5A5AULL;
+
+// Byte j of element i in the hostmem burst data pattern: tile (seed ^ i)
+// across the element's bytes and XOR each byte with a distinct per-position
+// mask so every byte is unique. Must match WriteMem/ReadMem in
+// esiaccel/esitester.py.
+static inline uint8_t esitesterDataByte(uint32_t i, size_t j) {
+  uint64_t seq = (uint64_t)i ^ kEsitesterSeqSeed;
+  return (uint8_t)(seq >> (8 * (j % 8))) ^ (uint8_t)(j * 0x9D);
+}
+
+static size_t hostmemWireBytes(uint32_t width) { return (width + 7) / 8; }
+
+static uint8_t esitesterHostmemByte(uint32_t index, size_t byte,
+                                    uint32_t width) {
+  uint8_t value = esitesterDataByte(index, byte);
+  const size_t tailBits = width % 8;
+  if (tailBits != 0 && byte + 1 == hostmemWireBytes(width))
+    value &= (uint8_t(1) << tailBits) - 1;
+  return value;
+}
+
+// Fold element i's `width` bits into its 64-bit readChecksum contribution:
+// XOR each 64-bit chunk with a per-chunk rotate so word/byte misplacement
+// doesn't cancel. Must match ReadMem's readChecksum in esiaccel/esitester.py.
+static inline uint64_t esitesterElemFold(uint32_t i, uint32_t width) {
+  size_t numBytes = hostmemWireBytes(width);
+  size_t numChunks = (width + 63) / 64;
+  uint64_t fold = 0;
+  for (size_t c = 0; c < numChunks; ++c) {
+    uint64_t chunk = 0;
+    for (size_t b = 0; b < 8; ++b) {
+      size_t j = 8 * c + b;
+      if (j < numBytes)
+        chunk |= (uint64_t)esitesterHostmemByte(i, j, width) << (8 * b);
+    }
+    unsigned r = (8 * c) % 64;
+    fold ^= r ? ((chunk << r) | (chunk >> (64 - r))) : chunk;
+  }
+  return fold;
 }
 
 //
@@ -859,24 +1116,32 @@ hostmemWriteBandwidthTest(AcceleratorConnection *conn, Accelerator *acc,
     throw std::runtime_error("hostmem write bandwidth: writemem child missing");
   auto &writeMemPorts = writeMemChildIter->second->getPorts();
 
-  auto cmdPortIter = writeMemPorts.find(AppID("cmd", width));
-  if (cmdPortIter == writeMemPorts.end())
+  // MMIO command surface and cycle telemetry live in nested BurstCommand
+  // submodules: MMIO at writemem[width]/mmio[width]/cmd and the active-cycle
+  // metric at writemem[width]/addrCmdResp/cycles.
+  AppIDPath cmdPath;
+  BundlePort *cmdPortBundle = acc->resolvePort(
+      {AppID("writemem", width), AppID("mmio", width), AppID("cmd")}, cmdPath);
+  if (!cmdPortBundle)
     throw std::runtime_error("hostmem write bandwidth: cmd MMIO missing");
-  auto *cmdMMIO = cmdPortIter->second.getAs<services::MMIO::MMIORegion>();
+  auto *cmdMMIO = cmdPortBundle->getAs<services::MMIO::MMIORegion>();
   if (!cmdMMIO)
     throw std::runtime_error("hostmem write bandwidth: cmd not MMIO");
 
+  AppIDPath cyclePath;
+  BundlePort *cyclePortBundle = acc->resolvePort(
+      {AppID("writemem", width), AppID("addrCmdResp"), AppID("cycles")},
+      cyclePath);
   auto issuedIter = writeMemPorts.find(AppID("addrCmdIssued"));
   auto respIter = writeMemPorts.find(AppID("addrCmdResponses"));
-  auto cycleCount = writeMemPorts.find(AppID("addrCmdCycles"));
   if (issuedIter == writeMemPorts.end() || respIter == writeMemPorts.end() ||
-      cycleCount == writeMemPorts.end())
+      !cyclePortBundle)
     throw std::runtime_error("hostmem write bandwidth: telemetry missing");
   auto *issuedPort =
       issuedIter->second.getAs<services::TelemetryService::Metric>();
   auto *respPort = respIter->second.getAs<services::TelemetryService::Metric>();
   auto *cyclePort =
-      cycleCount->second.getAs<services::TelemetryService::Metric>();
+      cyclePortBundle->getAs<services::TelemetryService::Metric>();
   if (!issuedPort || !respPort || !cyclePort)
     throw std::runtime_error(
         "hostmem write bandwidth: telemetry type mismatch");
@@ -895,9 +1160,9 @@ hostmemWriteBandwidthTest(AcceleratorConnection *conn, Accelerator *acc,
   auto start = std::chrono::high_resolution_clock::now();
   // Fire off xferCount write commands (one flit each).
   uint64_t devPtr = reinterpret_cast<uint64_t>(region.getDevicePtr());
-  cmdMMIO->write(0x10, devPtr);    // address
-  cmdMMIO->write(0x18, xferCount); // flits
-  cmdMMIO->write(0x20, 1);         // start
+  cmdMMIO->write(0x08, devPtr);    // address
+  cmdMMIO->write(0x10, xferCount); // flits
+  cmdMMIO->write(0x18, 1);         // start
 
   // Wait for responses counter to reach target.
   bool completed = false;
@@ -923,6 +1188,42 @@ hostmemWriteBandwidthTest(AcceleratorConnection *conn, Accelerator *acc,
             << std::to_string(duration.count()) << " us, "
             << std::to_string(cycles) << " cycles, " << bytesPerCycle
             << " bytes/cycle" << std::endl;
+
+  // Data integrity: WriteMem wrote the byte-level pattern (esitesterDataByte)
+  // into element i. The host-memory layout must be contiguous and backend-
+  // width-independent, so element i occupies ceil(width/8) bytes at that
+  // stride; verify every byte.
+  uint8_t *bytePtr = static_cast<uint8_t *>(region.getPtr());
+  size_t elemBytes = hostmemWireBytes(width);
+  size_t mismatches = 0;
+  uint32_t firstMismatch = 0;
+  size_t firstByte = 0;
+  uint8_t firstExpected = 0, firstActual = 0;
+  for (uint32_t i = 0; i < xferCount; ++i) {
+    for (size_t j = 0; j < elemBytes; ++j) {
+      uint8_t expected = esitesterHostmemByte(i, j, width);
+      uint8_t actual = bytePtr[(size_t)i * elemBytes + j];
+      if (actual != expected) {
+        if (mismatches == 0) {
+          firstMismatch = i;
+          firstByte = j;
+          firstExpected = expected;
+          firstActual = actual;
+        }
+        ++mismatches;
+      }
+    }
+  }
+  if (mismatches != 0) {
+    char eb[8], gb[8];
+    std::snprintf(eb, sizeof(eb), "0x%02x", firstExpected);
+    std::snprintf(gb, sizeof(gb), "0x%02x", firstActual);
+    throw std::runtime_error(
+        "hostmem write bandwidth data mismatch: " + std::to_string(mismatches) +
+        " bytes wrong; first at element " + std::to_string(firstMismatch) +
+        " byte " + std::to_string(firstByte) + " expected=" + eb +
+        " got=" + gb);
+  }
 }
 
 static void
@@ -939,42 +1240,60 @@ hostmemReadBandwidthTest(AcceleratorConnection *conn, Accelerator *acc,
     throw std::runtime_error("hostmem read bandwidth: readmem child missing");
   auto &readMemPorts = readMemChildIter->second->getPorts();
 
-  auto cmdPortIter = readMemPorts.find(AppID("cmd", width));
-  if (cmdPortIter == readMemPorts.end())
+  // MMIO at readmem[width]/mmio[width]/cmd; active-cycle metric at
+  // readmem[width]/addrCmdResp/cycles (nested BurstCommand submodules).
+  AppIDPath cmdPath;
+  BundlePort *cmdPortBundle = acc->resolvePort(
+      {AppID("readmem", width), AppID("mmio", width), AppID("cmd")}, cmdPath);
+  if (!cmdPortBundle)
     throw std::runtime_error("hostmem read bandwidth: cmd MMIO missing");
-  auto *cmdMMIO = cmdPortIter->second.getAs<services::MMIO::MMIORegion>();
+  auto *cmdMMIO = cmdPortBundle->getAs<services::MMIO::MMIORegion>();
   if (!cmdMMIO)
     throw std::runtime_error("hostmem read bandwidth: cmd not MMIO");
 
+  AppIDPath cyclePath;
+  BundlePort *cyclePortBundle = acc->resolvePort(
+      {AppID("readmem", width), AppID("addrCmdResp"), AppID("cycles")},
+      cyclePath);
   auto issuedIter = readMemPorts.find(AppID("addrCmdIssued"));
   auto respIter = readMemPorts.find(AppID("addrCmdResponses"));
-  auto cyclePort = readMemPorts.find(AppID("addrCmdCycles"));
+  auto checksumIter = readMemPorts.find(AppID("readChecksum"));
   if (issuedIter == readMemPorts.end() || respIter == readMemPorts.end() ||
-      cyclePort == readMemPorts.end())
+      checksumIter == readMemPorts.end() || !cyclePortBundle)
     throw std::runtime_error("hostmem read bandwidth: telemetry missing");
   auto *issuedPort =
       issuedIter->second.getAs<services::TelemetryService::Metric>();
   auto *respPort = respIter->second.getAs<services::TelemetryService::Metric>();
+  auto *checksumPort =
+      checksumIter->second.getAs<services::TelemetryService::Metric>();
   auto *cycleCntPort =
-      cyclePort->second.getAs<services::TelemetryService::Metric>();
-  if (!issuedPort || !respPort || !cycleCntPort)
+      cyclePortBundle->getAs<services::TelemetryService::Metric>();
+  if (!issuedPort || !respPort || !checksumPort || !cycleCntPort)
     throw std::runtime_error("hostmem read bandwidth: telemetry type mismatch");
   issuedPort->connect();
   respPort->connect();
+  checksumPort->connect();
   cycleCntPort->connect();
 
-  // Prepare memory pattern (optional).
-  uint64_t *dataPtr = static_cast<uint64_t *>(region.getPtr());
-  size_t words64 = region.getSize() / 8;
-  for (size_t i = 0; i < words64; ++i)
-    dataPtr[i] = 0xCAFEBABE0000ull + i;
+  // Lay out the read data contiguously (natural ceil(width/8)-byte stride)
+  // using the byte-level pattern for every byte; ReadMem folds each received
+  // element into readChecksum, which must match this host-side fold if the
+  // read fetched the right bytes.
+  uint8_t *bytePtr = static_cast<uint8_t *>(region.getPtr());
+  size_t elemBytes = hostmemWireBytes(width);
+  uint64_t expectedChecksum = 0;
+  for (uint32_t i = 0; i < xferCount; ++i) {
+    for (size_t j = 0; j < elemBytes; ++j)
+      bytePtr[(size_t)i * elemBytes + j] = esitesterHostmemByte(i, j, width);
+    expectedChecksum ^= esitesterElemFold(i, width);
+  }
   region.flush();
   uint64_t devPtr = reinterpret_cast<uint64_t>(region.getDevicePtr());
   auto start = std::chrono::high_resolution_clock::now();
 
-  cmdMMIO->write(0x10, devPtr);
-  cmdMMIO->write(0x18, xferCount);
-  cmdMMIO->write(0x20, 1);
+  cmdMMIO->write(0x08, devPtr);
+  cmdMMIO->write(0x10, xferCount);
+  cmdMMIO->write(0x18, 1);
 
   bool timeout = true;
   for (int wait = 0; wait < 100000; ++wait) {
@@ -997,6 +1316,18 @@ hostmemReadBandwidthTest(AcceleratorConnection *conn, Accelerator *acc,
             << "): " << formatBandwidth(bytesPerSec) << ", " << xferCount
             << " flits in " << duration.count() << " us, " << cycles
             << " cycles, " << bytesPerCycle << " bytes/cycle" << std::endl;
+
+  uint64_t gotChecksum = checksumPort->readInt();
+  if (gotChecksum != expectedChecksum) {
+    char eb[24], gb[24];
+    std::snprintf(eb, sizeof(eb), "0x%016llx",
+                  (unsigned long long)expectedChecksum);
+    std::snprintf(gb, sizeof(gb), "0x%016llx", (unsigned long long)gotChecksum);
+    throw std::runtime_error(
+        std::string(
+            "hostmem read bandwidth data mismatch: checksum expected ") +
+        eb + " got " + gb);
+  }
 }
 
 static void hostmemBandwidthTest(AcceleratorConnection *conn, Accelerator *acc,
@@ -1119,6 +1450,68 @@ static void loopbackAddTest(AcceleratorConnection *conn, Accelerator *accel,
   }
 }
 
+// Exercise the design reset feature using existing telemetry. Run a hostmem
+// write operation on the 'writemem' module, which increments its
+// 'addrCmdResponses' telemetry counter. Confirm the telemetry advanced,
+// request a design reset, then confirm the telemetry has been cleared back to
+// zero (the counters live in the user design which the reset clears).
+static void resetTest(AcceleratorConnection *conn, Accelerator *accel) {
+  Logger &logger = conn->getLogger();
+  constexpr uint32_t width = 64;
+
+  // Run an existing test that increments telemetry. The hostmem write test
+  // bumps the writemem module's 'addrCmdResponses' counter.
+  hostmemTest(conn, accel, {width}, /*write=*/true, /*read=*/false);
+
+  // Grab the writemem module's response telemetry counter to observe the
+  // reset.
+  auto writeMemChildIter = accel->getChildren().find(AppID("writemem", width));
+  if (writeMemChildIter == accel->getChildren().end())
+    throw std::runtime_error("Reset test: no 'writemem' child");
+  auto &ports = writeMemChildIter->second->getPorts();
+  auto respIter = ports.find(AppID("addrCmdResponses"));
+  if (respIter == ports.end())
+    throw std::runtime_error(
+        "Reset test: no 'addrCmdResponses' telemetry port");
+  auto *respMetric =
+      respIter->second.getAs<services::TelemetryService::Metric>();
+  if (!respMetric)
+    throw std::runtime_error("Reset test: 'addrCmdResponses' not telemetry");
+  respMetric->connect();
+
+  uint64_t before = respMetric->readInt();
+  std::cout << "[reset] telemetry addrCmdResponses before reset = " << before
+            << std::endl;
+  if (before == 0)
+    throw std::runtime_error(
+        "Reset test: telemetry was not incremented by the hostmem write");
+
+  // Request a design reset.
+  logger.info("esitester", "Requesting design reset");
+  if (!conn->reset())
+    throw std::runtime_error("Reset test: reset() reported failure");
+  std::cout << "[reset] reset requested" << std::endl;
+
+  // The reset is asserted a fixed number of cycles after the request (to let
+  // in-flight transactions drain), so poll the telemetry until it clears.
+  uint64_t after = before;
+  constexpr int maxPolls = 1000000;
+  for (int polls = 0; polls < maxPolls; ++polls) {
+    after = respMetric->readInt();
+    if (after == 0)
+      break;
+    std::this_thread::sleep_for(std::chrono::microseconds(1));
+  }
+  std::cout << "[reset] telemetry addrCmdResponses after reset = " << after
+            << std::endl;
+  if (after != 0)
+    throw std::runtime_error(
+        "Reset test: telemetry was not cleared by the reset (got " +
+        std::to_string(after) + ")");
+
+  std::cout << "Reset test passed" << std::endl;
+}
+
 static void aggregateHostmemBandwidthTest(AcceleratorConnection *conn,
                                           Accelerator *acc, uint32_t width,
                                           uint32_t xferCount, bool read,
@@ -1158,6 +1551,12 @@ static void aggregateHostmemBandwidthTest(AcceleratorConnection *conn,
   const std::vector<std::string> writePrefixes = {"writemem", "writemem_0",
                                                   "writemem_1", "writemem_2"};
 
+  // Size each unit's region to the actual transfer (min 1 MiB) rather than a
+  // fixed 1 GiB, so aggregating many units stays memory-bounded.
+  size_t strideBytes = ((width + 31) / 32) * 4;
+  size_t neededBytes = static_cast<size_t>(xferCount) * strideBytes;
+  size_t regionBytes = neededBytes < (1u << 20) ? (1u << 20) : neededBytes;
+
   auto addUnits = [&](const std::vector<std::string> &pref, bool doRead,
                       bool doWrite) {
     for (auto &p : pref) {
@@ -1166,14 +1565,19 @@ static void aggregateHostmemBandwidthTest(AcceleratorConnection *conn,
       if (childIt == acc->getChildren().end())
         continue; // silently skip missing variants
       auto &ports = childIt->second->getPorts();
-      auto cmdIt = ports.find(AppID("cmd", width));
       auto respIt = ports.find(AppID("addrCmdResponses"));
-      auto cycIt = ports.find(AppID("addrCmdCycles"));
-      if (cmdIt == ports.end() || respIt == ports.end() || cycIt == ports.end())
+      // MMIO ('cmd') and the cycle metric are nested inside BurstCommand
+      // submodules: <unit>/mmio[width]/cmd and <unit>/addrCmdResp/cycles.
+      AppIDPath cmdPath, cycPath;
+      BundlePort *cmdBundle =
+          acc->resolvePort({id, AppID("mmio", width), AppID("cmd")}, cmdPath);
+      BundlePort *cycBundle = acc->resolvePort(
+          {id, AppID("addrCmdResp"), AppID("cycles")}, cycPath);
+      if (respIt == ports.end() || !cmdBundle || !cycBundle)
         continue;
-      auto *cmd = cmdIt->second.getAs<services::MMIO::MMIORegion>();
+      auto *cmd = cmdBundle->getAs<services::MMIO::MMIORegion>();
       auto *resp = respIt->second.getAs<services::TelemetryService::Metric>();
-      auto *cyc = cycIt->second.getAs<services::TelemetryService::Metric>();
+      auto *cyc = cycBundle->getAs<services::TelemetryService::Metric>();
       if (!cmd || !resp || !cyc)
         continue;
       resp->connect();
@@ -1182,7 +1586,7 @@ static void aggregateHostmemBandwidthTest(AcceleratorConnection *conn,
       u.prefix = p;
       u.isRead = doRead;
       u.isWrite = doWrite;
-      u.region = hostmemSvc->allocate(1024 * 1024 * 1024, {.writeable = true});
+      u.region = hostmemSvc->allocate(regionBytes, {.writeable = true});
       // Init pattern.
       uint64_t *ptr = static_cast<uint64_t *>(u.region->getPtr());
       size_t words = u.region->getSize() / 8;
@@ -1211,9 +1615,9 @@ static void aggregateHostmemBandwidthTest(AcceleratorConnection *conn,
   // Launch sequentially.
   for (auto &u : units) {
     uint64_t devPtr = reinterpret_cast<uint64_t>(u.region->getDevicePtr());
-    u.cmd->write(0x10, devPtr);
-    u.cmd->write(0x18, xferCount);
-    u.cmd->write(0x20, 1);
+    u.cmd->write(0x08, devPtr);
+    u.cmd->write(0x10, xferCount);
+    u.cmd->write(0x18, 1);
     u.start = std::chrono::high_resolution_clock::now();
     u.launched = true;
   }
@@ -1519,8 +1923,9 @@ static void streamingAddTranslatedTest(AcceleratorConnection *conn,
   argPort.connect();
   resultPort.connect();
 
-  // Allocate the argument struct with proper alignment for the struct members.
-  // We use aligned_alloc to ensure the buffer meets alignment requirements.
+  // Allocate the argument struct with proper alignment for the struct
+  // members. We use aligned_alloc to ensure the buffer meets alignment
+  // requirements.
   size_t argSize = StreamingAddTranslatedArg::allocSize(numItems);
   constexpr size_t alignment = alignof(StreamingAddTranslatedArg);
   // aligned_alloc requires size to be a multiple of alignment
@@ -1712,7 +2117,8 @@ static void coordTranslateTest(AcceleratorConnection *conn, Accelerator *accel,
         "FuncService::Function");
   funcPort->connect();
 
-  // Allocate the argument struct with proper alignment for the struct members.
+  // Allocate the argument struct with proper alignment for the struct
+  // members.
   size_t argSize = CoordTranslateArg::allocSize(numCoords);
   constexpr size_t alignment = alignof(CoordTranslateArg);
   // aligned_alloc requires size to be a multiple of alignment
@@ -1797,17 +2203,95 @@ struct SerialCoordHeader {
   uint32_t yTranslation;
   uint32_t xTranslation;
 };
+static_assert(sizeof(SerialCoordHeader) == 10, "Size mismatch");
 struct SerialCoordData {
+  SerialCoordData(uint32_t x, uint32_t y) : _pad_head(0), y(y), x(x) {}
   uint16_t _pad_head;
   uint32_t y;
   uint32_t x;
 };
-union SerialCoordInputFrame {
-  SerialCoordHeader header;
-  SerialCoordData data;
-};
+static_assert(sizeof(SerialCoordData) == sizeof(SerialCoordHeader),
+              "Size mismatch");
 #pragma pack(pop)
-static_assert(sizeof(SerialCoordInputFrame) == 10, "Size mismatch");
+
+// Note: this application is intended to test hardware. As such, we need
+// to be able to send batches. So this is not the typical way one would define
+// a message struct. It's closer to a streaming style.
+struct SerialCoordInput : SegmentedMessageData {
+private:
+  SerialCoordHeader header;
+  std::vector<SerialCoordData> coords;
+  SerialCoordHeader footer;
+
+public:
+  SerialCoordInput() {
+    header.coordsCount = 0;
+    header.xTranslation = 0;
+    header.yTranslation = 0;
+    // The footer is a count==0 header that terminates the list per the ESI
+    // bulk-transfer serial encoding. Static fields are constant within a
+    // list so the footer's translation values are irrelevant; zero them.
+    footer.coordsCount = 0;
+    footer.xTranslation = 0;
+    footer.yTranslation = 0;
+  }
+  void yTranslation(uint32_t yTrans) { header.yTranslation = yTrans; }
+  uint32_t yTranslation() const { return header.yTranslation; }
+  void xTranslation(uint32_t xTrans) { header.xTranslation = xTrans; }
+  uint32_t xTranslation() const { return header.xTranslation; }
+  void appendCoord(uint32_t x, uint32_t y) {
+    coords.emplace_back(x, y);
+    header.coordsCount = (uint16_t)coords.size();
+  }
+  const std::vector<SerialCoordData> &getCoords() const { return coords; }
+
+  size_t numSegments() const override { return 3; }
+  Segment segment(size_t idx) const override {
+    if (idx == 0)
+      return {reinterpret_cast<const uint8_t *>(&header), sizeof(header)};
+    else if (idx == 1)
+      return {reinterpret_cast<const uint8_t *>(coords.data()),
+              coords.size() * sizeof(SerialCoordData)};
+    else if (idx == 2)
+      return {reinterpret_cast<const uint8_t *>(&footer), sizeof(footer)};
+    else
+      throw std::out_of_range("SerialCoordInput: invalid segment index");
+  }
+};
+
+// Like SerialCoordInput but without the trailing count==0 terminator. Used
+// when streaming multiple bursts that together comprise a single logical
+// list; the caller is responsible for sending a separate terminator burst
+// (a SerialCoordBurst with count==0 and no data).
+struct SerialCoordBurst : SegmentedMessageData {
+private:
+  SerialCoordHeader header;
+  std::vector<SerialCoordData> coords;
+
+public:
+  SerialCoordBurst() {
+    header.coordsCount = 0;
+    header.xTranslation = 0;
+    header.yTranslation = 0;
+  }
+  void yTranslation(uint32_t yTrans) { header.yTranslation = yTrans; }
+  void xTranslation(uint32_t xTrans) { header.xTranslation = xTrans; }
+  void appendCoord(uint32_t x, uint32_t y) {
+    coords.emplace_back(x, y);
+    header.coordsCount = (uint16_t)coords.size();
+  }
+
+  size_t numSegments() const override { return 2; }
+  Segment segment(size_t idx) const override {
+    if (idx == 0)
+      return {reinterpret_cast<const uint8_t *>(&header), sizeof(header)};
+    else if (idx == 1)
+      return {reinterpret_cast<const uint8_t *>(coords.data()),
+              coords.size() * sizeof(SerialCoordData)};
+    else
+      throw std::out_of_range("SerialCoordBurst: invalid segment index");
+  }
+};
 
 #pragma pack(push, 1)
 struct SerialCoordOutputHeader {
@@ -1825,21 +2309,92 @@ union SerialCoordOutputFrame {
 #pragma pack(pop)
 static_assert(sizeof(SerialCoordOutputFrame) == 8, "Size mismatch");
 
+/// Deserialized result batch from the serial coord translator. The
+/// TypeDeserializer accumulates header+data frame sequences until the
+/// zero-count footer header, then emits the complete coordinate list.
+struct SerialCoordOutputBatch {
+  std::vector<Coord> coords;
+
+  class TypeDeserializer
+      : public QueuedDecodeTypeDeserializer<SerialCoordOutputBatch> {
+  public:
+    using Base = QueuedDecodeTypeDeserializer<SerialCoordOutputBatch>;
+    using OutputCallback = Base::OutputCallback;
+    using DecodedOutputs = Base::DecodedOutputs;
+
+    explicit TypeDeserializer(OutputCallback output)
+        : Base(std::move(output)) {}
+
+  private:
+    DecodedOutputs decode(std::unique_ptr<SegmentedMessageData> &msg) override {
+      DecodedOutputs decoded;
+
+      MessageData scratch;
+      const MessageData &flat =
+          detail::getMessageDataRef<SerialCoordOutputBatch>(*msg, scratch);
+      const uint8_t *bytes = flat.getBytes();
+      size_t size = flat.getSize();
+      constexpr size_t frameSize = sizeof(SerialCoordOutputFrame);
+
+      size_t offset = 0;
+      while (offset < size) {
+        size_t needed = frameSize - partialFrameBytes.size();
+        size_t chunkSize = std::min(needed, size - offset);
+        partialFrameBytes.insert(partialFrameBytes.end(), bytes + offset,
+                                 bytes + offset + chunkSize);
+        offset += chunkSize;
+
+        if (partialFrameBytes.size() != frameSize)
+          break;
+
+        SerialCoordOutputFrame frame;
+        std::memcpy(&frame, partialFrameBytes.data(), frameSize);
+        partialFrameBytes.clear();
+
+        if (remainingCoords == 0) {
+          // Header frame.
+          uint16_t batchCount = frame.header.coordsCount;
+          if (batchCount == 0) {
+            // Footer: end of list. Emit accumulated coordinates.
+            auto batch = std::make_unique<SerialCoordOutputBatch>();
+            batch->coords = std::move(accumulated);
+            accumulated.clear();
+            decoded.push_back(std::move(batch));
+            msg.reset();
+            return decoded;
+          }
+          remainingCoords = batchCount;
+          continue;
+        }
+        // Data frame.
+        accumulated.push_back({frame.data.y, frame.data.x});
+        --remainingCoords;
+      }
+
+      msg.reset();
+      return decoded;
+    }
+
+    std::vector<Coord> accumulated;
+    std::vector<uint8_t> partialFrameBytes;
+    size_t remainingCoords = 0;
+  };
+};
+
 static void serialCoordTranslateTest(AcceleratorConnection *conn,
                                      Accelerator *accel, uint32_t xTrans,
                                      uint32_t yTrans, uint32_t numCoords,
                                      size_t batchSizeLimit) {
   Logger &logger = conn->getLogger();
-  logger.info("esitester", "Starting serial coord translate test");
+  logger.info("esitester", "Starting Serial coord translate test");
 
   // Generate random coordinates.
   std::mt19937 rng(0xDEADBEEF);
   std::uniform_int_distribution<uint32_t> dist(0, 1000000);
   std::vector<Coord> inputCoords;
   inputCoords.reserve(numCoords);
-  for (uint32_t i = 0; i < numCoords; ++i) {
+  for (uint32_t i = 0; i < numCoords; ++i)
     inputCoords.push_back({dist(rng), dist(rng)});
-  }
 
   auto child = accel->getChildren().find(AppID("coord_translator_serial"));
   if (child == accel->getChildren().end())
@@ -1849,70 +2404,76 @@ static void serialCoordTranslateTest(AcceleratorConnection *conn,
   auto &ports = child->second->getPorts();
   auto portIter = ports.find(AppID("translate_coords_serial"));
   if (portIter == ports.end())
-    throw std::runtime_error(
-        "Serial coord translate test: no 'translate_coords_serial' port found");
+    throw std::runtime_error("Serial coord translate test: no "
+                             "'translate_coords_serial' port found");
 
-  WriteChannelPort &argPort = portIter->second.getRawWrite("arg");
-  ReadChannelPort &resultPort = portIter->second.getRawRead("result");
+  TypedWritePort<SerialCoordBurst, /*SkipTypeCheck=*/true> argPort(
+      portIter->second.getRawWrite("arg"));
+  // Use the raw read port so we can verify the multi-burst output framing
+  // explicitly rather than relying on the typed deserializer to accumulate
+  // frames until the terminator.
+  ReadChannelPort &resultRaw = portIter->second.getRawRead("result");
 
   argPort.connect(ChannelPort::ConnectOptions(std::nullopt, false));
-  resultPort.connect(ChannelPort::ConnectOptions(std::nullopt, false));
+  // Use an unlimited read queue so the device output isn't stalled by a full
+  // queue while we're still writing. With raw reads (translateMessage=false),
+  // each output frame becomes its own queued message, so the default 32-msg
+  // limit can be hit easily on a multi-burst run.
+  resultRaw.connect(ChannelPort::ConnectOptions(/*bufferSize=*/0,
+                                                /*translateMessage=*/false));
 
   size_t sent = 0;
   while (sent < numCoords) {
     size_t batchSize = std::min(batchSizeLimit, numCoords - sent);
 
-    // Send Header. Only the first header needs the translation values, test the
-    // subsequent ones with zero translation to verify that the hardware
+    // Send Header. Only the first header needs the translation values, test
+    // the subsequent ones with zero translation to verify that the hardware
     // correctly applies the first header's translation to the whole list.
-    SerialCoordInputFrame headerFrame;
-    headerFrame.header.coordsCount = (uint16_t)batchSize;
-    headerFrame.header.xTranslation = sent == 0 ? xTrans : 0;
-    headerFrame.header.yTranslation = sent == 0 ? yTrans : 0;
-    argPort.write(MessageData(reinterpret_cast<const uint8_t *>(&headerFrame),
-                              sizeof(headerFrame)));
-
+    auto batch = std::make_unique<SerialCoordBurst>();
+    batch->xTranslation(sent == 0 ? xTrans : 0);
+    batch->yTranslation(sent == 0 ? yTrans : 0);
     // Send Data
     for (size_t i = 0; i < batchSize; ++i) {
-      SerialCoordInputFrame dataFrame;
-      dataFrame.data._pad_head = 0;
-      dataFrame.data.x = inputCoords[sent + i].x;
-      dataFrame.data.y = inputCoords[sent + i].y;
-      argPort.write(MessageData(reinterpret_cast<const uint8_t *>(&dataFrame),
-                                sizeof(dataFrame)));
+      batch->appendCoord(inputCoords[sent + i].x, inputCoords[sent + i].y);
     }
+    argPort.write(batch);
     sent += batchSize;
   }
-  // Send final header with count=0 to signal end of input
-  SerialCoordHeader footerData{0, 0, 0};
-  auto footer = MessageData::from(footerData);
-  argPort.write(footer);
+  // Send final header with count=0 to signal end of input.
+  auto footerBurst = std::make_unique<SerialCoordBurst>();
+  argPort.write(footerBurst);
 
-  // Read results. The hardware echoes headers (with count) followed by
-  // translated data frames, then autonomously sends a footer header with
-  // count=0 to signal end of list.
+  // Read raw output frames, walking the bulk-transfer wire format: zero or
+  // more (HDR(N) + N data frames) sequences followed by a single HDR(0)
+  // terminator. Each `read()` returns whatever the transport layer has
+  // available, which is not guaranteed to align with frame boundaries
+  // (e.g., DMA channel engines may coalesce or split across frames). So
+  // we accumulate bytes into a buffer and only consume whole frames.
+  constexpr size_t frameSize = sizeof(SerialCoordOutputFrame);
+  std::vector<uint8_t> rxBuf;
+  auto readFrame = [&](SerialCoordOutputFrame &out) {
+    while (rxBuf.size() < frameSize) {
+      MessageData data;
+      resultRaw.read(data);
+      rxBuf.insert(rxBuf.end(), data.getBytes(),
+                   data.getBytes() + data.getSize());
+    }
+    std::memcpy(&out, rxBuf.data(), frameSize);
+    rxBuf.erase(rxBuf.begin(), rxBuf.begin() + frameSize);
+  };
+
   std::vector<Coord> results;
+  results.reserve(numCoords);
   while (true) {
-    // Read Header
-    MessageData msg;
-    resultPort.read(msg);
-    if (msg.getSize() != sizeof(SerialCoordOutputFrame))
-      throw std::runtime_error("Unexpected result message size");
-
-    const auto *frame =
-        reinterpret_cast<const SerialCoordOutputFrame *>(msg.getBytes());
-    uint16_t batchCount = frame->header.coordsCount;
+    SerialCoordOutputFrame hdr{};
+    readFrame(hdr);
+    uint16_t batchCount = hdr.header.coordsCount;
     if (batchCount == 0)
       break;
-
-    // Read Data
     for (uint16_t i = 0; i < batchCount; ++i) {
-      resultPort.read(msg);
-      if (msg.getSize() != sizeof(SerialCoordOutputFrame))
-        throw std::runtime_error("Unexpected result message size");
-      const auto *dFrame =
-          reinterpret_cast<const SerialCoordOutputFrame *>(msg.getBytes());
-      results.push_back({dFrame->data.y, dFrame->data.x});
+      SerialCoordOutputFrame frame{};
+      readFrame(frame);
+      results.push_back({frame.data.y, frame.data.x});
     }
   }
 
@@ -1939,13 +2500,148 @@ static void serialCoordTranslateTest(AcceleratorConnection *conn,
   }
 
   argPort.disconnect();
-  resultPort.disconnect();
+  resultRaw.disconnect();
 
   if (!passed)
     throw std::runtime_error("Serial coord translate test failed");
 
   logger.info("esitester", "Serial coord translate test passed");
   std::cout << "Serial coord translate test passed" << std::endl;
+}
+
+//
+// AutoSerialCoordTranslator test
+//
+// The hardware module pipes the input through ListWindowToParallel ->
+// per-coordinate translation -> ListWindowToSerial. The conversion modules
+// emit one or more bulk transfers per call (each `header(count>0)` followed
+// by `count` data frames) terminated by a `header(count==0)` footer per the
+// ESI WindowField serial-encoding spec. This test:
+//   * Sends exactly one input batch: header(numCoords) + numCoords data
+//     frames + header(0) footer.
+//   * Reads back: a sequence of one-or-more `header(count>0) + count data`
+//     bursts terminated by `header(0)`. Use raw frame reads since the
+//     canonical `SerialCoordOutputBatch` deserializer hasn't been wired in
+//     for the converter pair.
+//
+static void autoSerialCoordTranslateTest(AcceleratorConnection *conn,
+                                         Accelerator *accel, uint32_t xTrans,
+                                         uint32_t yTrans, uint32_t numCoords) {
+  Logger &logger = conn->getLogger();
+  logger.info("esitester", "Starting Auto serial coord translate test");
+
+  // Generate random coordinates.
+  std::mt19937 rng(0xDEADBEEF);
+  std::uniform_int_distribution<uint32_t> dist(0, 1000000);
+  std::vector<Coord> inputCoords;
+  inputCoords.reserve(numCoords);
+  for (uint32_t i = 0; i < numCoords; ++i)
+    inputCoords.push_back({dist(rng), dist(rng)});
+
+  auto child = accel->getChildren().find(AppID("coord_translator_auto_serial"));
+  if (child == accel->getChildren().end())
+    throw std::runtime_error("Auto serial coord translate test: no "
+                             "'coord_translator_auto_serial' child found");
+
+  auto &ports = child->second->getPorts();
+  auto portIter = ports.find(AppID("translate_coords_auto_serial"));
+  if (portIter == ports.end())
+    throw std::runtime_error("Auto serial coord translate test: no "
+                             "'translate_coords_auto_serial' port found");
+
+  // Reuse SerialCoordInput: the input wire format is identical (header with
+  // x/y_translation+count, followed by data frames each carrying one coord).
+  TypedWritePort<SerialCoordInput, /*SkipTypeCheck=*/true> argPort(
+      portIter->second.getRawWrite("arg"));
+  argPort.connect(ChannelPort::ConnectOptions(std::nullopt, false));
+
+  // Use the raw read port for results: read one header frame then numCoords
+  // data frames as raw `SerialCoordOutputFrame`-shaped messages. Disable
+  // window-message translation so we get one frame per `read()` instead of
+  // assembled higher-level messages.
+  ReadChannelPort &resultRaw = portIter->second.getRawRead("result");
+  // Use an unlimited read queue so the device output isn't stalled by a full
+  // queue while we're still writing. With raw reads (translateMessage=false),
+  // each output frame becomes its own queued message, so the default 32-msg
+  // limit can be hit easily on a multi-frame run.
+  resultRaw.connect(ChannelPort::ConnectOptions(/*bufferSize=*/0,
+                                                /*translateMessage=*/false));
+
+  // Send a single header+data burst.
+  auto batch = std::make_unique<SerialCoordInput>();
+  batch->xTranslation(xTrans);
+  batch->yTranslation(yTrans);
+  for (uint32_t i = 0; i < numCoords; ++i)
+    batch->appendCoord(inputCoords[i].x, inputCoords[i].y);
+  argPort.write(batch);
+
+  // Helper: read one raw frame, accumulating bytes across `read()` calls
+  // since transports such as DMA channel engines do not guarantee that
+  // each `read()` returns exactly one frame.
+  constexpr size_t frameSize = sizeof(SerialCoordOutputFrame);
+  std::vector<uint8_t> rxBuf;
+  auto readFrame = [&](SerialCoordOutputFrame &out) {
+    while (rxBuf.size() < frameSize) {
+      MessageData data;
+      resultRaw.read(data);
+      rxBuf.insert(rxBuf.end(), data.getBytes(),
+                   data.getBytes() + data.getSize());
+    }
+    std::memcpy(&out, rxBuf.data(), frameSize);
+    rxBuf.erase(rxBuf.begin(), rxBuf.begin() + frameSize);
+  };
+
+  // Read a sequence of one-or-more `header(count>0) + count data` bursts
+  // followed by a `header(count==0)` terminator footer. Total data items
+  // received across all bursts must equal numCoords.
+  std::vector<Coord> results;
+  results.reserve(numCoords);
+  while (true) {
+    SerialCoordOutputFrame hdr{};
+    readFrame(hdr);
+    uint16_t burstCount = hdr.header.coordsCount;
+    if (burstCount == 0)
+      break;
+    if (results.size() + burstCount > numCoords)
+      throw std::runtime_error("Auto serial coord translate test: bursts "
+                               "overflow expected total " +
+                               std::to_string(numCoords));
+    for (uint32_t i = 0; i < burstCount; ++i) {
+      SerialCoordOutputFrame frame{};
+      readFrame(frame);
+      results.push_back({frame.data.y, frame.data.x});
+    }
+  }
+  if (results.size() != numCoords)
+    throw std::runtime_error("Auto serial coord translate test: got " +
+                             std::to_string(results.size()) +
+                             " coords across all bursts " + "(expected " +
+                             std::to_string(numCoords) + ")");
+
+  argPort.disconnect();
+  resultRaw.disconnect();
+
+  bool passed = true;
+  std::cout << "Auto serial coord translate test results:" << std::endl;
+  for (size_t i = 0; i < inputCoords.size(); ++i) {
+    uint32_t expX = inputCoords[i].x + xTrans;
+    uint32_t expY = inputCoords[i].y + yTrans;
+    std::cout << "  coord[" << i << "]=(" << inputCoords[i].x << ","
+              << inputCoords[i].y << ") + (" << xTrans << "," << yTrans
+              << ") = (" << results[i].x << "," << results[i].y
+              << ") (expected (" << expX << "," << expY << "))";
+    if (results[i].x != expX || results[i].y != expY) {
+      std::cout << " MISMATCH!";
+      passed = false;
+    }
+    std::cout << std::endl;
+  }
+
+  if (!passed)
+    throw std::runtime_error("Auto serial coord translate test failed");
+
+  logger.info("esitester", "Auto serial coord translate test passed");
+  std::cout << "Auto serial coord translate test passed" << std::endl;
 }
 
 static void channelTest(AcceleratorConnection *conn, Accelerator *accel,

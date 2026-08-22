@@ -1,4 +1,4 @@
-// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-infer-widths))' --verify-diagnostics %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-infer-widths{warn-on-implicit-truncation=true}))' --verify-diagnostics %s | FileCheck %s
 
 firrtl.circuit "Foo" {
   // CHECK-LABEL: @InferConstant
@@ -468,6 +468,26 @@ firrtl.circuit "Foo" {
     firrtl.domain.define %B, %A : !firrtl.domain<@ClockDomain()>
   }
 
+  // unsafe_domain_cast is node-like and should be looked through during width
+  // inference.
+  // https://github.com/llvm/circt/issues/10654
+  // CHECK-LABEL: @UnsafeDomainCast
+  firrtl.module @UnsafeDomainCast(
+    in %A: !firrtl.domain<@ClockDomain()>,
+    in %B: !firrtl.domain<@ClockDomain()>
+  ) {
+    // CHECK: %a = firrtl.wire : !firrtl.uint<1>
+    %a = firrtl.wire : !firrtl.uint
+    %b = firrtl.wire : !firrtl.uint<1>
+    %c = firrtl.wire : !firrtl.uint<1>
+    %invalid_ui1 = firrtl.invalidvalue : !firrtl.uint<1>
+    firrtl.connect %c, %invalid_ui1 : !firrtl.uint<1>, !firrtl.uint<1>
+    // CHECK: %0 = firrtl.unsafe_domain_cast %a domains[%B] : !firrtl.uint<1> domains[!firrtl.domain<@ClockDomain()>]
+    %0 = firrtl.unsafe_domain_cast %a domains[%B] : !firrtl.uint domains[!firrtl.domain<@ClockDomain()>]
+    firrtl.connect %b, %0 : !firrtl.uint<1>, !firrtl.uint
+    firrtl.connect %a, %c : !firrtl.uint, !firrtl.uint<1>
+  }
+
   // Issue #1088
   // CHECK-LABEL: @Issue1088
   firrtl.module @Issue1088(out %y: !firrtl.sint<4>) {
@@ -479,6 +499,7 @@ firrtl.circuit "Foo" {
     // CHECK: firrtl.connect %x, %c200_si9 : !firrtl.sint<9>
     %x = firrtl.wire : !firrtl.sint
     %c200_si = firrtl.constant 200 : !firrtl.sint
+    // expected-warning @+1 {{RHS width 9 exceeds LHS width 4, inserting implicit truncation}}
     firrtl.connect %y, %x : !firrtl.sint<4>, !firrtl.sint
     firrtl.connect %x, %c200_si : !firrtl.sint, !firrtl.sint
   }
@@ -492,6 +513,7 @@ firrtl.circuit "Foo" {
     %w1 = firrtl.wire  : !firrtl.uint<0>
     // CHECK: %0 = firrtl.tail %w, 1 : (!firrtl.uint<1>) -> !firrtl.uint<0>
     // CHECK: firrtl.connect %w1, %0 : !firrtl.uint<0>
+    // expected-warning @+1 {{RHS width 1 exceeds LHS width 0, inserting implicit truncation}}
     firrtl.connect %w1, %w : !firrtl.uint<0>, !firrtl.uint
   }
 

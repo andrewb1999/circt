@@ -23,9 +23,12 @@
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Support/Debug.h"
 #include "circt/Support/Namespace.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/IR/Iterators.h"
 #include "mlir/IR/Threading.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TinyPtrVector.h"
@@ -42,8 +45,16 @@ namespace firrtl {
 using namespace circt;
 using namespace firrtl;
 
+using hw::InnerRefNamespace;
+using hw::InnerSymbolTableCollection;
 using llvm::concat;
+using mlir::AsmState;
+using mlir::InFlightDiagnostic;
 using mlir::ReverseIterator;
+
+namespace {
+struct VariableTerm;
+} // namespace
 
 //====--------------------------------------------------------------------------
 // Helpers.
@@ -83,6 +94,14 @@ static bool isDriven(DomainValue port) {
   return false;
 }
 
+/// True if a value of the given type could be associated with a domain.
+static bool isHardware(Type type) {
+  return type_isa<FIRRTLBaseType, RefType>(type);
+}
+
+/// True if the given value could be association with a domain.
+static bool isHardware(Value value) { return isHardware(value.getType()); }
+
 //====--------------------------------------------------------------------------
 // Global State.
 //====--------------------------------------------------------------------------
@@ -97,33 +116,58 @@ struct DomainTypeID {
 };
 } // namespace
 
-/// Information about the domains in the circuit. Able to map domains to their
-/// type ID, which in this pass is the canonical way to reference the type
-/// of a domain, as well as provide fast access to domain ops.
+/// Information about the changes made to the interface of a moduleOp, which can
+/// be replayed onto an instance.
 namespace {
-class DomainInfo {
-public:
-  DomainInfo(CircuitOp circuit) { processCircuit(circuit); }
+struct ModuleUpdateInfo {
+  /// The updated domain information for a moduleOp.
+  ArrayAttr portDomainInfo;
+  /// The domain ports which have been inserted into a moduleOp.
+  PortInsertions portInsertions;
+};
+} // namespace
+
+namespace {
+struct CircuitState {
+  CircuitState(CircuitOp circuit, InstanceGraph &instanceGraph,
+               InnerRefNamespace &innerRefNamespace, InferDomainsMode mode)
+      : circuit(circuit), instanceGraph(instanceGraph),
+        innerRefNamespace(innerRefNamespace), mode(mode) {
+    processCircuit(circuit);
+  }
+
+  LogicalResult run();
 
   ArrayRef<DomainOp> getDomains() const { return domainTable; }
   size_t getNumDomains() const { return domainTable.size(); }
   DomainOp getDomain(DomainTypeID id) const { return domainTable[id.index]; }
+  DomainTypeID getDomainTypeID(Type type) { return typeIDTable[type]; }
 
-  DomainTypeID getDomainTypeID(Type type) const { return typeIDTable.at(type); }
-
-  DomainTypeID getDomainTypeID(FModuleLike module, size_t i) const {
-    return getDomainTypeID(module.getPortType(i));
+  void dirty() { asmState = nullptr; }
+  AsmState &getAsmState() {
+    if (!asmState) {
+      asmState = std::make_unique<AsmState>(
+          circuit, mlir::OpPrintingFlags().assumeVerified());
+    }
+    return *asmState;
   }
 
-  DomainTypeID getDomainTypeID(FInstanceLike op, size_t i) const {
-    return getDomainTypeID(op->getResult(i).getType());
+  size_t getVariableID(VariableTerm *term) {
+    return variableIDTable.insert({term, variableIDTable.size() + 1})
+        .first->second;
   }
 
-  DomainTypeID getDomainTypeID(DomainValue value) const {
-    return getDomainTypeID(value.getType());
+  DenseMap<StringAttr, ModuleUpdateInfo> &getModuleUpdateTable() {
+    return moduleUpdateTable;
   }
+
+  InnerRefNamespace &getInnerRefNamespace() { return innerRefNamespace; }
+
+  DenseSet<Value> inserted;
 
 private:
+  LogicalResult runOnModule(Operation *moduleOp);
+
   void processDomain(DomainOp op) {
     auto index = domainTable.size();
     auto domainType = DomainType::getFromDomainOp(op);
@@ -136,33 +180,17 @@ private:
       processDomain(decl);
   }
 
-  /// A map from domain type ID to op.
+  CircuitOp circuit;
+  InstanceGraph &instanceGraph;
+  InnerRefNamespace &innerRefNamespace;
+  InferDomainsMode mode;
   SmallVector<DomainOp> domainTable;
-
-  /// A map from domain type to type ID.
   DenseMap<Type, DomainTypeID> typeIDTable;
-};
-
-/// Information about the changes made to the interface of a moduleOp, which can
-/// be replayed onto an instance.
-struct ModuleUpdateInfo {
-  /// The updated domain information for a moduleOp.
-  ArrayAttr portDomainInfo;
-  /// The domain ports which have been inserted into a moduleOp.
-  PortInsertions portInsertions;
+  DenseMap<VariableTerm *, size_t> variableIDTable;
+  std::unique_ptr<AsmState> asmState;
+  DenseMap<StringAttr, ModuleUpdateInfo> moduleUpdateTable;
 };
 } // namespace
-
-using ModuleUpdateTable = DenseMap<StringAttr, ModuleUpdateInfo>;
-
-/// Apply the port changes of a moduleOp onto an instance-like op.
-static FInstanceLike fixInstancePorts(FInstanceLike op,
-                                      const ModuleUpdateInfo &update) {
-  auto clone = op.cloneWithInsertedPortsAndReplaceUses(update.portInsertions);
-  clone.setDomainInfoAttr(update.portDomainInfo);
-  op->erase();
-  return clone;
-}
 
 //====--------------------------------------------------------------------------
 // Terms: Syntax for unifying domain and domain-rows.
@@ -219,8 +247,318 @@ struct RowTerm : public TermBase<TermKind::Row> {
 };
 } // namespace
 
+//====--------------------------------------------------------------------------
+// Module processing: solve for the domain associations of hardware.
+//====--------------------------------------------------------------------------
+
+/// A map from unsolved variables to a port index, where that port has not yet
+/// been created. Eventually we will have an input domain at the port index,
+/// which will be the solution to the recorded variable.
+using PendingSolutions = DenseMap<VariableTerm *, unsigned>;
+
+/// A map from local domains to an aliasing port index, where that port has not
+/// yet been created. Eventually we will be exporting the domain value at the
+/// port index.
+using PendingExports = llvm::MapVector<DomainValue, unsigned>;
+
+namespace {
+struct PendingUpdates {
+  PortInsertions insertions;
+  PendingSolutions solutions;
+  PendingExports exports;
+};
+} // namespace
+
+/// A map from domain IR values defined internal to the moduleOp, to ports that
+/// alias that domain. These ports make the domain useable as associations of
+/// ports, and we say these are exporting ports.
+using ExportTable = DenseMap<DomainValue, TinyPtrVector<DomainValue>>;
+
+namespace {
+class ModuleState {
+public:
+  explicit ModuleState(CircuitState &globals) : globals(globals) {}
+
+  ArrayRef<DomainOp> getDomains() { return globals.getDomains(); }
+  size_t getNumDomains() { return globals.getNumDomains(); }
+  DomainOp getDomain(DomainTypeID id) { return globals.getDomain(id); }
+  DomainTypeID getDomainTypeID(Type type) {
+    return globals.getDomainTypeID(type);
+  }
+  DomainTypeID getDomainTypeID(FModuleLike module, size_t i) {
+    return globals.getDomainTypeID(module.getPortType(i));
+  }
+  DomainTypeID getDomainTypeID(FInstanceLike op, size_t i) const {
+    return globals.getDomainTypeID(op->getResult(i).getType());
+  }
+  DomainTypeID getDomainTypeID(DomainValue value) const {
+    return globals.getDomainTypeID(value.getType());
+  }
+  auto &getModuleUpdateTable() { return globals.getModuleUpdateTable(); }
+
+  mlir::AsmState &getAsmState() { return globals.getAsmState(); }
+  void dirty() { globals.dirty(); }
+
+  template <typename T>
+  void render(Operation *op, T &out);
+  template <typename T>
+  void render(Value value, T &out);
+  template <typename T>
+  void renderLong(Value value, T &out);
+  template <typename T>
+  void render(Term *term, T &out);
+  template <typename T>
+  struct Render;
+  template <typename T>
+  Render<T> render(T &&subject);
+  struct RenderLong;
+  RenderLong renderLong(Value value);
+
+  Term *find(Term *x);
+  LogicalResult unify(Term *lhs, Term *rhs);
+  LogicalResult unify(VariableTerm *x, Term *y);
+  LogicalResult unify(ValueTerm *xv, Term *y);
+  LogicalResult unify(RowTerm *lhsRow, Term *rhs);
+  void solve(Term *lhs, Term *rhs);
+
+  [[nodiscard]] RowTerm *allocRow(size_t size);
+  [[nodiscard]] RowTerm *allocRow(ArrayRef<Term *> elements);
+  [[nodiscard]] VariableTerm *allocVar();
+  [[nodiscard]] ValueTerm *allocVal(DomainValue value);
+  template <typename T, typename... Args>
+  T *alloc(Args &&...args);
+  ArrayRef<Term *> allocArray(ArrayRef<Term *> elements);
+
+  DomainValue getOptUnderlyingDomain(DomainValue value);
+  Term *getOptTermForDomain(DomainValue value);
+  Term *getTermForDomain(DomainValue value);
+  void setTermForDomain(DomainValue value, Term *term);
+
+  Term *getOptDomainAssociation(Value value);
+  Term *getDomainAssociation(Value value);
+  void setDomainAssociation(Value value, Term *term);
+
+  /// True if the value is "colorless": it is only driven by nodes or primops
+  /// whose inputs all terminate in constants, and therefore is not tied to any
+  /// domain. A colorless value imposes and inherits no domain constraints and
+  /// may be freely consumed by a value in any domain. All ports and wires are
+  /// treated as colored. Computed structurally over the SSA graph, memoized per
+  /// module.
+  bool isColorless(Value value);
+
+  void processDomainDefinition(DomainValue domain);
+  RowTerm *getDomainAssociationAsRow(Value value);
+
+  void noteLocation(InFlightDiagnostic &diag, Operation *op);
+  void noteDomain(InFlightDiagnostic &diag, DomainValue domain);
+  void noteDomainSource(InFlightDiagnostic &diag, DomainValue domain);
+  void noteDomainSource(InFlightDiagnostic &diag, Term *term);
+  void emitDomainCrossingError(Operation *op, Value lhs, Term *lhsTerm,
+                               Value rhs, Term *rhsTerm);
+  template <typename T>
+  void emitDuplicatePortDomainError(T op, size_t i, DomainTypeID domainTypeID,
+                                    IntegerAttr domainPortIndexAttr1,
+                                    IntegerAttr domainPortIndexAttr2);
+  template <typename T>
+  void emitDomainPortInferenceError(T op, size_t i);
+  template <typename T>
+  void emitAmbiguousPortDomainAssociation(
+      T op, const llvm::TinyPtrVector<DomainValue> &exports,
+      DomainTypeID typeID, size_t i);
+  template <typename T>
+  void emitMissingPortDomainAssociationError(T op, DomainTypeID typeID,
+                                             size_t i);
+
+  LogicalResult unifyAssociations(Operation *op, Value lhs, Value rhs);
+  template <typename T>
+  LogicalResult unifyAssociations(Operation *op, T &&range);
+  LogicalResult unifyAssociations(Operation *op);
+
+  LogicalResult processModulePorts(FModuleOp moduleOp);
+  template <typename T>
+  LogicalResult processInstancePorts(T op);
+  FInstanceLike fixInstancePorts(FInstanceLike op,
+                                 const ModuleUpdateInfo &update);
+  LogicalResult processOp(FInstanceLike op);
+  LogicalResult processOp(UnsafeDomainCastOp op);
+  LogicalResult processOp(DomainDefineOp op);
+  LogicalResult processOp(WireOp op);
+  LogicalResult processOp(RWProbeOp op);
+  LogicalResult processOp(Operation *op);
+  LogicalResult processModuleBody(FModuleOp moduleOp);
+  LogicalResult processModule(FModuleOp moduleOp);
+
+  ExportTable initializeExportTable(FModuleOp moduleOp);
+  void ensureSolved(Namespace &ns, DomainTypeID typeID, size_t ip,
+                    LocationAttr loc, VariableTerm *var,
+                    PendingUpdates &pending);
+  void ensureExported(Namespace &ns, const ExportTable &exports,
+                      DomainTypeID typeID, size_t ip, LocationAttr loc,
+                      ValueTerm *val, PendingUpdates &pending);
+  void getUpdatesForDomainAssociationOfPort(Namespace &ns,
+                                            PendingUpdates &pending,
+                                            DomainTypeID typeID, size_t ip,
+                                            LocationAttr loc, Term *term,
+                                            const ExportTable &exports);
+  void getUpdatesForDomainAssociationOfPort(Namespace &ns,
+                                            const ExportTable &exports,
+                                            size_t ip, LocationAttr loc,
+                                            RowTerm *row,
+                                            PendingUpdates &pending);
+  void getUpdatesForModulePorts(FModuleOp moduleOp, const ExportTable &exports,
+                                Namespace &ns, PendingUpdates &pending);
+  void getUpdatesForModule(FModuleOp moduleOp, const ExportTable &exports,
+                           PendingUpdates &pending);
+  void applyUpdatesToModule(FModuleOp moduleOp, ExportTable &exports,
+                            const PendingUpdates &pending);
+  SmallVector<Attribute> copyPortDomainAssociations(FModuleOp moduleOp,
+                                                    ArrayAttr moduleDomainInfo,
+                                                    size_t portIndex);
+  LogicalResult driveModuleOutputDomainPorts(FModuleOp moduleOp);
+  LogicalResult updateModuleDomainInfo(FModuleOp moduleOp,
+                                       const ExportTable &exportTable,
+                                       ArrayAttr &result);
+  DomainValue
+  solveVarWithAnonDomain(OpBuilder &builder,
+                         DenseMap<DomainValue, DomainValue> &domainsInScope,
+                         Operation *user, DomainType type, VariableTerm *var);
+  DomainValue
+  getDomainInScope(OpBuilder &builder,
+                   DenseMap<DomainValue, DomainValue> &domainsInScope,
+                   DomainValue domain);
+  LogicalResult
+  updateInstance(DenseMap<DomainValue, DomainValue> &domainsInScope,
+                 FInstanceLike op);
+  LogicalResult updateWire(DenseMap<DomainValue, DomainValue> &domainsInScope,
+                           WireOp wireOp);
+  LogicalResult updateModuleBody(FModuleOp moduleOp);
+  LogicalResult updateModule(FModuleOp moduleOp);
+
+  LogicalResult checkModulePorts(FModuleLike moduleOp);
+  LogicalResult checkModuleDomainPortDrivers(FModuleOp moduleOp);
+  LogicalResult checkInstanceDomainPortDrivers(FInstanceLike op);
+  LogicalResult checkModuleBody(FModuleOp moduleOp);
+
+  LogicalResult inferModule(FModuleOp moduleOp);
+  LogicalResult checkModule(FModuleOp moduleOp);
+  LogicalResult checkModule(FExtModuleOp extModuleOp);
+  LogicalResult checkAndInferModule(FModuleOp moduleOp);
+
+private:
+  CircuitState &globals;
+  DenseMap<Value, Term *> termTable;
+  DenseMap<Value, Term *> associationTable;
+  /// Memoization for `isColorless`. Absent = not computed; present = result.
+  DenseMap<Value, bool> colorlessTable;
+  llvm::BumpPtrAllocator allocator;
+};
+} // namespace
+
+template <typename T>
+void ModuleState::render(Operation *op, T &out) {
+  op->print(out, getAsmState());
+}
+
+template <typename T>
+void ModuleState::render(Value value, T &out) {
+  if (!value) {
+    out << "null";
+    return;
+  }
+
+  auto [name, _] = getFieldName(value);
+  if (name.empty()) {
+    llvm::raw_string_ostream os(name);
+    value.printAsOperand(os, globals.getAsmState());
+  }
+  out << name;
+}
+
+template <typename T>
+void ModuleState::renderLong(Value value, T &out) {
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    if (auto moduleOp = llvm::dyn_cast_if_present<FModuleLike>(
+            arg.getOwner()->getParentOp())) {
+      out << direction::toLongString(
+          moduleOp.getPortDirection(arg.getArgNumber()));
+      out << " module port ";
+    }
+  } else if (auto result = dyn_cast<OpResult>(value)) {
+    auto *op = result.getOwner();
+    if (auto inst = dyn_cast<FInstanceLike>(op)) {
+      out << direction::toLongString(
+          inst.getPortDirection(result.getResultNumber()));
+      out << " instance port ";
+    }
+  }
+
+  render(value, out);
+}
+
+template <typename T>
 // NOLINTNEXTLINE(misc-no-recursion)
-static Term *find(Term *x) {
+void ModuleState::render(Term *term, T &out) {
+  if (!term) {
+    out << "null";
+    return;
+  }
+  term = find(term);
+  if (auto *var = dyn_cast<VariableTerm>(term)) {
+    out << "?" << globals.getVariableID(var);
+    return;
+  }
+  if (auto *val = dyn_cast<ValueTerm>(term)) {
+    auto value = val->value;
+    render(value, out);
+    return;
+  }
+  if (auto *row = dyn_cast<RowTerm>(term)) {
+    out << "[";
+    llvm::interleaveComma(
+        llvm::seq(size_t(0), getNumDomains()), out, [&](auto i) {
+          render(row->elements[i], out);
+          out << " : " << getDomain(DomainTypeID{i}).getSymName();
+        });
+    out << "]";
+    return;
+  }
+  out << "unknown";
+}
+
+template <typename T>
+struct ModuleState::Render {
+  ModuleState *state;
+  T subject;
+};
+
+template <typename T>
+ModuleState::Render<T> ModuleState::render(T &&subject) {
+  return Render<T>{this, std::forward<T>(subject)};
+}
+
+template <typename T>
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &out,
+                                     ModuleState::Render<T> r) {
+  r.state->render(r.subject, out);
+  return out;
+}
+
+struct ModuleState::RenderLong {
+  ModuleState *state;
+  Value value;
+};
+
+ModuleState::RenderLong ModuleState::renderLong(Value value) {
+  return RenderLong{this, value};
+}
+
+static Diagnostic &operator<<(Diagnostic &diag, ModuleState::RenderLong r) {
+  r.state->renderLong(r.value, diag);
+  return diag;
+}
+
+// NOLINTNEXTLINE(misc-no-recursion)
+Term *ModuleState::find(Term *x) {
   if (!x)
     return nullptr;
 
@@ -237,59 +575,13 @@ static Term *find(Term *x) {
   return x;
 }
 
-/// A helper for assigning low numeric IDs to variables for user-facing output.
-namespace {
-class VariableIDTable {
-public:
-  size_t get(VariableTerm *term) {
-    return table.insert({term, table.size() + 1}).first->second;
-  }
-
-private:
-  DenseMap<VariableTerm *, size_t> table;
-};
-} // namespace
-
-// NOLINTNEXTLINE(misc-no-recursion)
-static void render(const DomainInfo &info, Diagnostic &out,
-                   VariableIDTable &idTable, Term *term) {
-  term = find(term);
-  if (auto *var = dyn_cast<VariableTerm>(term)) {
-    out << "?" << idTable.get(var);
-    return;
-  }
-  if (auto *val = dyn_cast<ValueTerm>(term)) {
-    auto value = val->value;
-    auto [name, _] = getFieldName(FieldRef(value, 0), false);
-    out << name;
-    return;
-  }
-  if (auto *row = dyn_cast<RowTerm>(term)) {
-    bool first = true;
-    out << "[";
-    for (size_t i = 0, e = info.getNumDomains(); i < e; ++i) {
-      auto domainOp = info.getDomain(DomainTypeID{i});
-      if (!first) {
-        out << ", ";
-        first = false;
-      }
-      out << domainOp.getName() << ": ";
-      render(info, out, idTable, row->elements[i]);
-    }
-    out << "]";
-    return;
-  }
-}
-
-static LogicalResult unify(Term *lhs, Term *rhs);
-
-static LogicalResult unify(VariableTerm *x, Term *y) {
+LogicalResult ModuleState::unify(VariableTerm *x, Term *y) {
   assert(!x->leader);
   x->leader = y;
   return success();
 }
 
-static LogicalResult unify(ValueTerm *xv, Term *y) {
+LogicalResult ModuleState::unify(ValueTerm *xv, Term *y) {
   if (auto *yv = dyn_cast<VariableTerm>(y)) {
     yv->leader = xv;
     return success();
@@ -302,7 +594,7 @@ static LogicalResult unify(ValueTerm *xv, Term *y) {
 }
 
 // NOLINTNEXTLINE(misc-no-recursion)
-static LogicalResult unify(RowTerm *lhsRow, Term *rhs) {
+LogicalResult ModuleState::unify(RowTerm *lhsRow, Term *rhs) {
   if (auto *rhsVar = dyn_cast<VariableTerm>(rhs)) {
     rhsVar->leader = lhsRow;
     return success();
@@ -317,13 +609,17 @@ static LogicalResult unify(RowTerm *lhsRow, Term *rhs) {
 }
 
 // NOLINTNEXTLINE(misc-no-recursion)
-static LogicalResult unify(Term *lhs, Term *rhs) {
+LogicalResult ModuleState::unify(Term *lhs, Term *rhs) {
   if (!lhs || !rhs)
     return success();
   lhs = find(lhs);
   rhs = find(rhs);
   if (lhs == rhs)
     return success();
+
+  LLVM_DEBUG(llvm::dbgs().indent(6)
+             << "unify " << render(lhs) << " = " << render(rhs) << "\n");
+
   if (auto *lhsVar = dyn_cast<VariableTerm>(lhs))
     return unify(lhsVar, rhs);
   if (auto *lhsVal = dyn_cast<ValueTerm>(lhs))
@@ -333,158 +629,270 @@ static LogicalResult unify(Term *lhs, Term *rhs) {
   return failure();
 }
 
-static void solve(Term *lhs, Term *rhs) {
+void ModuleState::solve(Term *lhs, Term *rhs) {
   [[maybe_unused]] auto result = unify(lhs, rhs);
   assert(result.succeeded());
 }
 
-namespace {
-class TermAllocator {
-public:
-  /// Allocate a row of fresh domain variables.
-  [[nodiscard]] RowTerm *allocRow(size_t size) {
-    SmallVector<Term *> elements;
-    elements.resize(size);
-    return allocRow(elements);
-  }
+RowTerm *ModuleState::allocRow(size_t size) {
+  SmallVector<Term *> elements;
+  elements.resize(size);
+  return allocRow(elements);
+}
 
-  /// Allocate a row of terms.
-  [[nodiscard]] RowTerm *allocRow(ArrayRef<Term *> elements) {
-    auto ds = allocArray(elements);
-    return alloc<RowTerm>(ds);
-  }
+RowTerm *ModuleState::allocRow(ArrayRef<Term *> elements) {
+  auto ds = allocArray(elements);
+  return alloc<RowTerm>(ds);
+}
 
-  /// Allocate a fresh variable.
-  [[nodiscard]] VariableTerm *allocVar() { return alloc<VariableTerm>(); }
+VariableTerm *ModuleState::allocVar() { return alloc<VariableTerm>(); }
 
-  /// Allocate a concrete domain.
-  [[nodiscard]] ValueTerm *allocVal(DomainValue value) {
-    return alloc<ValueTerm>(value);
-  }
+ValueTerm *ModuleState::allocVal(DomainValue value) {
+  return alloc<ValueTerm>(value);
+}
 
-private:
-  template <typename T, typename... Args>
-  [[nodiscard]] T *alloc(Args &&...args) {
-    static_assert(std::is_base_of_v<Term, T>, "T must be a term");
-    return new (allocator) T(std::forward<Args>(args)...);
-  }
+template <typename T, typename... Args>
+T *ModuleState::alloc(Args &&...args) {
+  static_assert(std::is_base_of_v<Term, T>, "T must be a term");
+  return new (allocator) T(std::forward<Args>(args)...);
+}
 
-  [[nodiscard]] ArrayRef<Term *> allocArray(ArrayRef<Term *> elements) {
-    auto size = elements.size();
-    if (size == 0)
-      return {};
+ArrayRef<Term *> ModuleState::allocArray(ArrayRef<Term *> elements) {
+  auto size = elements.size();
+  if (size == 0)
+    return {};
 
-    auto *result = allocator.Allocate<Term *>(size);
-    llvm::uninitialized_copy(elements, result);
-    for (size_t i = 0; i < size; ++i)
-      if (!result[i])
-        result[i] = alloc<VariableTerm>();
+  auto *result = allocator.Allocate<Term *>(size);
+  llvm::uninitialized_copy(elements, result);
+  for (size_t i = 0; i < size; ++i)
+    if (!result[i])
+      result[i] = alloc<VariableTerm>();
 
-    return ArrayRef(result, size);
-  }
+  return ArrayRef(result, size);
+}
 
-  llvm::BumpPtrAllocator allocator;
-};
-} // namespace
+DomainValue ModuleState::getOptUnderlyingDomain(DomainValue value) {
+  auto *term = getOptTermForDomain(value);
+  if (auto *val = llvm::dyn_cast_if_present<ValueTerm>(term))
+    return val->value;
+  return nullptr;
+}
 
-//====--------------------------------------------------------------------------
-// DomainTable: A mapping from IR to terms.
-//====--------------------------------------------------------------------------
-
-namespace {
-/// Tracks domain infomation for IR values.
-class DomainTable {
-public:
-  /// If the domain value is an alias, returns the domain it aliases.
-  DomainValue getOptUnderlyingDomain(DomainValue value) const {
-    auto *term = getOptTermForDomain(value);
-    if (auto *val = llvm::dyn_cast_if_present<ValueTerm>(term))
-      return val->value;
-    return nullptr;
-  }
-
-  /// Get the corresponding term for a domain in the IR, or null if unset.
-  Term *getOptTermForDomain(DomainValue value) const {
-    assert(isa<DomainType>(value.getType()));
-    auto it = termTable.find(value);
-    if (it == termTable.end())
-      return nullptr;
-    return find(it->second);
-  }
-
-  /// Get the corresponding term for a domain in the IR.
-  Term *getTermForDomain(DomainValue value) const {
-    auto *term = getOptTermForDomain(value);
-    assert(term);
-    return term;
-  }
-
-  /// Record a mapping from domain in the IR to its corresponding term.
-  void setTermForDomain(DomainValue value, Term *term) {
-    assert(term);
-    assert(!termTable.contains(value));
-    termTable.insert({value, term});
-  }
-
-  /// For a hardware value, get the term which represents the row of associated
-  /// domains. If no mapping has been defined, returns nullptr.
-  Term *getOptDomainAssociation(Value value) const {
-    assert(isa<FIRRTLBaseType>(value.getType()));
-    auto it = associationTable.find(value);
-    if (it == associationTable.end())
-      return nullptr;
-    return find(it->second);
-  }
-
-  /// For a hardware value, get the term which represents the row of associated
-  /// domains.
-  Term *getDomainAssociation(Value value) const {
-    auto *term = getOptDomainAssociation(value);
-    assert(term);
-    return term;
-  }
-
-  /// Record a mapping from a hardware value in the IR to a term which
-  /// represents the row of domains it is associated with.
-  void setDomainAssociation(Value value, Term *term) {
-    assert(isa<FIRRTLBaseType>(value.getType()));
-    assert(term);
-    term = find(term);
-    associationTable.insert({value, term});
-  }
-
-private:
-  /// Map from domains in the IR to their underlying term.
-  DenseMap<Value, Term *> termTable;
-
-  /// A map from hardware values to their associated row of domains, as a term.
-  DenseMap<Value, Term *> associationTable;
-};
-} // namespace
-
-//====--------------------------------------------------------------------------
-// Module processing: solve for the domain associations of hardware.
-//====--------------------------------------------------------------------------
-
-/// Get the corresponding term for a domain in the IR. If we don't know what the
-/// term is, then map the domain in the IR to a variable term.
-static Term *getTermForDomain(TermAllocator &allocator, DomainTable &table,
-                              DomainValue value) {
+Term *ModuleState::getOptTermForDomain(DomainValue value) {
   assert(isa<DomainType>(value.getType()));
-  if (auto *term = table.getOptTermForDomain(value))
+  auto it = termTable.find(value);
+  if (it == termTable.end())
+    return nullptr;
+  return find(it->second);
+}
+
+Term *ModuleState::getTermForDomain(DomainValue value) {
+  assert(isa<DomainType>(value.getType()));
+  if (auto *term = getOptTermForDomain(value))
     return term;
-  auto *term = allocator.allocVar();
-  table.setTermForDomain(value, term);
+  auto *term = allocVar();
+  setTermForDomain(value, term);
   return term;
 }
 
-static void processDomainDefinition(TermAllocator &allocator,
-                                    DomainTable &table, DomainValue domain) {
+void ModuleState::setTermForDomain(DomainValue value, Term *term) {
+  assert(term);
+  assert(!termTable.contains(value));
+  termTable.insert({value, term});
+  LLVM_DEBUG(llvm::dbgs().indent(6)
+             << "set " << render(value) << " := " << render(term) << "\n");
+}
+
+Term *ModuleState::getOptDomainAssociation(Value value) {
+  assert(isHardware(value));
+  auto it = associationTable.find(value);
+  if (it == associationTable.end())
+    return nullptr;
+  return find(it->second);
+}
+
+Term *ModuleState::getDomainAssociation(Value value) {
+  auto *term = getOptDomainAssociation(value);
+  assert(term);
+  return term;
+}
+
+void ModuleState::setDomainAssociation(Value value, Term *term) {
+  assert(isHardware(value));
+  assert(term);
+  term = find(term);
+  associationTable.insert({value, term});
+  LLVM_DEBUG({
+    llvm::dbgs().indent(6) << "set domains(" << render(value)
+                           << ") := " << render(term) << "\n";
+  });
+}
+
+bool ModuleState::isColorless(Value value) {
+  // Non-hardware values (domains, properties, indices, ...) never participate
+  // in coloring, so treat them as colorless: they impose no constraint.
+  if (!isHardware(value))
+    return true;
+
+  // Consult the memo table.  A value is visited (expanded) at most once.
+  if (auto it = colorlessTable.find(value); it != colorlessTable.end())
+    return it->second;
+
+  // Classify a single value structurally, without recursing.  A "look-through"
+  // value (a node or a pure primop) is colorless iff all of its hardware
+  // operands are colorless.  For every look-through op the operands to explore
+  // are exactly all of its operands (a node and a forwarding cast have a single
+  // input operand; a pure expression is only look-through when all of its
+  // operands are hardware), so the caller can iterate the defining op's operand
+  // list directly rather than collecting a subset here.  Everything else is
+  // either a colorless constant root or a colored leaf.  In particular, all
+  // ports (block arguments, instance results) and wires are colored and must be
+  // assigned a domain.
+  enum class Kind { Colorless, Colored, LookThrough };
+  auto classify = [&](Value v) -> Kind {
+    if (!isHardware(v))
+      return Kind::Colorless;
+
+    auto *op = v.getDefiningOp();
+    // Block arguments (ports) have no defining op and are always colored.
+    if (!op)
+      return Kind::Colored;
+
+    // Constants are the only colorless roots.
+    if (op->hasTrait<OpTrait::ConstantLike>())
+      return Kind::Colorless;
+
+    // A node forwards its single input.
+    if (isa<NodeOp>(op))
+      return Kind::LookThrough;
+
+    // An unsafe domain cast with explicit domain operands is an explicit
+    // coloring point and is always colored.  A cast with no domain operands is
+    // a pure forwarding cast that inherits colorlessness from its input.
+    if (auto castOp = dyn_cast<UnsafeDomainCastOp>(op)) {
+      if (!castOp.getDomains().empty())
+        return Kind::Colored;
+      return Kind::LookThrough;
+    }
+
+    // Pure, memory-effect-free expression ops (prim ops, muxes, casts,
+    // aggregate projections) fan out to their hardware-typed operands.  For
+    // the ops that are eligible to propagate colorlessness (arithmetic and
+    // bitwise prim ops, muxes, casts, aggregate projections) every SSA operand
+    // is hardware-typed; scalar indices and amounts are attributes, not
+    // operands.  A non-hardware SSA operand (a property, domain, or other
+    // opaque value, e.g. a `verbatim.expr` substitution) therefore only
+    // appears on ops that reference external state, which are colored.  An
+    // expression with no hardware operands is likewise a non-constant root
+    // (e.g. an `xmr.ref`) and is colored.
+    if (isExpression(op) && mlir::isMemoryEffectFree(op)) {
+      if (op->getNumOperands() == 0)
+        return Kind::Colored;
+      for (auto operand : op->getOperands())
+        if (!isHardware(operand))
+          return Kind::Colored;
+      return Kind::LookThrough;
+    }
+
+    // Everything else (wires, instance results, registers, memories, explicit
+    // domain casts, invalid values, probes, ...) is a colored leaf.
+    return Kind::Colored;
+  };
+
+  // Iterative post-order DFS.  Each frame tracks a look-through value (a value
+  // whose colorlessness is not yet known) and requires exploring its operands.
+  // Every look-through op explores all of its operands, so the frame only needs
+  // the value (whose defining op supplies the operands) and the index of the
+  // _next_ operand to visit.  A value's colorlessness is the conjunction of its
+  // operands' colorlessness.  As soon as a colored operand is found the frame
+  // short-circuits to colored.  Since look-through values (constants, nodes,
+  // primops) reference only dominating SSA operands, the explored subgraph is
+  // acyclic (combinational loops only close through wires, which are colored
+  // leaves).
+  //
+  // Note: this DFS is _not_ sufficient to determine colorlessness through
+  // nodes.  It is assumed that a post-condition of this pass is that all wires
+  // are assigned domains.
+  struct Frame {
+    // The lookthrough value whose colorlessness is being resolved.  Its
+    // defining op supplies the operands to explore; every look-through op
+    // explores all of its operands.
+    Value value;
+    // The index of the next operand to explore.
+    unsigned index = 0;
+  };
+  SmallVector<Frame> stack;
+
+  // Push the first value onto the stack (or exit).
+  switch (classify(value)) {
+  case Kind::Colored:
+    return colorlessTable[value] = false;
+  case Kind::Colorless:
+    return colorlessTable[value] = true;
+  case Kind::LookThrough:
+    stack.push_back({value});
+    break;
+  }
+
+  // Run the DFS.
+  while (!stack.empty()) {
+    auto &frame = stack.back();
+    auto *op = frame.value.getDefiningOp();
+    bool colored = false, pushed = false;
+
+    while (frame.index < op->getNumOperands()) {
+      Value child = op->getOperand(frame.index);
+
+      // If already resolved, short-circuit on a colored operand or advance.
+      if (auto it = colorlessTable.find(child); it != colorlessTable.end()) {
+        if (!it->second) {
+          colored = true;
+          break;
+        }
+        ++frame.index;
+        continue;
+      }
+
+      // Classify the operand.  Classify if not lookthrough.  Otherwise, push
+      // the lookthrough operand onto the stack and break so that we descend
+      // into it.
+      switch (classify(child)) {
+      case Kind::Colored:
+        colorlessTable[child] = false;
+        colored = true;
+        break;
+      case Kind::Colorless:
+        colorlessTable[child] = true;
+        ++frame.index;
+        continue;
+      case Kind::LookThrough:
+        stack.push_back({child});
+        pushed = true;
+        break;
+      }
+      break;
+    }
+
+    // We hit a lookthrough operand.  Dexcend into this.  We will revisit the
+    // current frame.index once we have an answer for that operand.
+    if (pushed)
+      continue;
+
+    // All operands resolved (or a colored operand short-circuited).  Record the
+    // result and pop this frame.
+    colorlessTable[frame.value] = !colored;
+    stack.pop_back();
+  }
+
+  return colorlessTable[value];
+}
+
+void ModuleState::processDomainDefinition(DomainValue domain) {
   assert(isa<DomainType>(domain.getType()));
-  auto *newTerm = allocator.allocVal(domain);
-  auto *oldTerm = table.getOptTermForDomain(domain);
+  auto *newTerm = allocVal(domain);
+  auto *oldTerm = getOptTermForDomain(domain);
   if (!oldTerm) {
-    table.setTermForDomain(domain, newTerm);
+    setTermForDomain(domain, newTerm);
     return;
   }
 
@@ -492,18 +900,14 @@ static void processDomainDefinition(TermAllocator &allocator,
   assert(result.succeeded());
 }
 
-/// Get the row of domains that a hardware value in the IR is associated with.
-/// The returned term is forced to be at least a row.
-static RowTerm *getDomainAssociationAsRow(const DomainInfo &info,
-                                          TermAllocator &allocator,
-                                          DomainTable &table, Value value) {
-  assert(isa<FIRRTLBaseType>(value.getType()));
-  auto *term = table.getOptDomainAssociation(value);
+RowTerm *ModuleState::getDomainAssociationAsRow(Value value) {
+  assert(isHardware(value));
+  auto *term = getOptDomainAssociation(value);
 
   // If the term is unknown, allocate a fresh row and set the association.
   if (!term) {
-    auto *row = allocator.allocRow(info.getNumDomains());
-    table.setDomainAssociation(value, row);
+    auto *row = allocRow(getNumDomains());
+    setDomainAssociation(value, row);
     return row;
   }
 
@@ -513,7 +917,7 @@ static RowTerm *getDomainAssociationAsRow(const DomainInfo &info,
 
   // Otherwise, unify the term with a fresh row of domains.
   if (auto *var = dyn_cast<VariableTerm>(term)) {
-    auto *row = allocator.allocRow(info.getNumDomains());
+    auto *row = allocRow(getNumDomains());
     solve(var, row);
     return row;
   }
@@ -522,7 +926,7 @@ static RowTerm *getDomainAssociationAsRow(const DomainInfo &info,
   return nullptr;
 }
 
-static void noteLocation(mlir::InFlightDiagnostic &diag, Operation *op) {
+void ModuleState::noteLocation(InFlightDiagnostic &diag, Operation *op) {
   auto &note = diag.attachNote(op->getLoc());
   if (auto mod = dyn_cast<FModuleOp>(op)) {
     note << "in module " << mod.getModuleNameAttr();
@@ -544,40 +948,159 @@ static void noteLocation(mlir::InFlightDiagnostic &diag, Operation *op) {
   note << "here";
 }
 
-template <typename T>
-static void emitPortDomainCrossingError(const DomainInfo &info, T op, size_t i,
-                                        DomainTypeID domainTypeID, Term *term1,
-                                        Term *term2) {
-  VariableIDTable idTable;
+void ModuleState::noteDomain(InFlightDiagnostic &diag, DomainValue domain) {
+  auto &note = diag.attachNote(domain.getLoc());
+  note << renderLong(domain);
 
-  auto portName = op.getPortNameAttr(i);
-  auto portLoc = op.getPortLocation(i);
-  auto domainDecl = info.getDomain(domainTypeID);
-  auto domainName = domainDecl.getNameAttr();
+  if (globals.inserted.contains(domain)) {
+    note << " automatically inserted here";
+    return;
+  }
 
-  auto diag = emitError(portLoc);
-  diag << "illegal " << domainName << " crossing in port " << portName;
+  note << " declared here";
+}
 
-  auto &note1 = diag.attachNote();
-  note1 << "1st instance: ";
-  render(info, note1, idTable, term1);
+void ModuleState::noteDomainSource(InFlightDiagnostic &diag,
+                                   DomainValue domain) {
+  auto &irns = globals.getInnerRefNamespace();
+  SmallVector<FInstanceLike> stack;
+  llvm::SmallDenseSet<DomainValue> seen;
 
-  auto &note2 = diag.attachNote();
-  note2 << "2nd instance: ";
-  render(info, note2, idTable, term2);
+  // This is reusing "domain" across iterations of the while loop.
 
-  noteLocation(diag, op);
+  auto chaseConnect = [&]() {
+    for (auto *user : domain.getUsers()) {
+      if (auto defineOp = dyn_cast<DomainDefineOp>(user)) {
+        if (defineOp.getDest() != domain)
+          continue;
+        auto src = defineOp.getSrc();
+        diag.attachNote(defineOp.getLoc())
+            << renderLong(domain) << " aliases " << renderLong(src);
+        domain = defineOp.getSrc();
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto chaseModulePort = [&]() {
+    auto arg = dyn_cast<BlockArgument>(domain);
+    if (!arg)
+      return false;
+
+    auto module =
+        llvm::dyn_cast_if_present<FModuleOp>(arg.getOwner()->getParentOp());
+    if (!module)
+      return false;
+
+    auto name = module.getModuleNameAttr();
+    while (!stack.empty()) {
+      auto instance = stack.back();
+      stack.pop_back();
+      auto referenced = instance.getReferencedModuleNamesAttr().getValue();
+      if (llvm::is_contained(referenced, name)) {
+        domain = cast<DomainValue>(instance->getResult(arg.getArgNumber()));
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto chaseInstancePort = [&]() {
+    auto result = dyn_cast<OpResult>(domain);
+    if (!result)
+      return false;
+
+    auto inst = dyn_cast<FInstanceLike>(result.getOwner());
+    if (!inst)
+      return false;
+
+    auto index = result.getResultNumber();
+    if (inst.getPortDirection(index) == Direction::In)
+      return false;
+
+    auto names = inst.getReferencedModuleNamesAttr().getAsRange<StringAttr>();
+    for (auto name : names) {
+      auto moduleLike = cast<FModuleLike>(irns.symTable.lookup(name));
+      if (auto moduleOp = dyn_cast<FModuleOp>(moduleLike.getOperation())) {
+        stack.push_back(inst);
+        domain = cast<DomainValue>(moduleOp.getArgument(index));
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto chaseUnderlying = [&]() {
+    if (auto *term = getOptTermForDomain(domain)) {
+      if (auto *val = dyn_cast<ValueTerm>(term)) {
+        if (domain != val->value) {
+          diag.attachNote(domain.getLoc())
+              << renderLong(domain) << " aliases " << renderLong(val->value);
+          domain = val->value;
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  while (true) {
+    auto [it, inserted] = seen.insert(domain);
+    if (!inserted)
+      return;
+
+    noteDomain(diag, domain);
+    chaseConnect() || chaseModulePort() || chaseInstancePort() ||
+        chaseUnderlying();
+  }
+}
+
+void ModuleState::noteDomainSource(InFlightDiagnostic &diag, Term *term) {
+  auto *val = dyn_cast<ValueTerm>(find(term));
+  if (!val)
+    return;
+
+  noteDomainSource(diag, val->value);
+}
+
+void ModuleState::emitDomainCrossingError(Operation *op, Value lhs,
+                                          Term *lhsTerm, Value rhs,
+                                          Term *rhsTerm) {
+  auto *lhsRow = cast<RowTerm>(lhsTerm);
+  auto *rhsRow = cast<RowTerm>(rhsTerm);
+  auto diag =
+      op->emitError("illegal domain crossing in operation between operands ");
+  render(lhs, diag);
+  diag << " and ";
+  render(rhs, diag);
+  auto &note1 = diag.attachNote(lhs.getLoc());
+  render(lhs, note1);
+  note1 << " has domains ";
+  render(lhsRow, note1);
+  auto &note2 = diag.attachNote(rhs.getLoc());
+  render(rhs, note2);
+  note2 << " has domains ";
+  render(rhsRow, note2);
+
+  for (size_t i = 0, e = getNumDomains(); i < e; ++i) {
+    auto *lhsDomain = find(lhsRow->elements[i]);
+    auto *rhsDomain = find(rhsRow->elements[i]);
+    if (lhsDomain == rhsDomain)
+      continue;
+
+    noteDomainSource(diag, lhsDomain);
+    noteDomainSource(diag, rhsDomain);
+  }
 }
 
 template <typename T>
-static void emitDuplicatePortDomainError(const DomainInfo &info, T op, size_t i,
-                                         DomainTypeID domainTypeID,
-                                         IntegerAttr domainPortIndexAttr1,
-                                         IntegerAttr domainPortIndexAttr2) {
-  VariableIDTable idTable;
+void ModuleState::emitDuplicatePortDomainError(
+    T op, size_t i, DomainTypeID domainTypeID, IntegerAttr domainPortIndexAttr1,
+    IntegerAttr domainPortIndexAttr2) {
   auto portName = op.getPortNameAttr(i);
   auto portLoc = op.getPortLocation(i);
-  auto domainDecl = info.getDomain(domainTypeID);
+  auto domainDecl = getDomain(domainTypeID);
   auto domainName = domainDecl.getNameAttr();
   auto domainPortIndex1 = domainPortIndexAttr1.getUInt();
   auto domainPortIndex2 = domainPortIndexAttr2.getUInt();
@@ -597,7 +1120,7 @@ static void emitDuplicatePortDomainError(const DomainInfo &info, T op, size_t i,
 /// Emit an error when we fail to infer the concrete domain to drive to a
 /// domain port.
 template <typename T>
-static void emitDomainPortInferenceError(T op, size_t i) {
+void ModuleState::emitDomainPortInferenceError(T op, size_t i) {
   auto name = op.getPortNameAttr(i);
   auto diag = emitError(op->getLoc());
   auto info = op.getDomainInfo();
@@ -618,13 +1141,12 @@ static void emitDomainPortInferenceError(T op, size_t i) {
 }
 
 template <typename T>
-static void emitAmbiguousPortDomainAssociation(
-    const DomainInfo &info, T op,
-    const llvm::TinyPtrVector<DomainValue> &exports, DomainTypeID typeID,
+void ModuleState::emitAmbiguousPortDomainAssociation(
+    T op, const llvm::TinyPtrVector<DomainValue> &exports, DomainTypeID typeID,
     size_t i) {
   auto portName = op.getPortNameAttr(i);
   auto portLoc = op.getPortLocation(i);
-  auto domainDecl = info.getDomain(typeID);
+  auto domainDecl = getDomain(typeID);
   auto domainName = domainDecl.getNameAttr();
   auto diag = emitError(portLoc) << "ambiguous " << domainName
                                  << " association for port " << portName;
@@ -638,10 +1160,10 @@ static void emitAmbiguousPortDomainAssociation(
 }
 
 template <typename T>
-static void emitMissingPortDomainAssociationError(const DomainInfo &info, T op,
-                                                  DomainTypeID typeID,
-                                                  size_t i) {
-  auto domainName = info.getDomain(typeID).getNameAttr();
+void ModuleState::emitMissingPortDomainAssociationError(T op,
+                                                        DomainTypeID typeID,
+                                                        size_t i) {
+  auto domainName = getDomain(typeID).getNameAttr();
   auto portName = op.getPortNameAttr(i);
   auto diag = emitError(op.getPortLocation(i))
               << "missing " << domainName << " association for port "
@@ -649,57 +1171,74 @@ static void emitMissingPortDomainAssociationError(const DomainInfo &info, T op,
   noteLocation(diag, op);
 }
 
-/// Unify the associated domain rows of two terms.
-static LogicalResult unifyAssociations(const DomainInfo &info,
-                                       TermAllocator &allocator,
-                                       DomainTable &table, Operation *op,
-                                       Value lhs, Value rhs) {
+LogicalResult ModuleState::unifyAssociations(Operation *op, Value lhs,
+                                             Value rhs) {
   if (!lhs || !rhs)
     return success();
 
   if (lhs == rhs)
     return success();
 
-  auto *lhsTerm = table.getOptDomainAssociation(lhs);
-  auto *rhsTerm = table.getOptDomainAssociation(rhs);
+  if (!isHardware(lhs) || !isHardware(rhs))
+    return success();
+
+  // Colorless values impose and receive no association: colorless is below
+  // every color in the lattice.
+  if (isColorless(lhs) || isColorless(rhs))
+    return success();
+
+  LLVM_DEBUG({
+    llvm::dbgs().indent(6) << "unify domains(" << render(lhs) << ") = domains("
+                           << render(rhs) << ")\n";
+  });
+
+  auto *lhsTerm = getOptDomainAssociation(lhs);
+  auto *rhsTerm = getOptDomainAssociation(rhs);
 
   if (lhsTerm) {
     if (rhsTerm) {
       if (failed(unify(lhsTerm, rhsTerm))) {
-        auto diag = op->emitOpError("illegal domain crossing in operation");
-        auto &note1 = diag.attachNote(lhs.getLoc());
-
-        note1 << "1st operand has domains: ";
-        VariableIDTable idTable;
-        render(info, note1, idTable, lhsTerm);
-
-        auto &note2 = diag.attachNote(rhs.getLoc());
-        note2 << "2nd operand has domains: ";
-        render(info, note2, idTable, rhsTerm);
-
+        emitDomainCrossingError(op, lhs, lhsTerm, rhs, rhsTerm);
         return failure();
       }
+      return success();
     }
-    table.setDomainAssociation(rhs, lhsTerm);
+    setDomainAssociation(rhs, lhsTerm);
     return success();
   }
 
   if (rhsTerm) {
-    table.setDomainAssociation(lhs, rhsTerm);
+    setDomainAssociation(lhs, rhsTerm);
     return success();
   }
 
-  auto *var = allocator.allocVar();
-  table.setDomainAssociation(lhs, var);
-  table.setDomainAssociation(rhs, var);
+  auto *var = allocVar();
+  setDomainAssociation(lhs, var);
+  setDomainAssociation(rhs, var);
   return success();
 }
 
-static LogicalResult processModulePorts(const DomainInfo &info,
-                                        TermAllocator &allocator,
-                                        DomainTable &table,
-                                        FModuleOp moduleOp) {
-  auto numDomains = info.getNumDomains();
+template <typename T>
+LogicalResult ModuleState::unifyAssociations(Operation *op, T &&range) {
+  Value lhs;
+  for (auto rhs : std::forward<T>(range)) {
+    if (!isHardware(rhs) || isColorless(rhs))
+      continue;
+    if (failed(unifyAssociations(op, lhs, rhs)))
+      return failure();
+    lhs = rhs;
+  }
+
+  return success();
+}
+
+LogicalResult ModuleState::unifyAssociations(Operation *op) {
+  return unifyAssociations(
+      op, llvm::concat<Value>(op->getOperands(), op->getResults()));
+}
+
+LogicalResult ModuleState::processModulePorts(FModuleOp moduleOp) {
+  auto numDomains = getNumDomains();
   auto domainInfo = moduleOp.getDomainInfoAttr();
   auto numPorts = moduleOp.getNumPorts();
 
@@ -709,24 +1248,29 @@ static LogicalResult processModulePorts(const DomainInfo &info,
     if (!port)
       continue;
 
-    if (moduleOp.getPortDirection(i) == Direction::In)
-      processDomainDefinition(allocator, table, port);
+    LLVM_DEBUG(llvm::dbgs().indent(4)
+               << "process port " << render(port) << "\n");
 
-    domainTypeIDTable[i] = info.getDomainTypeID(moduleOp, i);
+    if (moduleOp.getPortDirection(i) == Direction::In)
+      processDomainDefinition(port);
+
+    domainTypeIDTable[i] = getDomainTypeID(moduleOp, i);
   }
 
   for (size_t i = 0; i < numPorts; ++i) {
     BlockArgument port = moduleOp.getArgument(i);
-    auto type = type_dyn_cast<FIRRTLBaseType>(port.getType());
-    if (!type)
+    if (!isHardware(port))
       continue;
+
+    LLVM_DEBUG(llvm::dbgs().indent(4)
+               << "process port " << render(port) << "\n");
 
     SmallVector<IntegerAttr> associations(numDomains);
     for (auto domainPortIndex : getPortDomainAssociation(domainInfo, i)) {
       auto domainTypeID = domainTypeIDTable.at(domainPortIndex.getUInt());
       auto prevDomainPortIndex = associations[domainTypeID.index];
       if (prevDomainPortIndex) {
-        emitDuplicatePortDomainError(info, moduleOp, i, domainTypeID,
+        emitDuplicatePortDomainError(moduleOp, i, domainTypeID,
                                      prevDomainPortIndex, domainPortIndex);
         return failure();
       }
@@ -741,22 +1285,19 @@ static LogicalResult processModulePorts(const DomainInfo &info,
         continue;
       auto domainPortValue =
           cast<DomainValue>(moduleOp.getArgument(domainPortIndex.getUInt()));
-      elements[domainTypeIndex] =
-          getTermForDomain(allocator, table, domainPortValue);
+      elements[domainTypeIndex] = getTermForDomain(domainPortValue);
     }
 
-    auto *domainAssociations = allocator.allocRow(elements);
-    table.setDomainAssociation(port, domainAssociations);
+    auto *domainAssociations = allocRow(elements);
+    setDomainAssociation(port, domainAssociations);
   }
 
   return success();
 }
 
 template <typename T>
-static LogicalResult processInstancePorts(const DomainInfo &info,
-                                          TermAllocator &allocator,
-                                          DomainTable &table, T op) {
-  auto numDomains = info.getNumDomains();
+LogicalResult ModuleState::processInstancePorts(T op) {
+  auto numDomains = getNumDomains();
   auto domainInfo = op.getDomainInfoAttr();
   auto numPorts = op.getNumPorts();
 
@@ -767,15 +1308,14 @@ static LogicalResult processInstancePorts(const DomainInfo &info,
       continue;
 
     if (op.getPortDirection(i) == Direction::Out)
-      processDomainDefinition(allocator, table, port);
+      processDomainDefinition(port);
 
-    domainTypeIDTable[i] = info.getDomainTypeID(op, i);
+    domainTypeIDTable[i] = getDomainTypeID(op, i);
   }
 
   for (size_t i = 0; i < numPorts; ++i) {
     Value port = op->getResult(i);
-    auto type = type_dyn_cast<FIRRTLBaseType>(port.getType());
-    if (!type)
+    if (!isHardware(port))
       continue;
 
     SmallVector<IntegerAttr> associations(numDomains);
@@ -783,8 +1323,8 @@ static LogicalResult processInstancePorts(const DomainInfo &info,
       auto domainTypeID = domainTypeIDTable.at(domainPortIndex.getUInt());
       auto prevDomainPortIndex = associations[domainTypeID.index];
       if (prevDomainPortIndex) {
-        emitDuplicatePortDomainError(info, op, i, domainTypeID,
-                                     prevDomainPortIndex, domainPortIndex);
+        emitDuplicatePortDomainError(op, i, domainTypeID, prevDomainPortIndex,
+                                     domainPortIndex);
         return failure();
       }
       associations[domainTypeID.index] = domainPortIndex;
@@ -798,72 +1338,79 @@ static LogicalResult processInstancePorts(const DomainInfo &info,
         continue;
       auto domainPortValue =
           cast<DomainValue>(op->getResult(domainPortIndex.getUInt()));
-      elements[domainTypeIndex] =
-          getTermForDomain(allocator, table, domainPortValue);
+      elements[domainTypeIndex] = getTermForDomain(domainPortValue);
     }
 
-    auto *domainAssociations = allocator.allocRow(elements);
-    table.setDomainAssociation(port, domainAssociations);
+    auto *domainAssociations = allocRow(elements);
+    setDomainAssociation(port, domainAssociations);
   }
 
   return success();
 }
 
-static LogicalResult processOp(const DomainInfo &info, TermAllocator &allocator,
-                               DomainTable &table,
-                               const ModuleUpdateTable &updateTable,
-                               FInstanceLike op) {
+FInstanceLike ModuleState::fixInstancePorts(FInstanceLike op,
+                                            const ModuleUpdateInfo &update) {
+  auto clone = op.cloneWithInsertedPortsAndReplaceUses(update.portInsertions);
+  clone.setDomainInfoAttr(update.portDomainInfo);
+  op->erase();
+  dirty();
+  LLVM_DEBUG(llvm::dbgs().indent(6) << "fixup " << render(clone) << "\n");
+  return clone;
+}
+
+LogicalResult ModuleState::processOp(FInstanceLike op) {
   auto moduleName =
       cast<StringAttr>(cast<ArrayAttr>(op.getReferencedModuleNamesAttr())[0]);
+  auto updateTable = getModuleUpdateTable();
   auto lookup = updateTable.find(moduleName);
   if (lookup != updateTable.end())
     op = fixInstancePorts(op, lookup->second);
-  return processInstancePorts(info, allocator, table, op);
+  return processInstancePorts(op);
 }
 
-static LogicalResult processOp(const DomainInfo &info, TermAllocator &allocator,
-                               DomainTable &table, UnsafeDomainCastOp op) {
+LogicalResult ModuleState::processOp(UnsafeDomainCastOp op) {
   auto domains = op.getDomains();
   if (domains.empty())
-    return unifyAssociations(info, allocator, table, op, op.getInput(),
-                             op.getResult());
+    return unifyAssociations(op, op.getInput(), op.getResult());
 
   auto input = op.getInput();
-  RowTerm *inputRow = getDomainAssociationAsRow(info, allocator, table, input);
-  SmallVector<Term *> elements(inputRow->elements);
-  for (auto value : op.getDomains()) {
-    auto domain = cast<DomainValue>(value);
-    auto typeID = info.getDomainTypeID(domain);
-    elements[typeID.index] = getTermForDomain(allocator, table, domain);
+
+  SmallVector<Term *> elements(getNumDomains());
+  if (isHardware(input) && !isColorless(input)) {
+    auto *inputRow = getDomainAssociationAsRow(input);
+    elements.assign(inputRow->elements);
   }
 
-  auto *row = allocator.allocRow(elements);
-  table.setDomainAssociation(op.getResult(), row);
+  for (auto value : op.getDomains()) {
+    auto domain = cast<DomainValue>(value);
+    auto typeID = getDomainTypeID(domain);
+    elements[typeID.index] = getTermForDomain(domain);
+  }
+
+  auto *row = allocRow(elements);
+  setDomainAssociation(op.getResult(), row);
   return success();
 }
 
-static LogicalResult processOp(const DomainInfo &info, TermAllocator &allocator,
-                               DomainTable &table, DomainDefineOp op) {
+LogicalResult ModuleState::processOp(DomainDefineOp op) {
   auto src = op.getSrc();
   auto dst = op.getDest();
-  auto *srcTerm = getTermForDomain(allocator, table, src);
-  auto *dstTerm = getTermForDomain(allocator, table, dst);
+
+  auto *srcTerm = getTermForDomain(src);
+  auto *dstTerm = getTermForDomain(dst);
   if (succeeded(unify(dstTerm, srcTerm)))
     return success();
 
   auto diag =
       op->emitOpError()
       << "defines a domain value that was inferred to be a different domain '";
-  VariableIDTable idTable;
-  auto dstName = getFieldName(FieldRef(dst, 0), false).first;
-  render(info, *diag.getUnderlyingDiagnostic(), idTable, dstTerm);
+  render(dstTerm, diag);
   diag << "'";
 
   return failure();
 }
 
-static LogicalResult processOp(const DomainInfo &info, TermAllocator &allocator,
-                               DomainTable &table, WireOp op) {
+LogicalResult ModuleState::processOp(WireOp op) {
   // If the wire has explicit domain operands, seed the domain table with them
   // as constraints. When this op is visited, connections have not yet been
   // processed (wire declarations precede their uses), so the existing row
@@ -871,154 +1418,111 @@ static LogicalResult processOp(const DomainInfo &info, TermAllocator &allocator,
   // between an explicit wire domain and a connection's inferred domain is
   // caught later by the connection's own processOp.
   if (op.getDomains().empty())
-    return success();
+    return unifyAssociations(op, op.getResults());
 
   // Build a row with the explicitly-specified domain slots filled in and set
   // it as the association for this wire result.
-  SmallVector<Term *> elements(info.getNumDomains());
+  SmallVector<Term *> elements(getNumDomains());
   for (auto domain : op.getDomains()) {
     auto domainValue = cast<DomainValue>(domain);
-    auto typeID = info.getDomainTypeID(domainValue);
-    elements[typeID.index] = getTermForDomain(allocator, table, domainValue);
+    auto typeID = getDomainTypeID(domainValue);
+    elements[typeID.index] = getTermForDomain(domainValue);
   }
-  table.setDomainAssociation(op.getResult(), allocator.allocRow(elements));
+
+  auto *row = allocRow(elements);
+  for (auto result : op.getResults())
+    setDomainAssociation(result, row);
 
   return success();
 }
 
-static LogicalResult processOp(const DomainInfo &info, TermAllocator &allocator,
-                               DomainTable &table,
-                               const ModuleUpdateTable &updateTable,
-                               Operation *op) {
+LogicalResult ModuleState::processOp(RWProbeOp op) {
+  auto target = globals.getInnerRefNamespace().lookup(op.getTarget());
+
+  if (target.isPort()) {
+    auto targetOp = cast<FModuleOp>(target.getOp());
+    auto targetValue = targetOp.getArgument(target.getPort());
+    return unifyAssociations(op, targetValue, op.getResult());
+  }
+
+  auto targetOp = cast<hw::InnerSymbolOpInterface>(target.getOp());
+  auto targetValue = targetOp.getTargetResult();
+  return unifyAssociations(op, targetValue, op.getResult());
+}
+
+LogicalResult ModuleState::processOp(Operation *op) {
+  LLVM_DEBUG(llvm::dbgs().indent(4) << "process " << render(op) << "\n");
   if (auto instance = dyn_cast<FInstanceLike>(op))
-    return processOp(info, allocator, table, updateTable, instance);
+    return processOp(instance);
   if (auto wireOp = dyn_cast<WireOp>(op))
-    return processOp(info, allocator, table, wireOp);
+    return processOp(wireOp);
   if (auto cast = dyn_cast<UnsafeDomainCastOp>(op))
-    return processOp(info, allocator, table, cast);
+    return processOp(cast);
   if (auto def = dyn_cast<DomainDefineOp>(op))
-    return processOp(info, allocator, table, def);
+    return processOp(def);
+  if (auto probe = dyn_cast<RWProbeOp>(op))
+    return processOp(probe);
   if (auto create = dyn_cast<DomainCreateOp>(op)) {
-    processDomainDefinition(allocator, table, create);
+    processDomainDefinition(create);
     return success();
   }
   if (auto createAnon = dyn_cast<DomainCreateAnonOp>(op)) {
-    processDomainDefinition(allocator, table, createAnon);
+    processDomainDefinition(createAnon);
     return success();
   }
 
-  // For all other operations (including connections), propagate domains from
-  // operands to results. This is a conservative approach - all operands and
-  // results share the same domain associations.
-  Value lhs;
-  for (auto rhs : op->getOperands()) {
-    if (!isa<FIRRTLBaseType>(rhs.getType()))
-      continue;
-    if (auto *op = rhs.getDefiningOp();
-        op && op->hasTrait<OpTrait::ConstantLike>())
-      continue;
-    if (failed(unifyAssociations(info, allocator, table, op, lhs, rhs)))
-      return failure();
-    lhs = rhs;
-  }
-  for (auto rhs : op->getResults()) {
-    if (!isa<FIRRTLBaseType>(rhs.getType()))
-      continue;
-    if (auto *op = rhs.getDefiningOp();
-        op && op->hasTrait<OpTrait::ConstantLike>())
-      continue;
-    if (failed(unifyAssociations(info, allocator, table, op, lhs, rhs)))
-      return failure();
-    lhs = rhs;
-  }
-  return success();
+  return unifyAssociations(op);
 }
 
-static LogicalResult processModuleBody(const DomainInfo &info,
-                                       TermAllocator &allocator,
-                                       DomainTable &table,
-                                       const ModuleUpdateTable &updateTable,
-                                       FModuleOp moduleOp) {
-  return failure(moduleOp.getBody()
-                     .walk([&](Operation *op) -> WalkResult {
-                       return processOp(info, allocator, table, updateTable,
-                                        op);
-                     })
-                     .wasInterrupted());
+LogicalResult ModuleState::processModuleBody(FModuleOp moduleOp) {
+  return failure(
+      moduleOp.getBody()
+          .walk([&](Operation *op) -> WalkResult { return processOp(op); })
+          .wasInterrupted());
 }
 
-/// Populate the domain table by processing the moduleOp. If the moduleOp has
-/// any domain crossing errors, return failure.
-static LogicalResult processModule(const DomainInfo &info,
-                                   TermAllocator &allocator, DomainTable &table,
-                                   const ModuleUpdateTable &updateTable,
-                                   FModuleOp moduleOp) {
-  if (failed(processModulePorts(info, allocator, table, moduleOp)))
+LogicalResult ModuleState::processModule(FModuleOp moduleOp) {
+  LLVM_DEBUG(llvm::dbgs().indent(2) << "processing:\n");
+  if (failed(processModulePorts(moduleOp)))
     return failure();
-  if (failed(processModuleBody(info, allocator, table, updateTable, moduleOp)))
+  if (failed(processModuleBody(moduleOp)))
     return failure();
   return success();
 }
 
-//===---------------------------------------------------------------------------
-// ExportTable
-//===---------------------------------------------------------------------------
-
-/// A map from domain IR values defined internal to the moduleOp, to ports that
-/// alias that domain. These ports make the domain useable as associations of
-/// ports, and we say these are exporting ports.
-using ExportTable = DenseMap<DomainValue, TinyPtrVector<DomainValue>>;
-
-/// Build a table of exported domains: a map from domains defined internally,
-/// to their set of aliasing output ports.
-static ExportTable initializeExportTable(const DomainTable &table,
-                                         FModuleOp moduleOp) {
+ExportTable ModuleState::initializeExportTable(FModuleOp moduleOp) {
   ExportTable exports;
   size_t numPorts = moduleOp.getNumPorts();
   for (size_t i = 0; i < numPorts; ++i) {
     auto port = dyn_cast<DomainValue>(moduleOp.getArgument(i));
     if (!port)
       continue;
-    auto value = table.getOptUnderlyingDomain(port);
+    auto value = getOptUnderlyingDomain(port);
     if (value)
       exports[value].push_back(port);
   }
 
+  LLVM_DEBUG({
+    llvm::dbgs().indent(2) << "domain exports:\n";
+    for (auto entry : exports) {
+      llvm::dbgs().indent(4) << render(entry.first) << " exported as ";
+      llvm::interleaveComma(entry.second, llvm::dbgs(),
+                            [&](auto e) { llvm::dbgs() << render(e); });
+      llvm::dbgs() << "\n";
+    }
+  });
+
   return exports;
 }
 
-//====--------------------------------------------------------------------------
-// Updating: write domains back to the IR.
-//====--------------------------------------------------------------------------
-
-/// A map from unsolved variables to a port index, where that port has not yet
-/// been created. Eventually we will have an input domain at the port index,
-/// which will be the solution to the recorded variable.
-using PendingSolutions = DenseMap<VariableTerm *, unsigned>;
-
-/// A map from local domains to an aliasing port index, where that port has not
-/// yet been created. Eventually we will be exporting the domain value at the
-/// port index.
-using PendingExports = llvm::MapVector<DomainValue, unsigned>;
-
-namespace {
-struct PendingUpdates {
-  PortInsertions insertions;
-  PendingSolutions solutions;
-  PendingExports exports;
-};
-} // namespace
-
-/// If `var` is not solved, solve it by recording a pending input port at
-/// the indicated insertion point.
-static void ensureSolved(const DomainInfo &info, Namespace &ns,
-                         DomainTypeID typeID, size_t ip, LocationAttr loc,
-                         VariableTerm *var, PendingUpdates &pending) {
+void ModuleState::ensureSolved(Namespace &ns, DomainTypeID typeID, size_t ip,
+                               LocationAttr loc, VariableTerm *var,
+                               PendingUpdates &pending) {
   if (pending.solutions.contains(var))
     return;
 
   auto *context = loc.getContext();
-  auto domainDecl = info.getDomain(typeID);
+  auto domainDecl = getDomain(typeID);
   auto domainName = domainDecl.getNameAttr();
 
   auto portName = StringAttr::get(context, ns.newName(domainName.getValue()));
@@ -1036,15 +1540,10 @@ static void ensureSolved(const DomainInfo &info, Namespace &ns,
   pending.insertions.push_back({ip, portInfo});
 }
 
-/// Ensure that the domain value is available in the signature of the moduleOp,
-/// so that subsequent hardware ports may be associated with this domain.
-// If the domain is defined internally in the moduleOp, ensure it is aliased by
-// an
-/// output port.
-static void ensureExported(const DomainInfo &info, Namespace &ns,
-                           const ExportTable &exports, DomainTypeID typeID,
-                           size_t ip, LocationAttr loc, ValueTerm *val,
-                           PendingUpdates &pending) {
+void ModuleState::ensureExported(Namespace &ns, const ExportTable &exports,
+                                 DomainTypeID typeID, size_t ip,
+                                 LocationAttr loc, ValueTerm *val,
+                                 PendingUpdates &pending) {
   auto value = val->value;
   assert(isa<DomainType>(value.getType()));
   if (isPort(value) || exports.contains(value) ||
@@ -1053,89 +1552,85 @@ static void ensureExported(const DomainInfo &info, Namespace &ns,
 
   auto *context = loc.getContext();
 
-  auto domainDecl = info.getDomain(typeID);
+  auto domainDecl = getDomain(typeID);
   auto domainName = domainDecl.getNameAttr();
 
   auto portName = StringAttr::get(context, ns.newName(domainName.getValue()));
   auto portType = DomainType::getFromDomainOp(domainDecl);
   auto portDirection = Direction::Out;
   auto portSym = StringAttr();
-  auto portLoc = value.getLoc();
   auto portAnnos = std::nullopt;
   // Domain type ports have no associations (domain info is in the type).
   auto portDomainInfo = ArrayAttr::get(context, {});
-  PortInfo portInfo(portName, portType, portDirection, portSym, portLoc,
-                    portAnnos, portDomainInfo);
+  PortInfo portInfo(portName, portType, portDirection, portSym, loc, portAnnos,
+                    portDomainInfo);
   pending.exports[value] = pending.insertions.size() + ip;
   pending.insertions.push_back({ip, portInfo});
 }
 
-static void getUpdatesForDomainAssociationOfPort(const DomainInfo &info,
-                                                 Namespace &ns,
-                                                 PendingUpdates &pending,
-                                                 DomainTypeID typeID, size_t ip,
-                                                 LocationAttr loc, Term *term,
-                                                 const ExportTable &exports) {
+void ModuleState::getUpdatesForDomainAssociationOfPort(
+    Namespace &ns, PendingUpdates &pending, DomainTypeID typeID, size_t ip,
+    LocationAttr loc, Term *term, const ExportTable &exports) {
   if (auto *var = dyn_cast<VariableTerm>(term)) {
-    ensureSolved(info, ns, typeID, ip, loc, var, pending);
+    ensureSolved(ns, typeID, ip, loc, var, pending);
     return;
   }
   if (auto *val = dyn_cast<ValueTerm>(term)) {
-    ensureExported(info, ns, exports, typeID, ip, loc, val, pending);
+    ensureExported(ns, exports, typeID, ip, loc, val, pending);
     return;
   }
   llvm_unreachable("invalid domain association");
 }
 
-static void getUpdatesForDomainAssociationOfPort(
-    const DomainInfo &info, Namespace &ns, const ExportTable &exports,
-    size_t ip, LocationAttr loc, RowTerm *row, PendingUpdates &pending) {
+void ModuleState::getUpdatesForDomainAssociationOfPort(
+    Namespace &ns, const ExportTable &exports, size_t ip, LocationAttr loc,
+    RowTerm *row, PendingUpdates &pending) {
   for (auto [index, term] : llvm::enumerate(row->elements))
-    getUpdatesForDomainAssociationOfPort(info, ns, pending, DomainTypeID{index},
-                                         ip, loc, find(term), exports);
+    getUpdatesForDomainAssociationOfPort(ns, pending, DomainTypeID{index}, ip,
+                                         loc, find(term), exports);
 }
 
-static void getUpdatesForModulePorts(const DomainInfo &info,
-                                     TermAllocator &allocator,
-                                     const ExportTable &exports,
-                                     DomainTable &table, Namespace &ns,
-                                     FModuleOp moduleOp,
-                                     PendingUpdates &pending) {
+void ModuleState::getUpdatesForModulePorts(FModuleOp moduleOp,
+                                           const ExportTable &exports,
+                                           Namespace &ns,
+                                           PendingUpdates &pending) {
   for (size_t i = 0, e = moduleOp.getNumPorts(); i < e; ++i) {
     auto port = moduleOp.getArgument(i);
-    auto type = port.getType();
-    if (!isa<FIRRTLBaseType>(type))
+    if (!isHardware(port))
       continue;
+
     getUpdatesForDomainAssociationOfPort(
-        info, ns, exports, i, moduleOp.getPortLocation(i),
-        getDomainAssociationAsRow(info, allocator, table, port), pending);
+        ns, exports, i, moduleOp.getPortLocation(i),
+        getDomainAssociationAsRow(port), pending);
   }
 }
 
-static void getUpdatesForModule(const DomainInfo &info,
-                                TermAllocator &allocator,
-                                const ExportTable &exports, DomainTable &table,
-                                FModuleOp mod, PendingUpdates &pending) {
+void ModuleState::getUpdatesForModule(FModuleOp moduleOp,
+                                      const ExportTable &exports,
+                                      PendingUpdates &pending) {
   Namespace ns;
-  auto names = mod.getPortNamesAttr();
+  auto names = moduleOp.getPortNamesAttr();
   for (auto name : names.getAsRange<StringAttr>())
     ns.add(name);
-  getUpdatesForModulePorts(info, allocator, exports, table, ns, mod, pending);
+  getUpdatesForModulePorts(moduleOp, exports, ns, pending);
 }
 
-static void applyUpdatesToModule(const DomainInfo &info,
-                                 TermAllocator &allocator, ExportTable &exports,
-                                 DomainTable &table, FModuleOp moduleOp,
-                                 const PendingUpdates &pending) {
+void ModuleState::applyUpdatesToModule(FModuleOp moduleOp, ExportTable &exports,
+                                       const PendingUpdates &pending) {
+  LLVM_DEBUG(llvm::dbgs().indent(2) << "applying updates:\n");
   // Put the domain ports in place.
   moduleOp.insertPorts(pending.insertions);
+  dirty();
 
   // Solve any variables and record them as "self-exporting".
   for (auto [var, portIndex] : pending.solutions) {
     auto portValue = cast<DomainValue>(moduleOp.getArgument(portIndex));
-    auto *solution = allocator.allocVal(portValue);
+    auto *solution = allocVal(portValue);
+    LLVM_DEBUG(llvm::dbgs().indent(4)
+               << "new-input " << render(portValue) << "\n");
     solve(var, solution);
     exports[portValue].push_back(portValue);
+    globals.inserted.insert(portValue);
   }
 
   // Drive the output ports, and record the export.
@@ -1144,33 +1639,27 @@ static void applyUpdatesToModule(const DomainInfo &info,
     auto portValue = cast<DomainValue>(moduleOp.getArgument(portIndex));
     builder.setInsertionPointAfterValue(domainValue);
     DomainDefineOp::create(builder, portValue.getLoc(), portValue, domainValue);
-
+    LLVM_DEBUG(llvm::dbgs().indent(4) << "new-output " << render(portValue)
+                                      << " := " << render(domainValue) << "\n");
     exports[domainValue].push_back(portValue);
-    table.setTermForDomain(portValue, allocator.allocVal(domainValue));
+    globals.inserted.insert(portValue);
+    setTermForDomain(portValue, allocVal(domainValue));
   }
 }
 
-/// Copy the domain associations from the moduleOp domain info attribute into a
-/// small vector.
-static SmallVector<Attribute>
-copyPortDomainAssociations(const DomainInfo &info, FModuleLike moduleOp,
-                           ArrayAttr moduleDomainInfo, size_t portIndex) {
-  SmallVector<Attribute> result(info.getNumDomains());
+SmallVector<Attribute> ModuleState::copyPortDomainAssociations(
+    FModuleOp moduleOp, ArrayAttr moduleDomainInfo, size_t portIndex) {
+  SmallVector<Attribute> result(getNumDomains());
   auto oldAssociations = getPortDomainAssociation(moduleDomainInfo, portIndex);
   for (auto domainPortIndexAttr : oldAssociations) {
-
     auto domainPortIndex = domainPortIndexAttr.getUInt();
-    auto domainTypeID = info.getDomainTypeID(moduleOp, domainPortIndex);
+    auto domainTypeID = getDomainTypeID(moduleOp, domainPortIndex);
     result[domainTypeID.index] = domainPortIndexAttr;
   };
   return result;
 }
 
-// If the port is an output domain, we may need to drive the output with
-// a value. If we don't know what value to drive to the port, error.
-static LogicalResult driveModuleOutputDomainPorts(const DomainInfo &info,
-                                                  const DomainTable &table,
-                                                  FModuleOp moduleOp) {
+LogicalResult ModuleState::driveModuleOutputDomainPorts(FModuleOp moduleOp) {
   auto builder = OpBuilder::atBlockEnd(moduleOp.getBodyBlock());
   for (size_t i = 0, e = moduleOp.getNumPorts(); i < e; ++i) {
     auto port = dyn_cast<DomainValue>(moduleOp.getArgument(i));
@@ -1178,7 +1667,7 @@ static LogicalResult driveModuleOutputDomainPorts(const DomainInfo &info,
         isDriven(port))
       continue;
 
-    auto *term = table.getOptTermForDomain(port);
+    auto *term = getOptTermForDomain(port);
     auto *val = llvm::dyn_cast_if_present<ValueTerm>(term);
     if (!val) {
       emitDomainPortInferenceError(moduleOp, i);
@@ -1187,25 +1676,22 @@ static LogicalResult driveModuleOutputDomainPorts(const DomainInfo &info,
 
     auto loc = port.getLoc();
     auto value = val->value;
+    LLVM_DEBUG(llvm::dbgs().indent(4) << "connect " << render(port)
+                                      << " := " << render(value) << "\n");
     DomainDefineOp::create(builder, loc, port, value);
   }
 
   return success();
 }
 
-/// After generalizing the moduleOp, all domains should be solved. Reflect the
-/// solved domain associations into the port domain info attribute.
-static LogicalResult updateModuleDomainInfo(const DomainInfo &info,
-                                            const DomainTable &table,
-                                            const ExportTable &exportTable,
-                                            ArrayAttr &result,
-                                            FModuleOp moduleOp) {
+LogicalResult ModuleState::updateModuleDomainInfo(
+    FModuleOp moduleOp, const ExportTable &exportTable, ArrayAttr &result) {
   // At this point, all domain variables mentioned in ports have been
   // solved by generalizing the moduleOp (adding input domain ports). Now, we
   // have to form the new port domain information for the moduleOp by examining
   // the the associated domains of each port.
   auto *context = moduleOp.getContext();
-  auto numDomains = info.getNumDomains();
+  auto numDomains = getNumDomains();
   auto oldModuleDomainInfo = moduleOp.getDomainInfoAttr();
   auto numPorts = moduleOp.getNumPorts();
   SmallVector<Attribute> newModuleDomainInfo(numPorts);
@@ -1220,48 +1706,46 @@ static LogicalResult updateModuleDomainInfo(const DomainInfo &info,
       continue;
     }
 
-    if (isa<FIRRTLBaseType>(type)) {
-      auto associations =
-          copyPortDomainAssociations(info, moduleOp, oldModuleDomainInfo, i);
-      auto *row = cast<RowTerm>(table.getDomainAssociation(port));
-      for (size_t domainIndex = 0; domainIndex < numDomains; ++domainIndex) {
-        auto domainTypeID = DomainTypeID{domainIndex};
-        if (associations[domainIndex])
-          continue;
-
-        auto domain = cast<ValueTerm>(find(row->elements[domainIndex]))->value;
-        auto &exports = exportTable.at(domain);
-        if (exports.empty()) {
-          auto portName = moduleOp.getPortNameAttr(i);
-          auto portLoc = moduleOp.getPortLocation(i);
-          auto domainDecl = info.getDomain(domainTypeID);
-          auto domainName = domainDecl.getNameAttr();
-          auto diag = emitError(portLoc)
-                      << "private " << domainName << " association for port "
-                      << portName;
-          diag.attachNote(domain.getLoc()) << "associated domain: " << domain;
-          noteLocation(diag, moduleOp);
-          return failure();
-        }
-
-        if (exports.size() > 1) {
-          emitAmbiguousPortDomainAssociation(info, moduleOp, exports,
-                                             domainTypeID, i);
-          return failure();
-        }
-
-        auto argument = cast<BlockArgument>(exports[0]);
-        auto domainPortIndex = argument.getArgNumber();
-        associations[domainTypeID.index] = IntegerAttr::get(
-            IntegerType::get(context, 32, IntegerType::Unsigned),
-            domainPortIndex);
-      }
-
-      newModuleDomainInfo[i] = ArrayAttr::get(context, associations);
+    if (!isHardware(port)) {
+      newModuleDomainInfo[i] = ArrayAttr::get(context, {});
       continue;
     }
 
-    newModuleDomainInfo[i] = ArrayAttr::get(context, {});
+    auto associations =
+        copyPortDomainAssociations(moduleOp, oldModuleDomainInfo, i);
+    auto *row = cast<RowTerm>(getDomainAssociation(port));
+    for (size_t domainIndex = 0; domainIndex < numDomains; ++domainIndex) {
+      auto domainTypeID = DomainTypeID{domainIndex};
+      if (associations[domainIndex])
+        continue;
+
+      auto domain = cast<ValueTerm>(find(row->elements[domainIndex]))->value;
+      auto &exports = exportTable.at(domain);
+      if (exports.empty()) {
+        auto portName = moduleOp.getPortNameAttr(i);
+        auto portLoc = moduleOp.getPortLocation(i);
+        auto domainDecl = getDomain(domainTypeID);
+        auto domainName = domainDecl.getNameAttr();
+        auto diag = emitError(portLoc) << "private " << domainName
+                                       << " association for port " << portName;
+        diag.attachNote(domain.getLoc()) << "associated domain: " << domain;
+        noteLocation(diag, moduleOp);
+        return failure();
+      }
+
+      if (exports.size() > 1) {
+        emitAmbiguousPortDomainAssociation(moduleOp, exports, domainTypeID, i);
+        return failure();
+      }
+
+      auto argument = cast<BlockArgument>(exports[0]);
+      auto domainPortIndex = argument.getArgNumber();
+      associations[domainTypeID.index] =
+          IntegerAttr::get(IntegerType::get(context, 32, IntegerType::Unsigned),
+                           domainPortIndex);
+    }
+
+    newModuleDomainInfo[i] = ArrayAttr::get(context, associations);
   }
 
   result = ArrayAttr::get(moduleOp.getContext(), newModuleDomainInfo);
@@ -1269,41 +1753,76 @@ static LogicalResult updateModuleDomainInfo(const DomainInfo &info,
   return success();
 }
 
-static LogicalResult updateInstance(const DomainInfo &info,
-                                    TermAllocator &allocator,
-                                    DomainTable &table, FInstanceLike op,
-                                    OpBuilder &builder) {
+DomainValue ModuleState::solveVarWithAnonDomain(
+    OpBuilder &builder, DenseMap<DomainValue, DomainValue> &domainsInScope,
+    Operation *user, DomainType type, VariableTerm *var) {
+  auto name = type.getName().getAttr();
+  DomainValue anon =
+      DomainCreateAnonOp::create(builder, user->getLoc(), type, name);
+  dirty();
+  LLVM_DEBUG(llvm::dbgs().indent(6) << "create anon " << render(anon) << "\n");
+  solve(var, allocVal(anon));
+  domainsInScope[anon] = anon;
+  globals.inserted.insert(anon);
+  return anon;
+}
+
+DomainValue ModuleState::getDomainInScope(
+    OpBuilder &builder, DenseMap<DomainValue, DomainValue> &domainsInScope,
+    DomainValue domain) {
+  auto &domainInScope = domainsInScope[domain];
+  if (domainInScope)
+    return domainInScope;
+
+  domainInScope = cast<DomainValue>(
+      WireOp::create(builder, domain.getLoc(), domain.getType(),
+                     domain.getType().getName().getAttr())
+          .getResult());
+
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointAfterValue(domain);
+  DomainDefineOp::create(builder, domain.getLoc(), domainInScope, domain);
+  dirty();
+  LLVM_DEBUG(llvm::dbgs().indent(6) << "bounce wire " << render(domainInScope)
+                                    << " := " << render(domain) << "\n");
+  return domainInScope;
+}
+
+LogicalResult
+ModuleState::updateInstance(DenseMap<DomainValue, DomainValue> &domainsInScope,
+                            FInstanceLike op) {
+  LLVM_DEBUG(llvm::dbgs().indent(4) << "update " << render(op) << "\n");
+  OpBuilder builder(op.getContext());
+  builder.setInsertionPointAfter(op);
   auto numPorts = op->getNumResults();
+
+  for (size_t i = 0; i < numPorts; ++i)
+    if (auto port = dyn_cast<DomainValue>(op->getResult(i)))
+      if (op.getPortDirection(i) == Direction::Out)
+        domainsInScope[port] = port;
+
   for (size_t i = 0; i < numPorts; ++i) {
     auto port = dyn_cast<DomainValue>(op->getResult(i));
     auto direction = op.getPortDirection(i);
-
     // If the port is an input domain, we may need to drive the input with
     // a value. If we don't know what value to drive to the port, drive an
     // anonymous domain.
     if (port && direction == Direction::In && !isDriven(port)) {
       auto loc = port.getLoc();
-      auto *term = getTermForDomain(allocator, table, port);
+      auto *term = getTermForDomain(port);
       if (auto *var = dyn_cast<VariableTerm>(term)) {
-        auto domainType = cast<DomainType>(op->getResult(i).getType());
-        auto domainTypeID = info.getDomainTypeID(domainType);
-        auto domainDecl = info.getDomain(domainTypeID);
-        auto name = domainDecl.getNameAttr();
-        DomainValue anon;
-        {
-          OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPointAfter(op);
-          anon = DomainCreateAnonOp::create(builder, loc, domainType, name);
-        }
-        solve(var, allocator.allocVal(anon));
-        // Create domain.define at the end of the block to avoid use-before-def.
-        DomainDefineOp::create(builder, loc, port, anon);
+        auto domain = solveVarWithAnonDomain(builder, domainsInScope, op,
+                                             port.getType(), var);
+        LLVM_DEBUG(llvm::dbgs().indent(6) << "connect " << render(port)
+                                          << " := " << render(domain) << "\n");
+        DomainDefineOp::create(builder, loc, port, domain);
         continue;
       }
       if (auto *val = dyn_cast<ValueTerm>(term)) {
-        auto value = val->value;
-        // Create domain.define at the end of the block to avoid use-before-def.
-        DomainDefineOp::create(builder, loc, port, value);
+        auto domain = getDomainInScope(builder, domainsInScope, val->value);
+        LLVM_DEBUG(llvm::dbgs().indent(6) << "connect " << render(port)
+                                          << " := " << render(domain) << "\n");
+        DomainDefineOp::create(builder, loc, port, domain);
         continue;
       }
       llvm_unreachable("unhandled domain term type");
@@ -1313,111 +1832,144 @@ static LogicalResult updateInstance(const DomainInfo &info,
   return success();
 }
 
-/// Update a wire operation with inferred domain associations.
-static LogicalResult updateWire(const DomainInfo &info,
-                                TermAllocator &allocator, DomainTable &table,
-                                WireOp wireOp) {
+LogicalResult
+ModuleState::updateWire(DenseMap<DomainValue, DomainValue> &domainsInScope,
+                        WireOp wireOp) {
   auto result = wireOp.getResult();
-  if (!isa<FIRRTLBaseType>(result.getType()))
+
+  if (auto tgt = dyn_cast<DomainValue>(result)) {
+    if (isDriven(tgt))
+      return success();
+
+    LLVM_DEBUG(llvm::dbgs().indent(4) << "update " << render(wireOp) << "\n");
+    OpBuilder builder(wireOp);
+    builder.setInsertionPointAfter(wireOp);
+    auto *term = getTermForDomain(tgt);
+    if (auto *var = dyn_cast<VariableTerm>(term)) {
+      auto src = solveVarWithAnonDomain(builder, domainsInScope, wireOp,
+                                        tgt.getType(), var);
+      LLVM_DEBUG(llvm::dbgs().indent(6)
+                 << "connect " << render(tgt) << " := " << render(src) << "\n");
+      DomainDefineOp::create(builder, wireOp.getLoc(), tgt, src);
+      return success();
+    }
+    if (auto *val = dyn_cast<ValueTerm>(term)) {
+      auto src = getDomainInScope(builder, domainsInScope, val->value);
+      LLVM_DEBUG(llvm::dbgs().indent(6)
+                 << "connect " << render(tgt) << " := " << render(src) << "\n");
+      DomainDefineOp::create(builder, wireOp.getLoc(), tgt, src);
+      return success();
+    }
+    llvm_unreachable("unhandled domain term type");
+  }
+
+  if (!isHardware(result) || isColorless(result))
     return success();
 
-  // Get the inferred domain associations for this wire.
-  auto *term = table.getOptDomainAssociation(result);
-  if (!term)
-    return success();
+  LLVM_DEBUG(llvm::dbgs().indent(4) << "update " << render(wireOp) << "\n");
+  OpBuilder builder(wireOp);
+  auto *row = getDomainAssociationAsRow(wireOp.getResult());
 
-  auto *row = dyn_cast<RowTerm>(find(term));
-  if (!row)
-    return success();
-
-  // Collect the domain values to add as operands.
   SmallVector<Value> domainOperands;
-  for (auto *element : llvm::map_range(row->elements, find))
-    if (auto *val = dyn_cast_or_null<ValueTerm>(element))
-      domainOperands.push_back(val->value);
-
-  // Update the wire's domain operands in place. $domains is the only operand
-  // group on WireOp, so setOperands replaces exactly the domain list.
-  if (!domainOperands.empty() && wireOp.getDomains().empty())
-    wireOp->setOperands(domainOperands);
-
+  for (auto [i, element] : llvm::enumerate(
+           llvm::map_range(row->elements, [&](auto e) { return find(e); }))) {
+    if (auto *val = dyn_cast<ValueTerm>(element)) {
+      domainOperands.push_back(
+          getDomainInScope(builder, domainsInScope, val->value));
+      continue;
+    }
+    if (auto *var = dyn_cast<VariableTerm>(element)) {
+      auto type = DomainType::getFromDomainOp(getDomain(DomainTypeID{i}));
+      auto domain =
+          solveVarWithAnonDomain(builder, domainsInScope, wireOp, type, var);
+      domainOperands.push_back(domain);
+      continue;
+    }
+    assert(0 && "unhandled domain type");
+  }
+  wireOp.getDomainsMutable().assign(domainOperands);
   return success();
 }
 
-/// After updating the port domain associations, walk the body of the moduleOp
-/// to fix up any child instance modules and update wires with inferred domains.
-static LogicalResult updateModuleBody(const DomainInfo &info,
-                                      TermAllocator &allocator,
-                                      DomainTable &table, FModuleOp moduleOp) {
-  // Set insertion point to end of block so all domain.define operations are
-  // created there, avoiding use-before-def issues.
-  OpBuilder builder(moduleOp.getContext());
-  builder.setInsertionPointToEnd(moduleOp.getBodyBlock());
+LogicalResult ModuleState::updateModuleBody(FModuleOp moduleOp) {
+  DenseMap<DomainValue, DomainValue> domainsInScope;
 
-  // Update instances
-  auto instanceResult =
-      moduleOp.getBodyBlock()->walk([&](FInstanceLike op) -> WalkResult {
-        return updateInstance(info, allocator, table, op, builder);
-      });
-  if (instanceResult.wasInterrupted())
-    return failure();
+  for (size_t i = 0, e = moduleOp.getNumPorts(); i < e; ++i)
+    if (auto port = dyn_cast<DomainValue>(moduleOp.getArgument(i)))
+      if (moduleOp.getPortDirection(i) == Direction::In)
+        domainsInScope[port] = port;
 
-  // Update wires with inferred domain associations
-  auto wireResult = moduleOp.getBodyBlock()->walk([&](WireOp op) -> WalkResult {
-    return updateWire(info, allocator, table, op);
+  auto result = moduleOp.getBodyBlock()->walk([&](Operation *op) -> WalkResult {
+    return TypeSwitch<Operation *, WalkResult>(op)
+        .Case<WireOp>(
+            [&](auto wire) { return updateWire(domainsInScope, wire); })
+        .Case<FInstanceLike>([&](auto instance) {
+          return updateInstance(domainsInScope, instance);
+        })
+        .Case<DomainCreateOp, DomainCreateAnonOp>([&](auto domain) {
+          domainsInScope[domain] = domain;
+          return success();
+        })
+        .Default([&](auto op) { return success(); });
   });
-  return failure(wireResult.wasInterrupted());
+  return failure(result.wasInterrupted());
 }
 
-/// Write the domain associations recorded in the domain table back to the IR.
-static LogicalResult updateModule(const DomainInfo &info,
-                                  TermAllocator &allocator, DomainTable &table,
-                                  ModuleUpdateTable &updates, FModuleOp op) {
-  auto exports = initializeExportTable(table, op);
+LogicalResult ModuleState::updateModule(FModuleOp moduleOp) {
+  auto exports = initializeExportTable(moduleOp);
   PendingUpdates pending;
-  getUpdatesForModule(info, allocator, exports, table, op, pending);
-  applyUpdatesToModule(info, allocator, exports, table, op, pending);
+  getUpdatesForModule(moduleOp, exports, pending);
+  applyUpdatesToModule(moduleOp, exports, pending);
 
-  // Update the domain info for the moduleOp's ports.
   ArrayAttr portDomainInfo;
-  if (failed(updateModuleDomainInfo(info, table, exports, portDomainInfo, op)))
+  if (failed(updateModuleDomainInfo(moduleOp, exports, portDomainInfo)))
     return failure();
 
-  // Drive output domain ports.
-  if (failed(driveModuleOutputDomainPorts(info, table, op)))
+  if (failed(driveModuleOutputDomainPorts(moduleOp)))
     return failure();
 
-  // Record the updated interface change in the update table.
-  auto &entry = updates[op.getModuleNameAttr()];
+  // Record the updated interface change in the update
+  auto &entry = getModuleUpdateTable()[moduleOp.getModuleNameAttr()];
   entry.portDomainInfo = portDomainInfo;
   entry.portInsertions = std::move(pending.insertions);
 
-  if (failed(updateModuleBody(info, allocator, table, op)))
+  if (failed(updateModuleBody(moduleOp)))
     return failure();
+
+  LLVM_DEBUG({
+    llvm::dbgs().indent(2) << "port summary:\n";
+    for (auto port : moduleOp.getBodyBlock()->getArguments()) {
+      llvm::dbgs().indent(4) << render(port);
+      auto info = cast<ArrayAttr>(
+          moduleOp.getDomainInfoAttrForPort(port.getArgNumber()));
+      if (info.size()) {
+        llvm::dbgs() << " domains [";
+        llvm::interleaveComma(
+            info.getAsRange<IntegerAttr>(), llvm::dbgs(), [&](auto i) {
+              llvm::dbgs() << render(moduleOp.getArgument(i.getUInt()));
+            });
+        llvm::dbgs() << "]";
+      }
+      llvm::dbgs() << "\n";
+    }
+  });
 
   return success();
 }
 
-//===---------------------------------------------------------------------------
-// Checking: Check that a moduleOp has complete domain information.
-//===---------------------------------------------------------------------------
-
-/// Check that a module's hardware ports have complete domain associations.
-static LogicalResult checkModulePorts(const DomainInfo &info,
-                                      FModuleLike moduleOp) {
-  auto numDomains = info.getNumDomains();
+LogicalResult ModuleState::checkModulePorts(FModuleLike moduleOp) {
+  auto numDomains = getNumDomains();
   auto domainInfo = moduleOp.getDomainInfoAttr();
   auto numPorts = moduleOp.getNumPorts();
 
   DenseMap<unsigned, DomainTypeID> domainTypeIDTable;
   for (size_t i = 0; i < numPorts; ++i) {
     if (isa<DomainType>(moduleOp.getPortType(i)))
-      domainTypeIDTable[i] = info.getDomainTypeID(moduleOp, i);
+      domainTypeIDTable[i] = getDomainTypeID(moduleOp, i);
   }
 
   for (size_t i = 0; i < numPorts; ++i) {
-    auto type = type_dyn_cast<FIRRTLBaseType>(moduleOp.getPortType(i));
-    if (!type)
+    if (!isHardware(moduleOp.getPortType(i)))
       continue;
 
     // Record the domain associations of this port.
@@ -1426,7 +1978,7 @@ static LogicalResult checkModulePorts(const DomainInfo &info,
       auto domainTypeID = domainTypeIDTable.at(domainPortIndex.getUInt());
       auto prevDomainPortIndex = associations[domainTypeID.index];
       if (prevDomainPortIndex) {
-        emitDuplicatePortDomainError(info, moduleOp, i, domainTypeID,
+        emitDuplicatePortDomainError(moduleOp, i, domainTypeID,
                                      prevDomainPortIndex, domainPortIndex);
         return failure();
       }
@@ -1437,7 +1989,7 @@ static LogicalResult checkModulePorts(const DomainInfo &info,
     for (size_t domainIndex = 0; domainIndex < numDomains; ++domainIndex) {
       auto typeID = DomainTypeID{domainIndex};
       if (!associations[domainIndex]) {
-        emitMissingPortDomainAssociationError(info, moduleOp, typeID, i);
+        emitMissingPortDomainAssociationError(moduleOp, typeID, i);
         return failure();
       }
     }
@@ -1446,9 +1998,7 @@ static LogicalResult checkModulePorts(const DomainInfo &info,
   return success();
 }
 
-/// Check that output domain ports are driven.
-static LogicalResult checkModuleDomainPortDrivers(const DomainInfo &info,
-                                                  FModuleOp moduleOp) {
+LogicalResult ModuleState::checkModuleDomainPortDrivers(FModuleOp moduleOp) {
   for (size_t i = 0, e = moduleOp.getNumPorts(); i < e; ++i) {
     auto port = dyn_cast<DomainValue>(moduleOp.getArgument(i));
     if (!port || moduleOp.getPortDirection(i) != Direction::Out ||
@@ -1465,14 +2015,10 @@ static LogicalResult checkModuleDomainPortDrivers(const DomainInfo &info,
   return success();
 }
 
-/// Check that the input domain ports are driven.
-static LogicalResult checkInstanceDomainPortDrivers(FInstanceLike op) {
+LogicalResult ModuleState::checkInstanceDomainPortDrivers(FInstanceLike op) {
   for (size_t i = 0, e = op->getNumResults(); i < e; ++i) {
     auto port = dyn_cast<DomainValue>(op->getResult(i));
-
-    auto type = port.getType();
-    if (!isa<DomainType>(type) || op.getPortDirection(i) != Direction::In ||
-        isDriven(port))
+    if (!port || op.getPortDirection(i) != Direction::In || isDriven(port))
       continue;
 
     auto name = op.getPortNameAttr(i);
@@ -1485,74 +2031,156 @@ static LogicalResult checkInstanceDomainPortDrivers(FInstanceLike op) {
   return success();
 }
 
-/// Check that instances under this module have driven domain input ports.
-static LogicalResult checkModuleBody(FModuleOp moduleOp) {
-  auto result = moduleOp.getBody().walk([](FInstanceLike op) -> WalkResult {
+LogicalResult ModuleState::checkModuleBody(FModuleOp moduleOp) {
+  auto result = moduleOp.getBody().walk([&](FInstanceLike op) -> WalkResult {
     return checkInstanceDomainPortDrivers(op);
   });
   return failure(result.wasInterrupted());
+}
+
+LogicalResult ModuleState::inferModule(FModuleOp moduleOp) {
+  LLVM_DEBUG(llvm::dbgs() << "infer: " << moduleOp.getModuleName() << "\n");
+  if (failed(processModule(moduleOp)))
+    return failure();
+
+  return updateModule(moduleOp);
+}
+
+LogicalResult ModuleState::checkModule(FModuleOp moduleOp) {
+  LLVM_DEBUG(llvm::dbgs() << "check: " << moduleOp.getModuleName() << "\n");
+  if (failed(checkModulePorts(moduleOp)))
+    return failure();
+
+  if (failed(checkModuleDomainPortDrivers(moduleOp)))
+    return failure();
+
+  if (failed(checkModuleBody(moduleOp)))
+    return failure();
+
+  return processModule(moduleOp);
+}
+
+LogicalResult ModuleState::checkModule(FExtModuleOp extModuleOp) {
+  LLVM_DEBUG(llvm::dbgs() << "check: " << extModuleOp.getModuleName() << "\n");
+  return checkModulePorts(extModuleOp);
+}
+
+LogicalResult ModuleState::checkAndInferModule(FModuleOp moduleOp) {
+  LLVM_DEBUG(llvm::dbgs() << "check/infer: " << moduleOp.getModuleName()
+                          << "\n");
+
+  if (failed(checkModulePorts(moduleOp)))
+    return failure();
+
+  if (failed(processModule(moduleOp)))
+    return failure();
+
+  if (failed(driveModuleOutputDomainPorts(moduleOp)))
+    return failure();
+
+  return updateModuleBody(moduleOp);
 }
 
 //===---------------------------------------------------------------------------
 // Domain Stripping.
 //===---------------------------------------------------------------------------
 
-static LogicalResult stripModule(FModuleLike op) {
+/// A helper for stripping domains from a module based on a predicate. The
+/// predicate takes a domain name and returns true if that domain should be
+/// stripped.
+static LogicalResult
+stripModuleImpl(FModuleLike op,
+                llvm::function_ref<bool(StringAttr)> shouldStripDomain) {
+  auto shouldStripType = [&](Type type) {
+    if (auto domainType = dyn_cast<DomainType>(type))
+      return shouldStripDomain(domainType.getName().getAttr());
+    return false;
+  };
   WalkResult result = op->walk<mlir::WalkOrder::PostOrder, ReverseIterator>(
-      [=](Operation *op) -> WalkResult {
+      [&](Operation *op) -> WalkResult {
         return TypeSwitch<Operation *, WalkResult>(op)
-            .Case<FModuleLike>([](FModuleLike op) {
-              auto n = op.getNumPorts();
-              BitVector erasures(n);
-              for (size_t i = 0; i < n; ++i)
-                if (isa<DomainType>(op.getPortType(i)))
+            .Case<FModuleLike>([&](FModuleLike op) {
+              BitVector erasures(op.getNumPorts());
+              for (size_t i = 0, e = op.getNumPorts(); i < e; ++i)
+                if (shouldStripType(op.getPortType(i)))
                   erasures.set(i);
-              op.erasePorts(erasures);
+              if (erasures.any())
+                op.erasePorts(erasures);
               return WalkResult::advance();
             })
-            .Case<DomainDefineOp, DomainCreateAnonOp, DomainCreateOp>(
-                [](Operation *op) {
-                  op->erase();
-                  return WalkResult::advance();
-                })
-            .Case<DomainSubfieldOp>([](DomainSubfieldOp op) {
-              if (!op->use_empty()) {
-                OpBuilder builder(op);
-                op.replaceAllUsesWith(
-                    UnknownValueOp::create(builder, op.getLoc(), op.getType())
-                        .getResult());
+            .Case<DomainDefineOp>([&](DomainDefineOp op) {
+              if (shouldStripType(op.getDest().getType()) ||
+                  shouldStripType(op.getSrc().getType()))
+                op.erase();
+              return WalkResult::advance();
+            })
+            .Case<DomainCreateOp>([&](DomainCreateOp op) {
+              if (shouldStripType(op.getType()))
+                op.erase();
+              return WalkResult::advance();
+            })
+            .Case<DomainCreateAnonOp>([&](DomainCreateAnonOp op) {
+              if (shouldStripType(op.getType()))
+                op.erase();
+              return WalkResult::advance();
+            })
+            .Case<DomainSubfieldOp>([&](DomainSubfieldOp op) {
+              // The subfield's result is a property value; decide
+              // whether to strip based on the domain it reads from.
+              if (shouldStripType(op.getInput().getType())) {
+                if (!op->use_empty()) {
+                  OpBuilder builder(op);
+                  op.replaceAllUsesWith(
+                      UnknownValueOp::create(builder, op.getLoc(), op.getType())
+                          .getResult());
+                }
+                op.erase();
               }
-              op.erase();
               return WalkResult::advance();
             })
-            .Case<UnsafeDomainCastOp>([](UnsafeDomainCastOp op) {
-              op.replaceAllUsesWith(op.getInput());
-              op.erase();
+            .Case<UnsafeDomainCastOp>([&](UnsafeDomainCastOp op) {
+              // Strip cast if any of the domains being cast should be
+              // stripped.
+              if (llvm::any_of(op.getDomains(), [&](Value domain) {
+                    return shouldStripType(domain.getType());
+                  })) {
+                op.replaceAllUsesWith(op.getInput());
+                op.erase();
+              }
               return WalkResult::advance();
             })
-            .Case<WireOp>([](WireOp op) {
-              // Erase wires of DomainType
-              if (isa<DomainType>(op.getType(0))) {
+            .Case<WireOp>([&](WireOp op) {
+              // Erase wires of DomainType that should be stripped.
+              if (shouldStripType(op.getType(0))) {
                 op->erase();
                 return WalkResult::advance();
               }
-              // Erase domain operands from regular wires
-              if (!op.getDomains().empty()) {
-                op->eraseOperands(0, op.getNumOperands());
-              }
+              BitVector erasures(op.getDomains().size());
+
+              // Erase domain operands from regular wires.
+              for (int i = 0, e = op.getDomains().size(); i < e; ++i)
+                if (shouldStripType(op.getDomains()[i].getType()))
+                  erasures.set(i);
+
+              op->eraseOperands(erasures);
               return WalkResult::advance();
             })
-            .Case<FInstanceLike>([](auto op) {
+            .Case<FInstanceLike>([&](auto op) {
               auto n = op.getNumPorts();
               BitVector erasures(n);
               for (size_t i = 0; i < n; ++i)
-                if (isa<DomainType>(op->getResult(i).getType()))
+                if (shouldStripType(op->getResult(i).getType()))
                   erasures.set(i);
-              op.cloneWithErasedPortsAndReplaceUses(erasures);
-              op.erase();
+              if (erasures.any()) {
+                op.cloneWithErasedPortsAndReplaceUses(erasures);
+                op.erase();
+              }
               return WalkResult::advance();
             })
-            .Default([](Operation *op) {
+            .Default([&](Operation *op) {
+              // All operations that can have DomainType are handled
+              // above. If we encounter one here, it's a bug in the IR
+              // or this pass.
               for (auto type :
                    concat<Type>(op->getOperandTypes(), op->getResultTypes())) {
                 if (isa<DomainType>(type)) {
@@ -1566,97 +2194,64 @@ static LogicalResult stripModule(FModuleLike op) {
   return failure(result.wasInterrupted());
 }
 
-static LogicalResult stripCircuit(MLIRContext *context, CircuitOp circuit) {
+static LogicalResult stripDomainsFromCircuit(
+    MLIRContext *context, CircuitOp circuit,
+    llvm::function_ref<bool(StringAttr)> shouldStripDomain) {
+  // Collect modules and erase matching DomainOp declarations.
   llvm::SmallVector<FModuleLike> modules;
   for (Operation &op : make_early_inc_range(*circuit.getBodyBlock())) {
     TypeSwitch<Operation *, void>(&op)
         .Case<FModuleLike>([&](FModuleLike op) { modules.push_back(op); })
-        .Case<DomainOp>([](DomainOp op) { op.erase(); });
+        .Case<DomainOp>([&](DomainOp op) {
+          // Erase domain declaration if its name should be stripped.
+          if (shouldStripDomain(op.getNameAttr()))
+            op.erase();
+        });
   }
-  return failableParallelForEach(context, modules, stripModule);
+
+  // Strip domains from all modules in parallel.
+  return failableParallelForEach(context, modules, [&](FModuleLike module) {
+    return stripModuleImpl(module, shouldStripDomain);
+  });
 }
 
 //===---------------------------------------------------------------------------
 // InferDomainsPass: Top-level pass implementation.
 //===---------------------------------------------------------------------------
 
-/// Solve for domains and then write the domain associations back to the IR.
-static LogicalResult inferModule(const DomainInfo &info,
-                                 ModuleUpdateTable &updates,
-                                 FModuleOp moduleOp) {
-  TermAllocator allocator;
-  DomainTable table;
-
-  if (failed(processModule(info, allocator, table, updates, moduleOp)))
-    return failure();
-
-  return updateModule(info, allocator, table, updates, moduleOp);
-}
-
-/// Check that a module's ports are fully annotated, before performing domain
-/// inference on the module.
-static LogicalResult checkModule(const DomainInfo &info, FModuleOp moduleOp) {
-  if (failed(checkModulePorts(info, moduleOp)))
-    return failure();
-
-  if (failed(checkModuleDomainPortDrivers(info, moduleOp)))
-    return failure();
-
-  if (failed(checkModuleBody(moduleOp)))
-    return failure();
-
-  TermAllocator allocator;
-  DomainTable table;
-  ModuleUpdateTable updateTable;
-  return processModule(info, allocator, table, updateTable, moduleOp);
-}
-
-/// Check that an extmodule's ports are fully annotated.
-static LogicalResult checkModule(const DomainInfo &info,
-                                 FExtModuleOp moduleOp) {
-  return checkModulePorts(info, moduleOp);
-}
-
-/// Check that a module's ports are fully annotated, before performing domain
-/// inference on the module. We use this when private module interfaces are
-/// inferred but public module interfaces are checked.
-static LogicalResult checkAndInferModule(const DomainInfo &info,
-                                         ModuleUpdateTable &updateTable,
-                                         FModuleOp moduleOp) {
-  if (failed(checkModulePorts(info, moduleOp)))
-    return failure();
-
-  TermAllocator allocator;
-  DomainTable table;
-  if (failed(processModule(info, allocator, table, updateTable, moduleOp)))
-    return failure();
-
-  if (failed(driveModuleOutputDomainPorts(info, table, moduleOp)))
-    return failure();
-
-  return updateModuleBody(info, allocator, table, moduleOp);
-}
-
-static LogicalResult runOnModuleLike(InferDomainsMode mode,
-                                     const DomainInfo &info,
-                                     ModuleUpdateTable &updateTable,
-                                     Operation *op) {
+LogicalResult CircuitState::runOnModule(Operation *op) {
   assert(mode != InferDomainsMode::Strip);
-
+  ModuleState state(*this);
   if (auto moduleOp = dyn_cast<FModuleOp>(op)) {
     if (mode == InferDomainsMode::Check)
-      return checkModule(info, moduleOp);
+      return state.checkModule(moduleOp);
 
     if (mode == InferDomainsMode::InferAll || moduleOp.isPrivate())
-      return inferModule(info, updateTable, moduleOp);
+      return state.inferModule(moduleOp);
 
-    return checkAndInferModule(info, updateTable, moduleOp);
+    return state.checkAndInferModule(moduleOp);
   }
 
-  if (auto extModule = dyn_cast<FExtModuleOp>(op))
-    return checkModule(info, extModule);
+  if (auto extModuleOp = dyn_cast<FExtModuleOp>(op))
+    return state.checkModule(extModuleOp);
 
   return success();
+}
+
+LogicalResult CircuitState::run() {
+  DenseSet<Operation *> errored;
+  instanceGraph.walkPostOrder([&](auto &node) {
+    auto moduleOp = node.getModule();
+    for (auto *inst : node) {
+      if (errored.contains(inst->getTarget()->getModule())) {
+        errored.insert(moduleOp);
+        return;
+      }
+    }
+    if (failed(runOnModule(node.getModule())))
+      errored.insert(moduleOp);
+  });
+  return success(errored.empty());
 }
 
 namespace {
@@ -1668,27 +2263,35 @@ struct InferDomainsPass
     auto circuit = getOperation();
 
     if (mode == InferDomainsMode::Strip) {
-      if (failed(stripCircuit(&getContext(), circuit)))
+      // Strip all domain types
+      if (failed(stripDomainsFromCircuit(&getContext(), circuit,
+                                         [](StringAttr) { return true; })))
         signalPassFailure();
       return;
     }
 
+    // Strip skipped domains in a prepass before checking/inference
+    if (!skippedDomains.empty()) {
+      DenseSet<StringAttr> skippedNames;
+      auto *context = &getContext();
+      for (const auto &name : skippedDomains)
+        skippedNames.insert(StringAttr::get(context, name));
+
+      if (failed(
+              stripDomainsFromCircuit(context, circuit, [&](StringAttr name) {
+                return skippedNames.contains(name);
+              })))
+        return signalPassFailure();
+    }
+
     auto &instanceGraph = getAnalysis<InstanceGraph>();
-    DomainInfo info(circuit);
-    ModuleUpdateTable updateTable;
-    DenseSet<Operation *> errored;
-    instanceGraph.walkPostOrder([&](auto &node) {
-      auto moduleOp = node.getModule();
-      for (auto *inst : node) {
-        if (errored.contains(inst->getTarget()->getModule())) {
-          errored.insert(moduleOp);
-          return;
-        }
-      }
-      if (failed(runOnModuleLike(mode, info, updateTable, node.getModule())))
-        errored.insert(moduleOp);
-    });
-    if (errored.size())
+    auto &symbolTable = getAnalysis<SymbolTable>();
+    auto &innerSymbolTableCollection =
+        getAnalysis<InnerSymbolTableCollection>();
+    circt::hw::InnerRefNamespace innerRefNamespace{symbolTable,
+                                                   innerSymbolTableCollection};
+    CircuitState state(circuit, instanceGraph, innerRefNamespace, mode);
+    if (failed(state.run()))
       signalPassFailure();
   }
 };

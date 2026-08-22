@@ -15,6 +15,8 @@
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Support/CustomDirectiveImpl.h"
+#include "circt/Support/FormatInteger.h"
+#include "circt/Support/ProceduralRegionTrait.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/IR/PatternMatch.h"
@@ -238,11 +240,15 @@ sim::DPICallOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
          << referencedOp->getName() << "'";
 }
 
+// Render `value` in the given `radix` and pad it to a field width, returning
+// the result as a `StringAttr`. The field width and padding semantics are
+// shared with the Arc runtime through `circt::formatInteger` (see
+// FormatInteger.h). Zero-width values produce the empty string.
 static StringAttr formatIntegersByRadix(MLIRContext *ctx, unsigned radix,
                                         const Attribute &value,
                                         bool isUpperCase, bool isLeftAligned,
                                         char paddingChar,
-                                        std::optional<unsigned> specifierWidth,
+                                        std::optional<int32_t> specifierWidth,
                                         bool isSigned = false) {
   auto intAttr = llvm::dyn_cast_or_null<IntegerAttr>(value);
   if (!intAttr)
@@ -250,46 +256,11 @@ static StringAttr formatIntegersByRadix(MLIRContext *ctx, unsigned radix,
   if (intAttr.getType().getIntOrFloatBitWidth() == 0)
     return StringAttr::get(ctx, "");
 
-  SmallVector<char, 32> strBuf;
-  intAttr.getValue().toString(strBuf, radix, isSigned, false, isUpperCase);
-  unsigned width = intAttr.getType().getIntOrFloatBitWidth();
-
-  unsigned padWidth;
-  switch (radix) {
-  case 2:
-    padWidth = width;
-    break;
-  case 8:
-    padWidth = (width + 2) / 3;
-    break;
-  case 16:
-    padWidth = (width + 3) / 4;
-    break;
-  default:
-    padWidth = width;
-    break;
-  }
-
-  unsigned numSpaces = 0;
-  if (specifierWidth.has_value() &&
-      (specifierWidth.value() >
-       std::max(padWidth, static_cast<unsigned>(strBuf.size())))) {
-    numSpaces = std::max(
-        0U, specifierWidth.value() -
-                std::max(padWidth, static_cast<unsigned>(strBuf.size())));
-  }
-
-  SmallVector<char, 1> spacePadding(numSpaces, ' ');
-
-  padWidth = padWidth > strBuf.size() ? padWidth - strBuf.size() : 0;
-
-  SmallVector<char, 32> padding(padWidth, paddingChar);
-  if (isLeftAligned) {
-    return StringAttr::get(ctx, Twine(padding) + Twine(strBuf) +
-                                    Twine(spacePadding));
-  }
-  return StringAttr::get(ctx,
-                         Twine(spacePadding) + Twine(padding) + Twine(strBuf));
+  SmallString<32> str;
+  llvm::raw_svector_ostream os(str);
+  formatInteger(os, intAttr.getValue(), radix, isUpperCase, isLeftAligned,
+                paddingChar, specifierWidth, isSigned);
+  return StringAttr::get(ctx, str);
 }
 
 static StringAttr formatFloatsBySpecifier(MLIRContext *ctx, Attribute value,
@@ -325,28 +296,38 @@ OpFoldResult FormatLiteralOp::fold(FoldAdaptor adaptor) {
   return getLiteralAttr();
 }
 
+// --- FormatStringOp ---
+
+StringAttr FormatStringOp::formatConstant(Attribute constVal) {
+  auto strAttr = llvm::dyn_cast<StringAttr>(constVal);
+  if (!strAttr)
+    return {};
+
+  SmallString<128> strBuf(strAttr.getValue());
+  if (getSpecifierWidth().has_value()) {
+    auto padChar = static_cast<char>(getPaddingChar());
+    unsigned padWidth = getSpecifierWidth().value();
+    padWidth = padWidth > strBuf.size() ? padWidth - strBuf.size() : 0;
+    if (getIsLeftAligned())
+      strBuf.append(padWidth, padChar);
+    else
+      strBuf.insert(strBuf.begin(), padWidth, padChar);
+  }
+  return StringAttr::get(getContext(), strBuf);
+}
+
 // --- FormatDecOp ---
 
 StringAttr FormatDecOp::formatConstant(Attribute constVal) {
   auto intAttr = llvm::dyn_cast<IntegerAttr>(constVal);
   if (!intAttr)
     return {};
-  SmallVector<char, 16> strBuf;
-  intAttr.getValue().toString(strBuf, 10, getIsSigned());
-  unsigned padWidth;
-  if (getSpecifierWidth().has_value()) {
-    padWidth = getSpecifierWidth().value();
-  } else {
-    unsigned width = intAttr.getType().getIntOrFloatBitWidth();
-    padWidth = FormatDecOp::getDecimalWidth(width, getIsSigned());
-  }
-
-  padWidth = padWidth > strBuf.size() ? padWidth - strBuf.size() : 0;
-
-  SmallVector<char, 10> padding(padWidth, getPaddingChar());
-  if (getIsLeftAligned())
-    return StringAttr::get(getContext(), Twine(strBuf) + Twine(padding));
-  return StringAttr::get(getContext(), Twine(padding) + Twine(strBuf));
+  SmallString<16> str;
+  llvm::raw_svector_ostream os(str);
+  formatInteger(os, intAttr.getValue(), /*radix=*/10, /*isUpperCase=*/false,
+                getIsLeftAligned(), getPaddingChar(), getSpecifierWidth(),
+                getIsSigned());
+  return StringAttr::get(getContext(), str);
 }
 
 OpFoldResult FormatDecOp::fold(FoldAdaptor adaptor) {
@@ -527,6 +508,8 @@ LogicalResult FormatStringConcatOp::verify() {
 
 LogicalResult FormatStringConcatOp::canonicalize(FormatStringConcatOp op,
                                                  PatternRewriter &rewriter) {
+  // Any helper literals created during canonicalization must dominate `op`.
+  rewriter.setInsertionPoint(op);
 
   auto fmtStrType = FormatStringType::get(op.getContext());
 
@@ -621,29 +604,6 @@ LogicalResult PrintFormattedOp::canonicalize(PrintFormattedOp op,
     }
   }
   return failure();
-}
-
-LogicalResult PrintFormattedProcOp::verify() {
-  // Check if we know for sure that the parent is not procedural.
-  auto *parentOp = getOperation()->getParentOp();
-
-  if (!parentOp)
-    return emitOpError("must be within a procedural region.");
-
-  if (isa_and_nonnull<hw::HWDialect>(parentOp->getDialect())) {
-    if (!isa<hw::TriggeredOp>(parentOp))
-      return emitOpError("must be within a procedural region.");
-    return success();
-  }
-
-  if (isa_and_nonnull<sv::SVDialect>(parentOp->getDialect())) {
-    if (!parentOp->hasTrait<sv::ProceduralRegion>())
-      return emitOpError("must be within a procedural region.");
-    return success();
-  }
-
-  // Don't fail for dialects that are not explicitly handled.
-  return success();
 }
 
 LogicalResult PrintFormattedProcOp::canonicalize(PrintFormattedProcOp op,
@@ -774,6 +734,51 @@ LogicalResult QueueConcatOp::verify() {
     }
   }
 
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// TriggeredOp
+//===----------------------------------------------------------------------===//
+
+void TriggeredOp::build(OpBuilder &builder, OperationState &odsState,
+                        Value clock, Value condition) {
+  odsState.addOperands(clock);
+  if (condition)
+    odsState.addOperands(condition);
+
+  auto *region = odsState.addRegion();
+  region->push_back(new Block());
+}
+
+void TriggeredOp::build(OpBuilder &builder, OperationState &odsState,
+                        Value clock, Value condition,
+                        llvm::function_ref<void()> bodyCtor) {
+  OpBuilder::InsertionGuard guard(builder);
+
+  odsState.addOperands(clock);
+  if (condition)
+    odsState.addOperands(condition);
+
+  builder.createBlock(odsState.addRegion());
+  if (bodyCtor)
+    bodyCtor();
+}
+
+//===----------------------------------------------------------------------===//
+// SVReadMemOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult SVReadMemOp::verify() {
+  if (getFinishAddr() && !getStartAddr())
+    return emitOpError("'finishAddr' requires 'startAddr' to be present");
+  if (getSliceLeft() && !getSliceRight())
+    return emitOpError("'sliceLeft' requires 'sliceRight' to be present");
+  if (getSliceRight() && !getSliceLeft())
+    return emitOpError("'sliceRight' requires 'sliceLeft' to be present");
+  if (getDimLows().empty() || getDimLows().size() != getDimDescending().size())
+    return emitOpError("'dimLows' and 'dimDescending' must have one entry per "
+                       "unpacked dimension");
   return success();
 }
 

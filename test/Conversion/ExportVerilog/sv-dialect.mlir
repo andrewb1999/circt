@@ -277,6 +277,8 @@ hw.module @M1<param1: i42>(in %clock : i1, in %cond : i1, in %val : i8) {
       sv.fflush
       // CHECK-NEXT: $fflush(32'h80000002);
       sv.fflush fd %fd
+      // CHECK-NEXT: $fclose(32'h80000002);
+      sv.fclose %fd
     }// CHECK-NEXT:   {{end$}}
   } {sv.attributes = [#sv.attribute<"sv attr">]}
   // CHECK-NEXT:  end // initial
@@ -1092,6 +1094,21 @@ hw.module @RegisterOfStructOrArrayOfStruct() {
   %reg3 = sv.reg : !hw.inout<array<4xarray<8xstruct<a: i1, b: i1>>>>
 }
 
+// See https://github.com/llvm/circt/issues/7733
+// CHECK-LABEL: module RegisterOfUnpackedArrayOfStruct
+hw.module @RegisterOfUnpackedArrayOfStruct() {
+  // CHECK-NOT: reg
+  // CHECK: struct packed {logic a; logic b; }{{.*}}reg4[0:7]
+  %reg4 = sv.reg : !hw.inout<uarray<8xstruct<a: i1, b: i1>>>
+
+  // CHECK-NOT: reg
+  // CHECK: struct packed {logic a; logic b; }{{.*}}reg5[0:3][0:7]
+  %reg5 = sv.reg : !hw.inout<uarray<4xuarray<8xstruct<a: i1, b: i1>>>>
+
+  // CHECK-NOT: reg
+  // CHECK: struct packed {logic a; logic b; }[7:0]{{.*}}reg6[0:3]
+  %reg6 = sv.reg : !hw.inout<uarray<4xarray<8xstruct<a: i1, b: i1>>>>
+}
 
 // CHECK-LABEL: module MultiUseReadInOut(
 // Issue #1564
@@ -1935,6 +1952,17 @@ hw.module @sformatf(in %a: i1, out o: i1) {
   hw.output %1 : i1
 }
 
+// CHECK-LABEL: module concat_str
+hw.module @concat_str(out o: i1) {
+  %foo = sv.constantStr "foo"
+  %bar = sv.constantStr "bar"
+  %baz = sv.constantStr "baz"
+  %cat = sv.concat_str (%foo, %bar, %baz) : !hw.string
+  // CHECK: assign o = $test$plusargs({"foo", "bar", "baz"})
+  %0 = sv.system "test$plusargs"(%cat) : (!hw.string) -> i1
+  hw.output %0 : i1
+}
+
 hw.module @bindInMod() {
   sv.bind #hw.innerNameRef<@remoteInstDut::@bindInst>
   sv.bind #hw.innerNameRef<@remoteInstDut::@bindInst3>
@@ -1965,6 +1993,42 @@ hw.module @MacroExample() {
 }
 // CHECK-LABEL: module MacroExample
 // CHECK: `_ERROR_inside_macro_example
+
+// CHECK-LABEL: module write_task_test(
+// CHECK:      always_ff @(posedge clock) begin
+// CHECK-NEXT:   $write("stdout");
+// CHECK-NEXT:   $write("%d", 32'h2A);
+// CHECK-NEXT:   $write("%d %d", 32'h80000001, 32'h80000002);
+// CHECK-NEXT: end
+hw.module @write_task_test(in %clock : i1) {
+  sv.alwaysff(posedge %clock) {
+    %c0 = hw.constant 42 : i32
+    %c1 = hw.constant 0x80000001 : i32
+    %c2 = hw.constant 0x80000002 : i32
+    sv.write "stdout"
+    sv.write "%d"(%c0) : i32
+    sv.write "%d %d"(%c1, %c2) : i32, i32
+  }
+}
+
+// CHECK-LABEL: module fwrite_task_test(
+// CHECK:      always_ff @(posedge clock) begin
+// CHECK-NEXT:   $fwrite(32'h80000001, "stdout");
+// CHECK-NEXT:   $fwrite(32'h80000002, "stderr once");
+// CHECK-NEXT:   $fwrite(32'h80000002, "stderr twice");
+// CHECK-NEXT:   $fwrite(32'h80000002, "direct fd");
+// CHECK-NEXT: end
+hw.module @fwrite_task_test(in %clock : i1) {
+  sv.alwaysff(posedge %clock) {
+    %fd_stdout = hw.constant 0x80000001 : i32
+    %fd_stderr = hw.constant 0x80000002 : i32
+    sv.fwrite %fd_stdout, "stdout"
+    sv.fwrite %fd_stderr, "stderr once"
+    sv.fwrite %fd_stderr, "stderr twice"
+    %fd_direct = hw.constant 0x80000002 : i32
+    sv.fwrite %fd_direct, "direct fd"
+  }
+}
 
 sv.bind <@wait_order::@baz>
 

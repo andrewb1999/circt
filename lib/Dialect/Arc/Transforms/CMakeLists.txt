@@ -4,15 +4,19 @@ add_circt_dialect_library(CIRCTArcTransforms
   ArcCanonicalizer.cpp
   Dedup.cpp
   FindInitialVectors.cpp
+  GenerateDriver.cpp
+  InferContext.cpp
   InferMemories.cpp
   InferStateProperties.cpp
   InlineArcs.cpp
   InsertRuntime.cpp
-  IsolateClocks.cpp
   LatencyRetiming.cpp
   LowerArcsToFuncs.cpp
+  LowerArrays.cpp
   LowerClocksToFuncs.cpp
+  LowerCoroutines.cpp
   LowerLUT.cpp
+  LowerProcesses.cpp
   LowerState.cpp
   LowerVectorizations.cpp
   LowerVerifSimulations.cpp
@@ -21,6 +25,8 @@ add_circt_dialect_library(CIRCTArcTransforms
   MergeTaps.cpp
   MuxToControlFlow.cpp
   PrintCostModel.cpp
+  RemoveI0Types.cpp
+  ResolveXMRRef.cpp
   SimplifyVariadicOps.cpp
   SplitFuncs.cpp
   SplitLoops.cpp
@@ -42,11 +48,13 @@ add_circt_dialect_library(CIRCTArcTransforms
   CIRCTSupport
   CIRCTSV
   CIRCTVerif
+  MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRIR
   MLIRLLVMDialect
   MLIRPass
   MLIRSCFDialect
   MLIRTransformUtils
+  MLIRUBDialect
   MLIRVectorDialect
 )

@@ -12,7 +12,7 @@
 // Check if printing with very short line length, removing info locators (@[...]), no line is longer than 5x line length.
 // RUN: circt-translate --export-firrtl %s --target-line-length=10 | sed -e 's/ @\[.*\]//' | FileCheck %s --implicit-check-not "{{^(.{50})}}" --check-prefix PRETTY
 
-// CHECK-LABEL: FIRRTL version 5.1.0
+// CHECK-LABEL: FIRRTL version 7.0.0
 // CHECK-LABEL: circuit Foo :
 // PRETTY-LABEL: circuit Foo :
 firrtl.circuit "Foo" {
@@ -645,7 +645,11 @@ firrtl.circuit "Foo" {
                             out %path : !firrtl.path,
                             out %list : !firrtl.list<list<string>>,
                             out %unknownString : !firrtl.string,
-                            out %stringcat : !firrtl.string) {
+                            out %stringcat : !firrtl.string,
+                            out %stringeq : !firrtl.bool,
+                            out %booland : !firrtl.bool,
+                            out %boolor : !firrtl.bool,
+                            out %boolxor : !firrtl.bool) {
     // CHECK: propassign string, String("hello")
     %0 = firrtl.string "hello"
     firrtl.propassign %string, %0 : !firrtl.string
@@ -683,6 +687,22 @@ firrtl.circuit "Foo" {
     %str1 = firrtl.string "world"
     %strcat = firrtl.string.concat %str0, %str1 : !firrtl.string
     firrtl.propassign %stringcat, %strcat : !firrtl.string
+
+    // CHECK: propassign stringeq, prop_eq(String("hello"), String("world"))
+    %streq = firrtl.prop.eq %str0, %str1 : !firrtl.string
+    firrtl.propassign %stringeq, %streq : !firrtl.bool
+
+    // CHECK: propassign booland, bool_and(Bool(true), Bool(true))
+    %booland_val = firrtl.bool.and %true, %true
+    firrtl.propassign %booland, %booland_val : !firrtl.bool
+
+    // CHECK: propassign boolor, bool_or(Bool(true), Bool(true))
+    %boolor_val = firrtl.bool.or %true, %true
+    firrtl.propassign %boolor, %boolor_val : !firrtl.bool
+
+    // CHECK: propassign boolxor, bool_xor(Bool(true), Bool(true))
+    %boolxor_val = firrtl.bool.xor %true, %true
+    firrtl.propassign %boolxor, %boolxor_val : !firrtl.bool
   }
 
   // Test optional group declaration and definition emission.

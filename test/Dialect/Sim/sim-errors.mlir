@@ -26,20 +26,71 @@ hw.module @fmt_infinite_concat_canonicalize(in %val : i8, out res: !sim.fstring)
 
 // -----
 
-hw.module @proc_print_hw() {
+hw.module @procedural_ops_print() {
   %lit = sim.fmt.literal "Nope"
-  // expected-error @below {{must be within a procedural region.}}
+  // expected-error @below {{must not be in a non-procedural region}}
   sim.proc.print %lit
 }
 
 // -----
 
-sv.macro.decl @SOMEMACRO
-hw.module @proc_print_sv() {
-  %lit = sim.fmt.literal "Nope"
-  sv.ifdef  @SOMEMACRO {
-    // expected-error @below {{must be within a procedural region.}}
-    sim.proc.print %lit
+hw.module @procedural_ops_pause() {
+  // expected-error @below {{must not be in a non-procedural region}}
+  sim.pause quiet
+}
+
+// -----
+
+hw.module @procedural_ops_terminate() {
+  // expected-error @below {{must not be in a non-procedural region}}
+  sim.terminate success, quiet
+}
+
+// -----
+
+hw.module @procedural_ops_get_file() {
+  %name = sim.fmt.literal "out.log"
+  // expected-error @below {{must not be in a non-procedural region}}
+  %file = sim.get_file %name
+}
+
+// -----
+
+hw.module @nonprocedural_ops_print(in %trigger : i1, in %clock : !seq.clock, in %cond : i1) {
+  hw.triggered posedge %trigger {
+    %lit = sim.fmt.literal "Nope"
+    // expected-error @below {{must not be in a procedural region}}
+    sim.print %lit on %clock if %cond
+  }
+}
+
+// -----
+
+hw.module @nonprocedural_ops_pause(in %trigger : i1, in %clock : !seq.clock, in %cond : i1) {
+  hw.triggered posedge %trigger {
+    // expected-error @below {{must not be in a procedural region}}
+    sim.clocked_pause %clock, %cond, quiet
+  }
+}
+
+// -----
+
+hw.module @nonprocedural_ops_terminate(in %trigger : i1, in %clock : !seq.clock, in %cond : i1) {
+  hw.triggered posedge %trigger {
+    // expected-error @below {{must not be in a procedural region}}
+    sim.clocked_terminate %clock, %cond, success, quiet
+  }
+}
+
+// -----
+
+hw.module @nonproc_print_scf_if(in %trigger : i1, in %clock : !seq.clock, in %cond : i1) {
+  hw.triggered posedge %trigger {
+    %lit = sim.fmt.literal "Nope"
+    scf.if %cond {
+      // expected-error @below {{must not be in a procedural region}}
+      sim.print %lit on %clock if %cond
+    }
   }
 }
 
@@ -88,4 +139,28 @@ hw.module @queue_concat(in %q1: !sim.queue<i32, 0>, in %q2: !sim.queue<i16, 0>) 
 hw.module @queue_from_array(in %uparr: !hw.array<5xi33>) {
   // expected-error @below {{'sim.queue.from_array' op sim::Queue element type 'i32' doesn't match hw::ArrayType element type 'i33'}}
   sim.queue.from_array %uparr : !hw.array<5xi33> -> <i32, 0>
+}
+
+// -----
+
+func.func @ReadMemFinishWithoutStart(%arg0: !sim.dstring, %arg1: !hw.array<16xi8>, %arg2: i32) {
+  // expected-error @below {{'finishAddr' requires 'startAddr' to be present}}
+  %0 = "sim.sv.readmem"(%arg0, %arg1, %arg2) <{dimDescending = array<i1: false>, dimLows = array<i64: 0>, operandSegmentSizes = array<i32: 1, 1, 0, 1, 0, 0>}> : (!sim.dstring, !hw.array<16xi8>, i32) -> !hw.array<16xi8>
+  return
+}
+
+// -----
+
+func.func @ReadMemSliceUnpaired(%arg0: !sim.dstring, %arg1: !hw.array<16xi8>, %arg2: i32) {
+  // expected-error @below {{'sliceLeft' requires 'sliceRight' to be present}}
+  %0 = "sim.sv.readmem"(%arg0, %arg1, %arg2) <{dimDescending = array<i1: false>, dimLows = array<i64: 0>, operandSegmentSizes = array<i32: 1, 1, 0, 0, 1, 0>}> : (!sim.dstring, !hw.array<16xi8>, i32) -> !hw.array<16xi8>
+  return
+}
+
+// -----
+
+func.func @ReadMemDimsMismatch(%arg0: !sim.dstring, %arg1: !hw.array<16xi8>) {
+  // expected-error @below {{'dimLows' and 'dimDescending' must have one entry per unpacked dimension}}
+  %0 = sim.sv.readmem %arg0, %arg1 {dimDescending = array<i1: false, false>, dimLows = array<i64: 0>} : !hw.array<16xi8>
+  return
 }

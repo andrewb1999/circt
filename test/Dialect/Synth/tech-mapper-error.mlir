@@ -1,6 +1,6 @@
 // RUN: circt-opt --pass-pipeline='builtin.module(synth-tech-mapper)' %s --split-input-file --verify-diagnostics
 
-hw.module @do_nothing(in %a : i1, out result : i1) attributes {hw.techlib.info = {area = 1.0 : f64, delay = [[1]]}} {
+hw.module @do_nothing(in %a : i1, out result : i1) attributes {synth.mapping_cost = #synth.mapping_cost<area = 1.0 : f64, arcs = [#synth.linear_timing_arc<1, 0, #synth.polarity<positive>>], input_caps = {}>} {
     hw.output %a : i1
 }
 
@@ -13,7 +13,7 @@ hw.module @test(in %a : i1, in %b : i1, out result : i1) {
 // -----
 
 // expected-error@+1 {{Modules with multiple outputs are not supported yet}}
-hw.module @multi_output(in %a : i1, out result1 : i1, out result2 : i1) attributes {hw.techlib.info = {area = 1.0 : f64, delay = [[1], [1]]}} {
+hw.module @multi_output(in %a : i1, out result1 : i1, out result2 : i1) attributes {synth.mapping_cost = #synth.mapping_cost<area = 1.0 : f64, arcs = [#synth.linear_timing_arc<1, 0, #synth.polarity<positive>>], input_caps = {}>} {
     hw.output %a, %a : i1, i1
 }
 
@@ -25,7 +25,7 @@ hw.module @test(in %a : i1, out result : i1) {
 // -----
 
 // expected-error@+1 {{All input ports must be single bit}}
-hw.module @multibit(in %a : i2, in %b: i1, out result : i1) attributes {hw.techlib.info = {area = 1.0 : f64, delay = [[1], [2]]}} {
+hw.module @multibit(in %a : i2, in %b: i1, out result : i1) attributes {synth.mapping_cost = #synth.mapping_cost<area = 1.0 : f64, arcs = [#synth.linear_timing_arc<1, 0, #synth.polarity<positive>>, #synth.linear_timing_arc<2, 0, #synth.polarity<positive>>], input_caps = {}>} {
   hw.output %b: i1
 }
 
@@ -33,7 +33,7 @@ hw.module @multibit(in %a : i2, in %b: i1, out result : i1) attributes {hw.techl
 
 
 // expected-error@+1 {{All output ports must be single bit}}
-hw.module @multibit(in %a : i1, in %b: i1, out result : i2) attributes {hw.techlib.info = {area = 1.0 : f64, delay = [[1], [2]]}} {
+hw.module @multibit(in %a : i1, in %b: i1, out result : i2) attributes {synth.mapping_cost = #synth.mapping_cost<area = 1.0 : f64, arcs = [#synth.linear_timing_arc<1, 0, #synth.polarity<positive>>, #synth.linear_timing_arc<2, 0, #synth.polarity<positive>>], input_caps = {}>} {
   %0 = comb.concat %a, %b : i1, i1
   hw.output %0: i2
 }
@@ -41,7 +41,17 @@ hw.module @multibit(in %a : i1, in %b: i1, out result : i2) attributes {hw.techl
 // -----
 
 
-hw.module @multibit(in %a : i1, in %b: i1, out result : i1) attributes {hw.techlib.info = {area = 1.0 : f64, delay = [[1], [2]]}} {
+hw.module @multibit(in %a : i1, in %b: i1, out result : i1) attributes {synth.mapping_cost = #synth.mapping_cost<area = 1.0 : f64, arcs = [#synth.linear_timing_arc<1, 0, #synth.polarity<positive>>, #synth.linear_timing_arc<2, 0, #synth.polarity<positive>>], input_caps = {}>} {
+  // expected-error@+1 {{Unsupported operation for truth table simulation}}
+  %0 = hw.constant 1 : i2
+  %1 = comb.extract %0 from 1 : (i2) -> i1
+  hw.output %1: i1
+}
+
+// -----
+
+
+hw.module @multibit(in %a : i1, in %b: i1, out result : i1) attributes {synth.mapping_cost = #synth.mapping_cost<area = 1.0 : f64, arcs = [#synth.linear_timing_arc<1, 0, #synth.polarity<positive>>, #synth.linear_timing_arc<2, 0, #synth.polarity<positive>>], input_caps = {}>} {
   // expected-error@+1 {{Unsupported operation for truth table simulation}}
   %0 = comb.add %a, %b : i1
   hw.output %0: i1
@@ -54,11 +64,38 @@ hw.module @too_many_input_bits(in %a0 : i1, in %a1 : i1, in %a2 : i1, in %a3 : i
                                in %a5 : i1, in %a6 : i1, in %a7 : i1, in %a8 : i1, in %a9 : i1,
                                in %a10 : i1, in %a11 : i1, in %a12 : i1, in %a13 : i1, in %a14 : i1,
                                in %a15 : i1, in %a16 : i1,  out result : i1)
-  attributes {hw.techlib.info = {
-  area = 1.0 : f64,
-  delay = [[1], [1], [1], [1], [1], [1], [1], [1], [1], [1],
-           [1], [1], [1], [1], [1], [1], [1]]
-  }} {
+  attributes {synth.mapping_cost = #synth.mapping_cost<area = 1.0 : f64, arcs = [
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+  #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>
+  ], input_caps = {}>} {
   %0 = synth.aig.and_inv %a0, %a1 : i1
   hw.output %0: i1
+}
+
+// -----
+
+// expected-error@+1 {{synth.mapping_cost arcs do not match module inputs}}
+hw.module @duplicate_arc(in %a : i1, out result : i1) attributes {synth.mapping_cost = #synth.mapping_cost<area = 1.0 : f64, arcs = [#synth.linear_timing_arc<1, 0, #synth.polarity<positive>>, #synth.linear_timing_arc<2, 0, #synth.polarity<positive>>], input_caps = {}>} {
+  hw.output %a : i1
+}
+
+// -----
+
+// expected-error@+1 {{expected library module to have an output}}
+hw.module @no_output() attributes {synth.mapping_cost = #synth.mapping_cost<area = 1.0 : f64, arcs = [#synth.linear_timing_arc<1, 0, #synth.polarity<positive>>], input_caps = {}>} {
 }

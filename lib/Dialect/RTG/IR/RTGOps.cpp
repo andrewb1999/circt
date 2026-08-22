@@ -30,7 +30,7 @@ using namespace rtg;
 LogicalResult
 ConstantOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                              ValueRange operands, DictionaryAttr attributes,
-                             OpaqueProperties properties, RegionRange regions,
+                             PropertyRef properties, RegionRange regions,
                              SmallVectorImpl<Type> &inferredReturnTypes) {
   inferredReturnTypes.push_back(
       properties.as<Properties *>()->getValue().getType());
@@ -169,7 +169,7 @@ LogicalResult SubstituteSequenceOp::verify() {
 
 LogicalResult SubstituteSequenceOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   ArrayRef<Type> argTypes =
       cast<SequenceType>(operands[0].getType()).getElementTypes();
@@ -292,7 +292,7 @@ LogicalResult SetCreateOp::verify() {
 
 LogicalResult SetCartesianProductOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   if (operands.empty()) {
     if (loc)
@@ -386,7 +386,7 @@ LogicalResult BagCreateOp::verify() {
 
 LogicalResult TupleCreateOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   SmallVector<Type> elementTypes;
   for (auto operand : operands)
@@ -401,7 +401,7 @@ LogicalResult TupleCreateOp::inferReturnTypes(
 
 LogicalResult TupleExtractOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   assert(operands.size() == 1 && "must have exactly one operand");
 
@@ -446,7 +446,7 @@ LogicalResult ConstraintOp::canonicalize(ConstraintOp op,
 
 LogicalResult VirtualRegisterOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   auto allowedRegs = properties.as<Properties *>()->getAllowedRegs();
   inferredReturnTypes.push_back(allowedRegs.getType());
@@ -878,7 +878,7 @@ void MemoryBlockDeclareOp::print(OpAsmPrinter &p) {
 
 LogicalResult MemoryBaseAddressOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   if (operands.empty())
     return failure();
@@ -886,7 +886,7 @@ LogicalResult MemoryBaseAddressOp::inferReturnTypes(
   if (!memTy)
     return failure();
   inferredReturnTypes.push_back(
-      ImmediateType::get(context, memTy.getAddressWidth()));
+      IntegerType::get(context, memTy.getAddressWidth()));
   return success();
 }
 
@@ -896,7 +896,7 @@ LogicalResult MemoryBaseAddressOp::inferReturnTypes(
 
 LogicalResult ConcatImmediateOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   if (operands.empty()) {
     if (loc)
@@ -906,7 +906,7 @@ LogicalResult ConcatImmediateOp::inferReturnTypes(
 
   unsigned totalWidth = 0;
   for (auto operand : operands) {
-    auto immType = dyn_cast<ImmediateType>(operand.getType());
+    auto immType = dyn_cast<IntegerType>(operand.getType());
     if (!immType) {
       if (loc)
         return mlir::emitError(*loc)
@@ -916,7 +916,7 @@ LogicalResult ConcatImmediateOp::inferReturnTypes(
     totalWidth += immType.getWidth();
   }
 
-  inferredReturnTypes.push_back(ImmediateType::get(context, totalWidth));
+  inferredReturnTypes.push_back(IntegerType::get(context, totalWidth));
   return success();
 }
 
@@ -927,13 +927,14 @@ OpFoldResult ConcatImmediateOp::fold(FoldAdaptor adaptor) {
 
   // If all operands are constants, fold into a single constant
   if (llvm::all_of(adaptor.getOperands(), [](Attribute attr) {
-        return isa_and_nonnull<ImmediateAttr>(attr);
+        return isa_and_nonnull<IntegerAttr>(attr);
       })) {
     auto result = APInt::getZeroWidth();
     for (auto attr : adaptor.getOperands())
-      result = result.concat(cast<ImmediateAttr>(attr).getValue());
+      result = result.concat(cast<IntegerAttr>(attr).getValue());
 
-    return ImmediateAttr::get(getContext(), result);
+    return IntegerAttr::get(
+        IntegerType::get(getContext(), result.getBitWidth()), result);
   }
 
   return {};
@@ -961,10 +962,11 @@ LogicalResult SliceImmediateOp::verify() {
 }
 
 OpFoldResult SliceImmediateOp::fold(FoldAdaptor adaptor) {
-  if (auto inputAttr = dyn_cast_or_null<ImmediateAttr>(adaptor.getInput())) {
+  if (auto inputAttr = dyn_cast_or_null<IntegerAttr>(adaptor.getInput())) {
     auto resultWidth = getType().getWidth();
     APInt sliced = inputAttr.getValue().extractBits(resultWidth, getLowBit());
-    return ImmediateAttr::get(getContext(), sliced);
+    return IntegerAttr::get(
+        IntegerType::get(getContext(), sliced.getBitWidth()), sliced);
   }
 
   return {};
@@ -1006,7 +1008,7 @@ OpFoldResult IntFormatOp::fold(FoldAdaptor adaptor) {
 //===----------------------------------------------------------------------===//
 
 OpFoldResult ImmediateFormatOp::fold(FoldAdaptor adaptor) {
-  auto immAttr = dyn_cast_or_null<ImmediateAttr>(adaptor.getValue());
+  auto immAttr = dyn_cast_or_null<IntegerAttr>(adaptor.getValue());
   if (!immAttr)
     return {};
   SmallString<16> strBuf("0x");
@@ -1035,6 +1037,345 @@ OpFoldResult StringToLabelOp::fold(FoldAdaptor adaptor) {
     return LabelAttr::get(getContext(), stringAttr.getValue());
 
   return {};
+}
+
+//===----------------------------------------------------------------------===//
+// StringToASCIIArrayOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult StringToASCIIArrayOp::canonicalize(StringToASCIIArrayOp op,
+                                                 PatternRewriter &rewriter) {
+  auto constOp = op.getString().getDefiningOp<ConstantOp>();
+  if (!constOp)
+    return failure();
+
+  auto strAttr = dyn_cast<StringAttr>(constOp.getValue());
+  if (!strAttr)
+    return failure();
+
+  auto i8Ty = rewriter.getIntegerType(8);
+  SmallVector<Value> bytes;
+  bytes.reserve(strAttr.getValue().size());
+  for (unsigned char c : strAttr.getValue())
+    bytes.push_back(ConstantOp::create(rewriter, op.getLoc(),
+                                       rewriter.getIntegerAttr(i8Ty, c)));
+
+  rewriter.replaceOpWithNewOp<ArrayCreateOp>(op, op.getType(), bytes);
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// WithHandlersOp (algebraic effects)
+//===----------------------------------------------------------------------===//
+
+ParseResult WithHandlersOp::parse(OpAsmParser &parser, OperationState &result) {
+  // Syntax:
+  //   rtg.with_handlers {
+  //     handle @effect(arg: type, ...) { region }
+  //     ...
+  //     do { region }
+  //   }
+  SmallVector<Attribute> effectSymbols;
+  SmallVector<std::unique_ptr<Region>> handlerRegions;
+
+  if (parser.parseLBrace())
+    return failure();
+
+  while (true) {
+    // Stop when we see the 'do' keyword.
+    if (succeeded(parser.parseOptionalKeyword("do")))
+      break;
+
+    // 'handle' keyword
+    if (parser.parseKeyword("handle"))
+      return failure();
+
+    // @effect-symbol
+    FlatSymbolRefAttr sym;
+    if (parser.parseAttribute(sym))
+      return failure();
+    effectSymbols.push_back(sym);
+
+    // (arg: type, ...)  — these become the entry block args of the handler.
+    SmallVector<OpAsmParser::Argument> args;
+    if (parser.parseArgumentList(args, OpAsmParser::Delimiter::Paren,
+                                 /*allowType=*/true))
+      return failure();
+
+    // { handler-body }
+    auto handler = std::make_unique<Region>();
+    if (parser.parseRegion(*handler, args))
+      return failure();
+    if (handler->empty())
+      handler->emplaceBlock();
+    handlerRegions.push_back(std::move(handler));
+  }
+
+  // Set property (inherent attribute)
+  auto &props = result.getOrAddProperties<WithHandlersOp::Properties>();
+  props.effects = ArrayAttr::get(parser.getContext(), effectSymbols);
+
+  // Parse the do-body region (the 'do' keyword was already consumed above).
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body))
+    return failure();
+  if (body->empty())
+    body->emplaceBlock();
+
+  // Move handler regions into the op (body is region[0], handlers follow).
+  for (auto &h : handlerRegions) {
+    Region *hr = result.addRegion();
+    hr->takeBody(*h);
+  }
+
+  if (parser.parseRBrace() || parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  return success();
+}
+
+void WithHandlersOp::print(OpAsmPrinter &printer) {
+  printer << " {";
+  printer.increaseIndent();
+  for (auto [symAttr, handlerRegion] :
+       llvm::zip(getEffects(), getHandlerRegions())) {
+    printer.printNewline();
+    printer << "handle " << symAttr << "(";
+    bool first = true;
+    for (BlockArgument arg : handlerRegion.front().getArguments()) {
+      if (!first)
+        printer << ", ";
+      first = false;
+      printer.printRegionArgument(arg);
+    }
+    printer << ") ";
+    printer.printRegion(handlerRegion, /*printEntryBlockArgs=*/false);
+  }
+  printer.printNewline();
+  printer << "do ";
+  printer.printRegion(getBody());
+  printer.decreaseIndent();
+  printer.printNewline();
+  printer << "}";
+  // effects is a property (inherent), print discardable attributes only
+  printer.printOptionalAttrDict(
+      (*this)->getDiscardableAttrDictionary().getValue());
+}
+
+LogicalResult WithHandlersOp::verify() {
+  auto effects = getEffects();
+  if (effects.size() != getHandlerRegions().size())
+    return emitOpError("effects.size() (")
+           << effects.size() << ") != handlerRegions.size() ("
+           << getHandlerRegions().size() << ")";
+
+  llvm::SmallDenseSet<StringAttr> seen;
+  for (auto attr : effects) {
+    auto sym = cast<FlatSymbolRefAttr>(attr).getAttr();
+    if (!seen.insert(sym).second)
+      return emitOpError("duplicate handler for effect '")
+             << sym.getValue() << "'";
+  }
+  return success();
+}
+
+LogicalResult
+WithHandlersOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto moduleOp = (*this)->getParentOfType<ModuleOp>();
+  if (!moduleOp)
+    return emitOpError("must be inside a module");
+
+  for (auto [idx, symAttr] : llvm::enumerate(getEffects())) {
+    auto ref = dyn_cast<FlatSymbolRefAttr>(symAttr);
+    if (!ref)
+      return emitOpError("effects[") << idx << "] is not a symbol reference";
+
+    auto decl = symbolTable.lookupNearestSymbolFrom<EffectOp>(moduleOp, ref);
+    if (!decl)
+      return emitOpError("unresolved effect symbol '") << ref.getValue() << "'";
+
+    // Verify handler region block argument types.
+    Region &handlerRegion = getHandlerRegions()[idx];
+    if (handlerRegion.empty())
+      return emitOpError("handler region ") << idx << " is empty";
+
+    Block &handlerBlock = handlerRegion.front();
+    FunctionType ft = decl.getFunctionType();
+    auto inputTypes = ft.getInputs();
+    auto resultTypes = ft.getResults();
+
+    // Expected: input types + continuation<result>
+    Type resumeType =
+        resultTypes.empty() ? NoneType::get(getContext()) : resultTypes[0];
+    size_t expectedArgs = inputTypes.size() + 1;
+
+    if (handlerBlock.getNumArguments() != expectedArgs)
+      return emitOpError("handler region ")
+             << idx << " expects " << expectedArgs << " block args but has "
+             << handlerBlock.getNumArguments();
+
+    for (auto [argIdx, argType] : llvm::enumerate(inputTypes)) {
+      if (handlerBlock.getArgument(argIdx).getType() != argType)
+        return emitOpError("handler region ")
+               << idx << " block arg " << argIdx << " has type "
+               << handlerBlock.getArgument(argIdx).getType() << " but expected "
+               << argType;
+    }
+
+    auto contTy = ContinuationType::get(getContext(), resumeType);
+    if (handlerBlock.getArgument(inputTypes.size()).getType() != contTy)
+      return emitOpError("handler region ")
+             << idx << " continuation arg has type "
+             << handlerBlock.getArgument(inputTypes.size()).getType()
+             << " but expected " << contTy;
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// PerformOp
+//===----------------------------------------------------------------------===//
+
+ParseResult PerformOp::parse(OpAsmParser &parser, OperationState &result) {
+  // Parse: @effect `(` operands `)` `:` `(` inputTypes `)` `->` resultType
+  FlatSymbolRefAttr effectAttr;
+  if (parser.parseAttribute(effectAttr))
+    return failure();
+  result.getOrAddProperties<PerformOp::Properties>().effect = effectAttr;
+
+  SmallVector<OpAsmParser::UnresolvedOperand> operands;
+  if (parser.parseOperandList(operands, OpAsmParser::Delimiter::Paren))
+    return failure();
+
+  if (parser.parseColon())
+    return failure();
+
+  SmallVector<Type> operandTypes;
+  if (parser.parseLParen())
+    return failure();
+  if (succeeded(parser.parseOptionalRParen())) {
+    // empty operand list
+  } else {
+    if (parser.parseTypeList(operandTypes) || parser.parseRParen())
+      return failure();
+  }
+
+  if (parser.parseArrow())
+    return failure();
+
+  Type resultType;
+  if (parser.parseType(resultType))
+    return failure();
+
+  if (parser.resolveOperands(operands, operandTypes,
+                             parser.getCurrentLocation(), result.operands))
+    return failure();
+
+  if (!isa<NoneType>(resultType))
+    result.addTypes(resultType);
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  return success();
+}
+
+void PerformOp::print(OpAsmPrinter &printer) {
+  printer << " " << getEffectAttr() << "(";
+  llvm::interleaveComma(getOperands(), printer, [&](Value v) { printer << v; });
+  printer << ") : (";
+  llvm::interleaveComma(getOperands(), printer,
+                        [&](Value v) { printer << v.getType(); });
+  printer << ") -> ";
+  if (getResult())
+    printer << getResult().getType();
+  else
+    printer << NoneType::get(getContext());
+  // effect is a property (inherent), print discardable attributes only
+  printer.printOptionalAttrDict(
+      (*this)->getDiscardableAttrDictionary().getValue());
+}
+
+void PerformOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Write::get(), MutResource::get());
+}
+
+LogicalResult PerformOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto moduleOp = (*this)->getParentOfType<ModuleOp>();
+  if (!moduleOp)
+    return emitOpError("must be inside a module");
+
+  auto decl =
+      symbolTable.lookupNearestSymbolFrom<EffectOp>(moduleOp, getEffectAttr());
+  if (!decl)
+    return emitOpError("unresolved effect symbol '") << getEffect() << "'";
+
+  FunctionType ft = decl.getFunctionType();
+  auto inputTypes = ft.getInputs();
+  auto resultTypes = ft.getResults();
+
+  if (getOperands().size() != inputTypes.size())
+    return emitOpError("effect '")
+           << getEffect() << "' expects " << inputTypes.size()
+           << " inputs but got " << getOperands().size();
+
+  for (auto [idx, opType, declType] :
+       llvm::enumerate(getOperandTypes(), inputTypes)) {
+    if (opType != declType)
+      return emitOpError("operand ") << idx << " has type " << opType
+                                     << " but effect declares " << declType;
+  }
+
+  if (resultTypes.empty()) {
+    if (getResult())
+      return emitOpError("effect '")
+             << getEffect() << "' returns none but perform has a result";
+  } else {
+    if (!getResult())
+      return emitOpError("effect '")
+             << getEffect() << "' returns " << resultTypes[0]
+             << " but perform has no result";
+    if (getResult().getType() != resultTypes[0])
+      return emitOpError("result type ")
+             << getResult().getType() << " does not match effect result type "
+             << resultTypes[0];
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ResumeOp
+//===----------------------------------------------------------------------===//
+
+void ResumeOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Write::get(), MutResource::get());
+}
+
+LogicalResult ResumeOp::verify() {
+  auto contTy = cast<ContinuationType>(getContinuation().getType());
+  Type resumeType = contTy.getResumeType();
+
+  if (isa<NoneType>(resumeType)) {
+    if (getValue())
+      return emitOpError(
+          "continuation expects none but resume provides a value");
+  } else {
+    if (!getValue())
+      return emitOpError("continuation expects ")
+             << resumeType << " but resume provides no value";
+    if (getValue().getType() != resumeType)
+      return emitOpError("resume value type ")
+             << getValue().getType()
+             << " does not match continuation resume type " << resumeType;
+  }
+
+  return success();
 }
 
 //===----------------------------------------------------------------------===//

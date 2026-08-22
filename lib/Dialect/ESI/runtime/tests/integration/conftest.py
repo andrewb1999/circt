@@ -9,6 +9,7 @@ from pathlib import Path
 import logging
 import shutil
 import subprocess
+from typing import Optional
 
 import pytest
 
@@ -54,3 +55,131 @@ def check_lines(stdout: str, expected: list[str]) -> None:
     assert idx >= 0, \
         f"Expected output not found: {line!r}"
     remaining = remaining[idx + len(line):]
+
+
+def _runtime_env() -> dict[str, str]:
+  """Return an environment which can load ESI runtime shared libraries."""
+  env = os.environ.copy()
+  if os.name != "nt":
+    return env
+
+  runtime_root = get_runtime_root()
+  dll_dirs = [
+      path for path in (runtime_root, runtime_root / "bin",
+                        runtime_root / "lib") if path.exists()
+  ]
+  existing_path = env.get("PATH", "")
+  env["PATH"] = os.pathsep.join(str(path) for path in dll_dirs) + \
+      os.pathsep + existing_path
+  return env
+
+
+# ---------------------------------------------------------------------------
+# Shared C++ build helper
+# ---------------------------------------------------------------------------
+
+
+def build_cpp_test(sources_dir: Path,
+                   target: str,
+                   header_subdir: str,
+                   build_subdir: Optional[str] = None) -> Path:
+  """Configure + build a C++ integration test target, returning the binary.
+
+  * ``sources_dir``: root provided by ``cosim_test`` (contains ``generated/``).
+  * ``target``: CMake target name (e.g. ``loopback_test``).
+  * ``header_subdir``: subdirectory under the include root where the generated
+    headers are copied (e.g. ``"loopback"`` or ``"test_codegen"``).
+  * ``build_subdir``: name for the build directory under ``sources_dir``.
+    Defaults to ``target``.
+
+  The configure step is skipped when the Ninja build file already exists;
+  ``cmake --build`` always runs so that CMake's own dependency tracking
+  picks up any source or generated-header changes.
+  """
+  require_tool("cmake")
+  require_tool("ninja")
+
+  if build_subdir is None:
+    build_subdir = target
+  build_dir = sources_dir / build_subdir
+  exe_suffix = ".exe" if os.name == "nt" else ""
+  binary = build_dir / (target + exe_suffix)
+
+  runtime_root = get_runtime_root()
+  include_dir = sources_dir / "cpp_include"
+  generated_dir = include_dir / header_subdir
+
+  if not (build_dir / "build.ninja").exists():
+    if build_dir.exists():
+      shutil.rmtree(build_dir)
+
+    generated_dir.mkdir(parents=True, exist_ok=True)
+
+    codegen_src = sources_dir / "generated"
+    if codegen_src.exists():
+      for item in codegen_src.iterdir():
+        if item.is_file():
+          shutil.copy(item, generated_dir)
+
+    result = subprocess.run(
+        [
+            "cmake",
+            "-G",
+            "Ninja",
+            "-S",
+            str(SW_DIR),
+            "-B",
+            str(build_dir),
+            "-DCMAKE_BUILD_TYPE=Release",
+            f"-DLOOPBACK_GENERATED_DIR={include_dir}",
+            f"-DESI_RUNTIME_ROOT={runtime_root}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"cmake configure failed (rc={result.returncode}):\n"
+        f"--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}")
+
+  result = subprocess.run(
+      [
+          "cmake", "--build",
+          str(build_dir), "--target", target, "--config", "Release"
+      ],
+      capture_output=True,
+      text=True,
+  )
+  assert result.returncode == 0, (
+      f"cmake build failed (rc={result.returncode}):\n"
+      f"--- stdout ---\n{result.stdout}\n"
+      f"--- stderr ---\n{result.stderr}")
+
+  return binary
+
+
+def run_probe(binary: Path,
+              host: str,
+              port: int,
+              probe: str,
+              expected: Optional[list[str]] = None) -> str:
+  """Invoke ``binary --probe <probe>`` and assert it prints ``<probe> ok``.
+
+  If *expected* is given, those substrings are checked (in order) against
+  stdout instead of the default ``["<probe> ok"]``.
+
+  Returns the captured stdout for further assertions if needed.
+  """
+  result = subprocess.run(
+      [str(binary), "--probe", probe, "cosim", f"{host}:{port}"],
+      capture_output=True,
+      env=_runtime_env(),
+      text=True,
+      timeout=60,
+  )
+  assert result.returncode == 0, (
+      f"{binary.name} --probe {probe} failed (rc={result.returncode}):\n"
+      f"--- stdout ---\n{result.stdout}\n"
+      f"--- stderr ---\n{result.stderr}")
+  check_lines(result.stdout, expected or [f"{probe} ok"])
+  return result.stdout

@@ -10,13 +10,19 @@
 //
 //===----------------------------------------------------------------------===//
 
+#ifndef CIRCT_DIALECT_COMB_COMBINATIONAL_TD
+#define CIRCT_DIALECT_COMB_COMBINATIONAL_TD
+
+include "circt/Dialect/Comb/CombDialect.td"
+include "circt/Dialect/HW/HWTypes.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/InferIntRangeInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/IR/EnumAttr.td"
+
 //===----------------------------------------------------------------------===//
 // Arithmetic and Logical Operations
 //===----------------------------------------------------------------------===//
-
-include "mlir/Interfaces/InferTypeOpInterface.td"
-include "mlir/Interfaces/InferIntRangeInterface.td"
-include "mlir/IR/EnumAttr.td"
 
 // Base class for binary operators.
 class BinOp<string mnemonic, list<Trait> traits = []> :
@@ -169,17 +175,14 @@ def ICmpOp : CombOp<"icmp",
 // Unary Operations
 //===----------------------------------------------------------------------===//
 
-// Base class for unary reduction operations that produce an i1.
-class UnaryI1ReductionOp<string mnemonic, list<Trait> traits = []> :
-      CombOp<mnemonic, traits # [Pure]> {
+def ParityOp: CombOp<"parity", [Pure]> {
   let arguments = (ins HWIntegerType:$input, UnitAttr:$twoState);
   let results = (outs I1:$result);
   let hasFolder = 1;
+  let hasCanonicalizeMethod = true;
 
   let assemblyFormat = "(`bin` $twoState^)? $input attr-dict `:` qualified(type($input))";
 }
-
-def ParityOp : UnaryI1ReductionOp<"parity">;
 
 //===----------------------------------------------------------------------===//
 // Integer width modifying operations.
@@ -242,7 +245,7 @@ def ConcatOp : CombOp<"concat",
                                           std::optional<Location> loc,
                                           ValueRange operands,
                                           DictionaryAttr attrs,
-                                          mlir::OpaqueProperties properties,
+                                          mlir::PropertyRef properties,
                                           mlir::RegionRange regions,
                                           SmallVectorImpl<Type> &results);
   }];
@@ -356,3 +359,5 @@ def ReverseOp : CombOp<"reverse", [
 
   let assemblyFormat = "$input attr-dict `:` type($input)";
 }
+
+#endif // CIRCT_DIALECT_COMB_COMBINATIONAL_TD

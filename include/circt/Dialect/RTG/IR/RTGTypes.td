@@ -148,6 +148,13 @@ def ArrayType : RTGTypeDef<"Array"> {
   ];
 }
 
+class ArrayTypeOf<Type elementType> : ContainerType<
+  elementType, ArrayType.predicate,
+  "llvm::cast<rtg::ArrayType>($_self).getElementType()", "array">,
+  SameBuildabilityAs<elementType,
+    "::circt::rtg::ArrayType::get($_builder.getContext(), " #
+    elementType.builderCall # ")">;
+
 def MapType : RTGTypeDef<"Map"> {
   let summary = "a map from keys to values";
   let description = [{
@@ -221,28 +228,6 @@ def LabelType : RTGISATypeDef<"Label", "label"> {
   let assemblyFormat = "";
 }
 
-def ImmediateType : RTGISATypeDef<"Immediate", "immediate"> {
-  let summary = "an ISA immediate";
-  let description = [{
-    This type represents immediates of arbitrary but fixed bit-width.
-    The RTG dialect provides this type to avoid duplication in ISA payload
-    dialects.
-  }];
-
-  let parameters = (ins "uint32_t":$width);
-  let assemblyFormat = "`<` $width `>`";
-}
-
-class ImmediateOfWidth<int width> : Type<
-  And<[ImmediateType.predicate,
-       CPred<"llvm::cast<::circt::rtg::ImmediateType>($_self).getWidth() == " #
-             width>]>,
-  "a " # width # "-bit immediate">,
-  BuildableType<"::circt::rtg::ImmediateType::get($_builder.getContext(), " #
-                width # ")"> {
-  int immWidth = width;
-}
-
 def MemoryType : RTGISATypeDef<"Memory", "memory"> {
   let summary = "handle to a memory";
   let description = [{
@@ -279,11 +264,29 @@ def MemoryBlockType : RTGISATypeDef<"MemoryBlock", "memory_block"> {
   let assemblyFormat = "`<` $addressWidth `>`";
 }
 
-def ISAMemory : AnyTypeOf<[MemoryType, ImmediateType, LabelType]>;
+def ISAMemory : AnyTypeOf<[MemoryType, AnySignlessInteger, LabelType]>;
 
 class ISAMemoryWithAddressWidth<int width> : AnyTypeOf<[
   MemoryWithAddressWidth<width>,
-  ImmediateOfWidth<width>,
+  I<width>,
   LabelType]>;
+
+
+def ContinuationType : RTGTypeDef<"Continuation"> {
+  let mnemonic = "continuation";
+  let summary = "first-class continuation value";
+  let description = [{
+    A first-class continuation value.  `T` is the type the performer receives
+    back (i.e., what `rtg.resume` provides).  Use `NoneType` for void effects.
+  }];
+
+  let parameters = (ins "::mlir::Type":$resumeType);
+  let assemblyFormat = "`<` $resumeType `>`";
+
+  let builders = [
+    TypeBuilderWithInferredContext<(ins "::mlir::Type":$resumeType),
+      "return $_get(resumeType.getContext(), resumeType);">,
+  ];
+}
 
 #endif // CIRCT_DIALECT_RTG_IR_RTGTYPES_TD

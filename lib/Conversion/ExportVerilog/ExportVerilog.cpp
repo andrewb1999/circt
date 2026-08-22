@@ -37,6 +37,7 @@
 #include "circt/Support/Path.h"
 #include "circt/Support/PrettyPrinter.h"
 #include "circt/Support/PrettyPrinterHelpers.h"
+#include "circt/Support/ProceduralRegionTrait.h"
 #include "circt/Support/Version.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
@@ -254,7 +255,7 @@ bool ExportVerilog::isVerilogExpression(Operation *op) {
           IndexedPartSelectInOutOp, StructFieldInOutOp, IndexedPartSelectOp,
           ParamValueOp, XMROp, XMRRefOp, SampledOp, EnumConstantOp, SFormatFOp,
           SystemFunctionOp, STimeOp, TimeOp, UnpackedArrayCreateOp,
-          UnpackedOpenArrayCastOp>(op))
+          UnpackedOpenArrayCastOp, ConcatStrOp>(op))
     return true;
 
   // These are Verif dialect expressions.
@@ -778,7 +779,8 @@ static bool isExpressionUnableToInline(Operation *op,
     //
     // To handle these, we push the subexpression into a temporary.
     if (isa<ExtractOp, ArraySliceOp, ArrayGetOp, ArrayInjectOp, StructExtractOp,
-            UnionExtractOp, IndexedPartSelectOp>(user))
+            StructInjectOp, StructExplodeOp, UnionExtractOp,
+            IndexedPartSelectOp>(user))
       if (use.getOperandNumber() == 0 && // ignore index operands.
           !isOkToBitSelectFrom(use.get()))
         return true;
@@ -988,8 +990,9 @@ StringRef getVerilogValueName(Value val) {
 
   if (auto port = dyn_cast<BlockArgument>(val)) {
     // If the value is defined by for op, use its associated verilog name.
-    if (auto forOp = dyn_cast<ForOp>(port.getParentBlock()->getParentOp()))
-      return forOp->getAttrOfType<StringAttr>("hw.verilogName");
+    auto parent = port.getParentBlock()->getParentOp();
+    if (isa<ForOp, GenerateForOp>(parent))
+      return parent->getAttrOfType<StringAttr>("hw.verilogName");
     return getInputPortVerilogName(port.getParentBlock()->getParentOp(),
                                    port.getArgNumber());
   }
@@ -1018,7 +1021,7 @@ public:
       : designOp(designOp), shared(shared), options(options),
         symbolCache(symbolCache), globalNames(globalNames),
         fileMapping(fileMapping), os(os), verilogLocMap(verilogLocMap),
-        pp(os, options.emittedLineLength), fileName(fileName) {
+        pp(os, options.getEmittedLineLength().value_or(0)), fileName(fileName) {
     pp.setListener(&saver);
   }
   /// This is the root mlir::ModuleOp that holds the whole design being emitted.
@@ -1316,7 +1319,9 @@ void EmitterBase::emitComment(StringAttr comment) {
   // Set a line length for the comment.  Subtract off the leading comment and
   // space ("// ") as well as the current indent level to simplify later
   // arithmetic.  Ensure that this line length doesn't go below zero.
-  auto lineLength = std::max<size_t>(state.options.emittedLineLength, 3) - 3;
+  std::optional<size_t> lineLength = state.options.getEmittedLineLength();
+  if (lineLength)
+    lineLength = std::max<size_t>(*lineLength, 3) - 3;
 
   // Process the comment in line chunks extracted from manually specified line
   // breaks.  This is done to preserve user-specified line breaking if used.
@@ -1330,7 +1335,7 @@ void EmitterBase::emitComment(StringAttr comment) {
       ps << "// ";
 
       // Base case 1: the entire comment fits on one line.
-      if (line.size() <= lineLength) {
+      if (!lineLength || line.size() <= lineLength) {
         ps << PPExtString(line);
         setPendingNewline();
         break;
@@ -1343,10 +1348,10 @@ void EmitterBase::emitComment(StringAttr comment) {
       //      and break there.
       // This algorithm violates the emittedLineLength if (2) ever occurrs,
       // but it's dead simple.
-      auto breakPos = line.rfind(' ', lineLength);
+      auto breakPos = line.rfind(' ', *lineLength);
       // No whitespace exists looking backwards.
       if (breakPos == StringRef::npos) {
-        breakPos = line.find(' ', lineLength);
+        breakPos = line.find(' ', *lineLength);
         // No whitespace exists looking forward (you hit the end of the
         // string).
         if (breakPos == StringRef::npos)
@@ -1554,20 +1559,14 @@ static StringRef getVerilogDeclWord(Operation *op,
     // should be left off.
     auto elementType =
         cast<InOutType>(op->getResult(0).getType()).getElementType();
-    if (isa<StructType>(elementType))
-      return "";
-    if (isa<UnionType>(elementType))
-      return "";
-    if (isa<EnumType>(elementType))
-      return "";
-    if (auto innerType = dyn_cast<ArrayType>(elementType)) {
-      while (isa<ArrayType>(innerType.getElementType()))
-        innerType = cast<ArrayType>(innerType.getElementType());
-      if (isa<StructType>(innerType.getElementType()) ||
-          isa<TypeAliasType>(innerType.getElementType()))
-        return "";
-    }
-    if (isa<TypeAliasType>(elementType))
+    // Unwrap arrays. Since packed arrays cannot contain unpacked arrays, we can
+    // unpack unpacked arrays first.
+    while (auto arrayType = hw::type_dyn_cast<UnpackedArrayType>(elementType))
+      elementType = arrayType.getElementType();
+    while (auto arrayType = hw::type_dyn_cast<ArrayType>(elementType))
+      elementType = arrayType.getElementType();
+
+    if (isa<StructType, UnionType, EnumType, TypeAliasType>(elementType))
       return "";
 
     return "reg";
@@ -2360,6 +2359,7 @@ private:
   SubExprInfo visitSV(ConstantXOp op);
   SubExprInfo visitSV(ConstantZOp op);
   SubExprInfo visitSV(ConstantStrOp op);
+  SubExprInfo visitSV(ConcatStrOp op);
 
   SubExprInfo visitSV(sv::UnpackedArrayCreateOp op);
   SubExprInfo visitSV(sv::UnpackedOpenArrayCastOp op) {
@@ -2534,8 +2534,12 @@ SubExprInfo ExprEmitter::emitBinary(Operation *op, VerilogPrecedence prec,
   auto operandSignReq =
       SubExprSignRequirement(emitBinaryFlags & EB_OperandSignRequirementMask);
   auto lhsInfo = emitSubExpr(op->getOperand(0), prec, operandSignReq);
-  // Bit of a kludge: if this is a comparison, don't break on either side.
-  auto lhsSpace = prec == VerilogPrecedence::Comparison ? PP::nbsp : PP::space;
+  // Bit of a kludge: if this is a comparison or equality, don't break on either
+  // side.
+  auto lhsSpace = (prec == VerilogPrecedence::Comparison ||
+                   prec == VerilogPrecedence::Equality)
+                      ? PP::nbsp
+                      : PP::space;
   // Use non-breaking space between op and RHS so breaking is consistent.
   ps << lhsSpace << syntax << PP::nbsp; // PP::space;
 
@@ -2787,7 +2791,21 @@ SubExprInfo ExprEmitter::visitComb(ICmpOp op) {
   if (op.isNotEqualZero())
     return emitUnary(op, "|", true);
 
-  auto result = emitBinary(op, Comparison, symop[pred], signop[pred]);
+  VerilogPrecedence precedence = Comparison;
+  switch (op.getPredicate()) {
+  case ICmpPredicate::eq:
+  case ICmpPredicate::ne:
+  case ICmpPredicate::ceq:
+  case ICmpPredicate::cne:
+  case ICmpPredicate::weq:
+  case ICmpPredicate::wne:
+    precedence = Equality;
+    break;
+  default:
+    precedence = Comparison;
+    break;
+  }
+  auto result = emitBinary(op, precedence, symop[pred], signop[pred]);
 
   // SystemVerilog 11.8.1: "Comparison... operator results are unsigned,
   // regardless of the operands".
@@ -2954,6 +2972,16 @@ SubExprInfo ExprEmitter::visitSV(ConstantStrOp op) {
 
   ps.writeQuotedEscaped(op.getStr());
   return {Symbol, IsUnsigned}; // is a string unsigned?  Yes! SV 5.9
+}
+
+SubExprInfo ExprEmitter::visitSV(ConcatStrOp op) {
+  if (hasSVAttributes(op))
+    emitError(op, "SV attributes emission is unimplemented for the op");
+
+  // Emits the SystemVerilog concatenation `{a, b, ...}`. Strings are unsigned
+  // (SV 5.9) and braces bind at the primary/Symbol level.
+  emitBracedList(op.getInputs());
+  return {Symbol, IsUnsigned};
 }
 
 SubExprInfo ExprEmitter::visitSV(ConstantZOp op) {
@@ -3602,6 +3630,7 @@ private:
   EmittedProperty visitLTL(ltl::OrOp op);
   EmittedProperty visitLTL(ltl::IntersectOp op);
   EmittedProperty visitLTL(ltl::DelayOp op);
+  EmittedProperty visitLTL(ltl::ClockedDelayOp op);
   EmittedProperty visitLTL(ltl::ConcatOp op);
   EmittedProperty visitLTL(ltl::RepeatOp op);
   EmittedProperty visitLTL(ltl::GoToRepeatOp op);
@@ -3611,7 +3640,12 @@ private:
   EmittedProperty visitLTL(ltl::UntilOp op);
   EmittedProperty visitLTL(ltl::EventuallyOp op);
   EmittedProperty visitLTL(ltl::ClockOp op);
+  EmittedProperty visitLTL(ltl::WeakOp op);
+  EmittedProperty visitLTL(ltl::StrongOp op);
 
+  EmittedProperty emitWeakStrongOp(StringRef mnemonic, Value input);
+  void emitLTLDelay(int64_t delay, std::optional<int64_t> length);
+  void emitLTLClockingEvent(ltl::ClockEdge edge, Value clock);
   void emitLTLConcat(ValueRange inputs);
 
 public:
@@ -3770,32 +3804,55 @@ EmittedProperty PropertyEmitter::visitLTL(ltl::IntersectOp op) {
   return {PropertyPrecedence::Intersect};
 }
 
-EmittedProperty PropertyEmitter::visitLTL(ltl::DelayOp op) {
+void PropertyEmitter::emitLTLDelay(int64_t delay,
+                                   std::optional<int64_t> length) {
   ps << "##";
-  if (auto length = op.getLength()) {
+  if (length) {
     if (*length == 0) {
-      ps.addAsString(op.getDelay());
+      ps.addAsString(delay);
     } else {
       ps << "[";
-      ps.addAsString(op.getDelay());
+      ps.addAsString(delay);
       ps << ":";
-      ps.addAsString(op.getDelay() + *length);
+      ps.addAsString(delay + *length);
       ps << "]";
     }
   } else {
-    if (op.getDelay() == 0) {
+    if (delay == 0) {
       ps << "[*]";
-    } else if (op.getDelay() == 1) {
+    } else if (delay == 1) {
       ps << "[+]";
     } else {
       ps << "[";
-      ps.addAsString(op.getDelay());
+      ps.addAsString(delay);
       ps << ":$]";
     }
   }
+}
+
+void PropertyEmitter::emitLTLClockingEvent(ltl::ClockEdge edge, Value clock) {
+  ps << "@(";
+  ps.scopedBox(PP::ibox2, [&] {
+    ps << PPExtString(stringifyClockEdge(edge)) << PP::space;
+    emitNestedProperty(clock, PropertyPrecedence::Lowest);
+    ps << ")";
+  });
+}
+
+EmittedProperty PropertyEmitter::visitLTL(ltl::DelayOp op) {
+  emitLTLDelay(op.getDelay(), op.getLength());
   ps << PP::space;
   emitNestedProperty(op.getInput(), PropertyPrecedence::Concat);
   return {PropertyPrecedence::Concat};
+}
+
+EmittedProperty PropertyEmitter::visitLTL(ltl::ClockedDelayOp op) {
+  emitLTLClockingEvent(op.getEdge(), op.getClock());
+  ps << PP::space;
+  emitLTLDelay(op.getDelay(), op.getLength());
+  ps << PP::space;
+  emitNestedProperty(op.getInput(), PropertyPrecedence::Concat);
+  return {PropertyPrecedence::Clocking};
 }
 
 void PropertyEmitter::emitLTLConcat(ValueRange inputs) {
@@ -3871,6 +3928,20 @@ EmittedProperty PropertyEmitter::visitLTL(ltl::NonConsecutiveRepeatOp op) {
 }
 
 EmittedProperty PropertyEmitter::visitLTL(ltl::NotOp op) {
+  // Emit `not (s_eventually X)` as `always ...` by duality, pulling the
+  // quantifier to the top and cancelling any inner negation.
+  if (auto ev = op.getInput().getDefiningOp<ltl::EventuallyOp>()) {
+    ps << "always" << PP::space;
+    if (auto innerNot = ev.getInput().getDefiningOp<ltl::NotOp>()) {
+      // `not(strong_eventually(not(X)))` -> `always X`.
+      emitNestedProperty(innerNot.getInput(), PropertyPrecedence::Qualifier);
+    } else {
+      // `not(strong_eventually(X))` -> `always (not X)`.
+      ps << "not" << PP::space;
+      emitNestedProperty(ev.getInput(), PropertyPrecedence::Unary);
+    }
+    return {PropertyPrecedence::Qualifier};
+  }
   ps << "not" << PP::space;
   emitNestedProperty(op.getInput(), PropertyPrecedence::Unary);
   return {PropertyPrecedence::Unary};
@@ -3919,15 +3990,29 @@ EmittedProperty PropertyEmitter::visitLTL(ltl::EventuallyOp op) {
 }
 
 EmittedProperty PropertyEmitter::visitLTL(ltl::ClockOp op) {
-  ps << "@(";
-  ps.scopedBox(PP::ibox2, [&] {
-    ps << PPExtString(stringifyClockEdge(op.getEdge())) << PP::space;
-    emitNestedProperty(op.getClock(), PropertyPrecedence::Lowest);
-    ps << ")";
-  });
+  emitLTLClockingEvent(op.getEdge(), op.getClock());
   ps << PP::space;
   emitNestedProperty(op.getInput(), PropertyPrecedence::Clocking);
   return {PropertyPrecedence::Clocking};
+}
+
+// Weak and strong are emitted identically
+EmittedProperty PropertyEmitter::emitWeakStrongOp(StringRef mnemonic,
+                                                  Value input) {
+  ps << mnemonic << PP::space << "(";
+  ps.scopedBox(PP::ibox2, [&] {
+    emitNestedProperty(input, PropertyPrecedence::Unary);
+    ps << ")";
+  });
+  return {PropertyPrecedence::Lowest};
+}
+
+EmittedProperty PropertyEmitter::visitLTL(ltl::WeakOp op) {
+  return emitWeakStrongOp("weak", op.getInput());
+}
+
+EmittedProperty PropertyEmitter::visitLTL(ltl::StrongOp op) {
+  return emitWeakStrongOp("strong", op.getInput());
 }
 
 // NOLINTEND(misc-no-recursion)
@@ -4091,8 +4176,14 @@ private:
   LogicalResult visitSV(AlwaysFFOp op);
   LogicalResult visitSV(InitialOp op);
   LogicalResult visitSV(CaseOp op);
+  template <typename OpTy, typename EmitPrefixFn>
+  LogicalResult
+  emitFormattedWriteLikeOp(OpTy op, StringRef callee, StringRef formatString,
+                           ValueRange substitutions, EmitPrefixFn emitPrefix);
+  LogicalResult visitSV(WriteOp op);
   LogicalResult visitSV(FWriteOp op);
   LogicalResult visitSV(FFlushOp op);
+  LogicalResult visitSV(FCloseOp op);
   LogicalResult visitSV(VerbatimOp op);
   LogicalResult visitSV(MacroRefOp op);
 
@@ -4134,6 +4225,7 @@ private:
 
   LogicalResult visitSV(GenerateOp op);
   LogicalResult visitSV(GenerateCaseOp op);
+  LogicalResult visitSV(GenerateForOp op);
 
   LogicalResult visitSV(ForOp op);
 
@@ -4619,7 +4711,7 @@ LogicalResult StmtEmitter::visitSV(FFlushOp op) {
   return success();
 }
 
-LogicalResult StmtEmitter::visitSV(FWriteOp op) {
+LogicalResult StmtEmitter::visitSV(FCloseOp op) {
   if (hasSVAttributes(op))
     emitError(op, "SV attributes emission is unimplemented for the op");
 
@@ -4628,20 +4720,38 @@ LogicalResult StmtEmitter::visitSV(FWriteOp op) {
   ops.insert(op);
 
   ps.addCallback({op, true});
-  ps << "$fwrite(";
+  ps << "$fclose(";
+  ps.scopedBox(PP::ibox0, [&]() { emitExpression(op.getFd(), ops); });
+  ps << ");";
+  ps.addCallback({op, false});
+  emitLocationInfoAndNewLine(ops);
+  return success();
+}
+
+template <typename OpTy, typename EmitPrefixFn>
+LogicalResult StmtEmitter::emitFormattedWriteLikeOp(OpTy op, StringRef callee,
+                                                    StringRef formatString,
+                                                    ValueRange substitutions,
+                                                    EmitPrefixFn emitPrefix) {
+  if (hasSVAttributes(op))
+    emitError(op, "SV attributes emission is unimplemented for the op");
+
+  startStatement();
+  SmallPtrSet<Operation *, 8> ops;
+  ops.insert(op);
+
+  ps.addCallback({op, true});
+  ps << callee;
   ps.scopedBox(PP::ibox0, [&]() {
-    emitExpression(op.getFd(), ops);
-
-    ps << "," << PP::space;
-    ps.writeQuotedEscaped(op.getFormatString());
-
+    emitPrefix(ops);
+    ps.writeQuotedEscaped(formatString);
     // TODO: if any of these breaks, it'd be "nice" to break
     // after the comma, instead of:
     // $fwrite(5, "...", a + b,
     //         longexpr_goes
     //         + here, c);
     // (without forcing breaking between all elements, like braced list)
-    for (auto operand : op.getSubstitutions()) {
+    for (auto operand : substitutions) {
       ps << "," << PP::space;
       emitExpression(operand, ops);
     }
@@ -4650,6 +4760,21 @@ LogicalResult StmtEmitter::visitSV(FWriteOp op) {
   ps.addCallback({op, false});
   emitLocationInfoAndNewLine(ops);
   return success();
+}
+
+LogicalResult StmtEmitter::visitSV(WriteOp op) {
+  return emitFormattedWriteLikeOp(op, "$write(", op.getFormatString(),
+                                  op.getSubstitutions(),
+                                  [&](SmallPtrSetImpl<Operation *> &) {});
+}
+
+LogicalResult StmtEmitter::visitSV(FWriteOp op) {
+  return emitFormattedWriteLikeOp(op, "$fwrite(", op.getFormatString(),
+                                  op.getSubstitutions(),
+                                  [&](SmallPtrSetImpl<Operation *> &ops) {
+                                    emitExpression(op.getFd(), ops);
+                                    ps << "," << PP::space;
+                                  });
 }
 
 LogicalResult StmtEmitter::visitSV(VerbatimOp op) {
@@ -4944,6 +5069,64 @@ LogicalResult StmtEmitter::visitSV(GenerateCaseOp op) {
   return success();
 }
 
+LogicalResult StmtEmitter::visitSV(GenerateForOp op) {
+  emitSVAttributes(op);
+  llvm::SmallPtrSet<Operation *, 8> ops;
+  ps.addCallback({op, true});
+  startStatement();
+
+  StringRef inductionVarName = op->getAttrOfType<StringAttr>("hw.verilogName");
+
+  ps << "for (";
+  ps.scopedBox(PP::cbox0, [&]() {
+    emitAssignLike(
+        [&]() { ps << "genvar" << PP::nbsp << PPExtString(inductionVarName); },
+        [&]() {
+          ps.invokeWithStringOS([&](auto &os) {
+            emitter.printParamValue(
+                op.getLowerBound(), os, VerilogPrecedence::LowestPrecedence,
+                [&]() { return op->emitOpError("invalid lower bound"); });
+          });
+        },
+        PPExtString("="));
+    ps << PP::space;
+
+    emitAssignLike(
+        [&]() { ps << PPExtString(inductionVarName); },
+        [&]() {
+          ps.invokeWithStringOS([&](auto &os) {
+            emitter.printParamValue(
+                op.getUpperBound(), os, VerilogPrecedence::LowestPrecedence,
+                [&]() { return op->emitOpError("invalid upper bound"); });
+          });
+        },
+        PPExtString("<"));
+    ps << PP::space;
+
+    ps << PPExtString(inductionVarName) << PP::nbsp << "+=" << PP::nbsp;
+    ps.invokeWithStringOS([&](auto &os) {
+      emitter.printParamValue(
+          op.getStep(), os, VerilogPrecedence::LowestPrecedence,
+          [&]() { return op->emitOpError("invalid step"); });
+    });
+    ps << ") begin";
+    StringRef blockName = op.getGenBlockName();
+    if (!blockName.empty())
+      ps << " : " << PPExtString(blockName);
+  });
+
+  ps << PP::neverbreak;
+  setPendingNewline();
+  emitStatementBlock(op.getBody().getBlocks().front());
+  startStatement();
+  ps << "end";
+  if (StringRef blockName = op.getGenBlockName(); !blockName.empty())
+    ps << " // " << PPExtString(blockName);
+  ps.addCallback({op, false});
+  setPendingNewline();
+  return success();
+}
+
 LogicalResult StmtEmitter::visitSV(ForOp op) {
   emitSVAttributes(op);
   llvm::SmallPtrSet<Operation *, 8> ops;
@@ -5223,7 +5406,8 @@ void StmtEmitter::emitBlockAsStatement(
 
   // Determine if we need begin/end by scanning the block.
   auto count = countStatements(*block);
-  auto needsBeginEnd = count != BlockStatementCount::One;
+  auto needsBeginEnd =
+      count != BlockStatementCount::One || state.options.alwaysEmitBeginEnd;
   if (needsBeginEnd)
     ps << " begin";
   emitLocationInfoAndNewLine(locationOps);
@@ -5606,9 +5790,13 @@ void StmtEmitter::emitInstancePortList(Operation *op,
   ps << " (";
 
   // Get the max port name length so we can align the '('.
+  // Exclude outlier names that span the whole line from the alignment column.
   size_t maxNameLength = 0;
+  auto lineLength = state.options.getEmittedLineLength();
   for (auto &elt : modPortInfo) {
-    maxNameLength = std::max(maxNameLength, elt.getVerilogName().size());
+    size_t nameLength = elt.getVerilogName().size();
+    if (!lineLength || nameLength <= *lineLength / 3)
+      maxNameLength = std::max(maxNameLength, nameLength);
   }
 
   auto getWireForValue = [&](Value result) {
@@ -5659,7 +5847,11 @@ void StmtEmitter::emitInstancePortList(Operation *op,
     ps.scopedBox(isZeroWidth ? PP::neverbox : PP::ibox2, [&]() {
       auto modPortName = modPort.getVerilogName();
       ps << "." << PPExtString(modPortName);
-      ps.spaces(maxNameLength - modPortName.size() + 1);
+      // Align to the column if fits, else no-break and accept possible overrun.
+      if (modPortName.size() <= maxNameLength)
+        ps.spaces(maxNameLength - modPortName.size() + 1);
+      else
+        ps.nbsp();
       ps << "(";
       ps.scopedBox(PP::ibox0, [&]() {
         // Emit the value as an expression.
@@ -6225,11 +6417,15 @@ void ModuleEmitter::emitBind(BindOp op) {
     ModulePortInfo childPortInfo(cast<PortList>(childMod).getPortList());
 
     // Get the max port name length so we can align the '('.
+    // Exclude outlier names longer than the line.
     size_t maxNameLength = 0;
+    auto lineLength = state.options.getEmittedLineLength();
     for (auto &elt : childPortInfo) {
       auto portName = elt.getVerilogName();
       elt.name = Builder(inst.getContext()).getStringAttr(portName);
-      maxNameLength = std::max(maxNameLength, elt.getName().size());
+      size_t nameLength = elt.getName().size();
+      if (!lineLength || nameLength <= *lineLength / 3)
+        maxNameLength = std::max(maxNameLength, nameLength);
     }
 
     SmallVector<Value> instPortValues(childPortInfo.size());
@@ -6270,7 +6466,9 @@ void ModuleEmitter::emitBind(BindOp op) {
       }
 
       ps << "." << PPExtString(elt.getName());
-      ps.nbsp(maxNameLength - elt.getName().size());
+      // Align to the column if fits, else no-break and accept possible overrun.
+      if (elt.getName().size() <= maxNameLength)
+        ps.nbsp(maxNameLength - elt.getName().size());
       ps << " (";
       llvm::SmallPtrSet<Operation *, 4> ops;
       if (elt.isOutput()) {

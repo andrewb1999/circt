@@ -293,9 +293,9 @@ hw.module @TrackDriveCondition(in %u: i42, in %v: i42) {
   %c = llhd.sig %c0_i42 : i42
   // CHECK: llhd.process
   llhd.process {
+    // CHECK-NEXT: [[C:%.+]] = llhd.prb %c
     // CHECK-NEXT: %false = hw.constant false
     // CHECK-NEXT: [[B:%.+]] = llhd.prb %b
-    // CHECK-NEXT: [[C:%.+]] = llhd.prb %c
     // CHECK-NOT: llhd.drv
     llhd.drv %a, %u after %0 : i42
     // CHECK-NEXT: cf.br ^bb2(%u, [[B]], %false, [[C]] : i42, i42, i1, i42)
@@ -1159,20 +1159,50 @@ hw.module @CaptureNonProbeValuesAcrossWait(in %a: i42, in %b: i42) {
   }
 }
 
-// Don't try to promote signals with types that have no fixed bit width (such as
-// f64) or that exceed MLIR's IntegerType width limit, since Mem2Reg needs to
-// create integer constants for default values of promoted slots.
-// CHECK-LABEL: @RealSignalNotPromoted
-hw.module @RealSignalNotPromoted(in %clk : i1, in %a : f64, in %b : f64) {
+// Values defined after a wait should not be captured across that wait. They may
+// still need to be captured across later waits that their definition dominates.
+// CHECK-LABEL: @CapturePostWaitValueOnlyAcrossDominatedWaits
+hw.module @CapturePostWaitValueOnlyAcrossDominatedWaits(in %a: i42) {
+  %d = llhd.constant_time <1fs, 0d, 0e>
+  llhd.process {
+    // CHECK: llhd.wait delay [[D:%.+]], ^bb1
+    llhd.wait delay %d, ^bb1
+  ^bb1:
+    // CHECK-NEXT: ^bb1:
+    // CHECK-NEXT: [[VALUE:%.+]] = comb.xor %a, %a
+    %v = comb.xor %a, %a : i42
+    // CHECK-NEXT: llhd.wait delay [[D]], ^bb2([[VALUE]] : i42)
+    llhd.wait delay %d, ^bb2
+  ^bb2:
+    // CHECK-NEXT: ^bb2([[CAPTURED:%.+]]: i42):
+    // CHECK-NEXT: call @use_i42([[CAPTURED]])
+    func.call @use_i42(%v) : (i42) -> ()
+    llhd.halt
+  }
+}
+
+// Float signals are promotable; Mem2Reg materializes a floating-point zero
+// default for the merge and forwards the driven value through block arguments,
+// turning the drive into a single conditional drive. Extremely wide aggregate
+// signals still are not promotable since default values would exceed MLIR's
+// IntegerType limit.
+// CHECK-LABEL: @RealSignalDrivePromoted
+hw.module @RealSignalDrivePromoted(in %clk : i1, in %a : f64, in %b : f64) {
   %0 = llhd.constant_time <0ns, 0d, 1e>
   // CHECK: %r = llhd.sig %b : f64
   %r = llhd.sig %b : f64
+  // CHECK: llhd.process
+  // CHECK: arith.constant 0.000000e+00 : f64
+  // CHECK: ^bb1([[VAL:%.+]]: f64, [[EN:%.+]]: i1):
+  // CHECK:   llhd.drv %r, [[VAL]] after {{%.+}} if [[EN]] : f64
+  // CHECK:   llhd.wait (%clk : i1), ^bb2
+  // CHECK: ^bb2:
+  // CHECK:   cf.br ^bb1(%a, %true : f64, i1)
   llhd.process {
     cf.br ^bb1
   ^bb1:
     llhd.wait (%clk : i1), ^bb2
   ^bb2:
-    // CHECK: llhd.drv %r, %a after
     llhd.drv %r, %a after %0 : f64
     cf.br ^bb1
   }
@@ -1286,4 +1316,78 @@ hw.module @MultiDelayProjectionDrive() {
     llhd.drv %e, %c0 after %t_delta : i8
     llhd.halt
   }
+}
+
+// Same-successor conditional branches appear as duplicate predecessor edges in
+// the CFG. Mem2Reg must update every edge in the terminator, but only once per
+// predecessor terminator, so it does not append duplicate operands without
+// matching block arguments.
+// CHECK-LABEL: @SameSuccessorCondBr
+hw.module @SameSuccessorCondBr(in %clk : i1) {
+  %t_delta = llhd.constant_time <0ns, 1d, 0e>
+  %t_eps = llhd.constant_time <0ns, 0d, 1e>
+  %true = hw.constant true
+  %false = hw.constant false
+  %c0_i32 = hw.constant 0 : i32
+  %c1_i32 = hw.constant 1 : i32
+  %c5_i32 = hw.constant 5 : i32
+  %cnt = llhd.sig %c0_i32 : i32
+  %proc:2 = llhd.process -> i1, i1 {
+    cf.br ^bb1(%clk, %c0_i32, %false, %c0_i32, %false, %false, %false : i1, i32, i1, i32, i1, i1, i1)
+  // CHECK: ^bb1({{.*}}: i1, {{.*}}: i32, {{.*}}: i1, {{.*}}: i32, {{.*}}: i1, {{.*}}: i1, {{.*}}: i1, {{.*}}: i32):
+  ^bb1(%0: i1, %1: i32, %2: i1, %3: i32, %4: i1, %5: i1, %6: i1):
+    llhd.drv %cnt, %1 after %t_eps if %2 : i32
+    llhd.drv %cnt, %3 after %t_delta if %4 : i32
+    llhd.wait yield (%5, %6 : i1, i1), (%clk : i1), ^bb2(%0 : i1)
+  ^bb2(%7: i1):
+    %8 = llhd.prb %cnt : i32
+    %9 = comb.xor bin %7, %true : i1
+    %10 = comb.and bin %9, %clk : i1
+    cf.cond_br %10, ^bb3, ^bb1(%clk, %8, %false, %8, %false, %false, %false : i1, i32, i1, i32, i1, i1, i1)
+  ^bb3:
+    %11 = comb.add %8, %c1_i32 : i32
+    %12 = comb.icmp sgt %8, %c5_i32 : i32
+    // CHECK: cf.cond_br {{.*}}, ^bb1({{.*}} : i1, i32, i1, i32, i1, i1, i1, i32), ^bb1({{.*}} : i1, i32, i1, i32, i1, i1, i1, i32)
+    cf.cond_br %12, ^bb1(%clk, %c5_i32, %true, %c0_i32, %false, %true, %true : i1, i32, i1, i32, i1, i1, i1), ^bb1(%clk, %8, %false, %11, %true, %false, %false : i1, i32, i1, i32, i1, i1, i1)
+  }
+}
+
+// Test that the following doesn't hang.
+//
+// See: https://github.com/llvm/circt/issues/10314
+//
+// CHECK-LABEL: @Timeout_10314
+hw.module private @Timeout_10314() {
+  %c0_i5 = hw.constant 0 : i5
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %c0_i32 = hw.constant 0 : i32
+  %c0_i4 = hw.constant 0 : i4
+  %c0_i8 = hw.constant 0 : i8
+  %false = hw.constant false
+  %c0_i3 = hw.constant 0 : i3
+  %rdptr0 = llhd.sig %c0_i3 : i3
+  %rdptr0_dec = llhd.sig %c0_i8 : i8
+  llhd.process {
+    cf.br ^bb1
+  ^bb1:  // 2 preds: ^bb0, ^bb7
+    %1 = llhd.prb %rdptr0 : i3
+    %2 = comb.concat %c0_i5, %1 : i5, i3
+    llhd.drv %rdptr0_dec, %2 after %0 : i8
+    cf.br ^bb2
+  ^bb2:  // 2 preds: ^bb1, ^bb6
+    cf.cond_br %false, ^bb3, ^bb7
+  ^bb3:  // pred: ^bb2
+    %3 = llhd.prb %rdptr0 : i3
+    %4 = comb.icmp eq %3, %c0_i3 : i3
+    cf.cond_br %4, ^bb4, ^bb5
+  ^bb4:  // pred: ^bb3
+    cf.br ^bb6
+  ^bb5:  // pred: ^bb3
+    cf.br ^bb6
+  ^bb6:  // 2 preds: ^bb4, ^bb5
+    cf.br ^bb2
+  ^bb7:  // pred: ^bb2
+    llhd.wait (%c0_i3, %c0_i8, %c0_i32, %false, %false, %c0_i3, %c0_i8, %c0_i8, %c0_i4, %c0_i4 : i3, i8, i32, i1, i1, i3, i8, i8, i4, i4), ^bb1
+  }
+  hw.output
 }

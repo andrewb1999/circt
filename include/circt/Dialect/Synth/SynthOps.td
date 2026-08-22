@@ -23,53 +23,77 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 class SynthOp<string mnemonic, list<Trait> traits = []> :
     Op<Synth_Dialect, mnemonic, traits>;
 
-def MajorityInverterOp : SynthOp<"mig.maj_inv",
-                                 [SameOperandsAndResultType, Pure]> {
-  let summary = "Majority-Inverter operation";
-  let description = [{
-    The `synth.mig.maj_inv` operation represents a Majority-Inverter in the
-    Synth dialect. This is used to represent majority inverter graph in
-    synthesis. This operation computes the majority function of its inputs,
-    where operands can be inverted respectively.
-
-    The majority function returns 1 when more than half of the inputs are 1,
-    and 0 otherwise. For three inputs, it's equivalent to:
-    (a & b) | (a & c) | (b & c).
-
-    Example:
-    ```mlir
-      %r1 = synth.mig.maj_inv %a, %b, %c : i1
-      %r2 = synth.mig.maj_inv not %a, %b, not %c : i1
-      %r3 = synth.mig.maj_inv %a, %b, %c, %d, %e : i3
-    ```
-
-    The number of inputs must be odd to avoid ties.
-  }];
+class InvertibleOperandsOp<string mnemonic, list<Trait> traits = []>
+  : SynthOp<mnemonic,[
+      // Share the BooleanLogicOpInterface contract and invertible operand
+      // syntax across Synth ops such as `synth.aig.and_inv`.
+      SameOperandsAndResultType, Pure,
+      DeclareOpInterfaceMethods<BooleanLogicOpInterface, [
+        "areInputsPermutationInvariant", "evaluateBooleanLogicWithoutInversion",
+        "supportsNumInputs", "createBooleanLogicOp", "getLogicDepthCost",
+        "getLogicAreaCost", "emitCNFWithoutInversion"
+      ]> ] # traits> {
+  // TODO: Restrict to HWIntegerType.
   let arguments = (ins Variadic<AnyType>:$inputs,
                        DenseBoolArrayAttr:$inverted);
   let results = (outs AnyType:$result);
-  let hasVerifier = true;
-  let hasCanonicalizeMethod = true;
-  let hasFolder = true;
-
   let assemblyFormat = [{
-    custom<VariadicInvertibleOperands>($inputs, type($result), $inverted,
-                                       attr-dict)
+    custom<VariadicInvertibleOperands>($inputs, type($result), $inverted, attr-dict)
   }];
-  let cppNamespace = "::circt::synth::mig";
-  let extraClassDeclaration = [{
-    // Evaluate the operation with the given input values.
-    APInt evaluate(ArrayRef<APInt> inputs);
-
-    // Check if the input is inverted.
-    bool isInverted(size_t idx) {
-      return getInverted()[idx];
-    }
-  }];
-
 }
 
-def AndInverterOp : SynthOp<"aig.and_inv", [SameOperandsAndResultType, Pure]> {
+class ThreeInputOp<string mnemonic, string logicFn, bit symmetric = false,
+                   list<Trait> traits = []>
+  : InvertibleOperandsOp<mnemonic, [
+      PredOpTrait<"requires exactly three operands",
+                  CPred<"getOperation()->getNumOperands() == 3">>,
+      PredOpTrait<"requires exactly three inversion flags",
+                  CPred<"getInverted().size() == 3">>] # traits> {
+  let builders = [
+    OpBuilder<(ins "Value":$a, "Value":$b, "Value":$c,
+                                CArg<"bool", "false">:$invertA,
+                                CArg<"bool", "false">:$invertB,
+                                CArg<"bool", "false">:$invertC), [{
+      SmallVector<bool> inverted{invertA, invertB, invertC};
+      return build($_builder, $_state, ValueRange{a, b, c},
+                   $_builder.getDenseBoolArrayAttr(inverted));
+    }]>
+  ];
+  let extraClassDefinition = [{
+    bool $cppClass::areInputsPermutationInvariant() {
+      return }] # !if(symmetric, "true", "false") # [{;
+    }
+    bool $cppClass::supportsNumInputs(unsigned numInputs) {
+      return numInputs == 3;
+    }
+    int64_t $cppClass::getLogicDepthCost() { return 1; }
+    std::optional<uint64_t> $cppClass::getLogicAreaCost() {
+      int64_t bitWidth = hw::getBitWidth(getType());
+      if (bitWidth < 0)
+        return std::nullopt;
+      return static_cast<uint64_t>(bitWidth);
+    }
+    ::llvm::KnownBits $cppClass::computeKnownBits(
+        ::llvm::function_ref<const ::llvm::KnownBits &(unsigned)>
+            getInputKnownBits) {
+      auto a = applyInputInversion(getInputKnownBits(0), isInverted(0));
+      auto b = applyInputInversion(getInputKnownBits(1), isInverted(1));
+      auto c = applyInputInversion(getInputKnownBits(2), isInverted(2));
+      return }] # logicFn # [{(a, b, c);
+    }
+    ::llvm::APInt $cppClass::evaluateBooleanLogicWithoutInversion(
+        ::llvm::ArrayRef<::llvm::APInt> inputs) {
+      assert(inputs.size() == 3 && "expected exactly three inputs");
+      return }] # logicFn # [{(inputs[0], inputs[1], inputs[2]);
+    }
+  }];
+}
+
+class SymmetricThreeInputOp<string mnemonic, string logicFn,
+                            list<Trait> traits = []>
+  : ThreeInputOp<mnemonic, logicFn, true, traits>;
+
+def AndInverterOp : InvertibleOperandsOp<"aig.and_inv"> {
   let summary = "AIG dialect AND operation";
   let description = [{
     The `synth.aig.and_inv` operation represents an And-Inverter in the AIG dialect.
@@ -99,13 +123,6 @@ def AndInverterOp : SynthOp<"aig.and_inv", [SameOperandsAndResultType, Pure]> {
     batch processing of logic synthesis when multibit operations are constructed
     in a similar manner.
   }];
-  // TODO: Restrict to HWIntegerType.
-  let arguments = (ins Variadic<AnyType>:$inputs, DenseBoolArrayAttr:$inverted);
-  let results = (outs AnyType:$result);
-
-  let assemblyFormat = [{
-    custom<VariadicInvertibleOperands>($inputs, type($result), $inverted, attr-dict)
-  }];
 
   let builders = [OpBuilder<(ins "Value":$input, CArg<"bool", "false">:$invert),
                             [{
@@ -120,18 +137,74 @@ def AndInverterOp : SynthOp<"aig.and_inv", [SameOperandsAndResultType, Pure]> {
       return build($_builder, $_state, {lhs, rhs}, inverted);
     }]>];
 
-  let extraClassDeclaration = [{
-    // Evaluate the operation with the given input values.
-    APInt evaluate(ArrayRef<APInt> inputs);
-
-    // Check if the input is inverted.
-    bool isInverted(size_t idx) {
-      return getInverted()[idx];
-    }
-  }];
   let hasFolder = 1;
   let hasCanonicalizeMethod = 1;
   let cppNamespace = "::circt::synth::aig";
+}
+
+def XorInverterOp : InvertibleOperandsOp<"xor_inv"> {
+  let summary = "XOR gate with invertible variadic inputs";
+  let description = [{
+    The `synth.xor_inv` operation represents a parity node whose operands may be
+    individually inverted before the XOR is evaluated.
+
+    Example:
+    ```mlir
+      %r0 = synth.xor_inv %a, %b : i1
+      %r1 = synth.xor_inv not %a, %b, %c : i8
+      %r2 = synth.xor_inv not %a : i1
+    ```
+  }];
+
+  let builders = [
+    OpBuilder<(ins "Value":$input, CArg<"bool", "false">:$invert),
+                            [{
+      SmallVector<bool> inverted {invert};
+      return build($_builder, $_state, {input}, inverted);
+    }]>,
+    OpBuilder<(ins "Value":$lhs, "Value":$rhs,
+                                CArg<"bool", "false">:$invertLhs,
+                                CArg<"bool", "false">:$invertRhs),
+                            [{
+      SmallVector<bool> inverted {invertLhs, invertRhs};
+      return build($_builder, $_state, {lhs, rhs}, inverted);
+    }]>,
+    OpBuilder<(ins "ArrayRef<std::pair<Value, bool>>":$operands),
+                            [{
+      SmallVector<Value> values;
+      SmallVector<bool> inverts;
+      for (auto &[val, inv] : operands) {
+        values.push_back(val);
+        inverts.push_back(inv);
+      }
+      return build($_builder, $_state, values, inverts);
+    }]>
+    ];
+    
+    let hasFolder = 1;
+    let hasCanonicalizeMethod = 1;
+
+}
+
+def DotOp : ThreeInputOp<"dot", "evaluateDotLogic"> {
+  let summary = "Ordered 3-input DOT gate with invertible inputs";
+  let description = [{
+    The `synth.dot` operation represents the ordered three-input Boolean
+    function `x xor (z or (x and y))`, applied after optional per-input
+    inversion.
+
+    Unlike common AND, OR, XOR, and majority gates, `synth.dot` is not
+    permutation-invariant: its operands play distinct roles in the Boolean
+    expression. Dot gates are known to be a promising intermediate
+    representation for area optimization, as discussed in "Three-Input Gates
+    for Logic Synthesis" (Dewmini Sudara Marakkalage et al., TCAD 2021).
+
+    Example:
+    ```mlir
+      %r0 = synth.dot %x, %y, %z : i1
+      %r1 = synth.dot not %x, %y, not %z : i8
+    ```
+  }];
 }
 
 def ChoiceOp : SynthOp<"choice", [SameOperandsAndResultType, Pure]> {
@@ -157,5 +230,104 @@ def ChoiceOp : SynthOp<"choice", [SameOperandsAndResultType, Pure]> {
   let hasCanonicalizeMethod = 1;
   let assemblyFormat = "$inputs attr-dict `:` type($result)";
 }
+
+def MajorityOp : SymmetricThreeInputOp<"majority", "evaluateMajorityLogic"> {
+  let summary = "Majority gate with invertible inputs";
+  let description = [{
+    The `synth.majority` operation computes the majority function of its
+    inputs, where each operand can be optionally inverted. 
+
+    The majority function returns 1 when more than half of the inputs are 1,
+    and 0 otherwise. For three inputs, it's equivalent to:
+    (a & b) | (a & c) | (b & c).
+
+
+    Example:
+  ```mlir
+      %r0 = synth.majority %a, %b, %c : i1
+      %r1 = synth.majority not %a, %b, not %c : i1
+  ```
+  }];
+}
+
+def OneHotOp : SymmetricThreeInputOp<"onehot", "evaluateOneHotLogic"> {
+   let summary = "3-input Onehot gate with invertible inputs";
+  let description = [{
+    The `synth.onehot` operation computes the one-hot function of its three
+    inputs, where each operand can be optionally inverted. The one-hot function
+    returns 1 when exactly one of the inputs is 1, and 0 otherwise. For three
+    inputs, it is equivalent to:
+
+    `(a & ~b & ~c) | (~a & b & ~c) | (~a & ~b & c)`
+
+    Example:
+```mlir
+      %r0 = synth.onehot %a, %b, %c : i1
+      %r1 = synth.onehot not %a, %b, not %c : i1
+```
+  }];
+}
+
+def MuxInverterOp : ThreeInputOp<"mux_inv", "evaluateMuxLogic"> {
+  let summary = "MUX gate with invertible inputs";
+  let description = [{
+    The `synth.mux_inv` operation represents a 3-input multiplexer node
+    whose operands can be individually inverted before evaluation.
+    The operation chooses between two values based on a condition:
+    given operands (cond, trueValue, falseValue), it calculates `cond ? trueValue : falseValue`,
+    which is equivalent to:
+    
+    `(cond & trueValue) | (~cond & falseValue)`
+
+    Example:
+    ```mlir
+      %r0 = synth.mux_inv %a, %b, %c : i8
+      %r1 = synth.mux_inv not %a, %b, not %c : i8
+    ```
+  }];
+}
+
+def GambleOp : SymmetricThreeInputOp<"gamble", "evaluateGambleLogic"> {
+  let summary = "3-input Gamble gate with invertible inputs";
+  let description = [{
+  The `synth.gamble` operation computes the gamble function of its three
+  inputs, where each operand can be optionally inverted. The gamble function
+  returns 1 when all inputs are 1 or all inputs are 0, and 0 otherwise.
+  For three inputs, it is equivalent to:
+
+  `(a & b & c) | (~a & ~b & ~c)`
+
+  Example:
+```mlir
+    %r0 = synth.gamble %a, %b, %c : i1
+    %r1 = synth.gamble not %a, %b, not %c : i1
+```
+}];
+}
+
+def CutRewritePatternOp : SynthOp<"cut_rewrite_pattern", [
+  IsolatedFromAbove,
+  SingleBlockImplicitTerminator<"YieldOp">
+]> {
+  let summary = "Declarative cut rewrite pattern";
+
+  let arguments = (ins
+    TypeAttrOf<FunctionType>:$function_type,
+    MappingCostAttr:$cost
+  );
+
+  let regions = (region SizedRegion<1>:$body);
+  let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
+}
+
+def YieldOp : SynthOp<"yield",
+                   [Pure, Terminator]> {
+  let summary = "Yield synth operations";
+
+  let arguments = (ins Variadic<AnyType>:$operands);
+  let assemblyFormat = "$operands attr-dict `:` type($operands)";
+}
+
 
 #endif // CIRCT_DIALECT_SYNTH_SYNTHOPS_TD

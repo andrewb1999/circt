@@ -102,8 +102,7 @@ class CMakeBuild(build_py):
     cmake_cache_file = os.path.join(cmake_build_dir, "CMakeCache.txt")
     if os.path.exists(cmake_cache_file):
       os.remove(cmake_cache_file)
-    print(f"Running cmake with args: {cmake_args}", file=sys.stderr)
-    subprocess.check_call(["echo", "Running: cmake", src_dir] + cmake_args)
+    print(f"Running: cmake {src_dir} {' '.join(cmake_args)}", file=sys.stderr)
     subprocess.check_call(["cmake", src_dir] + cmake_args, cwd=cmake_build_dir)
     targets = ["check-pycde"]
     if "RUN_TESTS" in os.environ and os.environ["RUN_TESTS"] != "false":
@@ -115,8 +114,12 @@ class CMakeBuild(build_py):
         "--target",
     ] + targets + build_args,
                           cwd=cmake_build_dir)
-    install_cmd = ["cmake", "--build", ".", "--target", "install-PyCDE"]
-    subprocess.check_call(install_cmd + build_args, cwd=cmake_build_dir)
+    # Install the PyCDE package by components, which I think is the correct way
+    # to install a subset of a build. It picks up all of the necessary files.
+    for component in ("PyCDE", "PyCDE_CIRCTPythonModules"):
+      subprocess.check_call(
+          ["cmake", "--install", ".", "--component", component],
+          cwd=cmake_build_dir)
     shutil.copytree(os.path.join(cmake_install_dir, "python_packages"),
                     target_dir,
                     symlinks=False,

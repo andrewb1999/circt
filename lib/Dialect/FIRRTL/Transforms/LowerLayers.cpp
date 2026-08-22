@@ -194,6 +194,8 @@ struct BindFileInfo {
   StringAttr filename;
   /// Where to insert bind statements into the bind file.
   Block *body;
+  /// True if including the bindfile has an effect on the design.
+  bool effectful;
 };
 } // namespace
 
@@ -264,7 +266,8 @@ class LowerLayersPass
 
   /// Build a bindfile skeleton for a particular module and layer.
   void buildBindFile(CircuitNamespace &ns, InstanceGraphNode *node,
-                     OpBuilder &b, SymbolRefAttr layerName, LayerOp layer);
+                     OpBuilder &b, SymbolRefAttr layerName, LayerOp layer,
+                     bool effectful);
 
   /// Entry point for the function.
   void runOnOperation() override;
@@ -631,7 +634,7 @@ LogicalResult LowerLayersPass::runOnModuleBody(FModuleOp moduleOp,
                     op.getPortDomain(cast<OpResult>(value).getResultNumber());
                 return success();
               })
-              .Case<DomainCreateAnonOp>([&](auto op) {
+              .Case<DomainCreateAnonOp, DomainCreateOp>([&](auto op) {
                 domain = op.getDomainAttr();
                 return success();
               })
@@ -706,9 +709,16 @@ LogicalResult LowerLayersPass::runOnModuleBody(FModuleOp moduleOp,
     SmallVector<Value> connectValues;
     Namespace portNs;
 
-    // Create an input port for a domain-type operand.  The source is not in the
-    // current layer block.
-    auto createInputPort = [&](Value src, Location loc) -> LogicalResult {
+    // Create an input port for a domain-type source captured from outside the
+    // current layer block.  Returns the block argument that should be used in
+    // place of the original source within the layer block.  Repeated calls with
+    // the same source reuse the previously created, cached port.
+    DenseMap<Value, BlockArgument> domainInputPorts;
+    auto getOrCreateDomainInputPort =
+        [&](Value src, Location loc) -> FailureOr<BlockArgument> {
+      if (auto it = domainInputPorts.find(src); it != domainInputPorts.end())
+        return it->getSecond();
+
       Attribute domain;
       if (failed(getDomain(src, domain)))
         return failure();
@@ -733,7 +743,18 @@ LogicalResult LowerLayersPass::runOnModuleBody(FModuleOp moduleOp,
       connectValues.push_back(src);
       BlockArgument replacement =
           layerBlock.getBody()->addArgument(port.type, port.loc);
-      src.replaceUsesWithIf(replacement, [&](OpOperand &use) {
+      domainInputPorts[src] = replacement;
+      return replacement;
+    };
+
+    // Create an input port for a domain-type operand that is connected to a
+    // value inside the current layer block.  The source is not in the current
+    // layer block.
+    auto createInputPort = [&](Value src, Location loc) -> LogicalResult {
+      auto replacement = getOrCreateDomainInputPort(src, loc);
+      if (failed(replacement))
+        return failure();
+      src.replaceUsesWithIf(*replacement, [&](OpOperand &use) {
         auto *user = use.getOwner();
         if (!layerBlock->isAncestor(user))
           return false;
@@ -989,6 +1010,16 @@ LogicalResult LowerLayersPass::runOnModuleBody(FModuleOp moduleOp,
         if (isAncestorOfValueOwner(layerBlock, operand))
           continue;
 
+        // Domain-type operands have no XMR representation and need to have
+        // input ports created.
+        if (type_isa<DomainType>(operand.getType())) {
+          auto replacement = getOrCreateDomainInputPort(operand, op->getLoc());
+          if (failed(replacement))
+            return WalkResult::interrupt();
+          op->setOperand(i, *replacement);
+          continue;
+        }
+
         op->setOperand(i, getReplacement(op, operand));
       }
 
@@ -1143,7 +1174,8 @@ void LowerLayersPass::preprocessLayers(CircuitNamespace &ns) {
 
 void LowerLayersPass::buildBindFile(CircuitNamespace &ns,
                                     InstanceGraphNode *node, OpBuilder &b,
-                                    SymbolRefAttr layerName, LayerOp layer) {
+                                    SymbolRefAttr layerName, LayerOp layer,
+                                    bool effectful) {
   assert(layer.getConvention() == LayerConvention::Bind);
   auto module = node->getModule<FModuleOp>();
   auto loc = module.getLoc();
@@ -1222,15 +1254,16 @@ void LowerLayersPass::buildBindFile(CircuitNamespace &ns,
       continue;
     auto files = bindFiles[child];
     auto lookup = files.find(layer);
-    if (lookup != files.end())
-      sv::IncludeOp::create(b, loc, IncludeStyle::Local,
-                            lookup->second.filename);
+    if (lookup == files.end() || !lookup->second.effectful)
+      continue;
+    sv::IncludeOp::create(b, loc, IncludeStyle::Local, lookup->second.filename);
   }
 
   // Save the bind file information for later.
   auto &info = bindFiles[module][layer];
   info.filename = filename;
   info.body = includeGuard.getElseBlock();
+  info.effectful = effectful;
 }
 
 void LowerLayersPass::preprocessModule(CircuitNamespace &ns,
@@ -1240,13 +1273,13 @@ void LowerLayersPass::preprocessModule(CircuitNamespace &ns,
   b.setInsertionPointAfter(module);
 
   // Create a bind file only if the layer is used under the module.
-  llvm::SmallDenseSet<LayerOp> layersRequiringBindFiles;
+  llvm::SmallDenseMap<LayerOp, bool> layersRequiringBindFiles;
 
   // If the module is public, create a bind file for all layers.
   if (module.isPublic() || emitAllBindFiles)
     for (auto [_, layer] : symbolToLayer)
       if (layer.getConvention() == LayerConvention::Bind)
-        layersRequiringBindFiles.insert(layer);
+        layersRequiringBindFiles[layer] = false;
 
   // Handle layers used directly in this module.
   module->walk([&](LayerBlockOp layerBlock) {
@@ -1255,7 +1288,7 @@ void LowerLayersPass::preprocessModule(CircuitNamespace &ns,
       return;
 
     // Create a bindfile for any layer directly used in the module.
-    layersRequiringBindFiles.insert(layer);
+    layersRequiringBindFiles[layer] = true;
 
     // Determine names for all modules that will be created.
     auto moduleName = module.getModuleName();
@@ -1277,15 +1310,18 @@ void LowerLayersPass::preprocessModule(CircuitNamespace &ns,
   // Create a bindfile for layers used indirectly under this module.
   for (auto *record : *node) {
     auto *child = record->getTarget()->getModule().getOperation();
-    for (auto [layer, _] : bindFiles[child])
-      layersRequiringBindFiles.insert(layer);
+    for (auto [layer, info] : bindFiles[child])
+      layersRequiringBindFiles[layer] |= info.effectful;
   }
 
   // Build the bindfiles for any layer seen under this module. The bindfiles
   // are emitted in the order which they are declared, for readability.
-  for (auto [sym, layer] : symbolToLayer)
-    if (layersRequiringBindFiles.contains(layer))
-      buildBindFile(ns, node, b, sym, layer);
+  for (auto [sym, layer] : symbolToLayer) {
+    auto it = layersRequiringBindFiles.find(layer);
+    if (it == layersRequiringBindFiles.end())
+      continue;
+    buildBindFile(ns, node, b, sym, layer, it->second);
+  }
 }
 
 void LowerLayersPass::preprocessExtModule(CircuitNamespace &ns,
@@ -1315,6 +1351,7 @@ void LowerLayersPass::preprocessExtModule(CircuitNamespace &ns,
             fileNameForLayer(moduleName, rootLayerName, nestedLayerNames);
         info.filename = StringAttr::get(&getContext(), filename);
         info.body = nullptr;
+        info.effectful = true;
         files.insert({layer, info});
       }
       layer = layer->getParentOfType<LayerOp>();

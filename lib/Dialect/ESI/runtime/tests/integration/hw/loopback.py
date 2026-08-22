@@ -1,36 +1,11 @@
-# REQUIRES: esi-cosim, esi-runtime, rtl-sim
-# RUN: rm -rf %t
-# RUN: mkdir %t && cd %t
-
-# Build the system.
-# RUN: %PYTHON% %s %t 2>&1
-
-# Query against the manifest.
-# RUN: esiquery trace w:%t/esi_system_manifest.json info | FileCheck %s --check-prefix=QUERY-INFO
-# RUN: esiquery trace w:%t/esi_system_manifest.json hier | FileCheck %s --check-prefix=QUERY-HIER
-
-# Run a cosimulation with a python test driver.
-# RUN: esi-cosim.py --source %t -- %PYTHON% %S/test_software/loopback.py cosim env
-
-# Test C++ header generation against the manifest file.
-# Use the shared CMake build to compile the C++ test against generated headers.
-# RUN: %PYTHON% -m esiaccel.codegen --file %t/esi_system_manifest.json --output-dir %t/include/loopback/
-# RUN: cmake -S %S/test_software -B %t/loopback-build -DLOOPBACK_GENERATED_DIR=%t/include -DESI_RUNTIME_ROOT=%ESI_RUNTIME_PATH%
-# RUN: cmake --build %t/loopback-build --target loopback_test
-# RUN: esi-cosim.py --source %t -- %t/loopback-build/loopback_test cosim env | FileCheck %s --check-prefix=CPP-TEST
-# RUN: FileCheck %s --check-prefix=LOOPBACK-H --input-file %t/include/loopback/LoopbackIP.h
-
-# Test C++ header generation from the live accelerator.
-# The generated headers are still required to build the C++ test executable.
-# RUN: esi-cosim.py --source %t -- %PYTHON% -m esiaccel.codegen --platform cosim --connection env --output-dir %t/include/loopback/
-# RUN: cmake -S %S/test_software -B %t/loopback-build -DLOOPBACK_GENERATED_DIR=%t/include -DESI_RUNTIME_ROOT=%ESI_RUNTIME_PATH%
-# RUN: cmake --build %t/loopback-build --target loopback_test
-# RUN: esi-cosim.py --source %t -- %t/loopback-build/loopback_test cosim env | FileCheck %s --check-prefix=CPP-TEST
+#  Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+#  See https://llvm.org/LICENSE.txt for license information.
+#  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import sys
 
 from pycde import (AppID, Clock, Module, Reset, Signal, System, generator)
-from pycde.bsp import get_bsp
+from esiaccel.bsp import get_bsp
 from pycde.common import Constant
 from pycde.constructs import Wire
 from pycde.module import Metadata
@@ -38,6 +13,8 @@ from pycde.signals import Struct
 from pycde.types import (Bits, Bundle, BundledChannel, Channel,
                          ChannelDirection, SInt, TypeAlias, UInt)
 from pycde import esi
+
+from esiaccel.esitester import SerialCoordTranslator
 
 SendI8 = Bundle([BundledChannel("send", ChannelDirection.FROM, Bits(8))])
 RecvI8 = Bundle([BundledChannel("recv", ChannelDirection.TO, Bits(8))])
@@ -246,6 +223,12 @@ class Top(Module):
     LoopbackStruct()
     LoopbackOddStruct()
     LoopbackArray()
+    SerialCoordTranslator(
+        clk=ports.clk,
+        rst=ports.rst,
+        instance_name="coord_translator_serial",
+        appid=AppID("coord_translator_serial"),
+    )
 
 
 if __name__ == "__main__":

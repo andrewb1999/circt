@@ -10,7 +10,14 @@
 //
 //===----------------------------------------------------------------------===//
 
+#ifndef CIRCT_DIALECT_RTGTEST_IR_RTGTESTOPS_TD
+#define CIRCT_DIALECT_RTGTEST_IR_RTGTESTOPS_TD
+
+include "circt/Dialect/RTGTest/IR/RTGTestDialect.td"
+include "circt/Dialect/RTGTest/IR/RTGTestTypes.td"
+include "circt/Dialect/RTGTest/IR/RTGTestAttributes.td"
 include "mlir/IR/CommonAttrConstraints.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "circt/Dialect/RTG/IR/RTGTypes.td"
 include "circt/Dialect/RTG/IR/RTGInterfaces.td"
@@ -51,14 +58,16 @@ def ImplicitConstraintTestOp : RTGTestOp<"implicit_constraint_op", [
 //===- Instruction Formats -------------------------------------------------===//
 
 class InstrFormatOp<string mnemonic, list<Trait> traits = []> :
-  RTGTestOp<mnemonic, traits>, ISAInstructionFormat;
+  RTGTestOp<mnemonic, traits>, ISAInstructionFormat {
+  let isaMnemonic = mnemonic;
+}
 
 class InstFormatIOpBase<string mnemonic, string opcode7, string funct3>
   : InstrFormatOp<mnemonic, [InstructionOpAdaptor]> {
 
   let arguments = (ins Arg<IntegerRegisterType, "", [DestReg]>:$rd,
                        Arg<IntegerRegisterType, "", [SourceReg]>:$rs,
-                       ImmediateOfWidth<12>:$imm);
+                       I<12>:$imm);
 
   let assemblyFormat = "$rd `,` $rs `,` $imm attr-dict";
   let isaBinaryFormat = "$imm $rs " # funct3 # " $rd " # opcode7;
@@ -79,7 +88,7 @@ class InstFormatBOpBase<string mnemonic, string opcode7, string funct3>
 
   let arguments = (ins Arg<IntegerRegisterType, "", [SourceReg]>:$rs1,
                        Arg<IntegerRegisterType, "", [SourceReg]>:$rs2,
-                       AnyTypeOf<[ImmediateOfWidth<13>, LabelType]>:$imm);
+                       AnyTypeOf<[I<13>, LabelType]>:$imm);
 
   let assemblyFormat = [{
     $rs1 `,` $rs2 `,` $imm `:` qualified(type($imm)) attr-dict
@@ -107,7 +116,7 @@ class InstFormatSOpBase<string mnemonic, string opcode7, string funct3>
 
   let arguments = (ins Arg<IntegerRegisterType, "", [SourceReg]>:$rs1,
                        Arg<IntegerRegisterType, "", [SourceReg]>:$rs2,
-                       ImmediateOfWidth<12>:$imm);
+                       I<12>:$imm);
 
   let assemblyFormat = "$rs1 `,` $rs2 `,` $imm attr-dict";
   let isaBinaryFormat = "$imm[11:5] $rs2 $rs1 " # funct3 #
@@ -120,7 +129,7 @@ class InstFormatUOpBase<string mnemonic, string opcode7>
   : InstrFormatOp<mnemonic, [InstructionOpAdaptor]> {
 
   let arguments = (ins Arg<IntegerRegisterType, "", [DestReg]>:$rd,
-                       AnyTypeOf<[ImmediateOfWidth<32>, LabelType]>:$imm);
+                       AnyTypeOf<[I<32>, LabelType]>:$imm);
 
   let assemblyFormat = "$rd `,` $imm `:` type($imm) attr-dict";
   let isaBinaryFormat = "$imm[31:12] $rd " # opcode7;
@@ -131,7 +140,7 @@ class InstFormatJOpBase<string mnemonic, string opcode7>
   : InstrFormatOp<mnemonic, [InstructionOpAdaptor]> {
 
   let arguments = (ins Arg<IntegerRegisterType, "", [DestReg]>:$rd,
-                       AnyTypeOf<[ImmediateOfWidth<21>, LabelType]>:$imm);
+                       AnyTypeOf<[I<21>, LabelType]>:$imm);
 
   let assemblyFormat = "$rd `,` $imm `:` type($imm) attr-dict";
   let isaBinaryFormat =
@@ -144,7 +153,7 @@ class InstFormatIAOpBase<string mnemonic, string opcode7, string funct3>
 
   let arguments = (ins Arg<IntegerRegisterType, "", [DestReg]>:$rd,
                        Arg<IntegerRegisterType, "", [SourceReg]>:$rs,
-                       ImmediateOfWidth<12>:$imm);
+                       I<12>:$imm);
 
   let assemblyFormat = "$rd `,` $rs `,` $imm attr-dict";
 
@@ -159,7 +168,7 @@ class InstFormatShiftOpBase<string mnemonic, string opcode7,
 
   let arguments = (ins Arg<IntegerRegisterType, "", [DestReg]>:$rd,
                        Arg<IntegerRegisterType, "", [SourceReg]>:$rs,
-                       ImmediateOfWidth<5>:$imm);
+                       I<5>:$imm);
 
   let assemblyFormat = "$rd `,` $rs `,` $imm attr-dict";
   let isaBinaryFormat = funct7 # " $imm $rs " # funct3 # " $rd " # opcode7;
@@ -224,3 +233,5 @@ def AND       : InstFormatROpBase<"and",  "0b0110011", "0b111", "0b0000000">;
 
 def ECALLOp   : InstFormatIImmOpBase<"ecall", "0b1110011", "0b000000000000">;
 def EBREAKOp  : InstFormatIImmOpBase<"ebreak", "0b1110011", "0b000000000001">;
+
+#endif // CIRCT_DIALECT_RTGTEST_IR_RTGTESTOPS_TD

@@ -261,6 +261,9 @@ mlir::Type getPassiveType(mlir::Type anyBaseFIRRTLType);
 /// analog types. Non-HW types (e.g., ref types) are never considered InOut.
 bool isTypeInOut(mlir::Type type);
 
+/// Return true if the given type contains any elements of hardware types.
+bool hasHardwareElements(FIRRTLType type);
+
 //===----------------------------------------------------------------------===//
 // Width Qualified Ground Types
 //===----------------------------------------------------------------------===//
@@ -412,14 +415,6 @@ namespace llvm {
 template <>
 struct DenseMapInfo<circt::firrtl::FIRRTLType> {
   using FIRRTLType = circt::firrtl::FIRRTLType;
-  static FIRRTLType getEmptyKey() {
-    auto pointer = llvm::DenseMapInfo<void *>::getEmptyKey();
-    return FIRRTLType(static_cast<mlir::Type::ImplType *>(pointer));
-  }
-  static FIRRTLType getTombstoneKey() {
-    auto pointer = llvm::DenseMapInfo<void *>::getTombstoneKey();
-    return FIRRTLType(static_cast<mlir::Type::ImplType *>(pointer));
-  }
   static unsigned getHashValue(FIRRTLType val) { return mlir::hash_value(val); }
   static bool isEqual(FIRRTLType LHS, FIRRTLType RHS) { return LHS == RHS; }
 };

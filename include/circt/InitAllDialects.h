@@ -14,6 +14,7 @@
 #ifndef CIRCT_INITALLDIALECTS_H_
 #define CIRCT_INITALLDIALECTS_H_
 
+#include "circt/Dialect/AXI4/AXI4Dialect.h"
 #include "circt/Dialect/Arc/ArcDialect.h"
 #include "circt/Dialect/Calyx/CalyxDialect.h"
 #include "circt/Dialect/Comb/CombDialect.h"
@@ -38,6 +39,7 @@
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/OpLib/OpLibDialect.h"
 #include "circt/Dialect/Pipeline/PipelineDialect.h"
+#include "circt/Dialect/Probe/ProbeDialect.h"
 #include "circt/Dialect/RTG/IR/RTGDialect.h"
 #ifdef CIRCT_INCLUDE_TESTS
 #include "circt/Dialect/RTGTest/IR/RTGTestDialect.h"
@@ -59,6 +61,7 @@ inline void registerAllDialects(mlir::DialectRegistry &registry) {
   // clang-format off
   registry.insert<
     arc::ArcDialect,
+    axi4::AXI4Dialect,
     calyx::CalyxDialect,
     oplib::OpLibDialect,
     chirrtl::CHIRRTLDialect,
@@ -82,7 +85,7 @@ inline void registerAllDialects(mlir::DialectRegistry &registry) {
     msft::MSFTDialect,
     om::OMDialect,
     pipeline::PipelineDialect,
-    hwarith::HWArithDialect,
+    probe::ProbeDialect,
     rtg::RTGDialect,
 #ifdef CIRCT_INCLUDE_TESTS
     rtgtest::RTGTestDialect,

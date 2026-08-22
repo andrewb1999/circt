@@ -13,7 +13,7 @@ arc.define @Bar() {
 // -----
 
 hw.module @Foo(in %clock: !seq.clock) {
-  // expected-error @+1 {{'arc.state' op outside a clock domain requires a clock}}
+  // expected-error @+1 {{'arc.state' op requires a clock}}
   arc.state @Bar() latency 1 : () -> ()
 }
 arc.define @Bar() {
@@ -188,101 +188,10 @@ arc.define @lutSideEffects () -> i32 {
 
 // -----
 
-hw.module @clockDomainNumOutputs(in %clk: !seq.clock) {
-  %0 = arc.clock_domain () clock %clk : () -> (i32) {
-  ^bb0:
-    // expected-error @+1 {{incorrect number of outputs: expected 1, but got 0}}
-    arc.output
-  }
-  hw.output
-}
-
-// -----
-
-hw.module @clockDomainNumInputs(in %clk: !seq.clock) {
-  // expected-error @+1 {{incorrect number of inputs: expected 1, but got 0}}
-  arc.clock_domain () clock %clk : () -> () {
-  ^bb0(%arg0: i32):
-    arc.output
-  }
-  hw.output
-}
-
-// -----
-
-hw.module @clockDomainInputTypes(in %clk: !seq.clock, in %arg0: i16) {
-  // expected-error @+3 {{input type mismatch: input #0}}
-  // expected-note @+2 {{expected type: 'i32'}}
-  // expected-note @+1 {{actual type: 'i16'}}
-  arc.clock_domain (%arg0) clock %clk : (i16) -> () {
-  ^bb0(%arg1: i32):
-    arc.output
-  }
-  hw.output
-}
-
-// -----
-
-hw.module @clockDomainOutputTypes(in %clk: !seq.clock) {
-  %0 = arc.clock_domain () clock %clk : () -> (i32) {
-  ^bb0:
-    %c0_i16 = hw.constant 0 : i16
-    // expected-error @+3 {{output type mismatch: output #0}}
-    // expected-note @+2 {{expected type: 'i32'}}
-    // expected-note @+1 {{actual type: 'i16'}}
-    arc.output %c0_i16 : i16
-  }
-  hw.output
-}
-
-// -----
-
-hw.module @clockDomainIsolatedFromAbove(in %clk: !seq.clock, in %arg0: i32) {
-  // expected-note @+1 {{required by region isolation constraints}}
-  %0 = arc.clock_domain () clock %clk : () -> (i32) {
-    // expected-error @+1 {{using value defined outside the region}}
-    arc.output %arg0 : i32
-  }
-  hw.output
-}
-
-// -----
-
-hw.module @stateOpInsideClockDomain(in %clk: !seq.clock) {
-  arc.clock_domain (%clk) clock %clk : (!seq.clock) -> () {
-  ^bb0(%arg0: !seq.clock):
-    // expected-error @+1 {{inside a clock domain cannot have a clock}}
-    arc.state @dummyArc() clock %arg0 latency 1 : () -> ()
-    arc.output
-  }
-  hw.output
-}
-arc.define @dummyArc() {
-  arc.output
-}
-
-// -----
-
-hw.module @memoryWritePortOpInsideClockDomain(in %clk: !seq.clock) {
-  arc.clock_domain (%clk) clock %clk : (!seq.clock) -> () {
-  ^bb0(%arg0: !seq.clock):
-    %mem = arc.memory <4 x i32, i32>
-    %c0_i32 = hw.constant 0 : i32
-    // expected-error @+1 {{inside a clock domain cannot have a clock}}
-    arc.memory_write_port %mem, @identity(%c0_i32, %c0_i32, %arg0) clock %arg0 enable latency 1: !arc.memory<4 x i32, i32>, i32, i32, !seq.clock
-    arc.output
-  }
-}
-arc.define @identity(%addr: i32, %data: i32, %enable: i1) -> (i32, i32, i1) {
-  arc.output %addr, %data, %enable : i32, i32, i1
-}
-
-// -----
-
-hw.module @memoryWritePortOpOutsideClockDomain(in %clock: !seq.clock, in %en: i1) {
+hw.module @memoryWritePortOpNoClock(in %clock: !seq.clock, in %en: i1) {
   %mem = arc.memory <4 x i32, i32>
   %c0_i32 = hw.constant 0 : i32
-  // expected-error @+1 {{outside a clock domain requires a clock}}
+  // expected-error @+1 {{requires a clock}}
   arc.memory_write_port %mem, @identity(%c0_i32, %c0_i32, %en) latency 1 : !arc.memory<4 x i32, i32>, i32, i32, i1
 }
 arc.define @identity(%addr: i32, %data: i32, %enable: i1) -> (i32, i32, i1) {
@@ -529,21 +438,21 @@ func.func @InvalidStateType(%arg0: !arc.state<index>)
 
 // expected-error @below {{initializer 'Bar' does not reference a valid function}}
 arc.model @Foo io !hw.modty<> initializer @Bar {
-^bb0(%arg0: !arc.storage<42>):
+^bb0(%arg0: !arc.storage):
 }
 
 // -----
 
 // expected-error @below {{finalizer 'Bar' does not reference a valid function}}
-arc.model @Foo io !hw.modty<> finalizer @Bar {
-^bb0(%arg0: !arc.storage<42>):
+arc.model @Foo io !hw.modty<> storageBytes 42 finalizer @Bar {
+^bb0(%arg0: !arc.storage):
 }
 
 // -----
 
 // expected-error @below {{initializer 'Bar' does not reference a valid function}}
-arc.model @Foo io !hw.modty<> initializer @Bar {
-^bb0(%arg0: !arc.storage<42>):
+arc.model @Foo io !hw.modty<> storageBytes 42 initializer @Bar {
+^bb0(%arg0: !arc.storage):
 }
 hw.module @Bar() {
 }
@@ -551,8 +460,8 @@ hw.module @Bar() {
 // -----
 
 // expected-error @below {{finalizer 'Bar' does not reference a valid function}}
-arc.model @Foo io !hw.modty<> finalizer @Bar {
-^bb0(%arg0: !arc.storage<42>):
+arc.model @Foo io !hw.modty<> storageBytes 42 finalizer @Bar {
+^bb0(%arg0: !arc.storage):
 }
 hw.module @Bar() {
 }
@@ -560,26 +469,26 @@ hw.module @Bar() {
 // -----
 
 // expected-error @below {{initializer 'Bar' arguments must match arguments of model}}
-arc.model @Foo io !hw.modty<> initializer @Bar {
-^bb0(%arg0: !arc.storage<42>):
+arc.model @Foo io !hw.modty<> storageBytes 42 initializer @Bar {
+^bb0(%arg0: !arc.storage):
 }
 
 // expected-note @below {{initializer declared here:}}
-func.func @Bar(!arc.storage<24>) {
-^bb0(%arg0: !arc.storage<24>):
+func.func @Bar(!arc.state<i1>) {
+^bb0(%arg0: !arc.state<i1>):
   return
 }
 
 // -----
 
 // expected-error @below {{finalizer 'Bar' arguments must match arguments of model}}
-arc.model @Foo io !hw.modty<> finalizer @Bar {
-^bb0(%arg0: !arc.storage<42>):
+arc.model @Foo io !hw.modty<> storageBytes 42 finalizer @Bar {
+^bb0(%arg0: !arc.storage):
 }
 
 // expected-note @below {{finalizer declared here:}}
-func.func @Bar(!arc.storage<24>) {
-^bb0(%arg0: !arc.storage<24>):
+func.func @Bar(!arc.state<i1>) {
+^bb0(%arg0: !arc.state<i1>):
   return
 }
 
@@ -623,4 +532,222 @@ arc.execute -> (i42) {
   // expected-note @below {{expected type: 'i42'}}
   // expected-note @below {{actual type: 'i19'}}
   arc.output %0 : i19
+}
+
+// -----
+
+func.func @Foo(%arg0: !arc.coroutine_state<@NotACoroutine>, %arg1: !arc.coroutine_pc<@NotACoroutine>) {
+  // expected-error @below {{`NotACoroutine` does not reference a valid `arc.coroutine.define`}}
+  arc.coroutine.call @NotACoroutine(%arg0, %arg1) : (!arc.coroutine_state<@NotACoroutine>, !arc.coroutine_pc<@NotACoroutine>) -> (!arc.coroutine_state<@NotACoroutine>, !arc.coroutine_pc<@NotACoroutine>)
+  return
+}
+func.func @NotACoroutine() {
+  return
+}
+
+// -----
+
+hw.module @Foo() {
+  // expected-error @below {{`NotACoroutine` does not reference a valid `arc.coroutine.define`}}
+  arc.coroutine.instance @NotACoroutine() sensitive [] : () -> ()
+}
+func.func @NotACoroutine() {
+  return
+}
+
+// -----
+
+func.func @Foo(%arg0: !arc.coroutine_state<@NeedsI42>, %arg1: !arc.coroutine_pc<@NeedsI42>, %arg2: i9001) {
+  // expected-error @below {{operand type mismatch: operand #0}}
+  // expected-note @below {{expected type: 'i42'}}
+  // expected-note @below {{actual type: 'i9001'}}
+  arc.coroutine.call @NeedsI42(%arg0, %arg1, %arg2) : (!arc.coroutine_state<@NeedsI42>, !arc.coroutine_pc<@NeedsI42>, i9001) -> (!arc.coroutine_state<@NeedsI42>, !arc.coroutine_pc<@NeedsI42>)
+  return
+}
+arc.coroutine.define @NeedsI42(%arg0: i42) {
+  arc.coroutine.return
+}
+
+// -----
+
+hw.module @Foo(in %a: i9001) {
+  // expected-error @below {{operand type mismatch: operand #0}}
+  // expected-note @below {{expected type: 'i42'}}
+  // expected-note @below {{actual type: 'i9001'}}
+  arc.coroutine.instance @NeedsI42(%a) sensitive [false] : (i9001) -> ()
+}
+arc.coroutine.define @NeedsI42(%arg0: i42) -> (i1, i64) {
+  %c0_i1 = hw.constant 0 : i1
+  %c0_i64 = hw.constant 0 : i64
+  arc.coroutine.return %c0_i1, %c0_i64 : i1, i64
+}
+
+// -----
+
+func.func @Foo(%arg0: !arc.coroutine_state<@BarB>, %arg1: !arc.coroutine_pc<@BarB>) {
+  // expected-error @below {{bound to the op's callee symbol}}
+  arc.coroutine.call @BarA(%arg0, %arg1) : (!arc.coroutine_state<@BarB>, !arc.coroutine_pc<@BarB>) -> (!arc.coroutine_state<@BarB>, !arc.coroutine_pc<@BarB>)
+  return
+}
+arc.coroutine.define @BarA() {
+  arc.coroutine.return
+}
+arc.coroutine.define @BarB() {
+  arc.coroutine.return
+}
+
+// -----
+
+hw.module @Foo() {
+  // expected-error @below {{`DoesNotExist` does not reference a valid `arc.coroutine.define`}}
+  arc.coroutine.instance @DoesNotExist() sensitive [] : () -> ()
+}
+
+// -----
+
+func.func @Foo(%arg0: !arc.coroutine_state<@DoesNotExist>, %arg1: !arc.coroutine_pc<@DoesNotExist>) {
+  // expected-error @below {{`DoesNotExist` does not reference a valid `arc.coroutine.define`}}
+  arc.coroutine.call @DoesNotExist(%arg0, %arg1) : (!arc.coroutine_state<@DoesNotExist>, !arc.coroutine_pc<@DoesNotExist>) -> (!arc.coroutine_state<@DoesNotExist>, !arc.coroutine_pc<@DoesNotExist>)
+  return
+}
+
+// -----
+
+hw.module @Foo() {
+  // expected-error @below {{referenced coroutine `Bar` must produce an `i64` wakeup time as its last result}}
+  arc.coroutine.instance @Bar() sensitive [] : () -> ()
+}
+arc.coroutine.define @Bar() {
+  arc.coroutine.return
+}
+
+// -----
+
+hw.module @Foo() {
+  // expected-error @below {{referenced coroutine `Bar` must produce an `i64` wakeup time as its last result}}
+  arc.coroutine.instance @Bar() sensitive [] : () -> i42
+}
+arc.coroutine.define @Bar() -> i42 {
+  %c0_i42 = hw.constant 0 : i42
+  arc.coroutine.return %c0_i42 : i42
+}
+
+// -----
+
+hw.module @Foo(in %a: i42) {
+  // expected-error @below {{referenced coroutine `Bar` must produce an observe bitmask with one bit per argument (`i1`) as its second-to-last result}}
+  arc.coroutine.instance @Bar(%a) sensitive [false] : (i42) -> ()
+}
+// One argument, so the bitmask must be `i1`, but here it is `i8`.
+arc.coroutine.define @Bar(%arg0: i42) -> (i8, i64) {
+  %c0_i8 = hw.constant 0 : i8
+  %c0_i64 = hw.constant 0 : i64
+  arc.coroutine.return %c0_i8, %c0_i64 : i8, i64
+}
+
+// -----
+
+hw.module @Foo(in %a: i42) {
+  // expected-error @below {{`sensitivityMask` has one bit per argument}}
+  arc.coroutine.instance @Bar(%a) sensitive [false, false] : (i42) -> ()
+}
+arc.coroutine.define @Bar(%arg0: i42) -> (i1, i64) {
+  %c0_i1 = hw.constant 0 : i1
+  %c0_i64 = hw.constant 0 : i64
+  arc.coroutine.return %c0_i1, %c0_i64 : i1, i64
+}
+
+arc.coroutine.define @Foo() -> i42 {
+  // expected-error @below {{incorrect number of yielded values: expected 1, but got 0}}
+  arc.coroutine.return
+}
+
+// -----
+
+arc.coroutine.define @Foo() -> i42 {
+  %c0_i9001 = hw.constant 0 : i9001
+  // expected-error @below {{yielded value type mismatch: yielded value #0}}
+  // expected-note @below {{expected type: 'i42'}}
+  // expected-note @below {{actual type: 'i9001'}}
+  arc.coroutine.return %c0_i9001 : i9001
+}
+
+// -----
+
+arc.coroutine.define @Foo() -> i42 {
+  // expected-error @below {{incorrect number of yielded values: expected 1, but got 0}}
+  arc.coroutine.halt
+}
+
+// -----
+
+arc.coroutine.define @Foo() -> i42 {
+  %c0_i9001 = hw.constant 0 : i9001
+  // expected-error @below {{yielded value type mismatch: yielded value #0}}
+  // expected-note @below {{expected type: 'i42'}}
+  // expected-note @below {{actual type: 'i9001'}}
+  arc.coroutine.halt %c0_i9001 : i9001
+}
+
+// -----
+
+arc.coroutine.define @Foo() -> i42 {
+  // expected-error @below {{incorrect number of yielded values: expected 1, but got 0}}
+  arc.coroutine.yield ^bb1
+^bb1:
+  %c0_i42 = hw.constant 0 : i42
+  arc.coroutine.halt %c0_i42 : i42
+}
+
+// -----
+
+arc.coroutine.define @Foo() -> i42 {
+  %c0_i9001 = hw.constant 0 : i9001
+  // expected-error @below {{yielded value type mismatch: yielded value #0}}
+  // expected-note @below {{expected type: 'i42'}}
+  // expected-note @below {{actual type: 'i9001'}}
+  arc.coroutine.yield (%c0_i9001 : i9001), ^bb1
+^bb1:
+  %c0_i42 = hw.constant 0 : i42
+  arc.coroutine.halt %c0_i42 : i42
+}
+
+// -----
+
+arc.coroutine.define @Foo(%arg0: i42) {
+  // expected-error @below {{branch has 1 operands for successor #0, but target block has 0}}
+  arc.coroutine.yield ^bb1
+^bb1:
+  arc.coroutine.halt
+}
+
+// -----
+
+arc.coroutine.define @Foo(%arg0: i42) {
+  %c0_i42 = hw.constant 0 : i42
+  // expected-error @below {{branch has 2 operands for successor #0, but target block has 1}}
+  arc.coroutine.yield ^bb1(%c0_i42 : i42)
+^bb1(%arg1: i42):
+  arc.coroutine.halt
+}
+
+// -----
+
+arc.coroutine.define @Foo(%arg0: i42) {
+  // expected-error @below {{destination resume argument type mismatch: destination resume argument #0}}
+  // expected-note @below {{expected type: 'i42'}}
+  // expected-note @below {{actual type: 'i9001'}}
+  arc.coroutine.yield ^bb1
+^bb1(%arg1: i9001):
+  arc.coroutine.halt
+}
+
+// -----
+
+arc.coroutine.define @Foo(%arg0: i42) {
+  %c0_i42 = hw.constant 0 : i42
+  // expected-error @below {{type mismatch for bb argument #1 of successor #0}}
+  arc.coroutine.yield ^bb1(%c0_i42 : i42)
+^bb1(%arg1: i42, %arg2: i9001):
+  arc.coroutine.halt
 }

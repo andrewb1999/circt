@@ -10,7 +10,9 @@
 #include "circt/Conversion/CombToArith.h"
 #include "circt/Conversion/CombToLLVM.h"
 #include "circt/Conversion/HWToLLVM.h"
+#include "circt/Dialect/Arc/ArcConstants.h"
 #include "circt/Dialect/Arc/ArcOps.h"
+#include "circt/Dialect/Arc/ArcTypes.h"
 #include "circt/Dialect/Arc/ModelInfo.h"
 #include "circt/Dialect/Arc/Runtime/Common.h"
 #include "circt/Dialect/Arc/Runtime/FmtDescriptor.h"
@@ -30,6 +32,7 @@
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Index/IR/IndexOps.h"
@@ -37,7 +40,9 @@
 #include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/Support/Debug.h"
@@ -133,6 +138,12 @@ struct StateReadOpLowering : public OpConversionPattern<arc::StateReadOp> {
   LogicalResult
   matchAndRewrite(arc::StateReadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
+    // Loading an ArrayRef is a no-op as ArrayRefs are accessed by reference.
+    if (isa<ArrayRefType>(op.getType())) {
+      rewriter.replaceOp(op, adaptor.getState());
+      return success();
+    }
+
     auto type = typeConverter->convertType(op.getType());
     rewriter.replaceOpWithNewOp<LLVM::LoadOp>(op, type, adaptor.getState());
     return success();
@@ -144,18 +155,29 @@ struct StateWriteOpLowering : public OpConversionPattern<arc::StateWriteOp> {
   LogicalResult
   matchAndRewrite(arc::StateWriteOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
-    if (adaptor.getCondition()) {
-      rewriter.replaceOpWithNewOp<scf::IfOp>(
-          op, adaptor.getCondition(), [&](auto &builder, auto loc) {
-            LLVM::StoreOp::create(builder, loc, adaptor.getValue(),
-                                  adaptor.getState());
-            scf::YieldOp::create(builder, loc);
-          });
-    } else {
+    if (!isa<ArrayRefType>(op.getValue().getType())) {
       rewriter.replaceOpWithNewOp<LLVM::StoreOp>(op, adaptor.getValue(),
                                                  adaptor.getState());
+      return success();
     }
+
+    int numBytes = op.getState().getType().getByteWidth();
+    Value size = LLVM::ConstantOp::create(rewriter, op.getLoc(),
+                                          rewriter.getI64Type(), numBytes);
+    rewriter.replaceOpWithNewOp<LLVM::MemcpyOp>(
+        op, adaptor.getState(), adaptor.getValue(), size, /*volatile=*/false);
     return success();
+  }
+};
+
+struct AsContextOpLowering : public OpConversionPattern<arc::AsContextOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(arc::AsContextOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    // Context, root storage and instances resolve to the same pointer
+    rewriter.replaceOp(op, adaptor.getInput());
+    return llvm::success();
   }
 };
 
@@ -169,8 +191,48 @@ struct CurrentTimeOpLowering : public OpConversionPattern<arc::CurrentTimeOp> {
   matchAndRewrite(arc::CurrentTimeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
     // Time is stored at offset 0 in storage (no offset needed).
-    Value ptr = adaptor.getStorage();
+    Value ptr = adaptor.getArcContext();
     rewriter.replaceOpWithNewOp<LLVM::LoadOp>(op, rewriter.getI64Type(), ptr);
+    return success();
+  }
+};
+
+// Lower `llhd.constant_time` to an `i64` LLVM constant holding the time in
+// femtoseconds. Time attributes with non-zero delta or epsilon, units smaller
+// than `fs`, or values that overflow `i64` femtoseconds are rejected.
+struct ConstantTimeOpLowering
+    : public OpConversionPattern<llhd::ConstantTimeOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(llhd::ConstantTimeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    auto attr = op.getValue();
+    if (attr.getDelta() != 0 || attr.getEpsilon() != 0)
+      return rewriter.notifyMatchFailure(
+          op, "non-zero delta or epsilon time components are not supported");
+    uint64_t value = attr.getTime();
+    StringRef unit = attr.getTimeUnit();
+    uint64_t scale;
+    if (unit == "fs")
+      scale = 1;
+    else if (unit == "ps")
+      scale = 1'000ULL;
+    else if (unit == "ns")
+      scale = 1'000'000ULL;
+    else if (unit == "us")
+      scale = 1'000'000'000ULL;
+    else if (unit == "ms")
+      scale = 1'000'000'000'000ULL;
+    else if (unit == "s")
+      scale = 1'000'000'000'000'000ULL;
+    else
+      return rewriter.notifyMatchFailure(
+          op, "time units smaller than `fs` are not supported");
+    if (value > std::numeric_limits<uint64_t>::max() / scale)
+      return rewriter.notifyMatchFailure(
+          op, "time value does not fit into `i64` femtoseconds");
+    rewriter.replaceOpWithNewOp<LLVM::ConstantOp>(op, rewriter.getI64Type(),
+                                                  value * scale);
     return success();
   }
 };
@@ -294,9 +356,6 @@ struct MemoryWriteOpLowering : public OpConversionPattern<arc::MemoryWriteOp> {
         op.getLoc(), adaptor.getMemory(), adaptor.getAddress(),
         cast<MemoryType>(op.getMemory().getType()), rewriter);
     auto enable = access.withinBounds;
-    if (adaptor.getEnable())
-      enable = LLVM::AndOp::create(rewriter, op.getLoc(), adaptor.getEnable(),
-                                   enable);
 
     // Only attempt to write the memory if the address is within bounds.
     rewriter.replaceOpWithNewOp<scf::IfOp>(
@@ -621,8 +680,10 @@ struct SimStepOpLowering : public ModelAwarePattern<arc::SimStepOp> {
       // Increment time after step
       OpBuilder::InsertionGuard g(rewriter);
       rewriter.setInsertionPointAfter(op);
+      auto arcContext =
+          arc::AsContextOp::create(rewriter, op.getLoc(), op.getInstance());
       auto oldTime =
-          arc::SimGetTimeOp::create(rewriter, op.getLoc(), op.getInstance());
+          arc::CurrentTimeOp::create(rewriter, op.getLoc(), arcContext);
       auto newTime = LLVM::AddOp::create(rewriter, op.getLoc(), oldTime,
                                          adaptor.getTimePostIncrement());
       arc::SimSetTimeOp::create(rewriter, op.getLoc(), op.getInstance(),
@@ -634,21 +695,6 @@ struct SimStepOpLowering : public ModelAwarePattern<arc::SimStepOp> {
     rewriter.replaceOpWithNewOp<LLVM::CallOp>(op, mlir::TypeRange(), evalFunc,
                                               adaptor.getInstance());
 
-    return success();
-  }
-};
-
-// Loads the simulation time (i64 femtoseconds) from byte offset 0 in the
-// model instance's state storage.
-struct SimGetTimeOpLowering : public OpConversionPattern<arc::SimGetTimeOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(arc::SimGetTimeOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const final {
-    // Time is stored at offset 0 in the instance storage.
-    rewriter.replaceOpWithNewOp<LLVM::LoadOp>(op, rewriter.getI64Type(),
-                                              adaptor.getInstance());
     return success();
   }
 };
@@ -876,21 +922,32 @@ foldFormatString(ConversionPatternRewriter &rewriter, Value fstringValue,
                                   -> FailureOr<FormatInfo> {
         FmtDescriptor d = FmtDescriptor::createInt(
             op.getValue().getType().getWidth(), 10, op.getIsLeftAligned(),
-            op.getSpecifierWidth().value_or(-1), false, op.getIsSigned());
+            op.getSpecifierWidth().value_or(-1), op.getPaddingChar(), false,
+            op.getIsSigned());
         return FormatInfo{{d}, {reg2mem(rewriter, op.getLoc(), op.getValue())}};
       })
       .Case<sim::FormatHexOp>([&](sim::FormatHexOp op)
                                   -> FailureOr<FormatInfo> {
         FmtDescriptor d = FmtDescriptor::createInt(
             op.getValue().getType().getWidth(), 16, op.getIsLeftAligned(),
-            op.getSpecifierWidth().value_or(-1), op.getIsHexUppercase(), false);
+            op.getSpecifierWidth().value_or(-1), op.getPaddingChar(),
+            op.getIsHexUppercase(), false);
         return FormatInfo{{d}, {reg2mem(rewriter, op.getLoc(), op.getValue())}};
       })
       .Case<sim::FormatOctOp>([&](sim::FormatOctOp op)
                                   -> FailureOr<FormatInfo> {
         FmtDescriptor d = FmtDescriptor::createInt(
             op.getValue().getType().getWidth(), 8, op.getIsLeftAligned(),
-            op.getSpecifierWidth().value_or(-1), false, false);
+            op.getSpecifierWidth().value_or(-1), op.getPaddingChar(), false,
+            false);
+        return FormatInfo{{d}, {reg2mem(rewriter, op.getLoc(), op.getValue())}};
+      })
+      .Case<sim::FormatBinOp>([&](sim::FormatBinOp op)
+                                  -> FailureOr<FormatInfo> {
+        FmtDescriptor d = FmtDescriptor::createInt(
+            op.getValue().getType().getWidth(), 2, op.getIsLeftAligned(),
+            op.getSpecifierWidth().value_or(-1), op.getPaddingChar(), false,
+            false);
         return FormatInfo{{d}, {reg2mem(rewriter, op.getLoc(), op.getValue())}};
       })
       .Case<sim::FormatLiteralOp>(
@@ -928,14 +985,21 @@ foldFormatString(ConversionPatternRewriter &rewriter, Value fstringValue,
 FailureOr<LLVM::CallOp> emitFmtCall(OpBuilder &builder, Location loc,
                                     StringCache &stringCache,
                                     ArrayRef<FmtDescriptor> descriptors,
-                                    ValueRange args) {
+                                    ValueRange args, Value stream = {}) {
   ModuleOp moduleOp =
       builder.getInsertionBlock()->getParent()->getParentOfType<ModuleOp>();
-  // Lookup or create the arcRuntimeFormat function symbol.
   MLIRContext *ctx = builder.getContext();
-  auto func = LLVM::lookupOrCreateFn(
-      builder, moduleOp, runtime::APICallbacks::symNameFormat,
-      LLVM::LLVMPointerType::get(ctx), LLVM::LLVMVoidType::get(ctx), true);
+  auto ptrType = LLVM::LLVMPointerType::get(ctx);
+  SmallVector<Type, 2> paramTypes;
+  StringRef symbolName = runtime::APICallbacks::symNameFormat;
+  if (stream) {
+    symbolName = runtime::APICallbacks::symNameFormatToStream;
+    paramTypes.push_back(ptrType);
+  }
+  paramTypes.push_back(ptrType);
+
+  auto func = LLVM::lookupOrCreateFn(builder, moduleOp, symbolName, paramTypes,
+                                     LLVM::LLVMVoidType::get(ctx), true);
   if (failed(func))
     return func;
 
@@ -943,7 +1007,10 @@ FailureOr<LLVM::CallOp> emitFmtCall(OpBuilder &builder, Location loc,
                            descriptors.size() * sizeof(FmtDescriptor));
   Value fmtPtr = stringCache.getOrCreate(builder, rawDescriptors);
 
-  SmallVector<Value> argsVec(1, fmtPtr);
+  SmallVector<Value> argsVec;
+  if (stream)
+    argsVec.push_back(stream);
+  argsVec.push_back(fmtPtr);
   argsVec.append(args.begin(), args.end());
   auto result = LLVM::CallOp::create(builder, loc, func.value(), argsVec);
 
@@ -956,6 +1023,35 @@ FailureOr<LLVM::CallOp> emitFmtCall(OpBuilder &builder, Location loc,
 
   return result;
 }
+
+template <typename SourceOp>
+struct SimStreamOpLowering : public OpConversionPattern<SourceOp> {
+  SimStreamOpLowering(const TypeConverter &typeConverter, MLIRContext *context,
+                      StringRef symbolName)
+      : OpConversionPattern<SourceOp>(typeConverter, context),
+        symbolName(symbolName) {}
+
+  LogicalResult
+  matchAndRewrite(SourceOp op, typename SourceOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ModuleOp moduleOp = op->template getParentOfType<ModuleOp>();
+    if (!moduleOp)
+      return failure();
+
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    auto func =
+        LLVM::lookupOrCreateFn(rewriter, moduleOp, symbolName, {}, ptrType);
+    if (failed(func))
+      return failure();
+
+    auto call =
+        LLVM::CallOp::create(rewriter, op.getLoc(), func.value(), ValueRange{});
+    rewriter.replaceOp(op, call.getResults());
+    return success();
+  }
+
+  StringRef symbolName;
+};
 
 struct SimPrintFormattedProcOpLowering
     : public OpConversionPattern<sim::PrintFormattedProcOp> {
@@ -975,8 +1071,9 @@ struct SimPrintFormattedProcOpLowering
     // Add the end descriptor.
     formatInfo->descriptors.push_back(FmtDescriptor());
 
-    auto result = emitFmtCall(rewriter, op.getLoc(), stringCache,
-                              formatInfo->descriptors, formatInfo->args);
+    auto result =
+        emitFmtCall(rewriter, op.getLoc(), stringCache, formatInfo->descriptors,
+                    formatInfo->args, adaptor.getStream());
     if (failed(result))
       return failure();
     rewriter.replaceOp(op, result.value());
@@ -985,6 +1082,71 @@ struct SimPrintFormattedProcOpLowering
   }
 
   StringCache &stringCache;
+};
+
+struct TerminateOpLowering : public OpConversionPattern<arc::TerminateOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arc::TerminateOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+
+    auto i8Type = rewriter.getI8Type();
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+
+    Value flagPtr = LLVM::GEPOp::create(
+        rewriter, loc, ptrType, i8Type, adaptor.getArcContext(),
+        ArrayRef<LLVM::GEPArg>{arc::kTerminateFlagOffset});
+
+    uint8_t statusCode = op.getSuccess() ? 1 : 2;
+    Value codeVal = LLVM::ConstantOp::create(
+        rewriter, loc, i8Type, rewriter.getI8IntegerAttr(statusCode));
+
+    LLVM::StoreOp::create(rewriter, loc, codeVal, flagPtr);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+// Loads the next wakeup time (i64 femtoseconds) from the model's storage at
+// `kNextWakeupOffset`.
+struct GetNextWakeupOpLowering
+    : public OpConversionPattern<arc::GetNextWakeupOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arc::GetNextWakeupOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    Value slotPtr = LLVM::GEPOp::create(
+        rewriter, loc, ptrType, rewriter.getI8Type(), adaptor.getArcContext(),
+        ArrayRef<LLVM::GEPArg>{arc::kNextWakeupOffset});
+    rewriter.replaceOpWithNewOp<LLVM::LoadOp>(op, rewriter.getI64Type(),
+                                              slotPtr);
+    return success();
+  }
+};
+
+// Stores the next wakeup time (i64 femtoseconds) to the model's storage at
+// `kNextWakeupOffset`.
+struct SetNextWakeupOpLowering
+    : public OpConversionPattern<arc::SetNextWakeupOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arc::SetNextWakeupOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    Value slotPtr = LLVM::GEPOp::create(
+        rewriter, loc, ptrType, rewriter.getI8Type(), adaptor.getArcContext(),
+        ArrayRef<LLVM::GEPArg>{arc::kNextWakeupOffset});
+    rewriter.replaceOpWithNewOp<LLVM::StoreOp>(op, adaptor.getTime(), slotPtr);
+    return success();
+  }
 };
 
 } // namespace
@@ -1272,6 +1434,349 @@ struct RuntimeModelOpLowering
 };
 
 //===----------------------------------------------------------------------===//
+// ArrayRef patterns
+//===----------------------------------------------------------------------===//
+
+size_t computeByteWidth(ArrayRefType type) {
+  auto bitWidth = computeLLVMBitWidth(type);
+  assert(bitWidth.has_value());
+  return llvm::divideCeil(*bitWidth, 8);
+}
+
+// Computes the padded bytewidth (stride) of each element.
+size_t computeElementByteWidth(ArrayRefType arrayRefType) {
+  auto arrayBitWidth = computeLLVMBitWidth(arrayRefType);
+  assert(arrayBitWidth.has_value());
+  assert(arrayRefType.getNumElements() > 0 &&
+         "Cannot compute stride for zero sized array");
+  size_t elementBitWidth = *arrayBitWidth / arrayRefType.getNumElements();
+  return llvm::divideCeil(elementBitWidth, 8);
+}
+
+struct ArrayRefAllocOpLowering : public OpConversionPattern<ArrayRefAllocOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ArrayRefAllocOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto ptrTy = LLVM::LLVMPointerType::get(getContext());
+    auto i8Ty = rewriter.getI8Type();
+    ArrayRefType arrayRefType = op.getType();
+    size_t byteWidth = computeByteWidth(arrayRefType);
+    auto size = LLVM::ConstantOp::create(rewriter, op.getLoc(),
+                                         rewriter.getI64Type(), byteWidth);
+
+    size_t alignment = computeAllocaAlignment(arrayRefType, op);
+    auto alloc = LLVM::AllocaOp::create(rewriter, op.getLoc(), ptrTy, i8Ty,
+                                        size, alignment);
+
+    if (op.getInitAttr()) {
+      ArrayAttr initAttr = op.getInitAttr();
+      if (isZero(initAttr)) {
+        auto i8Ty = rewriter.getI8Type();
+        auto zero = LLVM::ConstantOp::create(rewriter, op.getLoc(), i8Ty, 0);
+        LLVM::MemsetOp::create(rewriter, op.getLoc(), alloc, zero, size,
+                               /*isVolatile=*/false);
+      } else {
+        initializeArray(rewriter, op.getLoc(), alloc, initAttr, arrayRefType);
+      }
+    }
+
+    rewriter.replaceOp(op, alloc);
+    return success();
+  }
+
+  // Computes the required alignment for an AllocaOp of the given type.
+  // c.f. HWToLLVM.cpp.
+  size_t computeAllocaAlignment(ArrayRefType type, Operation *op) const {
+    if (alignmentCache.count(type)) {
+      return alignmentCache[type];
+    }
+    auto dl = DataLayout::closest(op);
+    auto hwType =
+        hw::ArrayType::get(type.getElementType(), type.getNumElements());
+    auto llvmType = getTypeConverter()->convertType(hwType);
+    auto alignment =
+        static_cast<unsigned>(dl.getTypePreferredAlignment(llvmType));
+    alignment = std::max(4u, alignment);
+    alignmentCache[type] = alignment;
+    return alignment;
+  }
+
+  static bool isZero(Attribute attr) {
+    if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+      return intAttr.getValue().isZero();
+    if (auto arrayAttr = dyn_cast<ArrayAttr>(attr))
+      return llvm::all_of(arrayAttr, [](Attribute a) { return isZero(a); });
+    return false;
+  }
+
+  void initializeArray(ConversionPatternRewriter &rewriter, Location loc,
+                       Value alloc, ArrayAttr initAttr,
+                       ArrayRefType arrayRefType) const {
+    size_t elemByteWidth = computeElementByteWidth(arrayRefType);
+    Type ptrTy = LLVM::LLVMPointerType::get(getContext());
+    Type i8Ty = rewriter.getI8Type();
+    for (unsigned i = 0; i < arrayRefType.getNumElements(); ++i) {
+      unsigned elemIndex = arrayRefType.getNumElements() - i - 1;
+      Value elemOffset = LLVM::ConstantOp::create(
+          rewriter, loc, rewriter.getI64Type(), elemIndex * elemByteWidth);
+      auto elemAddr =
+          LLVM::GEPOp::create(rewriter, loc, ptrTy, i8Ty, alloc, elemOffset);
+      auto elem = LLVM::ConstantOp::create(
+          rewriter, loc, arrayRefType.getElementType(), initAttr[i]);
+      LLVM::StoreOp::create(rewriter, loc, elem, elemAddr);
+    }
+  }
+
+private:
+  mutable DenseMap<ArrayRefType, size_t> alignmentCache;
+};
+
+struct ArrayRefCreateOpLowering : public OpConversionPattern<ArrayRefCreateOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ArrayRefCreateOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ArrayRefType arrayRefType = cast<ArrayRefType>(op.getType());
+    Value alloc = adaptor.getInput();
+    auto ptrTy = LLVM::LLVMPointerType::get(getContext());
+    auto i8Ty = rewriter.getI8Type();
+    size_t elemByteWidth = computeElementByteWidth(arrayRefType);
+    auto elements = adaptor.getElements();
+    for (unsigned i = 0; i < elements.size(); ++i) {
+      // Note: hardcoded for little endian targets.
+      unsigned elemIndex = arrayRefType.getNumElements() - i - 1;
+      Value elemOffset =
+          LLVM::ConstantOp::create(rewriter, op.getLoc(), rewriter.getI64Type(),
+                                   elemIndex * elemByteWidth);
+      auto elemAddr = LLVM::GEPOp::create(rewriter, op.getLoc(), ptrTy, i8Ty,
+                                          alloc, elemOffset);
+      LLVM::StoreOp::create(rewriter, op.getLoc(), elements[i], elemAddr);
+    }
+    rewriter.replaceOp(op, alloc);
+    return success();
+  }
+};
+
+struct ArrayRefGetOpLowering : public OpConversionPattern<ArrayRefGetOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ArrayRefGetOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    ArrayRefType arrayRefType = cast<ArrayRefType>(op.getInput().getType());
+    auto ptrTy = LLVM::LLVMPointerType::get(getContext());
+    auto i8Ty = rewriter.getI8Type();
+    auto i64Ty = rewriter.getI64Type();
+    size_t elemByteWidth = computeElementByteWidth(arrayRefType);
+    assert(!isa<ArrayRefType>(arrayRefType.getElementType()));
+
+    Value stride =
+        LLVM::ConstantOp::create(rewriter, loc, i64Ty, elemByteWidth);
+    Value byteOffset =
+        LLVM::MulOp::create(rewriter, loc, adaptor.getIndex(), stride);
+    // Defend against out-of-bounds accesses. What we return is undefined in the
+    // case of OOB.
+    size_t lastElementByteOffset =
+        elemByteWidth * (arrayRefType.getNumElements() - 1);
+    Value lastElementByteOffsetVal =
+        LLVM::ConstantOp::create(rewriter, loc, i64Ty, lastElementByteOffset);
+    Value clampedOffset = LLVM::UMinOp::create(rewriter, loc, i64Ty, byteOffset,
+                                               lastElementByteOffsetVal);
+    auto elemAddr = LLVM::GEPOp::create(rewriter, loc, ptrTy, i8Ty,
+                                        adaptor.getInput(), clampedOffset);
+    Value loaded = LLVM::LoadOp::create(
+        rewriter, loc, typeConverter->convertType(op.getValue().getType()),
+        elemAddr);
+    rewriter.replaceOp(op, loaded);
+    return success();
+  }
+};
+
+struct ArrayRefInjectOpLowering : public OpConversionPattern<ArrayRefInjectOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ArrayRefInjectOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    ArrayRefType arrayRefType = cast<ArrayRefType>(op.getInput().getType());
+    assert(!isa<ArrayRefType>(arrayRefType.getElementType()));
+    auto ptrTy = LLVM::LLVMPointerType::get(getContext());
+    auto i8Ty = rewriter.getI8Type();
+    auto i64Ty = rewriter.getI64Type();
+    size_t byteWidth = computeByteWidth(arrayRefType);
+    size_t elemByteWidth = computeElementByteWidth(arrayRefType);
+
+    Value stride =
+        LLVM::ConstantOp::create(rewriter, loc, i64Ty, elemByteWidth);
+    Value byteOffset =
+        LLVM::MulOp::create(rewriter, loc, adaptor.getIndex(), stride);
+    Value totalSize = LLVM::ConstantOp::create(rewriter, loc, i64Ty, byteWidth);
+    // Defend against out-of-bounds accesses. We must avoid corrupting the
+    // array.
+    Value isInbounds = LLVM::ICmpOp::create(
+        rewriter, loc, LLVM::ICmpPredicate::ult, byteOffset, totalSize);
+    scf::IfOp::create(rewriter, loc, isInbounds, [&](OpBuilder &b, Location) {
+      auto elemAddr = LLVM::GEPOp::create(b, loc, ptrTy, i8Ty,
+                                          adaptor.getInput(), byteOffset);
+      LLVM::StoreOp::create(b, loc, adaptor.getElement(), elemAddr);
+      scf::YieldOp::create(b, loc);
+    });
+
+    // Inject is pure; returns the same pointer (input buffer is modified
+    // in-place and the pointer is forwarded as the result).
+    rewriter.replaceOp(op, adaptor.getInput());
+    return success();
+  }
+};
+
+struct ArrayRefSliceOpLowering : public OpConversionPattern<ArrayRefSliceOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ArrayRefSliceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    // The result type is the sub-array type; use its element size.
+    ArrayRefType inputType = cast<ArrayRefType>(op.getInput().getType());
+    ArrayRefType resultType = cast<ArrayRefType>(op.getOutput().getType());
+    auto ptrTy = LLVM::LLVMPointerType::get(getContext());
+    auto i8Ty = rewriter.getI8Type();
+    auto i64Ty = rewriter.getI64Type();
+    size_t elemByteWidth = computeElementByteWidth(resultType);
+
+    // Ensure the slice doesn't go out of bounds.
+    size_t maxLowIndex =
+        inputType.getNumElements() - resultType.getNumElements();
+    Value maxLowIndexVal =
+        LLVM::ConstantOp::create(rewriter, loc, i64Ty, maxLowIndex);
+    Value clampedLowIndex = LLVM::UMinOp::create(
+        rewriter, loc, i64Ty, adaptor.getLowIndex(), maxLowIndexVal);
+
+    // Byte offset = lowIndex * elemByteWidth.
+    Value stride =
+        LLVM::ConstantOp::create(rewriter, loc, i64Ty, elemByteWidth);
+    Value byteOffset =
+        LLVM::MulOp::create(rewriter, loc, clampedLowIndex, stride);
+    auto sliceAddr = LLVM::GEPOp::create(rewriter, loc, ptrTy, i8Ty,
+                                         adaptor.getInput(), byteOffset);
+    rewriter.replaceOp(op, sliceAddr);
+    return success();
+  }
+};
+
+struct ArrayRefCopyOpLowering : public OpConversionPattern<ArrayRefCopyOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ArrayRefCopyOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    ArrayRefType arrayRefType = cast<ArrayRefType>(op.getInput().getType());
+    auto i64Ty = rewriter.getI64Type();
+    size_t byteWidth = computeByteWidth(arrayRefType);
+    Value size = LLVM::ConstantOp::create(rewriter, loc, i64Ty, byteWidth);
+    // Use a memmove rather than a memcpy just in case the arrays alias.
+    LLVM::MemmoveOp::create(rewriter, loc, adaptor.getInput(),
+                            adaptor.getSource(), size,
+                            /*isVolatile=*/false);
+    rewriter.replaceOp(op, adaptor.getInput());
+    return success();
+  }
+};
+
+static Value loadArrayRefAsArray(ImplicitLocOpBuilder &builder, Value arrayRef,
+                                 ArrayRefType arrayRefType,
+                                 LLVM::LLVMArrayType llvmType) {
+  auto i8Ty = builder.getI8Type();
+  auto ptrTy = LLVM::LLVMPointerType::get(builder.getContext());
+  size_t elemByteWidth = computeElementByteWidth(arrayRefType);
+  Value v = LLVM::PoisonOp::create(builder, llvmType);
+  int32_t size = arrayRefType.getNumElements();
+  for (int32_t i = 0; i < size; i++) {
+    int32_t byteOffset = i * elemByteWidth;
+    Value gep = LLVM::GEPOp::create(builder, ptrTy, i8Ty, arrayRef,
+                                    LLVM::GEPArg{byteOffset});
+    Value load = LLVM::LoadOp::create(builder, llvmType.getElementType(), gep);
+    v = LLVM::InsertValueOp::create(builder, v, load, i);
+  }
+  return v;
+}
+
+static void storeArrayAsArrayRef(ImplicitLocOpBuilder &builder, Value array,
+                                 Value arrayRef, ArrayRefType arrayRefType) {
+  auto i8Ty = builder.getI8Type();
+  auto ptrTy = LLVM::LLVMPointerType::get(builder.getContext());
+  size_t elemByteWidth = computeElementByteWidth(arrayRefType);
+  int32_t size = arrayRefType.getNumElements();
+  for (int32_t i = 0; i < size; i++) {
+    int32_t byteOffset = i * elemByteWidth;
+    Value gep = LLVM::GEPOp::create(builder, ptrTy, i8Ty, arrayRef,
+                                    LLVM::GEPArg{byteOffset});
+    Value val = LLVM::ExtractValueOp::create(builder, array, i);
+    LLVM::StoreOp::create(builder, val, gep);
+  }
+}
+
+struct ArrayRefToLLVMArrayOpLowering
+    : public OpConversionPattern<UnrealizedConversionCastOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(UnrealizedConversionCastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!isa<ArrayRefType>(op.getOperand(0).getType()) ||
+        !isa<LLVM::LLVMArrayType>(op.getResult(0).getType())) {
+      return failure();
+    }
+
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    Value loaded = loadArrayRefAsArray(
+        b, adaptor.getInputs().front(),
+        cast<ArrayRefType>(op.getOperand(0).getType()),
+        cast<LLVM::LLVMArrayType>(op.getResult(0).getType()));
+    rewriter.replaceOp(op, loaded);
+    return success();
+  }
+};
+
+struct ArrayRefToArrayOpLowering
+    : public OpConversionPattern<ArrayRefToArrayOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ArrayRefToArrayOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultType = getTypeConverter()->convertType(op.getResult().getType());
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    Value loaded = loadArrayRefAsArray(
+        b, adaptor.getInput(), cast<ArrayRefType>(op.getInput().getType()),
+        cast<LLVM::LLVMArrayType>(resultType));
+    rewriter.replaceOp(op, loaded);
+    return success();
+  }
+};
+
+struct ArrayRefFromArrayOpLowering
+    : public OpConversionPattern<ArrayRefFromArrayOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ArrayRefFromArrayOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    storeArrayAsArrayRef(b, adaptor.getArray(), adaptor.getInput(),
+                         cast<ArrayRefType>(op.getInput().getType()));
+    rewriter.replaceOp(op, adaptor.getInput());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Pass Implementation
 //===----------------------------------------------------------------------===//
 
@@ -1283,27 +1788,18 @@ struct LowerArcToLLVMPass
 } // namespace
 
 void LowerArcToLLVMPass::runOnOperation() {
-  // Replace any `i0` values with an `hw.constant 0 : i0` to avoid later issues
-  // in LLVM conversion.
-  {
-    DenseMap<Region *, hw::ConstantOp> zeros;
-    getOperation().walk([&](Operation *op) {
-      if (op->hasTrait<OpTrait::ConstantLike>())
-        return;
-      for (auto result : op->getResults()) {
-        auto type = dyn_cast<IntegerType>(result.getType());
-        if (!type || type.getWidth() != 0)
-          continue;
-        auto *region = op->getParentRegion();
-        auto &zero = zeros[region];
-        if (!zero) {
-          auto builder = OpBuilder::atBlockBegin(&region->front());
-          zero = hw::ConstantOp::create(builder, result.getLoc(),
-                                        APInt::getZero(0));
-        }
-        result.replaceAllUsesWith(zero);
+  // Add `dereferenceable(<N>)` attributes to all function arguments that take
+  // ArrayRefTypes.
+  for (func::FuncOp func : getOperation().getOps<func::FuncOp>()) {
+    for (int i = 0, e = func.getNumArguments(); i != e; ++i) {
+      if (auto arrayRefType =
+              dyn_cast<ArrayRefType>(func.getArgumentTypes()[i])) {
+        size_t byteWidth = computeByteWidth(arrayRefType);
+        Builder builder(&getContext());
+        func.setArgAttr(i, LLVM::LLVMDialect::getDereferenceableAttrName(),
+                        builder.getI64IntegerAttr(byteWidth));
       }
-    });
+    }
   }
 
   // Collect the symbols in the root op such that the HW-to-LLVM lowering can
@@ -1336,6 +1832,9 @@ void LowerArcToLLVMPass::runOnOperation() {
   converter.addConversion([&](StorageType type) {
     return LLVM::LLVMPointerType::get(type.getContext());
   });
+  converter.addConversion([&](ContextType type) {
+    return LLVM::LLVMPointerType::get(type.getContext());
+  });
   converter.addConversion([&](MemoryType type) {
     return LLVM::LLVMPointerType::get(type.getContext());
   });
@@ -1348,9 +1847,24 @@ void LowerArcToLLVMPass::runOnOperation() {
   converter.addConversion([&](sim::FormatStringType type) {
     return LLVM::LLVMPointerType::get(type.getContext());
   });
+  converter.addConversion([&](sim::OutputStreamType type) {
+    return LLVM::LLVMPointerType::get(type.getContext());
+  });
   converter.addConversion([&](llhd::TimeType type) {
     // LLHD time is represented as i64 femtoseconds.
     return IntegerType::get(type.getContext(), 64);
+  });
+  converter.addConversion([&](ArrayRefType type) {
+    return LLVM::LLVMPointerType::get(type.getContext());
+  });
+
+  // Convert an UnrealizedConversionCastOp from !arc.arrayref<T> to
+  // !llvm.array<T>. These are inserted by the InsertRuntime pass.
+  target.addDynamicallyLegalOp<UnrealizedConversionCastOp>([&](Operation *op) {
+    Type src = op->getOperand(0).getType();
+    Type dst = op->getResult(0).getType();
+    bool needsConvert = isa<ArrayRefType>(src) && isa<LLVM::LLVMArrayType>(dst);
+    return !needsConvert;
   });
 
   // Setup the conversion patterns.
@@ -1362,11 +1876,13 @@ void LowerArcToLLVMPass::runOnOperation() {
   cf::populateControlFlowToLLVMConversionPatterns(converter, patterns);
   arith::populateArithToLLVMConversionPatterns(converter, patterns);
   index::populateIndexToLLVMConversionPatterns(converter, patterns);
+  ub::populateUBToLLVMConversionPatterns(converter, patterns);
   populateAnyFunctionOpInterfaceTypeConversionPattern(patterns, converter);
 
   // CIRCT patterns.
+  DataLayout layout = DataLayout::closest(getOperation());
   DenseMap<std::pair<Type, ArrayAttr>, LLVM::GlobalOp> constAggregateGlobalsMap;
-  populateHWToLLVMTypeConversions(converter);
+  populateHWToLLVMTypeConversions(converter, layout);
   std::optional<HWToLLVMArraySpillCache> spillCacheOpt =
       HWToLLVMArraySpillCache();
   {
@@ -1387,9 +1903,12 @@ void LowerArcToLLVMPass::runOnOperation() {
     AllocStateLikeOpLowering<arc::RootInputOp>,
     AllocStateLikeOpLowering<arc::RootOutputOp>,
     AllocStorageOpLowering,
+    AsContextOpLowering,
     ClockGateOpLowering,
     ClockInvOpLowering,
+    ConstantTimeOpLowering,
     CurrentTimeOpLowering,
+    GetNextWakeupOpLowering,
     IntToTimeOpLowering,
     MemoryReadOpLowering,
     MemoryWriteOpLowering,
@@ -1398,13 +1917,23 @@ void LowerArcToLLVMPass::runOnOperation() {
     ReplaceOpWithInputPattern<seq::FromClockOp>,
     RuntimeModelOpLowering,
     SeqConstClockLowering,
-    SimGetTimeOpLowering,
+    SetNextWakeupOpLowering,
     SimSetTimeOpLowering,
     StateReadOpLowering,
     StateWriteOpLowering,
     StorageGetOpLowering,
+    TerminateOpLowering,
     TimeToIntOpLowering,
-    ZeroCountOpLowering
+    ZeroCountOpLowering,
+    ArrayRefCreateOpLowering,
+    ArrayRefAllocOpLowering,
+    ArrayRefGetOpLowering,
+    ArrayRefInjectOpLowering,
+    ArrayRefSliceOpLowering,
+    ArrayRefCopyOpLowering,
+    ArrayRefToLLVMArrayOpLowering,
+    ArrayRefToArrayOpLowering,
+    ArrayRefFromArrayOpLowering
   >(converter, &getContext());
   // clang-format on
   patterns.add<ExecuteOp>(convert);
@@ -1412,6 +1941,10 @@ void LowerArcToLLVMPass::runOnOperation() {
   StringCache stringCache;
   patterns.add<SimEmitValueOpLowering, SimPrintFormattedProcOpLowering>(
       converter, &getContext(), stringCache);
+  patterns.add<SimStreamOpLowering<sim::StdoutStreamOp>>(
+      converter, &getContext(), runtime::APICallbacks::symNameGetStdoutStream);
+  patterns.add<SimStreamOpLowering<sim::StderrStreamOp>>(
+      converter, &getContext(), runtime::APICallbacks::symNameGetStderrStream);
 
   auto &modelInfo = getAnalysis<ModelInfoAnalysis>();
   llvm::DenseMap<StringRef, ModelInfoMap> modelMap(modelInfo.infoMap.size());

@@ -11,79 +11,6 @@
 #include "gtest/gtest.h"
 
 using namespace circt;
-namespace {
-struct HeapNode {
-  double score = 0.0;
-};
-
-struct HeapNodeScore {
-  double operator()(const HeapNode &node) const { return node.score; }
-};
-} // namespace
-
-TEST(SatSolverTest, IndexedMaxHeapPopsInDescendingScoreOrder) {
-  llvm::SmallVector<HeapNode, 4> nodes = {{1.0}, {5.0}, {3.0}, {4.0}};
-  IndexedMaxHeap<HeapNode, HeapNodeScore> heap(nodes);
-
-  for (unsigned i = 0; i < nodes.size(); ++i)
-    heap.insert(i);
-
-  EXPECT_EQ(1u, heap.pop());
-  EXPECT_EQ(3u, heap.pop());
-  EXPECT_EQ(2u, heap.pop());
-  EXPECT_EQ(0u, heap.pop());
-  EXPECT_TRUE(heap.empty());
-}
-
-TEST(SatSolverTest, IndexedMaxHeapIncreaseReordersExistingEntry) {
-  llvm::SmallVector<HeapNode, 4> nodes = {{1.0}, {2.0}, {3.0}};
-  IndexedMaxHeap<HeapNode, HeapNodeScore> heap(nodes);
-
-  for (unsigned i = 0; i < nodes.size(); ++i)
-    heap.insert(i);
-
-  nodes[0].score = 10.0;
-  heap.increase(0);
-
-  EXPECT_EQ(0u, heap.pop());
-  EXPECT_EQ(2u, heap.pop());
-  EXPECT_EQ(1u, heap.pop());
-}
-
-TEST(SatSolverTest, IndexedMaxHeapAvoidsDuplicateInsertions) {
-  llvm::SmallVector<HeapNode, 2> nodes = {{1.0}, {2.0}};
-  IndexedMaxHeap<HeapNode, HeapNodeScore> heap(nodes);
-
-  heap.insert(0);
-  heap.insert(1);
-  heap.insert(1);
-
-  EXPECT_EQ(1u, heap.pop());
-  EXPECT_EQ(0u, heap.pop());
-  EXPECT_TRUE(heap.empty());
-}
-
-TEST(SatSolverTest, IndexedMaxHeapClearRemovesEntriesAndAllowsReuse) {
-  llvm::SmallVector<HeapNode, 4> nodes = {{1.0}, {5.0}, {3.0}};
-  IndexedMaxHeap<HeapNode, HeapNodeScore> heap(nodes);
-
-  for (unsigned i = 0; i < nodes.size(); ++i)
-    heap.insert(i);
-
-  heap.clear();
-
-  EXPECT_TRUE(heap.empty());
-  for (unsigned i = 0; i < nodes.size(); ++i)
-    EXPECT_FALSE(heap.contains(i));
-
-  nodes[0].score = 7.0;
-  heap.insert(0);
-  heap.insert(2);
-
-  EXPECT_EQ(0u, heap.pop());
-  EXPECT_EQ(2u, heap.pop());
-  EXPECT_TRUE(heap.empty());
-}
 
 // ==----------------------------------------------------------------------===//
 // Z3 solver tests
@@ -124,6 +51,44 @@ TEST(SatSolverTest, AssumptionsAreScopedToSolve) {
   EXPECT_EQ(IncrementalSATSolver::kSAT, solver->solve());
   EXPECT_EQ(1, solver->val(1));
   EXPECT_EQ(2, solver->val(2));
+}
+
+TEST(SatSolverTest, AddAtMostOneClausesRejectsTwoTrueInputs) {
+  auto solver = createZ3SATSolver();
+  if (!solver)
+    GTEST_SKIP() << "Z3 is not available in this build.";
+  solver->reserveVars(3);
+  addAtMostOneClauses(
+      {1, 2, 3}, [&](llvm::ArrayRef<int> clause) { solver->addClause(clause); },
+      [&] { return solver->newVar(); });
+
+  // Any single selected literal should remain satisfiable.
+  EXPECT_EQ(IncrementalSATSolver::kSAT, solver->solve({1}));
+  EXPECT_EQ(IncrementalSATSolver::kSAT, solver->solve({2}));
+  EXPECT_EQ(IncrementalSATSolver::kSAT, solver->solve({3}));
+  // Any pair of selected literals must violate the at-most-one constraint.
+  EXPECT_EQ(IncrementalSATSolver::kUNSAT, solver->solve({1, 2}));
+  EXPECT_EQ(IncrementalSATSolver::kUNSAT, solver->solve({1, 3}));
+  EXPECT_EQ(IncrementalSATSolver::kUNSAT, solver->solve({2, 3}));
+}
+
+TEST(SatSolverTest, AddExactlyOneClausesRequiresOneSelection) {
+  auto solver = createZ3SATSolver();
+  if (!solver)
+    GTEST_SKIP() << "Z3 is not available in this build.";
+
+  solver->reserveVars(3);
+  addExactlyOneClauses(
+      {1, 2, 3}, [&](llvm::ArrayRef<int> clause) { solver->addClause(clause); },
+      [&] { return solver->newVar(); });
+
+  // Exactly one literal set true is a valid model.
+  EXPECT_EQ(IncrementalSATSolver::kSAT, solver->solve({1, -2, -3}));
+  EXPECT_EQ(IncrementalSATSolver::kSAT, solver->solve({-1, 2, -3}));
+  EXPECT_EQ(IncrementalSATSolver::kSAT, solver->solve({-1, -2, 3}));
+  // Zero or multiple selected literals must be rejected.
+  EXPECT_EQ(IncrementalSATSolver::kUNSAT, solver->solve({-1, -2, -3}));
+  EXPECT_EQ(IncrementalSATSolver::kUNSAT, solver->solve({1, 2}));
 }
 
 TEST(SatSolverTest, CadicalConflictLimitCanBeConfigured) {

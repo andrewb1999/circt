@@ -112,10 +112,15 @@ struct FormatStringParser {
       return success();
     }
 
-    // %l prints the library and cell name of the scope; not yet supported.
-    if (specifierLower == 'l')
-      return mlir::emitError(loc)
-             << "unsupported format specifier `" << fullSpecifier << "`";
+    // %l prints the library and cell name of the scope
+    if (specifierLower == 'l') {
+      if (context.currentDefinition)
+        emitLiteral(context.currentDefinition->sourceLibrary.name + "." +
+                    std::string(context.currentDefinition->name));
+      else
+        emitLiteral("");
+      return success();
+    }
 
     // Consume the next argument, which will provide the value to be
     // formatted.
@@ -150,6 +155,8 @@ struct FormatStringParser {
 
     case 's':
       return emitString(arg, options);
+    case 'c':
+      return emitChar(arg, options);
 
     default:
       return mlir::emitError(loc)
@@ -272,9 +279,22 @@ struct FormatStringParser {
 
   LogicalResult emitString(const slang::ast::Expression &arg,
                            const FormatOptions &options) {
-    if (options.width)
-      return mlir::emitError(loc)
-             << "string format specifier with width not supported";
+    // A field width (e.g. `%20s` / `%-20s`) prints the string in a field of at
+    // least that many characters, right- or left-justified and space-padded
+    // (IEEE 1800-2017 § 21.2.1.2). `moore.fmt.string` carries these attributes.
+    if (options.width) {
+      auto value = context.convertRvalueExpression(
+          arg, moore::StringType::get(context.getContext()));
+      if (!value)
+        return failure();
+      auto alignment = options.leftJustify ? IntAlign::Left : IntAlign::Right;
+      auto padding = options.zeroPad ? IntPadding::Zero : IntPadding::Space;
+      fragments.push_back(moore::FormatStringOp::create(
+          builder, loc, value, builder.getI32IntegerAttr(*options.width),
+          moore::IntAlignAttr::get(context.getContext(), alignment),
+          moore::IntPaddingAttr::get(context.getContext(), padding)));
+      return success();
+    }
 
     // Simplified handling for literals.
     if (auto *lit = arg.as_if<slang::ast::StringLiteral>()) {
@@ -293,9 +313,31 @@ struct FormatStringParser {
            << "expression cannot be formatted as string";
   }
 
+  LogicalResult emitChar(const slang::ast::Expression &arg,
+                         const FormatOptions &options) {
+    if (options.width)
+      return mlir::emitError(loc)
+             << "character format specifier with width not supported";
+
+    auto value = context.convertRvalueExpression(arg);
+    if (!value)
+      return failure();
+
+    auto bitValue = context.convertToSimpleBitVector(value);
+    if (!bitValue)
+      return failure();
+
+    fragments.push_back(moore::FormatCharOp::create(builder, loc, bitValue));
+    return success();
+  }
+
   /// Emit an expression argument with the appropriate default formatting.
   LogicalResult emitDefault(const slang::ast::Expression &expr) {
     FormatOptions options;
+    // Without an explicit format string, default formatting is not limited to
+    // integers, the string-typed arguments also be concerned.
+    if (expr.type->isString())
+      return emitString(expr, options);
     return emitInteger(expr, options, defaultFormat);
   }
 };

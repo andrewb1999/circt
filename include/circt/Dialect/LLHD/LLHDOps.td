@@ -11,6 +11,7 @@
 
 include "circt/Dialect/LLHD/LLHDDialect.td"
 include "circt/Dialect/LLHD/LLHDTypes.td"
+include "circt/Support/ProceduralRegionTrait.td"
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
@@ -53,10 +54,6 @@ class SmallerOrEqualResultTypeWidthConstraint<string result, string input>
                 "equal to the " # input # " type",
                 CPred<"llhd::getLLHDTypeWidth($" # result # ".getType()) <= " #
                       "llhd::getLLHDTypeWidth($" # input  # ".getType())">>;
-
-def ProceduralRegion : NativeOpTrait<"ProceduralRegion"> {
-  let cppNamespace = "::circt::llhd";
-}
 
 //===----------------------------------------------------------------------===//
 // Constants
@@ -503,7 +500,7 @@ def SigStructExtractOp : LLHDOp<"sig.struct_extract", [
 
   let extraClassDeclaration = [{
     hw::StructType getStructType() {
-      return cast<hw::StructType>(
+      return hw::type_dyn_cast<hw::StructType>(
         cast<RefType>(getInput().getType()).getNestedType()
       );
     }

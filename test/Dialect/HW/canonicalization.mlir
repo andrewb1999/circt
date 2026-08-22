@@ -504,6 +504,22 @@ hw.module @parity_constant_folding2(out result : i1) {
   hw.output %0 : i1
 }
 
+// CHECK-LABEL: hw.module @parity_concat_even_parity
+// CHECK-NEXT:  %[[RESULT0:.+]] = comb.parity %arg0 : i4
+// CHECK-NEXT:  %[[RESULT1:.+]] = comb.parity %arg0 : i4
+// CHECK-NEXT:  hw.output %[[RESULT0]], %[[RESULT1]]
+hw.module @parity_concat_even_parity(in %arg0 : i4, out o1 : i1, out o2 : i1) {
+  %c0_i4 = hw.constant 0 : i4
+  %c15_i8 = hw.constant 15 : i8
+  // parity(concat(0, x)) -> parity(x), 0 has even parity
+  %0 = comb.concat %c0_i4, %arg0 : i4, i4
+  %1 = comb.parity %0 : i8
+  // parity(concat(x, 15)) -> parity(x), 15 has even parity
+  %2 = comb.concat %arg0, %c15_i8 : i4, i8
+  %3 = comb.parity %2 : i12
+  hw.output %1, %3 : i1, i1
+}
+
 // CHECK-LABEL: hw.module @concat_fold_0
 // CHECK-NEXT:  %c120_i8 = hw.constant 120 : i8
 hw.module @concat_fold_0(out result : i8) {
@@ -1053,6 +1069,97 @@ hw.module @bitcast_canonicalization(in %arg0 : i4, out r1: i4, out r2: !hw.array
   hw.output %id, %b : i4, !hw.array<2xi2>
 }
 
+// CHECK-LABEL: hw.module @bitcast_int_to_struct
+hw.module @bitcast_int_to_struct(out result : !hw.struct<a: i4, b: i4>) {
+  %c = hw.constant 0x42 : i8
+  %0 = hw.bitcast %c : (i8) -> !hw.struct<a: i4, b: i4>
+  // CHECK-NEXT: %[[OUT:.+]] = hw.aggregate_constant [4 : i4, 2 : i4] : !hw.struct<a: i4, b: i4>
+  // CHECK-NEXT: hw.output %[[OUT]] : !hw.struct<a: i4, b: i4>
+  hw.output %0 : !hw.struct<a: i4, b: i4>
+}
+
+// CHECK-LABEL: hw.module @bitcast_struct_to_int
+hw.module @bitcast_struct_to_int(out result : i8) {
+  %c = hw.aggregate_constant [4 : i4, 2 : i4] : !hw.struct<a: i4, b: i4>
+  %0 = hw.bitcast %c : (!hw.struct<a: i4, b: i4>) -> i8
+  // CHECK-NEXT: %[[OUT:.+]] = hw.constant 66 : i8
+  // CHECK-NEXT: hw.output %[[OUT]] : i8
+  hw.output %0 : i8
+}
+
+// CHECK-LABEL: hw.module @bitcast_int_to_array
+hw.module @bitcast_int_to_array(out result : !hw.array<2xi4>) {
+  %c = hw.constant 0x42 : i8
+  // CHECK-NEXT: %[[OUT:.+]] = hw.aggregate_constant [4 : i4, 2 : i4] : !hw.array<2xi4>
+  // CHECK-NEXT: hw.output %[[OUT]] : !hw.array<2xi4>
+  %0 = hw.bitcast %c : (i8) -> !hw.array<2xi4>
+  hw.output %0 : !hw.array<2xi4>
+}
+
+// CHECK-LABEL: hw.module @bitcast_array_to_int
+hw.module @bitcast_array_to_int(out result : i8) {
+  %c = hw.aggregate_constant [4 : i4, 2 : i4] : !hw.array<2xi4>
+  // CHECK-NEXT: %[[OUT:.+]] = hw.constant 66 : i8
+  // CHECK-NEXT: hw.output %[[OUT]] : i8
+  %0 = hw.bitcast %c : (!hw.array<2xi4>) -> i8
+  hw.output %0 : i8
+}
+
+// CHECK-LABEL: hw.module @bitcast_int_to_0array
+hw.module @bitcast_int_to_0array(out result : !hw.array<0xi4>) {
+  %c = hw.constant 0 : i0
+  // CHECK-NEXT: %[[OUT:.+]] = hw.aggregate_constant [] : !hw.array<0xi4>
+  // CHECK-NEXT: hw.output %[[OUT]] : !hw.array<0xi4>
+  %0 = hw.bitcast %c : (i0) -> !hw.array<0xi4>
+  hw.output %0 : !hw.array<0xi4>
+}
+
+// CHECK-LABEL: hw.module @bitcast_0array_to_int
+hw.module @bitcast_0array_to_int(out result : i0) {
+  %c = hw.aggregate_constant [] : !hw.array<0xi4>
+  // CHECK-NEXT: %[[OUT:.+]] = hw.constant 0 : i0
+  // CHECK-NEXT: hw.output %[[OUT]] : i0
+  %0 = hw.bitcast %c : (!hw.array<0xi4>) -> i0
+  hw.output %0 : i0
+}
+
+// CHECK-LABEL: hw.module @bitcast_int_to_uarray
+hw.module @bitcast_int_to_uarray(out result : !hw.uarray<2xi4>) {
+  %c = hw.constant 0x42 : i8
+  // CHECK-NEXT: %[[OUT:.+]] = hw.aggregate_constant [4 : i4, 2 : i4] : !hw.uarray<2xi4>
+  // CHECK-NEXT: hw.output %[[OUT]] : !hw.uarray<2xi4>
+  %0 = hw.bitcast %c : (i8) -> !hw.uarray<2xi4>
+  hw.output %0 : !hw.uarray<2xi4>
+}
+
+// CHECK-LABEL: hw.module @bitcast_uarray_to_int
+hw.module @bitcast_uarray_to_int(out result : i8) {
+  %c = hw.aggregate_constant [4 : i4, 2 : i4] : !hw.uarray<2xi4>
+  // CHECK-NEXT: %[[OUT:.+]] = hw.constant 66 : i8
+  // CHECK-NEXT: hw.output %[[OUT]] : i8
+  %0 = hw.bitcast %c : (!hw.uarray<2xi4>) -> i8
+  hw.output %0 : i8
+}
+
+// CHECK-LABEL: hw.module @bitcast_int_to_nested_aggregate
+hw.module @bitcast_int_to_nested_aggregate(out result : !hw.array<2xstruct<a: i4, b: i4>>) {
+  %c = hw.constant 0x1234 : i16
+  %0 = hw.bitcast %c : (i16) -> !hw.array<2xstruct<a: i4, b: i4>>
+  // CHECK-NEXT: %[[OUT:.+]] = 
+  // CHECK-SAME{LITERAL}: hw.aggregate_constant [[1 : i4, 2 : i4], [3 : i4, 4 : i4]] : !hw.array<2xstruct<a: i4, b: i4>>
+  // CHECK-NEXT: hw.output %[[OUT]] : !hw.array<2xstruct<a: i4, b: i4>>
+  hw.output %0 : !hw.array<2xstruct<a: i4, b: i4>>
+}
+
+// CHECK-LABEL: hw.module @bitcast_nested_aggregate_to_int
+hw.module @bitcast_nested_aggregate_to_int(out result : i16) {
+  %c = hw.aggregate_constant [[1 : i4, 2 : i4], [3 : i4, 4 : i4]] : !hw.array<2xstruct<a: i4, b: i4>>
+  %0 = hw.bitcast %c : (!hw.array<2xstruct<a: i4, b: i4>>) -> i16
+  // CHECK-NEXT: %[[OUT:.+]] = hw.constant 4660 : i16
+  // CHECK-NEXT: hw.output %[[OUT]] : i16
+  hw.output %0 : i16
+}
+
 // CHECK-LABEL: hw.module @array_create
 // CHECK-NEXT:    %0 = hw.aggregate_constant [0 : i2, 1 : i2, 0 : i2] : !hw.array<3xi2>
 // CHECK-NEXT:    hw.output %0 : !hw.array<3xi2
@@ -1140,6 +1247,25 @@ hw.module @struct_create1(in %in: !hw.struct<a: i2, b: i2, c: i2>, in %in1: i2, 
   %3 = hw.struct_create (%a, %b, %in1) : !hw.struct<a: i2, b: i2, c: i2>
   // CHECK-NEXT: hw.output %in, [[V1]], [[V2]] : !hw.struct<a: i2, b: i2, c: i2>, !hw.struct<a: i2, b: i2, d: i2>, !hw.struct<a: i2, b: i2, c: i2>
   hw.output %1, %2, %3 : !hw.struct<a: i2, b: i2, c: i2>, !hw.struct<a: i2, b: i2, d: i2>, !hw.struct<a: i2, b: i2, c: i2>
+}
+
+// CHECK-LABEL: hw.module @struct_create_extract_fold
+hw.module @struct_create_extract_fold(in %in_a: !hw.struct<a: i2, b: i2, c: i2>, in %in_b: !hw.struct<a: i2, b: i2, c: i2>, out out_a: !hw.struct<a: i2, b: i2, c: i2>, out out_b: !hw.struct<a: i2, b: i2, c: i2>, out out_c: !hw.struct<a: i2, b: i2, c: i2>) {
+  // One of the three StructCreateOps should be folded
+  // CHECK-COUNT-2: hw.struct_create
+  // CHECK-NOT:     hw.struct_create
+  %a = hw.struct_extract %in_a["a"] : !hw.struct<a: i2, b: i2, c: i2>
+  %b = hw.struct_extract %in_a["b"] : !hw.struct<a: i2, b: i2, c: i2>
+  %c = hw.struct_extract %in_a["c"] : !hw.struct<a: i2, b: i2, c: i2>
+  // Fold
+  %folded = hw.struct_create (%a, %b, %c) : !hw.struct<a: i2, b: i2, c: i2>
+  // Don't fold: Different field order
+  %nofold0 = hw.struct_create (%a, %c, %b) : !hw.struct<a: i2, b: i2, c: i2>
+  // Don't fold: Different inputs
+  %c_other = hw.struct_extract %in_b["c"] : !hw.struct<a: i2, b: i2, c: i2>
+  %nofold1 = hw.struct_create (%a, %b, %c_other) : !hw.struct<a: i2, b: i2, c: i2>
+  // CHECK: hw.output %in_a
+  hw.output %folded, %nofold0, %nofold1 : !hw.struct<a: i2, b: i2, c: i2>, !hw.struct<a: i2, b: i2, c: i2>, !hw.struct<a: i2, b: i2, c: i2>
 }
 
 // CHECK-LABEL: hw.module @struct_extract1
@@ -1897,6 +2023,55 @@ hw.module @parameter<in: i8> (in %a: i8, out o1: !hw.array<1xi8>, out o2: !hw.st
   %0 = hw.array_create %param : i8
   %1 = hw.struct_create (%param) : !hw.struct<foo: i8>
   hw.output %0, %1 : !hw.array<1xi8>, !hw.struct<foo: i8>
+}
+
+// Fold union_extract when it undoes a union_create for the same field;
+// do NOT fold when the fields have different types (different bit widths).
+// CHECK-LABEL: hw.module @union_extract_create
+// CHECK-NEXT:    %[[U:.+]] = hw.union_create "a", %in
+// CHECK-NEXT:    %[[R1:.+]] = hw.union_extract %[[U]]["b"]
+// CHECK-NEXT:    hw.output %in, %[[R1]] : i8, i4
+hw.module @union_extract_create(in %in: i8, out r0: i8, out r1: i4) {
+  %u = hw.union_create "a", %in : !hw.union<a: i8, b: i4>
+  %r0 = hw.union_extract %u["a"] : !hw.union<a: i8, b: i4>
+  %r1 = hw.union_extract %u["b"] : !hw.union<a: i8, b: i4>
+  hw.output %r0, %r1 : i8, i4
+}
+
+// Fold union_extract("F1", union_create("F2", a)) across different fields when
+// both fields map to the same bits (same type, same offset in the union).
+// CHECK-LABEL: hw.module @union_extract_create_cross_field
+// CHECK-NEXT:    hw.output %in, %in : i8, i8
+hw.module @union_extract_create_cross_field(in %in: i8, out r0: i8, out r1: i8) {
+  %u = hw.union_create "a", %in : !hw.union<a: i8, b: i8>
+  %r0 = hw.union_extract %u["a"] : !hw.union<a: i8, b: i8>
+  %r1 = hw.union_extract %u["b"] : !hw.union<a: i8, b: i8>
+  hw.output %r0, %r1 : i8, i8
+}
+
+// Do NOT fold when the fields have the same type but sit at different offsets
+// within the union.
+// CHECK-LABEL: hw.module @union_extract_create_same_type_diff_offset
+// CHECK-NEXT:    %[[U:.+]] = hw.union_create "a", %in
+// CHECK-NEXT:    %[[R:.+]] = hw.union_extract %[[U]]["b"]
+// CHECK-NEXT:    hw.output %[[R]] : i8
+hw.module @union_extract_create_same_type_diff_offset(in %in: i8, out r: i8) {
+  %u = hw.union_create "a", %in : !hw.union<a: i8, b: i8 offset 8>
+  %r = hw.union_extract %u["b"] : !hw.union<a: i8, b: i8 offset 8>
+  hw.output %r : i8
+}
+
+// Fold union_extract of a bitcast into a direct bitcast when the field covers
+// the full union width; do NOT fold when the field is narrower.
+// CHECK-LABEL: hw.module @union_extract_bitcast
+// CHECK-NEXT:    %[[U:.+]] = hw.bitcast %in
+// CHECK-NEXT:    %[[R1:.+]] = hw.union_extract %[[U]]["b"]
+// CHECK-NEXT:    hw.output %in, %[[R1]] : i8, i4
+hw.module @union_extract_bitcast(in %in: i8, out r0: i8, out r1: i4) {
+  %u = hw.bitcast %in : (i8) -> !hw.union<a: i8, b: i4>
+  %r0 = hw.union_extract %u["a"] : !hw.union<a: i8, b: i4>
+  %r1 = hw.union_extract %u["b"] : !hw.union<a: i8, b: i4>
+  hw.output %r0, %r1 : i8, i4
 }
 
 // A self-referential wire must not crash during canonicalization.

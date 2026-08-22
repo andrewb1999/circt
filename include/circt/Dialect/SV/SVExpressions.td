@@ -10,14 +10,18 @@
 //
 //===----------------------------------------------------------------------===//
 
-include "mlir/Interfaces/InferTypeOpInterface.td"
+#ifndef CIRCT_DIALECT_SV_SVEXPRESSIONS_TD
+#define CIRCT_DIALECT_SV_SVEXPRESSIONS_TD
+
 include "circt/Dialect/HW/HWOpInterfaces.td"
 include "circt/Dialect/HW/HWTypes.td"
+include "circt/Dialect/SV/SVDialect.td"
 include "circt/Dialect/SV/SVTypes.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/IR/SymbolInterfaces.td"
 
 def HWValueOrInOutType : AnyTypeOf<[HWValueType, InOutType]>;
-def HasCustomSSAName : DeclareOpInterfaceMethods<OpAsmOpInterface,
-                         ["getAsmResultNames"]>;
 
 
 def SystemFunctionOp : SVOp<"system"> {
@@ -216,6 +220,24 @@ def SFormatFOp : SVOp<"sformatf", [Pure]> {
     "$format_string attr-dict (`(` $substitutions^ `)` `:` qualified(type($substitutions)))?";
 }
 
+def ConcatStrOp : SVOp<"concat_str", [Pure]> {
+  let summary = "Concatenate string values";
+  let description = [{
+    This operation concatenates one or more string values using the
+    SystemVerilog concatenation operator `{a, b, ...}` to produce a single
+    string. The result is a string whose contents are the operands joined in
+    order.
+
+    See section 11.4.12 of 1800-2023 for more details.
+  }];
+
+  let arguments = (ins Variadic<HWStringType>:$inputs);
+  let results = (outs HWStringType:$result);
+  let assemblyFormat = "`(` $inputs `)` attr-dict `:` type($result)";
+  let hasVerifier = 1;
+  let hasFolder = 1;
+}
+
 def LocalParamOp : SVOp<"localparam",
       [FirstAttrDerivedResultType, Pure, HasCustomSSAName]> {
   let summary = "Declare a localparam";
@@ -256,7 +278,7 @@ def IndexedPartSelectOp
                                           std::optional<Location> loc,
                                           ValueRange operands,
                                           DictionaryAttr attrs,
-                                          mlir::OpaqueProperties properties,
+                                          mlir::PropertyRef properties,
                                           mlir::RegionRange regions,
                                           SmallVectorImpl<Type> &results);
   }];
@@ -325,3 +347,5 @@ def UnpackedOpenArrayCastOp : SVOp<"unpacked_open_array_cast"> {
 
   let assemblyFormat = "$input attr-dict `:` functional-type($input, $result)";
 }
+
+#endif // CIRCT_DIALECT_SV_SVEXPRESSIONS_TD

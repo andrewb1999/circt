@@ -1,4 +1,5 @@
 add_circt_library(CIRCTTransforms
+  CellIFT.cpp
   FlattenMemRefs.cpp
   HierarchicalRunner.cpp
   IndexSwitchToIf.cpp
@@ -24,6 +25,7 @@ add_circt_library(CIRCTTransforms
   CIRCTComb
   CIRCTHW
   CIRCTLoopSchedule
+  CIRCTSeq
   CIRCTOpCountAnalysis
   CIRCTSCFWhileTripCountAnalysis
   MLIRArithDialect

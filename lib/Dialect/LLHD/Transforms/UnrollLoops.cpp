@@ -225,18 +225,26 @@ bool Loop::match() {
     return failMatch("unsupported increment");
   }
 
-  // Determine the trip count and loop behavior. We're very picky for now.
-  // for (unsigned i = 0; i < N; i += 1) with N < 1024
-  if (predicate == comb::ICmpPredicate::ult && indVarIncrement == 1 &&
-      beginBound == 0 && endBound.ult(1024)) {
-    tripCount = endBound.getZExtValue();
-    return true;
+  std::optional<unsigned> range;
+  // Determine the trip count and loop behavior.
+  // for (unsigned i = N; i < M; i += S) with N <= M and S > 0
+  if (predicate == comb::ICmpPredicate::ult && beginBound.ule(endBound) &&
+      indVarIncrement.sgt(0)) {
+    range = endBound.getZExtValue() - beginBound.getZExtValue();
   }
-  // for (signed i = 0; i < N; i += 1) with 0 <= N < 1024
-  if (predicate == comb::ICmpPredicate::slt && indVarIncrement == 1 &&
-      beginBound == 0 && !endBound.isNegative() && endBound.slt(1024)) {
-    tripCount = endBound.getZExtValue();
-    return true;
+  // for (signed i = N; i < M; i += S) with M > 0, N <= M and S > 0
+  if (predicate == comb::ICmpPredicate::slt && !endBound.isNegative() &&
+      beginBound.sle(endBound) && indVarIncrement.sgt(0)) {
+    range = endBound.getZExtValue() - beginBound.getZExtValue();
+  }
+  // for (signed i = N; i >= M; i += S) for N > 0, M >= 0, S < 0
+  if (predicate == comb::ICmpPredicate::sgt && !beginBound.isNegative() &&
+      endBound.sle(beginBound) && indVarIncrement.isNegative()) {
+    if (!endBound.isNegative())
+      range = beginBound.getZExtValue() - endBound.getZExtValue();
+    // Expressions like >= 0 are converted into > -1, so we handle this case.
+    else if (endBound.isAllOnes())
+      range = beginBound.getZExtValue() + 1;
   }
   // for (signless i = N; i == N; i += S) with S != 0
   if (predicate == comb::ICmpPredicate::eq && indVarIncrement != 0 &&
@@ -244,13 +252,23 @@ bool Loop::match() {
     tripCount = 1;
     return true;
   }
-  return failMatch("unsupported loop bounds");
+
+  if (!range.has_value())
+    return failMatch("unsupported loop bounds");
+
+  // Calculate the trip count as ceil(range/stride)
+  unsigned stride = indVarIncrement.abs().getZExtValue();
+  tripCount = (*range + stride - 1) / stride;
+  // For now don't expand more than 1k iterations.
+  if (tripCount >= 1024)
+    return failMatch("unsupported loop bounds");
+
+  return true;
 }
 
 /// Unroll the loop by cloning its body blocks and replacing the induction
 /// variable with constant iteration indices.
 void Loop::unroll(CFGLoopInfo &cfgLoopInfo) {
-  assert(beginBound == 0 && !endBound.isNegative() && indVarIncrement == 1);
   LLVM_DEBUG(llvm::dbgs() << "- Unrolling loop " << *this << "\n");
   UnusedOpPruner pruner;
 
@@ -345,19 +363,25 @@ void Loop::unroll(CFGLoopInfo &cfgLoopInfo) {
   exitEdge = nullptr;
 
   // Prune any body blocks that have become unreachable.
-  SmallPtrSet<Block *, 8> blocksToPrune;
-  for (auto *block : cfgLoop.getBlocks())
-    if (block->use_empty())
-      blocksToPrune.insert(block);
-  while (!blocksToPrune.empty()) {
-    auto *block = *blocksToPrune.begin();
-    blocksToPrune.erase(block);
-    if (!block->use_empty())
+  auto &region = *header->getParent();
+  SmallPtrSet<Block *, 8> reachable;
+  SmallVector<Block *> worklist;
+  reachable.insert(&region.front());
+  worklist.push_back(&region.front());
+  while (!worklist.empty())
+    for (auto *succ : worklist.pop_back_val()->getSuccessors())
+      if (reachable.insert(succ).second)
+        worklist.push_back(succ);
+
+  SmallVector<Block *> deadBlocks;
+  for (auto &block : region) {
+    if (reachable.contains(&block))
       continue;
-    for (auto *succ : block->getSuccessors())
-      if (cfgLoop.contains(succ))
-        blocksToPrune.insert(succ);
-    block->dropAllDefinedValueUses();
+    block.dropAllDefinedValueUses();
+    deadBlocks.push_back(&block);
+  }
+
+  for (auto *block : deadBlocks) {
     cfgLoopInfo.removeBlock(block);
     block->erase();
   }
@@ -398,6 +422,7 @@ struct UnrollLoopsPass
     : public llhd::impl::UnrollLoopsPassBase<UnrollLoopsPass> {
   void runOnOperation() override;
   void runOnOperation(CombinationalOp op);
+  bool unrollLoops(CombinationalOp op);
 };
 } // namespace
 
@@ -407,10 +432,18 @@ void UnrollLoopsPass::runOnOperation() {
 }
 
 void UnrollLoopsPass::runOnOperation(CombinationalOp op) {
+  // Unrolling a loop may open up opportunities to unroll its nested loops.
+  // Iterate until all possible loops are unrolled or the limit is reached.
+  for (unsigned i = 0; i < 16; ++i)
+    if (!unrollLoops(op))
+      break;
+}
+
+bool UnrollLoopsPass::unrollLoops(CombinationalOp op) {
   // There's nothing to do if we only have a single block. MLIR even refuses to
   // compute a dominator tree in that case.
   if (op.getBody().hasOneBlock())
-    return;
+    return false;
 
   // Find the loops.
   LLVM_DEBUG(llvm::dbgs() << "Unrolling loops in " << op.getLoc() << "\n");
@@ -422,6 +455,7 @@ void UnrollLoopsPass::runOnOperation(CombinationalOp op) {
   // data structure for each loop we can potentially unroll. The loops are in
   // preorder, with outer loops appearing before their child loops.
   SmallVector<Loop> loops;
+  bool retry = false;
   for (auto *cfgLoop : cfgLoopInfo.getLoopsInPreorder()) {
     // To simplify unrolling we need a unique latch block branching back to the
     // header.
@@ -458,12 +492,19 @@ void UnrollLoopsPass::runOnOperation(CombinationalOp op) {
     }
 
     // Check if the loop body matches the pattern we can unroll.
-    if (loop.match())
+    if (loop.match()) {
       loops.push_back(std::move(loop));
+      continue;
+    }
+
+    // If an enclosing loop is unrolled, we retry the unrolling.
+    retry |= llvm::any_of(loops, [&](const Loop &other) {
+      return other.cfgLoop.contains(cfgLoop);
+    });
   }
 
   if (loops.empty())
-    return;
+    return false;
 
   // Dump some debugging information about the loops we've found.
   LLVM_DEBUG({
@@ -492,4 +533,6 @@ void UnrollLoopsPass::runOnOperation(CombinationalOp op) {
   // their parent loops.
   for (auto &loop : llvm::reverse(loops))
     loop.unroll(cfgLoopInfo);
+
+  return retry;
 }

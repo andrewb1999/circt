@@ -295,7 +295,9 @@ static llvm::cl::opt<LayerSpecializationOpt> defaultLayerSpecialization{
 /// firtool does not support partially specified instance choice.
 static cl::list<std::string> selectInstanceChoice(
     "select-instance-choice",
-    cl::desc("Options to specialize instance choice, in option=case format"),
+    cl::desc("Options to specialize instance choice, in option=case format. "
+             "Use option?=case to allow non-existent options, or "
+             "option=<default> to select the default case"),
     cl::MiscFlags::CommaSeparated, cl::cat(mainCategory));
 
 static cl::opt<unsigned>
@@ -433,6 +435,7 @@ static LogicalResult processBuffer(
     options.scalarizePublicModules = scalarizePublicModules;
     options.scalarizeInternalModules = scalarizeIntModules;
     options.scalarizeExtModules = scalarizeExtModules;
+    options.warnOnTruncation = firtoolOptions.shouldWarnOnTruncation();
     options.enableLayers = enableLayers;
     options.disableLayers = disableLayers;
     options.selectInstanceChoice = selectInstanceChoice;
@@ -884,7 +887,7 @@ int main(int argc, char **argv) {
     om::registerPasses();
     sv::registerPasses();
     hw::registerFlattenModulesPass();
-    verif::registerVerifyClockedAssertLikePass();
+    verif::registerPasses();
 
     // Export passes:
     registerExportSplitVerilogPass();

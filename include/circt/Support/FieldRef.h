@@ -30,6 +30,8 @@ public:
   /// Get a null FieldRef.
   FieldRef() {}
 
+  FieldRef(Value value) : value(value) {}
+
   /// Get a FieldRef location for the specified value.
   FieldRef(Value value, unsigned id) : value(value), id(id) {}
 
@@ -100,12 +102,6 @@ namespace llvm {
 /// identity and field ID.
 template <>
 struct DenseMapInfo<circt::FieldRef> {
-  static inline circt::FieldRef getEmptyKey() {
-    return circt::FieldRef(DenseMapInfo<mlir::Value>::getEmptyKey(), 0);
-  }
-  static inline circt::FieldRef getTombstoneKey() {
-    return circt::FieldRef(DenseMapInfo<mlir::Value>::getTombstoneKey(), 0);
-  }
   static unsigned getHashValue(const circt::FieldRef &val) {
     return circt::hash_value(val);
   }

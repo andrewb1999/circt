@@ -854,6 +854,22 @@ def NullOp : MooreOp<"null", [Pure]> {
   }];
 }
 
+def NullChandleOp : MooreOp<"null_chandle", [Pure]> {
+  let summary = "A null `chandle`";
+  let results = (outs ChandleType:$result);
+  let assemblyFormat = [{
+     attr-dict
+  }];
+}
+
+def NullClassOp : MooreOp<"null_class", [Pure]> {
+  let summary = "A null class handle";
+  let results = (outs ClassHandleType:$result);
+  let assemblyFormat = [{
+     `:` type($result) attr-dict
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // Handle Comparison Ops
 //===----------------------------------------------------------------------===//
@@ -916,37 +932,6 @@ def HandleCaseNeOp : HandleCaseEqOpBase<"handle_case_ne"> {
 //===----------------------------------------------------------------------===//
 // Casting
 //===----------------------------------------------------------------------===//
-
-def ConversionOp : MooreOp<"conversion", [Pure]> {
-  let summary = "A type conversion";
-  let description = [{
-    An explicit or implicit type conversion. These are either generated
-    automatically in order to make assignments compatible:
-
-    ```
-    int a;
-    shortint b;
-    a = b;  // generates an implicit cast from shortint to int
-    ```
-
-    Or explicitly by the user through a type, sign, or const cast expression:
-
-    ```
-    byte'(a)
-    unsigned'(a)
-    signed'(a)
-    42'(a)
-    ```
-
-    See IEEE 1800-2017 § 6.24 "Casting".
-  }];
-  let arguments = (ins AnyType:$input);
-  let results = (outs AnyType:$result);
-  let assemblyFormat = [{
-    $input attr-dict `:` type($input) `->` type($result)
-  }];
-  let hasFolder = 1;
-}
 
 def PackedToSBVOp : MooreOp<"packed_to_sbv", [
   Pure,
@@ -2248,6 +2233,31 @@ def AssocArrayExtractRefOp : MooreOp<"assoc_array_extract_ref",
   }];
 }
 
+def AssocArraySetOp : MooreOp<"assoc_array.set", [
+    TypesMatchWith<"element type of associative array and given value must match",
+    "assoc_array", "value",
+    "cast<AssocArrayType>(cast<RefType>($_self).getNestedType()).getElementType()">,
+    TypesMatchWith<"associative array index and given index must match",
+    "assoc_array", "index",
+    "cast<AssocArrayType>(cast<RefType>($_self).getNestedType()).getIndexType()">]> {
+  let summary = "Overwrite (or insert) the element at a given index in an "
+                "associative array";
+  let description = [{
+    See IEEE 1800-2017 § 7.8.7 "Allocating associative array elements".
+    Writes $value at $index in the associative array, creating the entry
+    if it did not already exist.
+    This op is produced by the `SimplifyRefs` pass folding an
+    `assoc_array_extract_ref` immediately consumed by a blocking assignment;
+    ImportVerilog never emits it directly.
+  }];
+  let arguments = (ins AssocArrayRefType:$assoc_array, UnpackedType:$index,
+    UnpackedType:$value);
+  let results = (outs);
+  let assemblyFormat = [{
+    $assoc_array `[` $index `]` `=` $value attr-dict `:` type($assoc_array)
+  }];
+}
+
 def AssocArrayDeleteOp : MooreOp<"assoc_array.delete", 
     [TypesMatchWith<"associative array index and given index must match",
     "assoc_array", "index", "cast<AssocArrayType>(cast<RefType>($_self).getNestedType()).getIndexType()">]> {
@@ -2649,8 +2659,8 @@ def DeferAssertAttr : I32EnumAttr<
   let cppNamespace = "circt::moore";
 }
 
-class ImmediateAssertOp<string mnemonic, list<Trait> traits = []> : 
-    MooreOp<mnemonic, traits # [HasParent<"ProcedureOp">]>{
+class ImmediateAssertOp<string mnemonic, list<Trait> traits = []> :
+    MooreOp<mnemonic, traits # [ParentOneOf<["ProcedureOp", "::mlir::func::FuncOp"]>]>{
   let arguments = (ins
     DeferAssertAttr:$defer,
     AnySingleBitType:$cond,
@@ -2837,6 +2847,242 @@ def FormatHierPathOp : MooreOp<"fmt.hier_path", [Pure]> {
   let arguments = (ins UnitAttr:$useEscapes);
   let results = (outs FormatStringType:$result);
   let assemblyFormat = "(`escaped` $useEscapes^)? attr-dict";
+}
+
+def FormatCharOp : MooreOp<"fmt.char", [Pure]> {
+  let summary = "Display in ASCII character format";
+  let description = [{
+    Format string fragment that formats the given integer value as a single
+    ASCII character. This corresponds to the `%c` (or `%C`) format specifier
+    in SystemVerilog.
+
+    See IEEE 1800-2017 § 21.2.1.2 "Format specifications".
+  }];
+  let arguments = (ins IntType:$value);
+  let results = (outs FormatStringType:$result);
+  let assemblyFormat = "$value `:` type($value) attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// Scan String Operations
+//===----------------------------------------------------------------------===//
+
+def ScanBeginFScanFOp : MooreOp<"scan.begin_fscanf"> {
+  let summary = "Begin a $fscanf scan operation";
+  let description = [{
+    Opens a consuming scan chain that reads from the given channel.
+    The returned cursor is threaded through subsequent `moore.scan.*`
+    operations and closed with `moore.scan.end` to obtain the match count.
+
+    See IEEE 1800-2017 § 21.3.4.3 "Reading formatted data".
+  }];
+  let arguments = (ins TwoValuedI32:$channel);
+  let results = (outs ScanStringType:$cursor);
+  let assemblyFormat = "$channel attr-dict";
+}
+
+def ScanBeginSScanFOp : MooreOp<"scan.begin_sscanf"> {
+  let summary = "Begin a $sscanf scan operation";
+  let description = [{
+    Opens a consuming scan chain over the input `string`. The returned cursor
+    is threaded through subsequent `moore.scan.*` operations and closed with
+    `moore.scan.end` to obtain the match count.
+
+    See IEEE 1800-2017 § 21.3.4.3 "Reading formatted data".
+  }];
+  let arguments = (ins StringType:$string);
+  let results = (outs ScanStringType:$cursor);
+  let assemblyFormat = "$string attr-dict";
+}
+
+def ScanEndOp : MooreOp<"scan.end"> {
+  let summary = "Finalize a scan chain and return the match count";
+  let description = [{
+    Closes a consuming scan chain and returns the number of successfully
+    matched and assigned items. Returns -1 on EOF before the first match.
+  }];
+  let arguments = (ins ScanStringType:$cursor);
+  let results = (outs TwoValuedI32:$count);
+  let assemblyFormat = "$cursor attr-dict";
+}
+
+def ScanLiteralOp : MooreOp<"scan.literal", [Pure]> {
+  let summary = "Match a literal string in the scan input";
+  let description = [{
+    Matches the given literal text. If the input does not match, the scan
+    operation fails and no input is consumed.
+
+    See IEEE 1800-2017 § 21.3.4.3 "Reading formatted data".
+  }];
+  let arguments = (ins ScanStringType:$input, StrAttr:$literal);
+  let results = (outs ScanStringType:$remaining);
+  let assemblyFormat = "$input $literal attr-dict";
+}
+
+def ScanIntOp : MooreOp<"scan.int", [Pure, SameVariadicResultSize]> {
+  let summary = "Scan an integer value from input";
+  let description = [{
+    Reads an integer according to the given format
+    (binary, octal, decimal, or hexadecimal).
+    maxWidth limits the number of input characters consumed.
+    If the value/matched results are omitted, the field is consumed but
+    not stored (%* modifier).
+    Matched indicates whether a value was successfully scanned.
+
+    See IEEE 1800-2017 § 21.3.4.3, Table 21-8 (b, o, d, h, x).
+  }];
+  let arguments = (ins
+    ScanStringType:$input,
+    IntFormatAttr:$format,
+    OptionalAttr<I32Attr>:$maxWidth
+  );
+  let results = (outs
+    ScanStringType:$remaining,
+    Optional<AnyInteger>:$value,
+    Optional<BitType>:$matched
+  );
+  let assemblyFormat = [{
+    $input $format (`width` $maxWidth^)? attr-dict (`:` type($value)^ `,` type($matched))?
+  }];
+}
+
+def ScanRealOp : MooreOp<"scan.real", [Pure, SameVariadicResultSize]> {
+  let summary = "Scan a floating-point value from input";
+  let description = [{
+    Reads a floating-point number (f, e, g specifiers).
+    maxWidth limits the number of input characters consumed.
+    If the value/matched results are omitted, the field is consumed but
+    not stored (%* modifier).
+    Matched indicates whether a value was successfully scanned.
+
+    See IEEE 1800-2017 § 21.3.4.3, Table 21-8 (f, e, g).
+  }];
+  let arguments = (ins
+    ScanStringType:$input,
+    OptionalAttr<I32Attr>:$maxWidth
+  );
+  let results = (outs
+    ScanStringType:$remaining,
+    Optional<RealType>:$value,
+    Optional<BitType>:$matched
+);
+  let assemblyFormat = [{
+    $input (`width` $maxWidth^)? attr-dict (`:` type($value)^ `,` type($matched))?
+  }];
+}
+
+def ScanTimeOp : MooreOp<"scan.time", [Pure, SameVariadicResultSize]> {
+  let summary = "Scan a timescale-adjusted floating-point value from input";
+  let description = [{
+    Reads a floating-point number and scales it according to the current
+    timescale and $timeformat settings (%t specifier).
+    maxWidth limits the number of input characters consumed.
+    If the value/matched results are omitted, the field is consumed but
+    not stored (%* modifier).
+    Matched indicates whether a value was successfully scanned.
+
+    See IEEE 1800-2017 § 21.3.4.3, Table 21-8 (t).
+  }];
+  let arguments = (ins
+    ScanStringType:$input,
+    OptionalAttr<I32Attr>:$maxWidth
+  );
+  let results = (outs
+    ScanStringType:$remaining,
+    Optional<TimeType>:$value,
+    Optional<BitType>:$matched
+  );
+  let assemblyFormat = [{
+    $input (`width` $maxWidth^)? attr-dict (`:` type($value)^ `,` type($matched))?
+  }];
+}
+
+def ScanCharOp : MooreOp<"scan.char", [Pure, SameVariadicResultSize]> {
+  let summary = "Scan a single character from input";
+  let description = [{
+    Reads a single 8-bit ASCII character from the input stream (%c specifier).
+    Unlike other specifiers, leading whitespace is NOT skipped.
+    If the value/matched results are omitted, the field is consumed but
+    not stored (%* modifier).
+    Matched indicates whether a value was successfully scanned.
+
+    See IEEE 1800-2017 § 21.3.4.3, Table 21-8 (c).
+  }];
+  let arguments = (ins ScanStringType:$input);
+  let results = (outs
+    ScanStringType:$remaining,
+    Optional<AnyInteger>:$value,
+    Optional<BitType>:$matched
+  );
+  let assemblyFormat = [{
+    $input attr-dict (`:` type($value)^ `,` type($matched))?
+  }];
+}
+
+def ScanStrOp : MooreOp<"scan.str", [Pure, SameVariadicResultSize]> {
+  let summary = "Scan a whitespace-delimited string from input";
+  let description = [{
+    Reads a sequence of non-whitespace characters (%s specifier) and write
+    it to value.
+    maxWidth limits the number of characters consumed.
+    If the value/matched results are omitted, the field is consumed but
+    not stored (%* modifier).
+    Matched indicates whether a value was successfully scanned.
+
+    See IEEE 1800-2017 § 21.3.4.3, Table 21-8 (s).
+  }];
+  let arguments = (ins
+    ScanStringType:$input,
+    OptionalAttr<I32Attr>:$maxWidth
+  );
+  let results = (outs
+    ScanStringType:$remaining,
+    Optional<StringType>:$value,
+    Optional<BitType>:$matched
+  );
+  let assemblyFormat = [{
+    $input (`width` $maxWidth^)? attr-dict (`:` type($value)^ `,` type($matched))?
+  }];
+}
+
+def ScanUnformattedOp : MooreOp<"scan.unformatted", [Pure, SameVariadicResultSize]> {
+  let summary = "Scan unformatted binary data from input";
+  let description = [{
+    Reads raw binary data from the input stream.
+    %u reads 2-value binary data; %z reads 4-value (x/z-preserving) data.
+    The fourValue attribute distinguishes the two.
+    If the value/matched results are omitted, the field is consumed but
+    not stored (%* modifier).
+    Matched indicates whether a value was successfully scanned.
+
+    See IEEE 1800-2017 § 21.3.4.3, Table 21-8 (u, z).
+  }];
+  let arguments = (ins
+    ScanStringType:$input,
+    UnitAttr:$fourValue
+  );
+  let results = (outs
+    ScanStringType:$remaining,
+    Optional<AnyInteger>:$value,
+    Optional<BitType>:$matched
+  );
+  let assemblyFormat = [{
+    $input (`four_value` $fourValue^)? attr-dict (`:` type($value)^ `,` type($matched))?
+  }];
+}
+
+def ScanHierPathMatchOp : MooreOp<"scan.hier_path_match", [Pure]> {
+  let summary = "Match the current hierarchical path in the scan input";
+  let description = [{
+    Matches the current hierarchical scope path in the input stream (%m
+    specifier). Does not consume a destination argument and does not
+    store any value.
+
+    See IEEE 1800-2017 § 21.3.4.3, Table 21-8 (m).
+  }];
+  let arguments = (ins ScanStringType:$input);
+  let results = (outs ScanStringType:$remaining);
+  let assemblyFormat = "$input attr-dict";
 }
 
 //===----------------------------------------------------------------------===//
@@ -3069,6 +3315,165 @@ def SeverityBIOp : Builtin<"severity"> {
 }
 
 //===----------------------------------------------------------------------===//
+// Files Builtins
+//===----------------------------------------------------------------------===//
+
+// File open modes corresponding to the mode string argument of the `$fopen`
+
+def FOpenModeRead : I32EnumAttrCase<"Read", 0, "r">;
+def FOpenModeWrite : I32EnumAttrCase<"Write", 1, "w">;
+def FOpenModeAppend : I32EnumAttrCase<"Append", 2, "a">;
+def FOpenModeReadUpdate : I32EnumAttrCase<"ReadUpdate", 3, "r_update">;
+def FOpenModeWriteUpdate : I32EnumAttrCase<"WriteUpdate", 4, "w_update">;
+def FOpenModeAppendUpdate : I32EnumAttrCase<"AppendUpdate", 5, "a_update">;
+
+def FOpenModeAttr : I32EnumAttr<"FOpenMode",
+    "File open mode",
+    [FOpenModeRead, FOpenModeWrite, FOpenModeAppend,
+     FOpenModeReadUpdate, FOpenModeWriteUpdate, FOpenModeAppendUpdate]> {
+  let cppNamespace = "circt::moore";
+}
+
+def FOpenBIOp : Builtin<"fopen"> {
+  let summary = "Open a file";
+  let description = [{
+    Open a file and returns a file descriptor. If only the filename is provided,
+    opens the file and returns a multi-channel descriptor (MCD).
+    If the optional mode argument is also provided (e.g., "r", "w", "a"),
+    opens the file in the specified mode and returns a file descriptor (fd).
+    This corresponds to the `$fopen` system function.
+
+    See IEEE 1800-2017 § 21.3.1 "Opening and closing files".
+  }];
+  let arguments = (ins StringType:$filename, OptionalAttr<FOpenModeAttr>:$mode);
+  let results = (outs TwoValuedI32:$fd);
+  let assemblyFormat = "$filename (`mode` `=` $mode^)? attr-dict";
+}
+
+def FCloseBIOp : Builtin<"fclose"> {
+  let summary = "Close a file";
+  let description = [{
+    Closes a file given its descriptor. This corresponds to the `$fclose`
+    system task.
+
+    See IEEE 1800-2017 § 21.3.1 "Opening and closing files".
+  }];
+  let arguments = (ins TwoValuedI32:$fd);
+  let results = (outs);
+  let assemblyFormat = "$fd attr-dict";
+}
+
+def MooreMemBaseBin : I32EnumAttrCase<"Binary", 0, "bin">;
+def MooreMemBaseHex : I32EnumAttrCase<"Hex", 1, "hex">;
+def MooreMemBaseAttr : I32EnumAttr<"MemBase",
+    "encoding base for $readmem[bh]",
+    [MooreMemBaseBin, MooreMemBaseHex]> {
+  let cppNamespace = "circt::moore";
+}
+
+def ReadMemBIOp : Builtin<"readmem", [AttrSizedOperandSegments]> {
+  let summary = "Load a memory array from a file";
+  let description = [{
+    Loads data from a file into an unpacked array or queue using binary
+    or hexadecimal encoding. This corresponds to the
+    `$readmemb` / `$readmemh` system tasks.
+
+    `dimLows` and `dimDescending` record the declared low bound and
+    direction of every unpacked dimension (outermost first), which the
+    Moore array types do not carry. `sliceLeft`/`sliceRight` narrow the
+    addressable window of the highest dimension when the memory argument
+    uses slice syntax. When `enumValues` is present, loaded words are
+    checked against the enumeration's value set and the load stops with
+    an error on the first mismatch. Since the core dialects are
+    two-state, `x` and `z` digits load as 0 even for four-state elements.
+
+    See IEEE 1800-2017 § 21.4 "Loading memory array data from a file".
+  }];
+  let arguments = (ins
+    StringType:$filename,
+    AnyType:$dest,
+    MooreMemBaseAttr:$base,
+    Optional<TwoValuedI32>:$startAddr,
+    Optional<TwoValuedI32>:$finishAddr,
+    Optional<TwoValuedI32>:$sliceLeft,
+    Optional<TwoValuedI32>:$sliceRight,
+    DenseI64ArrayAttr:$dimLows,
+    DenseBoolArrayAttr:$dimDescending,
+    OptionalAttr<DenseI64ArrayAttr>:$enumValues
+  );
+  let results = (outs);
+  let assemblyFormat = [{
+    $base $filename `,` $dest
+    (`start` `=` $startAddr^)? (`finish` `=` $finishAddr^)?
+    (`slice` `` `[` $sliceLeft^ `,` $sliceRight `]`)?
+    attr-dict `:` type($dest)
+  }];
+  let hasVerifier = 1;
+}
+
+def FFlushBIOp : Builtin<"fflush"> {
+  let summary = "Flush a descriptor's output buffer";
+  let description = [{
+    Flushes the output buffer of the specified file(s).
+    This corresponds to the `$fflush` system task. If a file descriptor is provided,
+    writes any buffered output to the file associated with that descriptor.
+    If the descriptor is a multi-channel descriptor, all associated files are flushed.
+    If invoked with no arguments, flushes all open files.
+
+    See IEEE 1800-2017 § 21.3.6 "Flushing output".
+  }];
+  let arguments = (ins Optional<TwoValuedI32>:$fd);
+  let results = (outs);
+  let assemblyFormat = "($fd^)? attr-dict";
+}
+
+def FDisplayBIOp : Builtin<"fdisplay"> {
+  let summary = "Print a text message to a file";
+  let description = [{
+    Prints the given format string to the file corresponding to the given
+    descriptor. This corresponds to the `$fdisplay` and `$fwrite` system tasks.
+    Message formatting is handled by `moore.fmt.*` ops.
+
+    See IEEE 1800-2017 § 21.3.2 "File output system tasks".
+  }];
+  let arguments = (ins TwoValuedI32:$fd, FormatStringType:$message);
+  let assemblyFormat = "$fd `,` $message attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// Command Line Input System Functions
+//===----------------------------------------------------------------------===//
+
+def PlusArgsTestBIOp : Builtin<"plusargs_test"> {
+  let summary = "Test for the presence of a command-line plusarg";
+  let description = [{
+    Returns true if a command-line plus-argument matching the given format
+    string was supplied to the simulation. This corresponds to the
+    `$test$plusargs` system function.
+
+    See IEEE 1800-2017 § 21.6 "Command line input".
+  }];
+  let arguments = (ins StrAttr:$formatString);
+  let results = (outs BitType:$found);
+  let assemblyFormat = "$formatString attr-dict `:` type($found)";
+}
+
+def PlusArgsValueBIOp : Builtin<"plusargs_value"> {
+  let summary = "Read the value of a command-line plusarg";
+  let description = [{
+    Returns true if a command-line plus-argument matching the given format
+    string was supplied to the simulation, and parses the argument's value into
+    `result`. This corresponds to the `$value$plusargs` system function.
+
+    See IEEE 1800-2017 § 21.6 "Command line input".
+  }];
+  let arguments = (ins StrAttr:$formatString);
+  let results = (outs BitType:$found, UnpackedType:$result);
+  let assemblyFormat =
+      "$formatString attr-dict `:` type($found) `,` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
 // Math Builtins
 //===----------------------------------------------------------------------===//
 
@@ -3084,6 +3489,22 @@ class RealMathFunc<string mnemonic, list<Trait> traits = []> :
   let arguments = (ins RealF64:$value);
   let results = (outs RealF64:$result);
   let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
+class RealMathFuncTwoIn<string mnemonic, list<Trait> traits = []> :
+    Builtin<mnemonic, traits # [SameOperandsAndResultType]> {
+  let description = [{
+    The system real math functions shall accept two real value arguments and return
+    a real result type. Their behavior shall match the equivalent C language
+    standard math library function indicated.
+
+    See IEEE 1800-2017 § 20.8.2 "Real math functions".
+   }];
+  let arguments = (ins RealType:$lhs, RealType:$rhs);
+  let results = (outs RealType:$result);
+  let assemblyFormat = [{
+    $lhs `,` $rhs attr-dict `:` type($result)
+  }];
 }
 
 def Clog2BIOp : Builtin<"clog2", [SameOperandsAndResultType]> {
@@ -3120,6 +3541,18 @@ def SqrtBIOp : RealMathFunc<"sqrt"> {
   let summary = "Square root";
 }
 
+def MinBIOp : RealMathFuncTwoIn<"min"> {
+  let summary = "Minimum";
+}
+
+def MaxBIOp : RealMathFuncTwoIn<"max"> {
+  let summary = "Maximum";
+}
+
+def AbsBIOp : RealMathFunc<"abs"> {
+  let summary = "Absolute";
+}
+
 def FloorBIOp : RealMathFunc<"floor"> {
   let summary = "Floor";
 }
@@ -3150,6 +3583,14 @@ def AcosBIOp : RealMathFunc<"acos"> {
 
 def AtanBIOp : RealMathFunc<"atan"> {
   let summary = "Arc-tangent";
+}
+
+def Atan2BIOp : RealMathFuncTwoIn<"atan2"> {
+  let summary = "Arc-tangent of y/x";
+}
+
+def HypotBIOp : RealMathFuncTwoIn<"hypot"> {
+  let summary = "Hypotenusis function ((x^2+y^2)^(1/2))";
 }
 
 def SinhBIOp : RealMathFunc<"sinh"> {
@@ -3359,6 +3800,130 @@ def VTableEntryOp : MooreOp<"vtable_entry", [
   }];
 }
 
+// DPI argument direction enum — models the first-class direction keywords
+// used in DPI-imported function declarations (in, out, inout, return).
+def DPIArgDir_In     : I32EnumAttrCase<"In",     0, "in">;
+def DPIArgDir_Out    : I32EnumAttrCase<"Out",    1, "out">;
+def DPIArgDir_InOut  : I32EnumAttrCase<"InOut",  2, "inout">;
+def DPIArgDir_Return : I32EnumAttrCase<"Return", 3, "return">;
+
+def DPIArgDirection : I32EnumAttr<"DPIArgDirection",
+    "DPI argument direction",
+    [DPIArgDir_In, DPIArgDir_Out, DPIArgDir_InOut, DPIArgDir_Return]> {
+  let cppNamespace = "circt::moore";
+}
+
+def DPIFuncOp : MooreOp<"func.dpi",
+  [IsolatedFromAbove, Symbol, OpAsmOpInterface,
+   DeclareOpInterfaceMethods<FunctionOpInterface,
+     ["cloneTypeWith"]>]> {
+  let summary = "A DPI-imported SystemVerilog function declaration";
+  let description = [{
+    `moore.func.dpi` models a DPI-imported function declaration in Moore IR.
+    Each argument has a direction (`in`, `out`, `inout`, `return`), name, and
+    type. MooreToCore reconstructs a `sim::DPIFunctionType` for lowering to
+    `sim.func.dpi`.
+  }];
+
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    TypeAttrOf<FunctionType>:$function_type,
+    ArrayAttr:$dpi_arg_dirs,
+    ArrayAttr:$dpi_arg_names,
+    OptionalAttr<LocationArrayAttr>:$argument_locs,
+    OptionalAttr<StrAttr>:$verilogName,
+    OptionalAttr<StrAttr>:$sym_visibility
+  );
+  let regions = (region AnyRegion:$body);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+
+  let builders = [
+    OpBuilder<(ins
+      "StringAttr":$sym_name,
+      "ArrayRef<DPIArgInfo>":$dpiArgs,
+      "ArrayAttr":$argumentLocs,
+      "StringAttr":$verilogName
+    )>
+  ];
+
+  let extraClassDeclaration = [{
+    /// Whether a direction is a call operand (input-side).
+    static bool isCallOperandDir(DPIArgDirection dir) {
+      return dir == DPIArgDirection::In || dir == DPIArgDirection::InOut;
+    }
+
+    /// Reconstruct the absolute argument types from the FunctionType and
+    /// stored directions.
+    void getDPIArgTypes(SmallVectorImpl<Type> &argTypes);
+
+    ArrayRef<Type> getArgumentTypes() {
+      return cast<mlir::FunctionType>(getFunctionType()).getInputs();
+    }
+    ArrayRef<Type> getResultTypes() {
+      return cast<mlir::FunctionType>(getFunctionType()).getResults();
+    }
+
+    ::mlir::Region *getCallableRegion() { return nullptr; }
+
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// DPI Call
+//===----------------------------------------------------------------------===//
+
+def FuncDPICallOp : MooreOp<"func.dpi.call", [
+  CallOpInterface,
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>
+]> {
+  let summary = "Call a DPI-imported function";
+  let description = [{
+    `moore.func.dpi.call` represents a call to a DPI-C imported function,
+    preserving the DPI intent from ImportVerilog so that downstream
+    MooreToCore lowering emits `sim.func.dpi.call` instead of a plain
+    `func.call`.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$callee,
+                       Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>);
+
+  let assemblyFormat = [{
+    $callee `(` $inputs `)` attr-dict `:` functional-type($inputs, results)
+  }];
+
+  let extraClassDeclaration = [{
+    operand_range getArgOperands() {
+      return getInputs();
+    }
+    MutableOperandRange getArgOperandsMutable() {
+      return getInputsMutable();
+    }
+    mlir::CallInterfaceCallable getCallableForCallee() {
+      return (*this)->getAttrOfType<mlir::SymbolRefAttr>("callee");
+    }
+    void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
+      (*this)->setAttr(getCalleeAttrName(),
+                       llvm::cast<mlir::SymbolRefAttr>(callee));
+    }
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
+  }];
+
+}
+
 
 //===----------------------------------------------------------------------===//
 // String Builtins
@@ -3375,6 +3940,32 @@ def StringLenOp : StringBuiltin<"len"> {
   let arguments = (ins StringType:$str);
   let results = (outs TwoValuedI32:$result);
   let assemblyFormat = "$str attr-dict";
+}
+
+def StringPutOp : StringBuiltin<"put"> {
+  let summary = "Replace a character in a string";
+  let description = [{
+    Replaces the character at the specified index with the character
+    represented by the integer value.
+  }];
+  let arguments = (ins
+    StringRefType:$str,
+    TwoValuedI32:$index,
+    TwoValuedI8:$character
+  );
+  let assemblyFormat = [{
+    $str `[` $index `]` `,` $character attr-dict `:` type($str)
+  }];
+}
+
+def StringGetOp : StringBuiltin<"get"> {
+  let summary = "Get a character from a string";
+  let description = [{
+    Returns the character at the specified index in the given string.
+  }];
+  let arguments = (ins StringType:$str, TwoValuedI32:$index);
+  let results = (outs TwoValuedI8:$result);
+  let assemblyFormat = "$str `[` $index `]` attr-dict";
 }
 
 def StringToUpperOp : StringBuiltin<"toupper"> {
@@ -3397,14 +3988,89 @@ def StringToLowerOp : StringBuiltin<"tolower"> {
   let assemblyFormat = "$str attr-dict";
 }
 
-def StringGetOp : StringBuiltin<"get"> {
-  let summary = "Get a character from a string";
+class StringCompareOpBase<string mnemonic> : StringBuiltin<mnemonic> {
+  let summary = "Lexicographically compare two strings";
   let description = [{
-    Returns the character at the specified index in the given string.
+    As in the ANSI C `strcmp` function with regard to lexical ordering
+    and return value.
   }];
-  let arguments = (ins StringType:$str, TwoValuedI32:$index);
-  let results = (outs TwoValuedI8:$result);
-  let assemblyFormat = "$str `[` $index `]` attr-dict";
+  let arguments = (ins StringType:$lhs, StringType:$rhs);
+  let results = (outs TwoValuedI32:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict";
+}
+
+def StringCompareOp : StringCompareOpBase<"compare">;
+def StringICompareOp : StringCompareOpBase<"icompare"> {
+  let summary = "Case-insensitive compare";
+}
+
+def StringSubstrOp : StringBuiltin<"substr"> {
+  let summary = "Extract a substring";
+  let description = [{
+    Returns the characters from the start through end indices inclusive, or
+    the empty string if the range is invalid.
+  }];
+  let arguments = (ins
+    StringType:$str,
+    TwoValuedI32:$start,
+    TwoValuedI32:$end
+  );
+  let results = (outs StringType:$result);
+  let assemblyFormat = [{
+    $str `[` $start `:` $end `]` attr-dict
+  }];
+}
+
+class StringAToIOpBase<string mnemonic> : StringBuiltin<mnemonic> {
+  let summary = "Convert a string to an integer";
+  let description = [{
+    Converts the ASCII representation in the given string into a 32-bit
+    integer value, or returns zero if no digits were encountered.
+  }];
+  let arguments = (ins StringType:$str);
+  let results = (outs FourValuedI32:$result);
+  let assemblyFormat = [{
+    $str attr-dict `:` type($result)
+  }];
+}
+
+def StringAtoiOp : StringAToIOpBase<"atoi">;
+def StringAtohexOp : StringAToIOpBase<"atohex">;
+def StringAtooctOp : StringAToIOpBase<"atooct">;
+def StringAtobinOp : StringAToIOpBase<"atobin">;
+
+def StringAtorealOp : StringBuiltin<"atoreal"> {
+  let summary = "Convert a string to a real number";
+  let description = [{
+    Converts the ASCII decimal representation in the given string into a
+    real number, or returns zero if no digits were encountered.
+  }];
+  let arguments = (ins StringType:$str);
+  let results = (outs RealType:$result);
+  let assemblyFormat = [{
+    $str attr-dict `:` type($result)
+  }];
+}
+
+class StringIToAOpBase<string mnemonic> : StringBuiltin<mnemonic> {
+  let summary = "inverse of StringAToIOpBase";
+  let arguments = (ins StringRefType:$str, FourValuedI32:$input);
+  let assemblyFormat = [{
+    $str `,` $input attr-dict `:` type($str) `,` type($input)
+  }];
+}
+
+def StringItoaOp : StringIToAOpBase<"itoa">;
+def StringHextoaOp : StringIToAOpBase<"hextoa">;
+def StringOcttoaOp : StringIToAOpBase<"octtoa">;
+def StringBintoaOp : StringIToAOpBase<"bintoa">;
+
+def StringRealtoaOp : StringBuiltin<"realtoa"> {
+  let summary = "inverse of atoreal";
+  let arguments = (ins StringRefType:$str, RealType:$input);
+  let assemblyFormat = [{
+    $str `,` $input attr-dict `:` type($str) `,` type($input)
+  }];
 }
 
 def StringConcatOp : StringBuiltin<"concat"> {

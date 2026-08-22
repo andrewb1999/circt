@@ -1,6 +1,6 @@
 if(MLIR_ENABLE_EXECUTION_ENGINE)
   add_compile_definitions(CIRCT_LEC_ENABLE_JIT)
-  set(CIRCT_LEC_JIT_LLVM_COMPONENTS native)
+  set(CIRCT_LEC_JIT_LLVM_COMPONENTS native codegen)
   set(CIRCT_LEC_JIT_DEPS
     MLIRExecutionEngine
     MLIRExecutionEngineUtils
@@ -14,6 +14,7 @@ target_link_libraries(circt-lec
   PRIVATE
   CIRCTComb
   CIRCTCombToSMT
+  CIRCTCombTransforms
   CIRCTDatapath
   CIRCTDatapathToSMT
   CIRCTEmitTransforms
@@ -27,7 +28,6 @@ target_link_libraries(circt-lec
   CIRCTSupport
   CIRCTVerif
   CIRCTVerifToSMT
-  LLVMSupport
   MLIRArithDialect
   MLIRBuiltinToLLVMIRTranslation
   MLIRFuncDialect

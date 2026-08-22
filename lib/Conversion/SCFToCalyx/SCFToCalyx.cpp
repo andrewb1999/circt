@@ -668,7 +668,7 @@ private:
 
     // Pass the result from the source operation to register holding the resullt
     // from the Calyx primitive.
-    op.getResult().replaceAllUsesWith(reg.getOut());
+    rewriter.replaceAllUsesWith(op.getResult(), reg.getOut());
 
     if (isa<calyx::AddFOpIEEE754>(opPipe)) {
       auto opFOp = cast<calyx::AddFOpIEEE754>(opPipe);
@@ -735,7 +735,7 @@ private:
           rewriter, loc, cast<calyx::IntToFpOpIEEE754>(calyxOp).getSignedIn(),
           c1);
     }
-    op.getResult().replaceAllUsesWith(reg.getOut());
+    rewriter.replaceAllUsesWith(op.getResult(), reg.getOut());
 
     calyx::AssignOp::create(rewriter, loc, reg.getIn(), calyxOp.getOut());
     calyx::AssignOp::create(rewriter, loc, reg.getWriteEn(), c1);
@@ -958,7 +958,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     calyx::AssignOp::create(rewriter, loadOp.getLoc(), reg.getWriteEn(),
                             regWriteEn);
     calyx::GroupDoneOp::create(rewriter, loadOp.getLoc(), reg.getDone());
-    loadOp.getResult().replaceAllUsesWith(reg.getOut());
+    rewriter.replaceAllUsesWith(loadOp.getResult(), reg.getOut());
     res = reg.getOut();
   }
 
@@ -1133,12 +1133,12 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   PredicateInfo info = calyx::getPredicateInfo(cmpf.getPredicate());
   if (info.logic == CombLogic::None) {
     if (cmpf.getPredicate() == CmpFPredicate::AlwaysTrue) {
-      cmpf.getResult().replaceAllUsesWith(c1);
+      rewriter.replaceAllUsesWith(cmpf.getResult(), c1.getResult());
       return success();
     }
 
     if (cmpf.getPredicate() == CmpFPredicate::AlwaysFalse) {
-      cmpf.getResult().replaceAllUsesWith(c0);
+      rewriter.replaceAllUsesWith(cmpf.getResult(), c0.getResult());
       return success();
     }
   }
@@ -1275,7 +1275,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
       comb::createOrFoldNot(builder, loc, calyxCmpFOp.getDone()));
   calyx::GroupDoneOp::create(rewriter, loc, reg.getDone());
 
-  cmpf.getResult().replaceAllUsesWith(reg.getOut());
+  rewriter.replaceAllUsesWith(cmpf.getResult(), reg.getOut());
 
   // Register evaluating groups
   getState<ComponentLoweringState>().registerEvaluatingGroup(outputValue,
@@ -1800,7 +1800,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   if (targetBits == sourceBits) {
     /// Drop the index cast and replace uses of the target value with the source
     /// value.
-    op.getResult().replaceAllUsesWith(op.getOperand());
+    rewriter.replaceAllUsesWith(op.getResult(), op.getOperand());
   } else {
     /// pad/slice the source operand.
     if (sourceBits > targetBits)
@@ -1947,7 +1947,8 @@ class InlineExecuteRegionOpPattern
         yieldTypes,
         SmallVector<Location, 4>(yieldTypes.size(), rewriter.getUnknownLoc()));
     for (auto res : enumerate(execOp.getResults()))
-      res.value().replaceAllUsesWith(sinkBlock->getArgument(res.index()));
+      rewriter.replaceAllUsesWith(res.value(),
+                                  sinkBlock->getArgument(res.index()));
 
     /// Rewrite yield calls as branches.
     for (auto yieldOp :
@@ -2048,7 +2049,9 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
     /// Mark this component as the toplevel if it's the top-level function of
     /// the module.
     if (compOp.getName() == loweringState().getTopLevelFunction())
-      compOp->setAttr("toplevel", rewriter.getUnitAttr());
+      rewriter.modifyOpInPlace(compOp, [&]() {
+        compOp->setAttr("toplevel", rewriter.getUnitAttr());
+      });
 
     /// Store the function-to-component mapping.
     functionMapping[funcOp] = compOp;
@@ -2085,8 +2088,8 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
 
     /// Rewrite funcOp SSA argument values to the CompOp arguments.
     for (auto &mapping : funcOpArgRewrites)
-      mapping.getFirst().replaceAllUsesWith(
-          compOp.getArgument(mapping.getSecond()));
+      rewriter.replaceAllUsesWith(mapping.getFirst(),
+                                  compOp.getArgument(mapping.getSecond()));
 
     return success();
   }
@@ -2149,12 +2152,12 @@ class BuildWhileGroups : public calyx::FuncOpPartialLoweringPattern {
                            arg.value().getType().getIntOrFloatBitWidth(), name);
         getState<ComponentLoweringState>().addWhileLoopIterReg(whileOp, reg,
                                                                arg.index());
-        arg.value().replaceAllUsesWith(reg.getOut());
+        rewriter.replaceAllUsesWith(arg.value(), reg.getOut());
 
         /// Also replace uses in the "before" region of the while loop
-        whileOp.getConditionBlock()
-            ->getArgument(arg.index())
-            .replaceAllUsesWith(reg.getOut());
+        rewriter.replaceAllUsesWith(
+            whileOp.getConditionBlock()->getArgument(arg.index()),
+            reg.getOut());
       }
 
       /// Create iter args initial value assignment group(s), one per register.
@@ -2215,7 +2218,7 @@ class BuildForGroups : public calyx::FuncOpPartialLoweringPattern {
           createRegister(inductionVar.getLoc(), rewriter, getComponent(),
                          inductionVar.getType().getIntOrFloatBitWidth(), name);
       getState<ComponentLoweringState>().addForLoopIterReg(forOp, reg, 0);
-      inductionVar.replaceAllUsesWith(reg.getOut());
+      rewriter.replaceAllUsesWith(inductionVar, reg.getOut());
 
       // Create InitGroup that sets the InductionVar to LowerBound
       calyx::ComponentOp componentOp =
@@ -2669,12 +2672,13 @@ private:
 class LateSSAReplacement : public calyx::FuncOpPartialLoweringPattern {
   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
 
-  LogicalResult partiallyLowerFuncToComp(FuncOp funcOp,
-                                         PatternRewriter &) const override {
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
     funcOp.walk([&](scf::IfOp op) {
       for (auto res : getState<ComponentLoweringState>().getResultRegs(op))
-        op.getOperation()->getResults()[res.first].replaceAllUsesWith(
-            res.second.getOut());
+        rewriter.replaceAllUsesWith(op.getOperation()->getResults()[res.first],
+                                    res.second.getOut());
     });
 
     funcOp.walk([&](scf::WhileOp op) {
@@ -2687,7 +2691,8 @@ class LateSSAReplacement : public calyx::FuncOpPartialLoweringPattern {
       ScfWhileOp whileOp(op);
       for (auto res :
            getState<ComponentLoweringState>().getWhileLoopIterRegs(whileOp))
-        whileOp.getOperation()->getResults()[res.first].replaceAllUsesWith(
+        rewriter.replaceAllUsesWith(
+            whileOp.getOperation()->getResults()[res.first],
             res.second.getOut());
     });
 
@@ -2697,10 +2702,10 @@ class LateSSAReplacement : public calyx::FuncOpPartialLoweringPattern {
         /// link between evaluating groups (which fix the input addresses of a
         /// memory op) and a readData result. Now, we may replace these SSA
         /// values with their memoryOp readData output.
-        loadOp.getResult().replaceAllUsesWith(
-            getState<ComponentLoweringState>()
-                .getMemoryInterface(loadOp.getMemref())
-                .readData());
+        rewriter.replaceAllUsesWith(loadOp.getResult(),
+                                    getState<ComponentLoweringState>()
+                                        .getMemoryInterface(loadOp.getMemref())
+                                        .readData());
       }
     });
 

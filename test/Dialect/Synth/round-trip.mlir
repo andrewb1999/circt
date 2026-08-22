@@ -1,11 +1,4 @@
 // RUN: circt-opt --verify-roundtrip --verify-diagnostics %s | FileCheck %s
-// CHECK-LABEL: @basic
-// CHECK: synth.mig.maj_inv
-hw.module @basic(in %a : i4, out result : i4) {
-    %0 = synth.mig.maj_inv not %a, %a, %a {sv.namehint = "out0"} : i4
-    hw.output %0 : i4
-}
-
 // CHECK-LABEL: @And
 // CHECK-NEXT: %[[RES0:.+]] = synth.aig.and_inv %b, %b : i4
 // CHECK-NEXT: %[[RES1:.+]] = synth.aig.and_inv %b, not %b : i4
@@ -22,4 +15,70 @@ hw.module @And(in %a: i1, in %b: i4) {
 hw.module @choice(in %a: i4, in %b: i4) {
   %0 = synth.choice %a : i4
   %1 = synth.choice %a, %b, %a : i4
+}
+
+// CHECK-LABEL: @xor_inv
+// CHECK-NEXT: %[[R0:.+]] = synth.xor_inv %a, not %b, %c : i4
+// CHECK-NEXT: %[[R1:.+]] = synth.xor_inv not %d : i1
+hw.module @xor_inv(in %a: i4, in %b: i4, in %c: i4, in %d: i1) {
+  %0 = synth.xor_inv %a, not %b, %c : i4
+  %1 = synth.xor_inv not %d : i1
+}
+
+// CHECK-LABEL: @dot
+// CHECK-NEXT: %[[R0:.+]] = synth.dot %x, not %y, %z : i1
+hw.module @dot(in %x: i1, in %y: i1, in %z: i1) {
+  %0 = synth.dot %x, not %y, %z : i1
+}
+
+// CHECK-LABEL: @majority
+// CHECK-NEXT: %[[R0:.+]] = synth.majority %x, not %y, %z : i1
+hw.module @majority(in %x: i1, in %y: i1, in %z: i1) {
+  %0 = synth.majority %x, not %y, %z : i1
+}
+
+// CHECK-LABEL: @onehot
+// CHECK-NEXT: %[[R0:.+]] = synth.onehot %x, not %y, %z : i1
+hw.module @onehot(in %x: i1, in %y: i1, in %z: i1) {
+  %0 = synth.onehot %x, not %y, %z : i1
+}
+
+// CHECK-LABEL: @mux_inv
+// CHECK-NEXT: %[[R0:.+]] = synth.mux_inv %c, not %a, %b : i4
+hw.module @mux_inv(in %c: i4, in %a: i4, in %b: i4) {
+  %0 = synth.mux_inv %c, not %a, %b : i4
+}
+
+// CHECK-LABEL: @gamble
+// CHECK-NEXT: %[[R0:.+]] = synth.gamble %x, not %y, %z : i1
+hw.module @gamble(in %x: i1, in %y: i1, in %z: i1) {
+  %0 = synth.gamble %x, not %y, %z : i1
+}
+
+// CHECK-LABEL: synth.cut_rewrite_pattern
+// CHECK-SAME: (%{{.*}}: i1, %{{.*}}: i1, %{{.*}}: i1) -> i1
+// CHECK-SAME: attributes {cost = #synth.mapping_cost<area =
+// CHECK-SAME: arcs =
+synth.cut_rewrite_pattern (%a: i1, %b: i1, %c: i1) -> i1 attributes {
+  cost = #synth.mapping_cost<area = 1.0 : f64, arcs = [
+    #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+    #synth.linear_timing_arc<1, 0, #synth.polarity<negative>>,
+    #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>
+  ]>
+} {
+  %0 = synth.aig.and_inv %a, not %b, %c : i1
+  synth.yield %0 : i1
+}
+
+// CHECK-LABEL: synth.cut_rewrite_pattern
+// CHECK-SAME: (%{{.*}}: i1, %{{.*}}: i1) -> i1 attributes {cost = #synth.mapping_cost<area =
+// CHECK-SAME: arcs =
+synth.cut_rewrite_pattern (%a: i1, %b: i1) -> i1 attributes {
+  cost = #synth.mapping_cost<area = 1.0 : f64, arcs = [
+    #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>,
+    #synth.linear_timing_arc<1, 0, #synth.polarity<positive>>
+  ]>
+} {
+  %0 = synth.aig.and_inv %a, %b : i1
+  synth.yield %0 : i1
 }

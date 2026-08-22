@@ -2508,6 +2508,19 @@ firrtl.module @MuxCanon(in %c1: !firrtl.uint<1>, in %c2: !firrtl.uint<1>, in %d1
   // CHECK: firrtl.cat %[[mux2]], %d2
 }
 
+// See: https://github.com/llvm/circt/issues/10528
+// CHECK-LABEL: firrtl.module @MuxCanon10528
+firrtl.module @MuxCanon10528(in %cond: !firrtl.uint<1>, out %out: !firrtl.clock) {
+  %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
+  %clk = firrtl.asClock %c0_ui1 : (!firrtl.uint<1>) -> !firrtl.clock
+  %n0 = firrtl.node %clk : !firrtl.clock
+  %n1 = firrtl.node %clk {name = "n1"} : !firrtl.clock
+  %0 = firrtl.mux(%cond, %n0, %n1) : (!firrtl.uint<1>, !firrtl.clock, !firrtl.clock) -> !firrtl.clock
+  firrtl.matchingconnect %out, %0 : !firrtl.clock
+  // CHECK: %[[CLK:.+]] = firrtl.specialconstant 0 : !firrtl.clock
+  // CHECK: firrtl.matchingconnect %out, %[[CLK]]
+}
+
 // CHECK-LABEL: firrtl.module @MuxShorten
 firrtl.module @MuxShorten(
   in %c1: !firrtl.uint<1>, in %c2: !firrtl.uint<1>,
@@ -4023,4 +4036,196 @@ firrtl.module @StringConcatCanonicalization(in %str1: !firrtl.string, in %str2: 
   firrtl.propassign %out7, %nested : !firrtl.string
 }
 
+// CHECK-LABEL: firrtl.module @PropEqFold
+firrtl.module @PropEqFold(in %str: !firrtl.string, in %b: !firrtl.bool,
+                          in %i: !firrtl.integer,
+                          out %out1: !firrtl.bool, out %out2: !firrtl.bool,
+                          out %out3: !firrtl.bool, out %out4: !firrtl.bool,
+                          out %out5: !firrtl.bool, out %out6: !firrtl.bool,
+                          out %out7: !firrtl.bool, out %out8: !firrtl.bool,
+                          out %out9: !firrtl.bool) {
+  %s1 = firrtl.string "hello"
+  %s2 = firrtl.string "hello"
+  %s3 = firrtl.string "world"
+
+  // CHECK-DAG: [[TRUE:%.+]] = firrtl.bool true
+  // CHECK-DAG: [[FALSE:%.+]] = firrtl.bool false
+
+  // Equal constant strings fold to true.
+  // CHECK: firrtl.propassign %out1, [[TRUE]]
+  %0 = firrtl.prop.eq %s1, %s2 : !firrtl.string
+  firrtl.propassign %out1, %0 : !firrtl.bool
+
+  // Unequal constant strings fold to false.
+  // CHECK: firrtl.propassign %out2, [[FALSE]]
+  %1 = firrtl.prop.eq %s1, %s3 : !firrtl.string
+  firrtl.propassign %out2, %1 : !firrtl.bool
+
+  // Non-constant string operands do not fold.
+  // CHECK: [[EQ:%.+]] = firrtl.prop.eq %str, %str : !firrtl.string
+  // CHECK: firrtl.propassign %out3, [[EQ]]
+  %2 = firrtl.prop.eq %str, %str : !firrtl.string
+  firrtl.propassign %out3, %2 : !firrtl.bool
+
+  // Equal constant booleans fold to true.
+  %t1 = firrtl.bool true
+  %t2 = firrtl.bool true
+  %f1 = firrtl.bool false
+  // CHECK: firrtl.propassign %out4, [[TRUE]]
+  %3 = firrtl.prop.eq %t1, %t2 : !firrtl.bool
+  firrtl.propassign %out4, %3 : !firrtl.bool
+
+  // Unequal constant booleans fold to false.
+  // CHECK: firrtl.propassign %out5, [[FALSE]]
+  %4 = firrtl.prop.eq %t1, %f1 : !firrtl.bool
+  firrtl.propassign %out5, %4 : !firrtl.bool
+
+  // Non-constant bool operands do not fold.
+  // CHECK: [[BEQB:%.+]] = firrtl.prop.eq %b, %b : !firrtl.bool
+  // CHECK: firrtl.propassign %out6, [[BEQB]]
+  %5 = firrtl.prop.eq %b, %b : !firrtl.bool
+  firrtl.propassign %out6, %5 : !firrtl.bool
+
+  // Equal constant integers fold to true.
+  %i1 = firrtl.integer 42
+  %i2 = firrtl.integer 42
+  %i3 = firrtl.integer 0
+  // CHECK: firrtl.propassign %out7, [[TRUE]]
+  %6 = firrtl.prop.eq %i1, %i2 : !firrtl.integer
+  firrtl.propassign %out7, %6 : !firrtl.bool
+
+  // Unequal constant integers fold to false.
+  // CHECK: firrtl.propassign %out8, [[FALSE]]
+  %7 = firrtl.prop.eq %i1, %i3 : !firrtl.integer
+  firrtl.propassign %out8, %7 : !firrtl.bool
+
+  // Non-constant integer operands do not fold.
+  // CHECK: [[IEQI:%.+]] = firrtl.prop.eq %i, %i : !firrtl.integer
+  // CHECK: firrtl.propassign %out9, [[IEQI]]
+  %8 = firrtl.prop.eq %i, %i : !firrtl.integer
+  firrtl.propassign %out9, %8 : !firrtl.bool
+}
+
+// CHECK-LABEL: firrtl.module @BoolBinaryFold
+firrtl.module @BoolBinaryFold(in %b: !firrtl.bool,
+                               out %out1: !firrtl.bool, out %out2: !firrtl.bool,
+                               out %out3: !firrtl.bool, out %out4: !firrtl.bool,
+                               out %out5: !firrtl.bool, out %out6: !firrtl.bool,
+                               out %out7: !firrtl.bool, out %out8: !firrtl.bool,
+                               out %out9: !firrtl.bool, out %out10: !firrtl.bool,
+                               out %out11: !firrtl.bool) {
+  // CHECK-DAG: [[TRUE:%.+]] = firrtl.bool true
+  // CHECK-DAG: [[FALSE:%.+]] = firrtl.bool false
+  %t = firrtl.bool true
+  %f = firrtl.bool false
+
+  // AND: constant folding.
+  // true AND false = false
+  // CHECK: firrtl.propassign %out1, [[FALSE]]
+  %0 = firrtl.bool.and %t, %f
+  firrtl.propassign %out1, %0 : !firrtl.bool
+
+  // AND with false is always false.
+  // CHECK: firrtl.propassign %out2, [[FALSE]]
+  %1 = firrtl.bool.and %b, %f
+  firrtl.propassign %out2, %1 : !firrtl.bool
+
+  // AND with true is identity.
+  // CHECK: firrtl.propassign %out3, %b
+  %2 = firrtl.bool.and %b, %t
+  firrtl.propassign %out3, %2 : !firrtl.bool
+
+  // OR: constant folding.
+  // true OR false = true
+  // CHECK: firrtl.propassign %out4, [[TRUE]]
+  %3 = firrtl.bool.or %t, %f
+  firrtl.propassign %out4, %3 : !firrtl.bool
+
+  // OR with true is always true.
+  // CHECK: firrtl.propassign %out5, [[TRUE]]
+  %4 = firrtl.bool.or %b, %t
+  firrtl.propassign %out5, %4 : !firrtl.bool
+
+  // OR with false is identity.
+  // CHECK: firrtl.propassign %out6, %b
+  %5 = firrtl.bool.or %b, %f
+  firrtl.propassign %out6, %5 : !firrtl.bool
+
+  // XOR: constant folding.
+  // true XOR false = true
+  // CHECK: firrtl.propassign %out7, [[TRUE]]
+  %6 = firrtl.bool.xor %t, %f
+  firrtl.propassign %out7, %6 : !firrtl.bool
+
+  // XOR: constant folding T xor T = F.
+  // CHECK: firrtl.propassign %out8, [[FALSE]]
+  %7 = firrtl.bool.xor %t, %t
+  firrtl.propassign %out8, %7 : !firrtl.bool
+
+  // XOR with false is identity.
+  // CHECK: firrtl.propassign %out9, %b
+  %8 = firrtl.bool.xor %b, %f
+  firrtl.propassign %out9, %8 : !firrtl.bool
+
+  // Non-constant bool.and operands do not fold.
+  // CHECK: [[AND:%.+]] = firrtl.bool.and %b, %b
+  // CHECK: firrtl.propassign %out10, [[AND]]
+  %9 = firrtl.bool.and %b, %b
+  firrtl.propassign %out10, %9 : !firrtl.bool
+
+  // NOT idiom: bool.xor with true = NOT.
+  // false XOR true = true
+  // CHECK: firrtl.propassign %out11, [[TRUE]]
+  %10 = firrtl.bool.xor %f, %t
+  firrtl.propassign %out11, %10 : !firrtl.bool
+}
+
+// Register canonicalization tests.
+
+// A constant register whose initial value differs from the folded constant
+// must NOT be folded away.
+// CHECK-LABEL: firrtl.module @FoldBlocked
+firrtl.module @FoldBlocked(in %clock: !firrtl.clock, in %cond: !firrtl.uint<1>, out %q: !firrtl.uint<8>) {
+  // CHECK: %r = firrtl.reg %clock {initial = 5 : ui8}
+  %r = firrtl.reg %clock {initial = 5 : ui8} : !firrtl.clock, !firrtl.uint<8>
+  %c3 = firrtl.constant 3 : !firrtl.uint<8>
+  %m = firrtl.mux(%cond, %r, %c3) : (!firrtl.uint<1>, !firrtl.uint<8>, !firrtl.uint<8>) -> !firrtl.uint<8>
+  firrtl.matchingconnect %r, %m : !firrtl.uint<8>
+  firrtl.matchingconnect %q, %r : !firrtl.uint<8>
+}
+
+// A constant register whose initial value equals the folded constant may be
+// folded away.
+// CHECK-LABEL: firrtl.module @FoldAllowed
+firrtl.module @FoldAllowed(in %clock: !firrtl.clock, in %cond: !firrtl.uint<1>, out %q: !firrtl.uint<8>) {
+  // CHECK-NOT: firrtl.reg
+  // CHECK: %c3_ui8 = firrtl.constant 3
+  %r = firrtl.reg %clock {initial = 3 : ui8} : !firrtl.clock, !firrtl.uint<8>
+  %c3 = firrtl.constant 3 : !firrtl.uint<8>
+  %m = firrtl.mux(%cond, %r, %c3) : (!firrtl.uint<1>, !firrtl.uint<8>, !firrtl.uint<8>) -> !firrtl.uint<8>
+  firrtl.matchingconnect %r, %m : !firrtl.uint<8>
+  firrtl.matchingconnect %q, %r : !firrtl.uint<8>
+}
+
+// Promotion of a `reg` with a hidden reset to a `regreset` must carry the
+// `initial` attribute through.
+// CHECK-LABEL: firrtl.module @PromotePreservesInitial
+firrtl.module @PromotePreservesInitial(in %clock: !firrtl.clock, in %reset: !firrtl.uint<1>, in %d: !firrtl.uint<8>, out %q: !firrtl.uint<8>) {
+  // CHECK: firrtl.regreset {{.*}} {initial = 9 : ui8}
+  %r = firrtl.reg %clock {initial = 9 : ui8} : !firrtl.clock, !firrtl.uint<8>
+  %c1 = firrtl.constant 1 : !firrtl.uint<8>
+  %m = firrtl.mux(%reset, %c1, %d) : (!firrtl.uint<1>, !firrtl.uint<8>, !firrtl.uint<8>) -> !firrtl.uint<8>
+  firrtl.matchingconnect %r, %m : !firrtl.uint<8>
+  firrtl.matchingconnect %q, %r : !firrtl.uint<8>
+}
+
+// Zero-reset regreset rewritten to a plain reg forwards `initial`.
+// CHECK-LABEL: firrtl.module @ZeroResetForwardsInitial
+firrtl.module @ZeroResetForwardsInitial(in %clock: !firrtl.clock, out %q: !firrtl.uint<8>) {
+  // CHECK: firrtl.reg %clock {initial = 4 : ui8}
+  %zero = firrtl.constant 0 : !firrtl.uint<1>
+  %c0 = firrtl.constant 0 : !firrtl.uint<8>
+  %r = firrtl.regreset %clock, %zero, %c0 {initial = 4 : ui8} : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<8>, !firrtl.uint<8>
+  firrtl.matchingconnect %q, %r : !firrtl.uint<8>
+}
 }

@@ -9,17 +9,15 @@
 // This is the main Comb to Synth Conversion Pass Implementation.
 //
 //  High-level Comb Operations
-//             |             |
-//             v             |
-//   +-------------------+   |
-//   | and, or, xor, mux |   |
-//   +---------+---------+   |
-//             |             |
-//     +-------+--------+    |
-//     v                v    v
-//     +-----+         +-----+
-//     | AIG |-------->| MIG |
-//     +-----+         +-----+
+//             |
+//             v
+//   +-------------------+
+//   | and, or, xor, mux |
+//   +---------+---------+
+//             |
+//          +-----+
+//          | AIG |
+//          +-----+
 //
 //===----------------------------------------------------------------------===//
 
@@ -35,6 +33,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/DivisionByConstantInfo.h"
 #include <array>
 
 #define DEBUG_TYPE "comb-to-synth"
@@ -112,19 +111,10 @@ static Value createShiftLogic(ConversionPatternRewriter &rewriter, Location loc,
                                             outOfBoundsValue);
 }
 
-// Return a majority operation if MIG is enabled, otherwise return a majority
-// function implemented with Comb operations. In that case `carry` has slightly
-// smaller depth than the other inputs.
+// Return a majority function implemented with Comb operations. `carry` has
+// slightly smaller depth than the other inputs.
 static Value createMajorityFunction(OpBuilder &rewriter, Location loc, Value a,
-                                    Value b, Value carry,
-                                    bool useMajorityInverterOp) {
-  if (useMajorityInverterOp) {
-    std::array<Value, 3> inputs = {a, b, carry};
-    std::array<bool, 3> inverts = {false, false, false};
-    return synth::mig::MajorityInverterOp::create(rewriter, loc, inputs,
-                                                  inverts);
-  }
-
+                                    Value b, Value carry) {
   // maj(a, b, c) = (c & (a ^ b)) | (a & b)
   auto aXnorB = comb::XorOp::create(rewriter, loc, ValueRange{a, b}, true);
   auto andOp =
@@ -280,6 +270,76 @@ static LogicalResult emulateBinaryOpForUnknownBits(
   return success();
 }
 
+static Value createLShrByConstant(OpBuilder &builder, Location loc, Value value,
+                                  unsigned amount) {
+  if (amount == 0)
+    return value;
+  return builder.createOrFold<comb::ShrUOp>(
+      loc, value,
+      hw::ConstantOp::create(
+          builder, loc,
+          APInt(value.getType().getIntOrFloatBitWidth(), amount)));
+}
+
+static Value createAShrByConstant(OpBuilder &builder, Location loc, Value value,
+                                  unsigned amount) {
+  if (amount == 0)
+    return value;
+  return builder.createOrFold<comb::ShrSOp>(
+      loc, value,
+      hw::ConstantOp::create(
+          builder, loc,
+          APInt(value.getType().getIntOrFloatBitWidth(), amount)));
+}
+
+template <bool isSigned>
+static Value createMulHigh(OpBuilder &builder, Location loc, Value lhs,
+                           const APInt &rhs) {
+  unsigned width = lhs.getType().getIntOrFloatBitWidth();
+  auto destTy = builder.getIntegerType(width << 1);
+  // Compute the high half of a double-width product. For signed division,
+  // sign-extend both operands so this acts like a signed multiply-high.
+  Value wideLhs = isSigned ? comb::createOrFoldSExt(builder, loc, lhs, destTy)
+                           : comb::createZExt(builder, loc, lhs, width << 1);
+  Value wideRhs = hw::ConstantOp::create(
+      builder, loc, isSigned ? rhs.sext(width << 1) : rhs.zext(width << 1));
+  Value product = builder.createOrFold<comb::MulOp>(
+      loc, ValueRange{wideLhs, wideRhs}, /*twoState=*/true);
+  return builder.createOrFold<comb::ExtractOp>(loc, product, width, width);
+}
+
+static Value lowerUnsignedDivByConstant(OpBuilder &builder, Location loc,
+                                        Value lhs, const APInt &divisor) {
+  auto info = llvm::UnsignedDivisionByConstantInfo::get(divisor);
+  Value q = createLShrByConstant(builder, loc, lhs, info.PreShift);
+  q = createMulHigh<false>(builder, loc, q, info.Magic);
+  if (info.IsAdd) {
+    Value diff = builder.createOrFold<comb::SubOp>(loc, lhs, q);
+    diff = createLShrByConstant(builder, loc, diff, 1);
+    q = builder.createOrFold<comb::AddOp>(loc, q, diff);
+  }
+  return createLShrByConstant(builder, loc, q, info.PostShift);
+}
+
+static Value lowerSignedDivByConstant(OpBuilder &builder, Location loc,
+                                      Value lhs, const APInt &divisor) {
+  unsigned width = lhs.getType().getIntOrFloatBitWidth();
+  auto info = llvm::SignedDivisionByConstantInfo::get(divisor);
+  Value q = createMulHigh<true>(builder, loc, lhs, info.Magic);
+  // Depending on the magic constant the signed magic may need to
+  // add or subtract the dividend before the final shift.
+  if (divisor.isStrictlyPositive() && info.Magic.isNegative())
+    q = builder.createOrFold<comb::AddOp>(loc, q, lhs);
+  else if (divisor.isNegative() && info.Magic.isStrictlyPositive())
+    q = builder.createOrFold<comb::SubOp>(loc, q, lhs);
+  q = createAShrByConstant(builder, loc, q, info.ShiftAmount);
+  // Signed division rounds to zero. Add one back for negative tentative
+  // quotients after the arithmetic shift.
+  Value signBit = builder.createOrFold<comb::ExtractOp>(loc, q, width - 1, 1);
+  Value signPadded = comb::createZExt(builder, loc, signBit, width);
+  return builder.createOrFold<comb::AddOp>(loc, q, signPadded);
+}
+
 //===----------------------------------------------------------------------===//
 // Conversion patterns
 //===----------------------------------------------------------------------===//
@@ -318,97 +378,26 @@ struct CombOrToAIGConversion : OpConversionPattern<OrOp> {
   }
 };
 
-struct CombOrToMIGConversion : OpConversionPattern<OrOp> {
-  using OpConversionPattern<OrOp>::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(OrOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (op.getNumOperands() != 2)
-      return failure();
-    SmallVector<Value, 3> inputs(adaptor.getInputs());
-    auto one = hw::ConstantOp::create(
-        rewriter, op.getLoc(),
-        APInt::getAllOnes(hw::getBitWidth(op.getType())));
-    inputs.push_back(one);
-    std::array<bool, 3> inverts = {false, false, false};
-    replaceOpWithNewOpAndCopyNamehint<synth::mig::MajorityInverterOp>(
-        rewriter, op, inputs, inverts);
-    return success();
-  }
-};
-
-struct AndInverterToMIGConversion
-    : OpConversionPattern<synth::aig::AndInverterOp> {
-  using OpConversionPattern<synth::aig::AndInverterOp>::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(synth::aig::AndInverterOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (op.getNumOperands() > 2)
-      return failure();
-    if (op.getNumOperands() == 1) {
-      SmallVector<bool, 1> inverts{op.getInverted()[0]};
-      replaceOpWithNewOpAndCopyNamehint<synth::mig::MajorityInverterOp>(
-          rewriter, op, adaptor.getInputs(), inverts);
-      return success();
-    }
-    SmallVector<Value, 3> inputs(adaptor.getInputs());
-    auto one = hw::ConstantOp::create(
-        rewriter, op.getLoc(), APInt::getZero(hw::getBitWidth(op.getType())));
-    inputs.push_back(one);
-    SmallVector<bool, 3> inverts(adaptor.getInverted());
-    inverts.push_back(false);
-    replaceOpWithNewOpAndCopyNamehint<synth::mig::MajorityInverterOp>(
-        rewriter, op, inputs, inverts);
-    return success();
-  }
-};
-
-struct MajorityInverterToAIGConversion
-    : OpConversionPattern<synth::mig::MajorityInverterOp> {
-  using OpConversionPattern<
-      synth::mig::MajorityInverterOp>::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(synth::mig::MajorityInverterOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    // Only handle 1 or 3-input majority inverter for now.
-    if (op.getNumOperands() > 3)
-      return failure();
-
-    if (op.getNumOperands() == 1) {
-      bool inverts[1] = {op.getInverted()[0]};
-      replaceOpWithNewOpAndCopyNamehint<synth::aig::AndInverterOp>(
-          rewriter, op, adaptor.getInputs(), inverts);
-      return success();
-    }
-
-    assert(op.getNumOperands() == 3 && "Expected 3 operands for majority op");
-    auto getProduct = [&](unsigned idx1, unsigned idx2) {
-      bool inverts[2] = {op.getInverted()[idx1], op.getInverted()[idx2]};
-      return synth::aig::AndInverterOp::create(
-          rewriter, op.getLoc(),
-          ValueRange{adaptor.getInputs()[idx1], adaptor.getInputs()[idx2]},
-          inverts);
-    };
-
-    // Majority is the OR of the three pairwise products. Materialize that OR as
-    // a NOR followed by an inverter so it stays in AIG form.
-    Value products[3] = {getProduct(0, 1), getProduct(0, 2), getProduct(1, 2)};
-    bool allInverted[3] = {true, true, true};
-    auto notOr = synth::aig::AndInverterOp::create(rewriter, op.getLoc(),
-                                                   products, allInverted);
-    replaceOpWithNewOpAndCopyNamehint<synth::aig::AndInverterOp>(
-        rewriter, op, notOr,
-        /*invert=*/true);
-    return success();
-  }
-};
-
-/// Lower a comb::XorOp operation to AIG operations
-struct CombXorOpConversion : OpConversionPattern<XorOp> {
+struct CombXorOpToSynthConversion : OpConversionPattern<XorOp> {
   using OpConversionPattern<XorOp>::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(XorOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<bool> inverted(adaptor.getInputs().size(), false);
+    replaceOpWithNewOpAndCopyNamehint<synth::XorInverterOp>(
+        rewriter, op, adaptor.getInputs(), inverted);
+    return success();
+  }
+};
+
+/// Lower a synth::XorOp operation to AIG operations
+struct SynthXorInverterOpConversion
+    : OpConversionPattern<synth::XorInverterOp> {
+  using OpConversionPattern<synth::XorInverterOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(synth::XorInverterOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     if (op.getNumOperands() != 2)
       return failure();
@@ -417,8 +406,8 @@ struct CombXorOpConversion : OpConversionPattern<XorOp> {
     // (a | b) = ~(~a & ~b)
     // (~a | ~b) = ~(a & b)
     auto inputs = adaptor.getInputs();
-    SmallVector<bool> allInverts(inputs.size(), true);
-    SmallVector<bool> allNotInverts(inputs.size(), false);
+    auto allNotInverts = op.getInverted();
+    std::array<bool, 2> allInverts = {!allNotInverts[0], !allNotInverts[1]};
 
     auto notAAndNotB = synth::aig::AndInverterOp::create(rewriter, op.getLoc(),
                                                          inputs, allInverts);
@@ -429,6 +418,66 @@ struct CombXorOpConversion : OpConversionPattern<XorOp> {
         rewriter, op, notAAndNotB, aAndB,
         /*lhs_invert=*/true,
         /*rhs_invert=*/true);
+    return success();
+  }
+};
+
+/// Lower a comb::MuxOp operation to synth::MuxInverterOps.
+struct CombMuxOpToSynthConversion : OpConversionPattern<MuxOp> {
+  using OpConversionPattern<MuxOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(MuxOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Value cond = adaptor.getCond();
+    Value trueVal = adaptor.getTrueValue();
+    Value falseVal = adaptor.getFalseValue();
+
+    if (!op.getType().isInteger()) {
+      auto widthType = rewriter.getIntegerType(hw::getBitWidth(op.getType()));
+      trueVal =
+          hw::BitcastOp::create(rewriter, op.getLoc(), widthType, trueVal);
+      falseVal =
+          hw::BitcastOp::create(rewriter, op.getLoc(), widthType, falseVal);
+    }
+
+    if (!trueVal.getType().isInteger(1))
+      cond = comb::ReplicateOp::create(rewriter, op.getLoc(), trueVal.getType(),
+                                       cond);
+
+    Value result = synth::MuxInverterOp::create(rewriter, op.getLoc(), cond,
+                                                trueVal, falseVal);
+
+    if (result.getType() != op.getType())
+      result =
+          hw::BitcastOp::create(rewriter, op.getLoc(), op.getType(), result);
+
+    replaceOpAndCopyNamehint(rewriter, op, result);
+    return success();
+  }
+};
+
+/// Lower a synth::MuxInverterOp operation to AIG operations.
+struct SynthMuxInverterOpConversion
+    : OpConversionPattern<synth::MuxInverterOp> {
+  using OpConversionPattern<synth::MuxInverterOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(synth::MuxInverterOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto inputs = adaptor.getInputs();
+    auto inverted = op.getInverted();
+
+    auto lhs = synth::aig::AndInverterOp::create(
+        rewriter, op.getLoc(), inputs[0], inputs[1], inverted[0], inverted[1]);
+
+    auto rhs = synth::aig::AndInverterOp::create(
+        rewriter, op.getLoc(), inputs[0], inputs[2], !inverted[0], inverted[2]);
+
+    auto nand = synth::aig::AndInverterOp::create(rewriter, op.getLoc(), lhs,
+                                                  rhs, true, true);
+    replaceOpWithNewOpAndCopyNamehint<synth::aig::AndInverterOp>(rewriter, op,
+                                                                 nand, true);
     return success();
   }
 };
@@ -469,47 +518,6 @@ struct CombLowerVariadicOp : OpConversionPattern<OpTy> {
   }
 };
 
-// Lower comb::MuxOp to AIG operations.
-struct CombMuxOpConversion : OpConversionPattern<MuxOp> {
-  using OpConversionPattern<MuxOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(MuxOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    Value cond = op.getCond();
-    auto trueVal = op.getTrueValue();
-    auto falseVal = op.getFalseValue();
-
-    if (!op.getType().isInteger()) {
-      // If the type of the mux is not integer, bitcast the operands first.
-      auto widthType = rewriter.getIntegerType(hw::getBitWidth(op.getType()));
-      trueVal =
-          hw::BitcastOp::create(rewriter, op->getLoc(), widthType, trueVal);
-      falseVal =
-          hw::BitcastOp::create(rewriter, op->getLoc(), widthType, falseVal);
-    }
-
-    // Replicate condition if needed
-    if (!trueVal.getType().isInteger(1))
-      cond = comb::ReplicateOp::create(rewriter, op.getLoc(), trueVal.getType(),
-                                       cond);
-
-    // c ? a : b => (replicate(c) & a) | (~replicate(c) & b)
-    auto lhs =
-        synth::aig::AndInverterOp::create(rewriter, op.getLoc(), cond, trueVal);
-    auto rhs = synth::aig::AndInverterOp::create(rewriter, op.getLoc(), cond,
-                                                 falseVal, true, false);
-
-    Value result = comb::OrOp::create(rewriter, op.getLoc(), lhs, rhs);
-    // Insert the bitcast if the type of the mux is not integer.
-    if (result.getType() != op.getType())
-      result =
-          hw::BitcastOp::create(rewriter, op.getLoc(), op.getType(), result);
-    replaceOpAndCopyNamehint(rewriter, op, result);
-    return success();
-  }
-};
-
 //===----------------------------------------------------------------------===//
 // Adder Architecture Selection
 //===----------------------------------------------------------------------===//
@@ -547,7 +555,6 @@ AdderArchitecture determineAdderArch(Operation *op, int64_t width) {
 //===----------------------------------------------------------------------===//
 // Parallel Prefix Tree
 //===----------------------------------------------------------------------===//
-
 // Implement the Kogge-Stone parallel prefix tree
 // Described in https://en.wikipedia.org/wiki/Kogge%E2%80%93Stone_adder
 // Slightly better delay than Brent-Kung, but more area.
@@ -801,7 +808,6 @@ LazyKoggeStonePrefixTree::getGroupAndPropagate(int64_t level, int64_t i) {
   return prefixCache[key];
 }
 
-template <bool lowerToMIG>
 struct CombAddOpConversion : OpConversionPattern<AddOp> {
   using OpConversionPattern<AddOp>::OpConversionPattern;
 
@@ -809,6 +815,23 @@ struct CombAddOpConversion : OpConversionPattern<AddOp> {
   matchAndRewrite(AddOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto inputs = adaptor.getInputs();
+
+    // Detect add with a constant carryIn
+    if (inputs.size() == 3) {
+      auto constOp =
+          dyn_cast_or_null<hw::ConstantOp>(op.getOperand(2).getDefiningOp());
+      if (!constOp || !constOp.getValue().isOne())
+        return failure();
+
+      // Make a single bit constant 1
+      auto constOne =
+          hw::ConstantOp::create(rewriter, op.getLoc(), APInt(1, 1));
+
+      // Every adder (parallel prefix or ripple-carry) can consume a single-bit
+      // carry-in without additional logic.
+      return lowerAdder(op, inputs.take_front(2), constOne, rewriter);
+    }
+
     // Lower only when there are two inputs.
     // Variadic operands must be lowered in a different pattern.
     if (inputs.size() != 2)
@@ -822,20 +845,16 @@ struct CombAddOpConversion : OpConversionPattern<AddOp> {
       return success();
     }
 
-    // Check if the architecture is specified by an attribute.
-    auto arch = determineAdderArch(op, width);
-    if (arch == AdderArchitecture::RippleCarry)
-      return lowerRippleCarryAdder(op, inputs, rewriter);
-    return lowerParallelPrefixAdder(op, inputs, rewriter);
+    return lowerAdder(op, inputs, Value(), rewriter);
   }
 
   // Implement a basic ripple-carry adder for small bitwidths.
   LogicalResult
-  lowerRippleCarryAdder(comb::AddOp op, ValueRange inputs,
+  lowerRippleCarryAdder(comb::AddOp op, ValueRange inputs, Value carryIn,
                         ConversionPatternRewriter &rewriter) const {
     auto width = op.getType().getIntOrFloatBitWidth();
     // Implement a naive Ripple-carry full adder.
-    Value carry;
+    Value carry = carryIn;
 
     auto aBits = extractBits(rewriter, inputs[0]);
     auto bBits = extractBits(rewriter, inputs[1]);
@@ -864,7 +883,7 @@ struct CombAddOpConversion : OpConversionPattern<AddOp> {
       }
 
       carry = createMajorityFunction(rewriter, op.getLoc(), aBits[i], bBits[i],
-                                     carry, lowerToMIG);
+                                     carry);
     }
     LLVM_DEBUG(llvm::dbgs() << "Lower comb.add to Ripple-Carry Adder of width "
                             << width << "\n");
@@ -876,10 +895,20 @@ struct CombAddOpConversion : OpConversionPattern<AddOp> {
   // Implement a parallel prefix adder - with Kogge-Stone or Brent-Kung trees
   // Will introduce unused signals for the carry bits but these will be removed
   // by the AIG pass.
-  LogicalResult
-  lowerParallelPrefixAdder(comb::AddOp op, ValueRange inputs,
+  LogicalResult lowerAdder(comb::AddOp op, ValueRange inputs, Value carryIn,
                            ConversionPatternRewriter &rewriter) const {
+
+    // Check that the carryIn is a 1-bit value if it is provided (not
+    // necessarily a constant 1).
+    assert(carryIn == nullptr ||
+           carryIn.getType().getIntOrFloatBitWidth() == 1 &&
+               "carryIn must be a 1-bit value");
+
+    // Check if the architecture is specified by an attribute.
     auto width = op.getType().getIntOrFloatBitWidth();
+    auto arch = determineAdderArch(op, width);
+    if (arch == AdderArchitecture::RippleCarry)
+      return lowerRippleCarryAdder(op, inputs, carryIn, rewriter);
 
     auto aBits = extractBits(rewriter, inputs[0]);
     auto bBits = extractBits(rewriter, inputs[1]);
@@ -896,6 +925,13 @@ struct CombAddOpConversion : OpConversionPattern<AddOp> {
       g.push_back(comb::AndOp::create(rewriter, op.getLoc(), aBit, bBit));
     }
 
+    // With carry_in, adjust g[0]: g[0] = (a[0] AND b[0]) OR (p[0] AND carry_in)
+    // This bakes the carry_in into the prefix tree, avoiding a separate adder.
+    if (carryIn) {
+      Value pAndC = comb::AndOp::create(rewriter, op.getLoc(), p[0], carryIn);
+      g[0] = comb::OrOp::create(rewriter, op.getLoc(), g[0], pAndC);
+    }
+
     LLVM_DEBUG({
       llvm::dbgs() << "Lower comb.add to Parallel-Prefix of width " << width
                    << "\n--------------------------------------- Init\n";
@@ -903,8 +939,12 @@ struct CombAddOpConversion : OpConversionPattern<AddOp> {
       for (int64_t i = 0; i < width; ++i) {
         // p_i = a_i XOR b_i
         llvm::dbgs() << "P0" << i << " = A" << i << " XOR B" << i << "\n";
-        // g_i = a_i AND b_i
-        llvm::dbgs() << "G0" << i << " = A" << i << " AND B" << i << "\n";
+        if (i == 0 && carryIn)
+          llvm::dbgs() << "G0" << i << " = (A" << i << " AND B" << i
+                       << ") OR (P" << i << " AND CARRY_IN)\n";
+        else
+          // g_i = a_i AND b_i
+          llvm::dbgs() << "G0" << i << " = A" << i << " AND B" << i << "\n";
       }
     });
 
@@ -912,12 +952,10 @@ struct CombAddOpConversion : OpConversionPattern<AddOp> {
     SmallVector<Value> pPrefix = p;
     SmallVector<Value> gPrefix = g;
 
-    // Check if the architecture is specified by an attribute.
-    auto arch = determineAdderArch(op, width);
-
+    // Select the Parallel Prefix Architecture
     switch (arch) {
     case AdderArchitecture::RippleCarry:
-      llvm_unreachable("Ripple-Carry should be handled separately");
+      llvm_unreachable("Ripple-Carry handled above");
       break;
     case AdderArchitecture::Sklanskey:
       lowerSklanskeyPrefixTree(rewriter, op.getLoc(), pPrefix, gPrefix);
@@ -934,8 +972,10 @@ struct CombAddOpConversion : OpConversionPattern<AddOp> {
     // NOTE: The result is stored in reverse order.
     SmallVector<Value> results;
     results.resize(width);
-    // Sum bit 0 is just p[0] since carry_in = 0
-    results[width - 1] = p[0];
+    // sum[0] = p[0] XOR carry_in (carry_in = 0 when null -> just p[0])
+    results[width - 1] =
+        carryIn ? comb::XorOp::create(rewriter, op.getLoc(), p[0], carryIn)
+                : p[0];
 
     // For remaining bits, sum_i = p_i XOR g_(i-1)
     // The carry into position i is the group generate from position i-1
@@ -946,8 +986,12 @@ struct CombAddOpConversion : OpConversionPattern<AddOp> {
     replaceOpWithNewOpAndCopyNamehint<comb::ConcatOp>(rewriter, op, results);
 
     LLVM_DEBUG({
-      llvm::dbgs() << "--------------------------------------- Completion\n"
-                   << "RES0 = P0\n";
+      llvm::dbgs() << "--------------------------------------- Completion\n";
+
+      if (carryIn)
+        llvm::dbgs() << "RES0 = P0 XOR CARRY_IN\n";
+      else
+        llvm::dbgs() << "RES0 = P0\n";
       for (int64_t i = 1; i < width; ++i)
         llvm::dbgs() << "RES" << i << " = P" << i << " XOR G" << i - 1 << "\n";
     });
@@ -1003,7 +1047,7 @@ struct CombMulOpConversion : OpConversionPattern<MulOp> {
     }
 
     // Wallace tree reduction - reduce to two addends.
-    datapath::CompressorTree comp(width, partialProducts, loc);
+    datapath::CompressorTree comp(width, partialProducts, loc, rewriter);
     auto addends = comp.compressToHeight(rewriter, 2);
 
     // Sum the two addends using a carry-propagate adder
@@ -1033,6 +1077,23 @@ struct CombDivUOpConversion : DivModOpConversionBase<DivUOp> {
     if (llvm::succeeded(comb::convertDivUByPowerOfTwo(op, rewriter)))
       return success();
 
+    // Lower constant divisors with magic-number division; otherwise fall back
+    // to emulation for small rhs values.
+    if (auto rhsConst = adaptor.getRhs().getDefiningOp<hw::ConstantOp>()) {
+      APInt divisor = rhsConst.getValue();
+      // Division by zero is undefined, just return zero.
+      if (divisor.isZero()) {
+        replaceOpWithNewOpAndCopyNamehint<hw::ConstantOp>(rewriter, op,
+                                                          op.getType(), 0);
+        return success();
+      }
+      replaceOpAndCopyNamehint(rewriter, op,
+                               lowerUnsignedDivByConstant(rewriter, op.getLoc(),
+                                                          adaptor.getLhs(),
+                                                          divisor));
+      return success();
+    }
+
     // When rhs is not power of two and the number of unknown bits are small,
     // create a mux tree that emulates all possible cases.
     return emulateBinaryOpForUnknownBits(
@@ -1055,6 +1116,28 @@ struct CombModUOpConversion : DivModOpConversionBase<ModUOp> {
     if (llvm::succeeded(comb::convertModUByPowerOfTwo(op, rewriter)))
       return success();
 
+    // Lower constant divisors by calculating q = lhs / rhs and returning
+    // lhs - q * rhs; otherwise fall back to emulation for small rhs values.
+    if (auto rhsConst = adaptor.getRhs().getDefiningOp<hw::ConstantOp>()) {
+      APInt divisor = rhsConst.getValue();
+      // Remainder by zero is undefined, just return zero.
+      if (divisor.isZero()) {
+        replaceOpWithNewOpAndCopyNamehint<hw::ConstantOp>(rewriter, op,
+                                                          op.getType(), 0);
+        return success();
+      }
+      auto loc = op.getLoc();
+      Value q =
+          lowerUnsignedDivByConstant(rewriter, loc, adaptor.getLhs(), divisor);
+      Value product =
+          rewriter.createOrFold<comb::MulOp>(loc, q, adaptor.getRhs());
+      Value remainder =
+          rewriter.createOrFold<comb::SubOp>(loc, adaptor.getLhs(), product);
+      replaceOpAndCopyNamehint(rewriter, op, remainder);
+
+      return success();
+    }
+
     // When rhs is not power of two and the number of unknown bits are small,
     // create a mux tree that emulates all possible cases.
     return emulateBinaryOpForUnknownBits(
@@ -1074,8 +1157,40 @@ struct CombDivSOpConversion : DivModOpConversionBase<DivSOp> {
   LogicalResult
   matchAndRewrite(DivSOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // Currently only lower with emulation.
-    // TODO: Implement a signed division lowering at least for power of two.
+    // Lower constant divisors with magic-number division; otherwise fall back
+    // to emulation for small rhs values.
+    if (auto rhsConst = adaptor.getRhs().getDefiningOp<hw::ConstantOp>()) {
+      APInt divisor = rhsConst.getValue();
+      unsigned width = op.getType().getIntOrFloatBitWidth();
+      // Division by zero is undefined, just return zero.
+      if (divisor.isZero()) {
+        replaceOpWithNewOpAndCopyNamehint<hw::ConstantOp>(rewriter, op,
+                                                          op.getType(), 0);
+        return success();
+      }
+      // divs(lhs, 1) = lhs.
+      if (divisor.isOne()) {
+        replaceOpAndCopyNamehint(rewriter, op, adaptor.getLhs());
+        return success();
+      }
+      // divs(lhs, -1) = -lhs = sub(0, lhs).
+      if (divisor.isAllOnes()) {
+        replaceOpAndCopyNamehint(
+            rewriter, op,
+            rewriter.createOrFold<comb::SubOp>(
+                op.getLoc(),
+                hw::ConstantOp::create(rewriter, op.getLoc(),
+                                       APInt::getZero(width)),
+                adaptor.getLhs()));
+        return success();
+      }
+      replaceOpAndCopyNamehint(rewriter, op,
+                               lowerSignedDivByConstant(rewriter, op.getLoc(),
+                                                        adaptor.getLhs(),
+                                                        divisor));
+      return success();
+    }
+
     return emulateBinaryOpForUnknownBits(
         rewriter, maxEmulationUnknownBits, op,
         [](const APInt &lhs, const APInt &rhs) {
@@ -1092,8 +1207,27 @@ struct CombModSOpConversion : DivModOpConversionBase<ModSOp> {
   LogicalResult
   matchAndRewrite(ModSOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // Currently only lower with emulation.
-    // TODO: Implement a signed modulus lowering at least for power of two.
+    // Lower constant divisors by calculating q = lhs / rhs and returning
+    // lhs - q * rhs; otherwise fall back to emulation for small rhs values.
+    if (auto rhsConst = adaptor.getRhs().getDefiningOp<hw::ConstantOp>()) {
+      APInt divisor = rhsConst.getValue();
+      // Remainder by 0 is undefined; remainder by +/-1 is always zero.
+      if (divisor.isZero() || divisor.isOne() || divisor.isAllOnes()) {
+        replaceOpWithNewOpAndCopyNamehint<hw::ConstantOp>(rewriter, op,
+                                                          op.getType(), 0);
+        return success();
+      }
+      auto loc = op.getLoc();
+      Value q =
+          lowerSignedDivByConstant(rewriter, loc, adaptor.getLhs(), divisor);
+      Value product =
+          rewriter.createOrFold<comb::MulOp>(loc, q, adaptor.getRhs());
+      Value remainder =
+          rewriter.createOrFold<comb::SubOp>(loc, adaptor.getLhs(), product);
+      replaceOpAndCopyNamehint(rewriter, op, remainder);
+      return success();
+    }
+
     return emulateBinaryOpForUnknownBits(
         rewriter, maxEmulationUnknownBits, op,
         [](const APInt &lhs, const APInt &rhs) {
@@ -1441,30 +1575,31 @@ struct ConvertCombToSynthPass
 static void
 populateCombToAIGConversionPatterns(RewritePatternSet &patterns,
                                     uint32_t maxEmulationUnknownBits,
-                                    bool lowerToMIG) {
+                                    bool forceAIG) {
   patterns.add<
       // Bitwise Logical Ops
-      CombAndOpConversion, CombXorOpConversion, CombMuxOpConversion,
-      CombParityOpConversion,
+      CombAndOpConversion, CombParityOpConversion, CombXorOpToSynthConversion,
+      CombMuxOpToSynthConversion,
       // Arithmetic Ops
       CombMulOpConversion, CombICmpOpConversion,
       // Shift Ops
       CombShlOpConversion, CombShrUOpConversion, CombShrSOpConversion,
       // Variadic ops that must be lowered to binary operations
-      CombLowerVariadicOp<XorOp>, CombLowerVariadicOp<AddOp>,
-      CombLowerVariadicOp<MulOp>>(patterns.getContext());
+      CombLowerVariadicOp<AddOp>, CombLowerVariadicOp<MulOp>>(
+      patterns.getContext());
 
+  if (forceAIG) {
+    patterns.add<SynthXorInverterOpConversion, SynthMuxInverterOpConversion>(
+        patterns.getContext());
+  }
   patterns.add(comb::convertSubToAdd);
 
-  if (lowerToMIG) {
-    patterns.add<CombOrToMIGConversion, CombLowerVariadicOp<OrOp>,
-                 AndInverterToMIGConversion,
-                 circt::synth::AndInverterVariadicOpConversion,
-                 CombAddOpConversion</*useMIG=*/true>>(patterns.getContext());
-  } else {
-    patterns.add<CombOrToAIGConversion, MajorityInverterToAIGConversion,
-                 CombAddOpConversion</*useMIG=*/false>>(patterns.getContext());
-  }
+  patterns.add<CombOrToAIGConversion, CombAddOpConversion>(
+      patterns.getContext());
+  synth::populateVariadicAndInverterLoweringPatterns(patterns);
+
+  if (forceAIG)
+    synth::populateVariadicXorInverterLoweringPatterns(patterns);
 
   // Add div/mod patterns with a threshold given by the pass option.
   patterns.add<CombDivUOpConversion, CombModUOpConversion, CombDivSOpConversion,
@@ -1489,13 +1624,8 @@ void ConvertCombToSynthPass::runOnOperation() {
                       hw::AggregateConstantOp>();
 
   target.addLegalDialect<synth::SynthDialect>();
-
-  if (targetIR == CombToSynthTargetIR::AIG) {
-    // AIG is target dialect.
-    target.addIllegalOp<synth::mig::MajorityInverterOp>();
-  } else if (targetIR == CombToSynthTargetIR::MIG) {
-    target.addIllegalOp<synth::aig::AndInverterOp>();
-  }
+  if (forceAIG)
+    target.addIllegalOp<synth::XorInverterOp, synth::MuxInverterOp>();
 
   // If additional legal ops are specified, add them to the target.
   if (!additionalLegalOps.empty())
@@ -1504,7 +1634,7 @@ void ConvertCombToSynthPass::runOnOperation() {
 
   RewritePatternSet patterns(&getContext());
   populateCombToAIGConversionPatterns(patterns, maxEmulationUnknownBits,
-                                      targetIR == CombToSynthTargetIR::MIG);
+                                      forceAIG);
 
   if (failed(mlir::applyPartialConversion(getOperation(), target,
                                           std::move(patterns))))

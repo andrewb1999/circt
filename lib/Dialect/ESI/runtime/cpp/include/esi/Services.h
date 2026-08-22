@@ -172,6 +172,12 @@ public:
   virtual BundlePort *getPort(AppIDPath id,
                               const BundleType *type) const override;
 
+protected:
+  // The current ESI hardware implementations only support one MMIO command at a
+  // time but don't enforce it. So we must grab a lock to enforce it on the
+  // software side.
+  mutable std::mutex mmioCmdLock;
+
 private:
   /// MMIO base address table.
   std::map<AppIDPath, RegionDescriptor> regions;
@@ -358,7 +364,7 @@ public:
     static Function *get(AppID id, BundleType *type, WriteChannelPort &arg,
                          ReadChannelPort &result);
 
-    void connect();
+    void connect(const ChannelPort::ConnectOptions &options = {});
     std::future<MessageData> call(const MessageData &arg);
 
     const esi::Type *getArgType() const {
@@ -417,7 +423,8 @@ public:
     /// sufficiently fast that it could be called in the same thread as the
     /// port callback.
     void connect(std::function<MessageData(const MessageData &)> callback,
-                 bool quick = false);
+                 bool quick = false,
+                 const ChannelPort::ConnectOptions &options = {});
 
     const esi::Type *getArgType() const {
       return dynamic_cast<const ChannelType *>(type->findChannel("arg").first)

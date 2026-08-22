@@ -13,10 +13,10 @@
 #ifndef CIRCT_DIALECT_FIRRTL_FIRRTLCANONICALIZATION_TD
 #define CIRCT_DIALECT_FIRRTL_FIRRTLCANONICALIZATION_TD
 
-include "FIRRTLDeclarations.td"
-include "FIRRTLExpressions.td"
-include "FIRRTLStatements.td"
-include "FIRRTLIntrinsics.td"
+include "circt/Dialect/FIRRTL/FIRRTLDeclarations.td"
+include "circt/Dialect/FIRRTL/FIRRTLExpressions.td"
+include "circt/Dialect/FIRRTL/FIRRTLStatements.td"
+include "circt/Dialect/FIRRTL/FIRRTLIntrinsics.td"
 include "mlir/IR/OpBase.td"
 include "mlir/IR/PatternBase.td"
 
@@ -664,8 +664,8 @@ def CatBitsBits : Pat <
 
 // regreset(clock, constant_zero, resetValue) -> reg(clock)
 def RegResetWithZeroReset : Pat<
-  (RegResetOp $clock, $reset, $_, $name, $nameKind, $annotations, $inner_sym, $forceable),
-  (RegOp $clock, $name, $nameKind, $annotations, $inner_sym, $forceable), [(ZeroConstantOp $reset)]>;
+  (RegResetOp $clock, $reset, $_, $name, $nameKind, $annotations, $inner_sym, $forceable, $initial),
+  (RegOp $clock, $name, $nameKind, $annotations, $inner_sym, $forceable, $initial), [(ZeroConstantOp $reset)]>;
 
 // ref.resolve(ref.send(a)) -> a
 def RefResolveOfRefSend : Pat<

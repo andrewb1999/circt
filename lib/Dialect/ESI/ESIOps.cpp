@@ -56,7 +56,7 @@ LogicalResult SnoopValidReadyOp::verify() {
 
 LogicalResult SnoopValidReadyOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attrs, mlir::OpaqueProperties properties,
+    DictionaryAttr attrs, mlir::PropertyRef properties,
     mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
   auto i1 = IntegerType::get(context, 1);
   results.push_back(i1);
@@ -74,7 +74,7 @@ LogicalResult SnoopTransactionOp::verify() {
 
 LogicalResult SnoopTransactionOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attrs, mlir::OpaqueProperties properties,
+    DictionaryAttr attrs, mlir::PropertyRef properties,
     mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
   auto i1 = IntegerType::get(context, 1);
   results.push_back(i1);
@@ -236,7 +236,7 @@ LogicalResult UnwrapFIFOOp::verify() {
 LogicalResult
 UnwrapFIFOOp::inferReturnTypes(MLIRContext *context, std::optional<Location>,
                                ValueRange operands, DictionaryAttr,
-                               mlir::OpaqueProperties, mlir::RegionRange,
+                               mlir::PropertyRef, mlir::RegionRange,
                                SmallVectorImpl<Type> &inferredResulTypes) {
   inferredResulTypes.push_back(
       cast<ChannelType>(operands[0].getType()).getInner());
@@ -256,7 +256,7 @@ circt::esi::ChannelType WrapValidOnlyOp::channelType() {
 LogicalResult
 WrapValidOnlyOp::inferReturnTypes(MLIRContext *context, std::optional<Location>,
                                   ValueRange operands, DictionaryAttr,
-                                  mlir::OpaqueProperties, mlir::RegionRange,
+                                  mlir::PropertyRef, mlir::RegionRange,
                                   SmallVectorImpl<Type> &inferredResulTypes) {
   auto chanType = ChannelType::get(context, operands[0].getType(),
                                    ChannelSignaling::ValidOnly, 0);
@@ -276,7 +276,7 @@ LogicalResult UnwrapValidOnlyOp::verify() {
 
 LogicalResult UnwrapValidOnlyOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location>, ValueRange operands,
-    DictionaryAttr, mlir::OpaqueProperties, mlir::RegionRange,
+    DictionaryAttr, mlir::PropertyRef, mlir::RegionRange,
     SmallVectorImpl<Type> &inferredResulTypes) {
   inferredResulTypes.push_back(
       cast<ChannelType>(operands[0].getType()).getInner());
@@ -352,7 +352,7 @@ LogicalResult WrapWindow::verify() {
 LogicalResult
 UnwrapWindow::inferReturnTypes(MLIRContext *, std::optional<Location>,
                                ValueRange operands, DictionaryAttr,
-                               mlir::OpaqueProperties, mlir::RegionRange,
+                               mlir::PropertyRef, mlir::RegionRange,
                                SmallVectorImpl<Type> &inferredReturnTypes) {
   auto windowType = cast<WindowType>(operands.front().getType());
   inferredReturnTypes.push_back(windowType.getLoweredType());
@@ -565,8 +565,13 @@ RequestConnectionOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   auto svcPort = getServicePortInfo(*this, symbolTable, getServicePortAttr());
   if (failed(svcPort))
     return failure();
-  return checkBundleTypeMatch(*this, svcPort->type, getToClient().getType(),
-                              false);
+  if (failed(checkBundleTypeMatch(*this, svcPort->type, getToClient().getType(),
+                                  false)))
+    return failure();
+  auto svcDecl = getServiceDecl(*this, symbolTable, getServicePortAttr());
+  if (failed(svcDecl))
+    return failure();
+  return svcDecl->verifyRequest(*svcPort, getToClient().getType(), *this);
 }
 
 LogicalResult ServiceImplementConnReqOp::verifySymbolUses(
@@ -574,8 +579,13 @@ LogicalResult ServiceImplementConnReqOp::verifySymbolUses(
   auto svcPort = getServicePortInfo(*this, symbolTable, getServicePortAttr());
   if (failed(svcPort))
     return failure();
-  return checkBundleTypeMatch(*this, svcPort->type, getToClient().getType(),
-                              true);
+  if (failed(checkBundleTypeMatch(*this, svcPort->type, getToClient().getType(),
+                                  true)))
+    return failure();
+  auto svcDecl = getServiceDecl(*this, symbolTable, getServicePortAttr());
+  if (failed(svcDecl))
+    return failure();
+  return svcDecl->verifyRequest(*svcPort, getToClient().getType(), *this);
 }
 
 void CustomServiceDeclOp::getPortList(SmallVectorImpl<ServicePortInfo> &ports) {

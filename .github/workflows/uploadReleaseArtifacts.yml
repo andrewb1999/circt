@@ -20,6 +20,11 @@ on:
         default: false
         type: boolean
 
+      run_integration_tests:
+        description: Run CIRCT integration tests
+        default: false
+        type: boolean
+
       llvm_enable_assertions:
         description: Build with assertions.
         default: false
@@ -54,7 +59,7 @@ jobs:
       # Clone the CIRCT repo and its submodules. Do shallow clone to save clone
       # time.
       - name: Get CIRCT and LLVM
-        uses: actions/checkout@v3
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 2
           submodules: "true"
@@ -71,7 +76,7 @@ jobs:
           shasum -a 256 circt-full-sources.tar.gz | cut -d ' ' -f1 > circt-full-sources.tar.gz.sha256
 
       - name: Upload Source Archive
-        uses: AButler/upload-release-assets@v3.0
+        uses: AButler/upload-release-assets@34491005a5d7ec239a784e460807ce844fde7962 # v4.0.0
         with:
           # The * will grab the .sha256 as well
           files: circt-full-sources.tar.gz*
@@ -85,7 +90,7 @@ jobs:
       # Clone CIRCT as shallow as possible.  We just need the `.github`
       # directory.
       - name: Get CIRCT and LLVM
-        uses: actions/checkout@v3
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 1
           submodules: "false"
@@ -97,13 +102,18 @@ jobs:
               config=$(.github/bin/uploadReleaseArtifacts.sh -e ${{ github.event_name }})
               ;;
             "workflow_dispatch")
-              config=$(.github/bin/uploadReleaseArtifacts.sh \
-                -b ${{ inputs.cmake_build_type }} \
-                -e ${{ github.event_name }} \
-                -o ${{ inputs.os }} \
-                ${{ inputs.llvm_enable_assertions && '-a' || ' ' }} \
-                ${{ inputs.run_tests && '-t' || ' ' }})
-              ;;
+                if [[ "${{ inputs.manual_release }}" == "true" ]]; then
+                  config=$(.github/bin/uploadReleaseArtifacts.sh -e release)
+                else
+                  config=$(.github/bin/uploadReleaseArtifacts.sh \
+                    -b ${{ inputs.cmake_build_type }} \
+                    -e ${{ github.event_name }} \
+                    -o ${{ inputs.os }} \
+                    ${{ inputs.llvm_enable_assertions && '-a' || ' ' }} \
+                    ${{ inputs.run_tests && '-t' || ' ' }} \
+                    ${{ inputs.run_integration_tests && '-u' || ' ' }})
+                fi
+                ;;
           esac
 
           echo "Build Matrix:" >> $GITHUB_STEP_SUMMARY
@@ -121,6 +131,7 @@ jobs:
       native: ${{ steps.get-config.outputs.native }}
 
   publish-static:
+    name: ${{ matrix.generated.name }}
     needs:
       - choose-matrix
     if: ${{ needs.choose-matrix.outputs.static != '[]' }}
@@ -134,12 +145,13 @@ jobs:
     with:
       cmake_build_type: ${{ matrix.generated.cmake_build_type }}
       llvm_enable_assertions: ${{ matrix.generated.llvm_enable_assertions }}
-      llvm_force_enable_stats: ${{ matrix.generated.llvm_force_enable_stats }}
       run_tests: ${{ matrix.generated.run_tests }}
+      run_integration_tests: ${{ matrix.generated.run_integration_tests }}
       install_target: ${{ matrix.generated.install_target }}
       package_name_prefix: ${{ matrix.generated.package_name_prefix }}
 
   publish-native:
+    name: ${{ matrix.generated.name }}
     needs:
       - choose-matrix
     if: ${{ needs.choose-matrix.outputs.native != '[]' }}
@@ -155,9 +167,8 @@ jobs:
       cmake_build_type: ${{ matrix.generated.cmake_build_type }}
       build_shared_libs: ${{ matrix.generated.build_shared_libs }}
       llvm_enable_assertions: ${{ matrix.generated.llvm_enable_assertions }}
-      llvm_force_enable_stats: ${{ matrix.generated.llvm_force_enable_stats }}
       run_tests: ${{ matrix.generated.run_tests }}
+      run_integration_tests: ${{ matrix.generated.run_integration_tests }}
       install_target: ${{ matrix.generated.install_target }}
       package_name_prefix: ${{ matrix.generated.package_name_prefix }}
       cmake_c_compiler: ${{ matrix.generated.cmake_c_compiler }}
-      cmake_cxx_compiler: ${{ matrix.generated.cmake_cxx_compiler }}

@@ -2,6 +2,7 @@
 
 %true = hw.constant true
 %c0_i8 = hw.constant 0 : i8
+%clk = hw.constant true
 
 //===----------------------------------------------------------------------===//
 // Types
@@ -53,8 +54,12 @@ unrealized_conversion_cast %p3 : !ltl.property to index
 
 // CHECK: ltl.delay {{%.+}}, 0 : !ltl.sequence
 // CHECK: ltl.delay {{%.+}}, 42, 1337 : !ltl.sequence
+// CHECK: ltl.clocked_delay {{%.+}}, posedge {{%.+}}, 0 : !ltl.sequence
+// CHECK: ltl.clocked_delay {{%.+}}, posedge {{%.+}}, 42, 1337 : !ltl.sequence
 ltl.delay %s, 0 : !ltl.sequence
 ltl.delay %s, 42, 1337 : !ltl.sequence
+ltl.clocked_delay %s, posedge %clk, 0 : !ltl.sequence
+ltl.clocked_delay %s, posedge %clk, 42, 1337 : !ltl.sequence
 
 // CHECK: ltl.concat {{%.+}} : !ltl.sequence
 // CHECK: ltl.concat {{%.+}}, {{%.+}} : !ltl.sequence, !ltl.sequence
@@ -69,6 +74,11 @@ ltl.concat %s, %s, %s : !ltl.sequence, !ltl.sequence, !ltl.sequence
 ltl.repeat %s, 0 : !ltl.sequence
 ltl.repeat %s, 42 : !ltl.sequence
 ltl.repeat %s, 42, 1337 : !ltl.sequence
+
+// CHECK: ltl.weak {{%.+}} : !ltl.sequence
+// CHECK: ltl.strong {{%.+}} : !ltl.sequence
+ltl.weak %s : !ltl.sequence
+ltl.strong %s : !ltl.sequence
 
 //===----------------------------------------------------------------------===//
 // Properties
@@ -97,11 +107,6 @@ ltl.until %p, %p : !ltl.property, !ltl.property
 ltl.eventually %true : i1
 ltl.eventually %s : !ltl.sequence
 ltl.eventually %p : !ltl.property
-
-// CHECK: ltl.past {{%.+}}, 1 : i1
-// CHECK: ltl.past {{%.+}}, 5 : i8
-ltl.past %true, 1 : i1
-ltl.past %c0_i8, 5 : i8
 
 // CHECK: ltl.past {{%.+}}, 5 clk {{%.+}} : i8
 ltl.past %c0_i8, 5 clk %true : i8

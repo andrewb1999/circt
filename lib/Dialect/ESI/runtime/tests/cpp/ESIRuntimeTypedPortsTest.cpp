@@ -9,6 +9,12 @@
 #include "esi/TypedPorts.h"
 #include "gtest/gtest.h"
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <deque>
+
 using namespace esi;
 
 namespace {
@@ -164,6 +170,27 @@ struct TestStruct {
   uint16_t field2;
 };
 
+struct DeserializerWithESIID {
+  static constexpr std::string_view _ESI_ID = "MyModule.DeserializedStruct";
+
+  class TypeDeserializer
+      : public QueuedDecodeTypeDeserializer<DeserializerWithESIID> {
+  public:
+    using Base = QueuedDecodeTypeDeserializer<DeserializerWithESIID>;
+    using OutputCallback = Base::OutputCallback;
+    using DecodedOutputs = Base::DecodedOutputs;
+
+    explicit TypeDeserializer(OutputCallback output)
+        : Base(std::move(output)) {}
+
+  private:
+    DecodedOutputs decode(std::unique_ptr<SegmentedMessageData> &msg) override {
+      msg.reset();
+      return {};
+    }
+  };
+};
+
 TEST(TypedPortsTest, ESIIDTypeCompatibility) {
   // Matching ID should pass.
   StructType matchType("MyModule.TestStruct", {});
@@ -180,10 +207,12 @@ TEST(TypedPortsTest, ESIIDTypeCompatibility) {
 }
 
 TEST(TypedPortsTest, NullPortTypeThrows) {
-  EXPECT_THROW(verifyTypeCompatibility<int32_t>(nullptr),
-               AcceleratorMismatchError);
-  EXPECT_THROW(verifyTypeCompatibility<void>(nullptr),
-               AcceleratorMismatchError);
+  EXPECT_THROW(
+      verifyTypeCompatibility<int32_t>(static_cast<const Type *>(nullptr)),
+      AcceleratorMismatchError);
+  EXPECT_THROW(
+      verifyTypeCompatibility<void>(static_cast<const Type *>(nullptr)),
+      AcceleratorMismatchError);
 }
 
 // A type that is not integral and has no _ESI_ID — should hit fallback.
@@ -335,6 +364,364 @@ public:
   MessageData nextResponse;
 };
 
+TEST(TypedPortsTest, TypedReadPortCustomDeserializerVerifiesESIID) {
+  StructType matchType("MyModule.DeserializedStruct", {});
+  MockReadPort matching(&matchType);
+  TypedReadPort<DeserializerWithESIID> ok(matching);
+  EXPECT_NO_THROW(ok.connect());
+
+  StructType mismatchType("OtherModule.OtherStruct", {});
+  MockReadPort mismatch(&mismatchType);
+  TypedReadPort<DeserializerWithESIID> bad(mismatch);
+  EXPECT_THROW(bad.connect(), AcceleratorMismatchError);
+}
+
+class CallbackDrivenMockReadPort : public ReadChannelPort {
+public:
+  CallbackDrivenMockReadPort(const Type *type) : ReadChannelPort(type) {}
+
+  bool deliver(std::unique_ptr<SegmentedMessageData> msg) {
+    ++deliveryCount;
+    pending = std::move(msg);
+    return retryPending();
+  }
+
+  bool retryPending() {
+    if (!pending)
+      throw std::runtime_error(
+          "CallbackDrivenMockReadPort::retryPending with no message");
+    if (!invokeCallback(pending))
+      return false;
+    pending.reset();
+    return true;
+  }
+
+  bool hasPending() const { return static_cast<bool>(pending); }
+  size_t numActiveCallbacks() const { return activeCallbacks; }
+
+  size_t deliveryCount = 0;
+
+private:
+  std::unique_ptr<SegmentedMessageData> pending;
+};
+
+class ThrowOnCopyReadCallback {
+public:
+  explicit ThrowOnCopyReadCallback(std::shared_ptr<bool> shouldThrow)
+      : shouldThrow(std::move(shouldThrow)) {}
+
+  ThrowOnCopyReadCallback(const ThrowOnCopyReadCallback &other)
+      : shouldThrow(other.shouldThrow) {
+    if (*shouldThrow)
+      throw std::runtime_error("ThrowOnCopyReadCallback copy failure");
+  }
+
+  ThrowOnCopyReadCallback(ThrowOnCopyReadCallback &&) = default;
+  ThrowOnCopyReadCallback &operator=(const ThrowOnCopyReadCallback &) = default;
+  ThrowOnCopyReadCallback &operator=(ThrowOnCopyReadCallback &&) = default;
+
+  bool operator()(std::unique_ptr<SegmentedMessageData> &) const {
+    return true;
+  }
+
+private:
+  std::shared_ptr<bool> shouldThrow;
+};
+
+static MessageData packUint32Words(std::initializer_list<uint32_t> values) {
+  std::vector<uint8_t> bytes(values.size() * sizeof(uint32_t));
+  size_t offset = 0;
+  for (uint32_t value : values) {
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+    offset += sizeof(value);
+  }
+  return MessageData(std::move(bytes));
+}
+
+struct BufferedSequence {
+  std::vector<uint32_t> values;
+
+  class TypeDeserializer
+      : public QueuedDecodeTypeDeserializer<BufferedSequence> {
+  public:
+    using Base = QueuedDecodeTypeDeserializer<BufferedSequence>;
+    using OutputCallback = Base::OutputCallback;
+    using DecodedOutputs = Base::DecodedOutputs;
+
+    explicit TypeDeserializer(OutputCallback output)
+        : Base(std::move(output)) {}
+
+  private:
+    DecodedOutputs decode(std::unique_ptr<SegmentedMessageData> &msg) override {
+      MessageData scratch;
+      const MessageData &flat =
+          detail::getMessageDataRef<BufferedSequence>(*msg, scratch);
+      if (flat.getSize() % sizeof(uint32_t) != 0)
+        throw std::runtime_error(
+            "BufferedSequence::TypeDeserializer: truncated word payload");
+
+      DecodedOutputs decoded;
+      for (size_t offset = 0; offset < flat.getSize();
+           offset += sizeof(uint32_t)) {
+        uint32_t value = 0;
+        std::memcpy(&value, flat.getBytes() + offset, sizeof(value));
+        auto sequence = std::make_unique<BufferedSequence>();
+        sequence->values.push_back(value);
+        decoded.push_back(std::move(sequence));
+      }
+      msg.reset();
+      return decoded;
+    }
+  };
+};
+
+TEST(TypedPortsTest, TypedReadPortPODBackpressuresAfterOneBufferedOutput) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  TypedReadPort<uint32_t> typed(mock);
+  typed.connect();
+  typed.setMaxDataQueueMsgs(1);
+
+  EXPECT_TRUE(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({11}))));
+  // The second raw message is consumed into the POD deserializer's single-slot
+  // typed buffer even though the polling queue is full. Backpressure shows up
+  // on the next raw message boundary.
+  EXPECT_TRUE(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({22}))));
+  EXPECT_FALSE(mock.hasPending());
+  EXPECT_FALSE(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({33}))));
+  EXPECT_TRUE(mock.hasPending());
+
+  std::unique_ptr<uint32_t> first = typed.read();
+  ASSERT_TRUE(first);
+  EXPECT_EQ(*first, 11u);
+  EXPECT_TRUE(mock.retryPending());
+  EXPECT_FALSE(mock.hasPending());
+  std::unique_ptr<uint32_t> second = typed.read();
+  ASSERT_TRUE(second);
+  EXPECT_EQ(*second, 22u);
+  std::unique_ptr<uint32_t> third = typed.read();
+  ASSERT_TRUE(third);
+  EXPECT_EQ(*third, 33u);
+}
+
+TEST(TypedPortsTest, TypedReadPortPODRetriesSameOwnedObjectOnLaterPush) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  TypedReadPort<uint32_t> typed(mock);
+  const uint32_t *firstObject = nullptr;
+  size_t callbackAttempts = 0;
+
+  typed.connect([&](std::unique_ptr<uint32_t> &value) {
+    ++callbackAttempts;
+    EXPECT_TRUE(value);
+    if (callbackAttempts == 1) {
+      EXPECT_EQ(*value, 11u);
+      firstObject = value.get();
+      return false;
+    }
+    if (callbackAttempts == 2) {
+      EXPECT_EQ(*value, 11u);
+      EXPECT_EQ(value.get(), firstObject);
+      return true;
+    }
+    EXPECT_EQ(*value, 22u);
+    return true;
+  });
+
+  EXPECT_TRUE(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({11}))));
+  EXPECT_FALSE(mock.hasPending());
+  // A later raw push first retries the buffered typed value, then handles the
+  // new message once that buffered value is accepted.
+  EXPECT_TRUE(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({22}))));
+  EXPECT_FALSE(mock.hasPending());
+  EXPECT_EQ(callbackAttempts, 3u);
+}
+
+TEST(TypedPortsTest, TypedReadPortCustomDeserializerPokesBlockedOutput) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  TypedReadPort<BufferedSequence> typed(mock);
+  typed.connect();
+  typed.setMaxDataQueueMsgs(1);
+
+  EXPECT_TRUE(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({10, 20}))));
+  EXPECT_EQ(mock.deliveryCount, 1u);
+
+  std::unique_ptr<BufferedSequence> first = typed.read();
+  ASSERT_TRUE(first);
+  ASSERT_EQ(first->values.size(), 1u);
+  EXPECT_EQ(first->values[0], 10u);
+
+  std::unique_ptr<BufferedSequence> second = typed.read();
+  ASSERT_TRUE(second);
+  ASSERT_EQ(second->values.size(), 1u);
+  EXPECT_EQ(second->values[0], 20u);
+  EXPECT_EQ(mock.deliveryCount, 1u);
+}
+
+TEST(TypedPortsTest,
+     TypedReadPortCustomDeserializerConsumesMultipleFramesPerRawMessage) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  TypedReadPort<BufferedSequence> typed(mock);
+  typed.connect();
+
+  std::future<std::unique_ptr<BufferedSequence>> first = typed.readAsync();
+  std::future<std::unique_ptr<BufferedSequence>> second = typed.readAsync();
+  std::future<std::unique_ptr<BufferedSequence>> third = typed.readAsync();
+
+  EXPECT_TRUE(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({1, 2, 3}))));
+
+  std::unique_ptr<BufferedSequence> firstValue = first.get();
+  ASSERT_TRUE(firstValue);
+  EXPECT_EQ(firstValue->values[0], 1u);
+
+  std::unique_ptr<BufferedSequence> secondValue = second.get();
+  ASSERT_TRUE(secondValue);
+  EXPECT_EQ(secondValue->values[0], 2u);
+
+  std::unique_ptr<BufferedSequence> thirdValue = third.get();
+  ASSERT_TRUE(thirdValue);
+  EXPECT_EQ(thirdValue->values[0], 3u);
+}
+
+TEST(TypedPortsTest,
+     TypedReadPortCustomDeserializerQueuesMultiplePendingOutputs) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  TypedReadPort<BufferedSequence> typed(mock);
+  typed.connect();
+  typed.setMaxDataQueueMsgs(1);
+
+  EXPECT_TRUE(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({7, 8, 9}))));
+  EXPECT_EQ(mock.deliveryCount, 1u);
+
+  std::unique_ptr<BufferedSequence> first = typed.read();
+  ASSERT_TRUE(first);
+  EXPECT_EQ(first->values[0], 7u);
+
+  std::unique_ptr<BufferedSequence> second = typed.read();
+  ASSERT_TRUE(second);
+  EXPECT_EQ(second->values[0], 8u);
+
+  std::unique_ptr<BufferedSequence> third = typed.read();
+  ASSERT_TRUE(third);
+  EXPECT_EQ(third->values[0], 9u);
+  EXPECT_EQ(mock.deliveryCount, 1u);
+}
+
+struct FragmentedCoord {
+  uint32_t y;
+  uint32_t x;
+};
+static_assert(sizeof(FragmentedCoord) == 8, "Size mismatch");
+
+static std::array<uint8_t, sizeof(FragmentedCoord)> packCoordBytes(uint32_t y,
+                                                                   uint32_t x) {
+  FragmentedCoord coord{y, x};
+  std::array<uint8_t, sizeof(FragmentedCoord)> bytes{};
+  std::memcpy(bytes.data(), &coord, sizeof(coord));
+  return bytes;
+}
+
+struct FragmentedCoordBatch {
+  std::vector<FragmentedCoord> coords;
+
+  class TypeDeserializer
+      : public QueuedDecodeTypeDeserializer<FragmentedCoordBatch> {
+  public:
+    using Base = QueuedDecodeTypeDeserializer<FragmentedCoordBatch>;
+    using OutputCallback = Base::OutputCallback;
+    using DecodedOutputs = Base::DecodedOutputs;
+
+    explicit TypeDeserializer(OutputCallback output)
+        : Base(std::move(output)) {}
+
+  private:
+    DecodedOutputs decode(std::unique_ptr<SegmentedMessageData> &msg) override {
+      MessageData scratch;
+      const MessageData &flat =
+          detail::getMessageDataRef<FragmentedCoordBatch>(*msg, scratch);
+
+      DecodedOutputs decoded;
+      const uint8_t *bytes = flat.getBytes();
+      size_t offset = 0;
+      while (offset < flat.getSize()) {
+        size_t needed = sizeof(FragmentedCoord) - partialFrameBytes.size();
+        size_t chunkSize = std::min(needed, flat.getSize() - offset);
+        partialFrameBytes.insert(partialFrameBytes.end(), bytes + offset,
+                                 bytes + offset + chunkSize);
+        offset += chunkSize;
+
+        if (partialFrameBytes.size() != sizeof(FragmentedCoord))
+          break;
+
+        FragmentedCoord coord;
+        std::memcpy(&coord, partialFrameBytes.data(), sizeof(coord));
+        partialFrameBytes.clear();
+
+        auto batch = std::make_unique<FragmentedCoordBatch>();
+        batch->coords.push_back(coord);
+        decoded.push_back(std::move(batch));
+      }
+
+      msg.reset();
+      return decoded;
+    }
+
+    std::vector<uint8_t> partialFrameBytes;
+  };
+};
+
+TEST(TypedPortsTest,
+     TypedReadPortCustomDeserializerConsumesSplitFramesAcrossRawMessages) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  TypedReadPort<FragmentedCoordBatch> typed(mock);
+  typed.connect();
+
+  std::future<std::unique_ptr<FragmentedCoordBatch>> first = typed.readAsync();
+  std::future<std::unique_ptr<FragmentedCoordBatch>> second = typed.readAsync();
+
+  std::array<uint8_t, sizeof(FragmentedCoord)> coordA = packCoordBytes(10, 20);
+  std::array<uint8_t, sizeof(FragmentedCoord)> coordB = packCoordBytes(30, 40);
+
+  std::vector<uint8_t> firstChunk(coordA.begin(), coordA.begin() + 6);
+  EXPECT_TRUE(mock.deliver(
+      std::make_unique<MessageData>(MessageData(std::move(firstChunk)))));
+
+  std::vector<uint8_t> secondChunk;
+  secondChunk.insert(secondChunk.end(), coordA.begin() + 6, coordA.end());
+  secondChunk.insert(secondChunk.end(), coordB.begin(), coordB.end());
+  EXPECT_TRUE(mock.deliver(
+      std::make_unique<MessageData>(MessageData(std::move(secondChunk)))));
+
+  std::unique_ptr<FragmentedCoordBatch> firstBatch = first.get();
+  ASSERT_TRUE(firstBatch);
+  ASSERT_EQ(firstBatch->coords.size(), 1u);
+  EXPECT_EQ(firstBatch->coords[0].y, 10u);
+  EXPECT_EQ(firstBatch->coords[0].x, 20u);
+
+  std::unique_ptr<FragmentedCoordBatch> secondBatch = second.get();
+  ASSERT_TRUE(secondBatch);
+  ASSERT_EQ(secondBatch->coords.size(), 1u);
+  EXPECT_EQ(secondBatch->coords[0].y, 30u);
+  EXPECT_EQ(secondBatch->coords[0].x, 40u);
+}
 //===----------------------------------------------------------------------===//
 // TypedFunction tests
 //===----------------------------------------------------------------------===//
@@ -343,6 +730,38 @@ TEST(TypedPortsTest, TypedFunctionNullThrowsAtConnect) {
   // Null is accepted at construction but throws at connect().
   TypedFunction<uint32_t, uint16_t> typed(nullptr);
   EXPECT_THROW(typed.connect(), AcceleratorMismatchError);
+}
+
+TEST(TypedPortsTest, TypedFunctionCallBeforeConnectThrows) {
+  // call() before connect() must throw, not dereference a null optional.
+  TypedFunction<uint32_t, uint16_t> typed(nullptr);
+  EXPECT_THROW(typed.call(0u).get(), std::runtime_error);
+}
+
+TEST(TypedPortsTest, TypedFunctionDoubleConnectThrows) {
+  // A second connect() on an already-connected wrapper must throw rather
+  // than silently rebuild internal state.
+  SIntType argInner("si24", 24);
+  ChannelType argChanType("channel<si24>", &argInner);
+  UIntType resultInner("ui15", 15);
+  ChannelType resultChanType("channel<ui15>", &resultInner);
+
+  BundleType::ChannelVector channels = {
+      {"arg", BundleType::Direction::To, &argChanType},
+      {"result", BundleType::Direction::From, &resultChanType},
+  };
+  BundleType bundleType("func_bundle", channels);
+
+  MockWritePort mockWrite(&argInner);
+  CallbackDrivenMockReadPort mockRead(&resultInner);
+
+  auto *func = services::FuncService::Function::get(AppID("test"), &bundleType,
+                                                    mockWrite, mockRead);
+
+  TypedFunction<int32_t, uint16_t> typed(func);
+  typed.connect();
+  EXPECT_THROW(typed.connect(), std::runtime_error);
+  delete func;
 }
 
 TEST(TypedPortsTest, TypedFunctionConnectVerifiesTypes) {
@@ -408,11 +827,7 @@ TEST(TypedPortsTest, TypedFunctionCallRoundTrip) {
   BundleType bundleType("func_bundle", channels);
 
   MockWritePort mockWrite(&argInner);
-  MockReadPort mockRead(&resultInner);
-
-  // Set up mock read to return a known uint16_t value.
-  uint16_t expected = 42;
-  mockRead.nextResponse = MessageData::from(expected);
+  CallbackDrivenMockReadPort mockRead(&resultInner);
 
   auto *func = services::FuncService::Function::get(AppID("test"), &bundleType,
                                                     mockWrite, mockRead);
@@ -421,11 +836,573 @@ TEST(TypedPortsTest, TypedFunctionCallRoundTrip) {
   typed.connect();
 
   int32_t arg = 100;
-  uint16_t result = typed.call(arg).get();
+  std::future<uint16_t> f = typed.call(arg);
+  // Deliver the response frame to satisfy the future. ui15 wire width is 2
+  // bytes so a 2-byte payload is required.
+  uint16_t expected = 42;
+  EXPECT_TRUE(mockRead.deliver(std::make_unique<MessageData>(MessageData(
+      reinterpret_cast<const uint8_t *>(&expected), sizeof(expected)))));
+  uint16_t result = f.get();
   EXPECT_EQ(result, 42);
 
   // Verify the written arg matches — si24 wire size is 3 bytes.
   ASSERT_EQ(mockWrite.lastWritten.getSize(), 3u);
+  delete func;
+}
+
+//===----------------------------------------------------------------------===//
+// SegmentedMessageData tests via TypedWritePort
+//===----------------------------------------------------------------------===//
+
+/// A minimal SegmentedMessageData for testing.
+struct TestSegmented : public SegmentedMessageData {
+#pragma pack(push, 1)
+  struct Header {
+    uint32_t a;
+    uint16_t b;
+  };
+#pragma pack(pop)
+
+  Header header;
+  std::vector<uint32_t> items;
+
+  size_t numSegments() const override { return 2; }
+  Segment segment(size_t idx) const override {
+    if (idx == 0)
+      return {reinterpret_cast<const uint8_t *>(&header), sizeof(Header)};
+    return {reinterpret_cast<const uint8_t *>(items.data()),
+            items.size() * sizeof(uint32_t)};
+  }
+};
+
+TEST(TypedPortsTest, ReadChannelPortSegmentedCallbackRetriesSameMessageObject) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  uint32_t expected = 0x12345678;
+  const uint8_t *firstBytes = nullptr;
+  size_t callbackCalls = 0;
+
+  mock.connect([&](std::unique_ptr<SegmentedMessageData> &msg) -> bool {
+    ++callbackCalls;
+    EXPECT_EQ(msg->numSegments(), 1u);
+
+    auto *flat = dynamic_cast<MessageData *>(msg.get());
+    EXPECT_NE(flat, nullptr);
+    if (!flat)
+      return false;
+    EXPECT_EQ(*flat->as<uint32_t>(), expected);
+
+    if (callbackCalls == 1)
+      firstBytes = flat->getBytes();
+    else
+      EXPECT_EQ(flat->getBytes(), firstBytes);
+
+    return callbackCalls == 2;
+  });
+
+  EXPECT_FALSE(
+      mock.deliver(std::make_unique<MessageData>(MessageData::from(expected))));
+  EXPECT_TRUE(mock.hasPending());
+  EXPECT_TRUE(mock.retryPending());
+  EXPECT_FALSE(mock.hasPending());
+  EXPECT_EQ(callbackCalls, 2u);
+}
+
+TEST(TypedPortsTest, ReadChannelPortFlatCallbackFlattensSegmentedMessageRetry) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  TestSegmented input;
+  input.header.a = 0x12345678;
+  input.header.b = 0xABCD;
+  input.items = {1, 2, 3};
+  MessageData expected = input.toMessageData();
+
+  size_t callbackCalls = 0;
+  mock.connect([&](MessageData data) {
+    ++callbackCalls;
+    EXPECT_EQ(data.getData(), expected.getData());
+    return callbackCalls == 2;
+  });
+
+  EXPECT_FALSE(mock.deliver(std::make_unique<TestSegmented>(input)));
+  EXPECT_TRUE(mock.hasPending());
+  EXPECT_TRUE(mock.retryPending());
+  EXPECT_FALSE(mock.hasPending());
+  EXPECT_EQ(callbackCalls, 2u);
+}
+
+TEST(TypedPortsTest, ReadChannelPortPollingRetriesFlattenedSegmentedMessage) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+  mock.connect();
+  mock.setMaxDataQueueMsgs(1);
+
+  TestSegmented firstInput;
+  firstInput.header.a = 0xAAAA5555;
+  firstInput.header.b = 0x1357;
+  firstInput.items = {10};
+  MessageData firstExpected = firstInput.toMessageData();
+
+  TestSegmented secondInput;
+  secondInput.header.a = 0xDEADBEEF;
+  secondInput.header.b = 0x2468;
+  secondInput.items = {20, 30};
+  MessageData secondExpected = secondInput.toMessageData();
+
+  EXPECT_TRUE(mock.deliver(std::make_unique<TestSegmented>(firstInput)));
+  EXPECT_FALSE(mock.deliver(std::make_unique<TestSegmented>(secondInput)));
+  EXPECT_TRUE(mock.hasPending());
+
+  MessageData firstOut;
+  mock.read(firstOut);
+  EXPECT_EQ(firstOut.getData(), firstExpected.getData());
+
+  EXPECT_TRUE(mock.retryPending());
+  EXPECT_FALSE(mock.hasPending());
+
+  MessageData secondOut;
+  mock.read(secondOut);
+  EXPECT_EQ(secondOut.getData(), secondExpected.getData());
+}
+
+TEST(TypedPortsTest, ReadChannelPortPollingReadAsyncThrowsWhenDisconnected) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  EXPECT_THROW(mock.readAsync(), std::runtime_error);
+
+  mock.connect();
+  std::future<MessageData> pending = mock.readAsync();
+  mock.disconnect();
+
+  EXPECT_EQ(pending.wait_for(std::chrono::milliseconds(0)),
+            std::future_status::ready);
+  EXPECT_THROW(pending.get(), std::future_error);
+  EXPECT_THROW(mock.readAsync(), std::runtime_error);
+
+  mock.connect();
+  EXPECT_TRUE(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({11}))));
+  MessageData out;
+  mock.read(out);
+  EXPECT_EQ(*out.as<uint32_t>(), 11u);
+}
+
+TEST(TypedPortsTest, ReadChannelPortPollingConnectRejectsReconnect) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  mock.connect();
+  EXPECT_THROW(mock.connect(), std::runtime_error);
+}
+
+TEST(TypedPortsTest, ReadChannelPortDisconnectRevokesCallback) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  mock.connect();
+  mock.disconnect();
+
+  EXPECT_FALSE(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({11}))));
+  EXPECT_TRUE(mock.hasPending());
+
+  mock.connect();
+  EXPECT_TRUE(mock.retryPending());
+  EXPECT_FALSE(mock.hasPending());
+
+  MessageData out;
+  mock.read(out);
+  EXPECT_EQ(*out.as<uint32_t>(), 11u);
+}
+
+TEST(TypedPortsTest, TypedReadPortDestructorDisconnectsRawPort) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+
+  {
+    TypedReadPort<uint32_t> typed(mock);
+    typed.connect();
+    EXPECT_TRUE(mock.isConnected());
+  }
+
+  EXPECT_FALSE(mock.isConnected());
+  EXPECT_FALSE(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({11}))));
+  EXPECT_TRUE(mock.hasPending());
+
+  TypedReadPort<uint32_t> reconnected(mock);
+  reconnected.connect();
+  EXPECT_TRUE(mock.retryPending());
+  EXPECT_FALSE(mock.hasPending());
+
+  std::unique_ptr<uint32_t> out = reconnected.read();
+  ASSERT_TRUE(out);
+  EXPECT_EQ(*out, 11u);
+}
+
+TEST(TypedPortsTest,
+     ReadChannelPortInvokeCallbackMaintainsCountOnCallbackCopyFailure) {
+  UIntType uint32("ui32", 32);
+  CallbackDrivenMockReadPort mock(&uint32);
+  auto shouldThrow = std::make_shared<bool>(false);
+
+  mock.connect(ThrowOnCopyReadCallback(shouldThrow));
+  *shouldThrow = true;
+
+  EXPECT_THROW(
+      mock.deliver(std::make_unique<MessageData>(packUint32Words({11}))),
+      std::runtime_error);
+  EXPECT_EQ(mock.numActiveCallbacks(), 0u);
+}
+
+TEST(TypedPortsTest, TypedWritePortSegmentedMessageData) {
+  // Use any type — SegmentedMessageData skips type checks.
+  UIntType uint32("ui32", 32);
+  MockWritePort mock(&uint32);
+
+  TypedWritePort<TestSegmented, true> typed(mock);
+  typed.connect();
+
+  TestSegmented msg;
+  msg.header.a = 0x12345678;
+  msg.header.b = 0xABCD;
+  msg.items = {1, 2, 3};
+
+  // write(const T&) should flatten via toMessageData().
+  typed.write(msg);
+
+  // Expected: 6 bytes header + 12 bytes data = 18 bytes.
+  EXPECT_EQ(mock.lastWritten.getSize(), 18u);
+
+  // Verify header bytes.
+  const uint8_t *bytes = mock.lastWritten.getBytes();
+  uint32_t gotA;
+  uint16_t gotB;
+  std::memcpy(&gotA, bytes, 4);
+  std::memcpy(&gotB, bytes + 4, 2);
+  EXPECT_EQ(gotA, 0x12345678u);
+  EXPECT_EQ(gotB, 0xABCDu);
+
+  // Verify item bytes.
+  uint32_t gotItems[3];
+  std::memcpy(gotItems, bytes + 6, 12);
+  EXPECT_EQ(gotItems[0], 1u);
+  EXPECT_EQ(gotItems[1], 2u);
+  EXPECT_EQ(gotItems[2], 3u);
+}
+
+TEST(TypedPortsTest, TypedWritePortSegmentedNoTypeCheck) {
+  // SegmentedMessageData type against a mismatched port type — works because
+  // SkipTypeCheck=true bypasses verifyTypeCompatibility entirely.
+  SIntType sint8("si8", 8);
+  MockWritePort mock(&sint8);
+
+  TypedWritePort<TestSegmented, true> typed(mock);
+  EXPECT_NO_THROW(typed.connect());
+
+  TestSegmented msg;
+  msg.header.a = 42;
+  msg.header.b = 7;
+  msg.items = {100};
+
+  typed.write(msg);
+  // 6 bytes header + 4 bytes data = 10 bytes.
+  EXPECT_EQ(mock.lastWritten.getSize(), 10u);
+}
+
+TEST(TypedPortsTest, TypedFunctionSegmentedArg) {
+  // Arg type is SegmentedMessageData — type check is skipped for it.
+  // Use an arbitrary inner type for the arg channel since it won't be checked.
+  UIntType argInner("ui32", 32);
+  ChannelType argChanType("channel<ui32>", &argInner);
+  UIntType resultInner("ui16", 16);
+  ChannelType resultChanType("channel<ui16>", &resultInner);
+
+  BundleType::ChannelVector channels = {
+      {"arg", BundleType::Direction::To, &argChanType},
+      {"result", BundleType::Direction::From, &resultChanType},
+  };
+  BundleType bundleType("func_bundle", channels);
+
+  MockWritePort mockWrite(&argInner);
+  CallbackDrivenMockReadPort mockRead(&resultInner);
+
+  auto *func = services::FuncService::Function::get(AppID("test"), &bundleType,
+                                                    mockWrite, mockRead);
+
+  TypedFunction<TestSegmented, uint16_t, true> typed(func);
+  typed.connect();
+
+  TestSegmented arg;
+  arg.header.a = 0xDEAD;
+  arg.header.b = 0xBE;
+  arg.items = {10, 20};
+
+  std::future<uint16_t> f = typed.call(arg);
+  // Deliver the response frame to satisfy the call's future.
+  uint16_t expected = 99;
+  EXPECT_TRUE(mockRead.deliver(std::make_unique<MessageData>(MessageData(
+      reinterpret_cast<const uint8_t *>(&expected), sizeof(expected)))));
+  uint16_t result = f.get();
+  EXPECT_EQ(result, 99u);
+
+  // Verify the flattened arg: 6 bytes header + 8 bytes items = 14 bytes.
+  EXPECT_EQ(mockWrite.lastWritten.getSize(), 14u);
+
+  const uint8_t *bytes = mockWrite.lastWritten.getBytes();
+  uint32_t gotA;
+  std::memcpy(&gotA, bytes, 4);
+  EXPECT_EQ(gotA, 0xDEADu);
+
+  uint32_t gotItem0, gotItem1;
+  std::memcpy(&gotItem0, bytes + 6, 4);
+  std::memcpy(&gotItem1, bytes + 10, 4);
+  EXPECT_EQ(gotItem0, 10u);
+  EXPECT_EQ(gotItem1, 20u);
+
+  delete func;
+}
+
+// A plain struct without _ESI_ID — not integral, not void, not bool.
+struct UnrecognizedCppType {
+  double x;
+  double y;
+};
+
+TEST(TypedPortsTest, VerifyTypeCompatibilityThrowsForUnsupportedType) {
+  UIntType uint32("ui32", 32);
+  EXPECT_THROW(verifyTypeCompatibility<UnrecognizedCppType>(&uint32),
+               AcceleratorMismatchError);
+
+  SIntType sint16("si16", 16);
+  EXPECT_THROW(verifyTypeCompatibility<UnrecognizedCppType>(&sint16),
+               AcceleratorMismatchError);
+}
+
+//===----------------------------------------------------------------------===//
+// TypedFunction custom-deserializer tests
+//===----------------------------------------------------------------------===//
+
+// Simple TypeDeserializer that decodes a single uint32 from one frame and
+// emits exactly one OneWord value per push. Used to exercise the typical
+// 1-frame-in / 1-typed-value-out custom path.
+//
+// Implements the standard backpressure/retry contract: a decoded `OneWord`
+// is buffered until the output callback accepts it; only then is the raw
+// message consumed. If `output()` returns false, the same raw message will
+// be retried later, and a follow-up `poke()` retries delivery of the
+// already-decoded value without re-decoding.
+struct OneWord {
+  uint32_t value;
+
+  class TypeDeserializer {
+  public:
+    using OutputCallback = detail::TypedReadOwnedCallback<OneWord>;
+
+    explicit TypeDeserializer(OutputCallback output)
+        : output(std::move(output)) {}
+
+    bool push(std::unique_ptr<SegmentedMessageData> &msg) {
+      // First, try to flush any previously-decoded value blocked on output.
+      if (pending) {
+        if (!output(pending))
+          return false;
+        pending.reset();
+      }
+
+      MessageData scratch;
+      const MessageData &flat =
+          detail::getMessageDataRef<OneWord>(*msg, scratch);
+      if (flat.getSize() != sizeof(uint32_t))
+        throw std::runtime_error("OneWord: bad size");
+      pending = std::make_unique<OneWord>();
+      std::memcpy(&pending->value, flat.getBytes(), sizeof(uint32_t));
+      // Raw message is consumed regardless of whether the typed output is
+      // immediately accepted.
+      msg.reset();
+      if (output(pending))
+        pending.reset();
+      return true;
+    }
+
+    bool poke() {
+      if (pending && output(pending)) {
+        pending.reset();
+        return true;
+      }
+      return false;
+    }
+
+  private:
+    OutputCallback output;
+    std::unique_ptr<OneWord> pending;
+  };
+};
+
+TEST(TypedPortsTest, TypedFunctionCustomDeserializerSingleFrame) {
+  UIntType argInner("ui32", 32);
+  ChannelType argChanType("channel<ui32>", &argInner);
+  UIntType resultInner("ui32", 32);
+  ChannelType resultChanType("channel<ui32>", &resultInner);
+
+  BundleType::ChannelVector channels = {
+      {"arg", BundleType::Direction::To, &argChanType},
+      {"result", BundleType::Direction::From, &resultChanType},
+  };
+  BundleType bundleType("func_bundle", channels);
+
+  MockWritePort mockWrite(&argInner);
+  CallbackDrivenMockReadPort mockRead(&resultInner);
+
+  auto *func = services::FuncService::Function::get(AppID("test"), &bundleType,
+                                                    mockWrite, mockRead);
+
+  TypedFunction<uint32_t, OneWord> typed(func);
+  typed.connect();
+
+  std::future<OneWord> f = typed.call(0u);
+  // Deliver one frame containing a single uint32; the deserializer produces
+  // one OneWord which fulfills the call's pending future.
+  uint32_t expected = 0xCAFE;
+  EXPECT_TRUE(mockRead.deliver(std::make_unique<MessageData>(MessageData(
+      reinterpret_cast<const uint8_t *>(&expected), sizeof(expected)))));
+
+  OneWord result = f.get();
+  EXPECT_EQ(result.value, expected);
+
+  delete func;
+}
+
+TEST(TypedPortsTest, TypedFunctionCustomDeserializerReadsMultipleFrames) {
+  // FragmentedCoordBatch's TypeDeserializer emits one batch per 8-byte
+  // FragmentedCoord. By feeding partial frames across multiple raw messages,
+  // we exercise the deserializer's persistent partial-buffer state across
+  // raw callback invocations.
+  UIntType argInner("ui32", 32);
+  ChannelType argChanType("channel<ui32>", &argInner);
+  UIntType resultInner("ui32", 32);
+  ChannelType resultChanType("channel<ui32>", &resultInner);
+
+  BundleType::ChannelVector channels = {
+      {"arg", BundleType::Direction::To, &argChanType},
+      {"result", BundleType::Direction::From, &resultChanType},
+  };
+  BundleType bundleType("func_bundle", channels);
+
+  MockWritePort mockWrite(&argInner);
+  CallbackDrivenMockReadPort mockRead(&resultInner);
+
+  auto *func = services::FuncService::Function::get(AppID("test"), &bundleType,
+                                                    mockWrite, mockRead);
+
+  TypedFunction<uint32_t, FragmentedCoordBatch> typed(func);
+  typed.connect();
+
+  std::future<FragmentedCoordBatch> f = typed.call(0u);
+
+  // Split a single 8-byte FragmentedCoord across two raw frames.
+  std::array<uint8_t, sizeof(FragmentedCoord)> coordBytes =
+      packCoordBytes(/*y=*/55, /*x=*/77);
+  std::vector<uint8_t> firstChunk(coordBytes.begin(), coordBytes.begin() + 6);
+  std::vector<uint8_t> secondChunk(coordBytes.begin() + 6, coordBytes.end());
+  EXPECT_TRUE(
+      mockRead.deliver(std::make_unique<MessageData>(std::move(firstChunk))));
+  EXPECT_TRUE(
+      mockRead.deliver(std::make_unique<MessageData>(std::move(secondChunk))));
+
+  FragmentedCoordBatch batch = f.get();
+  ASSERT_EQ(batch.coords.size(), 1u);
+  EXPECT_EQ(batch.coords[0].y, 55u);
+  EXPECT_EQ(batch.coords[0].x, 77u);
+
+  delete func;
+}
+
+TEST(TypedPortsTest, TypedFunctionCustomDeserializerSkipsResultTypeCheck) {
+  // OneWord has no _ESI_ID, so the result-side type check should be skipped
+  // and we should be able to connect against an arbitrarily-typed result
+  // channel without a thrown AcceleratorMismatchError.
+  UIntType argInner("ui32", 32);
+  ChannelType argChanType("channel<ui32>", &argInner);
+  // Use a wildly mismatched result type to prove the check is skipped.
+  StructType resultInner("Anything", {});
+  ChannelType resultChanType("channel<Anything>", &resultInner);
+
+  BundleType::ChannelVector channels = {
+      {"arg", BundleType::Direction::To, &argChanType},
+      {"result", BundleType::Direction::From, &resultChanType},
+  };
+  BundleType bundleType("func_bundle", channels);
+
+  MockWritePort mockWrite(&argInner);
+  CallbackDrivenMockReadPort mockRead(&resultInner);
+
+  auto *func = services::FuncService::Function::get(AppID("test"), &bundleType,
+                                                    mockWrite, mockRead);
+
+  TypedFunction<uint32_t, OneWord> typed(func);
+  EXPECT_NO_THROW(typed.connect());
+
+  delete func;
+}
+
+TEST(TypedPortsTest, TypedFunctionPipelinedCallsGetOutOfOrder) {
+  // Two pipelined calls, each with a multi-frame response decoded by the
+  // shared deserializer. Even when the second future's get() is called
+  // before the first, each future must yield its own call's result -- not
+  // the other call's frames. This exercises the FIFO contract of the
+  // TypedReadPort polling buffer that backs `call()`.
+  UIntType argInner("ui32", 32);
+  ChannelType argChanType("channel<ui32>", &argInner);
+  UIntType resultInner("ui32", 32);
+  ChannelType resultChanType("channel<ui32>", &resultInner);
+
+  BundleType::ChannelVector channels = {
+      {"arg", BundleType::Direction::To, &argChanType},
+      {"result", BundleType::Direction::From, &resultChanType},
+  };
+  BundleType bundleType("func_bundle", channels);
+
+  MockWritePort mockWrite(&argInner);
+  CallbackDrivenMockReadPort mockRead(&resultInner);
+
+  auto *func = services::FuncService::Function::get(AppID("test"), &bundleType,
+                                                    mockWrite, mockRead);
+
+  TypedFunction<uint32_t, FragmentedCoordBatch> typed(func);
+  typed.connect();
+
+  // Issue two calls before any frames arrive; futures reserve slots in the
+  // polling buffer in call FIFO order.
+  std::future<FragmentedCoordBatch> f1 = typed.call(0u);
+  std::future<FragmentedCoordBatch> f2 = typed.call(0u);
+
+  auto deliverCoord = [&](uint32_t y, uint32_t x) {
+    auto bytes = packCoordBytes(y, x);
+    std::vector<uint8_t> first(bytes.begin(), bytes.begin() + 6);
+    std::vector<uint8_t> second(bytes.begin() + 6, bytes.end());
+    EXPECT_TRUE(
+        mockRead.deliver(std::make_unique<MessageData>(std::move(first))));
+    EXPECT_TRUE(
+        mockRead.deliver(std::make_unique<MessageData>(std::move(second))));
+  };
+  deliverCoord(/*y=*/11, /*x=*/22); // call 1's response
+  deliverCoord(/*y=*/33, /*x=*/44); // call 2's response
+
+  // Intentionally retrieve the second call's result first.
+  FragmentedCoordBatch r2 = f2.get();
+  ASSERT_EQ(r2.coords.size(), 1u);
+  EXPECT_EQ(r2.coords[0].y, 33u);
+  EXPECT_EQ(r2.coords[0].x, 44u);
+
+  FragmentedCoordBatch r1 = f1.get();
+  ASSERT_EQ(r1.coords.size(), 1u);
+  EXPECT_EQ(r1.coords[0].y, 11u);
+  EXPECT_EQ(r1.coords[0].x, 22u);
+
   delete func;
 }
 

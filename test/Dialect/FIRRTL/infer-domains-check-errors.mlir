@@ -74,11 +74,13 @@ firrtl.circuit "UndrivenInstanceChoiceDomainPort" {
 firrtl.circuit "IllegalDomainCrossing" {
   firrtl.domain @ClockDomain
   firrtl.module @IllegalDomainCrossing(
+    // expected-note @below {{input module port A declared here}}
     in %A: !firrtl.domain<@ClockDomain()>,
+    // expected-note @below {{input module port B declared here}}
     in %B: !firrtl.domain<@ClockDomain()>,
-    // expected-note @below {{2nd operand has domains: [ClockDomain: A]}}
+    // expected-note @below {{a has domains [A : ClockDomain]}}
     in %a: !firrtl.uint<1> domains [%A],
-    // expected-note @below {{1st operand has domains: [ClockDomain: B]}}
+    // expected-note @below {{b has domains [B : ClockDomain]}}
     out %b: !firrtl.uint<1> domains [%B]
   ) {
     // expected-error @below {{illegal domain crossing in operation}}
@@ -155,17 +157,30 @@ firrtl.circuit "UnsafeDomainCastMismatch" {
   firrtl.domain @ClockDomain [#firrtl.domain.field<"id", !firrtl.integer>]
 
   firrtl.module @UnsafeDomainCastMismatch(
+    // expected-note @below {{input module port A declared here}}
     in %A: !firrtl.domain<@ClockDomain(id: !firrtl.integer)>,
-    // expected-note @below {{1st operand has domains}}
+    // expected-note @below {{b has domains [A : ClockDomain]}}
     out %b: !firrtl.uint<1> domains [%A]
   ) {
     %id = firrtl.domain.subfield %A["id"] : !firrtl.domain<@ClockDomain(id: !firrtl.integer)>
+    // expected-note @below {{%C declared here}}
     %C = firrtl.domain.create(%id) : !firrtl.domain<@ClockDomain(id: !firrtl.integer)>
 
     %a = firrtl.wire : !firrtl.uint<1>
-    // expected-note @below {{2nd operand has domains}}
+    // expected-note @below {{%1 has domains}}
     %0 = firrtl.unsafe_domain_cast %a domains[%C] : !firrtl.uint<1> domains[!firrtl.domain<@ClockDomain(id: !firrtl.integer)>]
     // expected-error @below {{illegal domain crossing}}
     firrtl.matchingconnect %b, %0 : !firrtl.uint<1>
+  }
+}
+
+// https://github.com/llvm/circt/issues/10885
+firrtl.circuit "Issue10885" {
+  firrtl.module @Child(out %x: !firrtl.uint<1>) {
+    %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
+    firrtl.matchingconnect %x, %c0_ui1 : !firrtl.uint<1>
+  }
+  firrtl.module @Issue10885() {
+    %x = firrtl.instance c @Child(out x: !firrtl.uint<1>)
   }
 }

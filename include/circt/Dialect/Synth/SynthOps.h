@@ -13,7 +13,9 @@
 #ifndef CIRCT_DIALECT_SYNTH_SYNTHOPS_H
 #define CIRCT_DIALECT_SYNTH_SYNTHOPS_H
 
+#include "circt/Dialect/Synth/SynthAttributes.h"
 #include "circt/Dialect/Synth/SynthDialect.h"
+#include "circt/Dialect/Synth/SynthOpInterfaces.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -32,13 +34,11 @@
 
 namespace circt {
 namespace synth {
-struct AndInverterVariadicOpConversion
-    : mlir::OpRewritePattern<aig::AndInverterOp> {
-  using OpRewritePattern<aig::AndInverterOp>::OpRewritePattern;
-  mlir::LogicalResult
-  matchAndRewrite(aig::AndInverterOp op,
-                  mlir::PatternRewriter &rewriter) const override;
-};
+void populateVariadicAndInverterLoweringPatterns(
+    mlir::RewritePatternSet &patterns);
+void populateVariadicXorInverterLoweringPatterns(
+    mlir::RewritePatternSet &patterns);
+bool isLogicNetworkOp(mlir::Operation *op);
 
 /// This function performs a topological sort on the operations within each
 /// block of graph regions in the given operation. It uses MLIR's topological
@@ -128,6 +128,51 @@ T buildBalancedTreeWithArrivalTimes(llvm::ArrayRef<T> elements,
   }
 
   return pq.top();
+}
+
+/// Evaluate the Boolean function `x ^ (z | (x & y))`.
+template <typename T>
+T evaluateDotLogic(const T &x, const T &y, const T &z) {
+  return x ^ (z | (x & y));
+}
+
+template <typename T>
+T evaluateMajorityLogic(const T &a, const T &b, const T &c) {
+  return (a & b) | (a & c) | (b & c);
+}
+
+inline llvm::APInt invertBooleanLogic(llvm::APInt value) {
+  value.flipAllBits();
+  return value;
+}
+
+inline llvm::KnownBits invertBooleanLogic(llvm::KnownBits value) {
+  std::swap(value.Zero, value.One);
+  return value;
+}
+
+inline llvm::KnownBits applyInputInversion(llvm::KnownBits value,
+                                           bool inverted) {
+  if (inverted)
+    std::swap(value.Zero, value.One);
+  return value;
+}
+
+template <typename T>
+T evaluateOneHotLogic(const T &a, const T &b, const T &c) {
+  auto allSet = a & b & c;
+  return (a ^ b ^ c) & invertBooleanLogic(allSet);
+}
+
+template <typename T>
+T evaluateMuxLogic(const T &a, const T &b, const T &c) {
+  return (a & b) | (invertBooleanLogic(a) & c);
+}
+
+template <typename T>
+T evaluateGambleLogic(const T &a, const T &b, const T &c) {
+  auto orSet = a | b | c;
+  return (a & b & c) | invertBooleanLogic(orSet);
 }
 
 } // namespace synth

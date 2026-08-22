@@ -41,27 +41,6 @@ static FailureOr<size_t> calculateNonZeroBits(Value operand,
   return nonZeroBits;
 }
 
-// This pattern commonly arrises when inverting zext: ~zext(x) = {1,...1, ~x}
-// Check if the operand is {ones, base} and return the unextended operand:
-static FailureOr<Value> isOneExt(Value operand) {
-  // Check if operand is a concat operation
-  auto concatOp = operand.getDefiningOp<comb::ConcatOp>();
-  if (!concatOp)
-    return failure();
-
-  auto operands = concatOp.getOperands();
-  // ConcatOp must have exactly 2 operands
-  if (operands.size() != 2)
-    return failure();
-
-  APInt value;
-  if (matchPattern(operands[0], m_ConstantInt(&value)) && value.isAllOnes())
-    // Return the base unextended value
-    return success(operands[1]);
-
-  return failure();
-}
-
 // zext(input<<trailingZeros) to targetWidth
 static Value zeroPad(PatternRewriter &rewriter, Location loc, Value input,
                      size_t targetWidth, size_t trailingZeros) {
@@ -238,6 +217,9 @@ struct FoldAddIntoCompress : public OpRewritePattern<comb::AddOp> {
 //           {       1,    1, ...,       1,      0, ...,    0} =
 //         = zext({~x[p-1], x[p-2], ..., x[0]}) + ((-1) << (width(x)-1))
 //
+// More generally, for an arbitrary replicated prefix:
+// {r, r, ..., r, x} = zext({~r, x}) + ((-1) << width(x))
+//
 // Note that we are adding arguments to the compressor, but we are reducing the
 // number of unknown bits in the compressor array
 struct SextCompress : public OpRewritePattern<CompressOp> {
@@ -249,101 +231,49 @@ struct SextCompress : public OpRewritePattern<CompressOp> {
     auto opSize = inputs[0].getType().getIntOrFloatBitWidth();
     auto size = inputs.size();
 
-    APInt value;
     SmallVector<Value> newInputs;
     for (auto input : inputs) {
-      Value sextInput;
-      // Check for sext of the inverted value
-      if (!matchPattern(input, comb::m_Sext(m_Any(&sextInput)))) {
+      Value replBits;
+      bool isSext = matchPattern(input, comb::m_SextBy(m_Any(&replBits)));
+      if (!isSext && !matchPattern(input, comb::m_ReplExt(m_Any(&replBits)))) {
         newInputs.push_back(input);
         continue;
       }
+      auto baseWidth = opSize - replBits.getType().getIntOrFloatBitWidth();
 
-      auto baseWidth = sextInput.getType().getIntOrFloatBitWidth();
-      // Need a separate sign-bit that gets extended by at least two bits to
-      // be beneficial
+      // The replicated prefix must contain at least two bits to be beneficial.
       if (baseWidth <= 1 || (opSize - baseWidth) <= 1) {
         newInputs.push_back(input);
         continue;
       }
 
-      // x[p-2:0]
-      auto base = comb::ExtractOp::create(rewriter, op.getLoc(), sextInput, 0,
-                                          baseWidth - 1);
-      // x[p-1]
-      auto signBit = comb::ExtractOp::create(rewriter, op.getLoc(), sextInput,
-                                             baseWidth - 1, 1);
-      auto invSign =
-          comb::createOrFoldNot(rewriter, op.getLoc(), signBit, true);
-      // {~x[p-1], x[p-2:0]}
+      // For a sign extension, the repeated bit is already the most significant
+      // bit of the base. For a general replicated extension, preserve the
+      // entire base and get the repeated bit from the replicate operation.
+      auto correctionBit = isSext ? baseWidth - 1 : baseWidth;
+      auto base = comb::ExtractOp::create(rewriter, op.getLoc(), input, 0,
+                                          correctionBit);
+      Value repeatedBit = comb::ExtractOp::create(rewriter, op.getLoc(), input,
+                                                  correctionBit, 1);
+      auto invRepeatedBit =
+          comb::createOrFoldNot(rewriter, op.getLoc(), repeatedBit, true);
+      // Replace the repeated prefix zeros and a constant correction.
       auto newOp = comb::ConcatOp::create(rewriter, op.getLoc(),
-                                          ValueRange{invSign, base});
+                                          ValueRange{invRepeatedBit, base});
       auto newOpZExt = comb::createZExt(rewriter, op.getLoc(), newOp, opSize);
 
       newInputs.push_back(newOpZExt);
 
-      // (-1) << (width(x)-1)
+      // Constant correction (-1) << width (-1)
       auto ones = APInt::getAllOnes(opSize);
-      auto correction = hw::ConstantOp::create(rewriter, op.getLoc(),
-                                               ones << (baseWidth - 1));
+      auto correction =
+          hw::ConstantOp::create(rewriter, op.getLoc(), ones << correctionBit);
 
       newInputs.push_back(correction);
     }
 
     // If no sext inputs have not updated any arguments
     if (newInputs.size() == size)
-      return failure();
-
-    auto newCompress = datapath::CompressOp::create(
-        rewriter, op.getLoc(), newInputs, op.getNumResults());
-    rewriter.replaceOp(op, newCompress.getResults());
-    return success();
-  }
-};
-
-// compress(..., oneExt(x),...) ->
-// compress(..., zext(x), (-1) << (width(x)-1), ...)
-// Justification:
-//           {1, 1, ..., 1, x}
-//         = zext(x) + ((-1) << (width(x)-1))
-//
-// Note that we are adding arguments to the compressor, but these can be
-// constant folded should other constants arise
-//
-// A pattern encountered when we convert subtraction to addition:
-// zext(a)-zext(b) = zext(a) + ~zext(b) + 1
-//                 = zext(a) + oneExt(~b) + 1
-// TODO: use knownBits to extract all constant ones
-struct OnesExtCompress : public OpRewritePattern<CompressOp> {
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(CompressOp op,
-                                PatternRewriter &rewriter) const override {
-    auto inputs = op.getInputs();
-    auto opType = inputs[0].getType();
-    auto opSize = opType.getIntOrFloatBitWidth();
-
-    SmallVector<Value> newInputs;
-    for (auto input : inputs) {
-      // Check for replication of ones leading
-      auto baseInput = isOneExt(input);
-      if (failed(baseInput)) {
-        newInputs.push_back(input);
-        continue;
-      }
-
-      // Separate {ones, x} -> zext(x) + (ones << baseWidth)
-      auto newOp = comb::createZExt(rewriter, op.getLoc(), *baseInput, opSize);
-      newInputs.push_back(newOp);
-
-      APInt ones = APInt::getAllOnes(opSize);
-      auto baseWidth = baseInput->getType().getIntOrFloatBitWidth();
-      auto correction =
-          hw::ConstantOp::create(rewriter, op.getLoc(), ones << baseWidth);
-      newInputs.push_back(correction);
-    }
-
-    if (newInputs.size() == inputs.size())
       return failure();
 
     auto newCompress = datapath::CompressOp::create(
@@ -408,7 +338,7 @@ struct ConstantFoldCompress : public OpRewritePattern<CompressOp> {
 void CompressOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                              MLIRContext *context) {
   results.add<FoldCompressIntoCompress, FoldAddIntoCompress,
-              ConstantFoldCompress, SextCompress, OnesExtCompress>(context);
+              ConstantFoldCompress, SextCompress>(context);
 }
 
 //===----------------------------------------------------------------------===//
@@ -469,15 +399,22 @@ struct SignedPartialProducts : public OpRewritePattern<PartialProductOp> {
   // negations with constant corrections that can be folded together.
   LogicalResult matchAndRewrite(PartialProductOp op,
                                 PatternRewriter &rewriter) const override {
-    auto inputWidth = op.getOperand(0).getType().getIntOrFloatBitWidth();
-    Value lhs;
-    Value rhs;
-    if (!matchPattern(op.getOperand(0), comb::m_Sext(m_Any(&lhs))) ||
-        !matchPattern(op.getOperand(1), comb::m_Sext(m_Any(&rhs))))
+    // Booth encoding will automatically handle signed multiplications
+    auto isSquarer = op.getLhs() == op.getRhs();
+    if (comb::shouldUseBoothEncoding(op.getLhs(), op.getRhs()) && !isSquarer)
       return failure();
 
-    size_t lhsWidth = lhs.getType().getIntOrFloatBitWidth();
-    size_t rhsWidth = rhs.getType().getIntOrFloatBitWidth();
+    auto inputWidth = op.getLhs().getType().getIntOrFloatBitWidth();
+    Value lhsReplBits;
+    Value rhsReplBits;
+    if (!matchPattern(op.getLhs(), comb::m_SextBy(m_Any(&lhsReplBits))) ||
+        !matchPattern(op.getRhs(), comb::m_SextBy(m_Any(&rhsReplBits))))
+      return failure();
+
+    size_t lhsWidth =
+        inputWidth - lhsReplBits.getType().getIntOrFloatBitWidth();
+    size_t rhsWidth =
+        inputWidth - rhsReplBits.getType().getIntOrFloatBitWidth();
     // Subtract 1 as will handle sign-bit separately
     size_t maxRows = std::max(lhsWidth, rhsWidth) - 1;
 
@@ -493,14 +430,14 @@ struct SignedPartialProducts : public OpRewritePattern<PartialProductOp> {
     // Pull off the sign bits
     auto lhsBaseWidth = lhsWidth - 1;
     auto rhsBaseWidth = rhsWidth - 1;
-    auto lhsSignBit =
-        comb::ExtractOp::create(rewriter, op.getLoc(), lhs, lhsBaseWidth, 1);
-    auto rhsSignBit =
-        comb::ExtractOp::create(rewriter, op.getLoc(), rhs, rhsBaseWidth, 1);
-    auto lhsBase =
-        comb::ExtractOp::create(rewriter, op.getLoc(), lhs, 0, lhsBaseWidth);
-    auto rhsBase =
-        comb::ExtractOp::create(rewriter, op.getLoc(), rhs, 0, rhsBaseWidth);
+    auto lhsSignBit = comb::ExtractOp::create(rewriter, op.getLoc(),
+                                              op.getLhs(), lhsBaseWidth, 1);
+    auto rhsSignBit = comb::ExtractOp::create(rewriter, op.getLoc(),
+                                              op.getRhs(), rhsBaseWidth, 1);
+    auto lhsBase = comb::ExtractOp::create(rewriter, op.getLoc(), op.getLhs(),
+                                           0, lhsBaseWidth);
+    auto rhsBase = comb::ExtractOp::create(rewriter, op.getLoc(), op.getRhs(),
+                                           0, rhsBaseWidth);
 
     // Create the unsigned partial product of the unextended inputs
     auto lhsBaseZext =
@@ -660,7 +597,101 @@ struct ReduceNumPosPartialProducts
   }
 };
 
+struct SignedPosPartialProducts : public OpRewritePattern<PosPartialProductOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  // Inspired by the classical Baugh-Wooley algorithm for signed mulitplication.
+  // Paper: A Two's Complement Parallel Array Multiplication Algorithm
+  //
+  // Consider a p-bit signed pos - producing a q-bit result:
+  // a_sign = a[p-1], a_mag = a[p-2:0],
+  // b_sign = b[p-1], b_mag = b[p-2:0]
+  // (sext(a) + sext(b)) * c = (a_mag + b_mag) * c               [unsigned pos]
+  //                           - 2^(p-1) * (a_sign + b_sign) * c [sign correct]
+  //
+  // We implement optimizations to turn the subtractions into bitwise
+  // negations with constant corrections that can be folded together.
+  LogicalResult matchAndRewrite(PosPartialProductOp op,
+                                PatternRewriter &rewriter) const override {
+
+    auto a = op.getAddend0();
+    auto b = op.getAddend1();
+    auto c = op.getMultiplicand();
+    auto loc = op.getLoc();
+    auto inputWidth = a.getType().getIntOrFloatBitWidth();
+    Value aReplBits;
+    Value bReplBits;
+    if (!matchPattern(a, comb::m_SextBy(m_Any(&aReplBits))) ||
+        !matchPattern(b, comb::m_SextBy(m_Any(&bReplBits))))
+      return failure();
+
+    size_t aWidth = inputWidth - aReplBits.getType().getIntOrFloatBitWidth();
+    size_t bWidth = inputWidth - bReplBits.getType().getIntOrFloatBitWidth();
+
+    // TODO: add support for different width inputs
+    // Need to have a sign bit in both inputs
+    if (aWidth != bWidth || aWidth <= 1 || bWidth <= 1)
+      return failure();
+
+    // Pull off the sign bits
+    auto baseWidth = aWidth - 1;
+    // No further reduction possible - already reduced to min partial products
+    // Need baseWidth rows + 2 for sign correction and constant correction
+    if (baseWidth + 2 >= op.getNumResults())
+      return failure();
+
+    auto aSign = comb::ExtractOp::create(rewriter, loc, a, baseWidth, 1);
+    auto bSign = comb::ExtractOp::create(rewriter, loc, b, baseWidth, 1);
+    auto aBase = comb::ExtractOp::create(rewriter, loc, a, 0, baseWidth);
+    auto bBase = comb::ExtractOp::create(rewriter, loc, b, 0, baseWidth);
+
+    // Create the unsigned pos partial product of the unextended inputs
+    auto aBaseZext = comb::createZExt(rewriter, loc, aBase, inputWidth);
+    auto bBaseZext = comb::createZExt(rewriter, loc, bBase, inputWidth);
+    auto newPP = datapath::PosPartialProductOp::create(
+        rewriter, loc, ValueRange{aBaseZext, bBaseZext, op.getMultiplicand()},
+        baseWidth);
+
+    // Optimization:
+    // -2^(p-1)*(a_sign + b_sign) * c =
+    // ~(((a_sign & b_sign)*2c | (a_sign ^ b_sign)*c)  << (p-1)) + 1
+    //          CARRY                   SAVE
+
+    auto cWidth = c.getType().getIntOrFloatBitWidth();
+    auto carry = rewriter.createOrFold<comb::AndOp>(loc, aSign, bSign);
+    auto save = rewriter.createOrFold<comb::XorOp>(loc, aSign, bSign);
+    auto one = hw::ConstantOp::create(rewriter, loc, APInt(cWidth, 1));
+    auto twoC = rewriter.createOrFold<comb::ShlOp>(loc, c, one);
+    auto replSave = rewriter.createOrFold<comb::ReplicateOp>(loc, save, cWidth);
+    auto replCarry =
+        rewriter.createOrFold<comb::ReplicateOp>(loc, carry, cWidth);
+    auto carryAnd = rewriter.createOrFold<comb::AndOp>(loc, replCarry, twoC);
+    auto saveAnd = rewriter.createOrFold<comb::AndOp>(loc, replSave, c);
+    auto ppRow = rewriter.createOrFold<comb::OrOp>(loc, carryAnd, saveAnd);
+    auto shiftBy =
+        hw::ConstantOp::create(rewriter, loc, APInt(cWidth, baseWidth));
+    auto ppRowShift = rewriter.createOrFold<comb::ShlOp>(loc, ppRow, shiftBy);
+    auto ppRowNot = comb::createOrFoldNot(rewriter, loc, ppRowShift);
+
+    // Collect newPP results and pad with zeros if needed
+    SmallVector<Value> newResults(newPP.getResults().begin(),
+                                  newPP.getResults().end());
+
+    // Can safely append rows as we know original operation had at least
+    // baseWidth + 2 rows
+    newResults.push_back(ppRowNot);
+    newResults.push_back(one); // Constant correction for the sign correction
+    // Zero pad if necessary
+    auto zero = hw::ConstantOp::create(rewriter, op.getLoc(),
+                                       APInt::getZero(inputWidth));
+    newResults.append(op.getNumResults() - newResults.size(), zero);
+
+    rewriter.replaceOp(op, newResults);
+    return success();
+  }
+};
+
 void PosPartialProductOp::getCanonicalizationPatterns(
     RewritePatternSet &results, MLIRContext *context) {
-  results.add<ReduceNumPosPartialProducts>(context);
+  results.add<ReduceNumPosPartialProducts, SignedPosPartialProducts>(context);
 }

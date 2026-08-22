@@ -4,16 +4,18 @@
 
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Callable, IO
+from typing import Dict, List, Optional, Callable, IO, Union
 import threading
 
 _thisdir = Path(__file__).parent
 CosimCollateralDir = _thisdir
+_SUPPORTED_SIMULATORS = ("verilator", "questa")
 
 
 def is_port_open(port) -> bool:
@@ -22,6 +24,36 @@ def is_port_open(port) -> bool:
   result = sock.connect_ex(('127.0.0.1', port))
   sock.close()
   return True if result == 0 else False
+
+
+def supported_simulators() -> List[str]:
+  """Return the simulator backends known to the ESI cosim runtime."""
+  return list(_SUPPORTED_SIMULATORS)
+
+
+def is_simulator_available(name: str) -> bool:
+  """Return True if the requested simulator backend is usable.
+
+  This checks the executable and environment conventions used by the Python
+  cosim backends, so pytest callers can skip simulator-backed tests before
+  generating or compiling hardware collateral.
+  """
+  name = name.lower()
+  if name == "verilator":
+    from .verilator import Verilator
+    if Verilator._find_verilator_bin() is None:
+      return False
+    return Verilator._find_verilator_root() is not None
+  if name == "questa":
+    return shutil.which("vsim") is not None
+  raise ValueError(f"Unknown simulator: {name}")
+
+
+def available_simulators() -> List[str]:
+  """Return the known simulator backends available in this environment."""
+  return [
+      name for name in _SUPPORTED_SIMULATORS if is_simulator_available(name)
+  ]
 
 
 class SourceFiles:
@@ -57,19 +89,55 @@ class SourceFiles:
         self.add_dir(file)
 
   def dpi_so_paths(self) -> List[Path]:
-    """Return a list of all the DPI shared object files."""
+    """Return a list of all the DPI shared object files (the loadable
+    artifact: ``.so`` on POSIX, ``.dll`` on Windows)."""
+    return [self._find_dpi(name, link=False) for name in self.dpi_so]
 
-    def find_so(name: str) -> Path:
-      for path in Simulator.get_env().get("LD_LIBRARY_PATH", "").split(":"):
-        if os.name == "nt":
-          so = Path(path) / f"{name}.dll"
-        else:
-          so = Path(path) / f"lib{name}.so"
-        if so.exists():
-          return so
-      raise FileNotFoundError(f"Could not find {name}.so in LD_LIBRARY_PATH")
+  def dpi_link_paths(self) -> List[Path]:
+    """Return a list of files to pass to the linker for the DPI libraries.
+    On POSIX this is the same as ``dpi_so_paths()``; on Windows it is the
+    import library (``.lib``) sitting next to the DLL."""
+    return [self._find_dpi(name, link=True) for name in self.dpi_so]
 
-    return [find_so(name) for name in self.dpi_so]
+  def _find_dpi(self, name: str, link: bool) -> Path:
+    is_windows = os.name == "nt"
+
+    def check_path(p: Path) -> Optional[Path]:
+      if is_windows:
+        suffix = ".lib" if link else ".dll"
+        cand = p / f"{name}{suffix}"
+      else:
+        cand = p / f"lib{name}.so"
+      return cand if cand.exists() else None
+
+    env = Simulator.get_env()
+    if is_windows:
+      search_env = env.get("PATH", "")
+      env_sep = os.pathsep
+    else:
+      search_env = env.get("LD_LIBRARY_PATH", "")
+      env_sep = ":"
+    for path in search_env.split(env_sep):
+      if not path:
+        continue
+      p = check_path(Path(path))
+      if p is not None:
+        return p
+
+    # Check a few directories relative to this file. The build tree puts
+    # libraries under ``<package>/../lib`` and ``<package>/../../lib``; wheel
+    # installs put them directly in the esiaccel package dir.
+    for candidate in (
+        _thisdir.parent,
+        _thisdir.parent / "lib",
+        _thisdir.parent.parent / "lib",
+    ):
+      p = check_path(candidate)
+      if p is not None:
+        return p
+
+    suffix = (".lib" if link else ".dll") if is_windows else ".so"
+    raise FileNotFoundError(f"Could not find {name}{suffix}")
 
   @property
   def rtl_sources(self) -> List[Path]:
@@ -92,7 +160,15 @@ class SimProcess:
   def force_stop(self):
     """Make sure to stop the simulation no matter what."""
     if self.proc:
-      os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+      if os.name == "nt":
+        # The child was started with CREATE_NEW_PROCESS_GROUP, so CTRL_BREAK
+        # is delivered to that group only.
+        try:
+          self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except (OSError, ValueError):
+          pass
+      else:
+        os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
       # Allow the simulation time to flush its outputs.
       try:
         self.proc.wait(timeout=1.0)
@@ -106,6 +182,10 @@ class SimProcess:
 
 
 class Simulator:
+
+  CompileCommand = List[str]
+  CompileFunction = Callable[[], Optional[int]]
+  CompileStep = Union[CompileCommand, CompileFunction]
 
   # Some RTL simulators don't use stderr for error messages. Everything goes to
   # stdout. Boo! They should feel bad about this. Also, they can specify that
@@ -192,43 +272,76 @@ class Simulator:
     """Get the environment variables to locate shared objects."""
 
     env = os.environ.copy()
-    env["LIBRARY_PATH"] = env.get("LIBRARY_PATH", "") + ":" + str(
-        _thisdir.parent / "lib")
-    env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH", "") + ":" + str(
-        _thisdir.parent / "lib")
+    # Directories that may contain the ESI runtime / cosim DPI shared
+    # libraries (build tree and wheel install layouts).
+    lib_dirs = [
+        str(_thisdir.parent),
+        str(_thisdir.parent / "lib"),
+        str(_thisdir.parent.parent / "lib"),
+    ]
+    sep = os.pathsep
+    if os.name == "nt":
+      # Windows resolves DLL loads via PATH (and the loader's own search
+      # order). Make sure both the package dir (wheel layout) and any
+      # build-tree ``lib`` dirs are visible.
+      env["PATH"] = sep.join(lib_dirs) + sep + env.get("PATH", "")
+    else:
+      env["LIBRARY_PATH"] = env.get("LIBRARY_PATH",
+                                    "") + ":" + ":".join(lib_dirs)
+      env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH",
+                                       "") + ":" + ":".join(lib_dirs)
     return env
 
-  def compile_commands(self) -> List[List[str]]:
-    """Compile the sources. Returns the exit code of the simulation compiler."""
+  def compile_commands(self) -> List[CompileStep]:
+    """Return the compile steps for the simulator.
+
+    Each step may be either a shell command (`List[str]`) or a Python callback
+    (`Callable[[], Optional[int]]`). Python callbacks should return `0` or
+    `None` on success and a non-zero integer on failure.
+    """
     assert False, "Must be implemented by subclass"
+
+  def _run_compile_command(self, cmd: CompileCommand) -> int:
+    ret = self._start_process_with_callbacks(cmd,
+                                             env=Simulator.get_env(),
+                                             cwd=None,
+                                             stdout_cb=self._compile_stdout_cb,
+                                             stderr_cb=self._compile_stderr_cb,
+                                             wait=True)
+    if isinstance(ret, int) and ret != 0:
+      print("====== Compilation failure")
+
+      # Always print both stdout and stderr so that linker errors (which go
+      # to stdout for cmake/ninja) are not silently hidden.
+      if self._compile_stdout_log is not None:
+        self._compile_stdout_log.seek(0)
+        stdout_content = self._compile_stdout_log.read()
+        if stdout_content:
+          print(stdout_content)
+      if self._compile_stderr_log is not None:
+        self._compile_stderr_log.seek(0)
+        stderr_content = self._compile_stderr_log.read()
+        if stderr_content:
+          print(stderr_content)
+
+    return ret if isinstance(ret, int) else 1
+
+  def _run_compile_step(self, step: CompileStep) -> int:
+    if callable(step):
+      ret = step()
+      if ret is None:
+        return 0
+      if not isinstance(ret, int):
+        raise TypeError("compile step callback must return int or None")
+      return ret
+    return self._run_compile_command(step)
 
   def compile(self) -> int:
     cmds = self.compile_commands()
     self.run_dir.mkdir(parents=True, exist_ok=True)
-    for cmd in cmds:
-      ret = self._start_process_with_callbacks(
-          cmd,
-          env=Simulator.get_env(),
-          cwd=None,
-          stdout_cb=self._compile_stdout_cb,
-          stderr_cb=self._compile_stderr_cb,
-          wait=True)
-      if isinstance(ret, int) and ret != 0:
-        print("====== Compilation failure")
-
-        # Always print both stdout and stderr so that linker errors (which go
-        # to stdout for cmake/ninja) are not silently hidden.
-        if self._compile_stdout_log is not None:
-          self._compile_stdout_log.seek(0)
-          stdout_content = self._compile_stdout_log.read()
-          if stdout_content:
-            print(stdout_content)
-        if self._compile_stderr_log is not None:
-          self._compile_stderr_log.seek(0)
-          stderr_content = self._compile_stderr_log.read()
-          if stderr_content:
-            print(stderr_content)
-
+    for step in cmds:
+      ret = self._run_compile_step(step)
+      if ret != 0:
         return ret
     return 0
 
@@ -304,15 +417,9 @@ class Simulator:
           port = int(m.group(1))
       portFile.close()
 
-    # Wait for the simulation to start accepting RPC connections.
-    checkCount = 0
-    while not is_port_open(port):
-      checkCount += 1
-      if checkCount > 200:
-        raise Exception(f"Cosim RPC port ({port}) never opened")
-      if proc.poll() is not None:
-        raise Exception("Simulation exited early")
-      time.sleep(0.05)
+    # The cosim server writes ``cosim.cfg`` after its TCP listen socket is
+    # bound and the accept thread has been spawned. So we don't need to wait for
+    # the port to be opened.
     return SimProcess(proc=proc, port=port, threads=threads, gui=gui)
 
   def _start_process_with_callbacks(

@@ -52,47 +52,6 @@ using namespace chirrtl;
 // Utilities
 //===----------------------------------------------------------------------===//
 
-/// Remove elements from the input array corresponding to set bits in
-/// `indicesToDrop`, returning the elements not mentioned.
-template <typename T>
-static SmallVector<T>
-removeElementsAtIndices(ArrayRef<T> input,
-                        const llvm::BitVector &indicesToDrop) {
-#ifndef NDEBUG
-  if (!input.empty()) {
-    int lastIndex = indicesToDrop.find_last();
-    if (lastIndex >= 0)
-      assert((size_t)lastIndex < input.size() && "index out of range");
-  }
-#endif
-
-  // If the input is empty (which is an optimization we do for certain array
-  // attributes), simply return an empty vector.
-  if (input.empty())
-    return {};
-
-  // Copy over the live chunks.
-  size_t lastCopied = 0;
-  SmallVector<T> result;
-  result.reserve(input.size() - indicesToDrop.count());
-
-  for (unsigned indexToDrop : indicesToDrop.set_bits()) {
-    // If we skipped over some valid elements, copy them over.
-    if (indexToDrop > lastCopied) {
-      result.append(input.begin() + lastCopied, input.begin() + indexToDrop);
-      lastCopied = indexToDrop;
-    }
-    // Ignore this value so we don't copy it in the next iteration.
-    ++lastCopied;
-  }
-
-  // If there are live elements at the end, copy them over.
-  if (lastCopied < input.size())
-    result.append(input.begin() + lastCopied, input.end());
-
-  return result;
-}
-
 /// Emit an error if optional location is non-null, return null of return type.
 template <typename RetTy = FIRRTLType, typename... Args>
 static RetTy emitInferRetTypeError(std::optional<Location> loc,
@@ -2337,7 +2296,7 @@ void ExtClassOp::build(OpBuilder &builder, OperationState &result,
       llvm::all_of(ports,
                    [](const auto &port) { return port.annotations.empty(); }) &&
       "class ports may not have annotations");
-  buildClass<ClassOp>(builder, result, name, ports);
+  buildClass<ExtClassOp>(builder, result, name, ports);
 }
 
 void ExtClassOp::print(OpAsmPrinter &p) {
@@ -3815,7 +3774,7 @@ void NodeOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
 LogicalResult NodeOp::inferReturnTypes(
     mlir::MLIRContext *context, std::optional<mlir::Location> location,
     ::mlir::ValueRange operands, ::mlir::DictionaryAttr attributes,
-    ::mlir::OpaqueProperties properties, ::mlir::RegionRange regions,
+    ::mlir::PropertyRef properties, ::mlir::RegionRange regions,
     ::llvm::SmallVectorImpl<::mlir::Type> &inferredReturnTypes) {
   if (operands.empty())
     return failure();
@@ -3849,6 +3808,39 @@ RegOp::computeDataFlow() {
   return {};
 }
 
+/// Verify that an optional `initial` time-zero value attribute is a constant of
+/// the correct ground type. The attribute's bit width and signedness must match
+/// the register's declared ground type.
+static LogicalResult verifyInitialAttr(Operation *op, FIRRTLBaseType regType,
+                                       IntegerAttr initial) {
+  if (!initial)
+    return success();
+
+  // Aggregate register support is deferred; require a ground type.
+  auto intType = type_dyn_cast<IntType>(regType);
+  if (!intType)
+    return op->emitError(
+        "'initial' value is only supported on ground-type registers");
+
+  // The width of the attribute must match the register's declared width.
+  auto width = intType.getWidthOrSentinel();
+  if (width != -1 && (int)initial.getValue().getBitWidth() != width)
+    return op->emitError("'initial' value bitwidth (")
+           << initial.getValue().getBitWidth()
+           << ") doesn't match register type width (" << width << ")";
+
+  // The sign of the attribute's integer type must match the register type sign.
+  auto attrType = type_cast<IntegerType>(initial.getType());
+  if (attrType.isSignless() || attrType.isSigned() != intType.isSigned())
+    return op->emitError("'initial' value has wrong sign");
+
+  return success();
+}
+
+LogicalResult RegOp::verify() {
+  return verifyInitialAttr(*this, getResult().getType(), getInitialAttr());
+}
+
 LogicalResult RegResetOp::verify() {
   auto reset = getResetValue();
 
@@ -3860,7 +3852,7 @@ LogicalResult RegResetOp::verify() {
     return emitError("type mismatch between register ")
            << regType << " and reset value " << resetType;
 
-  return success();
+  return verifyInitialAttr(*this, regType, getInitialAttr());
 }
 
 std::optional<size_t> RegResetOp::getTargetResultIndex() { return 0; }
@@ -3956,9 +3948,9 @@ SimulationOp::verifySymbolUses(mlir::SymbolTableCollection &symbolTable) {
   // Additional non-hardware ports are allowed.
   for (unsigned i = 4; i < numPorts; ++i) {
     auto type = module.getPortType(i);
-    if (!isa<PropertyType>(type))
-      return complain() << "port " << i << " may only be a property type, got "
-                        << type << " instead";
+    auto firrtlType = type_dyn_cast<FIRRTLType>(type);
+    if (!firrtlType || hasHardwareElements(firrtlType))
+      return complain() << "port " << i << " contains hardware types: " << type;
   }
 
   return success();
@@ -4448,6 +4440,16 @@ LogicalResult PropAssignOp::verify() {
   if (failed(checkSingleConnect(*this)))
     return failure();
 
+  return success();
+}
+
+LogicalResult PropertyAssertOp::verify() {
+  // Static evaluation: if the condition is a known constant false, the
+  // assertion is trivially violated and we can report an error immediately.
+  if (auto *defOp = getCondition().getDefiningOp())
+    if (auto boolConst = dyn_cast<BoolConstantOp>(defOp))
+      if (!boolConst.getValue())
+        return emitOpError("property assertion is statically false");
   return success();
 }
 
@@ -5182,7 +5184,7 @@ ParseResult IsTagOp::parse(OpAsmParser &parser, OperationState &result) {
 }
 
 FIRRTLType IsTagOp::inferReturnType(ValueRange operands, DictionaryAttr attrs,
-                                    OpaqueProperties properties,
+                                    PropertyRef properties,
                                     mlir::RegionRange regions,
                                     std::optional<Location> loc) {
   Adaptor adaptor(operands, attrs, properties, regions);
@@ -5436,7 +5438,7 @@ FIRRTLType OpenSubindexOp::inferReturnType(Type type, uint32_t fieldIndex,
 }
 
 FIRRTLType SubtagOp::inferReturnType(ValueRange operands, DictionaryAttr attrs,
-                                     OpaqueProperties properties,
+                                     PropertyRef properties,
                                      mlir::RegionRange regions,
                                      std::optional<Location> loc) {
   Adaptor adaptor(operands, attrs, properties, regions);
@@ -5505,7 +5507,7 @@ void MultibitMuxOp::print(OpAsmPrinter &p) {
 
 FIRRTLType MultibitMuxOp::inferReturnType(ValueRange operands,
                                           DictionaryAttr attrs,
-                                          OpaqueProperties properties,
+                                          PropertyRef properties,
                                           mlir::RegionRange regions,
                                           std::optional<Location> loc) {
   if (operands.size() < 2)
@@ -5526,7 +5528,7 @@ FIRRTLType MultibitMuxOp::inferReturnType(ValueRange operands,
 
 LogicalResult ObjectSubfieldOp::inferReturnTypes(
     MLIRContext *context, std::optional<mlir::Location> location,
-    ValueRange operands, DictionaryAttr attributes, OpaqueProperties properties,
+    ValueRange operands, DictionaryAttr attributes, PropertyRef properties,
     RegionRange regions, llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
   auto type =
       inferReturnType(operands, attributes, properties, regions, location);
@@ -5744,7 +5746,7 @@ FIRRTLType impl::inferComparisonResult(FIRRTLType lhs, FIRRTLType rhs,
 }
 
 FIRRTLType CatPrimOp::inferReturnType(ValueRange operands, DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
   // If no operands, return a 0-bit UInt
@@ -6114,7 +6116,7 @@ FIRRTLType MuxPrimOp::inferReturnType(FIRRTLType sel, FIRRTLType high,
 
 FIRRTLType Mux2CellIntrinsicOp::inferReturnType(ValueRange operands,
                                                 DictionaryAttr attrs,
-                                                OpaqueProperties properties,
+                                                PropertyRef properties,
                                                 mlir::RegionRange regions,
                                                 std::optional<Location> loc) {
   auto highType = type_dyn_cast<FIRRTLBaseType>(operands[1].getType());
@@ -6127,7 +6129,7 @@ FIRRTLType Mux2CellIntrinsicOp::inferReturnType(ValueRange operands,
 
 FIRRTLType Mux4CellIntrinsicOp::inferReturnType(ValueRange operands,
                                                 DictionaryAttr attrs,
-                                                OpaqueProperties properties,
+                                                PropertyRef properties,
                                                 mlir::RegionRange regions,
                                                 std::optional<Location> loc) {
   SmallVector<FIRRTLBaseType> types;
@@ -6720,6 +6722,15 @@ void IntegerShrOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
 void IntegerShlOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
   genericAsmResultNames(*this, setNameFn);
 }
+void BoolAndOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  genericAsmResultNames(*this, setNameFn);
+}
+void BoolOrOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  genericAsmResultNames(*this, setNameFn);
+}
+void BoolXorOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  genericAsmResultNames(*this, setNameFn);
+}
 void IsTagOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
   genericAsmResultNames(*this, setNameFn);
 }
@@ -6872,7 +6883,7 @@ void RWProbeOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
 
 FIRRTLType RefResolveOp::inferReturnType(ValueRange operands,
                                          DictionaryAttr attrs,
-                                         OpaqueProperties properties,
+                                         PropertyRef properties,
                                          mlir::RegionRange regions,
                                          std::optional<Location> loc) {
   Type inType = operands[0].getType();
@@ -6884,7 +6895,7 @@ FIRRTLType RefResolveOp::inferReturnType(ValueRange operands,
 }
 
 FIRRTLType RefSendOp::inferReturnType(ValueRange operands, DictionaryAttr attrs,
-                                      OpaqueProperties properties,
+                                      PropertyRef properties,
                                       mlir::RegionRange regions,
                                       std::optional<Location> loc) {
   Type inType = operands[0].getType();
@@ -7435,7 +7446,7 @@ Type DomainSubfieldOp::inferReturnType(Type inType, uint32_t fieldIndex,
 
 Type DomainSubfieldOp::inferReturnType(ValueRange operands,
                                        mlir::DictionaryAttr attrs,
-                                       mlir::OpaqueProperties properties,
+                                       mlir::PropertyRef properties,
                                        mlir::RegionRange regions,
                                        std::optional<Location> loc) {
   Adaptor adaptor(operands, attrs, properties, regions);
@@ -7455,7 +7466,7 @@ DomainSubfieldOp DomainSubfieldOp::create(OpBuilder &builder, Type resultType,
 
 LogicalResult DomainSubfieldOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   Adaptor adaptor(operands, attributes, properties, regions);
   auto resultType = inferReturnType(adaptor.getInput().getType(),

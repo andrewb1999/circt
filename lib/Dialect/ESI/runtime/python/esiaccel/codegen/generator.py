@@ -1,0 +1,2183 @@
+#  Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+#  See https://llvm.org/LICENSE.txt for license information.
+#  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+"""Code generation from ESI manifests to source code.
+
+Uses a two-pass approach for C++: first collect and name all reachable types,
+then emit structs/aliases in a dependency-ordered sequence so headers are
+standalone and deterministic.
+"""
+
+# C++ header support included with the runtime, though it is intended to be
+# extensible for other languages.
+
+from typing import Any, Callable, Dict, List, Set, TextIO, Tuple, Type, Optional, cast
+from ..accelerator import AcceleratorConnection, Context, Instance
+from ..esiCppAccel import AppID, ModuleInfo
+from .. import types
+
+import sys
+import os
+import textwrap
+import argparse
+from pathlib import Path
+
+from .indented_writer import IndentedWriter
+from .ports import CppPortGroup, CppPortKind, cpp_port_kind
+
+
+class Generator:
+  """Base class for all generators."""
+
+  language: Optional[str] = None
+
+  def __init__(self, conn: AcceleratorConnection) -> None:
+    self.manifest = conn.manifest()
+
+  def generate(self, output_dir: Path, system_name: str) -> None:
+    raise NotImplementedError("Generator.generate() must be overridden")
+
+
+class CppGenerator(Generator):
+  """Generate C++ headers from an ESI manifest."""
+
+  language = "C++"
+
+  def __init__(self, conn: AcceleratorConnection) -> None:
+    super().__init__(conn)
+    self._conn = conn
+    self.type_planner = CppTypePlanner(self.manifest.type_table)
+    self.type_emitter = CppTypeEmitter(self.type_planner)
+
+  def get_consts_str(self, module_info: ModuleInfo) -> str:
+    """Get the C++ code for a constant in a module."""
+    const_strs: List[str] = [
+        f"static constexpr {self.type_emitter.type_identifier(const.type)} "
+        f"{name} = 0x{const.value:x};"
+        for name, const in module_info.constants.items()
+    ]
+    return "\n".join(const_strs)
+
+  # ---------------------------------------------------------------------------
+  # Port-emission helpers
+  # ---------------------------------------------------------------------------
+
+  @staticmethod
+  def _sanitize_id(name: str) -> str:
+    """Return a C++-safe identifier from an AppID name."""
+    result = []
+    for ch in name:
+      result.append(ch if (ch.isalnum() or ch == "_") else "_")
+    if not result:
+      return "_port"
+    if result[0].isdigit():
+      result.insert(0, "_")
+    return "".join(result)
+
+  def _build_module_instance_map(self) -> Dict[str, Instance]:
+    """Walk the live hierarchy and return {module_name: first Instance}."""
+    accel = self._conn.build_accelerator()
+    result: Dict[str, Instance] = {}
+    queue = list(accel.children.values())
+    while queue:
+      inst = queue.pop(0)
+      info = inst.cpp_hwmodule.info
+      if info is not None:
+        name = info.name
+        if name is not None and name not in result:
+          result[name] = inst
+      queue.extend(inst.children.values())
+    return result
+
+  def _port_using_aliases(self, kind: CppPortKind, alias_prefix: str,
+                          port: types.BundlePort) -> List[Tuple[str, str]]:
+    """Return (alias_name, type_id) pairs to emit as `using` declarations at
+    module-class scope for the typed-port template parameters."""
+    if kind.alias_kind == "func":
+      # func kinds are always FunctionPort / CallbackPort, which share the
+      # arg/result attributes accessed here.
+      func_port = cast(types.FunctionPort, port)
+      arg = self.type_emitter.type_identifier(func_port.arg_window_type or
+                                              func_port.arg_type)
+      res = self.type_emitter.type_identifier(func_port.result_window_type or
+                                              func_port.result_type)
+      return [
+          (f"{alias_prefix}Args", arg),
+          (f"{alias_prefix}Result", res),
+      ]
+    if kind.alias_kind == "chan":
+      # chan kinds are always ToHostPort / FromHostPort, which share the
+      # data attributes accessed here.
+      chan_port = cast(types.ToHostPort, port)
+      data = self.type_emitter.type_identifier(chan_port.data_window_type or
+                                               chan_port.data_type)
+      return [(f"{alias_prefix}Data", data)]
+    return []
+
+  @staticmethod
+  def _appid_expr(appid: AppID) -> str:
+    """Return `esi::AppID(...)` expression for an AppID."""
+    name = appid.name
+    idx = appid.idx
+    if idx is None:
+      return f'esi::AppID("{name}")'
+    return f'esi::AppID("{name}", {idx})'
+
+  def _scalar_port_group(self, member_name: str, port: types.BundlePort,
+                         appid: AppID) -> CppPortGroup:
+    """Build a CppPortGroup for a single scalar (non-indexed) port."""
+    kind = cpp_port_kind(port)
+    aliases = self._port_using_aliases(kind, member_name, port)
+    alias_prefix = member_name if aliases else None
+    member_type = kind.member_type(alias_prefix=alias_prefix)
+    is_ref = member_type.endswith(" &")
+    param_name = f"{member_name}{kind.param_suffix}"
+
+    if is_ref:
+      member_decl = f"{member_type}{member_name};"
+    else:
+      member_decl = f"{member_type} {member_name};"
+
+    post = ""
+    if kind.connectable:
+      post = f"connected->{member_name}.connect();"
+
+    return CppPortGroup(
+        member_decl=member_decl,
+        ctor_params=[f"{kind.param_type} {param_name}"],
+        init_entry=f"{member_name}({param_name})",
+        find_code=kind.scalar_find_code(param_name, self._appid_expr(appid)),
+        make_unique_args=[param_name],
+        post_connect=post,
+        using_aliases=aliases,
+    )
+
+  def _indexed_ports_group(
+      self, member_name: str, appid_name: str,
+      port_list: List[Tuple[AppID, types.BundlePort]]) -> CppPortGroup:
+    """Build a CppPortGroup for a same-name, same-type indexed port array."""
+    # Derive the element type from the first port.
+    first_port = port_list[0][1]
+    kind = cpp_port_kind(first_port)
+    aliases = self._port_using_aliases(kind, member_name, first_port)
+    alias_prefix = member_name if aliases else None
+    elem_type = kind.indexed_elem_type(alias_prefix=alias_prefix)
+    indexed_type = f"esi::IndexedPorts<{elem_type}>"
+    map_var = f"{member_name}_backing"
+    map_type = f"std::map<int, {elem_type}>"
+    indexed_var = f"{member_name}_map"
+
+    # Build the find code: per-index resolve and try_emplace, then freeze
+    # into the IndexedPorts wrapper. The body of the loop differs by port
+    # kind: channel ports need an extra `getRawRead("data")` /
+    # `getRawWrite("data")` step, MMIO regions and metrics store raw
+    # pointers.
+    find_parts = [
+        f"{map_type} {map_var};",
+        f"for (uint32_t idx : esi::findPortIndices(rawModule, "
+        f"\"{appid_name}\")) {{",
+    ]
+    appid_expr = f'esi::AppID("{appid_name}", idx)'
+    find_parts.append(kind.indexed_find_code(map_var, appid_expr))
+    find_parts.append("}")
+    find_parts.append(f"{indexed_type} {indexed_var}(std::move({map_var}));")
+
+    post = ""
+    if kind.connectable:
+      # IndexedPorts now exposes mutable iteration so `port.connect()` is fine.
+      post = (f"for (auto &[idx, port] : connected->{member_name})\n"
+              f"  port.connect();")
+
+    return CppPortGroup(
+        member_decl=f"{indexed_type} {member_name};",
+        ctor_params=[f"{indexed_type} {indexed_var}"],
+        init_entry=f"{member_name}(std::move({indexed_var}))",
+        find_code="\n".join(find_parts),
+        make_unique_args=[f"std::move({indexed_var})"],
+        post_connect=post,
+        using_aliases=aliases,
+    )
+
+  def _mixed_struct_group(
+      self, member_name: str, appid_name: str,
+      port_list: List[Tuple[AppID, types.BundlePort]]) -> CppPortGroup:
+    """Build a CppPortGroup for a same-name, mixed-type indexed port group."""
+    struct_name = f"{member_name}_ports"
+    sub_member_decls: List[str] = []
+    ctor_params: List[str] = []
+    init_args: List[str] = []
+    find_parts: List[str] = []
+    make_args: List[str] = []
+    post_parts: List[str] = []
+    using_aliases: List[Tuple[str, str]] = []
+
+    for appid, port in port_list:
+      kind = cpp_port_kind(port)
+      idx = appid.idx if appid.idx is not None else 0
+      sub_name = f"_{idx}"
+      sub_alias_prefix = f"{member_name}_{idx}"
+      sub_aliases = self._port_using_aliases(kind, sub_alias_prefix, port)
+      using_aliases.extend(sub_aliases)
+      alias_prefix = sub_alias_prefix if sub_aliases else None
+      member_type = kind.member_type(alias_prefix=alias_prefix)
+      is_ref = member_type.endswith(" &")
+      if is_ref:
+        sub_member_decls.append(f"{member_type}{sub_name};")
+      else:
+        sub_member_decls.append(f"{member_type} {sub_name};")
+
+      param_name = f"{member_name}_{idx}{kind.param_suffix}"
+      ctor_params.append(f"{kind.param_type} {param_name}")
+      init_args.append(param_name)
+      # The connect() local mirrors the ctor param name plus the kind's
+      # suffix; the find snippet declares it and make_unique passes it.
+      find_local = f"{param_name}{kind.param_suffix}"
+      find_parts.append(
+          kind.scalar_find_code(find_local, self._appid_expr(appid)))
+      make_args.append(find_local)
+      if kind.connectable:
+        post_parts.append(f"connected->{member_name}.{sub_name}.connect();")
+
+    struct_decl = (f"struct {struct_name} {{\n" +
+                   "".join(f"      {d}\n" for d in sub_member_decls) + "    };")
+    init_entry = f"{member_name}{{{', '.join(init_args)}}}"
+
+    return CppPortGroup(
+        struct_decls=[struct_decl],
+        member_decl=f"{struct_name} {member_name};",
+        ctor_params=ctor_params,
+        init_entry=init_entry,
+        find_code="\n".join(find_parts),
+        make_unique_args=make_args,
+        post_connect="\n".join(post_parts),
+        using_aliases=using_aliases,
+    )
+
+  def _collect_port_groups(
+      self, ports: Dict[AppID, types.BundlePort]) -> List[CppPortGroup]:
+    """Group `ports` (AppID → BundlePort) into CppPortGroup list."""
+    # Group by AppID name, preserving sorted order.
+    groups_by_name: Dict[str, list] = {}
+    for appid, port in ports.items():
+      n = appid.name
+      if n not in groups_by_name:
+        groups_by_name[n] = []
+      groups_by_name[n].append((appid, port))
+
+    result: List[CppPortGroup] = []
+    for appid_name, port_list in groups_by_name.items():
+      member_name = self._sanitize_id(appid_name)
+      # Sort by idx (None → -1 so scalar ports sort first).
+      port_list.sort(key=lambda x: x[0].idx if x[0].idx is not None else -1)
+
+      if len(port_list) == 1:
+        appid, port = port_list[0]
+        if appid.idx is None:
+          result.append(self._scalar_port_group(member_name, port, appid))
+        else:
+          result.append(
+              self._indexed_ports_group(member_name, appid_name, port_list))
+        continue
+
+      # Multiple ports with the same name.
+      all_indexed = all(a.idx is not None for a, _ in port_list)
+      if not all_indexed:
+        # Degenerate: mix of indexed and non-indexed with the same name.
+        # Emit as a mixed struct for safety.
+        result.append(
+            self._mixed_struct_group(member_name, appid_name, port_list))
+        continue
+
+      all_same_type = len({type(p) for _, p in port_list}) == 1
+      if all_same_type:
+        result.append(
+            self._indexed_ports_group(member_name, appid_name, port_list))
+      else:
+        result.append(
+            self._mixed_struct_group(member_name, appid_name, port_list))
+
+    return result
+
+  def _emit_module_class(self, name: str, system_name: str,
+                         module_info: ModuleInfo,
+                         port_groups: List[CppPortGroup], out: TextIO) -> None:
+    """Emit the full module class to `out`."""
+    out.write(f"/// Generated header for {system_name} module {name}.\n"
+              "#pragma once\n"
+              '#include "types.h"\n'
+              '#include "esi/TypedPorts.h"\n'
+              "\n"
+              "#include <any>\n"
+              "#include <map>\n"
+              "#include <optional>\n"
+              "#include <string>\n"
+              "\n"
+              f"namespace {system_name} {{\n"
+              "\n")
+
+    # Module metadata as a Doxygen comment block above the class.
+    metadata_lines: List[str] = []
+    summary = getattr(module_info, "summary", None)
+    if summary:
+      for line in summary.splitlines():
+        metadata_lines.append(line)
+    for label, attr in (("Version", "version"), ("Repository", "repo"),
+                        ("Commit", "commit_hash")):
+      val = getattr(module_info, attr, None)
+      if val:
+        metadata_lines.append(f"{label}: {val}")
+    if metadata_lines:
+      out.write("///\n")
+      for line in metadata_lines:
+        out.write(f"/// {line}\n" if line else "///\n")
+      out.write("///\n")
+
+    out.write(f"class {name} {{\n"
+              "public:\n")
+
+    consts = self.get_consts_str(module_info)
+    if consts:
+      out.write("  // Module constants.\n")
+      out.write(f"  {consts}\n\n")
+
+    # Type aliases for typed-port template parameters, hoisted to module scope
+    # so the long mangled names don't appear inline as template arguments.
+    aliases = [a for grp in port_groups for a in grp.using_aliases]
+    if aliases:
+      for alias_name, alias_type in aliases:
+        out.write(f"  using {alias_name} = {alias_type};\n")
+      out.write("\n")
+
+    if port_groups:
+      out.write(
+          "  /// Holds the resolved, typed ports for this module instance.\n"
+          "  /// Returned by `connect()`.\n"
+          "  class Connected {\n  public:\n")
+
+      # Struct declarations for mixed groups.
+      for grp in port_groups:
+        for decl in grp.struct_decls:
+          out.write(f"    {decl}\n")
+      if any(grp.struct_decls for grp in port_groups):
+        out.write("\n")
+
+      # Member declarations.
+      for grp in port_groups:
+        out.write(f"    {grp.member_decl}\n")
+      out.write("\n")
+
+      # Constructor.
+      all_params = [p for grp in port_groups for p in grp.ctor_params]
+      out.write("    Connected(\n")
+      for i, param in enumerate(all_params):
+        comma = "," if i < len(all_params) - 1 else ""
+        out.write(f"        {param}{comma}\n")
+      out.write("        )\n        : ")
+      inits = [grp.init_entry for grp in port_groups]
+      out.write(",\n          ".join(inits))
+      out.write(" {}\n  };\n\n")
+
+    # Outer constructor.
+    out.write(
+        f"  {name}(esi::HWModule *rawModule) : rawModule(rawModule) {{}}\n\n")
+
+    # Module-metadata accessors. These read from the live HWModule's ModuleInfo
+    # so callers can verify that the connected accelerator is compatible with
+    # the build the software was generated against.
+    out.write(
+        "  /// The connected module's name as reported by the manifest, or\n"
+        "  /// std::nullopt if the module has no metadata.\n"
+        "  std::optional<std::string> name() const {\n"
+        "    auto info = rawModule->getInfo();\n"
+        "    return info ? info->name : std::nullopt;\n"
+        "  }\n"
+        "  /// The connected module's summary string, if any.\n"
+        "  std::optional<std::string> summary() const {\n"
+        "    auto info = rawModule->getInfo();\n"
+        "    return info ? info->summary : std::nullopt;\n"
+        "  }\n"
+        "  /// The connected module's version string, if any.\n"
+        "  std::optional<std::string> version() const {\n"
+        "    auto info = rawModule->getInfo();\n"
+        "    return info ? info->version : std::nullopt;\n"
+        "  }\n"
+        "  /// The connected module's source repository, if any.\n"
+        "  std::optional<std::string> repo() const {\n"
+        "    auto info = rawModule->getInfo();\n"
+        "    return info ? info->repo : std::nullopt;\n"
+        "  }\n"
+        "  /// The connected module's source commit hash, if any.\n"
+        "  std::optional<std::string> commitHash() const {\n"
+        "    auto info = rawModule->getInfo();\n"
+        "    return info ? info->commitHash : std::nullopt;\n"
+        "  }\n"
+        "  /// Designer-specified constants for the connected module.\n"
+        "  /// Returns an empty map if the module has no metadata.\n"
+        "  std::map<std::string, esi::Constant> constants() const {\n"
+        "    auto info = rawModule->getInfo();\n"
+        "    return info ? info->constants\n"
+        "                : std::map<std::string, esi::Constant>{};\n"
+        "  }\n"
+        "  /// Free-form designer-supplied metadata for the connected module.\n"
+        "  /// Returns an empty map if the module has no metadata.\n"
+        "  std::map<std::string, std::any> extra() const {\n"
+        "    auto info = rawModule->getInfo();\n"
+        "    return info ? info->extra : std::map<std::string, std::any>{};\n"
+        "  }\n\n")
+
+    if port_groups:
+      out.write("  std::unique_ptr<Connected> connect() {\n")
+
+      # Find / resolve phase.
+      for grp in port_groups:
+        if grp.find_code:
+          for line in grp.find_code.splitlines():
+            out.write(f"    {line}\n")
+          out.write("\n")
+
+      # Construct Connected.
+      all_args = [a for grp in port_groups for a in grp.make_unique_args]
+      out.write("    auto connected = std::make_unique<Connected>(\n")
+      for i, arg in enumerate(all_args):
+        comma = "," if i < len(all_args) - 1 else ""
+        out.write(f"        {arg}{comma}\n")
+      out.write("    );\n\n")
+
+      # Post-construction connects.
+      for grp in port_groups:
+        if grp.post_connect:
+          for line in grp.post_connect.splitlines():
+            out.write(f"    {line}\n")
+
+      out.write("    return connected;\n  }\n\n")
+
+    out.write("private:\n  esi::HWModule *rawModule;\n};\n\n")
+    out.write(f"}} // namespace {system_name}\n")
+
+  def write_modules(self, output_dir: Path, system_name: str) -> None:
+    """Write the C++ header. One for each module in the manifest."""
+    module_instances = self._build_module_instance_map()
+
+    for module_info in self.manifest.module_infos:
+      if module_info.name is None:
+        continue
+      name = module_info.name
+      instance = module_instances.get(name)
+      try:
+        if instance is not None:
+          port_groups = self._collect_port_groups(instance.ports)
+        else:
+          port_groups = []
+      except (NotImplementedError, ValueError) as e:
+        hdr_file = output_dir / f"{name}.h"
+        with open(hdr_file, "w", encoding="utf-8") as hdr:
+          hdr.write(f"// Skipped: {e}\n")
+        continue
+
+      hdr_file = output_dir / f"{name}.h"
+      with open(hdr_file, "w", encoding="utf-8") as hdr:
+        self._emit_module_class(name, system_name, module_info, port_groups,
+                                hdr)
+
+  def generate(self, output_dir: Path, system_name: str) -> None:
+    self.type_emitter.write_header(output_dir, system_name)
+    self.write_modules(output_dir, system_name)
+
+
+class CppTypePlanner:
+  """Plan C++ type naming and ordering from an ESI manifest."""
+
+  def __init__(self, type_table: List[types.ESIType]) -> None:
+    """Initialize the generator with the manifest and target namespace."""
+    # Map manifest type ids to their preferred C++ names.
+    self.type_id_map: Dict[types.ESIType, str] = {}
+    # Track all names already taken to avoid collisions. True => alias-based.
+    self.used_names: Dict[str, bool] = {}
+    # Track alias base names to warn on collisions.
+    self.alias_base_names: Set[str] = set()
+    self.ordered_types: List[types.ESIType] = []
+    # Types the planner chose not to emit, paired with the reason. The
+    # emitter writes a `// Unsupported type ...` comment for each so the
+    # generated header explains the omission.
+    self.skipped_types: List[Tuple[types.ESIType, str]] = []
+    self.has_cycle = False
+    self._prepare_types(type_table)
+
+  def _prepare_types(self, type_table: List[types.ESIType]) -> None:
+    """Name the types and prepare for emission by registering all reachable
+    types and assigning."""
+    visited: Set[str] = set()
+    for t in type_table:
+      self._collect_aliases(t, visited)
+
+    visited = set()
+    for t in type_table:
+      self._collect_structs(t, visited)
+
+    visited = set()
+    for t in type_table:
+      self._collect_windows(t, visited)
+
+    self.ordered_types, self.has_cycle = self._ordered_emit_types()
+
+  def _sanitize_name(self, name: str) -> str:
+    """Create a C++-safe identifier from the manifest-provided name."""
+    name = name.replace("::", "_")
+    if name.startswith("@"):
+      name = name[1:]
+    sanitized = []
+    for ch in name:
+      if ch.isalnum() or ch == "_":
+        sanitized.append(ch)
+      else:
+        sanitized.append("_")
+    if not sanitized:
+      return "Type"
+    if sanitized[0].isdigit():
+      sanitized.insert(0, "_")
+    return "".join(sanitized)
+
+  def _reserve_name(self, base: str, is_alias: bool) -> str:
+    """Reserve a globally unique identifier using the sanitized base name."""
+    base = self._sanitize_name(base)
+    if is_alias and base in self.alias_base_names:
+      sys.stderr.write(
+          f"Warning: duplicate alias name '{base}' detected; disambiguating.\n")
+    if is_alias:
+      self.alias_base_names.add(base)
+    name = base
+    idx = 1
+    while name in self.used_names:
+      name = f"{base}_{idx}"
+      idx += 1
+    self.used_names[name] = is_alias
+    return name
+
+  def _auto_struct_name(self, struct_type: types.StructType) -> str:
+    """Derive a deterministic name for anonymous structs from their fields."""
+    parts = ["_struct"]
+    for field_name, field_type in struct_type.fields:
+      parts.append(field_name)
+      parts.append(self._sanitize_name(field_type.id))
+    return self._reserve_name("_".join(parts), is_alias=False)
+
+  def _auto_union_name(self, union_type: types.UnionType) -> str:
+    """Derive a deterministic name for anonymous unions from their fields."""
+    parts = ["_union"]
+    for field_name, field_type in union_type.fields:
+      parts.append(field_name)
+      parts.append(self._sanitize_name(field_type.id))
+    return self._reserve_name("_".join(parts), is_alias=False)
+
+  def _auto_window_name(self, window_type: types.WindowType) -> str:
+    """Derive a deterministic name for generated window helpers.
+
+    Two distinct windows can wrap the same `into` struct (e.g. serial and
+    parallel encodings of the same payload), so the helper name must be
+    derived from BOTH the inner type's name and the window's own name/id.
+    """
+    into_type = self._unwrap_aliases(window_type.into_type)
+    into_name = self.type_id_map.get(into_type)
+    window_part = (window_type.name
+                   if window_type.name else self._sanitize_name(window_type.id))
+    if into_name:
+      base = f"{into_name}_{window_part}"
+    elif window_type.name:
+      base = window_part
+    else:
+      base = f"_window_{window_part}"
+    return self._reserve_name(base, is_alias=False)
+
+  def _unwrap_aliases(self, wrapped: types.ESIType) -> types.ESIType:
+    while isinstance(wrapped, types.TypeAlias):
+      wrapped = wrapped.inner_type
+    return wrapped
+
+  def _is_supported_window(self, current_type: types.ESIType) -> bool:
+    if not isinstance(current_type, types.WindowType):
+      return False
+    into_type = self._unwrap_aliases(current_type.into_type)
+    if not isinstance(into_type, types.StructType):
+      return False
+
+    # The generated window helper only supports struct-shaped payloads with a
+    # single logical list field to stream across multiple frames.
+    list_fields = []
+    for field_name, field_type in into_type.fields:
+      if isinstance(self._unwrap_aliases(field_type), types.ListType):
+        list_fields.append(field_name)
+    if len(list_fields) != 1:
+      return False
+
+    list_field_name = list_fields[0]
+    header_field = None
+    data_field = None
+    # That list must appear exactly once as a bulk-count field and exactly once
+    # as a single-item data field so the helper can synthesize header/data/footer.
+    for frame in current_type.frames:
+      for field in frame.fields:
+        if field.name != list_field_name:
+          continue
+        if field.bulk_count_width > 0:
+          if header_field is not None:
+            return False
+          header_field = field
+        elif field.num_items > 0:
+          if data_field is not None:
+            return False
+          data_field = field
+    return (header_field is not None and data_field is not None and
+            data_field.num_items == 1)
+
+  def _iter_type_children(self, t: types.ESIType) -> List[types.ESIType]:
+    """Return child types in a stable order for traversal."""
+    if isinstance(t, types.TypeAlias):
+      return [t.inner_type] if t.inner_type is not None else []
+    if isinstance(t, types.BundleType):
+      return [channel.type for channel in t.channels]
+    if isinstance(t, types.ChannelType):
+      return [t.inner]
+    if isinstance(t, types.StructType):
+      return [field_type for _, field_type in t.fields]
+    if isinstance(t, types.UnionType):
+      return [field_type for _, field_type in t.fields]
+    if isinstance(t, types.ListType):
+      return [t.element_type]
+    if isinstance(t, types.WindowType):
+      return [t.into_type]
+    if isinstance(t, types.ArrayType):
+      return [t.element_type]
+    return []
+
+  def _visit_types(self, t: types.ESIType, visited: Set[str],
+                   visit_fn: Callable[[types.ESIType], None]) -> None:
+    """Traverse types with alphabetical child ordering in post-order."""
+    if not isinstance(t, types.ESIType):
+      raise TypeError(f"Expected ESIType, got {type(t)}")
+    tid = t.id
+    if tid in visited:
+      return
+    visited.add(tid)
+    children = sorted(self._iter_type_children(t), key=lambda child: child.id)
+    for child in children:
+      self._visit_types(child, visited, visit_fn)
+    visit_fn(t)
+
+  def _collect_aliases(self, t: types.ESIType, visited: Set[str]) -> None:
+    """Scan for aliases and reserve their names (recursive)."""
+
+    # Visit callback: reserve alias names and map aliases to identifiers.
+    def visit(alias_type: types.ESIType) -> None:
+      if not isinstance(alias_type, types.TypeAlias):
+        return
+      if alias_type not in self.type_id_map:
+        alias_name = self._reserve_name(alias_type.name, is_alias=True)
+        self.type_id_map[alias_type] = alias_name
+
+    self._visit_types(t, visited, visit)
+
+  def _collect_structs(self, t: types.ESIType, visited: Set[str]) -> None:
+    """Scan for structs/unions needing auto-names and reserve them."""
+
+    # Visit callback: assign auto-names to unnamed structs and unions.
+    def visit(current_type: types.ESIType) -> None:
+      if current_type in self.type_id_map:
+        return
+      if isinstance(current_type, types.StructType):
+        self.type_id_map[current_type] = self._auto_struct_name(current_type)
+      elif isinstance(current_type, types.UnionType):
+        self.type_id_map[current_type] = self._auto_union_name(current_type)
+
+    self._visit_types(t, visited, visit)
+
+  def _collect_windows(self, t: types.ESIType, visited: Set[str]) -> None:
+    """Scan for supported window types and reserve helper names."""
+
+    def visit(current_type: types.ESIType) -> None:
+      if not self._is_supported_window(current_type):
+        return
+      assert isinstance(current_type, types.WindowType)
+      if current_type in self.type_id_map:
+        return
+      self.type_id_map[current_type] = self._auto_window_name(current_type)
+
+    self._visit_types(t, visited, visit)
+
+  def _collect_decls_from_type(self,
+                               wrapped: types.ESIType) -> Set[types.ESIType]:
+    """Collect types that require top-level declarations for a given type."""
+    deps: Set[types.ESIType] = set()
+
+    # Visit callback: collect structs, unions, and aliases used by a type.
+    def visit(current: types.ESIType) -> None:
+      if isinstance(current, types.TypeAlias):
+        # A type that references an alias is emitted using the alias *name*
+        # (see `_cpp_type`), so it must be ordered after the alias's own
+        # `using` declaration. Depend on the alias itself, not the type it
+        # unwraps to; the alias in turn depends on that underlying struct /
+        # union / window, so the full chain (underlying -> alias -> user) is
+        # ordered correctly. (Depending on the unwrapped inner type instead
+        # left the alias free to sort *after* a user that referenced it --
+        # e.g. a nested `array<array<Alias>>` field, where it only happened
+        # to work for the un-nested case by alphabetical luck.)
+        deps.add(current)
+      elif isinstance(current, (types.StructType, types.UnionType)):
+        deps.add(current)
+      elif self._is_supported_window(current):
+        deps.add(current)
+
+    self._visit_types(wrapped, set(), visit)
+    return deps
+
+  def _collect_decls_from_window(
+      self, window_type: types.WindowType) -> Set[types.ESIType]:
+    """Collect only the declarations referenced by a generated window helper."""
+    deps: Set[types.ESIType] = set()
+    into_type = self._unwrap_aliases(window_type.into_type)
+    if not isinstance(into_type, types.StructType):
+      return deps
+
+    for _, field_type in into_type.fields:
+      unwrapped = self._unwrap_aliases(field_type)
+      if isinstance(unwrapped, types.ListType):
+        deps.update(self._collect_decls_from_type(unwrapped.element_type))
+      else:
+        deps.update(self._collect_decls_from_type(field_type))
+    return deps
+
+  def _contains_window(self, esi_type: types.ESIType) -> bool:
+    """Return True if `esi_type` is or transitively contains a WindowType.
+
+    Structs (and aliases/unions that reference them) which embed a window
+    cannot be emitted as C++ packed structs because the C++ window helper
+    is a variable-size multi-frame container. This helper is used to
+    exclude such types from the emission list entirely.
+    """
+    unwrapped = self._unwrap_aliases(esi_type)
+    if isinstance(unwrapped, types.WindowType):
+      return True
+    if isinstance(unwrapped, types.StructType):
+      return any(self._contains_window(ft) for _, ft in unwrapped.fields)
+    if isinstance(unwrapped, types.UnionType):
+      return any(self._contains_window(ft) for _, ft in unwrapped.fields)
+    if isinstance(unwrapped, types.ArrayType):
+      return self._contains_window(unwrapped.element_type)
+    return False
+
+  def _contains_unbounded(self, esi_type: types.ESIType) -> bool:
+    """Return True if `esi_type` is or transitively contains a type with
+    no bounded bit width (e.g. `!esi.any`, or a list that the window
+    helper can't wrap).
+
+    A struct can't be emitted as a fixed-size raw-bytes buffer if any
+    field's width is unbounded — there's no `std::array<uint8_t, N>` size
+    that would match the wire layout — so the planner excludes such
+    structs (and aliases/unions/arrays that reach one) from the emission
+    list, the same way `_contains_window` does for nested windows.
+    """
+    unwrapped = self._unwrap_aliases(esi_type)
+    try:
+      if unwrapped.bit_width < 0:
+        return True
+    except Exception:
+      return True
+    if isinstance(unwrapped, types.StructType):
+      return any(self._contains_unbounded(ft) for _, ft in unwrapped.fields)
+    if isinstance(unwrapped, types.UnionType):
+      return any(self._contains_unbounded(ft) for _, ft in unwrapped.fields)
+    if isinstance(unwrapped, types.ArrayType):
+      return self._contains_unbounded(unwrapped.element_type)
+    return False
+
+  def _ordered_emit_types(self) -> Tuple[List[types.ESIType], bool]:
+    """Collect and order types for deterministic emission."""
+    window_into_types: Set[types.ESIType] = set()
+    for esi_type in self.type_id_map.keys():
+      if not self._is_supported_window(esi_type):
+        continue
+      assert isinstance(esi_type, types.WindowType)
+      window_into_types.add(self._unwrap_aliases(esi_type.into_type))
+
+    # Build the skip set up front so the DFS dep-walk below can filter
+    # against it too — otherwise a top-level type can pull a skipped
+    # inner struct back into the emission list via `_collect_decls_*`.
+    skip_set: Set[types.ESIType] = set()
+    for esi_type in self.type_id_map.keys():
+      if isinstance(esi_type,
+                    types.StructType) and esi_type in window_into_types:
+        skip_set.add(esi_type)
+        self.skipped_types.append(
+            (esi_type,
+             "into-type of a windowed helper; subsumed by the helper class"))
+        continue
+      if isinstance(esi_type, types.TypeAlias):
+        inner = esi_type.inner_type
+        if inner is not None and self._unwrap_aliases(
+            inner) in window_into_types:
+          skip_set.add(esi_type)
+          self.skipped_types.append(
+              (esi_type, "alias of a windowed helper's into-type"))
+          continue
+      # Skip structs/unions/aliases that transitively embed a WindowType
+      # field. WindowType itself is fine — it emits as its own helper
+      # class.
+      if (not isinstance(self._unwrap_aliases(esi_type), types.WindowType) and
+          self._contains_window(esi_type)):
+        skip_set.add(esi_type)
+        self.skipped_types.append((esi_type, "contains a windowed sub-type"))
+        continue
+      # Skip structs/unions/aliases that transitively contain an
+      # unbounded type (e.g. `!esi.any`). No fixed-size raw-bytes buffer
+      # can hold them, so the per-field emitter has no width to embed.
+      # WindowType itself reports unbounded width but emits as its own
+      # helper class, so leave that branch alone.
+      if (not isinstance(self._unwrap_aliases(esi_type), types.WindowType) and
+          self._contains_unbounded(esi_type)):
+        skip_set.add(esi_type)
+        self.skipped_types.append(
+            (esi_type, "contains an unbounded sub-type (e.g. !esi.any)"))
+        continue
+
+    emit_types: List[types.ESIType] = []
+    for esi_type in self.type_id_map.keys():
+      if esi_type in skip_set:
+        continue
+      if (isinstance(esi_type,
+                     (types.StructType, types.UnionType, types.TypeAlias)) or
+          self._is_supported_window(esi_type)):
+        emit_types.append(esi_type)
+
+    # Prefer alias-reserved names first, then lexicographic for determinism.
+    name_to_type = {self.type_id_map[t]: t for t in emit_types}
+    sorted_names = sorted(name_to_type.keys(),
+                          key=lambda name:
+                          (0 if self.used_names.get(name, False) else 1, name))
+
+    ordered: List[types.ESIType] = []
+    visited: Set[types.ESIType] = set()
+    visiting: Set[types.ESIType] = set()
+    has_cycle = False
+
+    # Visit callback: DFS to emit dependencies before their users. Skipped
+    # types are filtered out of the dep set so they can't sneak back in
+    # via a non-skipped type that happens to reference them (e.g. an
+    # alias whose dep walk reaches the into-struct of a window helper).
+    def visit(current: types.ESIType) -> None:
+      nonlocal has_cycle
+      if current in visited:
+        return
+      if current in visiting:
+        has_cycle = True
+        return
+      visiting.add(current)
+
+      deps: Set[types.ESIType] = set()
+      if isinstance(current, types.TypeAlias):
+        inner = current.inner_type
+        if inner is not None:
+          deps.update(self._collect_decls_from_type(inner))
+      elif isinstance(current, (types.StructType, types.UnionType)):
+        for _, field_type in current.fields:
+          deps.update(self._collect_decls_from_type(field_type))
+      elif self._is_supported_window(current):
+        assert isinstance(current, types.WindowType)
+        deps.update(self._collect_decls_from_window(current))
+      for dep in sorted(deps, key=lambda dep: self.type_id_map[dep]):
+        if dep in skip_set:
+          continue
+        visit(dep)
+
+      visiting.remove(current)
+      visited.add(current)
+      ordered.append(current)
+
+    for name in sorted_names:
+      visit(name_to_type[name])
+
+    return ordered, has_cycle
+
+
+class CppTypeEmitter:
+  """Emit C++ headers from precomputed type ordering."""
+
+  def __init__(self, planner: CppTypePlanner) -> None:
+    self.type_id_map = planner.type_id_map
+    self.ordered_types = planner.ordered_types
+    self.skipped_types = planner.skipped_types
+    self.has_cycle = planner.has_cycle
+
+  def type_identifier(self, type: types.ESIType) -> str:
+    """Get the C++ type string for an ESI type."""
+    return self._cpp_type(type)
+
+  def _cpp_string_literal(self, value: str) -> str:
+    """Escape a Python string for use as a C++ string literal."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+  def _get_bitvector_str(self, type: types.ESIType) -> str:
+    """Get the textual code for the C++ type used to represent an integer
+    field's value at the API boundary.
+
+    Integers up to 64 bits map to the native `int{N}_t` / `uint{N}_t`
+    (or `bool` for a single bit) storage types so common scalars stay
+    zero-overhead, behave identically to plain C ints, and stay valid as
+    template parameters for the existing `TypedReadPort<T>` /
+    `TypedWritePort<T>` / `TypedFunction<...>` machinery.
+
+    Wider integers (signed > 64 bits, unsigned > 64 bits, or any
+    `BitsType` > 64 bits) fall back to the non-owning view classes from
+    `esi/Values.h`: `esi::BitVector` for `BitsType`, `esi::IntView` for
+    signed integers, `esi::UIntView` for unsigned. All three are
+    non-owning views over the parent struct's bytes, so generated
+    getters are zero-allocation; see the lifetime note on `BitVector`
+    and at the top of the generated header.
+    """
+    assert isinstance(type, (types.BitsType, types.IntType))
+
+    if type.bit_width > 64:
+      if isinstance(type, types.BitsType):
+        return "esi::BitVector"
+      if isinstance(type, types.UIntType):
+        return "esi::UIntView"
+      return "esi::IntView"
+
+    return self._storage_type(
+        type.bit_width, not isinstance(type, (types.BitsType, types.UIntType)))
+
+  def _storage_type(self, bit_width: int, signed: bool) -> str:
+    """Get the textual code for a native byte-addressable integer storage
+    type. Only valid for widths 1..64; wider integers are handled by
+    `_get_bitvector_str` via the `esi::IntView` / `esi::UIntView` view
+    classes.
+    """
+
+    if bit_width == 1:
+      return "bool"
+    elif bit_width <= 8:
+      storage_width = 8
+    elif bit_width <= 16:
+      storage_width = 16
+    elif bit_width <= 32:
+      storage_width = 32
+    elif bit_width <= 64:
+      storage_width = 64
+    else:
+      raise ValueError(f"Unsupported native integer width: {bit_width}")
+
+    if not signed:
+      return f"uint{storage_width}_t"
+    return f"int{storage_width}_t"
+
+  def _is_value_class_type(self, field_type: types.ESIType) -> bool:
+    """True if the C++ representation of this integer field is one of
+    the `esi::{BitVector,IntView,UIntView}` view classes from
+    `esi/Values.h` rather than a native integer.
+    """
+    wrapped = self._unwrap_aliases(field_type)
+    if not isinstance(wrapped, (types.BitsType, types.IntType)):
+      return False
+    return wrapped.bit_width > 64
+
+  def _array_base_and_dims(
+      self, array_type: types.ArrayType) -> Tuple[str, List[int]]:
+    """Return the base C++ type and outer-to-inner dimensions of a nested array."""
+    dims: List[int] = []
+    inner: types.ESIType = array_type
+    while isinstance(inner, types.ArrayType):
+      dims.append(inner.size)
+      inner = inner.element_type
+    base_cpp = self._cpp_type(inner)
+    return base_cpp, dims
+
+  def _std_array_type(self, array_type: types.ArrayType) -> str:
+    """Return the equivalent nested `std::array<...>` type for an array.
+
+    `std::array<T, N>` is layout-compatible in practice with `T[N]` on every
+    major implementation (and identical under `#pragma pack(1)`), so the
+    generator uses it everywhere a fixed-size array would appear.  This keeps
+    field/value/ctor types storable in `std::vector` and assignable with `=`.
+    """
+    base_cpp, dims = self._array_base_and_dims(array_type)
+    result = base_cpp
+    for size in reversed(dims):
+      result = f"std::array<{result}, {size}>"
+    return result
+
+  def _cpp_type(self, wrapped: types.ESIType) -> str:
+    """Resolve an ESI type to its C++ identifier."""
+    if isinstance(wrapped, types.WindowType) and wrapped in self.type_id_map:
+      return self.type_id_map[wrapped]
+    if isinstance(wrapped,
+                  (types.TypeAlias, types.StructType, types.UnionType)):
+      # Zero-width composite types (e.g. a struct of only void fields, or an
+      # alias to such a struct) collapse to `void`. C++ structs are defined to
+      # have `sizeof >= 1`, so there is no meaningful storage to emit; treat them
+      # as void everywhere they appear so callers comment them out exactly
+      # like a direct `VoidType` field.
+      if wrapped.bit_width == 0:
+        return "void"
+      return self.type_id_map[wrapped]
+    if isinstance(wrapped, types.BundleType):
+      return "void"
+    if isinstance(wrapped, types.ChannelType):
+      return self._cpp_type(wrapped.inner)
+    if isinstance(wrapped, types.ListType):
+      raise ValueError("List types require a generated window wrapper")
+    if isinstance(wrapped, types.VoidType):
+      return "void"
+    if isinstance(wrapped, types.AnyType):
+      return "std::any"
+    if isinstance(wrapped, (types.BitsType, types.IntType)):
+      # A zero-width integer carries no data; emit it as `void` so it gets
+      # commented out in field positions like any other void.
+      if wrapped.bit_width == 0:
+        return "void"
+      return self._get_bitvector_str(wrapped)
+    if isinstance(wrapped, types.ArrayType):
+      # `std::array<void, N>` is ill-formed; arrays of zero-width elements
+      # also collapse to `void`.
+      if wrapped.bit_width == 0:
+        return "void"
+      return self._std_array_type(wrapped)
+    if type(wrapped) is types.ESIType:
+      return "std::any"
+    raise NotImplementedError(
+        f"Type '{wrapped}' not supported for C++ generation")
+
+  def _unwrap_aliases(self, wrapped: types.ESIType) -> types.ESIType:
+    """Strip alias wrappers to reach the underlying type."""
+    while isinstance(wrapped, types.TypeAlias):
+      wrapped = wrapped.inner_type
+    return wrapped
+
+  def _format_window_ctor_param(self, field_name: str,
+                                field_type: types.ESIType) -> str:
+    """Emit a constructor parameter for generated window helpers.
+
+    Small scalar header fields are cheaper to pass by value than by reference.
+    Larger aggregates stay as const references.
+    """
+    field_cpp = self._cpp_type(field_type)
+    wrapped = self._unwrap_aliases(field_type)
+    if isinstance(wrapped, (types.BitsType, types.IntType)):
+      if self._is_value_class_type(field_type):
+        return f"const {field_cpp} &{field_name}"
+      return f"{field_cpp} {field_name}"
+    return f"const {field_cpp} &{field_name}"
+
+  def _field_byte_width(self, field_type: types.ESIType) -> int:
+    """Compute the byte width of a field type, rounding up to full bytes."""
+    return (field_type.bit_width + 7) // 8
+
+  def _safe_byte_width(self, esi_type: types.ESIType) -> Optional[int]:
+    """Return the bounded byte width of `esi_type`, or `None` if it has no
+    well-defined static size (e.g. unbounded `!esi.any` or recursive types).
+    """
+    try:
+      bit_width = esi_type.bit_width
+    except Exception:
+      return None
+    if bit_width is None or bit_width < 0:
+      return None
+    return (bit_width + 7) // 8
+
+  def _emit_size_assert(self, w: IndentedWriter, type_name: str,
+                        expected_bytes: Optional[int]) -> None:
+    """Emit a `static_assert` that pins the C++ `sizeof` of a packed type to
+    the byte width derived from the manifest.
+
+    `std::array` and bit-field layout are technically implementation-defined,
+    so this assertion is the safety net that catches a toolchain that lays
+    them out differently from the wire format.  Skipped silently for types
+    without a bounded static size.
+    """
+    if expected_bytes is None:
+      return
+    w.line(f"static_assert(sizeof({type_name}) == {expected_bytes},")
+    w.line(f'              "{type_name}: packed layout does not match '
+           f'manifest size");')
+
+  def _analyze_window(self, window_type: types.WindowType) -> Dict[str, Any]:
+    """Extract the metadata needed to emit a bulk list window wrapper."""
+    into_type = self._unwrap_aliases(window_type.into_type)
+    if not isinstance(into_type, types.StructType):
+      raise ValueError("window codegen currently requires a struct into-type")
+
+    field_map = {name: field_type for name, field_type in into_type.fields}
+    list_fields = [
+        (name, self._unwrap_aliases(field_type))
+        for name, field_type in into_type.fields
+        if isinstance(self._unwrap_aliases(field_type), types.ListType)
+    ]
+    if len(list_fields) != 1:
+      raise ValueError("window codegen currently supports exactly one list")
+
+    list_field_name, list_type = list_fields[0]
+    assert isinstance(list_type, types.ListType)
+
+    header_frame = None
+    header_field = None
+    data_frame = None
+    data_field = None
+    for frame in window_type.frames:
+      for field in frame.fields:
+        if field.name != list_field_name:
+          continue
+        if field.bulk_count_width > 0:
+          header_frame = frame
+          header_field = field
+        elif field.num_items > 0:
+          data_frame = frame
+          data_field = field
+
+    if header_frame is None or header_field is None:
+      raise ValueError("window codegen requires a bulk-count header frame")
+    if data_frame is None or data_field is None:
+      raise ValueError("window codegen requires a data frame for the list")
+    if data_field.num_items != 1:
+      raise ValueError("window codegen currently supports numItems == 1")
+
+    ctor_params = [(name, field_type)
+                   for name, field_type in into_type.fields
+                   if name != list_field_name]
+
+    # Frame fields are kept in declared (MSB-first) order and laid out
+    # MSB-aligned within the frame/union bit width, matching how CIRCT
+    # lowers the frame union (content packed from the most-significant bit
+    # down, with any slack as low-end padding). Widths are exact bit widths
+    # -- no per-field byte rounding -- so sub-byte count/static fields land
+    # at the same offsets the hardware uses.
+    header_fields = []
+    header_bits = 0
+    count_field_name = f"{list_field_name}_count"
+    count_width = header_field.bulk_count_width
+    count_cpp = self._storage_type(count_width, signed=False)
+    for field in header_frame.fields:
+      if field.name == list_field_name:
+        header_fields.append((count_field_name, None))
+        header_bits += count_width
+      else:
+        field_type = field_map[field.name]
+        header_fields.append((field.name, field_type))
+        header_bits += field_type.bit_width
+
+    data_fields = []
+    data_bits = 0
+    for field in data_frame.fields:
+      if field.name == list_field_name:
+        data_fields.append((list_field_name, list_type.element_type))
+        data_bits += list_type.element_type.bit_width
+      else:
+        field_type = field_map[field.name]
+        data_fields.append((field.name, field_type))
+        data_bits += field_type.bit_width
+
+    # The frame/union width is the wider of the two variants' content. The
+    # byte-array storage rounds that up to whole bytes (any extra high bits
+    # stay zero); both frames share it so `sizeof(header) == sizeof(data)`.
+    frame_bits = max(header_bits, data_bits)
+    frame_bytes = (frame_bits + 7) // 8
+
+    return {
+        "ctor_params": ctor_params,
+        "count_cpp": count_cpp,
+        "count_field_name": count_field_name,
+        "count_width": count_width,
+        "data_fields": data_fields,
+        "element_cpp": self._cpp_type(list_type.element_type),
+        "frame_bits": frame_bits,
+        "frame_bytes": frame_bytes,
+        "header_fields": header_fields,
+        "list_field_name": list_field_name,
+        "window_name": self.type_id_map[window_type],
+    }
+
+  def _compute_field_bit_offsets(
+      self, struct_type: types.StructType) -> Tuple[Dict[str, int], int]:
+    """Return `(bit_offset_by_name, total_bits)` for non-void fields.
+
+    Fields are laid out LSB-first in wire order, which is reversed manifest
+    order when `cpp_type.reverse` is set. Caller already knows each field's
+    type/width from `struct_type.fields`; we only need the per-name offset
+    and the resulting total bit width to size the storage array.
+    """
+    declared = struct_type.fields
+    if struct_type.cpp_type.reverse:
+      declared = list(reversed(declared))
+    bit_offsets: Dict[str, int] = {}
+    bit_offset = 0
+    for field_name, field_type in declared:
+      if self._cpp_type(field_type) == "void":
+        continue
+      bit_offsets[field_name] = bit_offset
+      bit_offset += field_type.bit_width
+    return bit_offsets, bit_offset
+
+  def _is_signed_int_field(self, field_type: types.ESIType) -> bool:
+    """True if the field is a signed integer (only `IntType`, not `UIntType`
+    or `BitsType`)."""
+    wrapped = self._unwrap_aliases(field_type)
+    return (isinstance(wrapped, types.IntType) and
+            not isinstance(wrapped, types.UIntType))
+
+  def _emit_view_store(self, w: IndentedWriter, raw_member: str, src: str,
+                       off_expr: str, width: int) -> None:
+    """Emit a loop writing the low `width` bits of the view `src` into
+    `raw_member`, with bit `b` landing at wire bit `off_expr + b`. Shared by
+    the scalar view-class field setter and the per-element view-array setter.
+    """
+    w.line(f"const std::size_t n = "
+           f"std::min<std::size_t>({src}.width(), {width});")
+    with w.block(f"for (std::size_t b = 0; b < {width}; ++b)"):
+      w.line(f"const std::size_t g = {off_expr} + b;")
+      w.line(f"const bool val = (b < n) && {src}.getBit(b);")
+      w.line("if (val)")
+      with w.indented():
+        w.line(f"{raw_member}[g / 8] |= "
+               f"static_cast<uint8_t>(uint8_t{{1}} << (g % 8));")
+      w.line("else")
+      with w.indented():
+        w.line(f"{raw_member}[g / 8] &= "
+               f"static_cast<uint8_t>(~(uint8_t{{1}} << (g % 8)));")
+
+  def _emit_field_accessor(self, w: IndentedWriter, raw_member: str,
+                           self_type: str, field_name: str,
+                           field_type: types.ESIType, bit_offset: int,
+                           bit_width: int) -> None:
+    """Emit a getter/setter pair that reads/writes `field_name` out of the
+    raw bytes member `raw_member` at `bit_offset` / `bit_width`.
+
+    Setters share the field's name (no `set_` prefix) and return
+    `self_type &` so the caller can chain calls (e.g.
+    `Foo{}.a(1).b(2).inner(x)`).
+
+    For integer fields the emitter picks between three inline strategies:
+
+      * Native ints (<= 64 bits). Delegate to the compile-time
+        `esi::detail::{read,write}{Un,}signedBits` helpers from
+        `esi/BitAccess.h`, which loop over the constituent bits at the
+        field's constant offset/width. The non-type template parameters
+        let the optimiser fully unroll the loop, so a byte-aligned
+        standard-width field still collapses to a single load/store on
+        -O1+ -- no special-cased `memcpy` / per-byte fast path required.
+      * `bool` (a single bit). Same helpers, specialised to read/write one
+        bit and hand back a `bool`.
+      * View-class fields. Triggered when `_is_value_class_type` is true --
+        currently widths above 64 bits, for any of `BitsType`, signed, or
+        unsigned. Returns a non-owning
+        `esi::BitVector` / `esi::IntView` / `esi::UIntView` view *into*
+        the parent struct's `_bytes` -- zero allocation, no copy. The
+        setter accepts any `esi::BitVector` (so views and owning
+        subclasses both work) and writes back bit-by-bit. The returned
+        view dangles when the parent buffer dies; see the lifetime warning
+        at the top of the generated header.
+    """
+    field_cpp = self._cpp_type(field_type)
+    if field_cpp == "void":
+      return
+
+    wrapped = self._unwrap_aliases(field_type)
+
+    if isinstance(wrapped, (types.BitsType, types.IntType)):
+      # View-class field. Today this is exactly the wider-than-64-bit
+      # integer / Bits cases; gated by `_is_value_class_type` so the rule
+      # lives in one place.
+      if self._is_value_class_type(field_type):
+        byte_offset = bit_offset // 8
+        sub_bit_index = bit_offset % 8
+        # Number of bytes the view needs to span: the high bit is at
+        # `sub_bit_index + bit_width - 1`, so we cover
+        # ceil((sub_bit_index + bit_width) / 8) bytes starting at
+        # `_bytes.data() + byte_offset`.
+        span_bytes = (sub_bit_index + bit_width + 7) // 8
+        with w.block(f"{field_cpp} {field_name}() const"):
+          w.line(f"return {field_cpp}(")
+          w.line(f"    std::span<const uint8_t>("
+                 f"{raw_member}.data() + {byte_offset}, {span_bytes}),")
+          w.line(f"    static_cast<std::size_t>({bit_width}),")
+          w.line(f"    static_cast<uint8_t>({sub_bit_index}));")
+        with w.block(f"{self_type} &{field_name}(const {field_cpp} &v)"):
+          # Walk the input view bit-by-bit and write each bit straight
+          # into `_bytes` at its target position.
+          self._emit_view_store(w, raw_member, "v", str(bit_offset), bit_width)
+          w.line("return *this;")
+        return
+
+      # `bool` is the storage choice for a single bit; bit-precise helpers
+      # are the simplest fit and the optimiser collapses them on -O2.
+      if bit_width == 1 and field_cpp == "bool":
+        with w.block(f"bool {field_name}() const"):
+          w.line(f"return esi::detail::readUnsignedBits<uint8_t, "
+                 f"{bit_offset}, 1>({raw_member}.data()) != 0;")
+        with w.block(f"{self_type} &{field_name}(bool v)"):
+          w.line(f"esi::detail::writeUnsignedBits<uint8_t, "
+                 f"{bit_offset}, 1>({raw_member}.data(), "
+                 f"static_cast<uint8_t>(v) & uint8_t{{1}});")
+          w.line("return *this;")
+        return
+
+      signed = self._is_signed_int_field(field_type)
+      kind = "Signed" if signed else "Unsigned"
+
+      # Delegate to the generic compile-time bit helpers from
+      # `esi/BitAccess.h`. They read/write `Width` bits starting at the
+      # field's constant `BitOffset` (LSB-first) for any width up to 64 --
+      # byte-aligned or not -- and sign-extend signed fields. Because
+      # `BitOffset` / `Width` are non-type template parameters the optimiser
+      # fully unrolls the per-bit loop, so byte-aligned standard-width fields
+      # (`ui8` / `ui32` / ...) still collapse to a single load/store on
+      # -O1+, so a single helper covers every width without any
+      # hand-written byte-copy fast paths.
+      with w.block(f"{field_cpp} {field_name}() const"):
+        w.line(f"return esi::detail::read{kind}Bits<{field_cpp}, "
+               f"{bit_offset}, {bit_width}>({raw_member}.data());")
+      with w.block(f"{self_type} &{field_name}({field_cpp} v)"):
+        w.line(f"esi::detail::write{kind}Bits<{field_cpp}, "
+               f"{bit_offset}, {bit_width}>({raw_member}.data(), v);")
+        w.line("return *this;")
+      return
+
+    # Aggregate field (struct / union / array). The inner aggregate stores
+    # its bits LSB-first in its own `_bytes` buffer, so reading/writing a
+    # struct or union reduces to copying `bit_width` bits between the parent
+    # buffer at `bit_offset` and the inner buffer at bit 0. Arrays are
+    # delegated to `_emit_array_accessor`, a recursive per-element (un)packer
+    # that places every scalar leaf at its true wire offset -- so sub-byte
+    # ints, odd widths, sub-byte aggregates, and *arbitrarily nested* arrays
+    # of those all round-trip, instead of being flat-copied (which only works
+    # when the C++ element layout already matches the wire, e.g. `4 x ui8`).
+    assert bit_width >= 0, (
+        f"field '{field_name}': unbounded aggregate field reached the "
+        f"emitter; the planner should have excluded the parent struct "
+        f"via `_contains_unbounded`")
+
+    # Arrays of plain (non view-class) elements: one uniform recursion.
+    if (isinstance(wrapped, types.ArrayType) and
+        not self._is_value_class_type(wrapped.element_type)):
+      self._emit_array_accessor(w, raw_member, self_type, field_name, wrapped,
+                                bit_offset)
+      return
+
+    # An array whose element is a >64-bit view class is handled by the
+    # dedicated span / lazy-range accessors at the end of this method.
+    is_view_array = (isinstance(wrapped, types.ArrayType) and
+                     self._is_value_class_type(wrapped.element_type))
+    byte_aligned = (bit_offset % 8 == 0 and bit_width % 8 == 0)
+    byte_offset = bit_offset // 8
+    byte_width = (bit_width + 7) // 8
+
+    if not is_view_array:
+      if byte_aligned:
+        # Byte-aligned: direct byte copy between the parent's buffer slice
+        # and the inner aggregate's `_bytes`. An explicit per-byte loop
+        # avoids `memcpy` while still collapsing to one on -O2.
+        with w.block(f"{field_cpp} {field_name}() const"):
+          w.line(f"{field_cpp} out{{}};")
+          w.line(f"for (std::size_t i = 0; i < {byte_width}; ++i)")
+          with w.indented():
+            w.line(f"reinterpret_cast<uint8_t *>(&out)[i] = "
+                   f"{raw_member}[{byte_offset} + i];")
+          w.line("return out;")
+        with w.block(f"{self_type} &{field_name}(const {field_cpp} &v)"):
+          w.line(f"for (std::size_t i = 0; i < {byte_width}; ++i)")
+          with w.indented():
+            w.line(f"{raw_member}[{byte_offset} + i] = "
+                   f"reinterpret_cast<const uint8_t *>(&v)[i];")
+          w.line("return *this;")
+      else:
+        # Non-byte-aligned: delegate to the per-bit copy helpers. The
+        # inner's `out{}` zero-initialiser is required by `copyBitsIn`,
+        # which only OR-sets the `1` bits.
+        with w.block(f"{field_cpp} {field_name}() const"):
+          w.line(f"{field_cpp} out{{}};")
+          w.line(f"esi::detail::copyBitsIn<{bit_offset}, "
+                 f"{bit_width}>({raw_member}.data(), "
+                 f"reinterpret_cast<uint8_t *>(&out));")
+          w.line("return out;")
+        with w.block(f"{self_type} &{field_name}(const {field_cpp} &v)"):
+          w.line(f"esi::detail::copyBitsOut<{bit_offset}, "
+                 f"{bit_width}>({raw_member}.data(), "
+                 f"reinterpret_cast<const uint8_t *>(&v));")
+          w.line("return *this;")
+
+    # Indexed accessors for arrays whose element is one of the view
+    # classes (`BitVector` / `IntView` / `UIntView`). The whole-array
+    # byte-copy path is intentionally skipped (the view's storage layout
+    # doesn't match the wire layout). Instead we emit three accessors:
+    #
+    #   * `field(i)` / `field(i, v)` -- per-element getter (zero-copy
+    #     view into the relevant slice of `_bytes`) and setter
+    #     (runtime per-bit copy, since `copyBitsOut` needs a
+    #     compile-time offset and the array index is runtime).
+    #   * `field()` -- a lazy `std::views::iota | std::views::transform`
+    #     range that yields the per-element views on demand. Random
+    #     access, no allocation, no element materialised until accessed.
+    #   * `field(const std::array<view, N> &)` -- whole-array setter
+    #     that delegates to the per-element setter N times. Lets the
+    #     emplace-style struct ctor accept view-array fields as a
+    #     single argument.
+    #
+    # All three share the parent struct's lifetime; see the warning at
+    # the top of the generated header.
+    if is_view_array:
+      assert isinstance(wrapped, types.ArrayType)
+      elem_type = wrapped.element_type
+      elem_cpp = self._cpp_type(elem_type)
+      elem_width = elem_type.bit_width
+      elem_count = wrapped.size
+      with w.block(f"{elem_cpp} {field_name}(std::size_t i) const"):
+        w.line(f"const std::size_t bit_off = {bit_offset} + i * {elem_width};")
+        w.line(f"return {elem_cpp}(")
+        w.line(f"    std::span<const uint8_t>("
+               f"{raw_member}.data() + bit_off / 8,")
+        w.line(f"                             "
+               f"(bit_off % 8 + {elem_width} + 7) / 8),")
+        w.line(f"    static_cast<std::size_t>({elem_width}),")
+        w.line(f"    static_cast<uint8_t>(bit_off % 8));")
+      with w.block(f"{self_type} &{field_name}(std::size_t i, "
+                   f"const {elem_cpp} &v)"):
+        w.line(f"const std::size_t bit_off = {bit_offset} + i * {elem_width};")
+        self._emit_view_store(w, raw_member, "v", "bit_off", elem_width)
+        w.line("return *this;")
+      # Lazy whole-array view: `iota(0, N) | transform([this](i){ ... })`
+      # gives a random-access range of `elem_cpp` views computed on
+      # access, with zero up-front allocation.
+      with w.block(f"auto {field_name}() const"):
+        w.line(f"return std::views::iota("
+               f"std::size_t{{0}}, std::size_t{{{elem_count}}}) |")
+        w.line("       std::views::transform([this](std::size_t i) {")
+        w.line(f"         return this->{field_name}(i);")
+        w.line("       });")
+      # Whole-array setter: forwards to the per-element setter for
+      # each index.
+      with w.block(f"{self_type} &{field_name}("
+                   f"const std::array<{elem_cpp}, {elem_count}> &v)"):
+        w.line(f"for (std::size_t i = 0; i < {elem_count}; ++i)")
+        with w.indented():
+          w.line(f"{field_name}(i, v[i]);")
+        w.line("return *this;")
+
+  def _emit_array_accessor(self, w: IndentedWriter, raw_member: str,
+                           self_type: str, field_name: str,
+                           array_type: types.ArrayType,
+                           bit_offset: int) -> None:
+    """Emit the accessor set for a fixed-size array field.
+
+    Four accessors are emitted, matching the existing array API:
+
+      * `Elem field(std::size_t i)` / `Self &field(std::size_t i, const Elem &)`
+        -- per-element get/set, where `Elem` is the (possibly itself an
+        array) element type.
+      * `Whole field()` / `Self &field(const Whole &)` -- whole-array
+        get/set, expressed in terms of the per-element accessors.
+
+    The per-element get/set bodies are produced by `_emit_unpack` /
+    `_emit_pack`, which recurse to the scalar leaves and place each leaf at
+    its true wire offset `bit_offset + i * elemWidth (+ ...)`. This is what
+    lets sub-byte, odd-width, sub-byte-aggregate, and *arbitrarily nested*
+    array elements round-trip even when the C++ element layout does not
+    match the wire layout.
+    """
+    elem_type = array_type.element_type
+    elem_cpp = self._cpp_type(elem_type)
+    elem_width = elem_type.bit_width
+    elem_count = array_type.size
+    whole_cpp = self._cpp_type(array_type)
+    elem_off = f"{bit_offset} + i * {elem_width}"
+
+    with w.block(f"{elem_cpp} {field_name}(std::size_t i) const"):
+      w.line(f"{elem_cpp} out{{}};")
+      self._emit_unpack(w, raw_member, "out", elem_off, elem_type, 1)
+      w.line("return out;")
+
+    with w.block(f"{self_type} &{field_name}(std::size_t i, "
+                 f"const {elem_cpp} &v)"):
+      self._emit_pack(w, raw_member, "v", elem_off, elem_type, 1)
+      w.line("return *this;")
+
+    with w.block(f"{whole_cpp} {field_name}() const"):
+      w.line(f"{whole_cpp} out{{}};")
+      w.line(f"for (std::size_t i = 0; i < {elem_count}; ++i)")
+      with w.indented():
+        w.line(f"out[i] = {field_name}(i);")
+      w.line("return out;")
+
+    with w.block(f"{self_type} &{field_name}(const {whole_cpp} &v)"):
+      w.line(f"for (std::size_t i = 0; i < {elem_count}; ++i)")
+      with w.indented():
+        w.line(f"{field_name}(i, v[i]);")
+      w.line("return *this;")
+
+  def _emit_unpack(self, w: IndentedWriter, raw_member: str, dst: str, off: str,
+                   esi_type: types.ESIType, depth: int) -> None:
+    """Emit statements that read a value of `esi_type` out of `raw_member`
+    at wire bit offset `off` (a C++ `size_t` expression) into the
+    already-declared, zero-initialised C++ lvalue `dst`.
+
+    Recurses through arrays (one loop per dimension) down to scalar / struct
+    / union leaves, which are read with the runtime-offset bit helpers.
+    """
+    wrapped = self._unwrap_aliases(esi_type)
+    if isinstance(wrapped, types.ArrayType):
+      idx = f"i{depth}"
+      ew = wrapped.element_type.bit_width
+      with w.block(f"for (std::size_t {idx} = 0; {idx} < "
+                   f"{wrapped.size}; ++{idx})"):
+        self._emit_unpack(w, raw_member, f"{dst}[{idx}]",
+                          f"{off} + {idx} * {ew}", wrapped.element_type,
+                          depth + 1)
+      return
+    if isinstance(wrapped, (types.StructType, types.UnionType)):
+      # The inner aggregate's own `_bytes` already mirror the wire layout, so
+      # copy its bits straight in. `dst` is zero-initialised by the caller,
+      # as `copyBitsInDyn` only OR-sets the `1` bits.
+      w.line(f"esi::detail::copyBitsInDyn({raw_member}.data(), {off},")
+      w.line(f"    reinterpret_cast<uint8_t *>(&{dst}), {wrapped.bit_width});")
+      return
+    if isinstance(wrapped, (types.BitsType, types.IntType)):
+      if self._is_value_class_type(esi_type):
+        raise NotImplementedError(
+            "arrays of integers wider than 64 bits are not supported")
+      cpp = self._cpp_type(esi_type)
+      if cpp == "bool":
+        w.line(f"{dst} = esi::detail::readUnsignedBitsDyn<uint8_t>("
+               f"{raw_member}.data(), {off}, 1) != 0;")
+      elif self._is_signed_int_field(esi_type):
+        w.line(f"{dst} = esi::detail::readSignedBitsDyn<{cpp}>("
+               f"{raw_member}.data(), {off}, {wrapped.bit_width});")
+      else:
+        w.line(f"{dst} = esi::detail::readUnsignedBitsDyn<{cpp}>("
+               f"{raw_member}.data(), {off}, {wrapped.bit_width});")
+      return
+    raise NotImplementedError(
+        f"unsupported array element type '{wrapped}' for C++ generation")
+
+  def _emit_pack(self, w: IndentedWriter, raw_member: str, src: str, off: str,
+                 esi_type: types.ESIType, depth: int) -> None:
+    """Inverse of `_emit_unpack`: write the C++ value `src` of `esi_type`
+    into `raw_member` at wire bit offset `off`."""
+    wrapped = self._unwrap_aliases(esi_type)
+    if isinstance(wrapped, types.ArrayType):
+      idx = f"i{depth}"
+      ew = wrapped.element_type.bit_width
+      with w.block(f"for (std::size_t {idx} = 0; {idx} < "
+                   f"{wrapped.size}; ++{idx})"):
+        self._emit_pack(w, raw_member, f"{src}[{idx}]", f"{off} + {idx} * {ew}",
+                        wrapped.element_type, depth + 1)
+      return
+    if isinstance(wrapped, (types.StructType, types.UnionType)):
+      w.line(f"esi::detail::copyBitsOutDyn({raw_member}.data(), {off},")
+      w.line(f"    reinterpret_cast<const uint8_t *>(&{src}), "
+             f"{wrapped.bit_width});")
+      return
+    if isinstance(wrapped, (types.BitsType, types.IntType)):
+      if self._is_value_class_type(esi_type):
+        raise NotImplementedError(
+            "arrays of integers wider than 64 bits are not supported")
+      cpp = self._cpp_type(esi_type)
+      if cpp == "bool":
+        w.line(f"esi::detail::writeUnsignedBitsDyn<uint8_t>("
+               f"{raw_member}.data(), "
+               f"static_cast<uint8_t>({src}) & uint8_t{{1}}, {off}, 1);")
+      elif self._is_signed_int_field(esi_type):
+        w.line(f"esi::detail::writeSignedBitsDyn<{cpp}>("
+               f"{raw_member}.data(), {src}, {off}, {wrapped.bit_width});")
+      else:
+        w.line(f"esi::detail::writeUnsignedBitsDyn<{cpp}>("
+               f"{raw_member}.data(), {src}, {off}, {wrapped.bit_width});")
+      return
+    raise NotImplementedError(
+        f"unsupported array element type '{wrapped}' for C++ generation")
+
+  def _ctor_param_type(self, field_type: types.ESIType) -> str:
+    """Return the C++ constructor-parameter type for a setter call."""
+    field_cpp = self._cpp_type(field_type)
+    wrapped = self._unwrap_aliases(field_type)
+    if isinstance(wrapped, (types.BitsType, types.IntType)):
+      return field_cpp
+    return f"const {field_cpp} &"
+
+  def _emit_struct(self, w: IndentedWriter,
+                   struct_type: types.StructType) -> None:
+    """Emit a packed struct as a raw byte buffer with bit-precise accessors.
+
+    The struct's storage is a single `std::array<uint8_t, N>` (where `N`
+    is the byte width derived from the manifest) whose layout matches the
+    on-wire bit-packing exactly. Per-field accessors (generated below)
+    read/write the bits so the wire format does not depend on C++ bit-field
+    allocation rules, which differ between the Itanium ABI (GCC/Clang) and MSVC.
+    """
+    # Zero-width composite types collapse to `void` everywhere they appear
+    # (see _cpp_type), so there is nothing meaningful to emit here.
+    if struct_type.bit_width == 0:
+      return
+    struct_name = self.type_id_map[struct_type]
+    bit_offsets, total_bits = self._compute_field_bit_offsets(struct_type)
+    total_bytes = (total_bits + 7) // 8
+
+    # Logical-order field list (manifest order) for the constructor and the
+    # public accessor list.
+    logical_fields = [(name, ftype)
+                      for name, ftype in struct_type.fields
+                      if self._cpp_type(ftype) != "void"]
+
+    # A struct whose every field collapses to void carries no data the
+    # generated header can expose. Emit nothing rather than a 1-byte
+    # placeholder, since (a) the placeholder doesn't reflect any real wire
+    # layout and (b) a size_assert built from the manifest's `bit_width`
+    # (which includes void padding) would fail to compile.
+    if not logical_fields:
+      return
+
+    with w.block(f"struct {struct_name}", tail=";"):
+      # `_bytes` holds the wire layout and is private; the only legitimate
+      # external view of those bytes is via `MessageData::from()` /
+      # `MessageData::as()` which reinterpret-cast through the whole struct
+      # and don't need member-level access.
+      w.access("private:")
+      w.line(f"std::array<uint8_t, {max(total_bytes, 1)}> _bytes{{}};")
+      w.line()
+      w.access("public:")
+      w.line(f"{struct_name}() = default;")
+      ctor_params = ", ".join(f"{self._ctor_param_type(ftype)} {name}"
+                              for name, ftype in logical_fields)
+      with w.block(f"{struct_name}({ctor_params})"):
+        # `this->` disambiguates the chained setter calls from the like-named
+        # parameters that shadow the member functions inside the ctor body.
+        chain = ".".join(f"{name}({name})" for name, _ in logical_fields)
+        w.line(f"this->{chain};")
+      w.line()
+
+      # Per-field accessors in logical (manifest) order so the user-facing
+      # API mirrors the manifest field order rather than the wire reversal.
+      for name, ftype in logical_fields:
+        self._emit_field_accessor(w, "_bytes", struct_name, name, ftype,
+                                  bit_offsets[name], ftype.bit_width)
+        w.line()
+
+      w.line(f"static constexpr std::string_view _ESI_ID = "
+             f"{self._cpp_string_literal(struct_type.id)};")
+    expected_bytes = self._safe_byte_width(struct_type)
+    if expected_bytes is not None and expected_bytes > 0:
+      self._emit_size_assert(w, struct_name, expected_bytes)
+    w.line()
+
+  def _emit_union(self, w: IndentedWriter, union_type: types.UnionType) -> None:
+    """Emit a union as a raw byte buffer with per-variant accessors.
+
+    The union's storage is a single `std::array<uint8_t, N>` sized to the
+    widest variant. Each variant lives at the MSB end of the buffer
+    (matching the existing SV-style packed union layout where padding
+    occupies the lower bytes), so the byte offset for a variant of size
+    V is `union_bytes - V`. Sub-byte integer variants are byte-padded to
+    full bytes within that region, matching the Python runtime's union
+    serialization.
+    """
+    # Zero-width unions collapse to `void` (see _cpp_type) so there is
+    # nothing meaningful to emit here.
+    if union_type.bit_width == 0:
+      return
+    union_name = self.type_id_map[union_type]
+    union_bytes = self._field_byte_width(union_type)
+
+    with w.block(f"struct {union_name}", tail=";"):
+      # See `_emit_struct` for the access-control rationale.
+      w.access("private:")
+      w.line(f"std::array<uint8_t, {union_bytes}> _bytes{{}};")
+      w.line()
+      w.access("public:")
+      w.line(f"{union_name}() = default;")
+      w.line()
+
+      for field_name, field_type in union_type.fields:
+        field_cpp = self._cpp_type(field_type)
+        if field_cpp == "void":
+          continue
+        field_bytes = self._field_byte_width(field_type)
+        byte_offset = union_bytes - field_bytes
+        bit_offset = byte_offset * 8
+        bit_width = field_type.bit_width
+        # Each variant is reached at the same MSB-aligned position regardless
+        # of width. Reuse `_emit_field_accessor` so we share the integer /
+        # aggregate code paths and don't duplicate the bit-access boilerplate.
+        self._emit_field_accessor(w, "_bytes", union_name, field_name,
+                                  field_type, bit_offset, bit_width)
+        w.line()
+
+      w.line(f"static constexpr std::string_view _ESI_ID = "
+             f"{self._cpp_string_literal(union_type.id)};")
+    if union_bytes > 0:
+      self._emit_size_assert(w, union_name, union_bytes)
+    w.line()
+
+  def _compute_window_frame_layout(
+      self, fields: List[Tuple[str, Optional[types.ESIType]]], frame_bits: int,
+      count_type_synth: types.ESIType
+  ) -> List[Tuple[str, types.ESIType, int, int]]:
+    """Compute (name, type, bit_offset, bit_width) for each window frame field.
+
+    Fields are listed in declared (MSB-first) order and laid out MSB-aligned
+    within `frame_bits`, matching how CIRCT lowers the serial-window frame
+    union: the first field occupies the highest bits, each subsequent field
+    sits immediately below it with no inter-field padding, and any slack
+    (`frame_bits - content_bits`) is left as zero padding at the LSB end.
+    The returned `bit_offset` is the field's LSB position within the frame's
+    little-endian `_bytes` array, ready to hand straight to
+    `_emit_field_accessor`.
+
+    The sentinel `(name, None)` count field is materialised as
+    `count_type_synth` so it can flow through the standard
+    `_emit_field_accessor` path.
+
+    Raises `ValueError` if a field is unbounded (`bit_width < 0`) or if the
+    accumulated content overflows `frame_bits` -- either would produce bogus
+    offsets, so fail fast rather than emit silently-wrong accessors.
+    """
+    layout = []
+    bit_top = frame_bits
+    for name, ftype in fields:
+      actual_type = count_type_synth if ftype is None else ftype
+      bit_width = actual_type.bit_width
+      if bit_width < 0:
+        raise ValueError(
+            f"window frame field '{name}' has an unbounded width; window "
+            f"codegen requires every frame field to be fixed-width")
+      bit_top -= bit_width
+      if bit_top < 0:
+        raise ValueError(
+            f"window frame field '{name}' overflows the {frame_bits}-bit frame "
+            f"(content is wider than the frame width)")
+      layout.append((name, actual_type, bit_top, bit_width))
+    return layout
+
+  def _emit_window_frame(
+      self, w: IndentedWriter, frame_name: str, frame_bytes: int,
+      layout: List[Tuple[str, types.ESIType, int, int]]) -> None:
+    """Emit a window header/data frame as a raw-bytes struct with accessors.
+
+    Nested inside the window helper class, it uses the same accessor pattern
+    as top-level structs/unions: a private `_bytes` array plus per-field
+    getter/setter pairs returning `frame_name &` to allow chaining.
+    """
+    with w.block(f"struct {frame_name}", tail=";"):
+      w.access("private:")
+      w.line(f"std::array<uint8_t, {frame_bytes}> _bytes{{}};")
+      w.line()
+      w.access("public:")
+      for name, ftype, bit_offset, bit_width in layout:
+        self._emit_field_accessor(w, "_bytes", frame_name, name, ftype,
+                                  bit_offset, bit_width)
+        w.line()
+    self._emit_size_assert(w, frame_name, frame_bytes)
+
+  def _emit_window(self, hdr: IndentedWriter,
+                   window_type: types.WindowType) -> None:
+    """Emit a SegmentedMessageData helper for a serial list window.
+
+    This emitter builds its own pre-indented text, so it uses the writer
+    purely as a verbatim `hdr.write(...)` sink. The nested frame structs,
+    however, are produced by the line-based `_emit_window_frame`, so their
+    calls are wrapped in `hdr.indented()` to place them at the window
+    class's member indent.
+    """
+    info = self._analyze_window(window_type)
+    ctor_params = [
+        self._format_window_ctor_param(name, field_type)
+        for name, field_type in info["ctor_params"]
+    ]
+    value_ctor_params = list(ctor_params)
+    value_ctor_params.append(
+        f"const std::vector<value_type> &{info['list_field_name']}")
+    value_ctor_signature = ", ".join(value_ctor_params)
+    frame_ctor_params = list(ctor_params)
+    frame_ctor_params.append("std::vector<data_frame> frames")
+    frame_ctor_signature = ", ".join(frame_ctor_params)
+    helper_args = ", ".join(name for name, _ in info["ctor_params"])
+    helper_call = f"{helper_args}, std::move(frames)" if helper_args else "std::move(frames)"
+
+    # Synthesise an unsigned integer type for the sentinel "count" header
+    # field so it flows through `_emit_field_accessor` like any other
+    # integer.
+    count_type_synth = types.UIntType(f"_count_ui{info['count_width']}",
+                                      info["count_width"])
+    data_layout = self._compute_window_frame_layout(info["data_fields"],
+                                                    info["frame_bits"],
+                                                    count_type_synth)
+    header_layout = self._compute_window_frame_layout(info["header_fields"],
+                                                      info["frame_bits"],
+                                                      count_type_synth)
+
+    # Largest list length encodable in a single burst's count field. Lists
+    # longer than this are split across multiple header/data bursts (the
+    # read-side `SerialListTypeDeserializer` reassembles them), each burst
+    # carrying at most this many data frames. `count_width` is <= 64 (the
+    # count field's storage type tops out at 64 bits), so this literal always
+    # fits in a `size_t`.
+    max_batch_val = (1 << info["count_width"]) - 1
+
+    hdr.write(
+        f"struct {info['window_name']} : public esi::SegmentedMessageData {{\n")
+    hdr.write("public:\n")
+    hdr.write(f"  using value_type = {info['element_cpp']};\n")
+    hdr.write(f"  using count_type = {info['count_cpp']};\n\n")
+    with hdr.indented():
+      self._emit_window_frame(hdr, "data_frame", info["frame_bytes"],
+                              data_layout)
+    hdr.write("\n")
+    hdr.write("private:\n")
+    with hdr.indented():
+      self._emit_window_frame(hdr, "header_frame", info["frame_bytes"],
+                              header_layout)
+    hdr.write("\n")
+    hdr.write("  // One header per burst (bursts 2..N are continuations whose\n"
+              "  // only meaningful field is the count); the data frames of\n"
+              "  // every burst are stored contiguously in `data_frames` and\n"
+              "  // sliced per burst by `segment()`.\n")
+    hdr.write("  std::vector<header_frame> headers;\n")
+    hdr.write("  std::vector<data_frame> data_frames;\n")
+    hdr.write("  header_frame footer{};\n\n")
+    hdr.write("  // Largest list length encodable in one burst's count field.\n"
+              "  // Longer lists are chunked across multiple bursts.\n")
+    hdr.write(f"  static constexpr size_t _kMaxBatch = {max_batch_val}ULL;\n\n")
+    hdr.write(f"  void construct({frame_ctor_signature}) {{\n")
+    hdr.write("    if (frames.empty())\n")
+    hdr.write(
+        f"      throw std::invalid_argument(\"{info['window_name']}: bulk windowed lists cannot be empty\");\n"
+    )
+    hdr.write("    data_frames = std::move(frames);\n")
+    hdr.write("    // Split the list into bursts no larger than the count\n"
+              "    // field can encode. The read side reassembles the bursts\n"
+              "    // back into a single list.\n")
+    hdr.write("    const size_t total = data_frames.size();\n")
+    hdr.write(
+        "    const size_t numBatches = (total + _kMaxBatch - 1) / _kMaxBatch;\n"
+    )
+    hdr.write("    headers.assign(numBatches, header_frame{});\n")
+    hdr.write("    for (size_t b = 0; b < numBatches; ++b) {\n")
+    hdr.write(
+        "      const size_t batchSize =\n"
+        "          std::min<size_t>(_kMaxBatch, total - b * _kMaxBatch);\n")
+    hdr.write(
+        f"      headers[b].{info['count_field_name']}(static_cast<count_type>(batchSize));\n"
+    )
+    hdr.write("    }\n")
+    hdr.write(
+        "    // Only the first burst's header carries the static fields.\n")
+    for name, _ in info["ctor_params"]:
+      hdr.write(f"    headers.front().{name}({name});\n")
+    hdr.write(f"    footer.{info['count_field_name']}(0);\n")
+    hdr.write("  }\n\n")
+    hdr.write("public:\n")
+    hdr.write(f"  {info['window_name']}({frame_ctor_signature}) {{\n")
+    hdr.write(f"    construct({helper_call});\n")
+    hdr.write("  }\n\n")
+    hdr.write(f"  {info['window_name']}({value_ctor_signature}) {{\n")
+    hdr.write("    std::vector<data_frame> frames;\n")
+    hdr.write(f"    frames.reserve({info['list_field_name']}.size());\n")
+    hdr.write(f"    for (const auto &element : {info['list_field_name']}) {{\n")
+    hdr.write("      auto &frame = frames.emplace_back();\n")
+    hdr.write(f"      frame.{info['list_field_name']}(element);\n")
+    hdr.write("    }\n")
+    hdr.write(f"    construct({helper_call});\n")
+    hdr.write("  }\n\n")
+    hdr.write("  size_t numSegments() const override {\n"
+              "    return 2 * headers.size() + 1;\n"
+              "  }\n")
+    hdr.write("  esi::Segment segment(size_t idx) const override {\n")
+    hdr.write("    const size_t footerIdx = 2 * headers.size();\n")
+    hdr.write("    if (idx == footerIdx)\n")
+    hdr.write(
+        "      return {reinterpret_cast<const uint8_t *>(&footer), sizeof(footer)};\n"
+    )
+    hdr.write("    if (idx > footerIdx)\n")
+    hdr.write(
+        f"      throw std::out_of_range(\"{info['window_name']}: invalid segment index\");\n"
+    )
+    hdr.write("    const size_t b = idx / 2;\n")
+    hdr.write("    if (idx % 2 == 0)\n")
+    hdr.write("      return {reinterpret_cast<const uint8_t *>(&headers[b]),\n"
+              "              sizeof(header_frame)};\n")
+    hdr.write("    const size_t start = b * _kMaxBatch;\n")
+    hdr.write(
+        "    const size_t batchSize =\n"
+        "        std::min<size_t>(_kMaxBatch, data_frames.size() - start);\n")
+    hdr.write(
+        "    return {reinterpret_cast<const uint8_t *>(data_frames.data() + start),\n"
+        "            batchSize * sizeof(data_frame)};\n")
+    hdr.write("  }\n\n")
+    hdr.write(
+        f"  static constexpr std::string_view _ESI_ID = {self._cpp_string_literal(self._unwrap_aliases(window_type.into_type).id)};\n"
+    )
+    # The into-type id alone cannot distinguish two different windows over
+    # the same underlying struct (e.g. serial vs. parallel list encoding).
+    # Emit the window id so the runtime can verify the wire format too.
+    hdr.write(
+        f"  static constexpr std::string_view _ESI_WINDOW_ID = {self._cpp_string_literal(window_type.id)};\n"
+    )
+    self._emit_window_data_accessors(hdr, info)
+    self._emit_window_deserializer(hdr, info)
+    hdr.write("};\n\n")
+
+  def _emit_window_data_accessors(self, hdr: IndentedWriter,
+                                  info: Dict[str, Any]) -> None:
+    """Emit accessors for the header and data fields of a window helper.
+
+    Exposes each static header field as a scalar accessor, the count of data
+    frames, and one vector-valued accessor per data field so decoded values
+    are easy to inspect on the read side.
+    """
+    list_field_name = info["list_field_name"]
+    hdr.write("\n")
+    for field_name, field_type in info["header_fields"]:
+      # Skip the synthetic bulk-count field; it is exposed via
+      # `<list>_count()` below.
+      if field_type is None:
+        continue
+      cpp = self._cpp_type(field_type)
+      # The header-frame accessor returns by value (it pulls bytes out of
+      # the raw buffer), so this is also returned by value regardless of
+      # whether the underlying type is a scalar or an aggregate. The static
+      # fields live on the first burst's header.
+      hdr.write(
+          f"  {cpp} {field_name}() const {{ return headers.front().{field_name}(); }}\n"
+      )
+    hdr.write(
+        f"  size_t {list_field_name}_count() const {{ return data_frames.size(); }}\n"
+    )
+    for field_name, field_type in info["data_fields"]:
+      if field_name == list_field_name:
+        elem_cpp = "value_type"
+      else:
+        elem_cpp = self._cpp_type(field_type)
+      # The data-frame accessor is now a member function returning by value
+      # (the underlying `_bytes` is private; getters reconstruct the field
+      # value from its wire bytes), so the projection has to call it
+      # rather than form a pointer-to-data-member.
+      #
+      # TODO: For byte-aligned aggregate data fields this means iterating
+      # `field()` copies each element; the pre-B3 pointer-to-member form
+      # could yield references for free. If profiling shows it matters,
+      # we can add a separate `field_ref()` accessor on `data_frame` for
+      # byte-aligned aggregate fields (they're stored contiguously inside
+      # `_bytes` and the inner type's only member is itself a byte array,
+      # so a `reinterpret_cast`-backed reference is well-defined) and
+      # project on that instead.
+      projection = (f"[](const data_frame &f) -> {elem_cpp} "
+                    f"{{ return f.{field_name}(); }}")
+      hdr.write(
+          f"  auto {field_name}() const {{\n"
+          f"    return std::views::transform(data_frames, {projection});\n"
+          f"  }}\n")
+      hdr.write(f"  std::vector<{elem_cpp}> {field_name}_vector() const {{\n"
+                f"    std::vector<{elem_cpp}> out;\n"
+                f"    out.reserve(data_frames.size());\n"
+                f"    for (const auto &frame : data_frames)\n"
+                f"      out.push_back(frame.{field_name}());\n"
+                f"    return out;\n"
+                f"  }}\n")
+
+  def _emit_window_deserializer(self, hdr: IndentedWriter,
+                                info: Dict[str, Any]) -> None:
+    """Emit a few bridge helpers + a `TypeDeserializer` alias.
+
+    The actual decoder lives in `esi::SerialListTypeDeserializer<T>`, which
+    walks the header/data/footer burst protocol generically. Each window
+    helper only has to expose:
+
+      - `_headerCount(const header_frame &)` -> `count_type`
+      - `_fromFrames(const header_frame &, std::vector<data_frame> &&)`
+        -> `std::unique_ptr<T>`
+
+    plus a `friend class esi::SerialListTypeDeserializer<T>;` so the template
+    can reach the (private) `header_frame` definition.
+    """
+    window_name = info["window_name"]
+    count_field_name = info["count_field_name"]
+    ctor_args = ", ".join(f"h.{name}()" for name, _ in info["ctor_params"])
+    if ctor_args:
+      ctor_args = f"{ctor_args}, std::move(frames)"
+    else:
+      ctor_args = "std::move(frames)"
+
+    hdr.write("\n")
+    hdr.write("private:\n")
+    hdr.write(
+        "  // Bridge helpers used by esi::SerialListTypeDeserializer<T>; the\n")
+    hdr.write(
+        "  // template walks the serial-list burst protocol generically and\n")
+    hdr.write(
+        "  // reaches into `header_frame` via the friend declaration below.\n")
+    hdr.write("  static count_type _headerCount(const header_frame &h) {\n")
+    hdr.write(f"    return h.{count_field_name}();\n")
+    hdr.write("  }\n")
+    hdr.write(f"  static std::unique_ptr<{window_name}> _fromFrames(\n")
+    hdr.write(
+        "      const header_frame &h, std::vector<data_frame> &&frames) {\n")
+    hdr.write(f"    return std::make_unique<{window_name}>({ctor_args});\n")
+    hdr.write("  }\n")
+    hdr.write(
+        f"  friend class esi::SerialListTypeDeserializer<{window_name}>;\n\n")
+    hdr.write("public:\n")
+    hdr.write(
+        f"  using TypeDeserializer = esi::SerialListTypeDeserializer<{window_name}>;\n"
+    )
+
+  def _emit_alias(self, w: IndentedWriter, alias_type: types.TypeAlias) -> None:
+    """Emit a using alias when the alias targets a different C++ type."""
+    inner_wrapped = alias_type.inner_type
+    alias_name = self.type_id_map[alias_type]
+    inner_cpp = None
+    if inner_wrapped is not None:
+      inner_cpp = self._cpp_type(inner_wrapped)
+    if inner_cpp is None:
+      inner_cpp = self.type_id_map[alias_type]
+    if inner_cpp != alias_name:
+      w.line(f"using {alias_name} = {inner_cpp};")
+      w.line()
+
+  def write_header(self, output_dir: Path, system_name: str) -> None:
+    """Emit the fully ordered types.h header into the output directory."""
+    if self.has_cycle:
+      sys.stderr.write("Warning: cyclic type dependencies detected.\n")
+      sys.stderr.write("  Logically this should not be possible.\n")
+      sys.stderr.write(
+          "  Emitted code may fail to compile due to ordering issues.\n")
+
+    hdr_file = output_dir / "types.h"
+    with open(hdr_file, "w", encoding="utf-8") as hdr:
+      w = IndentedWriter(hdr)
+      w.write(
+          textwrap.dedent(f"""
+        // Generated header for {system_name} types.
+        //
+        // Lifetime note: accessors that return `esi::BitVector` (for
+        // `Bits<N>` fields), `esi::IntView` (for `Int<N>`, N > 64), or
+        // `esi::UIntView` (for `UInt<N>`, N > 64) hand back non-owning
+        // views into the parent struct's bytes. The view is only valid
+        // while the parent is alive. Bind the parent to a named local
+        // first, or construct an owning `esi::Int` / `esi::UInt` /
+        // `esi::MutableBitVector` from the view if you need the value
+        // to outlive its source. See `esi/Values.h` for details.
+        #pragma once
+
+        #include <cstdint>
+        #include <cstddef>
+        #include <cstring>
+        #include <algorithm>
+        #include <any>
+        #include <array>
+        #include <limits>
+        #include <ranges>
+        #include <stdexcept>
+        #include <string_view>
+        #include <utility>
+        #include <vector>
+
+        #include "esi/BitAccess.h"
+        #include "esi/Common.h"
+        #include "esi/TypedPorts.h"
+        #include "esi/Values.h"
+
+        namespace {system_name} {{
+
+      """))
+
+      for skipped_type, reason in self.skipped_types:
+        w.write(f"// Unsupported type '{skipped_type}': {reason}\n\n")
+
+      for emit_type in self.ordered_types:
+        # Anything that wasn't expressible should have been caught by
+        # CppTypePlanner and recorded in `skipped_types`; if a problem
+        # leaks past that, treat it as a planner bug rather than emitting
+        # a half-written header.
+        if isinstance(emit_type, types.StructType):
+          self._emit_struct(w, emit_type)
+        elif isinstance(emit_type, types.UnionType):
+          self._emit_union(w, emit_type)
+        elif isinstance(emit_type, types.WindowType):
+          self._emit_window(w, emit_type)
+        elif isinstance(emit_type, types.TypeAlias):
+          self._emit_alias(w, emit_type)
+
+      w.write(textwrap.dedent(f"""
+    }} // namespace {system_name}
+    """))
+
+
+def run(generator: Type[Generator] = CppGenerator,
+        cmdline_args: List[str] = sys.argv) -> int:
+  """Create and run a generator reading options from the command line."""
+
+  argparser = argparse.ArgumentParser(
+      description=f"Generate {generator.language} headers from an ESI manifest",
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+      epilog=textwrap.dedent("""
+        Can read the manifest from either a file OR a running accelerator.
+
+        Usage examples:
+          # To read the manifest from a file:
+          esi-cppgen --file /path/to/manifest.json
+
+          # To read the manifest from a running accelerator:
+          esi-cppgen --platform cosim --connection localhost:1234
+      """))
+
+  argparser.add_argument("--file",
+                         type=str,
+                         default=None,
+                         help="Path to the manifest file.")
+  argparser.add_argument(
+      "--platform",
+      type=str,
+      help="Name of platform for live accelerator connection.")
+  argparser.add_argument(
+      "--connection",
+      type=str,
+      help="Connection string for live accelerator connection.")
+  argparser.add_argument(
+      "--output-dir",
+      type=str,
+      default="esi",
+      help="Output directory for generated files. Recommend adding either `esi`"
+      " or the system name to the end of the path so as to avoid header name"
+      "conflicts. Defaults to `esi`")
+  argparser.add_argument(
+      "--system-name",
+      type=str,
+      default="esi_system",
+      help="Name of the ESI system. For C++, this will be the namespace.")
+
+  if (len(cmdline_args) <= 1):
+    argparser.print_help()
+    return 1
+  args = argparser.parse_args(cmdline_args[1:])
+
+  if args.file is not None and args.platform is not None:
+    print("Cannot specify both --file and --platform")
+    return 1
+
+  conn: AcceleratorConnection
+  if args.file is not None:
+    # Use os.pathsep (';' on Windows, ':' on Unix) to avoid conflicts with
+    # drive letters.
+    conn = Context.default().connect("trace", f"-{os.pathsep}{args.file}")
+  elif args.platform is not None:
+    if args.connection is None:
+      print("Must specify --connection with --platform")
+      return 1
+    conn = Context.default().connect(args.platform, args.connection)
+  else:
+    print("Must specify either --file or --platform")
+    return 1
+
+  output_dir = Path(args.output_dir)
+  if output_dir.exists() and not output_dir.is_dir():
+    print(f"Output directory {output_dir} is not a directory")
+    return 1
+  if not output_dir.exists():
+    output_dir.mkdir(parents=True)
+
+  gen = generator(conn)
+  gen.generate(output_dir, args.system_name)
+  return 0

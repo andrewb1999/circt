@@ -16,6 +16,7 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOpInterfaces.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "circt/Dialect/Synth/SynthOpInterfaces.h"
 #include "circt/Dialect/Synth/SynthOps.h"
 #include "circt/Dialect/Synth/Transforms/SynthPasses.h"
 #include "circt/Support/InstanceGraph.h"
@@ -45,29 +46,31 @@ using namespace synth;
 /// Returns true if the operation was tracked, false otherwise.
 static bool accumulateResourceCounts(Operation *op,
                                      llvm::StringMap<uint64_t> &counts) {
+  // Memory declarations do not produce integer values, and memory ports are
+  // already accounted for by their declaration.
+  if (auto memory = dyn_cast<seq::FirMemOp>(op)) {
+    auto type = memory.getMemory().getType();
+    counts[op->getName().getStringRef()] += type.getDepth() * type.getWidth();
+    return true;
+  }
+  if (isa<seq::FirMemReadOp, seq::FirMemWriteOp, seq::FirMemReadWriteOp>(op))
+    return true;
   if (op->getNumResults() != 1 || !op->getResult(0).getType().isInteger())
     return false;
   return TypeSwitch<Operation *, bool>(op)
-      // Variadic logic operations (AND, OR, XOR, AIG).
+      .Case<BooleanLogicOpInterface>([&](auto logicOp) {
+        if (auto areaCost = logicOp.getLogicAreaCost()) {
+          counts[op->getName().getStringRef()] += *areaCost;
+          return true;
+        }
+        return false;
+      })
+      // Variadic comb logic operations.
       // Gate count = (num_inputs - 1) * bitwidth
-      .Case<synth::aig::AndInverterOp, comb::AndOp, comb::OrOp, comb::XorOp>(
-          [&](auto logicOp) {
-            counts[logicOp->getName().getStringRef()] +=
-                (logicOp.getNumOperands() - 1) *
-                logicOp.getType().getIntOrFloatBitWidth();
-            return true;
-          })
-      // Majority-inverter graph (MIG) - include input count in the name.
-      // Gate count = (num_inputs / 2) * bitwidth
-      // Each MIG gate consumes 3 inputs and produces 1 output, so a variadic
-      // MIG operation with N inputs requires N/2 gates (rounded down).
-      .Case<synth::mig::MajorityInverterOp>([&](auto logicOp) {
-        uint64_t count = logicOp.getType().getIntOrFloatBitWidth();
-        // Concatenate input count to the operation name.
-        std::string name = (Twine(logicOp->getName().getStringRef()) + "_" +
-                            Twine(logicOp.getNumOperands()))
-                               .str();
-        counts[name] += count;
+      .Case<comb::AndOp, comb::OrOp, comb::XorOp>([&](auto logicOp) {
+        counts[logicOp->getName().getStringRef()] +=
+            static_cast<uint64_t>(logicOp.getNumOperands() - 1) *
+            logicOp.getType().getIntOrFloatBitWidth();
         return true;
       })
       // Truth tables (LUTs) - count both the total number of truth tables and

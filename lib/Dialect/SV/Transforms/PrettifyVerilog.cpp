@@ -26,6 +26,7 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 namespace circt {
@@ -61,21 +62,17 @@ private:
   bool anythingChanged;
   LoweringOptions options;
 
-  DenseSet<Operation *> toDelete;
+  llvm::SetVector<Operation *> toDelete;
 };
 } // end anonymous namespace
 
-/// Return true if this is something that will get printed as a unary operator
-/// by the Verilog printer.
-static bool isVerilogUnaryOperator(Operation *op) {
-  if (isa<comb::ParityOp>(op))
-    return true;
-
+/// Return true if this is a unary operator that is cheap enough to sink or
+/// duplicate into its users as part of prettification.
+static bool isPrettifiableUnaryOperator(Operation *op) {
+  // NOTE: Don't allow reduction operators (^, &, |) here since they are not
+  //       cheap.
   if (auto xorOp = dyn_cast<comb::XorOp>(op))
     return xorOp.isBinaryNot();
-
-  if (auto icmpOp = dyn_cast<comb::ICmpOp>(op))
-    return icmpOp.isEqualAllOnes() || icmpOp.isNotEqualZero();
 
   return false;
 }
@@ -508,7 +505,7 @@ void PrettifyVerilogPass::processPostOrder(Block &body) {
     }
 
     // Sink and duplicate unary operators.
-    if (isVerilogUnaryOperator(&op) && prettifyUnaryOperator(&op))
+    if (isPrettifiableUnaryOperator(&op) && prettifyUnaryOperator(&op))
       continue;
 
     // Sink or duplicate constant ops and invisible "free" ops into the same
@@ -560,10 +557,7 @@ void PrettifyVerilogPass::runOnOperation() {
 
   // Erase any dangling operands of simplified operations.
   while (!toDelete.empty()) {
-    auto it = toDelete.begin();
-    Operation *op = *it;
-    toDelete.erase(it);
-
+    auto *op = toDelete.pop_back_val();
     if (!op || !isOpTriviallyDead(op))
       continue;
 

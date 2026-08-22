@@ -21,10 +21,9 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Support/LogicalResult.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/Support/Debug.h"
 
-#include <queue>
 #include <utility>
 
 namespace circt {
@@ -48,7 +47,7 @@ using ObjectFields = SmallDenseMap<StringAttr, EvaluatorValuePtr>;
 class EvaluatorValue : public std::enable_shared_from_this<EvaluatorValue> {
 public:
   // Implement LLVM RTTI.
-  enum class Kind { Attr, Object, List, Reference, BasePath, Path };
+  enum class Kind { Attr, Object, List, BasePath, Path };
   EvaluatorValue(MLIRContext *ctx, Kind kind, Location loc)
       : kind(kind), ctx(ctx), loc(loc) {}
   Kind getKind() const { return kind; }
@@ -83,9 +82,6 @@ public:
   // Return a MLIR type which the value represents.
   Type getType() const;
 
-  // Finalize the evaluator value. Strip intermidiate reference values.
-  LogicalResult finalize();
-
   // Return the Location associated with the Value.
   Location getLoc() const { return loc; }
   // Set the Location associated with the Value.
@@ -101,50 +97,7 @@ private:
   MLIRContext *ctx;
   Location loc;
   bool fullyEvaluated = false;
-  bool finalized = false;
   bool unknown = false;
-};
-
-/// Values which can be used as pointers to different values.
-/// ReferenceValue is replaced with its element and erased at the end of
-/// evaluation.
-class ReferenceValue : public EvaluatorValue {
-public:
-  ReferenceValue(Type type, Location loc)
-      : EvaluatorValue(type.getContext(), Kind::Reference, loc), value(nullptr),
-        type(type) {}
-
-  // Implement LLVM RTTI.
-  static bool classof(const EvaluatorValue *e) {
-    return e->getKind() == Kind::Reference;
-  }
-
-  Type getValueType() const { return type; }
-  EvaluatorValuePtr getValue() const { return value; }
-  void setValue(EvaluatorValuePtr newValue) {
-    value = std::move(newValue);
-    markFullyEvaluated();
-  }
-
-  // Finalize the value.
-  LogicalResult finalizeImpl();
-
-  // Return the first non-reference value that is reachable from the reference.
-  FailureOr<EvaluatorValuePtr> getStrippedValue() const {
-    llvm::SmallPtrSet<ReferenceValue *, 4> visited;
-    auto currentValue = value;
-    while (auto *v = dyn_cast<ReferenceValue>(currentValue.get())) {
-      // Detect a cycle.
-      if (!visited.insert(v).second)
-        return failure();
-      currentValue = v->getValue();
-    }
-    return success(currentValue);
-  }
-
-private:
-  EvaluatorValuePtr value;
-  Type type;
 };
 
 /// Values which can be directly representable by MLIR attributes.
@@ -161,9 +114,6 @@ public:
 
   // Set Attribute for partially evaluated case.
   LogicalResult setAttr(Attribute attr);
-
-  // Finalize the value.
-  LogicalResult finalizeImpl();
 
   Type getType() const { return type; }
 
@@ -195,19 +145,6 @@ private:
   friend std::shared_ptr<EvaluatorValue> get(Type type, LocationAttr loc);
 };
 
-// This perform finalization to `value`.
-static inline LogicalResult finalizeEvaluatorValue(EvaluatorValuePtr &value) {
-  if (failed(value->finalize()))
-    return failure();
-  if (auto *ref = llvm::dyn_cast<ReferenceValue>(value.get())) {
-    auto v = ref->getStrippedValue();
-    if (failed(v))
-      return v;
-    value = v.value();
-  }
-  return success();
-}
-
 /// A List which contains variadic length of elements with the same type.
 class ListValue : public EvaluatorValue {
 public:
@@ -222,9 +159,6 @@ public:
     elements = std::move(newElements);
     markFullyEvaluated();
   }
-
-  // Finalize the value.
-  LogicalResult finalizeImpl();
 
   // Partially evaluated value.
   ListValue(om::ListType type, Location loc)
@@ -289,9 +223,6 @@ public:
   /// Get all the field names of the Object.
   ArrayAttr getFieldNames();
 
-  // Finalize the evaluator value.
-  LogicalResult finalizeImpl();
-
 private:
   om::ClassLike cls;
   llvm::SmallDenseMap<StringAttr, EvaluatorValuePtr> fields;
@@ -309,9 +240,6 @@ public:
 
   /// Set the basepath which this path is relative to.
   void setBasepath(const BasePathValue &basepath);
-
-  /// Finalize the evaluator value.
-  LogicalResult finalizeImpl() { return success(); }
 
   /// Implement LLVM RTTI.
   static bool classof(const EvaluatorValue *e) {
@@ -344,9 +272,6 @@ public:
   StringAttr getAsString() const;
 
   void setBasepath(const BasePathValue &basepath);
-
-  // Finalize the evaluator value.
-  LogicalResult finalizeImpl() { return success(); }
 
   /// Implement LLVM RTTI.
   static bool classof(const EvaluatorValue *e) {
@@ -387,26 +312,15 @@ public:
   FailureOr<evaluator::EvaluatorValuePtr>
   getPartiallyEvaluatedValue(Type type, Location loc);
 
-  using ActualParameters =
-      SmallVectorImpl<std::shared_ptr<evaluator::EvaluatorValue>> *;
-
-  using ObjectKey = std::pair<Value, ActualParameters>;
+  using ActualParameters = ArrayRef<EvaluatorValuePtr>;
 
 private:
-  bool isFullyEvaluated(Value value, ActualParameters key) {
-    return isFullyEvaluated({value, key});
-  }
-
-  bool isFullyEvaluated(ObjectKey key) {
-    auto val = objects.lookup(key);
-    return val && val->isFullyEvaluated();
-  }
+  FailureOr<evaluator::EvaluatorValuePtr>
+  instantiateImpl(StringAttr className,
+                  ArrayRef<EvaluatorValuePtr> actualParams);
 
   FailureOr<EvaluatorValuePtr>
   getOrCreateValue(Value value, ActualParameters actualParams, Location loc);
-  FailureOr<EvaluatorValuePtr>
-  allocateObjectInstance(StringAttr clasName, ActualParameters actualParams);
-
   /// Evaluate a Value in a Class body according to the small expression grammar
   /// described in the rationale document. The actual parameters are the values
   /// supplied at the current instantiation of the Class being evaluated.
@@ -421,28 +335,19 @@ private:
   FailureOr<EvaluatorValuePtr>
   evaluateConstant(ConstantOp op, ActualParameters actualParams, Location loc);
 
-  FailureOr<EvaluatorValuePtr>
-  evaluateIntegerBinaryArithmetic(IntegerBinaryArithmeticOp op,
-                                  ActualParameters actualParams, Location loc);
-
   /// Instantiate an Object with its class name and actual parameters.
   FailureOr<EvaluatorValuePtr>
   evaluateObjectInstance(StringAttr className, ActualParameters actualParams,
-                         Location loc, ObjectKey instanceKey = {});
+                         Location loc);
   FailureOr<EvaluatorValuePtr>
-  evaluateObjectInstance(ObjectOp op, ActualParameters actualParams);
-  FailureOr<EvaluatorValuePtr>
-  evaluateObjectField(ObjectFieldOp op, ActualParameters actualParams,
-                      Location loc);
+  evaluateElaboratedObject(ElaboratedObjectOp op, ActualParameters actualParams,
+                           Location loc);
   FailureOr<EvaluatorValuePtr> evaluateListCreate(ListCreateOp op,
                                                   ActualParameters actualParams,
                                                   Location loc);
   FailureOr<EvaluatorValuePtr> evaluateListConcat(ListConcatOp op,
                                                   ActualParameters actualParams,
                                                   Location loc);
-  FailureOr<EvaluatorValuePtr>
-  evaluateStringConcat(StringConcatOp op, ActualParameters actualParams,
-                       Location loc);
   FailureOr<evaluator::EvaluatorValuePtr>
   evaluateBasePathCreate(FrozenBasePathCreateOp op,
                          ActualParameters actualParams, Location loc);
@@ -458,25 +363,32 @@ private:
   FailureOr<evaluator::EvaluatorValuePtr> createUnknownValue(Type type,
                                                              Location loc);
 
-  FailureOr<ActualParameters>
-  createParametersFromOperands(ValueRange range, ActualParameters actualParams,
-                               Location loc);
-
   /// The symbol table for the IR module the Evaluator was constructed with.
   /// Used to look up class definitions.
   SymbolTable symbolTable;
 
-  /// This uniquely stores vectors that represent parameters.
-  SmallVector<
-      std::unique_ptr<SmallVector<std::shared_ptr<evaluator::EvaluatorValue>>>>
-      actualParametersBuffers;
+  /// Evaluator value storage for the current instantiation.
+  DenseMap<Value, std::shared_ptr<evaluator::EvaluatorValue>> objects;
 
-  /// A worklist that tracks values which needs to be fully evaluated.
-  std::queue<ObjectKey> worklist;
+#ifndef NDEBUG
+  /// Current nesting depth for debug output indentation.
+  unsigned debugNesting = 0;
 
-  /// Evaluator value storage. Return an evaluator value for the given
-  /// instantiation context (a pair of Value and parameters).
-  DenseMap<ObjectKey, std::shared_ptr<evaluator::EvaluatorValue>> objects;
+  /// RAII helper to increment/decrement debugNesting.
+  struct DebugNesting {
+    unsigned &depth;
+    DebugNesting(unsigned &depth) : depth(depth) { ++depth; }
+    ~DebugNesting() { --depth; }
+  };
+
+  raw_ostream &dbgs(unsigned extra = 0) {
+    return llvm::dbgs().indent(debugNesting * 2 + extra * 2);
+  }
+
+  llvm::indent indent(unsigned extra = 0) {
+    return llvm::indent(debugNesting, 2) + extra;
+  }
+#endif
 };
 
 /// Helper to enable printing objects in Diagnostics.
@@ -508,6 +420,29 @@ static inline mlir::Diagnostic &
 operator<<(mlir::Diagnostic &diag, const EvaluatorValuePtr &evaluatorValue) {
   return diag << *evaluatorValue.get();
 }
+
+#ifndef NDEBUG
+/// Helper to enable printing objects to raw_ostream (e.g., llvm::dbgs()).
+/// Delegates to the Diagnostic overload via an intermediate string.
+static inline llvm::raw_ostream &
+operator<<(llvm::raw_ostream &os,
+           const evaluator::EvaluatorValue &evaluatorValue) {
+  std::string buf;
+  llvm::raw_string_ostream ss(buf);
+  mlir::Diagnostic diag(UnknownLoc::get(evaluatorValue.getContext()),
+                        mlir::DiagnosticSeverity::Note);
+  diag << evaluatorValue;
+  ss << diag;
+  return os << ss.str();
+}
+
+static inline llvm::raw_ostream &
+operator<<(llvm::raw_ostream &os, const EvaluatorValuePtr &evaluatorValue) {
+  if (evaluatorValue)
+    return os << *evaluatorValue.get();
+  return os << "<null>";
+}
+#endif // NDEBUG
 
 } // namespace om
 } // namespace circt

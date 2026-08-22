@@ -117,6 +117,7 @@ NB_MODULE(esiCppAccel, m) {
   nb::class_<Type>(m, "Type")
       .def(nb::init<const Type::ID &>(), nb::arg("id"))
       .def_prop_ro("id", &Type::getID)
+      .def_prop_ro("bit_width", &Type::getBitWidth)
       .def("__repr__", [](Type &t) { return "<" + t.getID() + ">"; });
   nb::class_<ChannelType, Type>(m, "ChannelType")
       .def(nb::init<const Type::ID &, const Type *>(), nb::arg("id"),
@@ -168,6 +169,38 @@ NB_MODULE(esiCppAccel, m) {
       .def_prop_ro("element", &ArrayType::getElementType,
                    nb::rv_policy::reference)
       .def_prop_ro("size", &ArrayType::getSize);
+  nb::class_<WindowType::Field>(m, "WindowField")
+      .def(nb::init<>())
+      .def(nb::init<std::string, uint64_t, uint64_t>(), nb::arg("name"),
+           nb::arg("num_items") = 0, nb::arg("bulk_count_width") = 0)
+      .def_rw("name", &WindowType::Field::name)
+      .def_rw("num_items", &WindowType::Field::numItems)
+      .def_rw("bulk_count_width", &WindowType::Field::bulkCountWidth);
+  nb::class_<WindowType::Frame>(m, "WindowFrame")
+      .def(nb::init<>())
+      .def(nb::init<std::string, const std::vector<WindowType::Field> &>(),
+           nb::arg("name"), nb::arg("fields"))
+      .def_rw("name", &WindowType::Frame::name)
+      .def_rw("fields", &WindowType::Frame::fields);
+  nb::class_<WindowType, Type>(m, "WindowType")
+      .def(nb::init<const Type::ID &, const std::string &, const Type *,
+                    const Type *, const std::vector<WindowType::Frame> &>(),
+           nb::arg("id"), nb::arg("name"), nb::arg("into_type"),
+           nb::arg("lowered_type"), nb::arg("frames"))
+      .def_prop_ro("name", &WindowType::getName)
+      .def_prop_ro("into", &WindowType::getIntoType, nb::rv_policy::reference)
+      .def_prop_ro("lowered", &WindowType::getLoweredType,
+                   nb::rv_policy::reference)
+      .def_prop_ro("frames", &WindowType::getFrames, nb::rv_policy::reference);
+  nb::class_<ListType, Type>(m, "ListType")
+      .def(nb::init<const Type::ID &, const Type *>(), nb::arg("id"),
+           nb::arg("element_type"))
+      .def_prop_ro("element", &ListType::getElementType,
+                   nb::rv_policy::reference);
+  nb::class_<UnionType, Type>(m, "UnionType")
+      .def(nb::init<const Type::ID &, const UnionType::FieldVector &>(),
+           nb::arg("id"), nb::arg("fields"))
+      .def_prop_ro("fields", &UnionType::getFields, nb::rv_policy::reference);
 
   nb::class_<Constant>(m, "Constant")
       .def_prop_ro("value", [](Constant &c) { return c.value; })
@@ -314,7 +347,9 @@ NB_MODULE(esiCppAccel, m) {
       .def("connect", &ChannelPort::connect, nb::arg("options"),
            "Connect with specified options")
       .def("disconnect", &ChannelPort::disconnect)
-      .def_prop_ro("type", &ChannelPort::getType, nb::rv_policy::reference);
+      .def_prop_ro("type", &ChannelPort::getType, nb::rv_policy::reference)
+      .def_prop_ro("windowType", &ChannelPort::getWindowType,
+                   nb::rv_policy::reference);
 
   nb::class_<WriteChannelPort, ChannelPort>(m, "WriteChannelPort")
       .def("write",
@@ -365,7 +400,7 @@ NB_MODULE(esiCppAccel, m) {
              MessageData data(dataVec);
              return self.call(data);
            })
-      .def("connect", &FuncService::Function::connect);
+      .def("connect", [](FuncService::Function &self) { self.connect(); });
 
   nb::class_<CallService::Callback, ServicePort>(m, "Callback")
       .def("connect", [](CallService::Callback &self,

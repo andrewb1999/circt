@@ -10,7 +10,13 @@
 //
 //===----------------------------------------------------------------------===//
 
+#ifndef CIRCT_DIALECT_SV_SVGENERATE_TD
+#define CIRCT_DIALECT_SV_SVGENERATE_TD
+
+include "circt/Dialect/SV/SVDialect.td"
 include "mlir/IR/BuiltinAttributeInterfaces.td"
+include "mlir/IR/OpAsmInterface.td"
+include "mlir/IR/OpBase.td"
 
 def GenerateOp : SVOp<"generate",
                       [SingleBlock, NoTerminator, NoRegionArguments]> {
@@ -50,3 +56,33 @@ def GenerateCaseOp : SVOp<"generate.case",
 
   let hasVerifier = true;
 }
+
+def GenerateForOp : SVOp<"generate.for",
+                         [SingleBlock, NoTerminator,
+                          HasParent<"GenerateOp">,
+                          DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmBlockArgumentNames"]>,
+                          AllTypesMatch<["lowerBound", "upperBound", "step"]>]> {
+  let summary = "A 'for' loop inside of a generate block";
+  let description = "See SystemVerilog 2017 27.4.";
+
+  let regions = (region SizedRegion<1>:$body);
+  let arguments = (ins TypedAttrInterface:$lowerBound,
+                       TypedAttrInterface:$upperBound,
+                       TypedAttrInterface:$step,
+                       StrAttr:$genBlockName,
+                       OptionalAttr<StrAttr>:$inductionVarName);
+
+  let assemblyFormat = [{
+    custom<GenerateFor>($lowerBound, $upperBound, $step, $inductionVarName,
+                        $genBlockName, $body) attr-dict
+  }];
+
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    Block* getBodyBlock() { return &getBody().front(); }
+    Value getInductionVar() { return getBodyBlock()->getArgument(0); }
+  }];
+}
+
+#endif // CIRCT_DIALECT_SV_SVGENERATE_TD

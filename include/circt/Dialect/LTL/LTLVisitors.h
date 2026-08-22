@@ -21,12 +21,13 @@ public:
   ResultType dispatchLTLVisitor(Operation *op, ExtraArgs... args) {
     auto *thisCast = static_cast<ConcreteType *>(this);
     return TypeSwitch<Operation *, ResultType>(op)
-        .template Case<AndOp, OrOp, DelayOp, ConcatOp, RepeatOp, NotOp,
-                       ImplicationOp, UntilOp, EventuallyOp, ClockOp,
-                       IntersectOp, NonConsecutiveRepeatOp, GoToRepeatOp,
-                       BooleanConstantOp>([&](auto op) -> ResultType {
-          return thisCast->visitLTL(op, args...);
-        })
+        .template Case<AndOp, OrOp, DelayOp, ClockedDelayOp, ConcatOp, RepeatOp,
+                       NotOp, ImplicationOp, UntilOp, EventuallyOp, ClockOp,
+                       ClockedAtomOp, IntersectOp, NonConsecutiveRepeatOp,
+                       GoToRepeatOp, BooleanConstantOp, WeakOp, StrongOp>(
+            [&](auto op) -> ResultType {
+              return thisCast->visitLTL(op, args...);
+            })
         .Default([&](auto) -> ResultType {
           return thisCast->visitInvalidLTL(op, args...);
         });
@@ -52,6 +53,7 @@ public:
   HANDLE(AndOp, Unhandled);
   HANDLE(OrOp, Unhandled);
   HANDLE(DelayOp, Unhandled);
+  HANDLE(ClockedDelayOp, Unhandled);
   HANDLE(ConcatOp, Unhandled);
   HANDLE(RepeatOp, Unhandled);
   HANDLE(NotOp, Unhandled);
@@ -59,10 +61,13 @@ public:
   HANDLE(UntilOp, Unhandled);
   HANDLE(EventuallyOp, Unhandled);
   HANDLE(ClockOp, Unhandled);
+  HANDLE(ClockedAtomOp, Unhandled);
   HANDLE(IntersectOp, Unhandled);
   HANDLE(NonConsecutiveRepeatOp, Unhandled);
   HANDLE(GoToRepeatOp, Unhandled);
   HANDLE(BooleanConstantOp, Unhandled);
+  HANDLE(WeakOp, Unhandled);
+  HANDLE(StrongOp, Unhandled);
 #undef HANDLE
 };
 

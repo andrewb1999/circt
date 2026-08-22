@@ -16,6 +16,7 @@
 #include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -99,10 +100,13 @@ struct OpLowering {
   LogicalResult lower(MemoryOp op);
   LogicalResult lower(TapOp op);
   LogicalResult lower(InstanceOp op);
+  LogicalResult lower(CoroutineInstanceOp op);
+  LogicalResult lower(hw::TriggeredOp op);
   LogicalResult lower(hw::OutputOp op);
   LogicalResult lower(seq::InitialOp op);
   LogicalResult lower(llhd::FinalOp op);
   LogicalResult lower(llhd::CurrentTimeOp op);
+  LogicalResult lower(sim::ClockedTerminateOp op);
 
   scf::IfOp createIfClockOp(Value clock);
 
@@ -112,6 +116,7 @@ struct OpLowering {
   // be lowered first.
   Value lowerValue(Value value, Phase phase);
   Value lowerValue(InstanceOp op, OpResult result, Phase phase);
+  Value lowerValue(CoroutineInstanceOp op, OpResult result, Phase phase);
   Value lowerValue(StateOp op, OpResult result, Phase phase);
   Value lowerValue(sim::DPICallOp op, OpResult result, Phase phase);
   Value lowerValue(MemoryReadPortOp op, OpResult result, Phase phase);
@@ -137,6 +142,11 @@ struct ModuleLowering {
 
   /// The storage value that can be used for `arc.alloc_state` and friends.
   Value storageArg;
+  Value arcContext;
+
+  /// The symbol table of the enclosing top-level module. Used to resolve
+  /// coroutine callees without walking the entire IR.
+  SymbolTable &symbolTable;
 
   /// A worklist of pending op lowerings.
   SmallVector<OpLowering> opsWorklist;
@@ -169,9 +179,10 @@ struct ModuleLowering {
   /// previous if ops for the same reset value.
   std::pair<Value, Value> prevReset;
 
-  ModuleLowering(HWModuleOp moduleOp)
+  ModuleLowering(HWModuleOp moduleOp, SymbolTable &symbolTable)
       : moduleOp(moduleOp), builder(moduleOp), allocBuilder(moduleOp),
-        initialBuilder(moduleOp), finalBuilder(moduleOp) {}
+        initialBuilder(moduleOp), finalBuilder(moduleOp),
+        symbolTable(symbolTable) {}
   LogicalResult run();
   LogicalResult lowerOp(Operation *op);
   Value getAllocatedState(OpResult result);
@@ -192,12 +203,20 @@ LogicalResult ModuleLowering::run() {
   // Create the replacement `ModelOp`.
   auto modelOp =
       ModelOp::create(builder, moduleOp.getLoc(), moduleOp.getModuleNameAttr(),
-                      TypeAttr::get(moduleOp.getModuleType()),
+                      TypeAttr::get(moduleOp.getModuleType()), IntegerAttr{},
                       FlatSymbolRefAttr{}, FlatSymbolRefAttr{}, ArrayAttr{});
   auto &modelBlock = modelOp.getBody().emplaceBlock();
-  storageArg = modelBlock.addArgument(
-      StorageType::get(builder.getContext(), {}), modelOp.getLoc());
+  storageArg = modelBlock.addArgument(StorageType::get(builder.getContext()),
+                                      modelOp.getLoc());
   builder.setInsertionPointToStart(&modelBlock);
+  arcContext = AsContextOp::create(builder, moduleOp.getLoc(), storageArg);
+
+  // Reset the next wakeup slot to `UINT64_MAX` ("no wakeup pending") at the
+  // start of every eval. Process suspension code lowers the value to the
+  // earliest scheduled wakeup over the course of the evaluation.
+  auto noWakeup = hw::ConstantOp::create(builder, moduleOp.getLoc(),
+                                         builder.getI64Type(), -1);
+  SetNextWakeupOp::create(builder, moduleOp.getLoc(), arcContext, noWakeup);
 
   // Create the `arc.initial` op to contain the ops for the initialization
   // phase.
@@ -223,7 +242,8 @@ LogicalResult ModuleLowering::run() {
 
   // Lower the ops.
   for (auto &op : moduleOp.getOps()) {
-    if (mlir::isMemoryEffectFree(&op) && !isa<hw::OutputOp>(op))
+    if (mlir::isMemoryEffectFree(&op) &&
+        !isa<hw::OutputOp, sim::ClockedTerminateOp>(op))
       continue;
     if (isa<MemoryReadPortOp, MemoryWritePortOp>(op))
       continue; // handled as part of `MemoryOp`
@@ -364,7 +384,7 @@ Value ModuleLowering::detectPosedge(Value clock) {
   // Read the old clock value from storage and write the new clock value to
   // storage.
   auto oldClock = StateReadOp::create(builder, loc, oldStorage);
-  StateWriteOp::create(builder, loc, oldStorage, clock, Value{});
+  StateWriteOp::create(builder, loc, oldStorage, clock);
 
   // Detect a rising edge.
   auto edge = comb::XorOp::create(builder, loc, oldClock, clock);
@@ -416,8 +436,9 @@ static scf::IfOp createOrReuseIf(OpBuilder &builder, Value condition,
 LogicalResult OpLowering::lower() {
   return TypeSwitch<Operation *, LogicalResult>(op)
       // Operations with special lowering.
-      .Case<StateOp, sim::DPICallOp, MemoryOp, TapOp, InstanceOp, hw::OutputOp,
-            seq::InitialOp, llhd::FinalOp, llhd::CurrentTimeOp>(
+      .Case<StateOp, sim::DPICallOp, MemoryOp, TapOp, InstanceOp,
+            CoroutineInstanceOp, hw::TriggeredOp, hw::OutputOp, seq::InitialOp,
+            llhd::FinalOp, llhd::CurrentTimeOp, sim::ClockedTerminateOp>(
           [&](auto op) { return lower(op); })
 
       // Operations that should be skipped entirely and never land on the
@@ -488,8 +509,7 @@ LogicalResult OpLowering::lower(StateOp op) {
       auto state = module.getAllocatedState(result);
       if (!state)
         return failure();
-      StateWriteOp::create(module.initialBuilder, value.getLoc(), state, value,
-                           Value{});
+      StateWriteOp::create(module.initialBuilder, value.getLoc(), state, value);
     }
     return success();
   }
@@ -619,8 +639,7 @@ LogicalResult OpLowering::lowerStateful(
       if (value.getType() != type)
         value = BitcastOp::create(module.builder, loweredReset.getLoc(), type,
                                   value);
-      StateWriteOp::create(module.builder, loweredReset.getLoc(), state, value,
-                           Value{});
+      StateWriteOp::create(module.builder, loweredReset.getLoc(), state, value);
     }
     module.builder.setInsertionPoint(ifResetOp.elseYield());
   }
@@ -655,7 +674,7 @@ LogicalResult OpLowering::lowerStateful(
   // Compute the transfer function and write its results to the state's storage.
   auto loweredResults = createMapping(loweredInputs);
   for (auto [state, value] : llvm::zip(states, loweredResults))
-    StateWriteOp::create(module.builder, value.getLoc(), state, value, Value{});
+    StateWriteOp::create(module.builder, value.getLoc(), state, value);
 
   // Since we just wrote the new state value to storage, insert read ops just
   // before the if op that keep the old value around for any later ops that
@@ -773,8 +792,7 @@ LogicalResult OpLowering::lower(MemoryOp op) {
     }
 
     // Actually write to the memory.
-    MemoryWriteOp::create(module.builder, write.getLoc(), state, address,
-                          Value{}, data);
+    MemoryWriteOp::create(module.builder, write.getLoc(), state, address, data);
   }
 
   return success();
@@ -799,7 +817,7 @@ LogicalResult OpLowering::lower(TapOp op) {
     alloc->setAttr("names", op.getNamesAttr());
     state = alloc;
   }
-  StateWriteOp::create(module.builder, op.getLoc(), state, value, Value{});
+  StateWriteOp::create(module.builder, op.getLoc(), state, value);
   return success();
 }
 
@@ -827,7 +845,7 @@ LogicalResult OpLowering::lower(InstanceOp op) {
     state->setAttr("name", module.builder.getStringAttr(
                                op.getInstanceName() + "/" +
                                cast<StringAttr>(name).getValue()));
-    StateWriteOp::create(module.builder, value.getLoc(), state, value, Value{});
+    StateWriteOp::create(module.builder, value.getLoc(), state, value);
   }
 
   // HACK: Also ensure that storage has been allocated for all outputs.
@@ -836,6 +854,200 @@ LogicalResult OpLowering::lower(InstanceOp op) {
   // dialect.
   for (auto result : op.getResults())
     module.getAllocatedState(result);
+
+  return success();
+}
+
+/// Lower a coroutine instance.
+///
+/// An `arc.coroutine.instance` runs a top-level coroutine continuously inside a
+/// model. The coroutine's program counter, local state, and next wakeup time
+/// are kept in persistent state slots, and the values it yields are latched
+/// into result slots so they remain readable on evaluations where the coroutine
+/// does not run. On every evaluation the instance re-enters the coroutine if
+/// its scheduled wakeup time has been reached, stores the resulting program
+/// counter, state, and yielded values, and folds the next wakeup time into the
+/// model's global wakeup schedule.
+///
+/// A coroutine that has halted or returned must never be re-entered. Instead of
+/// inspecting the program counter on entry, the lowering forces the stored
+/// wakeup time to `UINT64_MAX` ("never") as soon as the coroutine reports a
+/// halt or return, so the time guard alone keeps it suspended.
+LogicalResult OpLowering::lower(CoroutineInstanceOp op) {
+  assert(phase == Phase::New);
+
+  // A coroutine samples its arguments in the New phase, so that a re-entry sees
+  // the up-to-date values produced in the same evaluation and the change
+  // detector below compares against fresh values.
+  SmallVector<Value> inputs;
+  for (auto input : op.getArgs())
+    inputs.push_back(lowerValue(input, Phase::New));
+  if (initial)
+    return success();
+  if (llvm::is_contained(inputs, Value{}))
+    return failure();
+
+  // Resolve the callee to obtain its state, program counter, and result types.
+  // The callee's last result is the next wakeup time; it is consumed for
+  // scheduling and not exposed as a result of the instance.
+  auto callee = op.getCalleeAttr();
+  auto defineOp =
+      module.symbolTable.lookup<CoroutineDefineOp>(callee.getAttr());
+  assert(defineOp && "verified by CoroutineInstanceOp::verifySymbolUses");
+  auto loc = op.getLoc();
+  auto *context = op.getContext();
+  auto stateType = CoroutineStateType::get(context, callee);
+  auto pcType = CoroutinePCType::get(context, callee);
+  auto i64Type = module.builder.getI64Type();
+
+  // Allocate the persistent program counter, state, and wakeup slots. Their
+  // zero-initialized contents represent the coroutine's start program counter,
+  // an unread initial state, and a wakeup time of zero ("run immediately").
+  auto pcSlot = AllocStateOp::create(module.allocBuilder, loc,
+                                     StateType::get(pcType), module.storageArg);
+  auto stateSlot = AllocStateOp::create(
+      module.allocBuilder, loc, StateType::get(stateType), module.storageArg);
+  auto wakeupSlot = AllocStateOp::create(
+      module.allocBuilder, loc, StateType::get(i64Type), module.storageArg);
+
+  // Allocate a slot for each yielded value so that it persists across
+  // evaluations where the coroutine does not run.
+  SmallVector<Value> resultSlots;
+  for (auto result : op.getResults()) {
+    auto slot = module.getAllocatedState(result);
+    if (!slot)
+      return failure();
+    resultSlots.push_back(slot);
+  }
+
+  // Detect changes on the observed arguments: each argument's value from the
+  // previous evaluation is held in a state slot, and a change is an inequality
+  // against the freshly sampled value. The observe bitmask reported by the
+  // coroutine on its last run selects which arguments matter; unobserved
+  // changes are ignored. The previous-value slots are updated unconditionally
+  // so they always track the latest value.
+  Value maskSlot;
+  Value anyChange = hw::ConstantOp::create(module.builder, loc,
+                                           module.builder.getI1Type(), 0);
+  if (!inputs.empty()) {
+    auto maskType = module.builder.getIntegerType(inputs.size());
+    maskSlot = AllocStateOp::create(
+        module.allocBuilder, loc, StateType::get(maskType), module.storageArg);
+    auto mask = StateReadOp::create(module.builder, loc, maskSlot);
+    for (auto [index, input] : llvm::enumerate(inputs)) {
+      if (!op.getSensitivityMask()[index])
+        continue;
+      auto prevSlot = AllocStateOp::create(module.allocBuilder, loc,
+                                           StateType::get(input.getType()),
+                                           module.storageArg);
+      auto prev = StateReadOp::create(module.builder, loc, prevSlot);
+      StateWriteOp::create(module.builder, loc, prevSlot, input);
+      auto changed = comb::ICmpOp::create(module.builder, loc,
+                                          comb::ICmpPredicate::ne, input, prev);
+      auto maskBit =
+          comb::ExtractOp::create(module.builder, loc, mask,
+                                  static_cast<unsigned>(index), /*bitWidth=*/1);
+      auto masked = comb::AndOp::create(module.builder, loc, changed, maskBit);
+      anyChange = comb::OrOp::create(module.builder, loc, anyChange, masked);
+    }
+  }
+
+  // Re-enter the coroutine if its scheduled wakeup time has been reached or if
+  // an observed argument changed.
+  auto now = CurrentTimeOp::create(module.builder, loc, module.arcContext);
+  auto wakeup = StateReadOp::create(module.builder, loc, wakeupSlot);
+  auto timeReady = comb::ICmpOp::create(module.builder, loc,
+                                        comb::ICmpPredicate::uge, now, wakeup);
+  auto ready = comb::OrOp::create(module.builder, loc, timeReady, anyChange);
+  auto ifOp =
+      scf::IfOp::create(module.builder, loc, ready, /*withElseRegion=*/false);
+  {
+    OpBuilder::InsertionGuard guard(module.builder);
+    module.builder.setInsertionPoint(ifOp.thenYield());
+
+    auto oldState = StateReadOp::create(module.builder, loc, stateSlot);
+    auto oldPc = StateReadOp::create(module.builder, loc, pcSlot);
+
+    // The call returns the resume state and program counter followed by the
+    // coroutine's own results, the last of which is the next wakeup time.
+    SmallVector<Type> callResultTypes;
+    callResultTypes.push_back(stateType);
+    callResultTypes.push_back(pcType);
+    llvm::append_range(callResultTypes, defineOp.getResultTypes());
+    auto call = CoroutineCallOp::create(module.builder, loc, callResultTypes,
+                                        callee, oldState, oldPc, inputs);
+    auto newState = call.getResult(0);
+    auto newPc = call.getResult(1);
+    auto wakeupNew = call.getResults().back();
+    auto maskNew = call.getResult(2 + op.getNumResults());
+
+    // Force the wakeup time to "never" once the coroutine halts or returns, so
+    // the time guard above prevents it from ever being re-entered.
+    auto isHalt = CoroutinePCIsHaltOp::create(module.builder, loc, newPc);
+    auto isReturn = CoroutinePCIsReturnOp::create(module.builder, loc, newPc);
+    auto isDone = comb::OrOp::create(module.builder, loc, isHalt, isReturn);
+    auto never = hw::ConstantOp::create(module.builder, loc, i64Type, -1);
+    auto wakeupEff =
+        comb::MuxOp::create(module.builder, loc, isDone, never, wakeupNew);
+
+    StateWriteOp::create(module.builder, loc, stateSlot, newState);
+    StateWriteOp::create(module.builder, loc, pcSlot, newPc);
+    StateWriteOp::create(module.builder, loc, wakeupSlot, wakeupEff);
+    if (maskSlot)
+      StateWriteOp::create(module.builder, loc, maskSlot, maskNew);
+    for (auto [index, slot] : llvm::enumerate(resultSlots))
+      StateWriteOp::create(module.builder, loc, slot,
+                           call.getResult(2 + index));
+  }
+
+  // Fold the coroutine's pending wakeup time into the model's wakeup schedule.
+  // This runs unconditionally: even when the coroutine did not execute this
+  // evaluation, its stored wakeup must keep the model scheduled.
+  auto curWakeup = StateReadOp::create(module.builder, loc, wakeupSlot);
+  auto nextWakeup =
+      GetNextWakeupOp::create(module.builder, loc, module.arcContext);
+  auto minWakeup =
+      arith::MinUIOp::create(module.builder, loc, curWakeup, nextWakeup);
+  SetNextWakeupOp::create(module.builder, loc, module.arcContext, minWakeup);
+
+  return success();
+}
+
+/// Lower `hw.triggered` by inlining its body under a posedge check.
+LogicalResult OpLowering::lower(hw::TriggeredOp op) {
+  assert(phase == Phase::New);
+
+  if (op.getEvent() != hw::EventControl::AtPosEdge) {
+    if (!initial)
+      return op.emitOpError("only posedge triggers are supported");
+    return success();
+  }
+
+  lowerValue(op.getTrigger(), Phase::New);
+  SmallVector<Value> inputs;
+  for (auto input : op.getInputs())
+    inputs.push_back(lowerValue(input, Phase::Old));
+  if (initial)
+    return success();
+  if (llvm::is_contained(inputs, Value{}))
+    return failure();
+
+  auto ifClockOp = createIfClockOp(op.getTrigger());
+  if (!ifClockOp)
+    return failure();
+
+  OpBuilder::InsertionGuard guard(module.builder);
+  module.builder.setInsertionPoint(ifClockOp.thenYield());
+
+  // Expose the trigger inputs as values for the body block arguments.
+  for (auto [arg, input] : llvm::zip(op.getBodyBlock()->getArguments(), inputs))
+    module.loweredValues[{arg, Phase::New}] = input;
+  for (auto &bodyOp : llvm::make_early_inc_range(*op.getBodyBlock())) {
+    OpLowering bodyLowering(&bodyOp, Phase::New, module);
+    bodyLowering.initial = false;
+    if (failed(bodyLowering.lower()))
+      return failure();
+  }
 
   return success();
 }
@@ -860,7 +1072,7 @@ LogicalResult OpLowering::lower(hw::OutputOp op) {
     auto state = RootOutputOp::create(
         module.allocBuilder, value.getLoc(), StateType::get(value.getType()),
         cast<StringAttr>(name), module.storageArg);
-    StateWriteOp::create(module.builder, value.getLoc(), state, value, Value{});
+    StateWriteOp::create(module.builder, value.getLoc(), state, value);
   }
   return success();
 }
@@ -1034,13 +1246,43 @@ LogicalResult OpLowering::lower(llhd::CurrentTimeOp op) {
   case Phase::Final: {
     // Get the current time from storage.
     auto &builder = module.getBuilder(phase);
-    auto timeInt = CurrentTimeOp::create(builder, loc, module.storageArg);
+    auto timeInt = CurrentTimeOp::create(builder, loc, module.arcContext);
     time = llhd::IntToTimeOp::create(builder, loc, timeInt);
     break;
   }
   }
 
   module.loweredValues[{op.getResult(), phase}] = time;
+  return success();
+}
+
+LogicalResult OpLowering::lower(sim::ClockedTerminateOp op) {
+  if (phase != Phase::New)
+    return success();
+
+  if (initial)
+    return success();
+
+  auto ifClockOp = createIfClockOp(op.getClock());
+  if (!ifClockOp)
+    return failure();
+
+  OpBuilder::InsertionGuard guard(module.builder);
+  module.builder.setInsertionPoint(ifClockOp.thenYield());
+
+  auto loc = op.getLoc();
+  Value cond = lowerValue(op.getCondition(), phase);
+  if (!cond)
+    return op.emitOpError("Failed to lower condition");
+
+  auto ifOp = createOrReuseIf(module.builder, cond, false);
+  if (!ifOp)
+    return op.emitOpError("Failed to create condition block");
+
+  module.builder.setInsertionPoint(ifOp.thenYield());
+  arc::TerminateOp::create(module.builder, loc, module.arcContext,
+                           op.getSuccessAttr());
+
   return success();
 }
 
@@ -1068,17 +1310,22 @@ scf::IfOp OpLowering::createIfClockOp(Value clock) {
 /// cases. Some operations and values have special handling though. For example,
 /// states and memory reads are immediately materialized as a new read op.
 Value OpLowering::lowerValue(Value value, Phase phase) {
+  // Check if the value has already been lowered.
+  if (auto lowered = module.loweredValues.lookup({value, phase}))
+    return lowered;
+
   // Handle module inputs. They read the same in all phases.
   if (auto arg = dyn_cast<BlockArgument>(value)) {
+    if (arg.getOwner() != module.moduleOp.getBodyBlock()) {
+      if (!initial)
+        emitError(arg.getLoc()) << "block argument has not been lowered";
+      return {};
+    }
     if (initial)
       return {};
     auto state = module.allocatedInputs[arg.getArgNumber()];
     return StateReadOp::create(module.getBuilder(phase), arg.getLoc(), state);
   }
-
-  // Check if the value has already been lowered.
-  if (auto lowered = module.loweredValues.lookup({value, phase}))
-    return lowered;
 
   // At this point the value is the result of an op. (Block arguments are
   // handled above.)
@@ -1087,6 +1334,8 @@ Value OpLowering::lowerValue(Value value, Phase phase) {
 
   // Special handling for some ops.
   if (auto instOp = dyn_cast<InstanceOp>(op))
+    return lowerValue(instOp, result, phase);
+  if (auto instOp = dyn_cast<CoroutineInstanceOp>(op))
     return lowerValue(instOp, result, phase);
   if (auto stateOp = dyn_cast<StateOp>(op))
     return lowerValue(stateOp, result, phase);
@@ -1115,6 +1364,29 @@ Value OpLowering::lowerValue(Value value, Phase phase) {
 Value OpLowering::lowerValue(InstanceOp op, OpResult result, Phase phase) {
   if (initial)
     return {};
+  auto state = module.getAllocatedState(result);
+  return StateReadOp::create(module.getBuilder(phase), result.getLoc(), state);
+}
+
+/// Handle the yielded values of a coroutine instance. The values are latched
+/// into a result slot by the instance lowering; reading the new value requires
+/// the instance to be lowered first so the slot has been written, while reading
+/// the old value observes the slot's contents before this evaluation's update.
+Value OpLowering::lowerValue(CoroutineInstanceOp op, OpResult result,
+                             Phase phase) {
+  if (initial) {
+    // The instance only ever runs in the new phase, where it writes the result
+    // slots. Make sure that has happened before we read them.
+    if (phase == Phase::New)
+      addPending(op, Phase::New);
+    return {};
+  }
+
+  // If we want to read the old value, no writes must have been lowered yet.
+  if (phase == Phase::Old)
+    assert(!module.loweredOps.contains({op, Phase::New}) &&
+           "need old value but new value already written");
+
   auto state = module.getAllocatedState(result);
   return StateReadOp::create(module.getBuilder(phase), result.getLoc(), state);
 }
@@ -1227,8 +1499,7 @@ Value OpLowering::lowerValue(seq::InitialOp op, OpResult result, Phase phase) {
                                  module.storageArg);
     OpBuilder::InsertionGuard guard(module.initialBuilder);
     module.initialBuilder.setInsertionPointAfterValue(value);
-    StateWriteOp::create(module.initialBuilder, value.getLoc(), state, value,
-                         Value{});
+    StateWriteOp::create(module.initialBuilder, value.getLoc(), state, value);
   }
 
   // Read back the value computed during the initial phase.
@@ -1270,13 +1541,13 @@ struct LowerStatePass : public arc::impl::LowerStatePassBase<LowerStatePass> {
 
 void LowerStatePass::runOnOperation() {
   auto op = getOperation();
+  auto &symbolTable = getAnalysis<SymbolTable>();
   for (auto moduleOp : llvm::make_early_inc_range(op.getOps<HWModuleOp>())) {
-    if (failed(ModuleLowering(moduleOp).run()))
+    if (failed(ModuleLowering(moduleOp, symbolTable).run()))
       return signalPassFailure();
     moduleOp.erase();
   }
 
-  SymbolTable symbolTable(op);
   for (auto extModuleOp :
        llvm::make_early_inc_range(op.getOps<HWModuleExternOp>())) {
     // Make sure that we're not leaving behind a dangling reference to this

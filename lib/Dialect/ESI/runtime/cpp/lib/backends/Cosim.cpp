@@ -1,4 +1,4 @@
-//===- Cosim.cpp - Connection to ESI simulation via GRPC ------------------===//
+//===- Cosim.cpp - Connection to ESI simulation ---------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -20,7 +20,9 @@
 #include "esi/Utils.h"
 #include "esi/backends/RpcClient.h"
 
+#include <array>
 #include <cstring>
+#include <format>
 #include <fstream>
 #include <iostream>
 #include <set>
@@ -53,23 +55,27 @@ public:
 
 protected:
   void writeImpl(const MessageData &data) override {
-    // Add trace logging before sending the message.
-    conn.getLogger().trace(
-        [this,
-         &data](std::string &subsystem, std::string &msg,
-                std::unique_ptr<std::map<std::string, std::any>> &details) {
-          subsystem = "cosim_write";
-          msg = "Writing message to channel '" + name + "'";
-          details = std::make_unique<std::map<std::string, std::any>>();
-          (*details)["channel"] = name;
-          (*details)["data_size"] = data.getSize();
-          (*details)["message_data"] = data.toHex();
-        });
+    auto frames = getMessageFrames(data);
+    for (const auto &frame : frames) {
+      conn.getLogger().trace(
+          [this,
+           &data](std::string &subsystem, std::string &msg,
+                  std::unique_ptr<std::map<std::string, std::any>> &details) {
+            subsystem = "cosim_write";
+            msg = "Writing message to channel '" + name + "'";
+            details = std::make_unique<std::map<std::string, std::any>>();
+            (*details)["channel"] = name;
+            (*details)["data_size"] = data.getSize();
+            (*details)["message_data"] = data.toHex();
+          });
 
-    client.writeToServer(name, data);
+      client.writeToServer(name, frame);
+    }
   }
-
   bool tryWriteImpl(const MessageData &data) override {
+    // For simplicity, this implementation does not support backpressure and
+    // always returns true. A more complex implementation could track pending
+    // messages and return false if there are too many.
     writeImpl(data);
     return true;
   }
@@ -85,8 +91,9 @@ private:
 // ReadCosimChannelPort
 //===----------------------------------------------------------------------===//
 
-/// Cosim client implementation of a read channel port. Since gRPC read protocol
-/// streams messages back, this implementation is quite complex.
+/// Cosim client implementation of a read channel port. The wire transport
+/// (see `CosimRpc`) delivers messages via callback, so this class just
+/// forwards them to the registered `ReadChannelPort` consumer.
 class ReadCosimChannelPort : public ReadChannelPort {
 public:
   ReadCosimChannelPort(AcceleratorConnection &conn, RpcClient &client,
@@ -103,8 +110,8 @@ public:
                                "' is not a to client channel");
 
     // Connect to the channel and set up callback.
-    connection =
-        client.connectClientReceiver(name, [this](const MessageData &data) {
+    connection = client.connectClientReceiver(
+        name, [this](std::unique_ptr<SegmentedMessageData> &data) {
           // Add trace logging for the received message.
           conn.getLogger().trace(
               [this, &data](
@@ -113,12 +120,13 @@ public:
                 subsystem = "cosim_read";
                 msg = "Received message from channel '" + name + "'";
                 details = std::make_unique<std::map<std::string, std::any>>();
+                MessageData flat = data->toMessageData();
                 (*details)["channel"] = name;
-                (*details)["data_size"] = data.getSize();
-                (*details)["message_data"] = data.toHex();
+                (*details)["data_size"] = flat.getSize();
+                (*details)["message_data"] = flat.toHex();
               });
 
-          bool consumed = callback(data);
+          bool consumed = invokeCallback(data);
 
           if (consumed) {
             // Log the message consumption.
@@ -219,10 +227,11 @@ CosimAccelerator::CosimAccelerator(Context &ctxt, std::string hostname,
                                    uint16_t port)
     : AcceleratorConnection(ctxt) {
   // Connect to the simulation.
-  rpcClient = std::make_unique<RpcClient>(hostname, port);
+  rpcClient = std::make_unique<RpcClient>(getLogger(), hostname, port);
 }
 CosimAccelerator::~CosimAccelerator() {
   disconnect();
+  clearOwnedObjects();
   channels.clear();
 }
 
@@ -350,6 +359,7 @@ public:
   uint64_t read(uint32_t addr) const override {
     MMIOCmd cmd{.data = 0, .offset = addr, .write = false};
     auto arg = MessageData::from(cmd);
+    std::lock_guard<std::mutex> g(mmioCmdLock);
     std::future<MessageData> result = cmdMMIO->call(arg);
     result.wait();
     uint64_t ret = *result.get().as<uint64_t>();
@@ -372,6 +382,7 @@ public:
         });
     MMIOCmd cmd{.data = data, .offset = addr, .write = true};
     auto arg = MessageData::from(cmd);
+    std::lock_guard<std::mutex> g(mmioCmdLock);
     std::future<MessageData> result = cmdMMIO->call(arg);
     result.wait();
   }
@@ -397,20 +408,106 @@ struct HostMemReadReq {
   uint64_t address;
 };
 
-struct HostMemReadResp {
-  uint64_t data;
-  uint8_t tag;
-};
-
-struct HostMemWriteReq {
-  uint8_t valid_bytes;
-  uint64_t data;
-  uint8_t tag;
-  uint64_t address;
-};
-
 using HostMemWriteResp = uint8_t;
 #pragma pack(pop)
+
+// ESI lowers a parallel-window frame MSB-first (the first-declared field
+// occupies the highest bits) into a little-endian byte buffer; array elements
+// are packed least-index-first (element[0] in the low bits). The sub-byte
+// `last` / `data_size` fields make these frames bit-packed and not
+// byte-aligned, so -- to stay ABI-portable across toolchains (bit-field and
+// sub-byte `#pragma pack` layout is not guaranteed under MSVC) -- each frame is
+// a plain byte array whose bits are assembled/extracted explicitly with these
+// helpers. `bitOff` counts from the LSB (bit 0 of byte 0).
+void putBits(uint8_t *buf, size_t bitOff, size_t width, uint64_t val) {
+  for (size_t i = 0; i < width; ++i)
+    if ((val >> i) & 1ULL)
+      buf[(bitOff + i) >> 3] |= static_cast<uint8_t>(1u << ((bitOff + i) & 7));
+}
+uint64_t getBits(const uint8_t *buf, size_t bitOff, size_t width) {
+  uint64_t val = 0;
+  for (size_t i = 0; i < width; ++i)
+    if (buf[(bitOff + i) >> 3] & (1u << ((bitOff + i) & 7)))
+      val |= (1ULL << i);
+  return val;
+}
+
+// Read-response frame: one bus beat of a burst read. The client-facing read
+// response is a parallel window over struct{tag, data: list<i<HostMemWidth>>};
+// with one word per beat (num_items=1) the lowered frame is
+//   struct{tag: ui8, data: i64, last: i1}    (73 bits)
+// packed MSB-first: tag | data | last. `last` marks the final beat of a burst.
+class HostMemReadRespFrame {
+public:
+  static constexpr size_t kMessageBits = 8 + 64 + 1;              // 73
+  static constexpr size_t kMessageBytes = (kMessageBits + 7) / 8; // 10
+
+  HostMemReadRespFrame(uint8_t tag, uint64_t data, bool last) {
+    putBits(bytes.data(), kLastOff, kLastW, last ? 1 : 0);
+    putBits(bytes.data(), kDataOff, kDataW, data);
+    putBits(bytes.data(), kTagOff, kTagW, tag);
+  }
+
+  uint8_t tag() const { return getBits(bytes.data(), kTagOff, kTagW); }
+  uint64_t data() const { return getBits(bytes.data(), kDataOff, kDataW); }
+  bool last() const { return getBits(bytes.data(), kLastOff, kLastW) != 0; }
+
+  MessageData toMessage() const {
+    return MessageData(bytes.data(), bytes.size());
+  }
+
+private:
+  // MSB-first field order => reverse (LSB-most) bit offsets.
+  static constexpr size_t kLastW = 1, kLastOff = 0;                  // bit 0
+  static constexpr size_t kDataW = 64, kDataOff = kLastOff + kLastW; // bit 1
+  static constexpr size_t kTagW = 8, kTagOff = kDataOff + kDataW;    // bit 65
+  std::array<uint8_t, kMessageBytes> bytes{};
+};
+
+// Write-request frame: one bus beat of a burst write. The upstream write
+// request is a parallel window over struct{address, tag, data: list<i8>} with
+// num_items = the host-memory bus width in bytes (cosim HostMemWidth=64 => 8).
+// The lowered frame is
+//   struct{address: ui64, tag: ui8, data: i8[8], data_size: ui3, last: i1}
+// (140 bits) packed MSB-first: address | tag | data[8] | data_size | last, with
+// data element[i] in ascending bits. `data_size` holds (valid_bytes - 1);
+// `last` marks the final beat. Received from the device, so construct from raw
+// bytes plus read accessors.
+class HostMemWriteReqFrame {
+public:
+  static constexpr size_t kNumItems = 8; // bus width in bytes (cosim: 64 / 8)
+  static constexpr size_t kMessageBits = 64 + 8 + kNumItems * 8 + 3 + 1; // 140
+  static constexpr size_t kMessageBytes = (kMessageBits + 7) / 8;        // 18
+
+  explicit HostMemWriteReqFrame(const uint8_t *raw) {
+    std::memcpy(bytes.data(), raw, kMessageBytes);
+  }
+
+  uint64_t address() const { return getBits(bytes.data(), kAddrOff, kAddrW); }
+  uint8_t tag() const { return getBits(bytes.data(), kTagOff, kTagW); }
+  uint8_t dataByte(size_t i) const {
+    return getBits(bytes.data(), kDataOff + 8 * i, 8);
+  }
+  // Number of valid data bytes in this beat (data_size holds valid_bytes - 1).
+  unsigned validBytes() const {
+    return static_cast<unsigned>(getBits(bytes.data(), kSizeOff, kSizeW)) + 1;
+  }
+  bool last() const { return getBits(bytes.data(), kLastOff, kLastW) != 0; }
+
+private:
+  static constexpr size_t kLastW = 1, kLastOff = 0;
+  static constexpr size_t kSizeW = 3, kSizeOff = kLastOff + kLastW;
+  static constexpr size_t kDataW = kNumItems * 8, kDataOff = kSizeOff + kSizeW;
+  static constexpr size_t kTagW = 8, kTagOff = kDataOff + kDataW;
+  static constexpr size_t kAddrW = 64, kAddrOff = kTagOff + kTagW;
+  std::array<uint8_t, kMessageBytes> bytes{};
+};
+
+// PCIe caps a single memory read request at the Max_Read_Request_Size, whose
+// largest encoding (PCIe Gen 4 and earlier) is 4096 bytes, but root ports often
+// negotiate a smaller limit. Model a conservative 64-double-word (256-byte) cap
+// here: a read request larger than this is a protocol violation.
+static constexpr uint32_t kPcieMaxReadRequestBytes = 64 * 4;
 
 class CosimHostMem : public HostMem {
 public:
@@ -433,10 +530,10 @@ public:
         !rpcClient->getChannelDesc("__cosim_hostmem_read_resp.data", readResp))
       throw std::runtime_error("Could not find HostMem read channels");
 
-    const esi::Type *readRespType =
-        getType(ctxt, new StructType(readResp.type,
-                                     {{"tag", new UIntType("ui8", 8)},
-                                      {"data", new BitsType("i64", 64)}}));
+    const esi::Type *readRespType = getType(
+        ctxt, new StructType(readResp.type, {{"tag", new UIntType("ui8", 8)},
+                                             {"data", new BitsType("i64", 64)},
+                                             {"last", new BitsType("i1", 1)}}));
     const esi::Type *readReqType =
         getType(ctxt, new StructType(readArg.type,
                                      {{"address", new UIntType("ui64", 64)},
@@ -466,7 +563,9 @@ public:
         getType(ctxt, new StructType(writeArg.type,
                                      {{"address", new UIntType("ui64", 64)},
                                       {"tag", new UIntType("ui8", 8)},
-                                      {"data", new BitsType("i64", 64)}}));
+                                      {"data", new BitsType("i64", 64)},
+                                      {"data_size", new UIntType("ui3", 3)},
+                                      {"last", new BitsType("i1", 1)}}));
 
     // Get ports, create the function, then connect to it.
     writeRespPort = std::make_unique<WriteCosimChannelPort>(
@@ -497,18 +596,41 @@ public:
                 " len=" + std::to_string(req->length) +
                 " tag=" + std::to_string(req->tag);
         });
-    // Send one response per 8 bytes.
+    // Send one response per 8 bytes. Zero-length reads (e.g. void / zero-width
+    // types) indicates a bug in the hardware and we log an error, but we still
+    // send a single response.
     uint64_t *dataPtr = reinterpret_cast<uint64_t *>(req->address);
-    for (uint32_t i = 0, e = (req->length + 7) / 8; i < e; ++i) {
-      HostMemReadResp resp{.data = dataPtr[i], .tag = req->tag};
+    uint32_t numDataResps = (req->length + 7) / 8;
+    if (numDataResps == 0)
+      acc.getLogger().error(
+          "hostmem",
+          std::format("Read request with length=0 from addr=0x{} tag={}. "
+                      "Reads of length 0 are not valid and indicate a bug "
+                      "in the requester.",
+                      toHex(req->address), req->tag));
+    if (req->length > kPcieMaxReadRequestBytes)
+      acc.getLogger().error(
+          "hostmem",
+          std::format("Read request length={} from addr=0x{} tag={} exceeds "
+                      "the PCIe maximum read request size ({} bytes). The "
+                      "requester must split reads larger than this into "
+                      "multiple requests.",
+                      req->length, toHex(req->address), req->tag,
+                      kPcieMaxReadRequestBytes));
+    uint32_t numResps = std::max(numDataResps, 1u);
+    for (uint32_t i = 0; i < numResps; ++i) {
+      uint64_t word = i < numDataResps ? dataPtr[i] : 0;
+      bool last = i + 1 == numResps;
+      HostMemReadRespFrame frame(req->tag, word, last);
       acc.getLogger().trace(
           [&](std::string &subsystem, std::string &msg,
               std::unique_ptr<std::map<std::string, std::any>> &details) {
             subsystem = "HostMem";
-            msg = "Read result: data=0x" + toHex(resp.data) +
-                  " tag=" + std::to_string(resp.tag);
+            msg = "Read result: data=0x" + toHex(word) +
+                  " tag=" + std::to_string(req->tag) +
+                  " last=" + std::to_string(last);
           });
-      readRespPort->write(MessageData::from(resp));
+      readRespPort->write(frame.toMessage());
     }
     return true;
   }
@@ -516,20 +638,26 @@ public:
   // Service a write request as a callback. Simply write the data to the
   // location specified. TODO: check that the memory has been mapped.
   MessageData serviceWrite(const MessageData &reqBytes) {
-    const HostMemWriteReq *req = reqBytes.as<HostMemWriteReq>();
+    if (reqBytes.getSize() != HostMemWriteReqFrame::kMessageBytes)
+      throw std::runtime_error(
+          "HostMem write frame size mismatch. Size is " +
+          std::to_string(reqBytes.getSize()) + ", expected " +
+          std::to_string(HostMemWriteReqFrame::kMessageBytes) + ".");
+    HostMemWriteReqFrame req(reqBytes.getBytes());
     acc.getLogger().trace(
         [&](std::string &subsystem, std::string &msg,
             std::unique_ptr<std::map<std::string, std::any>> &details) {
           subsystem = "hostmem";
-          msg = "Write request: addr=0x" + toHex(req->address) + " data=0x" +
-                toHex(req->data) +
-                " valid_bytes=" + std::to_string(req->valid_bytes) +
-                " tag=" + std::to_string(req->tag);
+          msg = "Write request: addr=0x" + toHex(req.address()) +
+                " valid_bytes=" + std::to_string(req.validBytes()) +
+                " tag=" + std::to_string(req.tag()) +
+                " last=" + std::to_string(req.last());
         });
-    uint8_t *dataPtr = reinterpret_cast<uint8_t *>(req->address);
-    for (uint8_t i = 0; i < req->valid_bytes; ++i)
-      dataPtr[i] = (req->data >> (i * 8)) & 0xFF;
-    HostMemWriteResp resp = req->tag;
+    uint8_t *dataPtr = reinterpret_cast<uint8_t *>(req.address());
+    unsigned validBytes = req.validBytes();
+    for (unsigned i = 0; i < validBytes; ++i)
+      dataPtr[i] = req.dataByte(i);
+    HostMemWriteResp resp = req.tag();
     return MessageData::from(resp);
   }
 

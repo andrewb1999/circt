@@ -511,6 +511,9 @@ def LowerFIRRTLToHW : Pass<"lower-firrtl-to-hw", "mlir::ModuleOp"> {
     Option<"enableAnnotationWarning", "warn-on-unprocessed-annotations",
            "bool", "false",
     "Emit warnings on unprocessed annotations during lower-to-hw pass">,
+    Option<"lowerToCore", "lower-to-core", "bool", "false",
+           "Prefer core dialects over direct SV lowering for FIRRTL "
+           "verification and printf operations">,
     Option<"verificationFlavor", "verification-flavor",
            "circt::firrtl::VerificationFlavor",
            "circt::firrtl::VerificationFlavor::None",
@@ -607,6 +610,7 @@ def ConvertMooreToCore : Pass<"convert-moore-to-core", "mlir::ModuleOp"> {
     "mlir::scf::SCFDialect",
     "mlir::math::MathDialect",
     "mlir::LLVM::LLVMDialect",
+    "mlir::ub::UBDialect",
     "sim::SimDialect",
     "verif::VerifDialect",
   ];
@@ -712,19 +716,14 @@ def ConvertHWToBTOR2 : Pass<"convert-hw-to-btor2", "mlir::ModuleOp"> {
 def LowerLTLToCore : Pass<"lower-ltl-to-core", "hw::HWModuleOp"> {
   let summary = "Convert LTL and Verif to Core";
   let description = [{
-    This pass converts ltl and verif operations to core ones. This can be done directly
-    without going through FSM if we're only working with overlapping properties (no delays).
+    This pass converts LTL and Verif operations that can be expressed with Core
+    operations. Other LTL operations are left for downstream backends.
   }];
   let constructor = "circt::createLowerLTLToCorePass()";
   let dependentDialects = [
     "hw::HWDialect", "sv::SVDialect", "comb::CombDialect",
     "seq::SeqDialect"
   ];
-  let options =
-    [Option<"assumeFirstClock", "assume-first-clock", "bool", "false",
-            "Assume that implicitly clocked LTL operations are clocked by the"
-            "first clock argument, or failing that, the first seq.to_clock"
-            "operation in their parent hw.module.">];
 }
 
 //===----------------------------------------------------------------------===//
@@ -832,7 +831,8 @@ def ConvertVerifToSMT : Pass<"convert-verif-to-smt", "mlir::ModuleOp"> {
     "mlir::smt::SMTDialect",
     "mlir::arith::ArithDialect",
     "mlir::scf::SCFDialect",
-    "mlir::func::FuncDialect"
+    "mlir::func::FuncDialect",
+    "verif::VerifDialect"
   ];
   let options = [
     Option<"risingClocksOnly", "rising-clocks-only", "bool",
@@ -866,12 +866,17 @@ def LowerSMTToZ3LLVM : Pass<"lower-smt-to-z3-llvm", "mlir::ModuleOp"> {
   let summary = "Lower the SMT dialect to LLVM IR calling the Z3 API";
   let dependentDialects = [
     "mlir::smt::SMTDialect", "mlir::LLVM::LLVMDialect", "mlir::scf::SCFDialect",
-    "mlir::cf::ControlFlowDialect", "mlir::func::FuncDialect"
+    "mlir::cf::ControlFlowDialect", "mlir::func::FuncDialect",
+    "verif::VerifDialect"
   ];
   let options = [
     Option<"debug", "debug", "bool", "false",
            "Insert additional printf calls printing the solver's state to "
            "stdout (e.g. at check-sat operations) for debugging purposes">,
+    Option<"printOnlyFirstCounterexample", "print-only-first-counterexample",
+           "bool", "false",
+           "Suppress counterexample printing after the first successfully "
+           "printed model in each solver invocation">,
   ];
 }
 
@@ -895,7 +900,10 @@ def LowerSeqToSV: Pass<"lower-seq-to-sv",  "mlir::ModuleOp"> {
     Option<"emitSeparateAlwaysBlocks", "emit-separate-always-blocks", "bool", "false",
            "Emit assigments to registers in separate always blocks">,
     Option<"lowerToAlwaysFF", "lower-to-always-ff", "bool", "true",
-           "Place assignments to registers into `always_ff` blocks if possible">
+           "Place assignments to registers into `always_ff` blocks if possible">,
+    Option<"emitPresetAsInlineInit", "emit-preset-as-inline-init", "bool", "true",
+           "Emit register preset values as inline `sv.reg` initializers instead "
+           "of a guarded `initial` block">
   ];
   let statistics = [
     Statistic<"numSubaccessRestored", "num-subaccess-restored",
@@ -929,7 +937,7 @@ def LowerSimToSV: Pass<"lower-sim-to-sv",  "mlir::ModuleOp"> {
 // ConvertCombToSynth
 //===----------------------------------------------------------------------===//
 
-def ConvertCombToSynth : Pass<"convert-comb-to-synth", "hw::HWModuleOp"> {
+def ConvertCombToSynth : Pass<"convert-comb-to-synth"> {
   let summary = "Lower Comb ops to Synth ops.";
   let dependentDialects = ["circt::comb::CombDialect",
                            "circt::synth::SynthDialect"];
@@ -937,12 +945,9 @@ def ConvertCombToSynth : Pass<"convert-comb-to-synth", "hw::HWModuleOp"> {
   let options =
       [ListOption<"additionalLegalOps", "additional-legal-ops", "std::string",
                   "Specify additional legal ops to partially legalize Comb">,
-       Option<"targetIR", "target-ir", "circt::CombToSynthTargetIR",
-              /*default=*/"circt::CombToSynthTargetIR::AIG", "Target IR kind",
-              [{::llvm::cl::values(
-             clEnumValN(circt::CombToSynthTargetIR::AIG, "aig", "Lower to AIG"),
-             clEnumValN(circt::CombToSynthTargetIR::MIG, "mig", "Lower to MIG")
-           )}]>,
+       Option<"forceAIG", "force-aig", "bool", "true",
+              "Force lowering to AIG-only synth ops instead of preserving "
+              "higher-level synth ops such as synth.xor_inv">,
        Option<"maxEmulationUnknownBits", "max-emulation-unknown-bits",
               "uint32_t", "10",
               "Maximum number of unknown bits to emulate in a table lookup">];
@@ -966,7 +971,7 @@ def ConvertSynthToComb: Pass<"convert-synth-to-comb"> {
 // ConvertCombToDatapath
 //===----------------------------------------------------------------------===//
 
-def ConvertCombToDatapath: Pass<"convert-comb-to-datapath",  "hw::HWModuleOp"> {
+def ConvertCombToDatapath: Pass<"convert-comb-to-datapath"> {
   let summary = "Lower Comb ops to Datapath ops";
   let description = [{
     This pass converts arithmetic Comb operations into Datapath operations that
@@ -1001,6 +1006,8 @@ def ConvertDatapathToComb : Pass<"convert-datapath-to-comb"> {
     "circt::hw::HWDialect"
   ];
   let options = [
+    Option<"lowerCompress", "lower-compress", "bool", "true",
+           "Lower compress operators to a tree of compressor cells.">,
     Option<"lowerCompressToAdd", "lower-compress-to-add", "bool", "false",
            "Lower compress operators to variadic add.">,
     Option<"forceBooth", "lower-partial-product-to-booth", "bool", "false",

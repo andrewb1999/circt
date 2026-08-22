@@ -33,6 +33,7 @@ using namespace arc;
 
 void circt::populateArcPreprocessingPipeline(
     OpPassManager &pm, const ArcPreprocessingOptions &options) {
+  pm.addPass(arc::createResolveXMRRef());
   pm.addPass(om::createStripOMPass());
   pm.addPass(emit::createStripEmitPass());
   pm.addPass(createLowerFirMemPass());
@@ -58,6 +59,12 @@ void circt::populateArcPreprocessingPipeline(
 
 void circt::populateArcConversionPipeline(OpPassManager &pm,
                                           const ArcConversionOptions &options) {
+  {
+    sim::SquashSimTriggeredOptions opts;
+    opts.convertToHW = true;
+    pm.addNestedPass<hw::HWModuleOp>(sim::createSquashSimTriggered(opts));
+  }
+  pm.addPass(arc::createLowerProcessesPass());
   {
     ConvertToArcsPassOptions opts;
     opts.tapRegisters = options.observeRegisters;
@@ -120,11 +127,13 @@ void circt::populateArcStateLoweringPipeline(
   pm.addPass(arc::createMergeIfsPass());
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizer());
+  pm.addPass(arc::createLowerCoroutinesPass());
 }
 
 void circt::populateArcStateAllocationPipeline(
     OpPassManager &pm, const ArcStateAllocationOptions &options) {
   pm.addPass(arc::createLowerArcsToFuncs());
+  pm.addPass(arc::createRemoveI0Types());
   {
     AllocateStateOptions allocStateOpts;
     allocStateOpts.insertTraceTaps = options.insertTraceTaps;
@@ -142,6 +151,8 @@ void circt::populateArcStateAllocationPipeline(
 
 void circt::populateArcToLLVMPipeline(OpPassManager &pm,
                                       const ArcToLLVMOptions &options) {
+  if (!options.noGenerateDriver)
+    pm.addPass(createGenerateDriver());
   {
     hw::HWConvertBitcastsOptions options;
     options.allowPartialConversion = false;
@@ -153,6 +164,10 @@ void circt::populateArcToLLVMPipeline(OpPassManager &pm,
     opts.traceFileName = options.traceFileName;
     pm.addPass(createInsertRuntime(opts));
   }
+  if (options.bufferizeArrays) {
+    pm.addPass(createLowerArrays());
+  }
+  pm.addPass(createInferContext());
   pm.addPass(createLowerArcToLLVMPass());
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizer());

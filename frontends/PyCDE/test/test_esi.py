@@ -6,7 +6,7 @@ from pycde import (Clock, Input, InputChannel, Output, OutputChannel, Module,
 from pycde import esi
 from pycde.common import AppID, Constant, RecvBundle, SendBundle
 from pycde.constructs import Wire
-from pycde.esi import HostMem, MMIO
+from pycde.esi import HostMem, MMIO, ListWindowToParallel, ListWindowToSerial
 from pycde.module import Metadata
 from pycde.support import _obj_to_attribute, optional_dict_to_dict_attr
 from pycde.types import (Bit, Bits, Bundle, BundledChannel, Channel,
@@ -402,6 +402,56 @@ class HostMemReq(Module):
     _ = HostMem.write(appid=AppID("host_mem_write_req"), req=write_req)
 
 
+# Exercises the HostMem burst/list interface: read_req_burst_type(),
+# write_window(), read_list() (-> read_window()/read_list_from_bundle()) and
+# write() with a list (-> write_from_bundle()). The list windows are the
+# 'parallel' (default) framing: a single frame carrying 'num_items' items.
+# CHECK-LABEL:  hw.module @HostMemListReq()
+# read_list: {address, tag, length} request, parallel windowed list response.
+# CHECK:          esi.service.req <@_HostMem::@read_list>(#esi.appid<"host_mem_read_list">) : !esi.bundle<[!esi.channel<!hw.struct<address: ui64, tag: ui8, length: ui64>> from "req", !esi.channel<!esi.window<"HostMemReadResp", !hw.struct<tag: ui8, data: !esi.list<ui256>>, [<"", [<"tag">, <"data", 4>]>]>> to "resp"]>
+# write with a list: wrap a parallel write window and send it on the 'write' port.
+# CHECK:          esi.window.wrap %{{.+}} : !esi.window<"HostMemWriteReq", !hw.struct<address: ui64, tag: ui8, data: !esi.list<ui256>>, [<"", [<"address">, <"tag">, <"data", 4>]>]>
+# CHECK:          esi.service.req <@_HostMem::@write>(#esi.appid<"host_mem_write_list">) : !esi.bundle<[!esi.channel<!esi.window<"HostMemWriteReq", !hw.struct<address: ui64, tag: ui8, data: !esi.list<ui256>>, [<"", [<"address">, <"tag">, <"data", 4>]>]>> from "req", !esi.channel<ui8> to "ackTag"]>
+# CHECK:        esi.service.std.hostmem @_HostMem
+@unittestmodule(esi_sys=True)
+class HostMemListReq(Module):
+
+  @generator
+  def build(ports):
+    u64 = UInt(64)(0)
+    c1 = Bits(1)(0)
+
+    # Burst (list) read: exercises read_req_burst_type(), read_window() and
+    # read_list() (-> read_list_from_bundle()).
+    burst_req, _ = Channel(esi.HostMem.read_req_burst_type()).wrap(
+        esi.HostMem.read_req_burst_type()({
+            "address": u64,
+            "tag": UInt(8)(0),
+            "length": UInt(64)(0),
+        }), c1)
+    _ = HostMem.read_list(appid=AppID("host_mem_read_list"),
+                          req=burst_req,
+                          element_type=UInt(256),
+                          num_items=4)
+
+    # Windowed (list) write: exercises write_window() and write() with a list
+    # (-> write_from_bundle()).
+    write_win = esi.HostMem.write_window(UInt(256), 4)
+    lowered = write_win.lowered_type
+    frame_val = lowered({
+        "address": u64,
+        "tag": UInt(8)(0),
+        "data": [UInt(256)(0),
+                 UInt(256)(0),
+                 UInt(256)(0),
+                 UInt(256)(0)],
+        "data_size": Bits(2)(0),
+        "last": c1,
+    })
+    write_frame, _ = Channel(write_win).wrap(write_win.wrap(frame_val), c1)
+    _ = HostMem.write(appid=AppID("host_mem_write_list"), req=write_frame)
+
+
 def Writer(type):
 
   class Writer(Module):
@@ -513,3 +563,248 @@ class TestBundleTransformBasic(Module):
         req=transform_double_width, resp=(Bits(48), transform_truncate_half))
 
     self.bundle_out = transformed_bundle
+
+
+# CHECK-LABEL: hw.module @ListWindowToParallel_{{.*}}esi_list_i8{{.*}}(in %clk : !seq.clock, in %rst : i1, in %serial_in :
+# Non-zero-width data: the per-item buffer register and forward/buffer mux
+# are present.
+# CHECK:         %buf_item = seq.compreg.ce sym @buf_item %{{.+}}, %clk, %{{.+}} reset %rst, %{{.+}} : i8
+# CHECK:         comb.mux bin %{{.+}}, %buf_item, %{{.+}} {{.+}} : i8
+# CHECK:         hw.instance "remaining" sym @remaining @DownCounter_decrement_on_loadFalse_width8
+# CHECK:         %state = seq.compreg sym @state %{{.+}}, %clk reset %rst, %{{.+}} : i2
+@unittestmodule()
+class TestListWindowToParallel(Module):
+  """Test transforming a list window to parallel channels."""
+
+  clk = Clock()
+  rst = Reset()
+
+  into_type = StructType({'header': Bits(4), 'data': List(Bits(8))})
+  data_count_width = 8
+  items_per_frame = 1
+
+  serial_lst_in = InputChannel(
+      Window.serial_of(into_type, data_count_width, items_per_frame))
+  parallel_lst_out = OutputChannel(Window.default_of(into_type))
+
+  @generator
+  def build(self):
+    to_parallel = ListWindowToParallel(
+        Window.serial_of(TestListWindowToParallel.into_type,
+                         TestListWindowToParallel.data_count_width,
+                         TestListWindowToParallel.items_per_frame))(
+                             clk=self.clk,
+                             rst=self.rst,
+                             serial_in=self.serial_lst_in)
+    self.parallel_lst_out = to_parallel.parallel_out
+
+
+# CHECK-LABEL: hw.module @ListWindowToSerial_{{.*}}esi_list_i8{{.*}}(in %clk : !seq.clock, in %rst : i1, in %parallel_in :
+# Non-zero-width data: a data FIFO of element type i8 is instantiated in
+# addition to the metadata FIFO.
+# CHECK:         seq.fifo depth 8 {{.+}} : i8
+# CHECK:         seq.fifo depth 2 {{.+}} : !hw.struct<hdr:
+# CHECK:         hw.instance "in_list" sym @in_list @ControlReg_num_asserts1_num_resets1
+# CHECK:         %state = seq.compreg sym @state %{{.+}}, %clk reset %rst, %{{.+}} : i2
+@unittestmodule()
+class TestListWindowToSerial(Module):
+  """Test transforming parallel channels into a serial list window."""
+
+  clk = Clock()
+  rst = Reset()
+
+  into_type = StructType({'header': Bits(4), 'data': List(Bits(8))})
+  data_count_width = 8
+  items_per_frame = 1
+  fifo_depth = 8
+
+  parallel_lst_in = InputChannel(Window.default_of(into_type))
+  serial_lst_out = OutputChannel(
+      Window.serial_of(into_type, data_count_width, items_per_frame))
+
+  @generator
+  def build(self):
+    to_serial = ListWindowToSerial(
+        Window.default_of(TestListWindowToSerial.into_type),
+        TestListWindowToSerial.data_count_width,
+        TestListWindowToSerial.items_per_frame,
+        TestListWindowToSerial.fifo_depth)(clk=self.clk,
+                                           rst=self.rst,
+                                           parallel_in=self.parallel_lst_in)
+    self.serial_lst_out = to_serial.serial_out
+
+
+# Verify ListWindowToParallel/Serial accept list element types of zero
+# bitwidth. With zero-width data the per-item buffer register and data FIFO
+# are skipped (seq.CompReg / SeqFIFO disallow zero-width types), but the
+# modules still elaborate with the same external signatures.
+# CHECK-LABEL: hw.module @ListWindowToParallel_{{.*}}esi_list_i0{{.*}}(in %clk : !seq.clock, in %rst : i1, in %serial_in :
+# Zero-width data: the per-item buffer register is omitted and the data
+# item is forwarded directly into the output struct.
+# CHECK-NOT:     @buf_item
+# CHECK:         hw.struct_create (%{{.+}}, %{{.+}}, %{{.+}}) : !hw.struct<header: i4, data: i0, last: i1>
+# CHECK:         hw.instance "remaining" sym @remaining @DownCounter_decrement_on_loadFalse_width8
+# CHECK-NOT:     @buf_item
+# CHECK:         %state = seq.compreg sym @state %{{.+}}, %clk reset %rst, %{{.+}} : i2
+@unittestmodule()
+class TestListWindowToParallelZeroWidth(Module):
+  """Test transforming a zero-bitwidth list window to parallel channels."""
+
+  clk = Clock()
+  rst = Reset()
+
+  into_type = StructType({'header': Bits(4), 'data': List(Bits(0))})
+  data_count_width = 8
+  items_per_frame = 1
+
+  serial_lst_in = InputChannel(
+      Window.serial_of(into_type, data_count_width, items_per_frame))
+  parallel_lst_out = OutputChannel(Window.default_of(into_type))
+
+  @generator
+  def build(self):
+    to_parallel = ListWindowToParallel(
+        Window.serial_of(TestListWindowToParallelZeroWidth.into_type,
+                         TestListWindowToParallelZeroWidth.data_count_width,
+                         TestListWindowToParallelZeroWidth.items_per_frame))(
+                             clk=self.clk,
+                             rst=self.rst,
+                             serial_in=self.serial_lst_in)
+    self.parallel_lst_out = to_parallel.parallel_out
+
+
+# CHECK-LABEL: hw.module @ListWindowToSerial_{{.*}}esi_list_i0{{.*}}(in %clk : !seq.clock, in %rst : i1, in %parallel_in :
+# Zero-width data: only the metadata FIFO is instantiated; no data FIFO.
+# CHECK-NOT:     seq.fifo {{.+}} : i0
+# CHECK:         seq.fifo depth 2 {{.+}} : !hw.struct<hdr:
+# CHECK-NOT:     seq.fifo {{.+}} : i0
+# CHECK:         hw.instance "in_list" sym @in_list @ControlReg_num_asserts1_num_resets1
+# CHECK-NOT:     seq.fifo {{.+}} : i0
+# CHECK:         %state = seq.compreg sym @state %{{.+}}, %clk reset %rst, %{{.+}} : i2
+@unittestmodule()
+class TestListWindowToSerialZeroWidth(Module):
+  """Test transforming zero-bitwidth parallel channels into a serial list
+  window."""
+
+  clk = Clock()
+  rst = Reset()
+
+  into_type = StructType({'header': Bits(4), 'data': List(Bits(0))})
+  data_count_width = 8
+  items_per_frame = 1
+  fifo_depth = 8
+
+  parallel_lst_in = InputChannel(Window.default_of(into_type))
+  serial_lst_out = OutputChannel(
+      Window.serial_of(into_type, data_count_width, items_per_frame))
+
+  @generator
+  def build(self):
+    to_serial = ListWindowToSerial(
+        Window.default_of(TestListWindowToSerialZeroWidth.into_type),
+        TestListWindowToSerialZeroWidth.data_count_width,
+        TestListWindowToSerialZeroWidth.items_per_frame,
+        TestListWindowToSerialZeroWidth.fifo_depth)(
+            clk=self.clk, rst=self.rst, parallel_in=self.parallel_lst_in)
+    self.serial_lst_out = to_serial.serial_out
+
+
+# CHECK-LABEL: hw.module @ChannelMergeOneValidImpl_{{.*}}num_inputs3_register_outputFalse
+# Every input is unwrapped with the *same* `%ready`. This broadcast is the
+# property the module exists for: no input's `ready` is a function of any
+# sibling's `valid`, so there is no combinational coupling between the inputs.
+# If arbitration ever creeps back in, these three stop matching.
+# CHECK:         esi.unwrap.vr %{{.+}}, %ready : i8
+# CHECK:         esi.unwrap.vr %{{.+}}, %ready : i8
+# CHECK:         esi.unwrap.vr %{{.+}}, %ready : i8
+# `valid` is a single OR-reduce over the inputs' valids, and the payload is a
+# list select on a binary encode of that same vector -- never an OR of masked
+# payloads, so only one input's data can reach the output even if the caller
+# violates the at-most-one-valid contract. The interleaved `CHECK-NOT`s cover
+# the whole span from the last unwrap to the wrap.
+# CHECK-NOT:     comb.or {{.*}} : i8
+# CHECK:         comb.or bin %{{.+}}, %{{.+}}, %{{.+}} : i1
+# CHECK-NOT:     comb.or {{.*}} : i8
+# CHECK:         comb.concat %{{.+}}, %{{.+}} {{.*}}: i1, i1
+# The payload is read straight out of an array indexed by that select, sized to
+# the input count -- no rounding up to a power of two, since under the contract
+# the select only ever takes on a real input's index.
+# CHECK:         hw.array_create
+# CHECK:         hw.array_get %{{.+}}[%{{.+}}] {{.*}}: !hw.array<3xi8>, i2
+# CHECK-NOT:     comb.or {{.*}} : i8
+# CHECK:         esi.wrap.vr
+@unittestmodule()
+class TestChannelMergeOneValid(Module):
+  """Merge channels which are never simultaneously valid, without
+  arbitration."""
+
+  clk = Clock()
+  rst = Reset()
+
+  in0 = InputChannel(Bits(8))
+  in1 = InputChannel(Bits(8))
+  in2 = InputChannel(Bits(8))
+  merged_out = OutputChannel(Bits(8))
+
+  @generator
+  def build(self):
+    self.merged_out = esi.ChannelMergeOneValid([self.in0, self.in1, self.in2],
+                                               self.clk,
+                                               self.rst,
+                                               register_output=False)
+
+
+# CHECK-LABEL: hw.module @ChannelMergeOneValidImpl_{{.*}}num_inputs2_register_outputTrue
+# `register_output=True` is the default every caller gets. It must still
+# broadcast one `ready`, and must terminate in a one-stage buffer -- that skid
+# is what makes every input's `ready` a flop output, which is the whole point
+# of the option. With two inputs the select is a single `valid` bit, so the
+# array is indexed directly by it with no encode in between.
+# CHECK:         esi.unwrap.vr %{{.+}}, %ready : i8
+# CHECK:         esi.unwrap.vr %{{.+}}, %ready : i8
+# CHECK:         comb.or bin %{{.+}}, %{{.+}} : i1
+# CHECK:         hw.array_get %{{.+}}[%{{.+}}] {{.*}}: !hw.array<2xi8>, i1
+# CHECK:         esi.wrap.vr
+# CHECK:         esi.buffer %clk, %rst, %{{.+}} {stages = 1 : i64}
+@unittestmodule()
+class TestChannelMergeOneValidRegistered(Module):
+  """The default `register_output=True` path: skid buffer on the output."""
+
+  clk = Clock()
+  rst = Reset()
+
+  in0 = InputChannel(Bits(8))
+  in1 = InputChannel(Bits(8))
+  merged_out = OutputChannel(Bits(8))
+
+  @generator
+  def build(self):
+    self.merged_out = esi.ChannelMergeOneValid([self.in0, self.in1], self.clk,
+                                               self.rst)
+
+
+# CHECK-LABEL: hw.module @ChannelMergeOneValidImpl_{{.*}}esi_channel_i0{{.*}}register_outputFalse
+# Zero-width payload: there is nothing to select, so the merge degenerates to
+# the `valid` OR-reduce and no payload select is built at all.
+# CHECK:         esi.unwrap.vr %{{.+}}, %ready : i0
+# CHECK:         esi.unwrap.vr %{{.+}}, %ready : i0
+# CHECK-NOT:     hw.array_get
+# CHECK:         comb.or bin %{{.+}}, %{{.+}} : i1
+# CHECK:         esi.wrap.vr %{{.+}}, %{{.+}} {{.*}}: i0
+@unittestmodule()
+class TestChannelMergeOneValidZeroWidth(Module):
+  """Zero-width payloads (pure tokens) take the no-mux path."""
+
+  clk = Clock()
+  rst = Reset()
+
+  in0 = InputChannel(Bits(0))
+  in1 = InputChannel(Bits(0))
+  merged_out = OutputChannel(Bits(0))
+
+  @generator
+  def build(self):
+    self.merged_out = esi.ChannelMergeOneValid([self.in0, self.in1],
+                                               self.clk,
+                                               self.rst,
+                                               register_output=False)

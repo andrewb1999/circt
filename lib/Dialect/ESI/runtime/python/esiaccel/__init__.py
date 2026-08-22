@@ -3,16 +3,6 @@
 #  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 import sys
 import os
-from .accelerator import AcceleratorConnection, Context, LogLevel
-
-from .esiCppAccel import (AppID, Type, BundleType, ChannelType, ArrayType,
-                          StructType, BitsType, UIntType, SIntType)
-
-__all__ = [
-    "AcceleratorConnection", "AppID", "Context", "LogLevel", "Type",
-    "BundleType", "ChannelType", "ArrayType", "StructType", "BitsType",
-    "UIntType", "SIntType"
-]
 
 if sys.platform == "win32":
   """Ensure that ESI libraries are in the dll path on Windows. Necessary to
@@ -21,6 +11,18 @@ if sys.platform == "win32":
   """
   from .utils import get_dll_dir
   os.add_dll_directory(str(get_dll_dir()))
+
+from .accelerator import AcceleratorConnection, Context, LogLevel
+
+from .esiCppAccel import (AppID, Type, BundleType, ChannelType, ArrayType,
+                          StructType, BitsType, UIntType, SIntType, ListType,
+                          WindowType)
+
+__all__ = [
+    "AcceleratorConnection", "AppID", "Context", "LogLevel", "Type",
+    "BundleType", "ChannelType", "ArrayType", "StructType", "BitsType",
+    "UIntType", "SIntType", "ListType", "WindowType"
+]
 
 
 def connect(platform: str, connection_str: str) -> "AcceleratorConnection":

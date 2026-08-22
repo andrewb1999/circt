@@ -149,6 +149,17 @@ void circt::python::populateDialectRTGSubmodule(nb::module_ &m) {
           },
           nb::arg("self"), nb::arg("ctxt") = nullptr);
 
+  mlir_type_subclass(m, "ContinuationType", rtgTypeIsAContinuation)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, MlirType resumeType) {
+            return cls(rtgContinuationTypeGet(resumeType));
+          },
+          nb::arg("self"), nb::arg("resume_type"))
+      .def_property_readonly("resume_type", [](MlirType self) {
+        return rtgContinuationTypeGetResumeType(self);
+      });
+
   // Types for ISA targets
   //===--------------------------------------------------------------------===//
 
@@ -159,17 +170,6 @@ void circt::python::populateDialectRTGSubmodule(nb::module_ &m) {
             return cls(rtgLabelTypeGet(ctxt));
           },
           nb::arg("self"), nb::arg("ctxt") = nullptr);
-
-  mlir_type_subclass(m, "ImmediateType", rtgTypeIsAImmediate)
-      .def_classmethod(
-          "get",
-          [](nb::object cls, uint32_t width, MlirContext ctx) {
-            return cls(rtgImmediateTypeGet(ctx, width));
-          },
-          nb::arg("self"), nb::arg("width"), nb::arg("ctx") = nullptr)
-      .def_property_readonly("width", [](MlirType self) {
-        return rtgImmediateTypeGetWidth(self);
-      });
 
   mlir_type_subclass(m, "MemoryBlockType", rtgTypeIsAMemoryBlock)
       .def_classmethod(
@@ -264,21 +264,6 @@ void circt::python::populateDialectRTGSubmodule(nb::module_ &m) {
           nb::arg("self"), nb::arg("visibility"), nb::arg("ctxt") = nullptr)
       .def_property_readonly("value", [](MlirAttribute self) {
         return rtgLabelVisibilityAttrGetValue(self);
-      });
-
-  mlir_attribute_subclass(m, "ImmediateAttr", rtgAttrIsAImmediate)
-      .def_classmethod(
-          "get",
-          [](nb::object cls, uint32_t width, uint64_t value, MlirContext ctx) {
-            return cls(rtgImmediateAttrGet(ctx, width, value));
-          },
-          nb::arg("self"), nb::arg("width"), nb::arg("value"),
-          nb::arg("ctx") = nullptr)
-      .def_property_readonly(
-          "width",
-          [](MlirAttribute self) { return rtgImmediateAttrGetWidth(self); })
-      .def_property_readonly("value", [](MlirAttribute self) {
-        return rtgImmediateAttrGetValue(self);
       });
 
   mlir_attribute_subclass(m, "VirtualRegisterConfigAttr",

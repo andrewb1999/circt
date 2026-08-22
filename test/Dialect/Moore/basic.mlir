@@ -189,8 +189,6 @@ moore.module @Expressions(
   // CHECK: moore.constant b1010XZ : l8
   moore.constant b1010XZ : l8
 
-  // CHECK: moore.conversion [[A]] : !moore.i32 -> !moore.l32
-  moore.conversion %a : !moore.i32 -> !moore.l32
   // CHECK: moore.packed_to_sbv [[STRUCT1]] : struct<{a: i32, b: i32}>
   moore.packed_to_sbv %struct1 : struct<{a: i32, b: i32}>
   // CHECK: moore.sbv_to_packed [[C]] : struct<{u: l16, v: l16}>
@@ -478,11 +476,53 @@ func.func @SeverityAndDisplayBuiltins(%arg0: !moore.format_string) {
 }
 
 // CHECK-LABEL: func.func @MathBuiltins
-func.func @MathBuiltins(%arg0: !moore.i32, %arg1: !moore.l42) {
+func.func @MathBuiltins(%arg0: !moore.i32, %arg1: !moore.l42, %arg2: !moore.f64) {
   // CHECK: moore.builtin.clog2 %arg0 : i32
   moore.builtin.clog2 %arg0 : i32
   // CHECK: moore.builtin.clog2 %arg1 : l42
   moore.builtin.clog2 %arg1 : l42
+    // CHECK: moore.builtin.ln %arg2 : f64
+  moore.builtin.ln %arg2 : f64
+  // CHECK: moore.builtin.log10 %arg2 : f64
+  moore.builtin.log10 %arg2 : f64
+  // CHECK: moore.fpow %arg2, %arg2 : f64
+  moore.fpow %arg2, %arg2 : f64
+  // CHECK: moore.builtin.exp %arg2 : f64
+  moore.builtin.exp %arg2 : f64
+  // CHECK: moore.builtin.sqrt %arg2 : f64
+  moore.builtin.sqrt %arg2 : f64
+  // CHECK: moore.builtin.floor %arg2 : f64
+  moore.builtin.floor %arg2 : f64
+  // CHECK: moore.builtin.ceil %arg2 : f64
+  moore.builtin.ceil %arg2 : f64
+  // CHECK: moore.builtin.sin %arg2 : f64
+  moore.builtin.sin %arg2 : f64
+  // CHECK: moore.builtin.cos %arg2 : f64
+  moore.builtin.cos %arg2 : f64
+  // CHECK: moore.builtin.tan %arg2 : f64
+  moore.builtin.tan %arg2 : f64
+  // CHECK: moore.builtin.asin %arg2 : f64
+  moore.builtin.asin %arg2 : f64
+  // CHECK: moore.builtin.acos %arg2 : f64
+  moore.builtin.acos %arg2 : f64
+  // CHECK: moore.builtin.atan %arg2 : f64
+  moore.builtin.atan %arg2 : f64
+  // CHECK: moore.builtin.atan2 %arg2, %arg2 : f64
+  moore.builtin.atan2 %arg2, %arg2  : f64
+  // CHECK: moore.builtin.hypot %arg2, %arg2 : f64
+  moore.builtin.hypot %arg2, %arg2  : f64
+  // CHECK: moore.builtin.sinh %arg2 : f64
+  moore.builtin.sinh %arg2 : f64
+  // CHECK: moore.builtin.cosh %arg2 : f64
+  moore.builtin.cosh %arg2 : f64
+  // CHECK: moore.builtin.tanh %arg2 : f64
+  moore.builtin.tanh %arg2 : f64
+  // CHECK: moore.builtin.asinh %arg2 : f64
+  moore.builtin.asinh %arg2 : f64
+  // CHECK: moore.builtin.acosh %arg2 : f64
+  moore.builtin.acosh %arg2 : f64
+  // CHECK: moore.builtin.atanh %arg2 : f64
+  moore.builtin.atanh %arg2 : f64
   return
 }
 
@@ -587,4 +627,15 @@ moore.module @CoroutineCallTest() {
     moore.return
   }
   moore.output
+}
+
+// CHECK-LABEL: func.func @ReadMemOps
+func.func @ReadMemOps(%arg0: !moore.string, %arg1: !moore.ref<uarray<16 x l8>>, %arg2: !moore.ref<queue<l8, 0>>, %arg3: !moore.i32) {
+  // CHECK: moore.builtin.readmem hex %arg0, %arg1 {dimDescending = array<i1: false>, dimLows = array<i64: 0>} : !moore.ref<uarray<16 x l8>>
+  moore.builtin.readmem hex %arg0, %arg1 {dimDescending = array<i1: false>, dimLows = array<i64: 0>} : !moore.ref<uarray<16 x l8>>
+  // CHECK: moore.builtin.readmem bin %arg0, %arg1 start = %arg3 finish = %arg3 slice[%arg3, %arg3] {dimDescending = array<i1: false>, dimLows = array<i64: 0>, enumValues = array<i64: 0, 1, 2>} : !moore.ref<uarray<16 x l8>>
+  moore.builtin.readmem bin %arg0, %arg1 start = %arg3 finish = %arg3 slice[%arg3, %arg3] {dimDescending = array<i1: false>, dimLows = array<i64: 0>, enumValues = array<i64: 0, 1, 2>} : !moore.ref<uarray<16 x l8>>
+  // CHECK: moore.builtin.readmem hex %arg0, %arg2 {dimDescending = array<i1: false>, dimLows = array<i64: 0>} : !moore.ref<queue<l8, 0>>
+  moore.builtin.readmem hex %arg0, %arg2 {dimDescending = array<i1: false>, dimLows = array<i64: 0>} : !moore.ref<queue<l8, 0>>
+  return
 }

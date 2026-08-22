@@ -26,6 +26,7 @@
 #include "circt/Dialect/Verif/VerifDialect.h"
 #include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
+#include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
@@ -33,6 +34,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Parser/Parser.h"
@@ -63,6 +65,7 @@ enum class LoweringMode {
   OnlyPreprocess,
   OnlyLint,
   OnlyParse,
+  OnlyImport,
   OutputIRMoore,
   OutputIRLLHD,
   OutputIRHW,
@@ -86,6 +89,13 @@ struct CLOptions {
       "o", cl::desc("Output filename (`-` for stdout)"),
       cl::value_desc("filename"), cl::init("-"), cl::cat(cat)};
 
+  cl::opt<bool> emitBytecode{
+      "emit-bytecode", cl::desc("Emit bytecode when generating MLIR output"),
+      cl::init(false), cl::cat(cat)};
+
+  cl::opt<bool> force{"f", cl::desc("Enable binary output on terminals"),
+                      cl::init(false), cl::cat(cat)};
+
   cl::opt<bool> verifyDiagnostics{
       "verify-diagnostics",
       cl::desc("Check that emitted diagnostics match expected-* lines on the "
@@ -107,8 +117,12 @@ struct CLOptions {
                      "Only lint the input, without elaboration and mapping to "
                      "CIRCT IR"),
           clEnumValN(LoweringMode::OnlyParse, "parse-only",
-                     "Only parse and elaborate the input, without mapping to "
-                     "CIRCT IR"),
+                     "Only parse the input syntax and report diagnostics; do "
+                     "not elaborate or map to IR"),
+          clEnumValN(
+              LoweringMode::OnlyImport, "import-only",
+              "Parse and elaborate the input and map it to Moore IR, but "
+              "do not run any lowering passes"),
           clEnumValN(LoweringMode::OutputIRMoore, "ir-moore",
                      "Run the entire pass manager to just before MooreToCore "
                      "conversion, and emit the resulting Moore dialect IR"),
@@ -256,6 +270,11 @@ struct CLOptions {
       cl::desc("One or more paths in which to suppress warnings"),
       cl::value_desc("filename"), cl::cat(cat)};
 
+  cl::opt<bool> makeSourceLocationsProximate{
+      "make-source-locations-proximate",
+      cl::desc("Make paths for source file debug locations proximate"),
+      cl::init(true), cl::cat(cat)};
+
   //===--------------------------------------------------------------------===//
   // File lists
   //===--------------------------------------------------------------------===//
@@ -278,10 +297,27 @@ struct CLOptions {
           "One or more command files, which are independent compilation units "
           "where modules are automatically instantiated."),
       cl::value_desc("filename"), cl::Prefix, cl::cat(cat)};
+
+  cl::list<std::string> slangArgs{"Xslang",
+                                  cl::desc("Pass <arg> to the Slang CLI"),
+                                  cl::value_desc("arg"), cl::cat(cat)};
 };
 } // namespace
 
 static CLOptions opts;
+
+/// Check output stream before writing bytecode to it.
+/// Warn and return true if output is known to be displayed.
+static bool checkBytecodeOutputToConsole(raw_ostream &os) {
+  if (os.is_displayed()) {
+    llvm::errs() << "WARNING: You're attempting to print out a bytecode file.\n"
+                    "This is inadvisable as it may cause display problems. If\n"
+                    "you REALLY want to taste MLIR bytecode first-hand, you\n"
+                    "can force output with the `-f' option.\n\n";
+    return true;
+  }
+  return false;
+}
 
 /// Populate the given pass manager with transformations as configured by the
 /// command line options.
@@ -315,6 +351,8 @@ static LogicalResult executeWithSources(MLIRContext *context,
     options.mode = ImportVerilogOptions::Mode::OnlyLint;
   else if (opts.loweringMode == LoweringMode::OnlyParse)
     options.mode = ImportVerilogOptions::Mode::OnlyParse;
+  else if (opts.loweringMode == LoweringMode::OnlyImport)
+    options.mode = ImportVerilogOptions::Mode::OnlyImport;
   options.debugInfo = opts.debugInfo;
   options.lowerAlwaysAtStarAsComb = opts.lowerAlwaysAtStarAsComb;
 
@@ -342,10 +380,12 @@ static LogicalResult executeWithSources(MLIRContext *context,
   if (opts.errorLimit.getNumOccurrences() > 0)
     options.errorLimit = opts.errorLimit;
   options.suppressWarningsPaths = opts.suppressWarningsPaths;
+  options.makeLocationPathsProximate = opts.makeSourceLocationsProximate;
 
   options.singleUnit = opts.singleUnit;
   options.libraryFiles = opts.libraryFiles;
   options.commandFiles = opts.commandFiles;
+  options.slangArgs = opts.slangArgs;
 
   // Open the output file.
   std::string errorMessage;
@@ -374,9 +414,10 @@ static LogicalResult executeWithSources(MLIRContext *context,
     if (failed(importVerilog(sourceMgr, context, ts, module.get(), &options)))
       return failure();
 
-    // If the user requested for the files to be only linted, the module remains
-    // empty and there is nothing left to do.
-    if (opts.loweringMode == LoweringMode::OnlyLint)
+    // If the user requested for the files to be only linted or parsed, the
+    // module remains empty and there is nothing left to do.
+    if (opts.loweringMode == LoweringMode::OnlyLint ||
+        opts.loweringMode == LoweringMode::OnlyParse)
       return success();
   } break;
 
@@ -388,9 +429,10 @@ static LogicalResult executeWithSources(MLIRContext *context,
   if (!module)
     return failure();
 
-  // If the user requested anything besides simply parsing the input, run the
-  // appropriate transformation passes according to the command line options.
-  if (opts.loweringMode != LoweringMode::OnlyParse) {
+  // If the user requested anything besides importing the input to Moore IR, run
+  // the appropriate transformation passes according to the command line
+  // options.
+  if (opts.loweringMode != LoweringMode::OnlyImport) {
     PassManager pm(context);
     pm.enableVerifier(true);
     pm.enableTiming(ts);
@@ -407,7 +449,15 @@ static LogicalResult executeWithSources(MLIRContext *context,
 
   // Print the final MLIR.
   auto outputTimer = ts.nest("MLIR Printer");
-  module->print(outputFile->os());
+  if (opts.emitBytecode &&
+      (opts.force || !checkBytecodeOutputToConsole(outputFile->os()))) {
+    if (failed(
+            writeBytecodeToFile(module.get(), outputFile->os(),
+                                mlir::BytecodeWriterConfig(getCirctVersion()))))
+      return failure();
+  } else {
+    module->print(outputFile->os());
+  }
   outputFile->keep();
   return success();
 }
@@ -522,6 +572,7 @@ int main(int argc, char **argv) {
     scf::SCFDialect,
     seq::SeqDialect,
     sim::SimDialect,
+    ub::UBDialect,
     verif::VerifDialect
   >();
   // clang-format on

@@ -64,7 +64,7 @@ hw.module @And(in %a: i1, in %b: i1, in %c: !ltl.property, in %clk: i1) {
   // Convert if there are non-assert users but the result type is i1
   %and2 = ltl.and %a, %b : i1, i1
   %user = hw.wire %and2 : i1
-  // Or if there are non-i1 operands (and therefore results)
+  // Don't convert if there are non-i1 operands (and therefore results)
   %and3 = ltl.and %b, %c : i1, !ltl.property
   verif.assert %and3 : !ltl.property
 }
@@ -86,9 +86,32 @@ hw.module @Or(in %a: i1, in %b: i1, in %c: !ltl.property, in %clk: i1) {
   // Convert if there are non-assert users but the result type is i1
   %or2 = ltl.or %a, %b : i1, i1
   %user = hw.wire %or2 : i1
-  // Or if there are non-i1 operands (and therefore results)
+  // Don't convert if there are non-i1 operands (and therefore results)
   %or3 = ltl.or %b, %c : i1, !ltl.property
   verif.assert %or3 : !ltl.property
+}
+
+// CHECK: hw.module @Intersect(in [[A:%.+]] : i1, in [[B:%.+]] : i1, in [[C:%.+]] : !ltl.sequence, in [[CLK:%.+]] : i1)
+// CHECK: [[INT1:%.+]] = comb.and [[A]], [[B]] : i1
+// CHECK: verif.assert [[INT1]] : i1
+// CHECK: verif.clocked_assert [[INT1]], posedge [[CLK]] : i1
+// CHECK: [[INT2:%.+]] = comb.and [[A]], [[B]] : i1
+// CHECK: [[USER:%.+]] = hw.wire [[INT2]] : i1
+// CHECK: [[INT3:%.+]] = ltl.intersect [[B]], [[C]] : i1, !ltl.sequence
+// CHECK: verif.assert [[INT3]] : !ltl.sequence
+
+hw.module @Intersect(in %a: i1, in %b: i1, in %c: !ltl.sequence, in %clk: i1) {
+  // Boolean intersection is instantaneous, i.e. conjunction. Convert if both
+  // operands are i1 and the only users are asserts
+  %int1 = ltl.intersect %a, %b : i1, i1
+  verif.assert %int1 : i1
+  verif.clocked_assert %int1, posedge %clk : i1
+  // Convert if there are non-assert users but the result type is i1
+  %int2 = ltl.intersect %a, %b : i1, i1
+  %user = hw.wire %int2 : i1
+  // Don't convert if there are non-i1 operands (and therefore results)
+  %int3 = ltl.intersect %b, %c : i1, !ltl.sequence
+  verif.assert %int3 : !ltl.sequence
 }
 
 // CHECK: hw.module @Past(in [[A:%.+]] : i32, in [[CLK:%.+]] : i1)
@@ -102,4 +125,58 @@ hw.module @Or(in %a: i1, in %b: i1, in %c: !ltl.property, in %clk: i1) {
 hw.module @Past(in %a: i32, in %clk: i1) {
   ltl.past %a, 1 clk %clk : i32
   ltl.past %a, 5 clk %clk : i32
+}
+
+// CHECK-LABEL: hw.module @ClockedAtom(
+// CHECK-SAME:    in %[[CLOCK:[^, ]+]] : !seq.clock
+// CHECK-SAME:    in %[[A:[^, ]+]] : i1
+// CHECK:         %[[SAMPLED_A:.+]] = seq.compreg %[[A]], %[[CLOCK]] initial
+// CHECK:         %[[FALSE:.+]] = hw.constant false
+// CHECK:         %[[DONT_CARE_INIT:.+]] = seq.initial()
+// CHECK:           %[[TRUE:.+]] = hw.constant true
+// CHECK:           seq.yield %[[TRUE]] : i1
+// CHECK:         %[[DONT_CARE:.+]] = seq.compreg %[[FALSE]], %[[CLOCK]] initial %[[DONT_CARE_INIT]]
+// CHECK:         %[[GUARDED:.+]] = comb.or %[[DONT_CARE]], %[[SAMPLED_A]] : i1
+// CHECK:         verif.assert %[[GUARDED]] label "clocked_atom" : i1
+hw.module @ClockedAtom(in %clock : !seq.clock, in %a : i1) {
+  %0 = seq.from_clock %clock
+  %1 = ltl.clocked_atom %a, posedge %0 : i1
+  verif.assert %1 label "clocked_atom" : !ltl.sequence
+  hw.output
+}
+
+// CHECK-LABEL: hw.module @NegedgeClock(
+// CHECK-SAME:    in %[[CLOCK:[^, ]+]] : !seq.clock
+// CHECK-SAME:    in %[[A:[^, ]+]] : i1
+// CHECK:         %[[CLOCK_I1:.+]] = seq.from_clock %[[CLOCK]]
+// CHECK:         %[[CLOCK_TRUE:.+]] = hw.constant true
+// CHECK:         %[[NOT_CLOCK:.+]] = comb.xor %[[CLOCK_I1]], %[[CLOCK_TRUE]] : i1
+// CHECK:         %[[NEGEDGE_CLOCK:.+]] = seq.to_clock %[[NOT_CLOCK]]
+// CHECK:         %[[SAMPLED_A:.+]] = seq.compreg %[[A]], %[[NEGEDGE_CLOCK]] initial
+// CHECK:         %[[FALSE:.+]] = hw.constant false
+// CHECK:         %[[DONT_CARE_TRUE:.+]] = hw.constant true
+// CHECK:         %[[DONT_CARE_NOT_CLOCK:.+]] = comb.xor %[[CLOCK_I1]], %[[DONT_CARE_TRUE]] : i1
+// CHECK:         %[[DONT_CARE_CLOCK:.+]] = seq.to_clock %[[DONT_CARE_NOT_CLOCK]]
+// CHECK:         %[[DONT_CARE_INIT:.+]] = seq.initial()
+// CHECK:           %[[TRUE:.+]] = hw.constant true
+// CHECK:           seq.yield %[[TRUE]] : i1
+// CHECK:         %[[DONT_CARE:.+]] = seq.compreg %[[FALSE]], %[[DONT_CARE_CLOCK]] initial %[[DONT_CARE_INIT]]
+// CHECK:         %[[GUARDED:.+]] = comb.or %[[DONT_CARE]], %[[SAMPLED_A]] : i1
+// CHECK:         verif.assert %[[GUARDED]] label "negedge" : i1
+hw.module @NegedgeClock(in %clock : !seq.clock, in %a : i1) {
+  %0 = seq.from_clock %clock
+  %1 = ltl.clocked_atom %a, negedge %0 : i1
+  verif.assert %1 label "negedge" : !ltl.sequence
+  hw.output
+}
+
+// CHECK-LABEL: hw.module @BothEdgeClock(
+// CHECK-NOT:     seq.compreg
+// CHECK:         %[[ATOM:.+]] = ltl.clocked_atom
+// CHECK:         verif.assert %[[ATOM]] : !ltl.sequence
+hw.module @BothEdgeClock(in %clock : !seq.clock, in %a : i1) {
+  %0 = seq.from_clock %clock
+  %1 = ltl.clocked_atom %a, edge %0 : i1
+  verif.assert %1 : !ltl.sequence
+  hw.output
 }

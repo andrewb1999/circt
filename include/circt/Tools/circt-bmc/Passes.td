@@ -38,7 +38,8 @@ def LowerToBMC : Pass<"lower-to-bmc", "::mlir::ModuleOp"> {
 
   let dependentDialects = [
     "mlir::func::FuncDialect", "mlir::LLVM::LLVMDialect",
-    "circt::verif::VerifDialect", "circt::comb::CombDialect"
+    "circt::verif::VerifDialect", "circt::comb::CombDialect",
+    "circt::debug::DebugDialect"
   ];
 }
 
@@ -50,5 +51,37 @@ def ExternalizeRegisters : Pass<"externalize-registers", "::mlir::ModuleOp"> {
   ];
 }
 
-#endif // CIRCT_TOOLS_CIRCT_BMC_PASSES_TD
+def MaterializeDebugVariables : Pass<"materialize-debug-variables", "::mlir::ModuleOp"> {
+  let summary = "Materializes debug anchors for module inputs and registers";
+  let description = [{
+    Creates `dbg.variable` anchors for module inputs and register
+    results that do not yet have one.
+  }];
 
+  let dependentDialects = [
+    "circt::debug::DebugDialect", "circt::seq::SeqDialect",
+    "circt::hw::HWDialect"
+  ];
+}
+
+def PrepareForBMC : Pass<"prepare-for-bmc", "::mlir::ModuleOp"> {
+  let summary = "Normalizes clock ports and clocked properties for BMC";
+  let description = [{
+    Converts `i1` module inputs used through `seq.to_clock` into native
+    `!seq.clock` inputs. It also converts clocked assertions and assumptions
+    into unclocked properties gated by an actual edge, tracked by comparing the
+    current clock value with a registered previous value.
+  }];
+  let options = [
+    Option<"topModule", "top-module", "std::string",
+           /*default=*/"",
+           "Name of the top module to prepare.">
+  ];
+
+  let dependentDialects = [
+    "circt::comb::CombDialect", "circt::hw::HWDialect",
+    "circt::seq::SeqDialect", "circt::verif::VerifDialect"
+  ];
+}
+
+#endif // CIRCT_TOOLS_CIRCT_BMC_PASSES_TD

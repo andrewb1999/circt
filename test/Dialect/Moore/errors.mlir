@@ -179,6 +179,16 @@ moore.global_variable @Foo : !moore.i42 init {
 
 // -----
 
+// expected-error @below {{'return' argument must be the last argument}}
+moore.func.dpi @dpi_bad_return_pos(return ret : !moore.i32, in %other : !moore.i32)
+
+// -----
+
+// expected-error @below {{'return' argument must be the last argument}}
+moore.func.dpi @dpi_bad_multi_return(return a : !moore.i32, return b : !moore.i32)
+
+// -----
+
 // UnionCreateOp verifier: input type mismatch
 %0 = moore.constant 42 : i16
 // expected-error @below {{op input type '!moore.i16' does not match union field 'x' type '!moore.i32'}}
@@ -217,5 +227,29 @@ moore.coroutine @someCoroutine() { moore.return }
 func.func @funcCallingCoroutine() {
   // expected-error @below {{'someCoroutine' does not reference a valid function}}
   func.call @someCoroutine() : () -> ()
+  return
+}
+
+// -----
+
+func.func @ReadMemFinishWithoutStart(%arg0: !moore.string, %arg1: !moore.ref<uarray<16 x l8>>, %arg2: !moore.i32) {
+  // expected-error @below {{'finishAddr' requires 'startAddr' to be present}}
+  "moore.builtin.readmem"(%arg0, %arg1, %arg2) <{base = 1 : i32, dimDescending = array<i1: false>, dimLows = array<i64: 0>, operandSegmentSizes = array<i32: 1, 1, 0, 1, 0, 0>}> : (!moore.string, !moore.ref<uarray<16 x l8>>, !moore.i32) -> ()
+  return
+}
+
+// -----
+
+func.func @ReadMemDimsMismatch(%arg0: !moore.string, %arg1: !moore.ref<uarray<16 x l8>>) {
+  // expected-error @below {{'dimLows' and 'dimDescending' must have one entry per unpacked dimension}}
+  moore.builtin.readmem hex %arg0, %arg1 {dimDescending = array<i1: false, false>, dimLows = array<i64: 0, 0>} : !moore.ref<uarray<16 x l8>>
+  return
+}
+
+// -----
+
+func.func @ReadMemBadDest(%arg0: !moore.string, %arg1: !moore.ref<i8>) {
+  // expected-error @below {{'dest' must reference an unpacked array or queue}}
+  moore.builtin.readmem hex %arg0, %arg1 {dimDescending = array<i1: false>, dimLows = array<i64: 0>} : !moore.ref<i8>
   return
 }

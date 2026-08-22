@@ -237,10 +237,12 @@ FirRegLowering::FirRegLowering(TypeConverter &typeConverter,
                                hw::HWModuleOp module,
                                const PathTable &pathTable,
                                bool disableRegRandomization,
-                               bool emitSeparateAlwaysBlocks)
+                               bool emitSeparateAlwaysBlocks,
+                               bool emitPresetAsInlineInit)
     : pathTable(pathTable), typeConverter(typeConverter), module(module),
       disableRegRandomization(disableRegRandomization),
-      emitSeparateAlwaysBlocks(emitSeparateAlwaysBlocks) {
+      emitSeparateAlwaysBlocks(emitSeparateAlwaysBlocks),
+      emitPresetAsInlineInit(emitPresetAsInlineInit) {
   reachableMuxes = std::make_unique<ReachableMuxes>(module);
 }
 
@@ -697,7 +699,24 @@ void FirRegLowering::lowerReg(FirRegOp reg) {
   ImplicitLocOpBuilder builder(reg.getLoc(), reg);
   RegLowerInfo svReg{nullptr, path, reg.getPresetAttr(), nullptr, nullptr,
                      -1,      0};
-  svReg.reg = sv::RegOp::create(builder, loc, regTy, reg.getNameAttr());
+
+  // Decide whether the preset value should be emitted as an inline `sv.reg`
+  // initializer rather than through the guarded `initial` block.
+  bool inlinePreset = svReg.preset && emitPresetAsInlineInit;
+
+  Value initValue;
+  if (inlinePreset) {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(reg);
+    auto cst = getOrCreateConstant(loc, svReg.preset.getValue());
+    if (cst.getType() == regTy)
+      initValue = cst;
+    else
+      initValue = hw::BitcastOp::create(builder, loc, regTy, cst);
+  }
+
+  svReg.reg = sv::RegOp::create(builder, loc, regTy, reg.getNameAttr(),
+                                hw::InnerSymAttr(), initValue);
   svReg.width = hw::getBitWidth(regTy);
 
   if (auto attr = reg->getAttrOfType<IntegerAttr>("firrtl.random_init_start"))
@@ -743,9 +762,10 @@ void FirRegLowering::lowerReg(FirRegOp reg) {
   // Record information required later on to build the initialization code for
   // this register. All initialization is grouped together in a single initial
   // block at the back of the module.
-  if (svReg.preset)
-    presetInitRegs.push_back(svReg);
-  else if (!disableRegRandomization)
+  if (svReg.preset) {
+    if (!inlinePreset)
+      presetInitRegs.push_back(svReg);
+  } else if (!disableRegRandomization)
     randomInitRegs.push_back(svReg);
 
   if (svReg.asyncResetSignal)
@@ -757,7 +777,15 @@ void FirRegLowering::lowerReg(FirRegOp reg) {
   if (!conditions.empty())
     regConditionTable.emplace_or_assign(svReg.reg, conditions);
 
-  reg.replaceAllUsesWith(regVal.getResult());
+  // For clock-typed registers the lowered sv.reg holds i1, but any remaining
+  // users of the original !seq.clock result (e.g. seq.from_clock, hw.wire)
+  // still expect that type.  Bridge the gap with a seq.to_clock so that those
+  // users stay type-correct until applyPartialConversion resolves them via
+  // ClockCastLowering<ToClockOp>.
+  Value replacement = regVal.getResult();
+  if (isa<seq::ClockType>(reg.getType()) && !reg.use_empty())
+    replacement = seq::ToClockOp::create(builder, loc, regVal.getResult());
+  reg.replaceAllUsesWith(replacement);
   reg.erase();
 }
 

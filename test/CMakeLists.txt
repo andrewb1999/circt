@@ -1,6 +1,10 @@
 add_subdirectory(lib)
 add_subdirectory(CAPI)
 
+llvm_canonicalize_cmake_booleans(
+  MLIR_ENABLE_EXPENSIVE_PATTERN_API_CHECKS
+)
+
 configure_lit_site_cfg(
   ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
   ${CMAKE_CURRENT_BINARY_DIR}/lit.site.cfg.py
@@ -22,6 +26,7 @@ set(CIRCT_TEST_DEPENDS
   circt-capi-om-test
   circt-capi-firrtl-test
   circt-capi-firtool-test
+  circt-capi-ltl-test
   circt-capi-rtg-test
   circt-capi-rtgtest-test
   circt-capi-support-test
@@ -35,6 +40,7 @@ set(CIRCT_TEST_DEPENDS
   circt-test
   circt-translate
   circt-reduce
+  circt-tblgen
   domaintool
   handshake-runner
   firld

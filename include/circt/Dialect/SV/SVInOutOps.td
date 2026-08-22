@@ -11,9 +11,19 @@
 //
 //===----------------------------------------------------------------------===//
 
+#ifndef CIRCT_DIALECT_SV_SVINOUTOPS_TD
+#define CIRCT_DIALECT_SV_SVINOUTOPS_TD
+
+include "circt/Dialect/HW/HWAttributesNaming.td"
 include "circt/Dialect/HW/HWOpInterfaces.td"
+include "circt/Dialect/HW/HWTypes.td"
+include "circt/Dialect/SV/SVDialect.td"
+include "circt/Dialect/SV/SVTypes.td"
+include "circt/Support/ProceduralRegionTrait.td"
 include "circt/Types.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/IR/OpAsmInterface.td"
 
 // Note that net declarations like 'wire' should not appear in an always block.
 def WireOp : SVOp<"wire", [NonProceduralOp,
@@ -196,7 +206,7 @@ def IndexedPartSelectInOutOp : SVOp<"indexed_part_select_inout",
                                           std::optional<Location> loc,
                                           ValueRange operands,
                                           DictionaryAttr attrs,
-                                          mlir::OpaqueProperties properties,
+                                          mlir::PropertyRef properties,
                                           mlir::RegionRange regions,
                                           SmallVectorImpl<Type> &results);
   }];
@@ -227,7 +237,7 @@ def StructFieldInOutOp : SVOp<"struct_field_inout",
                                           std::optional<Location> loc,
                                           ValueRange operands,
                                           DictionaryAttr attrs,
-                                          mlir::OpaqueProperties properties,
+                                          mlir::PropertyRef properties,
                                           mlir::RegionRange regions,
                                           SmallVectorImpl<Type> &results);
   }];
@@ -268,3 +278,5 @@ def LogicOp : SVOp<"logic", [
     }
   }];
 }
+
+#endif // CIRCT_DIALECT_SV_SVINOUTOPS_TD
