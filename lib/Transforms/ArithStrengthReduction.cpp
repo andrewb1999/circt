@@ -10,6 +10,7 @@
 #include "circt/Transforms/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Dominance.h"
@@ -221,11 +222,16 @@ void ArithStrengthReduction::runOnOperation() {
   patterns.add<DivSIStrengthReduction>(ctx);
   patterns.add<RemUIStrengthReduction>(ctx);
   patterns.add<RemSIStrengthReduction>(ctx);
+  // min/max ops expand to the cmpi+select the scheduler and operator library
+  // model; upstream canonicalization now folds that shape INTO these ops, so
+  // without the expansion they reach SCFToLoopSchedule as unsupported.
+  arith::populateExpandMinMaxIPatterns(patterns);
 
   target.addDynamicallyLegalOp<MulIOp>(mulLegalityCallback);
   target.addDynamicallyLegalOp<DivSIOp>(divSIOpLegalityCallback);
   target.addDynamicallyLegalOp<RemUIOp>(remUILegalityCallback);
   target.addDynamicallyLegalOp<RemSIOp>(remSILegalityCallback);
+  target.addIllegalOp<MaxSIOp, MaxUIOp, MinSIOp, MinUIOp>();
 
   auto op = getOperation();
   if (failed(applyPartialConversion(op, target, std::move(patterns))))

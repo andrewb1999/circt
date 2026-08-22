@@ -5424,7 +5424,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
       // cycle after the load's address is applied; without this
       // capture the consumer reads whatever address the port has
       // moved to next.
-      if (hasCycleGates && atOffset + 1 < fsmFrameCycleGates[frameIdx].size()) {
+      // No early `atOffset + 1 < size` cut here: a result produced in the
+      // frame's LAST cycle still needs its capture when its residual is 0
+      // (a comb load-indirection settled in the at's own cycle — the enable
+      // gate exists), and a launched child then reads the held register in
+      // WAIT instead of a comb cone over rd_data that has already moved.
+      // The per-result `atOffset + residual` bound below rejects exactly
+      // the captures whose enable cycle does not exist.
+      if (hasCycleGates) {
         hw.setInsertionPointToEnd(hwBody);
         // One gate per distinct enable cycle, created lazily and shared by
         // every capture that uses it (a per-result AndOp would duplicate
@@ -6639,7 +6646,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopNodeAsModule(
   // nested-stream two_nests regression), and instance names would collide.
   auto savedShared = std::move(sharedOperators);
   auto savedUniquer = std::move(instanceUniquer);
-  auto restoreScopes = llvm::make_scope_exit([&] {
+  auto restoreScopes = llvm::scope_exit([&] {
     sharedOperators = std::move(savedShared);
     instanceUniquer = std::move(savedUniquer);
   });
@@ -8709,7 +8716,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   analysis::OperatorLibraryAnalysis ola(funcOp);
   operatorLibrary = &ola;
   auto unbindLibrary =
-      llvm::make_scope_exit([&] { operatorLibrary = nullptr; });
+      llvm::scope_exit([&] { operatorLibrary = nullptr; });
 
   // R7 adapter-port refusal (see the member comment): one function-scope
   // scan up front, consulted by every pre-arm eligibility decision below.
@@ -10405,7 +10412,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
   analysis::OperatorLibraryAnalysis ola(funcOp);
   operatorLibrary = &ola;
   auto unbindLibrary =
-      llvm::make_scope_exit([&] { operatorLibrary = nullptr; });
+      llvm::scope_exit([&] { operatorLibrary = nullptr; });
 
   IRMapping mapping;
   unsigned clkIdx, rstIdx, startIdx;

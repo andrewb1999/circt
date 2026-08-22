@@ -1155,6 +1155,35 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
             ifOpConversion(loop.getOperation(), loop.getAfter(), predicateMap)))
       return failure();
 
+    // Un-CSE yield operands that also feed same-iteration consumers. The
+    // shared-operators problem places a WAR dependence from every reader of
+    // an iter arg onto the producer of its NEXT value (the iter-arg register
+    // may update mid-frame), so a producer that doubles as, say, an address
+    // for a load whose result reaches a store closes a positive-latency
+    // cycle and the schedule is declared infeasible — even though the
+    // hardware is fine, since the consumer reads the comb value while only
+    // the register update carries the WAR. Giving the yield a private clone
+    // of any pure producer with other in-loop users separates the two roles
+    // (this is the shape the IR had before upstream CSE learned to merge
+    // them).
+    {
+      Operation *terminator = loop.getAfterBody()->getTerminator();
+      OpBuilder cloneBuilder(terminator);
+      for (OpOperand &yielded : terminator->getOpOperands()) {
+        Operation *def = yielded.get().getDefiningOp();
+        if (!def || def->getBlock() != terminator->getBlock() ||
+            !isMemoryEffectFree(def) || def->getNumResults() != 1)
+          continue;
+        bool hasOtherUsers = llvm::any_of(
+            def->getResult(0).getUsers(),
+            [&](Operation *user) { return user != terminator; });
+        if (!hasOtherUsers)
+          continue;
+        Operation *clone = cloneBuilder.clone(*def);
+        yielded.set(clone->getResult(0));
+      }
+    }
+
     auto problem = getChainingSharedOperatorsProblem(loop, *dependenceAnalysis);
 
     // Populate the target operator types.

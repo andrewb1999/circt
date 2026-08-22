@@ -409,15 +409,11 @@ public:
 
 namespace llvm {
 
+// DenseMapInfo no longer defines sentinel keys (getEmptyKey/getTombstoneKey);
+// hash and equality are all a specialization provides.
 template <>
 struct DenseMapInfo<circt::binding::BindingProblem::ResourceType> {
   using ResourceType = circt::binding::BindingProblem::ResourceType;
-  static ResourceType getEmptyKey() {
-    return ResourceType{DenseMapInfo<mlir::StringAttr>::getEmptyKey()};
-  }
-  static ResourceType getTombstoneKey() {
-    return ResourceType{DenseMapInfo<mlir::StringAttr>::getTombstoneKey()};
-  }
   static unsigned getHashValue(const ResourceType &r) {
     return DenseMapInfo<mlir::StringAttr>::getHashValue(r.attr);
   }

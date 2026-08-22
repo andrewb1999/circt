@@ -119,10 +119,17 @@ circt::analysis::LoopScheduleDependenceAnalysis::LoopScheduleDependenceAnalysis(
 }
 
 /// Returns the dependencies, if any, that the given Operation depends on.
+/// Must not insert: `results[op]` would grow the map on every query for a
+/// dep-free op, and a growth rehash invalidates the ArrayRefs handed to
+/// earlier callers (observed as garbage dependencies making schedules
+/// infeasible once DenseMap's growth behavior changed).
 ArrayRef<LoopScheduleDependence>
 circt::analysis::LoopScheduleDependenceAnalysis::getDependencies(
     Operation *op) {
-  return results[op];
+  auto it = results.find(op);
+  if (it == results.end())
+    return {};
+  return it->second;
 }
 
 /// Replaces the dependences, if any, from the oldOp to the newOp.
