@@ -707,6 +707,60 @@ struct TruncCleanupPattern : OpRewritePattern<TruncIOp> {
   }
 };
 
+/// Push a trunc up through low-bit-closed arithmetic: the low W bits of
+/// add/sub/mul (and shl by a constant < W) depend only on the low W bits of
+/// the operands, so `trunci(op(a, b))` is `op(trunci(a), trunci(b))`
+/// exactly. Address cones are built wide (i64 loop-boundary values, the
+/// extsi at every frame yield) with a single trunc at the port; sinking
+/// that trunc through the cone lets TruncCleanupPattern collapse it into
+/// the boundary extsi and the whole chain computes at port width. Without
+/// this, matmul's k-pipeline carried its row-base arithmetic at i64 and
+/// the chaining budget forced an extra pipeline stage (+2,304 cycles after
+/// the LLVM-23 merge).
+///
+/// Guarded on hasOneUse: when the wide op has other consumers it must stay,
+/// and rebuilding a narrow copy beside it would duplicate the arithmetic
+/// (the reason the unguarded ImplicitTruncPattern registrations below are
+/// commented out).
+struct TruncArithCleanupPattern : OpRewritePattern<TruncIOp> {
+  using OpRewritePattern<TruncIOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(TruncIOp op,
+                                PatternRewriter &rewriter) const override {
+    Operation *def = op.getIn().getDefiningOp();
+    if (!def || !def->hasOneUse())
+      return failure();
+    auto outType = cast<IntegerType>(op.getOut().getType());
+    if (auto shl = dyn_cast<ShLIOp>(def)) {
+      IntegerAttr shiftAttr;
+      if (!matchPattern(shl.getRhs(), m_Constant(&shiftAttr)))
+        return failure();
+      if (shiftAttr.getValue().uge(outType.getWidth()))
+        return failure();
+      Value narrowIn =
+          TruncIOp::create(rewriter, op.getLoc(), outType, shl.getLhs());
+      Value narrowShift = ConstantOp::create(
+          rewriter, op.getLoc(),
+          IntegerAttr::get(outType, shiftAttr.getValue().getZExtValue()));
+      rewriter.replaceOpWithNewOp<ShLIOp>(op, narrowIn, narrowShift);
+      return success();
+    }
+    if (!isa<AddIOp, SubIOp, MulIOp>(def))
+      return failure();
+    Value lhs =
+        TruncIOp::create(rewriter, op.getLoc(), outType, def->getOperand(0));
+    Value rhs =
+        TruncIOp::create(rewriter, op.getLoc(), outType, def->getOperand(1));
+    // Overflow flags do not survive narrowing: low-bit equivalence is exact
+    // arithmetic mod 2^W, but an nsw/nuw promise at the wide width says
+    // nothing at the narrow one.
+    Operation *narrow = rewriter.create(
+        op.getLoc(), def->getName().getIdentifier(), {lhs, rhs}, {outType});
+    rewriter.replaceOp(op, narrow->getResults());
+    return success();
+  }
+};
+
 struct LoadCleanupPattern : OpRewritePattern<LoopScheduleLoadOp> {
   using OpRewritePattern<LoopScheduleLoadOp>::OpRewritePattern;
 
@@ -1168,6 +1222,7 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   // Cleanup extraneous casts after int narrowing
   patterns.clear();
   patterns.add<TruncCleanupPattern>(&context);
+  patterns.add<TruncArithCleanupPattern>(&context);
   patterns.add<LoadCleanupPattern>(&context);
   patterns.add<StoreCleanupPattern>(&context);
   patterns.add<LoadAddressNarrowingPattern>(&context);
