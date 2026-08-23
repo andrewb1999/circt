@@ -11,6 +11,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Transforms/Passes.h"
+#include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
@@ -1199,7 +1200,14 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   }
 
   DataFlowSolver solver;
+  // SparseConstantPropagation is load-bearing, not optional: without it the
+  // solver cannot resolve region control flow through scf.while, the
+  // carried-value lattices never leave uninitialized, and NarrowCmpI skips
+  // every compare on a loop-carried value (the find_first found-flag then
+  // stays a 32-bit eq-0 in the continuation cone). Mirrors upstream's
+  // loadBaselineAnalyses.
   solver.load<dataflow::DeadCodeAnalysis>();
+  solver.load<dataflow::SparseConstantPropagation>();
   solver.load<dataflow::IntegerRangeAnalysis>();
   if (failed(solver.initializeAndRun(op)))
     return signalPassFailure();
