@@ -969,6 +969,10 @@ void addPredicateDependencies(Operation *op, Region &body,
     auto pred = it.second;
     predicateUse[pred].push_back(op);
     auto *definingOp = pred.getDefiningOp();
+    // A predicate that is a block argument (an `if` on a bool function
+    // argument) has no producer to order after: it is stable from cycle 0.
+    if (!definingOp)
+      continue;
     assert(problem.hasOperation(definingOp));
     assert(problem.hasOperation(op));
     Problem::Dependence dep(definingOp, op);
