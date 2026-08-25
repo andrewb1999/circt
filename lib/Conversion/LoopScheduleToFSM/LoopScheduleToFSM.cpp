@@ -1829,7 +1829,7 @@ static bool isSeqDynAccess(Operation *op) {
 /// operator library.
 static bool isFreeArithOp(Operation *op) {
   if (isa<arith::ConstantOp, arith::IndexCastOp, arith::ExtSIOp,
-          arith::ExtUIOp, arith::TruncIOp>(op))
+          arith::ExtUIOp, arith::TruncIOp, arith::BitcastOp>(op))
     return true;
   // Arith ops whose result and all operands are `index` are loop-control
   // ops — treat as free.
@@ -2179,6 +2179,19 @@ LogicalResult LoopScheduleToFSMPass::emitComputeOp(
                                     instanceUniquer, *operatorLibrary, opCE,
                                     shareGate, &sharedOperators);
 }
+
+  // `arith.bitcast` is how AMC's legalize-float-types carries a float
+  // through the integer-only HW layer: an fp operator's float operands and
+  // results are bitcast to/from same-width integers, and on a wire those
+  // are the same bits. Map it as an identity rather than cloning it, so no
+  // float-typed value is ever materialized below this point.
+  if (auto bc = dyn_cast<arith::BitcastOp>(op)) {
+    Value in = mapping.lookupOrNull(bc.getIn());
+    if (!in)
+      return bc.emitOpError("bitcast operand was not lowered");
+    mapping.map(bc.getResult(), in);
+    return success();
+  }
 
 LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
     Block *frameBody, OpBuilder &builder, IRMapping &mapping,
@@ -8531,6 +8544,13 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
     Backedge wrDataBE = funcBB.get(dataType);
     Backedge wrEnBE = funcBB.get(i1);
 
+    // Function-scope float bitcasts (see emitComputeOp) are identities.
+    if (auto bc = dyn_cast<arith::BitcastOp>(&op)) {
+      if (Value in = mapping.lookupOrNull(bc.getIn())) {
+        mapping.map(bc.getResult(), in);
+        continue;
+      }
+    }
     Value notWrEn = comb::XorOp::create(
         builder, loc, Value(wrEnBE),
         hw::ConstantOp::create(builder, loc, i1, 1));
