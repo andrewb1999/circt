@@ -1848,23 +1848,24 @@ static bool isFreeArithOp(Operation *op) {
   return false;
 }
 
-/// Clone the real comb op living inside `origOp`'s hw_match body.
-/// Operands are remapped: the body's block args correspond positionally
-/// to the target function's inputs, i.e. `origOp->getOperand(i)`.
+/// Clone the combinational body of `origOp`'s hw_match. The body's block
+/// args correspond positionally to the target function's inputs, i.e.
+/// `origOp->getOperand(i)`; every op but the `oplib.hw_return` is cloned in
+/// order (a single `comb.<op>` for the JSON-described operators, a small
+/// cone for hand-built ones such as `math.absi`), and `origOp`'s results
+/// are what the `hw_return` names.
 static LogicalResult
 emitCombOpFromOperator(Operation *origOp, OpBuilder &builder,
                        IRMapping &mapping, oplib::HwMatchOp hwMatch) {
   Block *body = hwMatch.getBodyBlock();
-  Operation *templateOp = nullptr;
-  for (auto &op : *body) {
-    if (isa<oplib::HwReturnOp>(op))
-      continue;
-    templateOp = &op;
-    break;
-  }
-  if (!templateOp)
+  auto retOp = dyn_cast_or_null<oplib::HwReturnOp>(body->getTerminator());
+  if (!retOp || body->getOperations().size() < 2)
     return origOp->emitOpError(
         "comb-op hw_match body is missing its template op");
+  if (retOp.getNumOperands() != origOp->getNumResults())
+    return origOp->emitOpError("comb-op hw_match returns ")
+           << retOp.getNumOperands() << " values for an op with "
+           << origOp->getNumResults() << " results";
 
   // Map body block args -> origOp operands.
   IRMapping bodyMap;
@@ -1872,10 +1873,34 @@ emitCombOpFromOperator(Operation *origOp, OpBuilder &builder,
        llvm::zip(body->getArguments(), origOp->getOperands())) {
     bodyMap.map(arg, mapping.lookup(operand));
   }
-  Operation *newOp = builder.clone(*templateOp, bodyMap);
-  for (auto [oldRes, newRes] :
-       llvm::zip(origOp->getResults(), newOp->getResults()))
-    mapping.map(oldRes, newRes);
+  // A constant the body used may have been hoisted out of it (canonicalize
+  // moves constants to the enclosing `oplib.operator`, which is isolated):
+  // clone such operands on demand so nothing in the kernel module refers
+  // into the library.
+  auto resolveOperand = [&](Value v) -> LogicalResult {
+    if (bodyMap.contains(v))
+      return success();
+    Operation *def = v.getDefiningOp();
+    if (!def || !def->hasTrait<OpTrait::ConstantLike>())
+      return origOp->emitOpError("comb-op hw_match body uses ")
+             << v << " from outside its block";
+    builder.clone(*def, bodyMap);
+    return success();
+  };
+  for (auto &op : *body) {
+    if (isa<oplib::HwReturnOp>(op))
+      continue;
+    for (Value v : op.getOperands())
+      if (failed(resolveOperand(v)))
+        return failure();
+    builder.clone(op, bodyMap);
+  }
+  for (auto [oldRes, retVal] :
+       llvm::zip(origOp->getResults(), retOp.getOperands())) {
+    if (failed(resolveOperand(retVal)))
+      return failure();
+    mapping.map(oldRes, bodyMap.lookup(retVal));
+  }
   return success();
 }
 
@@ -2155,6 +2180,19 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
 LogicalResult LoopScheduleToFSMPass::emitComputeOp(
     Operation *op, OpBuilder &builder, IRMapping &mapping, ModuleOp moduleOp,
     Value clk, Value rst, Value opCE, Value shareGate) {
+  // `arith.bitcast` is how AMC's legalize-float-types carries a float
+  // through the integer-only HW layer: an fp operator's float operands and
+  // results are bitcast to/from same-width integers, and on a wire those
+  // are the same bits. Map it as an identity rather than cloning it, so no
+  // float-typed value is ever materialized below this point.
+  if (auto bc = dyn_cast<arith::BitcastOp>(op)) {
+    Value in = mapping.lookupOrNull(bc.getIn());
+    if (!in)
+      return bc.emitOpError("bitcast operand was not lowered");
+    mapping.map(bc.getResult(), in);
+    return success();
+  }
+
   // Constants and free-pass casts (extsi/extui/trunci/index_cast) are not
   // first-class operator-library entries. They get cloned through the
   // mapping so downstream consumers see them.
@@ -2179,19 +2217,6 @@ LogicalResult LoopScheduleToFSMPass::emitComputeOp(
                                     instanceUniquer, *operatorLibrary, opCE,
                                     shareGate, &sharedOperators);
 }
-
-  // `arith.bitcast` is how AMC's legalize-float-types carries a float
-  // through the integer-only HW layer: an fp operator's float operands and
-  // results are bitcast to/from same-width integers, and on a wire those
-  // are the same bits. Map it as an identity rather than cloning it, so no
-  // float-typed value is ever materialized below this point.
-  if (auto bc = dyn_cast<arith::BitcastOp>(op)) {
-    Value in = mapping.lookupOrNull(bc.getIn());
-    if (!in)
-      return bc.emitOpError("bitcast operand was not lowered");
-    mapping.map(bc.getResult(), in);
-    return success();
-  }
 
 LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
     Block *frameBody, OpBuilder &builder, IRMapping &mapping,
@@ -8519,6 +8544,13 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
       instanceOps.push_back(instOp);
       continue;
     }
+    // Function-scope float bitcasts (see emitComputeOp) are identities.
+    if (auto bc = dyn_cast<arith::BitcastOp>(&op)) {
+      if (Value in = mapping.lookupOrNull(bc.getIn())) {
+        mapping.map(bc.getResult(), in);
+        continue;
+      }
+    }
     builder.clone(op, mapping);
   }
 
@@ -8544,13 +8576,6 @@ LogicalResult LoopScheduleToFSMPass::setupFunctionPrelude(
     Backedge wrDataBE = funcBB.get(dataType);
     Backedge wrEnBE = funcBB.get(i1);
 
-    // Function-scope float bitcasts (see emitComputeOp) are identities.
-    if (auto bc = dyn_cast<arith::BitcastOp>(&op)) {
-      if (Value in = mapping.lookupOrNull(bc.getIn())) {
-        mapping.map(bc.getResult(), in);
-        continue;
-      }
-    }
     Value notWrEn = comb::XorOp::create(
         builder, loc, Value(wrEnBE),
         hw::ConstantOp::create(builder, loc, i1, 1));
