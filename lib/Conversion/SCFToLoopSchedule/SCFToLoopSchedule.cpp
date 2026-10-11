@@ -1475,9 +1475,15 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
     auto potentialOperators =
         operatorLibraryAnalysis->getPotentialOperators(op);
     if (!potentialOperators.empty()) {
-      // Just pick the first potential operator for now
-      // TODO: Perform better allocation
-      auto selectedOperator = potentialOperators.front();
+      // Allocation is decided before scheduling (AMC's operator-allocation)
+      // and recorded on the op as `loopschedule.operator`; take that choice
+      // when it names one of the matching operators. Ops without one fall
+      // back to the first match.
+      StringRef selectedOperator = potentialOperators.front();
+      if (auto sym = op->getAttrOfType<SymbolRefAttr>("loopschedule.operator"))
+        if (llvm::is_contained(potentialOperators,
+                               sym.getLeafReference().getValue()))
+          selectedOperator = sym.getLeafReference().getValue();
       Problem::OperatorType libOpr =
           problem.getOrInsertOperatorType(selectedOperator);
       problem.setLatency(libOpr, operatorLibraryAnalysis->getOperatorLatency(
