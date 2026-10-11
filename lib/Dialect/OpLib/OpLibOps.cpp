@@ -46,7 +46,7 @@ LogicalResult OperatorOp::verify() {
   unsigned numMatches = 0;
   unsigned numTargets = 0;
   for (auto &op : getBodyBlock()->getOperations()) {
-    if (isa<CalyxMatchOp, HwMatchOp>(op)) {
+    if (isa<HwMatchOp>(op)) {
       ++numMatches;
       continue;
     }
@@ -251,7 +251,7 @@ void TargetOp::build(OpBuilder &builder, OperationState &state,
 }
 
 //===----------------------------------------------------------------------===//
-// CalyxMatchOp / HwMatchOp shared helpers
+// HwMatchOp helpers
 //===----------------------------------------------------------------------===//
 
 static LogicalResult verifyMatchSymbolUse(Operation *op, StringRef targetName,
@@ -268,60 +268,6 @@ static LogicalResult verifyMatchSymbolUse(Operation *op, StringRef targetName,
     return op->emitOpError("reference to target with mismatched type");
 
   return success();
-}
-
-static LogicalResult verifyMatchBody(Operation *op, Block *body,
-                                     FunctionType targetType) {
-  if (!body->mightHaveTerminator())
-    return op->emitOpError("must be terminated by a YieldOp");
-
-  auto yieldOp = dyn_cast<oplib::YieldOp>(body->getTerminator());
-  if (!yieldOp)
-    return op->emitOpError("must be terminated by a YieldOp");
-
-  auto inputTypes = yieldOp.getInputs().getTypes();
-  auto outputTypes = yieldOp.getOutputs().getTypes();
-
-  if (inputTypes.size() != targetType.getNumInputs())
-    return op->emitOpError("yielded different number of inputs than expected"
-                           " by target type");
-
-  if (outputTypes.size() != targetType.getNumResults())
-    return op->emitOpError("yielded different number of outputs than expected"
-                           " by target type");
-
-  for (auto iv : llvm::enumerate(inputTypes)) {
-    auto i = iv.index();
-    auto type = iv.value();
-    if (type.getIntOrFloatBitWidth() !=
-        targetType.getInput(i).getIntOrFloatBitWidth())
-      return op->emitOpError(
-          "yield input type does not have same bitwidth as target type");
-  }
-
-  for (auto iv : llvm::enumerate(outputTypes)) {
-    auto i = iv.index();
-    auto type = iv.value();
-    if (type.getIntOrFloatBitWidth() !=
-        targetType.getResult(i).getIntOrFloatBitWidth())
-      return op->emitOpError(
-          "yield output type does not have same bitwidth as target type");
-  }
-
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
-// CalyxMatchOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult
-CalyxMatchOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  return verifyMatchSymbolUse(*this, getTarget(), getTargetType(), symbolTable);
-}
-
-LogicalResult CalyxMatchOp::verify() {
-  return verifyMatchBody(*this, getBodyBlock(), getTargetType());
 }
 
 //===----------------------------------------------------------------------===//
@@ -517,8 +463,7 @@ void HwInstanceOp::print(OpAsmPrinter &p) {
 LogicalResult
 HwInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   // Resolve the extern from the enclosing ModuleOp, bypassing the
-  // oplib.operator / oplib.library SymbolTable boundaries. Mirrors the
-  // scope trick `calyx.primitive` uses.
+  // oplib.operator / oplib.library SymbolTable boundaries.
   auto moduleOp = (*this)->getParentOfType<ModuleOp>();
   if (!moduleOp)
     return emitOpError("must be nested in a ModuleOp");

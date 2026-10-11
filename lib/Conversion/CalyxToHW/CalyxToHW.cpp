@@ -257,20 +257,20 @@ private:
           wires.append({sel.getInput(), tru.getInput(), fal.getInput(), out});
         })
         // Pipelined arithmetic operations.
-        .Case([&](SeqMultLibOp op) {
-          convertPipelineOp<SeqMultLibOp, comb::MulOp>(op, wires, b);
+        .Case([&](MultPipeLibOp op) {
+          convertPipelineOp<MultPipeLibOp, comb::MulOp>(op, wires, b);
         })
-        .Case([&](SeqDivULibOp op) {
-          convertPipelineOp<SeqDivULibOp, comb::DivUOp>(op, wires, b);
+        .Case([&](DivUPipeLibOp op) {
+          convertPipelineOp<DivUPipeLibOp, comb::DivUOp>(op, wires, b);
         })
-        .Case([&](SeqDivSLibOp op) {
-          convertPipelineOp<SeqDivSLibOp, comb::DivSOp>(op, wires, b);
+        .Case([&](DivSPipeLibOp op) {
+          convertPipelineOp<DivSPipeLibOp, comb::DivSOp>(op, wires, b);
         })
-        .Case([&](SeqRemSLibOp op) {
-          convertPipelineOp<SeqRemSLibOp, comb::ModSOp>(op, wires, b);
+        .Case([&](RemSPipeLibOp op) {
+          convertPipelineOp<RemSPipeLibOp, comb::ModSOp>(op, wires, b);
         })
-        .Case([&](SeqRemULibOp op) {
-          convertPipelineOp<SeqRemULibOp, comb::ModUOp>(op, wires, b);
+        .Case([&](RemUPipeLibOp op) {
+          convertPipelineOp<RemUPipeLibOp, comb::ModUOp>(op, wires, b);
         })
         // Sequential operations.
         .Case([&](RegisterOp op) {

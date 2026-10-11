@@ -207,48 +207,6 @@ def OperationOp : OpLibOp<"operation", [HasParent<"TargetOp">]> {
   }];
 }
 
-def CalyxMatchOp : OpLibOp<"calyx_match",
-    [SymbolTable,
-     HasParent<"OperatorOp">,
-     NoRegionArguments,
-     SingleBlock,
-     DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
-  let summary = "OpLib dialect Target operation";
-  let description = [{
-  }];
-
-  let arguments = (ins FlatSymbolRefAttr:$target,
-                       TypeAttrOf<FunctionType>:$targetType);
-
-  let results = (outs);
-  let regions = (region SizedRegion<1>:$body);
-
-  let skipDefaultBuilders = 1;
-  let builders = [
-    OpBuilder<(ins "mlir::FlatSymbolRefAttr":$target,
-                   "mlir::TypeAttr":$targetType), [{
-      Region* region = $_state.addRegion();
-      region->push_back(new Block());
-      $_state.addAttribute($_builder.getStringAttr("target"), target);
-      $_state.addAttribute($_builder.getStringAttr("targetType"), targetType);
-    }]>
-  ];
-
-  let extraClassDeclaration = [{
-    static bool isOptionalSymbol() { return false; }
-
-    // Convenience
-    ::mlir::Block *getBodyBlock() {
-      return &getBody().getBlocks().front();
-    }
-  }];
-
-  let assemblyFormat = [{
-    `(` $target `:` $targetType `)` `produce` attr-dict-with-keyword $body
-  }];
-  let hasVerifier = 1;
-}
-
 def HwMatchOp : OpLibOp<"hw_match",
     [HasParent<"OperatorOp">,
      SingleBlock,
@@ -317,10 +275,9 @@ def HwInstanceOp : OpLibOp<"hw_instance",
     `hw.module.extern`. Its operands are real SSA values (the enclosing
     `oplib.hw_match` body's block arguments), not placeholder constants.
 
-    The symbol verifier resolves the extern from the enclosing `ModuleOp`
-    (like `calyx.primitive` does), so the op can live inside
-    `oplib.operator`'s `SymbolTable` even though a real `hw.instance`
-    cannot.
+    The symbol verifier resolves the extern from the enclosing `ModuleOp`,
+    so the op can live inside `oplib.operator`'s `SymbolTable` even though
+    a real `hw.instance` cannot.
   }];
 
   let arguments = (ins StrAttr:$instanceName,
@@ -355,34 +312,6 @@ def OutputOp : OpLibOp<"output", [Terminator,
   let arguments = (ins Variadic<AnyType>:$outputs);
   let assemblyFormat = [{
     attr-dict ($outputs^ `:` qualified(type($outputs)))?
-  }];
-}
-
-def YieldOp : OpLibOp<"yield", [Terminator,
-                                   ReturnLike,
-                                   AttrSizedOperandSegments,
-                                   ParentOneOf<["CalyxMatchOp"]>]> {
-  let summary = "OpLib dialect Yield operation";
-  let description = [{
-    The `oplib.output` operation.
-  }];
-  let arguments = (ins Optional<AnyType>:$clock,
-                       Optional<AnyType>:$clockEnable,
-                       Optional<AnyType>:$reset,
-                       Variadic<AnyType>:$inputs,
-                       Variadic<AnyType>:$outputs);
-
-  let builders = [
-    OpBuilder<(ins "ValueRange":$inputs, "ValueRange":$outputs), [{
-      build($_builder, $_state, Value(), Value(), Value(), inputs, outputs);
-    }]>
-  ];
-  let assemblyFormat = [{
-    attr-dict (`clk` `(` $clock^ `:` qualified(type($clock)) `)` `,` )? 
-              (`ce` `(` $clockEnable^ `:` qualified(type($clockEnable)) `)` `,` )?
-              (`reset` `(` $reset^ `:` qualified(type($reset)) `)` `,` )?
-              (`ins` `(` $inputs^ `:` qualified(type($inputs)) `)` `,` )?
-              (`outs` `(` $outputs^ `:` qualified(type($outputs)) `)`)?
   }];
 }
 

@@ -65,7 +65,7 @@ getIterArgUpdatesInOrder(LoopInterface loop);
 /// Given an `iter_arg_update` op, return the SSA value outside its enclosing
 /// phase (step / pipeline.stage) that carries the same registered value
 /// — i.e., the phase result produced by registering `u.getValue()`. This is
-/// the "feedback" value that consumers (FSM / Calyx) wire into iter-arg
+/// the "feedback" value that consumers (the FSM lowering) wire into iter-arg
 /// registers. Returns the `value` operand unchanged if the phase does not
 /// register it (should not occur for well-formed IR).
 Value getIterArgPhaseResult(LoopScheduleIterArgUpdateOp u);

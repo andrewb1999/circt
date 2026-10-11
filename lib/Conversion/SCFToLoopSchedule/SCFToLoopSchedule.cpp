@@ -1388,9 +1388,9 @@ static bool feedsSameCycleAccess(Value v) {
   return false;
 }
 
-/// Populate the schedling problem operator types for the dialect we are
-/// targetting. Right now, we assume Calyx, which has a standard library with
-/// well-defined operator latencies. Ultimately, we should move this to a
+/// Populate the scheduling problem's operator types: an op's operator comes
+/// from the function's oplib library when one matches, otherwise from the
+/// generic built-in types below. Ultimately, we should move this to a
 /// dialect interface in the Scheduling dialect.
 LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
     Operation *op, Region &loopBody, ChainingSharedOperatorsProblem &problem,
@@ -1437,9 +1437,9 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
             0.5f)};
   };
 
-  // Load the Calyx operator library into the problem. This is a very minimal
-  // set of arithmetic and memory operators for now. This should ultimately be
-  // pulled out into some sort of dialect interface.
+  // Generic operator types for ops the library does not match. This is a
+  // very minimal set of arithmetic and memory operators for now. This should
+  // ultimately be pulled out into some sort of dialect interface.
   Problem::OperatorType freeOpr = problem.getOrInsertOperatorType("free");
   problem.setLatency(freeOpr, 0);
   problem.setIncomingDelay(freeOpr, 0);

@@ -122,66 +122,6 @@ def RegisterOp : CalyxPrimitive<"register", [
   ];
 }
 
-def BypassRegisterOp : CalyxPrimitive<"bypass_register", [
-    SameTypeConstraint<"in", "out">
-  ]> {
-  let summary = "Defines a bypass register";
-  let description = [{
-    The "calyx.bypass_register" op defines a bypass register.
-    ```mlir
-      // A 32-bit bypass register.
-      %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.bypass_register @r : i32, i1, i1, i1, i32, i1
-    ```
-  }];
-  let results = (outs AnyType:$in, I1:$write_en, I1:$clk, I1:$reset, AnyType:$out, I1:$done);
-  let builders = [
-    OpBuilder<(ins "StringRef":$sym_name, "size_t":$width), [{
-      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
-      Type i1Type = $_builder.getI1Type();
-      Type widthType = $_builder.getIntegerType(width);
-      $_state.addTypes({widthType, i1Type, i1Type, i1Type, widthType, i1Type});
-    }]>,
-    OpBuilder<(ins "StringRef":$sym_name, "Type":$type), [{
-      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
-      Type i1Type = $_builder.getI1Type();
-      $_state.addTypes({type, i1Type, i1Type, i1Type, type, i1Type});
-    }]>
-  ];
-}
-
-def ShiftRegisterOp : CalyxPrimitive<"shift_register", [
-    SameTypeConstraint<"in", "out">
-  ]> {
-  let summary = "Defines a shift register";
-  let description = [{
-    The "calyx.shift_register" op defines a shift register.
-    ```mlir
-      // A 32-bit shift register.
-      %r.in, %r.write_en, %r.clk, %r.out, %r.done = calyx.shift_register @r : i32, i1, i1, i32, i1
-    ```
-  }];
-  let arguments = (ins
-    SymbolNameAttr:$sym_name,
-    I64Attr:$depth
-  );
-  let results = (outs AnyType:$in, I1:$write_en, I1:$clk, AnyType:$out, I1:$done);
-  let builders = [
-    OpBuilder<(ins "StringRef":$sym_name, "size_t":$width, "size_t":$depth), [{
-      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
-      $_state.addAttribute(getDepthAttrName($_state.name), $_builder.getI64IntegerAttr(depth));
-      Type i1Type = $_builder.getI1Type();
-      Type widthType = $_builder.getIntegerType(width);
-      $_state.addTypes({widthType, i1Type, i1Type, widthType, i1Type});
-    }]>,
-    OpBuilder<(ins "StringRef":$sym_name, "Type":$type, "size_t":$depth), [{
-      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
-      $_state.addAttribute(getDepthAttrName($_state.name), $_builder.getI64IntegerAttr(depth));
-      Type i1Type = $_builder.getI1Type();
-      $_state.addTypes({type, i1Type, i1Type, type, i1Type});
-    }]>
-  ];
-}
-
 def MemoryOp : CalyxPrimitive<"memory", []> {
   let summary = "Defines a memory";
   let description = [{
@@ -284,7 +224,7 @@ def SeqMemoryOp : CalyxPrimitive<"seq_mem", []> {
   );
 
   let results = (outs
-    Variadic<AnyType>:$results
+    Variadic<AnySignlessInteger>:$results
   );
 
   let assemblyFormat = [{
@@ -590,68 +530,17 @@ def MuxLibOp : CalyxLibraryOp<"mux", "std_", [
   }];
 }
 
-class SequentialArithBinaryLibraryOp<string mnemonic> : ArithBinaryLibraryOp<mnemonic # "_pipe", "std_", [
+class ArithBinaryPipeLibraryOp<string mnemonic> : ArithBinaryLibraryOp<mnemonic # "_pipe", "std_", [
     SameTypeConstraint<"left", "out">
   ]> {
   let results = (outs I1:$clk, I1:$reset, I1:$go, AnyType:$left, AnyType:$right, AnyType:$out, I1:$done);
 }
 
-class ArithBinaryPipeLibraryOp<string mnemonic> : CalyxPrimitive<"pipelined_" # mnemonic, [
-    SameTypeConstraint<"left", "out">
-  ]> {
-  let summary = "Defines an operation which maps to a Calyx pipelined primitive";
-  let description = [{
-    This operation represents an instance of a Calyx pipelined primitive.
-    A library primitive maps to some hardware-implemented component within the
-    native Calyx compiler.
-
-    ```mlir
-      // A 32-bit adder. This falls under the binary library operations.
-      %add.left, %add.right, %add.out = calyx.std_add @add : i32, i32, i32
-
-      // An 8-bit comparison operator (with a 1-bit output). This falls under
-      // the boolean binary library operations.
-      %gt.left, %gt.right, %gt.out = calyx.std_gt @gt : i8, i8, i1
-
-      // An 8-bit to 16-bit pad operator. This falls under the unary
-      // library operations.
-      %pad.in, %pad.out = calyx.std_pad @pad : i8, i16
-    ```
-  }];
-
-  let arguments = (ins SymbolNameAttr:$sym_name);
-  let builders = [
-    OpBuilder<(ins "StringRef":$sym_name, "::mlir::TypeRange":$resultTypes), [{
-      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
-      $_state.addTypes(resultTypes);
-    }]>
-  ];
-  let results = (outs I1:$clk, I1:$reset, AnyType:$left, AnyType:$right, AnyType:$out);
-}
-
-def SeqMultLibOp : SequentialArithBinaryLibraryOp<"mult"> {}
-def SeqDivSLibOp : SequentialArithBinaryLibraryOp<"divs"> {}
-def SeqDivULibOp : SequentialArithBinaryLibraryOp<"divu"> {}
-def SeqRemULibOp : SequentialArithBinaryLibraryOp<"remu"> {}
-def SeqRemSLibOp : SequentialArithBinaryLibraryOp<"rems"> {}
-
-def PipelinedMultLibOp : ArithBinaryPipeLibraryOp<"mult"> {}
-def PipelinedDivSLibOp : ArithBinaryPipeLibraryOp<"divs"> {}
-
-class ArithBinaryStallableLibraryOp<string mnemonic> : CalyxPrimitive<"stallable_" # mnemonic, [
-    SameTypeConstraint<"left", "out">
-  ]> {
-  let arguments = (ins SymbolNameAttr:$sym_name);
-  let builders = [
-    OpBuilder<(ins "StringRef":$sym_name, "::mlir::TypeRange":$resultTypes), [{
-      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
-      $_state.addTypes(resultTypes);
-    }]>
-  ];
-  let results = (outs I1:$clk, I1:$reset, I1:$stall, AnyType:$left, AnyType:$right, AnyType:$out);
-}
-
-def StallableMultLibOp : ArithBinaryStallableLibraryOp<"mult"> {}
+def MultPipeLibOp : ArithBinaryPipeLibraryOp<"mult"> {}
+def DivSPipeLibOp : ArithBinaryPipeLibraryOp<"divs"> {}
+def DivUPipeLibOp : ArithBinaryPipeLibraryOp<"divu"> {}
+def RemUPipeLibOp : ArithBinaryPipeLibraryOp<"remu"> {}
+def RemSPipeLibOp : ArithBinaryPipeLibraryOp<"rems"> {}
 
 class UnaryLibraryOp<string mnemonic, string prefix, list<Trait> traits = []> :
     CalyxLibraryOp<mnemonic, prefix, !listconcat(traits, [Combinational])> {
@@ -663,25 +552,6 @@ def PadLibOp : UnaryLibraryOp<"pad", "std_"> {
 }
 
 def SliceLibOp : UnaryLibraryOp<"slice", "std_"> {
-  let hasVerifier = 1;
-}
-
-def BitSliceLibOp : CalyxPrimitive<"std_bit_slice",
-    [DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>
-    ]> {
-  let arguments = (ins SymbolNameAttr:$sym_name, I32Attr:$startIdx);
-
-  let results = (outs AnyInteger:$in, AnyInteger:$out);
-
-  let builders = [
-    OpBuilder <(ins "StringRef":$sym_name, "uint32_t":$startIdx, "::mlir::TypeRange":$resultTypes), [{
-      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
-      $_state.addAttribute(getStartIdxAttrName($_state.name), $_builder.getI32IntegerAttr(startIdx));
-      $_state.addTypes(resultTypes);
-    }]>
-  ];
-
-  let assemblyFormat = "$sym_name ` ` `<` $startIdx `>` attr-dict `:` qualified(type(results))";
   let hasVerifier = 1;
 }
 
@@ -698,27 +568,6 @@ def WireLibOp : UnaryLibraryOp<"wire", "std_", [SameTypeConstraint<"in", "out">]
 }
 
 def ExtSILibOp  : UnaryLibraryOp<"signext", "std_"> {}
-
-def ConstMultLibOp : CalyxLibraryOp<"const_mult", "std_", [
-    Combinational,
-    SameTypeConstraint<"in", "out">
-  ]> {
-  let arguments = (ins SymbolNameAttr:$sym_name,
-                       I64Attr:$value);
-  let results = (outs AnyInteger:$in, AnyInteger:$out);
-
-  let builders = [
-    OpBuilder<(ins "StringRef":$sym_name, "int":$value, "::mlir::TypeRange":$resultTypes), [{
-      $_state.addAttribute(mlir::SymbolTable::getSymbolAttrName(), $_builder.getStringAttr(sym_name));
-      $_state.addAttribute(getValueAttrName($_state.name), $_builder.getI64IntegerAttr(value));
-      $_state.addTypes(resultTypes);
-    }]>
-  ];
-
-  let assemblyFormat = [{
-    $sym_name ` ` $value attr-dict `:` qualified(type(results))
-  }];
-}
 
 class UnaryFloatingPointLibraryOp<string mnemonic, list<Trait> traits = []> :
   UnaryLibraryOp<mnemonic, /*prefix=*/"", !listconcat(traits, [

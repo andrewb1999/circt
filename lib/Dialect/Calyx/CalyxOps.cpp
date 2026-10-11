@@ -14,7 +14,6 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/FSM/FSMOps.h"
 #include "circt/Dialect/HW/HWAttributes.h"
-#include "circt/Dialect/HW/HWOpInterfaces.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "mlir/IR/AsmState.h"
@@ -27,7 +26,6 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
 #include "mlir/Support/LLVM.h"
-#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PriorityQueue.h"
@@ -36,7 +34,6 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
-#include <cassert>
 
 using namespace circt;
 using namespace circt::calyx;
@@ -77,14 +74,16 @@ IntegerAttr direction::packAttribute(MLIRContext *ctx, size_t nIns,
 //===----------------------------------------------------------------------===//
 
 /// This pattern collapses a calyx.seq or calyx.par operation when it
-/// contains exactly one operation.
+/// contains exactly one calyx.enable operation.
 template <typename CtrlOp>
 struct CollapseUnaryControl : mlir::OpRewritePattern<CtrlOp> {
   using mlir::OpRewritePattern<CtrlOp>::OpRewritePattern;
   LogicalResult matchAndRewrite(CtrlOp ctrlOp,
                                 PatternRewriter &rewriter) const override {
     auto &ops = ctrlOp.getBodyBlock()->getOperations();
-    bool isUnaryControl = (ops.size() == 1);
+    bool isUnaryControl =
+        (ops.size() == 1) && isa<EnableOp>(ops.front()) &&
+        isa<SeqOp, ParOp, StaticSeqOp, StaticParOp>(ctrlOp->getParentOp());
     if (!isUnaryControl)
       return failure();
 
@@ -211,7 +210,10 @@ LogicalResult calyx::verifyComponent(Operation *op) {
 }
 
 LogicalResult calyx::verifyCell(Operation *op) {
-  // auto opParent = op->getParentOp();
+  auto opParent = op->getParentOp();
+  if (!isa<ComponentInterface>(opParent))
+    return op->emitOpError()
+           << "has parent: " << opParent << ", expected ComponentInterface.";
   return success();
 }
 
@@ -1450,14 +1452,6 @@ LogicalResult calyx::verifyGroupInterface(Operation *op) {
   return success();
 }
 
-LogicalResult StaticGroupOp::verify() {
-  if (getLatency() < 1) {
-    return emitOpError() << "has latency less than 1";
-  }
-
-  return success();
-}
-
 //===----------------------------------------------------------------------===//
 // Utilities for operations with the Cell trait.
 //===----------------------------------------------------------------------===//
@@ -1600,13 +1594,11 @@ void AssignOp::print(OpAsmPrinter &p) {
 /// Lookup the component for the symbol. This returns null on
 /// invalid IR.
 ComponentInterface InstanceOp::getReferencedComponent() {
-  auto moduleOp = (*this)->getParentOfType<ModuleOp>();
-  assert(moduleOp && "InstanceOp no parent of type moduleOp");
+  auto module = (*this)->getParentOfType<ModuleOp>();
+  if (!module)
+    return nullptr;
 
-  auto comp = moduleOp.lookupSymbol<ComponentInterface>(getComponentName());
-  assert(comp && "InstanceOp referenced component does not exist");
-
-  return comp;
+  return module.lookupSymbol<ComponentInterface>(getComponentName());
 }
 
 /// Verifies the port information in comparison with the referenced component
@@ -1708,24 +1700,12 @@ bool InstanceOp::isCombinational() {
 
 /// Lookup the component for the symbol. This returns null on
 /// invalid IR.
-hw::HWModuleLike PrimitiveOp::getReferencedPrimitive() {
+hw::HWModuleExternOp PrimitiveOp::getReferencedPrimitive() {
   auto module = (*this)->getParentOfType<ModuleOp>();
   if (!module)
     return nullptr;
 
-  return module.lookupSymbol<hw::HWModuleLike>(getPrimitiveName());
-}
-
-static ArrayAttr getModuleParameters(hw::HWModuleLike hwModule) {
-  if (auto op = dyn_cast<hw::HWModuleExternOp>(hwModule.getOperation())) {
-    return op.getParameters();
-  }
-
-  if (auto op = dyn_cast<hw::HWModuleOp>(hwModule.getOperation())) {
-    return op.getParameters();
-  }
-  assert(false &&
-         "Only HWModuleExtern and HWModule are supported for calyx primitives");
+  return module.lookupSymbol<hw::HWModuleExternOp>(getPrimitiveName());
 }
 
 /// Verifies the port information in comparison with the referenced component
@@ -1733,16 +1713,14 @@ static ArrayAttr getModuleParameters(hw::HWModuleLike hwModule) {
 /// referenced component twice.
 static LogicalResult
 verifyPrimitiveOpType(PrimitiveOp instance,
-                      hw::HWModuleLike referencedPrimitive) {
+                      hw::HWModuleExternOp referencedPrimitive) {
   auto module = instance->getParentOfType<ModuleOp>();
-  if (module->hasAttrOfType<StringAttr>("calyx.entrypoint")) {
-    StringRef entryPointName =
-        module->getAttrOfType<StringAttr>("calyx.entrypoint");
-    if (instance.getPrimitiveName() == entryPointName)
-      return instance.emitOpError()
-             << "cannot reference the entry-point component: '"
-             << entryPointName << "'.";
-  }
+  StringRef entryPointName =
+      module->getAttrOfType<StringAttr>("calyx.entrypoint");
+  if (instance.getPrimitiveName() == entryPointName)
+    return instance.emitOpError()
+           << "cannot reference the entry-point component: '" << entryPointName
+           << "'.";
 
   // Verify the instance result ports with those of its referenced component.
   auto primitivePorts = referencedPrimitive.getPortList();
@@ -1755,37 +1733,35 @@ verifyPrimitiveOpType(PrimitiveOp instance,
            << " but got " << numResults;
 
   // Verify parameters match up
-  if (instance.getParameters().has_value()) {
-    ArrayAttr modParameters = getModuleParameters(referencedPrimitive);
-    ArrayAttr parameters = instance.getParameters().value();
-    size_t numExpected = modParameters.size();
-    size_t numParams = parameters.size();
-    if (numParams != numExpected)
+  ArrayAttr modParameters = referencedPrimitive.getParameters();
+  ArrayAttr parameters = instance.getParameters().value_or(ArrayAttr());
+  size_t numExpected = modParameters.size();
+  size_t numParams = parameters.size();
+  if (numParams != numExpected)
+    return instance.emitOpError()
+           << "has the wrong number of parameters; expected: " << numExpected
+           << " but got " << numParams;
+
+  for (size_t i = 0; i != numExpected; ++i) {
+    auto param = cast<circt::hw::ParamDeclAttr>(parameters[i]);
+    auto modParam = cast<circt::hw::ParamDeclAttr>(modParameters[i]);
+
+    auto paramName = param.getName();
+    if (paramName != modParam.getName())
       return instance.emitOpError()
-             << "has the wrong number of parameters; expected: " << numExpected
-             << " but got " << numParams;
+             << "parameter #" << i << " should have name " << modParam.getName()
+             << " but has name " << paramName;
 
-    for (size_t i = 0; i != numExpected; ++i) {
-      auto param = cast<circt::hw::ParamDeclAttr>(parameters[i]);
-      auto modParam = cast<circt::hw::ParamDeclAttr>(modParameters[i]);
+    if (param.getType() != modParam.getType())
+      return instance.emitOpError()
+             << "parameter " << paramName << " should have type "
+             << modParam.getType() << " but has type " << param.getType();
 
-      auto paramName = param.getName();
-      if (paramName != modParam.getName())
-        return instance.emitOpError()
-               << "parameter #" << i << " should have name "
-               << modParam.getName() << " but has name " << paramName;
-
-      if (param.getType() != modParam.getType())
-        return instance.emitOpError()
-               << "parameter " << paramName << " should have type "
-               << modParam.getType() << " but has type " << param.getType();
-
-      // All instance parameters must have a value.  Specify the same value as
-      // a module's default value if you want the default.
-      if (!param.getValue())
-        return instance.emitOpError("parameter ")
-               << paramName << " must have a value";
-    }
+    // All instance parameters must have a value.  Specify the same value as
+    // a module's default value if you want the default.
+    if (!param.getValue())
+      return instance.emitOpError("parameter ")
+             << paramName << " must have a value";
   }
 
   for (size_t i = 0; i != numResults; ++i) {
@@ -1821,16 +1797,16 @@ PrimitiveOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
                        << "' is already a symbol for another primitive.";
 
   // Verify the referenced primitive is not instantiating itself.
-  auto parentPrimitive = op->getParentOfType<hw::HWModuleLike>();
+  auto parentPrimitive = op->getParentOfType<hw::HWModuleExternOp>();
   if (parentPrimitive == referencedPrimitive)
     return emitError() << "recursive instantiation of its parent primitive: '"
                        << getPrimitiveName() << "'";
 
-  assert(isa<hw::HWModuleLike>(referencedPrimitive) &&
+  assert(isa<hw::HWModuleExternOp>(referencedPrimitive) &&
          "Should be a HardwareModuleExternOp.");
 
   return verifyPrimitiveOpType(*this,
-                               cast<hw::HWModuleLike>(referencedPrimitive));
+                               cast<hw::HWModuleExternOp>(referencedPrimitive));
 }
 
 /// Provide meaningful names to the result values of an PrimitiveOp.
@@ -1867,9 +1843,7 @@ SmallVector<Direction> PrimitiveOp::portDirections() {
   return portDirections;
 }
 
-bool PrimitiveOp::isCombinational() {
-  return getReferencedPrimitive()->hasAttr("combinational");
-}
+bool PrimitiveOp::isCombinational() { return false; }
 
 /// Returns a new DictionaryAttr containing only the calyx dialect attrs
 /// in the input DictionaryAttr. Also strips the 'calyx.' prefix from these
@@ -1892,11 +1866,11 @@ static DictionaryAttr cleanCalyxPortAttrs(OpBuilder builder,
   return builder.getDictionaryAttr(attrs);
 }
 
-// Grabs calyx port attributes from the HWModuleLike arg/result attributes.
+// Grabs calyx port attributes from the HWModuleExternOp arg/result attributes.
 SmallVector<DictionaryAttr> PrimitiveOp::portAttributes() {
   SmallVector<DictionaryAttr> portAttributes;
   OpBuilder builder(getContext());
-  hw::HWModuleLike prim = getReferencedPrimitive();
+  hw::HWModuleExternOp prim = getReferencedPrimitive();
   auto argAttrs = prim.getAllInputAttrs();
   auto resAttrs = prim.getAllOutputAttrs();
   for (auto a : argAttrs)
@@ -1953,7 +1927,7 @@ static ParseResult parseParameterList(OpAsmParser &parser,
 /// Print a parameter list for a module or instance. Same format as HW dialect.
 static void printParameterList(OpAsmPrinter &p, Operation *op,
                                ArrayAttr parameters) {
-  if (parameters == nullptr || parameters.empty())
+  if (parameters.empty())
     return;
 
   p << '<';
@@ -2127,78 +2101,6 @@ SmallVector<DictionaryAttr> RegisterOp::portAttributes() {
 }
 
 bool RegisterOp::isCombinational() { return false; }
-
-//===----------------------------------------------------------------------===//
-// BypassRegisterOp
-//===----------------------------------------------------------------------===//
-
-/// Provide meaningful names to the result values of a BypassRegisterOp.
-void BypassRegisterOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
-  getCellAsmResultNames(setNameFn, *this, this->portNames());
-}
-
-SmallVector<StringRef> BypassRegisterOp::portNames() {
-  return {"in", "write_en", clkPort, resetPort, "out", donePort};
-}
-
-SmallVector<Direction> BypassRegisterOp::portDirections() {
-  return {Input, Input, Input, Input, Output, Output};
-}
-
-SmallVector<DictionaryAttr> BypassRegisterOp::portAttributes() {
-  MLIRContext *context = getContext();
-  IntegerAttr isSet = IntegerAttr::get(IntegerType::get(context, 1), 1);
-  NamedAttrList writeEn, clk, reset, done;
-  writeEn.append(goPort, isSet);
-  clk.append(clkPort, isSet);
-  reset.append(resetPort, isSet);
-  done.append(donePort, isSet);
-  return {
-      DictionaryAttr::get(context),   // In
-      writeEn.getDictionary(context), // Write enable
-      clk.getDictionary(context),     // Clk
-      reset.getDictionary(context),   // Reset
-      DictionaryAttr::get(context),   // Out
-      done.getDictionary(context)     // Done
-  };
-}
-
-bool BypassRegisterOp::isCombinational() { return false; }
-
-//===----------------------------------------------------------------------===//
-// ShiftRegisterOp
-//===----------------------------------------------------------------------===//
-
-/// Provide meaningful names to the result values of a ShiftRegisterOp.
-void ShiftRegisterOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
-  getCellAsmResultNames(setNameFn, *this, this->portNames());
-}
-
-SmallVector<StringRef> ShiftRegisterOp::portNames() {
-  return {"in", "write_en", clkPort, "out", donePort};
-}
-
-SmallVector<Direction> ShiftRegisterOp::portDirections() {
-  return {Input, Input, Input, Output, Output};
-}
-
-SmallVector<DictionaryAttr> ShiftRegisterOp::portAttributes() {
-  MLIRContext *context = getContext();
-  IntegerAttr isSet = IntegerAttr::get(IntegerType::get(context, 1), 1);
-  NamedAttrList writeEn, clk, done;
-  writeEn.append(goPort, isSet);
-  clk.append(clkPort, isSet);
-  done.append(donePort, isSet);
-  return {
-      DictionaryAttr::get(context),   // In
-      writeEn.getDictionary(context), // Write enable
-      clk.getDictionary(context),     // Clk
-      DictionaryAttr::get(context),   // Out
-      done.getDictionary(context)     // Done
-  };
-}
-
-bool ShiftRegisterOp::isCombinational() { return false; }
 
 //===----------------------------------------------------------------------===//
 // MemoryOp
@@ -2911,8 +2813,9 @@ Value InvokeOp::getInstGoValue() {
   Value ret = nullptr;
   llvm::TypeSwitch<Operation *>(operation)
       .Case<RegisterOp>([&](auto op) { ret = operation->getResult(1); })
-      .Case<MemoryOp, SeqDivSLibOp, SeqDivULibOp, SeqMultLibOp, SeqRemSLibOp,
-            SeqRemULibOp>([&](auto op) { ret = operation->getResult(2); })
+      .Case<MemoryOp, DivSPipeLibOp, DivUPipeLibOp, MultPipeLibOp,
+            RemSPipeLibOp, RemUPipeLibOp>(
+          [&](auto op) { ret = operation->getResult(2); })
       .Case<InstanceOp>([&](auto op) {
         auto portInfo = op.getReferencedComponent().getPortInfo();
         for (auto [portInfo, res] :
@@ -2942,8 +2845,8 @@ Value InvokeOp::getInstDoneValue() {
   Operation *operation = componentOp.lookupSymbol(getCallee());
   Value ret = nullptr;
   llvm::TypeSwitch<Operation *>(operation)
-      .Case<RegisterOp, MemoryOp, SeqDivSLibOp, SeqDivULibOp, SeqMultLibOp,
-            SeqRemSLibOp, SeqRemULibOp>([&](auto op) {
+      .Case<RegisterOp, MemoryOp, DivSPipeLibOp, DivUPipeLibOp, MultPipeLibOp,
+            RemSPipeLibOp, RemUPipeLibOp>([&](auto op) {
         size_t doneIdx = operation->getResults().size() - 1;
         ret = operation->getResult(doneIdx);
       })
@@ -2974,11 +2877,12 @@ Value InvokeOp::getInstDoneValue() {
 
 // A helper function that gets the number of go or done ports in
 // hw.module.extern.
-static size_t getHwModuleExtGoOrDonePortNumber(hw::HWModuleLike &moduleLike,
-                                               bool isGo) {
+static size_t
+getHwModuleExtGoOrDonePortNumber(hw::HWModuleExternOp &moduleExternOp,
+                                 bool isGo) {
   size_t ret = 0;
   std::string str = isGo ? "calyx.go" : "calyx.done";
-  for (Attribute attr : moduleLike.getAllInputAttrs()) {
+  for (Attribute attr : moduleExternOp.getAllInputAttrs()) {
     if (DictionaryAttr dictAttr = dyn_cast<DictionaryAttr>(attr)) {
       ret = llvm::count_if(dictAttr, [&](NamedAttribute iter) {
         return iter.getName().getValue() == str;
@@ -3007,8 +2911,8 @@ LogicalResult InvokeOp::verify() {
   // They both have a go port and a done port, but the "go" port for
   // registers and memrey should be "write_en" port.
   llvm::TypeSwitch<Operation *>(operation)
-      .Case<RegisterOp, SeqDivSLibOp, SeqDivULibOp, MemoryOp, SeqMultLibOp,
-            SeqRemSLibOp, SeqRemULibOp>(
+      .Case<RegisterOp, DivSPipeLibOp, DivUPipeLibOp, MemoryOp, MultPipeLibOp,
+            RemSPipeLibOp, RemUPipeLibOp>(
           [&](auto op) { goPortNum = 1, donePortNum = 1; })
       .Case<InstanceOp>([&](auto op) {
         auto portInfo = op.getReferencedComponent().getPortInfo();
@@ -3100,17 +3004,7 @@ LogicalResult SliceLibOp::verify() {
   return success();
 }
 
-LogicalResult BitSliceLibOp::verify() {
-  unsigned inBits = getResult(0).getType().getIntOrFloatBitWidth();
-  unsigned outBits = getResult(1).getType().getIntOrFloatBitWidth();
-  if (inBits <= outBits)
-    return emitOpError("expected input bits (")
-           << inBits << ')' << " to be greater than output bits (" << outBits
-           << ')';
-  return success();
-}
-
-#define ImplBinSeqOpCellInterface(OpType, outName)                             \
+#define ImplBinPipeOpCellInterface(OpType, outName)                            \
   SmallVector<StringRef> OpType::portNames() {                                 \
     return {clkPort, resetPort, goPort, "left", "right", outName, donePort};   \
   }                                                                            \
@@ -3173,86 +3067,18 @@ LogicalResult BitSliceLibOp::verify() {
             DictionaryAttr::get(getContext())};                                \
   }
 
-#define ImplBinPipeOpCellInterface(OpType, outName)                            \
-  SmallVector<StringRef> OpType::portNames() {                                 \
-    return {"clk", "reset", "left", "right", outName};                         \
-  }                                                                            \
-                                                                               \
-  SmallVector<Direction> OpType::portDirections() {                            \
-    return {Input, Input, Input, Input, Output};                               \
-  }                                                                            \
-                                                                               \
-  void OpType::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {              \
-    getCellAsmResultNames(setNameFn, *this, this->portNames());                \
-  }                                                                            \
-                                                                               \
-  SmallVector<DictionaryAttr> OpType::portAttributes() {                       \
-    MLIRContext *context = getContext();                                       \
-    IntegerAttr isSet = IntegerAttr::get(IntegerType::get(context, 1), 1);     \
-    NamedAttrList clk, reset;                                                  \
-    clk.append("clk", isSet);                                                  \
-    reset.append("reset", isSet);                                              \
-    return {                                                                   \
-        clk.getDictionary(context),   /* Clk    */                             \
-        reset.getDictionary(context), /* Reset  */                             \
-        DictionaryAttr::get(context), /* Lhs    */                             \
-        DictionaryAttr::get(context), /* Rhs    */                             \
-        DictionaryAttr::get(context)  /* Out    */                             \
-    };                                                                         \
-  }                                                                            \
-                                                                               \
-  bool OpType::isCombinational() { return false; }
-
-#define ImplBinStallOpCellInterface(OpType, outName)                           \
-  SmallVector<StringRef> OpType::portNames() {                                 \
-    return {"clk", "reset", "stall", "left", "right", outName};                \
-  }                                                                            \
-                                                                               \
-  SmallVector<Direction> OpType::portDirections() {                            \
-    return {Input, Input, Input, Input, Input, Output};                        \
-  }                                                                            \
-                                                                               \
-  void OpType::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {              \
-    getCellAsmResultNames(setNameFn, *this, this->portNames());                \
-  }                                                                            \
-                                                                               \
-  SmallVector<DictionaryAttr> OpType::portAttributes() {                       \
-    MLIRContext *context = getContext();                                       \
-    IntegerAttr isSet = IntegerAttr::get(IntegerType::get(context, 1), 1);     \
-    NamedAttrList clk, reset;                                                  \
-    clk.append("clk", isSet);                                                  \
-    reset.append("reset", isSet);                                              \
-    return {                                                                   \
-        clk.getDictionary(context),   /* Clk    */                             \
-        reset.getDictionary(context), /* Reset  */                             \
-        DictionaryAttr::get(context), /* Stall  */                             \
-        DictionaryAttr::get(context), /* Lhs    */                             \
-        DictionaryAttr::get(context), /* Rhs    */                             \
-        DictionaryAttr::get(context)  /* Out    */                             \
-    };                                                                         \
-  }                                                                            \
-                                                                               \
-  bool OpType::isCombinational() { return false; }
-
 // clang-format off
-ImplBinSeqOpCellInterface(SeqMultLibOp, "out")
-ImplBinSeqOpCellInterface(SeqDivULibOp, "out_quotient")
-ImplBinSeqOpCellInterface(SeqDivSLibOp, "out_quotient")
-ImplBinSeqOpCellInterface(SeqRemULibOp, "out_remainder")
-ImplBinSeqOpCellInterface(SeqRemSLibOp, "out_remainder")
-
-ImplBinPipeOpCellInterface(PipelinedMultLibOp, "out")
-ImplBinPipeOpCellInterface(PipelinedDivSLibOp, "out")
-
-ImplBinStallOpCellInterface(StallableMultLibOp, "out")
+ImplBinPipeOpCellInterface(MultPipeLibOp, "out")
+ImplBinPipeOpCellInterface(DivUPipeLibOp, "out_quotient")
+ImplBinPipeOpCellInterface(DivSPipeLibOp, "out_quotient")
+ImplBinPipeOpCellInterface(RemUPipeLibOp, "out_remainder")
+ImplBinPipeOpCellInterface(RemSPipeLibOp, "out_remainder")
 
 ImplUnaryOpCellInterface(PadLibOp)
 ImplUnaryOpCellInterface(SliceLibOp)
-ImplUnaryOpCellInterface(BitSliceLibOp)
 ImplUnaryOpCellInterface(NotLibOp)
 ImplUnaryOpCellInterface(WireLibOp)
 ImplUnaryOpCellInterface(ExtSILibOp)
-ImplUnaryOpCellInterface(ConstMultLibOp)
 
 ImplBinOpCellInterface(LtLibOp)
 ImplBinOpCellInterface(GtLibOp)

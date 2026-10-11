@@ -1,88 +1,61 @@
 // RUN: circt-opt %s | circt-opt | FileCheck %s
 
-hw.module.extern @ext_fmult(in %clk : i1 {calyx.clk}, in %left : i32 {calyx.data}, in %right : i32 {calyx.data}, in %ce : i1, out result : i32 {calyx.stable, calyx.data}) attributes {filename = "fmult.sv", verilogName = "fmult"}
-
 hw.module.extern @ext_muli(in %clk : i1, in %reset : i1, in %ce : i1, in %din0 : i32, in %din1 : i32, out dout : i32) attributes {filename = "muli.sv", verilogName = "muli"}
 
 // CHECK-LABEL: @lib0
 
-// CHECK-LABEL: oplib.operator @fmult latency<4>, incDelay<5.000000e-01>, outDelay<5.000000e-01>
-// CHECK-NEXT: oplib.target @target0(%[[VAL_0:.*]]: f32, %[[VAL_1:.*]]: f32) -> f32
-// CHECK-NEXT: %[[VAL_2:.*]] = oplib.operation "mulf" in "arith"(%[[VAL_0]], %[[VAL_1]] : f32, f32) : f32
-// CHECK-NEXT: oplib.output %[[VAL_2]] : f32
-// CHECK:      oplib.calyx_match(@target0 : (f32, f32) -> f32) produce
-// CHECK-NEXT: %[[VAL_3:.*]], %[[VAL_4:.*]], %[[VAL_5:.*]], %[[VAL_6:.*]], %[[VAL_7:.*]] = calyx.primitive @fmult of @ext_fmult : i1, i32, i32, i1, i32
-// CHECK-NEXT: oplib.yield clk(%[[VAL_3]] : i1), ce(%[[VAL_6]] : i1), ins(%[[VAL_4]], %[[VAL_5]] : i32, i32), outs(%[[VAL_7]] : i32)
-
 // CHECK-LABEL: oplib.operator @addi latency<0>, incDelay<2.000000e-01>, outDelay<2.000000e-01>
-// CHECK-NEXT: oplib.target @target0(%[[VAL_8:.*]]: i32, %[[VAL_9:.*]]: i32) -> i32
-// CHECK-NEXT: %[[VAL_10:.*]] = oplib.operation "addi" in "arith"(%[[VAL_8]], %[[VAL_9]] : i32, i32) : i32
-// CHECK-NEXT: oplib.output %[[VAL_10]] : i32
-// CHECK:      oplib.calyx_match(@target0 : (i32, i32) -> i32) produce
-// CHECK-NEXT: %[[VAL_11:.*]], %[[VAL_12:.*]], %[[VAL_13:.*]] = calyx.std_add @add : i32, i32, i32
-// CHECK-NEXT: oplib.yield ins(%[[VAL_11]], %[[VAL_12]] : i32, i32), outs(%[[VAL_13]] : i32)
+// CHECK-NEXT: oplib.target @target0(%[[L:.*]]: i32, %[[R:.*]]: i32) -> i32
+// CHECK-NEXT: %[[O:.*]] = oplib.operation "arith.addi"(%[[L]], %[[R]] : i32, i32) : i32
+// CHECK-NEXT: oplib.output %[[O]] : i32
+// CHECK:      oplib.hw_match(@target0 : (i32, i32) -> i32) produce (in %[[ML:.*]] : i32, in %[[MR:.*]] : i32)
+// CHECK-NEXT: %[[SUM:.*]] = comb.add %[[ML]], %[[MR]] : i32
+// CHECK-NEXT: oplib.hw_return %[[SUM]] : i32
 
-// CHECK-LABEL: oplib.operator @trunci latency<0>
+// CHECK-LABEL: oplib.operator @cmpi latency<0>
+// CHECK:      oplib.operation "arith.cmpi" with {predicate = 0 : i64}
+// CHECK:      comb.icmp eq
 
 // CHECK-LABEL: oplib.operator @muli latency<4>, incDelay<5.000000e-01>, outDelay<5.000000e-01>
-// CHECK:      oplib.calyx_match(@target0 : (i32, i32) -> i32) produce
-// CHECK:      oplib.hw_match(@target0 : (i32, i32) -> i32) produce
-// CHECK:      oplib.yield clk(%{{.+}} : i1), ce(%{{.+}} : i1), reset(%{{.+}} : i1), ins(%{{.+}}, %{{.+}} : i32, i32), outs(%{{.+}} : i32)
+// CHECK:      oplib.hw_match(@target0 : (i32, i32) -> i32) produce (clk %[[CLK:.*]] : i1, reset %[[RST:.*]] : i1, ce %[[CE:.*]] : i1, in %[[A:.*]] : i32, in %[[B:.*]] : i32)
+// CHECK-NEXT: %[[P:.*]] = oplib.hw_instance "mul" @ext_muli(clk: %[[CLK]]: i1, reset: %[[RST]]: i1, ce: %[[CE]]: i1, din0: %[[A]]: i32, din1: %[[B]]: i32) -> (dout: i32)
+// CHECK-NEXT: oplib.hw_return %[[P]] : i32
+
+// CHECK-LABEL: oplib.operator @mem latency<1>, limit<2>
 
 oplib.library @lib0 {
-  oplib.operator @fmult latency<4>, incDelay<0.5>, outDelay<0.5> {
-    oplib.target @target0(%l: f32, %r: f32) -> f32 {
-      %o = oplib.operation "mulf" in "arith"(%l, %r : f32, f32) : f32
-      oplib.output %o : f32
-    }
-    oplib.calyx_match(@target0 : (f32, f32) -> f32) produce {
-      %clk, %left, %right, %ce, %result = calyx.primitive @fmult of @ext_fmult : i1, i32, i32, i1, i32
-      oplib.yield clk(%clk : i1), ce(%ce : i1), ins(%left, %right : i32, i32), outs(%result : i32)
-    }
-  }
   oplib.operator @addi latency<0>, incDelay<0.2>, outDelay<0.2> {
     oplib.target @target0(%l: i32, %r: i32) -> i32 {
-      %o = oplib.operation "addi" in "arith"(%l, %r : i32, i32) : i32
+      %o = oplib.operation "arith.addi"(%l, %r : i32, i32) : i32
       oplib.output %o : i32
     }
-    oplib.calyx_match(@target0 : (i32, i32) -> i32) produce {
-      %left, %right, %out = calyx.std_add @add : i32, i32, i32
-      oplib.yield ins(%left, %right : i32, i32), outs(%out : i32)
-    }
-  }
-  oplib.operator @trunci latency<0> {
-    oplib.target @target0(%in: i5) -> i4 {
-      %o = oplib.operation "trunci" in "arith"(%in : i5) : i4
-      oplib.output %o : i4
-    }
-    oplib.calyx_match(@target0 : (i5) -> i4) produce {
-      %slice.in, %slice.out = calyx.std_slice @slice : i5, i4
-      oplib.yield ins(%slice.in : i5), outs(%slice.out : i4)
+    oplib.hw_match(@target0 : (i32, i32) -> i32) produce (in %l : i32, in %r : i32) {
+      %o = comb.add %l, %r : i32
+      oplib.hw_return %o : i32
     }
   }
   oplib.operator @cmpi latency<0> {
     oplib.target @target0(%l: i32, %r: i32) -> i1 {
-      %o = oplib.operation "cmpi" in "arith" with {predicate = 0 : i64}(%l, %r : i32, i32) : i1
+      %o = oplib.operation "arith.cmpi" with {predicate = 0 : i64}(%l, %r : i32, i32) : i1
       oplib.output %o : i1
     }
-    oplib.calyx_match(@target0 : (i32, i32) -> i1) produce {
-      %eq.left, %eq.right, %eq.out = calyx.std_eq @eq : i32, i32, i1
-      oplib.yield ins(%eq.left, %eq.right : i32, i32), outs(%eq.out : i1)
+    oplib.hw_match(@target0 : (i32, i32) -> i1) produce (in %l : i32, in %r : i32) {
+      %o = comb.icmp eq %l, %r : i32
+      oplib.hw_return %o : i1
     }
   }
   oplib.operator @muli latency<4>, incDelay<0.5>, outDelay<0.5> {
     oplib.target @target0(%l: i32, %r: i32) -> i32 {
-      %o = oplib.operation "muli" in "arith"(%l, %r : i32, i32) : i32
+      %o = oplib.operation "arith.muli"(%l, %r : i32, i32) : i32
       oplib.output %o : i32
     }
-    oplib.calyx_match(@target0 : (i32, i32) -> i32) produce {
-      %l, %r, %o = calyx.std_add @mul : i32, i32, i32
-      oplib.yield ins(%l, %r : i32, i32), outs(%o : i32)
+    oplib.hw_match(@target0 : (i32, i32) -> i32) produce (clk %clk : i1, reset %rst : i1, ce %ce : i1, in %a : i32, in %b : i32) {
+      %p = oplib.hw_instance "mul" @ext_muli(clk: %clk: i1, reset: %rst: i1, ce: %ce: i1, din0: %a: i32, din1: %b: i32) -> (dout: i32)
+      oplib.hw_return %p : i32
     }
-    oplib.hw_match(@target0 : (i32, i32) -> i32) produce {
-      %c0 = hw.constant 0 : i1
-      %c0_i32 = hw.constant 0 : i32
-      oplib.yield clk(%c0 : i1), ce(%c0 : i1), reset(%c0 : i1), ins(%c0_i32, %c0_i32 : i32, i32), outs(%c0_i32 : i32)
-    }
+  }
+  // An operator without a target carries properties only (here the memory
+  // operators operator-allocation emits), so it needs no match op.
+  oplib.operator @mem latency<1>, limit<2> {
   }
 }

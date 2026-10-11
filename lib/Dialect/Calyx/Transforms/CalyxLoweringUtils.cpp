@@ -18,10 +18,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
-#include "mlir/Pass/AnalysisManager.h"
-#include "llvm/ADT/STLExtras.h"
 
-#include <cassert>
 #include <variant>
 
 using namespace llvm;
@@ -153,28 +150,6 @@ bool noStoresToMemory(Value memoryReference) {
   });
 }
 
-bool singleLoadFromMemoryInBlock(Value memoryReference, Block *block) {
-  return llvm::count_if(memoryReference.getUses(), [&block](OpOperand &user) {
-           auto res = block->walk([&](mlir::memref::LoadOp op) {
-             if (op.getOperation() == user.getOwner())
-               return WalkResult::interrupt();
-             return WalkResult::advance();
-           });
-           return res.wasInterrupted();
-         }) <= 1;
-}
-
-bool noStoresToMemoryInBlock(Value memoryReference, Block *block) {
-  return llvm::none_of(memoryReference.getUses(), [&block](OpOperand &user) {
-    auto res = block->walk([&](mlir::memref::StoreOp op) {
-      if (op.getOperation() == user.getOwner())
-        return WalkResult::interrupt();
-      return WalkResult::advance();
-    });
-    return res.wasInterrupted();
-  });
-}
-
 Value getComponentOutput(calyx::ComponentOp compOp, unsigned outPortIdx) {
   size_t index = compOp.getInputPortInfo().size() + outPortIdx;
   assert(index < compOp.getNumArguments() &&
@@ -190,63 +165,18 @@ Type normalizeType(OpBuilder &builder, Type type) {
   return type;
 }
 
-// Creates a new calyx::StaticGroupOp group within compOp.
-StaticGroupOp createStaticGroup(OpBuilder &builder, calyx::ComponentOp compOp,
-                                Location loc, Twine uniqueName,
-                                uint64_t latency) {
-  mlir::IRRewriter::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(compOp.getWiresOp().getBodyBlock());
-  return builder.create<StaticGroupOp>(loc, uniqueName.str(), latency);
-}
-
-unsigned getBitWidth(Type t) {
-  if (t.isIndex()) {
-    return 32;
-  }
-
-  return t.getIntOrFloatBitWidth();
-}
-
-Value buildCombAndTree(OpBuilder &builder,
-                       ComponentLoweringStateInterface &state, Location loc,
-                       SmallVector<Value> values) {
-
-  if (values.size() == 1)
-    return values.front();
-
-  auto type = builder.getI1Type();
-  std::optional<Value> finalVal;
-  for (Value v : values) {
-    auto bitwidth = v.getType().getIntOrFloatBitWidth();
-    assert(bitwidth == 1);
-    if (!finalVal.has_value()) {
-      finalVal = v;
-      continue;
-    }
-    auto andOp = state.getNewLibraryOpInstance<calyx::AndLibOp>(
-        builder, loc, {type, type, type});
-    builder.create<calyx::AssignOp>(loc, andOp.getLeft(), v);
-    builder.create<calyx::AssignOp>(loc, andOp.getRight(), finalVal.value());
-    finalVal = andOp.getOut();
-  }
-
-  assert(finalVal.has_value());
-  return finalVal.value();
-}
-
 void buildAssignmentsForRegisterWrite(OpBuilder &builder,
-                                      calyx::GroupInterface groupOp,
+                                      calyx::GroupOp groupOp,
                                       calyx::ComponentOp componentOp,
                                       calyx::RegisterOp &reg,
                                       Value inputValue) {
   mlir::IRRewriter::InsertionGuard guard(builder);
   auto loc = inputValue.getLoc();
-  builder.setInsertionPointToEnd(groupOp.getBody());
+  builder.setInsertionPointToEnd(groupOp.getBodyBlock());
   calyx::AssignOp::create(builder, loc, reg.getIn(), inputValue);
   calyx::AssignOp::create(builder, loc, reg.getWriteEn(),
                           createConstant(loc, builder, componentOp, 1, 1));
-  if (!llvm::isa<StaticGroupOp>(groupOp))
-    calyx::GroupDoneOp::create(builder, loc, reg.getDone());
+  calyx::GroupDoneOp::create(builder, loc, reg.getDone());
 }
 
 //===----------------------------------------------------------------------===//
@@ -329,11 +259,11 @@ std::optional<Value> MemoryInterface::readEnOpt() {
     return std::nullopt;
   }
 
-  if (std::get<MemoryPortsImpl>(impl).readOrContentEn.has_value() &&
-      !std::get<MemoryPortsImpl>(impl).isContentEn.value_or(true)) {
-    return std::get<MemoryPortsImpl>(impl).readOrContentEn;
+  if (std::get<MemoryPortsImpl>(impl).readOrContentEn.has_value()) {
+    assert(std::get<MemoryPortsImpl>(impl).isContentEn.has_value());
+    assert(!std::get<MemoryPortsImpl>(impl).isContentEn.value());
   }
-  return std::nullopt;
+  return std::get<MemoryPortsImpl>(impl).readOrContentEn;
 }
 
 std::optional<Value> MemoryInterface::contentEnOpt() {
@@ -345,12 +275,12 @@ std::optional<Value> MemoryInterface::contentEnOpt() {
     return memOp->contentEn();
   }
 
-  if (std::get<MemoryPortsImpl>(impl).readOrContentEn.has_value() &&
-      std::get<MemoryPortsImpl>(impl).isContentEn.value_or(false)) {
+  if (std::get<MemoryPortsImpl>(impl).readOrContentEn.has_value()) {
     assert(std::get<MemoryPortsImpl>(impl).writeEn.has_value());
-    return std::get<MemoryPortsImpl>(impl).readOrContentEn;
+    assert(std::get<MemoryPortsImpl>(impl).isContentEn.has_value());
+    assert(std::get<MemoryPortsImpl>(impl).isContentEn.value());
   }
-  return std::nullopt;
+  return std::get<MemoryPortsImpl>(impl).readOrContentEn;
 }
 
 std::optional<Value> MemoryInterface::writeDataOpt() {
@@ -361,16 +291,7 @@ std::optional<Value> MemoryInterface::writeDataOpt() {
   if (auto *memOp = std::get_if<calyx::SeqMemoryOp>(&impl); memOp) {
     return memOp->writeData();
   }
-
-  if (auto *memOp = std::get_if<calyx::SeqMemoryOp>(&impl); memOp) {
-    return memOp->writeData();
-  }
-
-  if (auto *memOp = std::get_if<calyx::SeqMemoryOp>(&impl); memOp) {
-    return memOp->writeData();
-  }
-  auto writeData = std::get<MemoryPortsImpl>(impl).writeData;
-  return writeData;
+  return std::get<MemoryPortsImpl>(impl).writeData;
 }
 
 std::optional<Value> MemoryInterface::writeEnOpt() {
@@ -406,14 +327,6 @@ ValueRange MemoryInterface::addrPorts() {
   return std::get<MemoryPortsImpl>(impl).addrPorts;
 }
 
-bool MemoryInterface::isDynamic() {
-  if (auto *memImpl = std::get_if<MemoryPortsImpl>(&impl); memImpl) {
-    return memImpl->isDynamic;
-  }
-
-  return false;
-}
-
 //===----------------------------------------------------------------------===//
 // BasicLoopInterface
 //===----------------------------------------------------------------------===//
@@ -447,12 +360,12 @@ ComponentLoweringStateInterface::getBlockArgRegs(Block *block) {
   return blockArgRegs[block];
 }
 
-void ComponentLoweringStateInterface::addBlockArgGroup(
-    Block *from, Block *to, calyx::GroupInterface grp) {
+void ComponentLoweringStateInterface::addBlockArgGroup(Block *from, Block *to,
+                                                       calyx::GroupOp grp) {
   blockArgGroups[from][to].push_back(grp);
 }
 
-ArrayRef<calyx::GroupInterface>
+ArrayRef<calyx::GroupOp>
 ComponentLoweringStateInterface::getBlockArgGroups(Block *from, Block *to) {
   return blockArgGroups[from][to];
 }
@@ -482,17 +395,6 @@ void ComponentLoweringStateInterface::registerEvaluatingGroup(
   valueGroupAssigns[v] = group;
 }
 
-void ComponentLoweringStateInterface::removeEvaluatingGroup(
-    calyx::GroupInterface group) {
-  for (auto valGroup : llvm::make_early_inc_range(valueGroupAssigns)) {
-    auto val = valGroup.getFirst();
-    auto otherGroup = valGroup.getSecond();
-    if (otherGroup.getOperation() == group.getOperation()) {
-      valueGroupAssigns.erase(val);
-    }
-  }
-}
-
 void ComponentLoweringStateInterface::addReturnReg(calyx::RegisterOp reg,
                                                    unsigned idx) {
   assert(returnRegs.count(idx) == 0 &&
@@ -507,33 +409,25 @@ calyx::RegisterOp ComponentLoweringStateInterface::getReturnReg(unsigned idx) {
 
 void ComponentLoweringStateInterface::registerMemoryInterface(
     Value memref, const calyx::MemoryInterface &memoryInterface) {
+  assert(isa<MemRefType>(memref.getType()));
   assert(memories.find(memref) == memories.end() &&
          "Memory already registered for memref");
   memories[memref] = memoryInterface;
 }
 
-void ComponentLoweringStateInterface::removeMemoryInterface(Value memref) {
-  assert(memories.contains(memref));
-  memories.erase(memref);
-}
-
 calyx::MemoryInterface
 ComponentLoweringStateInterface::getMemoryInterface(Value memref) {
+  assert(isa<MemRefType>(memref.getType()));
   auto it = memories.find(memref);
   assert(it != memories.end() && "No memory registered for memref");
   return it->second;
-}
-
-bool ComponentLoweringStateInterface::hasMemoryInterface(Value memref) {
-  return memories.contains(memref);
 }
 
 std::optional<calyx::MemoryInterface>
 ComponentLoweringStateInterface::isInputPortOfMemory(Value v) {
   for (auto &memIf : memories) {
     auto &mem = memIf.getSecond();
-    if ((mem.writeEnOpt().has_value() && mem.writeEn() == v) ||
-        (mem.writeDataOpt() && mem.writeData() == v) ||
+    if (mem.writeEn() == v || mem.writeData() == v ||
         llvm::any_of(mem.addrPorts(), [=](Value port) { return port == v; }))
       return {mem};
   }
@@ -576,42 +470,22 @@ void ComponentLoweringStateInterface::addSeqGuardCmpLibOp(Operation *op) {
 //===----------------------------------------------------------------------===//
 
 CalyxLoweringState::CalyxLoweringState(mlir::ModuleOp module,
-                                       mlir::AnalysisManager am,
                                        StringRef topLevelFunction)
-    : topLevelFunction(topLevelFunction), module(module), am(am),
-      asmState(module) {}
+    : topLevelFunction(topLevelFunction), module(module) {}
 
 mlir::ModuleOp CalyxLoweringState::getModule() {
   assert(module.getOperation() != nullptr);
   return module;
 }
 
-mlir::AnalysisManager &CalyxLoweringState::getAnalysisManager() { return am; }
-
 StringRef CalyxLoweringState::getTopLevelFunction() const {
   return topLevelFunction;
 }
 
 std::string CalyxLoweringState::blockName(Block *b) {
-  auto it = blockNameMap.find(b);
-  if (it != blockNameMap.end()) {
-    return it->getSecond();
-  }
-
   std::string blockName = irName(*b);
-  // The cached AsmState only knows blocks that existed when the lowering
-  // state was constructed. Blocks created during lowering (e.g. the sink
-  // block from InlineExecuteRegionOpPattern) print as "INVALIDBLOCK";
-  // build a fresh AsmState so the new block gets a real name.
-  if (blockName == "INVALIDBLOCK") {
-    mlir::AsmState freshState(module);
-    blockName.clear();
-    llvm::raw_string_ostream os(blockName);
-    b->printAsOperand(os, freshState);
-  }
   blockName.erase(std::remove(blockName.begin(), blockName.end(), '^'),
                   blockName.end());
-  blockNameMap.insert(std::pair(b, blockName));
   return blockName;
 }
 
@@ -675,10 +549,6 @@ CalyxLoweringState &FuncOpPartialLoweringPattern::loweringState() const {
 LogicalResult
 ConvertIndexTypes::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
                                             PatternRewriter &rewriter) const {
-  for (auto arg : funcOp.getArguments()) {
-    arg.setType(calyx::normalizeType(rewriter, arg.getType()));
-  }
-
   funcOp.walk([&](Block *block) {
     for (Value arg : block->getArguments())
       arg.setType(calyx::normalizeType(rewriter, arg.getType()));
@@ -759,13 +629,11 @@ MultipleGroupDonePattern::matchAndRewrite(calyx::GroupOp groupOp,
 LogicalResult
 EliminateUnusedCombGroups::matchAndRewrite(calyx::CombGroupOp combGroupOp,
                                            PatternRewriter &rewriter) const {
-  auto component = combGroupOp->getParentOfType<calyx::ComponentOp>();
-  auto control = component.getControlOp();
+  auto control =
+      combGroupOp->getParentOfType<calyx::ComponentOp>().getControlOp();
   if (!SymbolTable::symbolKnownUseEmpty(combGroupOp.getSymNameAttr(), control))
     return failure();
 
-  if (auto *state = cls.getState(component))
-    state->removeEvaluatingGroup(combGroupOp);
   rewriter.eraseOp(combGroupOp);
   return success();
 }
@@ -845,12 +713,11 @@ void InlineCombGroups::recurseInlineCombGroups(
     //   return values have at the current point of conversion not yet
     //   been rewritten to their register outputs, see comment in
     //   LateSSAReplacement)
-    // Needed to add memory interfaces as well
     if (isa<BlockArgument>(src) ||
         isa<calyx::RegisterOp, calyx::MemoryOp, calyx::SeqMemoryOp,
-            hw::ConstantOp, mlir::arith::ConstantOp, calyx::SeqMultLibOp,
-            calyx::SeqDivULibOp, calyx::SeqDivSLibOp, calyx::SeqRemSLibOp,
-            calyx::SeqRemULibOp, mlir::scf::WhileOp, calyx::InstanceOp,
+            hw::ConstantOp, mlir::arith::ConstantOp, calyx::MultPipeLibOp,
+            calyx::DivUPipeLibOp, calyx::DivSPipeLibOp, calyx::RemSPipeLibOp,
+            calyx::RemUPipeLibOp, mlir::scf::WhileOp, calyx::InstanceOp,
             calyx::ConstantOp, calyx::AddFOpIEEE754, calyx::MulFOpIEEE754,
             calyx::CompareFOpIEEE754, calyx::FpToIntOpIEEE754,
             calyx::IntToFpOpIEEE754, calyx::DivSqrtOpIEEE754>(
@@ -861,14 +728,8 @@ void InlineCombGroups::recurseInlineCombGroups(
       continue;
     }
 
-    auto evalGroupOpt = state.findEvaluatingGroup(src);
-    if (!evalGroupOpt.has_value()) {
-      continue;
-    }
-    auto evalGroup = evalGroupOpt.value();
-    if (evalGroup == nullptr)
-      continue;
-    auto srcCombGroup = dyn_cast<calyx::CombGroupOp>(evalGroup.getOperation());
+    auto srcCombGroup = dyn_cast<calyx::CombGroupOp>(
+        state.getEvaluatingGroup(src).getOperation());
     if (!srcCombGroup)
       continue;
     if (inlinedGroups.count(srcCombGroup))
@@ -893,8 +754,8 @@ RewriteMemoryAccesses::partiallyLower(calyx::AssignOp assignOp,
     return success();
 
   Value src = assignOp.getSrc();
-  unsigned srcBits = getBitWidth(src.getType());
-  unsigned dstBits = getBitWidth(dest.getType());
+  unsigned srcBits = src.getType().getIntOrFloatBitWidth();
+  unsigned dstBits = dest.getType().getIntOrFloatBitWidth();
   if (srcBits == dstBits)
     return success();
 
@@ -1121,7 +982,3 @@ bool parentIsSeqCell(const Value value) {
 
 } // namespace calyx
 } // namespace circt
-
-#include "circt/Dialect/Calyx/CalyxLoweringInterfaces.cpp.inc"
-
-#include "circt/Dialect/Calyx/CalyxLoweringTypeInterfaces.cpp.inc"

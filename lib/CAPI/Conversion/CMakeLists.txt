@@ -32,7 +32,6 @@ add_circt_public_c_api_library(CIRCTCAPIConversion
   CIRCTHWToSMT
   CIRCTHWToSV
   CIRCTHWToSystemC
-  CIRCTLoopScheduleToCalyx
   CIRCTLTLToCore
   CIRCTMooreToCore
   CIRCTPipelineToHW

@@ -358,7 +358,9 @@ module {
 // CHECK:             }
 // CHECK:           }
 // CHECK:           calyx.control {
-// CHECK:             calyx.enable @ret_assign_0
+// CHECK:             calyx.seq {
+// CHECK:               calyx.enable @ret_assign_0
+// CHECK:             }
 // CHECK:           }
 // CHECK:         } {toplevel}
   func.func @main(%i : i8) -> index {
@@ -384,7 +386,9 @@ module {
 // CHECK:           calyx.wires {
 // CHECK:           }
 // CHECK:           calyx.control {
-// CHECK:             calyx.invoke @main_1_instance[arg_mem_0 = mem_0](%[[VAL_15]] = %[[VAL_0]], %[[VAL_16]] = %[[VAL_1]]) -> (i32, i32)
+// CHECK:             calyx.seq {
+// CHECK:               calyx.invoke @main_1_instance[arg_mem_0 = mem_0](%[[VAL_15]] = %[[VAL_0]], %[[VAL_16]] = %[[VAL_1]]) -> (i32, i32)
+// CHECK:             }
 // CHECK:           }
 // CHECK:         } {toplevel}
 
@@ -409,9 +413,11 @@ module {
 // CHECK:             }
 // CHECK:           }
 // CHECK:           calyx.control {
-// CHECK:             calyx.enable @bb0_0
+// CHECK:             calyx.seq {
+// CHECK:               calyx.enable @bb0_0
+// CHECK:             }
 // CHECK:           }
-// CHECK:         }
+// CHECK:         }  
   func.func @main(%arg0 : i32, %mem0 : memref<8xi32>, %i : index) {
     memref.store %arg0, %mem0[%i] : memref<8xi32>
     return
@@ -434,7 +440,9 @@ module {
 // CHECK:           calyx.wires {
 // CHECK:           }
 // CHECK:           calyx.control {
-// CHECK:             calyx.invoke @main_1_instance[arg_mem_0 = mem_0](%[[VAL_14]] = %[[VAL_0]]) -> (i32)
+// CHECK:             calyx.seq {
+// CHECK:               calyx.invoke @main_1_instance[arg_mem_0 = mem_0](%[[VAL_14]] = %[[VAL_0]]) -> (i32)
+// CHECK:             }
 // CHECK:           }
 // CHECK:         } {toplevel}
 
@@ -495,7 +503,9 @@ module {
 // CHECK:           calyx.wires {
 // CHECK:           }
 // CHECK:           calyx.control {
-// CHECK:             calyx.invoke @main_1_instance[arg_mem_0 = mem_0](%[[VAL_15]] = %[[VAL_0]], %[[VAL_16]] = %[[VAL_1]]) -> (i32, i32)
+// CHECK:             calyx.seq {
+// CHECK:               calyx.invoke @main_1_instance[arg_mem_0 = mem_0](%[[VAL_15]] = %[[VAL_0]], %[[VAL_16]] = %[[VAL_1]]) -> (i32, i32)
+// CHECK:             }
 // CHECK:           }
 // CHECK:         } {toplevel}
 
@@ -639,7 +649,9 @@ module {
 // CHECK:           calyx.wires {
 // CHECK:           }
 // CHECK:           calyx.control {
-// CHECK:             calyx.invoke @main_1_instance[arg_mem_0 = mem_0]() -> ()
+// CHECK:             calyx.seq {
+// CHECK:               calyx.invoke @main_1_instance[arg_mem_0 = mem_0]() -> ()
+// CHECK:             }
 // CHECK:           }
 // CHECK:         } {toplevel}
 
@@ -720,7 +732,9 @@ module {
 // CHECK:             }
 // CHECK:           }
 // CHECK:           calyx.control {
-// CHECK:             calyx.enable @bb0_0
+// CHECK:             calyx.seq {
+// CHECK:               calyx.enable @bb0_0
+// CHECK:             }
 // CHECK:           }
 // CHECK:         } {toplevel}
   func.func @main() {
@@ -757,7 +771,9 @@ module {
 // CHECK:             }
 // CHECK:           }
 // CHECK:           calyx.control {
-// CHECK:             calyx.enable @bb0_0
+// CHECK:             calyx.seq {
+// CHECK:               calyx.enable @bb0_0
+// CHECK:             }
 // CHECK:           }
 // CHECK:         } {toplevel}
   func.func @main() {
@@ -783,7 +799,9 @@ module {
 // CHECK:           calyx.wires {
 // CHECK:           }
 // CHECK:           calyx.control {
-// CHECK:             calyx.invoke @main_1_instance[arg_mem_0 = mem_0, arg_mem_1 = mem_1]() -> ()
+// CHECK:             calyx.seq {
+// CHECK:               calyx.invoke @main_1_instance[arg_mem_0 = mem_0, arg_mem_1 = mem_1]() -> ()
+// CHECK:             }
 // CHECK:           }
 // CHECK:         } {toplevel}
 

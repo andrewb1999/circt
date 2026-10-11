@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This describes the interfaces in the Calyx dialect.
+// This describes the interfaces in the LoopSchedule dialect.
 //
 //===----------------------------------------------------------------------===//
 

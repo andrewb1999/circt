@@ -12,7 +12,6 @@
 
 #include "circt/Analysis/OperatorLibraryAnalysis.h"
 #include "circt/Analysis/NameAnalysis.h"
-#include "circt/Dialect/Calyx/CalyxDialect.h"
 #include "circt/Dialect/OpLib/OpLibOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -62,7 +61,6 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
     operatorStruct.outDelay = operatorOp.getOutDelay();
     if (auto limit = operatorOp.getLimit())
       operatorStruct.limit = static_cast<unsigned>(*limit);
-    operatorStruct.templateOp = nullptr;
     operatorStruct.opToMatch = nullptr;
 
     StringRef operatorName = operatorOp.getSymName();
@@ -100,59 +98,9 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
     if (!hwMatches.empty())
       operatorStruct.hwMatchOp = *hwMatches.begin();
 
-    auto calyxMatches = operatorOp.getBodyBlock()->getOps<oplib::CalyxMatchOp>();
-    if (!calyxMatches.empty()) {
-      auto matchOp = *calyxMatches.begin();
-      operatorStruct.templateOp = &matchOp.getBodyBlock()->front();
-
-      auto yieldOp =
-          cast<oplib::YieldOp>(matchOp.getBodyBlock()->getTerminator());
-
-      if (yieldOp.getClock() != nullptr) {
-        auto clockResultNum =
-            cast<OpResult>(yieldOp.getClock()).getResultNumber();
-        operatorStruct.clock = clockResultNum;
-      }
-
-      if (yieldOp.getReset() != nullptr) {
-        auto resetResultNum =
-            cast<OpResult>(yieldOp.getReset()).getResultNumber();
-        operatorStruct.reset = resetResultNum;
-      }
-
-      if (yieldOp.getClockEnable() != nullptr) {
-        auto ceResultNum =
-            cast<OpResult>(yieldOp.getClockEnable()).getResultNumber();
-        operatorStruct.ce = ceResultNum;
-      }
-
-      for (auto iv : llvm::enumerate(yieldOp.getInputs())) {
-        auto i = iv.index();
-        auto input = iv.value();
-        assert(input.getDefiningOp() == &matchOp.getBodyBlock()->front() &&
-               "matchOp can only contain one calyx cell");
-        auto opResultNum = cast<OpResult>(input).getResultNumber();
-        operatorStruct.operandToCellResultMapping[i] = opResultNum;
-      }
-
-      for (auto iv : llvm::enumerate(yieldOp.getOutputs())) {
-        auto i = iv.index();
-        auto output = iv.value();
-        assert(output.getDefiningOp() == &matchOp.getBodyBlock()->front() &&
-               "matchOp can only contain one calyx cell");
-        auto opResultNum = cast<OpResult>(output).getResultNumber();
-        operatorStruct.resultToCellResultMapping[i] = opResultNum;
-      }
-    }
-
     potentialOperatorsMap[operationName.getStringRef()].push_back(operatorName);
     operatorMap.insert(std::pair(operatorName, operatorStruct));
   }
-}
-
-Operation *
-OperatorLibraryAnalysis::getOperatorTemplateOp(StringRef operatorName) {
-  return operatorMap.at(operatorName).templateOp;
 }
 
 circt::oplib::HwMatchOp
@@ -225,16 +173,6 @@ OperatorLibraryAnalysis::getOperatorBySymbol(mlir::SymbolRefAttr symbol) {
   return name.getValue();
 }
 
-SmallVector<StringRef> OperatorLibraryAnalysis::getAllSupportedTargets() {
-  SmallVector<StringRef> targets;
-
-  for (auto &[key, _] : potentialOperatorsMap) {
-    targets.push_back(key);
-  }
-
-  return targets;
-}
-
 bool OperatorLibraryAnalysis::hasOperator(StringRef operatorName) {
   return operatorMap.find(operatorName) != operatorMap.end();
 }
@@ -271,26 +209,4 @@ OperatorLibraryAnalysis::getOperatorLimit(StringRef operatorName) {
   if (it == operatorMap.end())
     return std::nullopt;
   return it->second.limit;
-}
-
-std::optional<unsigned>
-OperatorLibraryAnalysis::getCEResultNum(StringRef operatorName) {
-  auto operatorStruct = operatorMap.at(operatorName);
-  return operatorStruct.ce;
-}
-
-unsigned
-OperatorLibraryAnalysis::getCellResultForOperandNum(StringRef operatorName,
-                                                    unsigned int operandNum) {
-  auto operatorStruct = operatorMap.at(operatorName);
-  auto num = operatorStruct.operandToCellResultMapping.at(operandNum);
-  return num;
-}
-
-unsigned
-OperatorLibraryAnalysis::getCellResultForResultNum(StringRef operatorName,
-                                                   unsigned int resultNum) {
-  auto operatorStruct = operatorMap.at(operatorName);
-  auto num = operatorStruct.resultToCellResultMapping.at(resultNum);
-  return num;
 }

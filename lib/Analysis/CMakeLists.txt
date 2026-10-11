@@ -66,7 +66,6 @@ add_circt_library(CIRCTOperatorLibraryAnalysis
   MLIRIR
   MLIRTransformUtils
   CIRCTOpLib
-  CIRCTCalyx
 )
 
 add_circt_library(CIRCTOpCountAnalysis

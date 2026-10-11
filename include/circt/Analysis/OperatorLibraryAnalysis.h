@@ -14,7 +14,6 @@
 #ifndef CIRCT_ANALYSIS_OPERATOR_LIBRARY_ANALYSIS_H
 #define CIRCT_ANALYSIS_OPERATOR_LIBRARY_ANALYSIS_H
 
-#include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/OpLib/OpLibOps.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/Attributes.h"
@@ -40,20 +39,7 @@ struct Operator {
   /// binder will create as many instances as the schedule demands).
   std::optional<unsigned> limit;
 
-  // Must be calyx::CellInterface
-  Operation *templateOp;
-
   Operation *opToMatch;
-
-  std::map<unsigned, unsigned> operandToCellResultMapping;
-
-  std::map<unsigned, unsigned> resultToCellResultMapping;
-
-  std::optional<unsigned> clock;
-
-  std::optional<unsigned> ce;
-
-  std::optional<unsigned> reset;
 
   SmallVector<mlir::NamedAttribute> attrs;
 
@@ -77,10 +63,6 @@ struct OperatorLibraryAnalysis {
 
   StringRef getOperatorBySymbol(mlir::SymbolRefAttr);
 
-  SmallVector<StringRef> getAllSupportedTargets();
-
-  Operation *getOperatorTemplateOp(StringRef);
-
   /// True when an operator with this symbol name exists in the library.
   /// The per-operator getters below assert on unknown names; callers
   /// resolving symbols from attributes should check this first.
@@ -95,14 +77,6 @@ struct OperatorLibraryAnalysis {
   /// Maximum number of physical instances of this operator. `std::nullopt`
   /// means no cap — the binder will create as many as needed.
   std::optional<unsigned> getOperatorLimit(StringRef);
-
-  std::optional<unsigned> getCEResultNum(StringRef operatorName);
-
-  unsigned getCellResultForOperandNum(StringRef operatorName,
-                                      unsigned operandNum);
-
-  unsigned getCellResultForResultNum(StringRef operatorName,
-                                     unsigned resultNum);
 
   // Returns the operator's `oplib.hw_match` op, or null if absent.
   oplib::HwMatchOp getHwMatchOp(StringRef operatorName);

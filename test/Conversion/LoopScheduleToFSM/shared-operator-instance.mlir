@@ -19,7 +19,7 @@ oplib.library @lib {
   }
 }
 
-hw.module.extern @int_mul_pipe_i32_l4(in %clk : i1 {calyx.clk, oplib.clock}, in %reset : i1 {calyx.reset, oplib.reset}, in %ce : i1 {oplib.enable}, in %lhs : i32 {calyx.data, oplib.operand = 0 : i32}, in %rhs : i32 {calyx.data, oplib.operand = 1 : i32}, out out : i32 {oplib.result = 0 : i32}) attributes {verilogName = "int_mul_pipe_i32_l4"}
+hw.module.extern @int_mul_pipe_i32_l4(in %clk : i1 {oplib.clock}, in %reset : i1 {oplib.reset}, in %ce : i1 {oplib.enable}, in %lhs : i32 {oplib.operand = 0 : i32}, in %rhs : i32 {oplib.operand = 1 : i32}, out out : i32 {oplib.result = 0 : i32}) attributes {verilogName = "int_mul_pipe_i32_l4"}
 
 loopschedule.func_sequential @shared(%m: memref<8xi32>)
       attributes {oplib.library = @lib, top} {

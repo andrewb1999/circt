@@ -23,7 +23,7 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
   let summary = "Convert SCF dialect to LoopSchedule scheduled loops";
   let description = [{
     This pass analyzes SCF loops and control flow, creates a Scheduling
-    problem using the Calyx operator library, solves the problem, and lowers
+    problem from the function's operator library, solves the problem, and lowers
     the loops to a LoopSchedule. Memory dependencies must be maked prior to
     calling this pass using ConstructMemoryDependencies.
   }];
@@ -174,29 +174,6 @@ def SCFToCalyx : Pass<"lower-scf-to-calyx", "mlir::ModuleOp"> {
             "Whether to track source location for the Cider debugger.">,
     Option<"writeJsonOpt", "write-json", "std::string", "",
             "Whether to write memory contents to the json file.">
-  ];
-}
-
-//===----------------------------------------------------------------------===//
-// LoopScheduleToCalyx
-//===----------------------------------------------------------------------===//
-
-def LoopScheduleToCalyx : Pass<"lower-loopschedule-to-calyx", "mlir::ModuleOp"> {
-  let summary = "Lower LoopSchedule to Calyx";
-  let description = [{
-    This pass lowers LoopSchedule to Calyx.
-  }];
-  let constructor = "circt::createLoopScheduleToCalyxPass()";
-  let dependentDialects = [
-    "calyx::CalyxDialect", "loopschedule::LoopScheduleDialect", "hw::HWDialect",
-    "comb::CombDialect", "oplib::OpLibDialect"
-  ];
-  let options = [
-    Option<"topLevelFunctionOpt", "top-level-function", "std::string", "",
-            "Identifier of top-level function to be the entry-point component"
-            " of the Calyx program.">,
-    Option<"ciderSourceLocationMetadata", "cider-source-location-metadata", "bool", "",
-            "Whether to track source location for the Cider debugger.">
   ];
 }
 

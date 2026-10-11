@@ -44,7 +44,6 @@
 #include "circt/Conversion/HandshakeToHW.h"
 #include "circt/Conversion/ImportAIGER.h"
 #include "circt/Conversion/LTLToCore.h"
-#include "circt/Conversion/LoopScheduleToCalyx.h"
 #include "circt/Conversion/LoopScheduleToFSM.h"
 #include "circt/Conversion/MemrefToLoopSchedule.h"
 #include "circt/Conversion/MooreToCore.h"

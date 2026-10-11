@@ -45,8 +45,8 @@ SmallVector<LoopScheduleLaunchOp> getLaunchOpsInOrder(LoopScheduleFrameOp frame)
 // rebuild the issue stage with payload-typed results where it previously held
 // handle-typed results. After this call the pipeline is launch/expect-free
 // and semantically equivalent to the pre-wrap IR (dynamic stall info is
-// discarded). Lowerings that cannot consume handles (Calyx) or that don't yet
-// implement pipeline stalling (FSM, transitionally) call this at the start.
+// discarded). Lowerings that don't yet implement pipeline stalling (FSM,
+// transitionally) call this at the start.
 void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp);
 
 scheduling::ModuloProblem

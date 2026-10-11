@@ -12,24 +12,17 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/Calyx/CalyxEmitter.h"
-#include "circt/Conversion/ExportVerilog.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
-#include "circt/Dialect/SV/SVAttributes.h"
-#include "circt/Dialect/SV/SVDialect.h"
-#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Support/LLVM.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Support/LLVM.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
-#include "llvm/Support/Format.h"
 #include "llvm/Support/FormatVariadic.h"
 #include <bitset>
 #include <string>
@@ -58,10 +51,6 @@ static constexpr std::string_view quote() { return "\""; }
 static constexpr std::string_view apostrophe() { return "'"; }
 static constexpr std::string_view LBraceEndL() { return "{\n"; }
 static constexpr std::string_view RBraceEndL() { return "}\n"; }
-static constexpr std::string_view BeginEndL() { return "begin\n"; }
-static constexpr std::string_view EndEndL() { return "end\n"; }
-static constexpr std::string_view Begin() { return "begin"; }
-static constexpr std::string_view End() { return "end"; }
 static constexpr std::string_view semicolonEndL() { return ";\n"; }
 static constexpr std::string_view addressSymbol() { return "@"; }
 static constexpr std::string_view endl() { return "\n"; }
@@ -107,7 +96,7 @@ public:
   /// Returns the list of library names used for in this program.
   /// E.g. if `primitives/core.futil` is used, returns { "core" }.
   FailureOr<llvm::SmallSet<StringRef, 4>> getLibraryNames(ModuleOp module) {
-    auto walkRes = module.walk([&](ComponentInterface component) {
+    auto walkRes = module.walk([&](ComponentOp component) {
       for (auto &op : *component.getBodyBlock()) {
         if (!isa<CellInterface>(op) || isa<InstanceOp, PrimitiveOp>(op))
           // It is not a primitive.
@@ -135,14 +124,14 @@ private:
             })
         .Case<NotLibOp, AndLibOp, OrLibOp, XorLibOp, SubLibOp, GtLibOp, LtLibOp,
               EqLibOp, NeqLibOp, GeLibOp, LeLibOp, LshLibOp, RshLibOp,
-              SliceLibOp, PadLibOp, MuxLibOp, BitSliceLibOp, BypassRegisterOp,
-              ShiftRegisterOp>([&](auto op) -> FailureOr<StringRef> {
-          static constexpr std::string_view sCore = "core";
-          return {sCore};
-        })
+              SliceLibOp, PadLibOp, MuxLibOp>(
+            [&](auto op) -> FailureOr<StringRef> {
+              static constexpr std::string_view sCore = "core";
+              return {sCore};
+            })
         .Case<SgtLibOp, SltLibOp, SeqLibOp, SneqLibOp, SgeLibOp, SleLibOp,
-              SrshLibOp, SeqMultLibOp, SeqRemULibOp, SeqRemSLibOp, SeqDivULibOp,
-              SeqDivSLibOp, ExtSILibOp, ConstMultLibOp>(
+              SrshLibOp, MultPipeLibOp, RemUPipeLibOp, RemSPipeLibOp,
+              DivUPipeLibOp, DivSPipeLibOp, ExtSILibOp>(
             [&](auto op) -> FailureOr<StringRef> {
               static constexpr std::string_view sBinaryOperators =
                   "binary_operators";
@@ -156,16 +145,6 @@ private:
           static constexpr std::string_view sMemories = "memories/seq";
           return {sMemories};
         })
-        .Case<PipelinedMultLibOp, PipelinedDivSLibOp>(
-            [&](auto op) -> FailureOr<StringRef> {
-              static constexpr std::string_view sMemories = "pipelined";
-              return {sMemories};
-            })
-        .Case<StallableMultLibOp>([&](auto op) -> FailureOr<StringRef> {
-          static constexpr std::string_view sMemories = "stallable";
-          return {sMemories};
-        })
-        /*.Case<>([&](auto op) { library = "math"; })*/
         .Case<ConstantOp>([&](auto op) -> FailureOr<StringRef> {
           static constexpr std::string_view sFloat = "float";
           return {sFloat};
@@ -210,7 +189,7 @@ private:
 
 /// An emitter for Calyx dialect operations to .futil output.
 struct Emitter {
-  Emitter(llvm::raw_ostream &os) : logicCount(0), os(os) {}
+  Emitter(llvm::raw_ostream &os) : os(os) {}
   LogicalResult finalize();
 
   // Indentation
@@ -267,23 +246,7 @@ struct Emitter {
 
   // HWModuleExtern emission
   void emitPrimitiveExtern(hw::HWModuleExternOp op);
-  void emitPrimitiveModule(hw::HWModuleOp op);
-  void emitPrimitivePorts(hw::HWModuleLike op);
-
-  // SV emission
-  void emitSVStmt(Operation *op);
-  void emitLogic(sv::LogicOp op);
-  void emitHWConstant(hw::ConstantOp op);
-  void emitConstantZ(sv::ConstantZOp op);
-  void emitAlwaysFF(sv::AlwaysFFOp op);
-  void emitAlwaysComb(sv::AlwaysCombOp op);
-  void emitCombExtract(comb::ExtractOp op);
-  void emitCombSub(comb::SubOp op);
-  void emitCase(sv::CaseOp op);
-  void emitIf(sv::IfOp op);
-  void emitPAssign(sv::PAssignOp op);
-  void emitBPAssign(sv::BPAssignOp op);
-  void emitReadInOut(sv::ReadInOutOp op);
+  void emitPrimitivePorts(hw::HWModuleExternOp op);
 
   // Instance emission
   void emitInstance(InstanceOp op);
@@ -309,12 +272,6 @@ struct Emitter {
   // Register emission
   void emitRegister(RegisterOp reg);
 
-  // BypassRegister emission
-  void emitBypassRegister(BypassRegisterOp reg);
-
-  // ShiftRegister emission
-  void emitShiftRegister(ShiftRegisterOp reg);
-
   // Emit undefined op
   void emitUndef(UndefLibOp op);
 
@@ -324,17 +281,11 @@ struct Emitter {
   // Seq Memory emission
   void emitSeqMemory(SeqMemoryOp memory);
 
-  // Const Mult emission
-  void emitConstMult(ConstMultLibOp op);
-
   // Invoke emission
   void emitInvoke(InvokeOp invoke);
 
   // Floating point Constant emission
   void emitConstant(ConstantOp constant);
-
-  // Bit Slice Emission
-  void emitBitSlice(BitSliceLibOp op);
 
   // Emits a library primitive with template parameters based on all in- and
   // output ports.
@@ -364,23 +315,7 @@ struct Emitter {
   // Emits a library floating point primitives
   void emitLibraryFloatingPoint(Operation *op);
 
-  std::string getUniqueLogic() {
-    auto name = "GEN" + std::to_string(logicCount) + "_";
-    logicCount++;
-    return name;
-  }
-
-  std::string getUniqueConstantName(hw::ConstantOp op) {
-    auto name = "I" + std::to_string(op.getType().getIntOrFloatBitWidth()) +
-                "_CONST_" + std::to_string(op.getValue().getZExtValue());
-    return name;
-  }
-
 private:
-  unsigned int logicCount;
-
-  DenseMap<Value, std::string> logicNameMap;
-
   /// Used to track which imports are required for this program.
   ImportTracker importTracker;
 
@@ -712,33 +647,13 @@ LogicalResult Emitter::finalize() { return failure(encounteredError); }
 
 /// Emit an entire program.
 void Emitter::emitModule(ModuleOp op) {
-  DenseMap<StringRef, SmallVector<hw::HWModuleExternOp>> collectedExterns;
-
-  op.walk([&](hw::HWModuleExternOp op) {
-    auto filename = op->getAttrOfType<StringAttr>("filename");
-    collectedExterns[filename.getValue()].push_back(op);
-  });
-
-  for (auto [filename, vec] : collectedExterns) {
-    indent() << "extern \"" << filename << "\"" << space() << LBraceEndL();
-    addIndent();
-    for (auto hwModuleExternOp : vec) {
-      emitPrimitiveExtern(hwModuleExternOp);
-    }
-    reduceIndent();
-    os << RBraceEndL();
-  }
-
   for (auto &bodyOp : *op.getBody()) {
     if (auto componentOp = dyn_cast<ComponentInterface>(bodyOp))
       emitComponent(componentOp);
-    else if (auto hwModuleExternOp = dyn_cast<hw::HWModuleExternOp>(bodyOp) ||
-                                     isa<memref::GlobalOp>(bodyOp))
-      continue;
-    else if (auto hwModuleOp = dyn_cast<hw::HWModuleOp>(bodyOp))
-      emitPrimitiveModule(hwModuleOp);
+    else if (auto hwModuleExternOp = dyn_cast<hw::HWModuleExternOp>(bodyOp))
+      emitPrimitiveExtern(hwModuleExternOp);
     else
-      emitOpError(&bodyOp, "Unexpected op in calyx emission");
+      emitOpError(&bodyOp, "Unexpected op");
   }
 }
 
@@ -765,31 +680,26 @@ void Emitter::emitComponent(ComponentInterface op) {
           .Case<InstanceOp>([&](auto op) { emitInstance(op); })
           .Case<PrimitiveOp>([&](auto op) { emitPrimitive(op); })
           .Case<RegisterOp>([&](auto op) { emitRegister(op); })
-          .Case<BypassRegisterOp>([&](auto op) { emitBypassRegister(op); })
-          .Case<ShiftRegisterOp>([&](auto op) { emitShiftRegister(op); })
           .Case<MemoryOp>([&](auto op) { emitMemory(op); })
           .Case<SeqMemoryOp>([&](auto op) { emitSeqMemory(op); })
-          .Case<ConstMultLibOp>([&](auto op) { emitConstMult(op); })
           .Case<hw::ConstantOp>([&](auto op) { /*Do nothing*/ })
           .Case<calyx::ConstantOp>([&](auto op) { emitConstant(op); })
           .Case<SliceLibOp, PadLibOp, ExtSILibOp>(
               [&](auto op) { emitLibraryPrimTypedByAllPorts(op); })
-          .Case<BitSliceLibOp>([&](auto op) { emitBitSlice(op); })
           .Case<LtLibOp, GtLibOp, EqLibOp, NeqLibOp, GeLibOp, LeLibOp, SltLibOp,
                 SgtLibOp, SeqLibOp, SneqLibOp, SgeLibOp, SleLibOp, AddLibOp,
                 SubLibOp, ShruLibOp, RshLibOp, SrshLibOp, LshLibOp, AndLibOp,
                 NotLibOp, OrLibOp, XorLibOp, WireLibOp>(
               [&](auto op) { emitLibraryPrimTypedByFirstInputPort(op); })
-          .Case<SeqMultLibOp, PipelinedMultLibOp, StallableMultLibOp,
-                PipelinedDivSLibOp>(
-              [&](auto op) { emitLibraryPrimTypedByFirstOutputPort(op); })
           .Case<MuxLibOp>(
               [&](auto op) { emitLibraryPrimTypedByFirstOutputPort(op); })
-          .Case<SeqRemULibOp, SeqDivULibOp>([&](auto op) {
+          .Case<MultPipeLibOp>(
+              [&](auto op) { emitLibraryPrimTypedByFirstOutputPort(op); })
+          .Case<RemUPipeLibOp, DivUPipeLibOp>([&](auto op) {
             emitLibraryPrimTypedByFirstOutputPort(
                 op, /*calyxLibName=*/{"std_div_pipe"});
           })
-          .Case<SeqRemSLibOp, SeqDivSLibOp>([&](auto op) {
+          .Case<RemSPipeLibOp, DivSPipeLibOp>([&](auto op) {
             emitLibraryPrimTypedByFirstOutputPort(
                 op, /*calyxLibName=*/{"std_sdiv_pipe"});
           })
@@ -832,6 +742,9 @@ void Emitter::emitComponentPorts(ComponentInterface op) {
 
 /// Emit a primitive extern
 void Emitter::emitPrimitiveExtern(hw::HWModuleExternOp op) {
+  Attribute filename = op->getAttrDictionary().get("filename");
+  indent() << "extern " << filename << space() << LBraceEndL();
+  addIndent();
   indent() << "primitive " << op.getName();
 
   if (!op.getParameters().empty()) {
@@ -846,57 +759,12 @@ void Emitter::emitPrimitiveExtern(hw::HWModuleExternOp op) {
   // Emit the ports.
   emitPrimitivePorts(op);
   os << semicolonEndL();
-}
-
-static void createInputLogicMap(hw::HWModuleOp op,
-                                DenseMap<Value, std::string> &logicNameMap) {
-  for (unsigned i = 0; i < op.getNumInputPorts(); ++i) {
-    auto name = op.getInputName(i);
-    auto val = op.getArgumentForInput(i);
-    logicNameMap[val] = name;
-  }
-}
-
-void Emitter::emitPrimitiveModule(hw::HWModuleOp op) {
-  indent() << "primitive " << op.getName();
-
-  if (!op.getParameters().empty()) {
-    os << LSquare();
-    llvm::interleaveComma(op.getParameters(), os, [&](Attribute param) {
-      auto paramAttr = cast<hw::ParamDeclAttr>(param);
-      os << paramAttr.getName().str();
-    });
-    os << RSquare();
-  }
-  os << getAttributes(op, /*atFormat=*/false);
-  // Emit the ports.
-  emitPrimitivePorts(op);
-  createInputLogicMap(op, logicNameMap);
-  os << space() << LBraceEndL();
-  addIndent();
-
-  for (auto &&bodyOp : *op.getBodyBlock()) {
-    emitSVStmt(&bodyOp);
-  }
-
-  auto outputOp = cast<hw::OutputOp>(op.getBodyBlock()->getTerminator());
-
-  for (auto [src, dst] :
-       llvm::zip(outputOp.getOutputs(), op.getOutputNames())) {
-    Value srcVal = src;
-    assert(logicNameMap.contains(srcVal));
-    auto srcName = logicNameMap[src];
-    auto dstName = cast<StringAttr>(dst).str();
-    indent() << "assign" << space() << dstName << space() << equals() << space()
-             << srcName << semicolonEndL();
-  }
-
   reduceIndent();
-  indent() << RBraceEndL();
+  os << RBraceEndL();
 }
 
 /// Emit the ports of a component.
-void Emitter::emitPrimitivePorts(hw::HWModuleLike op) {
+void Emitter::emitPrimitivePorts(hw::HWModuleExternOp op) {
   auto emitPorts = [&](auto ports, bool isInput) {
     auto e = static_cast<size_t>(std::distance(ports.begin(), ports.end()));
     os << LParen();
@@ -928,187 +796,6 @@ void Emitter::emitPrimitivePorts(hw::HWModuleLike op) {
   emitPorts(ports.getInputs(), true);
   os << arrow();
   emitPorts(ports.getOutputs(), false);
-}
-
-void Emitter::emitSVStmt(Operation *op) {
-  TypeSwitch<Operation *>(op)
-      .Case<sv::LogicOp>([&](auto op) { emitLogic(op); })
-      .Case<hw::ConstantOp>([&](auto op) { emitHWConstant(op); })
-      .Case<sv::ConstantZOp>([&](auto op) { emitConstantZ(op); })
-      .Case<sv::AlwaysFFOp>([&](auto op) { emitAlwaysFF(op); })
-      .Case<sv::AlwaysCombOp>([&](auto op) { emitAlwaysComb(op); })
-      .Case<comb::ExtractOp>([&](auto op) { emitCombExtract(op); })
-      .Case<comb::SubOp>([&](auto op) { emitCombSub(op); })
-      .Case<sv::CaseOp>([&](auto op) { emitCase(op); })
-      .Case<sv::IfOp>([&](auto op) { emitIf(op); })
-      .Case<sv::PAssignOp>([&](auto op) { emitPAssign(op); })
-      .Case<sv::BPAssignOp>([&](auto op) { emitBPAssign(op); })
-      .Case<sv::ReadInOutOp>([&](auto op) { emitReadInOut(op); })
-      .Case<hw::OutputOp>([&](auto op) { /* Do nothing */ })
-      .Default([&](auto op) {
-        emitOpError(op, "not supported for emission inside HWModuleOp body");
-      });
-}
-
-void Emitter::emitConstantZ(sv::ConstantZOp op) {
-  indent() << "logic ";
-  if (op.getWidth() > 1) {
-    os << "[" << std::to_string(op.getWidth() - 1) << ":0]" << space();
-  }
-  std::string name = getUniqueLogic();
-  os << name << space() << equals() << space() << "'z" << semicolonEndL();
-  logicNameMap[op.getResult()] = name;
-}
-
-void Emitter::emitHWConstant(hw::ConstantOp op) {
-  indent() << "localparam ";
-  std::string name = getUniqueConstantName(op);
-  auto bitwidth = op.getType().getIntOrFloatBitWidth();
-  os << name << space() << equals() << space() << std::to_string(bitwidth)
-     << "'d" << op.getValue().getZExtValue() << semicolonEndL();
-  logicNameMap[op.getResult()] = name;
-}
-
-void Emitter::emitLogic(sv::LogicOp op) {
-  indent() << "logic ";
-  if (op.getElementType().getIntOrFloatBitWidth() > 1) {
-    os << "[" << std::to_string(op.getElementType().getIntOrFloatBitWidth() - 1)
-       << ":0]" << space();
-  }
-  std::string name;
-  if (!op.getName().empty()) {
-    name = op.getName();
-  } else {
-    name = getUniqueLogic();
-  }
-  logicNameMap[op.getResult()] = name;
-  os << name << semicolonEndL();
-}
-
-void Emitter::emitPAssign(sv::PAssignOp op) {
-  indent() << logicNameMap[op.getDest()] << space() << "<=" << space()
-           << logicNameMap[op.getSrc()] << semicolonEndL();
-}
-
-void Emitter::emitBPAssign(sv::BPAssignOp op) {
-  indent() << logicNameMap[op.getDest()] << space() << "=" << space()
-           << logicNameMap[op.getSrc()] << semicolonEndL();
-}
-
-void Emitter::emitReadInOut(sv::ReadInOutOp op) {
-  auto name = logicNameMap[op.getInput()];
-  logicNameMap[op] = name;
-}
-
-void Emitter::emitIf(sv::IfOp op) {
-  indent() << "if" << space() << LParen();
-  os << logicNameMap[op.getCond()] << RParen() << space() << BeginEndL();
-  addIndent();
-  for (auto &&bodyOp : *op.getThenBlock()) {
-    emitSVStmt(&bodyOp);
-  }
-  reduceIndent();
-  indent() << End();
-  if (!op.hasElse()) {
-    os << endl();
-    return;
-  }
-
-  os << space() << "else" << space() << BeginEndL();
-  addIndent();
-  for (auto &&bodyOp : *op.getElseBlock()) {
-    emitSVStmt(&bodyOp);
-  }
-  reduceIndent();
-  indent() << EndEndL();
-}
-
-void Emitter::emitCase(sv::CaseOp op) {
-  indent() << "case" << LParen() << logicNameMap[op.getCond()] << RParen()
-           << endl();
-  addIndent();
-  for (auto &c : op.getCases()) {
-    if (auto *pattern = dyn_cast<sv::CaseDefaultPattern>(c.pattern.get())) {
-      indent() << "default: " << BeginEndL();
-    } else if (auto *pattern = dyn_cast<sv::CaseBitPattern>(c.pattern.get())) {
-      auto width = pattern->getWidth();
-      indent() << std::to_string(width) << "'b";
-      for (int i = width - 1; i >= 0; --i) {
-        os << sv::getLetter(pattern->getBit(i));
-      }
-      os << ":" << space() << BeginEndL();
-    } else {
-      assert(false && "unsupported case pattern");
-    }
-    addIndent();
-    addIndent();
-    for (auto &&bodyOp : *c.block) {
-      emitSVStmt(&bodyOp);
-    }
-    reduceIndent();
-    indent() << EndEndL();
-    reduceIndent();
-  }
-  reduceIndent();
-  indent() << "endcase" << endl();
-}
-
-void Emitter::emitAlwaysFF(sv::AlwaysFFOp op) {
-  indent() << "always_ff" << space() << "@" << LParen();
-  if (op.getClockEdge() == sv::EventControl::AtPosEdge) {
-    os << "posedge";
-  } else if (op.getClockEdge() == sv::EventControl::AtNegEdge) {
-    os << "negedge";
-  }
-  assert(logicNameMap.contains(op.getClock()));
-  auto clkName = logicNameMap[op.getClock()];
-  os << space() << clkName << RParen() << space() << BeginEndL();
-  addIndent();
-
-  for (auto &&bodyOp : *op.getBodyBlock()) {
-    emitSVStmt(&bodyOp);
-  }
-
-  reduceIndent();
-  indent() << EndEndL();
-}
-
-void Emitter::emitAlwaysComb(sv::AlwaysCombOp op) {
-  indent() << "always_comb" << space() << BeginEndL();
-  addIndent();
-
-  for (auto &&bodyOp : *op.getBodyBlock()) {
-    emitSVStmt(&bodyOp);
-  }
-
-  reduceIndent();
-  indent() << EndEndL();
-}
-
-void Emitter::emitCombExtract(comb::ExtractOp op) {
-  auto input = logicNameMap[op.getInput()];
-  auto lowBit = op.getLowBit();
-  auto hiBit = lowBit + op.getResult().getType().getIntOrFloatBitWidth() - 1;
-  if (hiBit == lowBit) {
-    logicNameMap[op.getResult()] = input + "[" + std::to_string(lowBit) + "]";
-  } else {
-    logicNameMap[op.getResult()] = input + "[" + std::to_string(hiBit) + ":" +
-                                   std::to_string(lowBit) + "]";
-  }
-}
-
-void Emitter::emitCombSub(comb::SubOp op) {
-  auto lhs = logicNameMap[op.getLhs()];
-  auto rhs = logicNameMap[op.getRhs()];
-
-  if (isa<hw::ConstantOp>(op.getLhs().getDefiningOp())) {
-    auto constOp = op.getLhs().getDefiningOp<hw::ConstantOp>();
-    if (constOp.getValue() == 0) {
-      logicNameMap[op.getResult()] = "(-" + rhs + ")";
-      return;
-    }
-  }
-  logicNameMap[op.getResult()] = "(" + lhs + " - " + rhs + ")";
 }
 
 void Emitter::emitInstance(InstanceOp op) {
@@ -1144,22 +831,6 @@ void Emitter::emitRegister(RegisterOp reg) {
   indent() << getAttributes(reg, /*atFormat=*/true) << reg.instanceName()
            << space() << equals() << space() << "std_reg" << LParen()
            << std::to_string(bitWidth) << RParen() << semicolonEndL();
-}
-
-void Emitter::emitBypassRegister(BypassRegisterOp reg) {
-  size_t bitWidth = reg.getIn().getType().getIntOrFloatBitWidth();
-  indent() << getAttributes(reg, /*atFormat=*/true) << reg.instanceName()
-           << space() << equals() << space() << "std_bypass_reg" << LParen()
-           << std::to_string(bitWidth) << RParen() << semicolonEndL();
-}
-
-void Emitter::emitShiftRegister(ShiftRegisterOp reg) {
-  size_t bitWidth = reg.getIn().getType().getIntOrFloatBitWidth();
-  size_t depth = reg.getDepth();
-  indent() << getAttributes(reg, /*atFormat=*/true) << reg.instanceName()
-           << space() << equals() << space() << "std_shift_reg" << LParen()
-           << std::to_string(bitWidth) << comma() << space()
-           << std::to_string(depth) << RParen() << semicolonEndL();
 }
 
 void Emitter::emitUndef(UndefLibOp op) {
@@ -1300,33 +971,15 @@ void Emitter::emitConstant(ConstantOp constantOp) {
   auto fltAttr = cast<FloatAttr>(attr);
   APFloat value = fltAttr.getValue();
   auto type = cast<FloatType>(fltAttr.getType());
+  double doubleValue = value.convertToDouble();
   auto floatBits = value.getSizeInBits(type.getFloatSemantics());
   indent() << constantOp.instanceName() << space() << equals() << space()
            << "std_float_const";
   // Currently defaults to IEEE-754 representation [1].
   // [1]: https://github.com/calyxir/calyx/blob/main/primitives/float.futil
-  static constexpr int32_t ieee754 = 0;
-  os << LParen() << std::to_string(ieee754) << comma() << floatBits << comma();
-  if (type.isF32()) {
-    float floatValue = value.convertToFloat();
-    os << llvm::format("%.9f", floatValue);
-  } else if (type.isF64()) {
-    double doubleValue = value.convertToDouble();
-    os << llvm::format("%.17f", doubleValue);
-  }
-
-  os << RParen() << semicolonEndL();
-}
-
-void Emitter::emitBitSlice(BitSliceLibOp op) {
-  auto cell = cast<CellInterface>(op.getOperation());
-  indent() << getAttributes(op, /*atFormat=*/true) << cell.instanceName()
-           << space() << equals() << space() << "std_bit_slice" << LParen();
-  os << op.getIn().getType().getIntOrFloatBitWidth() << comma();
-  auto outWidth = op.getOut().getType().getIntOrFloatBitWidth();
-  os << op.getStartIdx() << comma() << op.getStartIdx() + outWidth - 1
-     << comma();
-  os << outWidth << RParen() << semicolonEndL();
+  static constexpr int32_t IEEE754 = 0;
+  os << LParen() << std::to_string(IEEE754) << comma() << floatBits << comma()
+     << std::to_string(doubleValue) << RParen() << semicolonEndL();
 }
 
 /// Calling getName() on a calyx operation will return "calyx.${opname}". This
@@ -1364,16 +1017,6 @@ void Emitter::emitLibraryPrimTypedByFirstOutputPort(
            << space() << equals() << space()
            << (calyxLibName ? *calyxLibName : removeCalyxPrefix(opName))
            << LParen() << bitWidth << RParen() << semicolonEndL();
-}
-
-void Emitter::emitConstMult(ConstMultLibOp op) {
-  unsigned bitWidth = op.getInputPorts()[0].getType().getIntOrFloatBitWidth();
-  int value = op.getValue();
-  StringRef opName = op->getName().getStringRef();
-  indent() << getAttributes(op, /*atFormat=*/true) << op.instanceName()
-           << space() << equals() << space() << removeCalyxPrefix(opName)
-           << LParen() << bitWidth << comma() << space() << value << RParen()
-           << semicolonEndL();
 }
 
 unsigned getFPBitWidth(CellInterface &cell) {
@@ -1558,7 +1201,7 @@ void circt::calyx::registerToCalyxTranslation() {
         return exportCalyx(module, os);
       },
       [](mlir::DialectRegistry &registry) {
-        registry.insert<calyx::CalyxDialect, comb::CombDialect, hw::HWDialect,
-                        sv::SVDialect>();
+        registry
+            .insert<calyx::CalyxDialect, comb::CombDialect, hw::HWDialect>();
       });
 }
