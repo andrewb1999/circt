@@ -14,7 +14,6 @@
 #include "circt/Scheduling/DependenceIterator.h"
 
 #include "mlir/IR/Operation.h"
-#include <cassert>
 
 using namespace circt;
 using namespace circt::scheduling;
@@ -39,12 +38,6 @@ LogicalResult Problem::insertDependence(Dependence dep) {
     auxDependences[dst].insert(src);
 
   // auto-register the endpoints
-  assert(src != nullptr);
-  assert(dst != nullptr);
-  // if (!operations.contains(src)) {
-  //   llvm::errs() << "src not in problem\n";
-  //   src->dump();
-  // }
   operations.insert(src);
   operations.insert(dst);
 
@@ -52,7 +45,7 @@ LogicalResult Problem::insertDependence(Dependence dep) {
 }
 
 Problem::OperatorType Problem::getOrInsertOperatorType(StringRef name) {
-  auto opr = OperatorType(StringAttr::get(containingOp->getContext(), name));
+  auto opr = OperatorType::get(containingOp->getContext(), name);
   operatorTypes.insert(opr);
   return opr;
 }
@@ -71,7 +64,7 @@ Problem::DependenceRange Problem::getDependences(Operation *op) {
 Problem::PropertyStringVector Problem::getProperties(Operation *op) {
   PropertyStringVector psv;
   if (auto linkedOpr = getLinkedOperatorType(op))
-    psv.emplace_back("linkedOpr", (*linkedOpr).getAttr().str());
+    psv.emplace_back("linkedOpr", (*linkedOpr).str());
   if (auto startTime = getStartTime(op))
     psv.emplace_back("startTime", std::to_string(*startTime));
   return psv;
@@ -95,7 +88,6 @@ Problem::PropertyStringVector Problem::getProperties(ResourceType rsrc) {
 }
 
 LogicalResult Problem::checkLinkedOperatorType(Operation *op) {
-  // op->dump();
   if (!getLinkedOperatorType(op))
     return op->emitError("Operation is not linked to an operator type ") << op;
   if (!hasOperatorType(*getLinkedOperatorType(op)))

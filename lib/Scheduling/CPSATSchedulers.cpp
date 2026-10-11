@@ -13,7 +13,6 @@
 
 #include "circt/Scheduling/Algorithms.h"
 
-#include "circt/Scheduling/Problems.h"
 #include "mlir/IR/Operation.h"
 
 #include "ortools/sat/cp_model.h"
@@ -29,6 +28,7 @@ using namespace operations_research;
 using namespace operations_research::sat;
 
 using llvm::dbgs;
+using llvm::format;
 
 /// Solve the shared operators problem by modeling it as a Resource
 /// Constrained Project Scheduling Problem (RCPSP), which in turn is formulated

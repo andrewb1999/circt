@@ -7,12 +7,9 @@ add_circt_library(CIRCTTransforms
   ConvertIndexToUInt.cpp
   MapArithToComb.cpp
   MaximizeSSA.cpp
-  InsertMergeBlocks.cpp
   IfOpHoisting.cpp
-  IndexSwitchToIf.cpp
   ArithStrengthReduction.cpp
   IndexRemoval.cpp
-  PrintOpCount.cpp
   MemoryBanking.cpp
   PrintOpCount.cpp
   SCFWhileLoopFlattening.cpp

@@ -80,11 +80,6 @@ inline void registerAllPasses() {
   moore::registerPasses();
   msft::registerPasses();
   om::registerPasses();
-  seq::registerPasses();
-  sv::registerPasses();
-  handshake::registerPasses();
-  kanagawa::registerPasses();
-  hw::registerPasses();
   loopschedule::registerPasses();
   pipeline::registerPasses();
   rtg::registerRTGPasses();
