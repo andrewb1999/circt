@@ -285,6 +285,75 @@ getChainingModuloProblem(scf::WhileOp whileOp,
   return problem;
 }
 
+/// The most accesses `loop` makes to each port group (by unique id) in one
+/// cycle of its own schedule: {group capacity, peak}. Single ports are left
+/// out; the resource model already covers them.
+static llvm::StringMap<std::pair<unsigned, unsigned>>
+peakPortGroupDemand(Operation *loop) {
+  std::map<std::tuple<std::string, Operation *, int64_t>, unsigned> perSlot;
+  llvm::StringMap<std::pair<unsigned, unsigned>> peak;
+  loop->walk([&](Operation *op) {
+    std::string id;
+    std::optional<unsigned> limit;
+    if (auto load = dyn_cast<LoadInterface>(op)) {
+      id = load.getUniqueId();
+      limit = load.getLimit();
+    } else if (auto store = dyn_cast<StoreInterface>(op)) {
+      id = store.getUniqueId();
+      limit = store.getLimit();
+    } else {
+      return;
+    }
+    auto at = op->getParentOfType<LoopScheduleAtOp>();
+    if (!limit || *limit < 2 || !at)
+      return;
+    // Accesses issue together when they share a frame cycle, or a modulo
+    // slot of a pipeline.
+    Operation *scope = at->getParentOp();
+    int64_t slot = at.getOffset();
+    if (auto pipeline = dyn_cast<LoopSchedulePipelineOp>(scope))
+      slot %= pipeline.getII();
+    unsigned n = ++perSlot[{id, scope, slot}];
+    auto &[capacity, most] = peak[id];
+    capacity = *limit;
+    most = std::max(most, n);
+  });
+  return peak;
+}
+
+/// Order sibling loops that need more of a port group between them than it
+/// has. A loop is one operation of its parent's problem and uses each port
+/// resource it touches once, in the cycle it starts, so two loops that use
+/// a group of N ports may start together and then run concurrently, each on
+/// as many of the ports as its own schedule accesses in one cycle. When that
+/// adds up to more than N, the later loop waits for the earlier one.
+static void orderLoopsByPortGroupDemand(Problem &problem, Region &body) {
+  SmallVector<
+      std::pair<Operation *, llvm::StringMap<std::pair<unsigned, unsigned>>>>
+      loops;
+  body.walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (!isa<LoopInterface>(op))
+      return WalkResult::advance();
+    if (problem.hasOperation(op))
+      loops.push_back({op, peakPortGroupDemand(op)});
+    return WalkResult::skip();
+  });
+  for (unsigned later = 1; later < loops.size(); ++later)
+    for (unsigned earlier = 0; earlier < later; ++earlier)
+      for (const auto &entry : loops[later].second) {
+        auto [capacity, peak] = entry.getValue();
+        auto it = loops[earlier].second.find(entry.getKey());
+        if (it == loops[earlier].second.end() ||
+            it->getValue().second + peak <= capacity)
+          continue;
+        auto inserted = problem.insertDependence(
+            Problem::Dependence(loops[earlier].first, loops[later].first));
+        assert(succeeded(inserted));
+        (void)inserted;
+        break;
+      }
+}
+
 SharedOperatorsProblem
 getSharedOperatorsProblem(scf::WhileOp whileOp,
                           LoopScheduleDependenceAnalysis &dependenceAnalysis) {
@@ -354,6 +423,8 @@ getSharedOperatorsProblem(scf::WhileOp whileOp,
     (void)depInserted;
   });
 
+  orderLoopsByPortGroupDemand(problem, whileOp.getAfter());
+
   return problem;
 }
 
@@ -416,9 +487,18 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
         !problem.hasOperation(op))
       return;
 
+    // The terminator reads an iter arg only to forward it as another's next
+    // value; every iter arg register updates on the same edge, so that is no
+    // hazard (and ordering the terminator before a producer is a cycle).
+    if (op == anchor)
+      return;
     for (OpOperand &operand : anchor->getOpOperands()) {
       Value v = operand.get();
       Operation *argProducer = v.getDefiningOp();
+      // An iter arg's next value with no producer in the body (an iter arg
+      // or a value from outside the loop) is ready from the start.
+      if (!argProducer || !problem.hasOperation(argProducer))
+        continue;
       if (op != argProducer) {
         Value arg = whileOp.getAfterArguments()[operand.getOperandNumber()];
         if (auto loop = dyn_cast<LoopInterface>(op)) {
@@ -455,6 +535,8 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
     assert(succeeded(depInserted));
     (void)depInserted;
   });
+
+  orderLoopsByPortGroupDemand(problem, whileOp.getAfter());
 
   return problem;
 }
@@ -523,6 +605,8 @@ getSharedOperatorsProblem(func::FuncOp funcOp,
     assert(succeeded(depInserted));
     (void)depInserted;
   });
+
+  orderLoopsByPortGroupDemand(problem, funcOp.getBody());
 
   return problem;
 }
@@ -645,6 +729,8 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
     (void)depInserted;
   });
 
+  orderLoopsByPortGroupDemand(problem, funcOp.getBody());
+
   return problem;
 }
 
@@ -691,7 +777,8 @@ LogicalResult recordMemoryResources(Operation *op, Region &body,
     if (auto yield = dyn_cast<scf::YieldOp>(op)) {
       if (!ifOps.empty()) {
         auto &ifOpTypes = ifOps.back();
-        if (ifOpTypes->inThen) {
+        // An if without an else is done at its then-yield.
+        if (ifOpTypes->inThen && !ifOpTypes->ifOp.getElseRegion().empty()) {
           ifOpTypes->inThen = false;
         } else {
           std::unique_ptr<IfOpTypes> ifOpTypes = std::move(ifOps.back());
@@ -967,14 +1054,18 @@ void addPredicateDependencies(Operation *op, Region &body,
   for (auto it : predicateMap) {
     auto *op = it.first;
     auto pred = it.second;
+    // The map is shared by every region the pass schedules: an op of an
+    // inner loop scheduled earlier is not this problem's.
+    if (!problem.hasOperation(op))
+      continue;
     predicateUse[pred].push_back(op);
     auto *definingOp = pred.getDefiningOp();
     // A predicate that is a block argument (an `if` on a bool function
-    // argument) has no producer to order after: it is stable from cycle 0.
-    if (!definingOp)
+    // argument) or is computed outside the region (a condition hoisted out
+    // of the loop) has no producer to order after: it is stable from cycle 0.
+    if (!definingOp || !body.isAncestor(definingOp->getParentRegion()))
       continue;
     assert(problem.hasOperation(definingOp));
-    assert(problem.hasOperation(op));
     Problem::Dependence dep(definingOp, op);
     auto depInserted = problem.insertDependence(dep);
     assert(succeeded(depInserted));

@@ -284,9 +284,14 @@ HwMatchOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
 //   `(` ( role `%name` `:` type (`,` ...)* )? `)`
 //   attr-dict-with-keyword $body
 //
-// Valid roles: `clk`, `reset`, `ce`, `in`. They're stored in `argRoles`
-// as a StrArrayAttr in block-arg order, and labelled block args are
-// printed in the same order.
+// Valid roles: `clk`, `reset`, `ce`, `in`, `attr`. They're stored in
+// `argRoles` as a StrArrayAttr in block-arg order, and labelled block args
+// are printed in the same order.
+static bool isHwMatchArgRole(StringRef role) {
+  return role == "clk" || role == "reset" || role == "ce" || role == "in" ||
+         role == "attr";
+}
+
 ParseResult HwMatchOp::parse(OpAsmParser &parser, OperationState &result) {
   FlatSymbolRefAttr targetAttr;
   TypeAttr targetTypeAttr;
@@ -303,9 +308,9 @@ ParseResult HwMatchOp::parse(OpAsmParser &parser, OperationState &result) {
     StringRef role;
     if (parser.parseKeyword(&role))
       return failure();
-    if (role != "clk" && role != "reset" && role != "ce" && role != "in")
+    if (!isHwMatchArgRole(role))
       return parser.emitError(parser.getCurrentLocation())
-             << "expected role keyword 'clk', 'reset', 'ce', or 'in'";
+             << "expected role keyword 'clk', 'reset', 'ce', 'in', or 'attr'";
     roles.push_back(
         StringAttr::get(parser.getContext(), role));
     OpAsmParser::Argument arg;
@@ -363,16 +368,17 @@ LogicalResult HwMatchOp::verify() {
     if (!s)
       return emitOpError("argRoles entries must be strings");
     auto v = s.getValue();
-    if (v != "clk" && v != "reset" && v != "ce" && v != "in")
+    if (!isHwMatchArgRole(v))
       return emitOpError("argRoles entry '")
-             << v << "' must be 'clk', 'reset', 'ce', or 'in'";
+             << v << "' must be 'clk', 'reset', 'ce', 'in', or 'attr'";
   }
 
   // The `in`-role block args, in declaration order, must match the target
   // function's input types one-for-one (bitwidth comparison, consistent
   // with how hw_return outputs are checked against target results).
   // Clock / reset / enable args are ignored — they carry HW-level
-  // plumbing that sits outside the logical operator signature.
+  // plumbing that sits outside the logical operator signature — and so
+  // are `attr` args, constants taken from one of the op's attributes.
   auto targetType = getTargetType();
   SmallVector<Type, 4> inArgTypes;
   for (auto [roleAttr, arg] :
@@ -472,10 +478,12 @@ HwInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   if (!referenced)
     return emitOpError("references unknown extern module '")
            << getModuleName() << "'";
-  auto externOp = dyn_cast<hw::HWModuleExternOp>(referenced);
+  // Usually an extern; a module once the operator's implementation has been
+  // built (e.g. a wrapper around a vendor IP core).
+  auto externOp = dyn_cast<hw::HWModuleLike>(referenced);
   if (!externOp)
     return emitOpError("referenced symbol '")
-           << getModuleName() << "' is not an hw.module.extern";
+           << getModuleName() << "' is not an hw.module or hw.module.extern";
 
   // Shape-check operands and results against the referenced extern:
   // counts, per-port types, AND per-port names must all match exactly.

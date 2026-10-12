@@ -165,3 +165,86 @@ loopschedule.func_sequential @cross_at_addr_far(%mem: memref<32xi64>, %n: i64) {
   }
   loopschedule.return
 }
+
+// -----
+
+// A wait frame's RESULTS are read after the launched child has run, so an
+// at-result the frame yields needs the hold as much as one the child reads:
+// the child walks the same port during WAIT_0 and leaves rd_data holding its
+// own last load. This is trisolv's shape: `L[i][i]`, loaded ahead of the
+// `j` loop over row i of L and read after it, came back as `L[i][i-1]`.
+// CHECK-LABEL: hw.module @frame_result_hold(
+// CHECK:         %[[HOLD:.+]] = seq.compreg.ce sym @loop0_f0_at0_r2_latched
+// CHECK:         arith.addi %{{.+}}, %[[HOLD]] : i32
+// CHECK:         fsm.machine @frame_result_hold_fsm
+loopschedule.func_sequential @frame_result_hold(%L: memref<16xi32>, %x: memref<16xi32>) {
+  %c0_i4 = arith.constant 0 : i4
+  %c1_i4 = arith.constant 1 : i4
+  %c2_i4 = arith.constant 2 : i4
+  %c4_i4 = arith.constant 4 : i4
+  %c0_i32 = arith.constant 0 : i32
+  %h = loopschedule.frame -> (!loopschedule.handle) {
+    %outer = loopschedule.at 0 -> !loopschedule.handle {
+      %launch = loopschedule.launch : !loopschedule.handle {
+        %seq = loopschedule.sequential trip_count = 4 iter_args(%i = %c0_i4) : (i4) -> i4 {
+          %f:4 = loopschedule.frame -> (i1, i4, i32, !loopschedule.handle) {
+            %s0:3 = loopschedule.at 0 -> (i1, i4, i32) {
+              %cond = arith.cmpi slt, %i, %c4_i4 : i4
+              %row = arith.shli %i, %c2_i4 : i4
+              %didx = arith.addi %row, %i : i4
+              %diag = loopschedule.load %L[%didx : i4] : memref<16xi32>
+              loopschedule.yield %cond, %row, %diag : i1, i4, i32
+            }
+            %s1 = loopschedule.at 1 -> !loopschedule.handle {
+              %inner = loopschedule.launch : !loopschedule.handle {
+                %sq:2 = loopschedule.sequential iter_args(%j = %c0_i4, %acc = %c0_i32) : (i4, i32) -> (i4, i32) {
+                  %g:3 = loopschedule.frame -> (i1, i4, i32) {
+                    %p0:3 = loopschedule.at 0 -> (i1, i4, i32) {
+                      %c = arith.cmpi slt, %j, %i : i4
+                      %jnext = arith.addi %j, %c1_i4 : i4
+                      %eidx = arith.addi %s0#1, %j : i4
+                      %e = loopschedule.load %L[%eidx : i4] : memref<16xi32>
+                      loopschedule.iter_arg_update %j = %jnext : i4
+                      loopschedule.yield %c, %jnext, %e : i1, i4, i32
+                    }
+                    %p1 = loopschedule.at 1 -> i32 {
+                      %sum = arith.addi %acc, %p0#2 : i32
+                      loopschedule.iter_arg_update %acc = %sum : i32
+                      loopschedule.yield %sum : i32
+                    }
+                    loopschedule.yield %p0#0, %p0#1, %p1 : i1, i4, i32
+                  }
+                  loopschedule.terminator condition(%g#0), results(%g#1, %g#2) : i4, i32
+                }
+                loopschedule.yield %sq#0, %sq#1 : i4, i32
+              }
+              loopschedule.yield %inner : !loopschedule.handle
+            }
+            loopschedule.yield %s0#0, %s0#1, %s0#2, %s1 : i1, i4, i32, !loopschedule.handle
+          }
+          %post = loopschedule.frame -> (i4) {
+            %r = loopschedule.await %f#3 -> i32
+            loopschedule.yield %r : i32
+          } do (%acc: i32) {
+            %n = loopschedule.at 0 -> i4 {
+              %inext = arith.addi %i, %c1_i4 : i4
+              %v = arith.addi %acc, %f#2 : i32
+              loopschedule.store %v, %x[%i : i4] : memref<16xi32>
+              loopschedule.iter_arg_update %i = %inext : i4
+              loopschedule.yield %inext : i4
+            }
+            loopschedule.yield %n : i4
+          }
+          loopschedule.terminator condition(%f#0), results(%post) : i4
+        }
+        loopschedule.yield %seq : i4
+      }
+      loopschedule.yield %launch : !loopschedule.handle
+    }
+    loopschedule.yield %outer : !loopschedule.handle
+  }
+  loopschedule.frame await {
+    loopschedule.await %h
+  }
+  loopschedule.return
+}

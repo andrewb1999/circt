@@ -223,8 +223,10 @@ def HwMatchOp : OpLibOp<"hw_match",
     result order.
 
     Each body block argument carries a role from `argRoles`: `"clk"`,
-    `"reset"`, `"ce"`, or `"in"`. The custom printer uses these to label
-    each argument (e.g. `clk %arg0: i1, in %arg3: i32`).
+    `"reset"`, `"ce"`, `"in"`, or `"attr"` (a constant the lowering takes
+    from one of the op's attributes, e.g. a compare predicate). The custom
+    printer uses these to label each argument (e.g. `clk %arg0: i1, in
+    %arg3: i32`).
   }];
 
   let arguments = (ins FlatSymbolRefAttr:$target,
@@ -277,7 +279,8 @@ def HwInstanceOp : OpLibOp<"hw_instance",
 
     The symbol verifier resolves the extern from the enclosing `ModuleOp`,
     so the op can live inside `oplib.operator`'s `SymbolTable` even though
-    a real `hw.instance` cannot.
+    a real `hw.instance` cannot. The symbol may also name an `hw.module`:
+    the extern once a later pass has built the operator's implementation.
   }];
 
   let arguments = (ins StrAttr:$instanceName,

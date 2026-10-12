@@ -858,15 +858,20 @@ static void applySecondaryScheduleObjectives(
 /// guarantees that sibling launches at different start times land in separate
 /// frames so the second frame can await the first's handle (the only correct
 /// ordering for two launches with a memref dependency but no SSA dep).
-static SmallVector<SmallVector<unsigned>>
-partitionPhasesByLaunch(ArrayRef<unsigned> startTimes,
-                        const DenseMap<unsigned, SmallVector<Operation *>>
-                            &startGroups,
-                        llvm::function_ref<bool(Operation *)> isLaunchLike) {
+///
+/// With `launchOpensPhase`, a launch's bucket also starts a phase of its own.
+/// The function-level FSM lowering runs a frame that launches a child as one
+/// state, starting the child in it, so the frame's earlier cycles would run
+/// alongside the child and anything the child reads from them would not be
+/// ready yet.
+static SmallVector<SmallVector<unsigned>> partitionPhasesByLaunch(
+    ArrayRef<unsigned> startTimes,
+    const DenseMap<unsigned, SmallVector<Operation *>> &startGroups,
+    llvm::function_ref<bool(Operation *)> isLaunchLike,
+    bool launchOpensPhase = false) {
   SmallVector<SmallVector<unsigned>> phases;
   SmallVector<unsigned> currentPhase;
   for (auto t : startTimes) {
-    currentPhase.push_back(t);
     bool hasLaunch = false;
     auto it = startGroups.find(t);
     if (it != startGroups.end())
@@ -875,6 +880,11 @@ partitionPhasesByLaunch(ArrayRef<unsigned> startTimes,
           hasLaunch = true;
           break;
         }
+    if (hasLaunch && launchOpensPhase && !currentPhase.empty()) {
+      phases.push_back(currentPhase);
+      currentPhase.clear();
+    }
+    currentPhase.push_back(t);
     if (hasLaunch) {
       phases.push_back(currentPhase);
       currentPhase.clear();
@@ -1503,9 +1513,9 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
 
     return TypeSwitch<Operation *, WalkResult>(op)
         .Case<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
-              arith::TruncIOp, IndexCastOp, memref::AllocaOp, memref::AllocOp,
-              loopschedule::AllocInterface, YieldOp, func::ReturnOp,
-              comb::ExtractOp>([&](Operation *freeOp) {
+              arith::TruncIOp, arith::BitcastOp, IndexCastOp, memref::AllocaOp,
+              memref::AllocOp, loopschedule::AllocInterface, YieldOp,
+              func::ReturnOp, comb::ExtractOp>([&](Operation *freeOp) {
           // Some known free ops.
           problem.setLinkedOperatorType(freeOp, freeOpr);
           return WalkResult::advance();
@@ -2787,6 +2797,36 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
     }
   }
 
+  // The terminator samples iter args' next values as the iteration ends, in
+  // its last cycle. A load or multi-cycle operator in the last bucket is
+  // ready only after it, so its ready cycle gets a bucket that re-yields the
+  // result for the terminator to take.
+  DenseMap<uint32_t, SmallVector<Value>> lateTerminatorValues;
+  if (S.iterArgs) {
+    const unsigned lastBucketTime = endTime;
+    for (auto *op : problem.getOperations()) {
+      if (S.shouldSkipForGrouping(op) || S.isTerminator(op) ||
+          isLaunchLikeOp(op) || op->getNumResults() != 1)
+        continue;
+      std::optional<unsigned> latency;
+      if (isa<LoopScheduleLoadOp>(op))
+        latency = 1;
+      else if (auto load = dyn_cast<LoadInterface>(op))
+        latency = load.getLatency();
+      else if (auto opr = problem.getLinkedOperatorType(op))
+        latency = problem.getLatency(*opr);
+      if (!latency || !*latency ||
+          !llvm::any_of(op->getUsers(),
+                        [&](Operation *user) { return S.isTerminator(user); }))
+        continue;
+      unsigned resTime = *problem.getStartTime(op) + *latency;
+      if (resTime <= lastBucketTime)
+        continue;
+      startGroups.try_emplace(resTime);
+      lateTerminatorValues[resTime].push_back(op->getResult(0));
+    }
+  }
+
   // Sequential-only: if the induction-var iter-arg has users and the last
   // bucket contains a launch, append a trailing empty bucket so iter-arg
   // forwards have a landing site.
@@ -2811,7 +2851,8 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
     return isLaunchLikeOp(op) ||
            (S.dynAccessesAsLaunches && isDynamicLatencyOp(*op));
   };
-  auto phases = partitionPhasesByLaunch(startTimes, startGroups, isLaunchLike);
+  auto phases = partitionPhasesByLaunch(startTimes, startGroups, isLaunchLike,
+                                        isa<func::FuncOp>(S.root));
 
   DenseMap<uint32_t, size_t> bucketTimeToPhase;
   for (auto phaseIdx : llvm::seq<size_t>(0, phases.size()))
@@ -2840,7 +2881,8 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
   };
 
   DominanceInfo dom(getOperation());
-  DenseMap<uint32_t, SmallVector<Value>> reregisterValues;
+  DenseMap<uint32_t, SmallVector<Value>> reregisterValues =
+      std::move(lateTerminatorValues);
 
   Value scheduleCondResult;
   Operation *condOp = S.condValue ? S.condValue.getDefiningOp() : nullptr;
@@ -3455,10 +3497,18 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
         return WalkResult::advance();
       });
       if (!alreadyEmitted) {
+        // The next value is not computed in the body: it is the iter arg
+        // itself, another iter arg (`x2 = x1`), or a value from outside
+        // the loop, all of which every at can read.
+        Value next = termIterArgs[i];
+        Operation *loopOp = S.scheduleBlock->getParentOp();
+        if (!next ||
+            (next.getDefiningOp() && loopOp->isAncestor(next.getDefiningOp())))
+          next = iterArg;
         OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPoint(hostAt.getYieldOp());
         builder.create<LoopScheduleIterArgUpdateOp>(hostAt.getLoc(), iterArg,
-                                                    iterArg);
+                                                    next);
       }
     }
   }

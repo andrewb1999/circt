@@ -628,19 +628,30 @@ computeOpCycleLatency(Operation *def,
 }
 
 /// Value-sensitive variant of `computeOpCycleLatency`: looks through
-/// `loopschedule.if` wrappers to the op that actually produces the value.
-/// Predication gates side effects but adds no cycles, so an if-wrapped
-/// multi-cycle operator's result is live exactly when the bare operator's
-/// would be. Without the look-through, an if-wrapped latency-L result
+/// `loopschedule.if` wrappers and `arith.bitcast`s to the op that actually
+/// produces the value. Predication gates side effects but adds no cycles,
+/// and a bitcast is an identity here (see emitComputeOp), so an if-wrapped
+/// or bitcast multi-cycle operator's result is live exactly when the bare
+/// operator's would be. Without the look-through, such a latency-L result
 /// reports 0 and picks up a spurious stage register on top of the
 /// operator's internal pipeline, skewing every downstream consumer by one
 /// cycle (first seen when loop flattening began predicating compute
-/// epilogues, e.g. gesummv's `y[i] = alpha*accA + beta*accB`).
+/// epilogues, e.g. gesummv's `y[i] = alpha*accA + beta*accB`; a
+/// floating-point operator's result always comes out of a bitcast, see
+/// AMC's LegalizeFloatTypes).
 static unsigned
 computeValueCycleLatency(Value v,
                          analysis::OperatorLibraryAnalysis *operatorLibrary) {
   Operation *def = v.getDefiningOp();
-  while (auto ifOp = dyn_cast_or_null<LoopScheduleIfOp>(def)) {
+  while (def) {
+    if (auto bitcast = dyn_cast<arith::BitcastOp>(def)) {
+      v = bitcast.getIn();
+      def = v.getDefiningOp();
+      continue;
+    }
+    auto ifOp = dyn_cast<LoopScheduleIfOp>(def);
+    if (!ifOp)
+      break;
     auto yieldOp =
         dyn_cast<LoopScheduleYieldOp>(ifOp.getBody().front().getTerminator());
     if (!yieldOp)
@@ -769,6 +780,9 @@ struct SharedOperatorInstance {
   /// Instance input index for the extern port carrying `oplib.operand j`
   /// (index j into this vector), -1 when the operator has no such port.
   SmallVector<int> operandPortForIdx;
+  /// Instance input index of each `oplib.attr` port, with the name of the
+  /// attribute whose value drives it; muxed between users like operands.
+  SmallVector<std::pair<StringAttr, int>> attrPorts;
   /// Instance input index of the `oplib.enable` port, -1 if none.
   int ceInputIdx = -1;
   /// Current CE drive (ANDed as users join).
@@ -1266,6 +1280,9 @@ private:
   /// sym_names emitted by the operator-library dispatch helpers. Reset per
   /// `hw.module` we generate.
   llvm::StringMap<unsigned> instanceUniquer;
+
+  /// Names the capture registers of lowerFrameBody.
+  unsigned frameHoldCounter = 0;
 
   /// Extern operator instances shared by binding id within the hw.module
   /// currently being generated (reset alongside `instanceUniquer`). Ops
@@ -1904,6 +1921,24 @@ emitCombOpFromOperator(Operation *origOp, OpBuilder &builder,
   return success();
 }
 
+/// The constant an `oplib.attr = "<name>"` extern port is driven with for
+/// `origOp`: the integer value of `origOp`'s attribute `<name>` (an integer
+/// or integer-backed enum attribute, e.g. a cmpf predicate), at the port's
+/// width.
+static FailureOr<Value> attrPortConstant(Operation *origOp, OpBuilder &builder,
+                                         StringAttr attrName, Type portType,
+                                         StringRef opName) {
+  auto value = dyn_cast_or_null<IntegerAttr>(origOp->getAttr(attrName));
+  if (!value)
+    return origOp->emitOpError("operator '")
+           << opName << "' drives a port from attribute '"
+           << attrName.getValue()
+           << "', which the op does not carry as an integer";
+  return Value(hw::ConstantOp::create(
+      builder, origOp->getLoc(),
+      APInt(portType.getIntOrFloatBitWidth(), value.getInt())));
+}
+
 /// Materialize an `hw.instance` of the operator's extern for `origOp` by
 /// cloning the `oplib.hw_instance` op inside `templateInst` and
 /// substituting its operands. Clock / reset are wired from the enclosing
@@ -1911,7 +1946,9 @@ emitCombOpFromOperator(Operation *origOp, OpBuilder &builder,
 /// tied to a constant `1 : i1`. Per-operand / per-result routing uses
 /// the extern's `oplib.clock` / `oplib.reset` / `oplib.enable` /
 /// `oplib.operand = N` / `oplib.result = N` per-port attrs stamped by
-/// `OperatorLibraryLoader::makePortAttrDict`.
+/// `OperatorLibraryLoader::makePortAttrDict`. A port tagged
+/// `oplib.attr = "<name>"` is a constant from the op's attribute `<name>`
+/// (attrPortConstant), e.g. the predicate a compare core's wrapper decodes.
 static LogicalResult
 emitHwInstanceFromOperator(
     Operation *origOp, OpBuilder &builder, IRMapping &mapping,
@@ -1980,6 +2017,18 @@ emitHwInstanceFromOperator(
                                           shareGate, mine, cur);
         shared.instOp->setOperand(idx, muxed);
       }
+      for (auto [attrName, idx] : shared.attrPorts) {
+        Value cur = shared.instOp->getOperand(idx);
+        auto mine =
+            attrPortConstant(origOp, builder, attrName, cur.getType(), opName);
+        if (failed(mine))
+          return failure();
+        if (*mine == cur)
+          continue;
+        shared.instOp->setOperand(idx,
+                                  comb::MuxOp::create(builder, origOp->getLoc(),
+                                                      shareGate, *mine, cur));
+      }
       if (shared.ceInputIdx >= 0) {
         Value oneI1Local = hw::ConstantOp::create(
             builder, origOp->getLoc(), builder.getI1Type(), (int64_t)1);
@@ -2040,6 +2089,15 @@ emitHwInstanceFromOperator(
         if (sharedEntry.operandPortForIdx.size() <= j)
           sharedEntry.operandPortForIdx.resize(j + 1, -1);
         sharedEntry.operandPortForIdx[j] = (int)instanceOperands.size();
+      } else if (auto attrName = dyn_cast_or_null<StringAttr>(
+                     portAttrs.get("oplib.attr"))) {
+        auto constant =
+            attrPortConstant(origOp, builder, attrName, port.type, opName);
+        if (failed(constant))
+          return failure();
+        driver = *constant;
+        sharedEntry.attrPorts.emplace_back(attrName,
+                                           (int)instanceOperands.size());
       }
     }
     if (!driver)
@@ -2218,17 +2276,105 @@ LogicalResult LoopScheduleToFSMPass::emitComputeOp(
                                     shareGate, &sharedOperators);
 }
 
+/// The op `v` comes from, looking through the `arith.bitcast`s and
+/// `loopschedule.if` wrappers that add no cycles (as computeValueCycleLatency
+/// does).
+static Operation *valueProducer(Value v) {
+  Operation *def = v.getDefiningOp();
+  while (def) {
+    if (auto bitcast = dyn_cast<arith::BitcastOp>(def)) {
+      v = bitcast.getIn();
+    } else if (auto ifOp = dyn_cast<LoopScheduleIfOp>(def)) {
+      auto yieldOp =
+          dyn_cast<LoopScheduleYieldOp>(ifOp.getBody().front().getTerminator());
+      unsigned idx = cast<OpResult>(v).getResultNumber();
+      if (!yieldOp || idx >= yieldOp.getNumOperands())
+        return def;
+      v = yieldOp.getOperand(idx);
+    } else {
+      return def;
+    }
+    def = v.getDefiningOp();
+  }
+  return def;
+}
+
 LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
     Block *frameBody, OpBuilder &builder, IRMapping &mapping,
     ArrayRef<Value> cycleGates,
     DenseMap<Value, MemPortMapping> &memPorts, ModuleOp moduleOp,
     Value clk, Value rst, SeqDynCtx *seqDyn, SeqPortMuxCtx *seqMux,
     Value opCE) {
+  // A frame holds no registers between its cycles: an op's operands stay
+  // put for the whole frame, so a combinational result reads the same in
+  // every later cycle. A result from an operator instance does not: a
+  // pipelined unit keeps computing on whatever its inputs show, and an
+  // instance shared by binding switches its operands to another user once
+  // this one has issued. Such a result -- and anything computed from it in
+  // the cycle it is read directly -- is captured in the cycle it is ready
+  // (issue + latency for the instance's own result) and read from that
+  // register by every consumer in a later cycle, including the frame's own
+  // results when it is ready before the frame's last cycle; a consumer in
+  // the ready cycle itself reads it directly (the schedule chained it
+  // there). Unread captures fold away.
+  struct Held {
+    Value result;
+    unsigned ready;
+    Value direct, captured;
+  };
+  SmallVector<Held> held;
+  auto readFrom = [&](unsigned cycle) {
+    for (auto &h : held)
+      mapping.map(h.result, cycle > h.ready ? h.captured : h.direct);
+  };
+  auto isMemoryAccess = [](Operation *op) {
+    return isa<LoopScheduleLoadOp, LoopScheduleStoreOp, LoadInterface,
+               StoreInterface>(op);
+  };
+  // Whether `v`, yielded by `atOp` in cycle `cycle`, is computed in that
+  // cycle from an operator instance's output, or from an earlier result
+  // read directly in that cycle.
+  auto readsUnheld = [&](Value v, LoopScheduleAtOp atOp, unsigned cycle) {
+    SmallVector<Value> worklist = {v};
+    DenseSet<Value> seen;
+    while (!worklist.empty()) {
+      Value x = worklist.pop_back_val();
+      if (!seen.insert(x).second)
+        continue;
+      if (llvm::any_of(held, [&](const Held &h) {
+            return h.result == x && h.ready == cycle;
+          }))
+        return true;
+      Operation *def = x.getDefiningOp();
+      if (!def || def->getParentOfType<LoopScheduleAtOp>() != atOp ||
+          isMemoryAccess(def))
+        continue;
+      if (def->hasAttr("loopschedule.binding") ||
+          computeOpCycleLatency(def, operatorLibrary) > 0)
+        return true;
+      worklist.append(def->operand_begin(), def->operand_end());
+    }
+    return false;
+  };
+  auto readyCycle = [&](Value v, LoopScheduleAtOp atOp,
+                        unsigned issue) -> std::optional<unsigned> {
+    unsigned ready = issue;
+    Operation *def = valueProducer(v);
+    if (def && !isMemoryAccess(def))
+      ready += computeValueCycleLatency(v, operatorLibrary);
+    if (ready == issue && !readsUnheld(v, atOp, issue))
+      return std::nullopt;
+    if (ready >= cycleGates.size())
+      return std::nullopt;
+    return ready;
+  };
+
   for (auto &op : *frameBody) {
     if (isa<LoopScheduleYieldOp>(&op))
       continue;
     if (auto atOp = dyn_cast<LoopScheduleAtOp>(&op)) {
       unsigned offset = (unsigned)atOp.getOffset();
+      readFrom(offset);
       if (failed(lowerAtBody(&atOp.getBodyBlock(), builder, mapping, cycleGates,
                              offset, memPorts, moduleOp, clk, rst, seqDyn,
                              seqMux, opCE)))
@@ -2236,8 +2382,21 @@ LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
       // Forward at results to the caller's mapping via the at's yield.
       auto yieldOp = atOp.getYieldOp();
       for (auto [res, val] :
-           llvm::zip(atOp.getResults(), yieldOp.getOperands()))
-        mapping.map(res, mapping.lookup(val));
+           llvm::zip(atOp.getResults(), yieldOp.getOperands())) {
+        Value direct = mapping.lookup(val);
+        mapping.map(res, direct);
+        std::optional<unsigned> ready = readyCycle(val, atOp, offset);
+        if (!ready || !isa<IntegerType>(direct.getType()))
+          continue;
+        Location loc = atOp.getLoc();
+        auto name = builder.getStringAttr("frame_hold_" +
+                                          std::to_string(frameHoldCounter++));
+        Value captured = seq::CompRegClockEnabledOp::create(
+            builder, loc, direct.getType(), direct, clk, cycleGates[*ready],
+            name, rst, createZeroConstant(builder, loc, direct.getType()),
+            /*initialValue=*/Value(), /*inner_sym=*/hw::InnerSymAttr());
+        held.push_back({res, *ready, direct, captured});
+      }
       continue;
     }
     // Frames should only contain `at` children and the terminator yield.
@@ -2245,6 +2404,10 @@ LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
         "LoopScheduleToFSM: unexpected op in frame body; expected only "
         "loopschedule.at and loopschedule.yield");
   }
+  // The frame's results and iter_arg updates are sampled as the frame ends,
+  // in its last cycle: a result ready in that cycle is read directly (its
+  // capture latches at the same edge), any earlier one from its capture.
+  readFrom(cycleGates.empty() ? 0 : cycleGates.size() - 1);
   return success();
 }
 
@@ -4259,13 +4422,39 @@ isFrameStableValue(Value v, Operation *frame,
     if (isa<loopschedule::LoopScheduleLaunchOp, loopschedule::LoadInterface,
             loopschedule::StoreInterface, loopschedule::LoopScheduleLoadOp,
             loopschedule::LoopScheduleStoreOp>(def) ||
-        !isMemoryEffectFree(def) ||
+        !isMemoryEffectFree(def) || def->hasAttr("loopschedule.binding") ||
         computeOpCycleLatency(def, operatorLibrary) != 0)
       return false;
     for (Value operand : def->getOperands())
       stack.push_back(operand);
   }
   return true;
+}
+
+/// The select of a launched child's drives of one memory port over its
+/// frame's: the child's while it is active, except in a cycle where only
+/// the frame accesses the port. The child is already active in the launch
+/// cycle, where the frame's own last-cycle accesses issue too (an embedded
+/// child checks its entry condition there). `childEns` / `frameEns` are the
+/// port's read and write enables (null where the port has none); without
+/// any, the child is selected whenever it is active.
+static Value childPortSelect(OpBuilder &b, Location loc, Value childActive,
+                             ArrayRef<Value> childEns,
+                             ArrayRef<Value> frameEns) {
+  auto anyOf = [&](ArrayRef<Value> ens) {
+    Value any;
+    for (Value en : ens)
+      if (en)
+        any = any ? comb::OrOp::create(b, loc, any, en).getResult() : en;
+    return any;
+  };
+  Value frameEn = anyOf(frameEns);
+  if (!frameEn)
+    return childActive;
+  Value childFirst = comb::createOrFoldNot(b, loc, frameEn);
+  if (Value childEn = anyOf(childEns))
+    childFirst = comb::OrOp::create(b, loc, childEn, childFirst);
+  return comb::AndOp::create(b, loc, childActive, childFirst);
 }
 
 /// Earliest cycle within `frameOp` at which `pipOp`'s child_start may pulse
@@ -5329,8 +5518,55 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
     // hold register buys is validity ACROSS the frame boundary — during
     // WAIT_i the launched child owns the port and rd_data moves — which is
     // why a launch-holder consumer still counts at any offset: the child
-    // runs after every cycle state of the frame.
+    // runs after every cycle state of the frame. A frame result counts for
+    // the same reason (see readAfterFrame).
+    //
+    // Is `atResult` a result of the frame that something reads? A wait
+    // frame's results get no capture registers of their own, and their
+    // consumers run after the child has had the ports.
+    auto readAfterFrame = [&](Value atResult) {
+      for (OpOperand &use : atResult.getUses())
+        if (use.getOwner() == frameBody.getTerminator() &&
+            !frame->getResult(use.getOperandNumber()).use_empty())
+          return !isFrameStableValue(atResult, frame, operatorLibrary);
+      return false;
+    };
+    // The latency of an at result an operator instance produces. Such a
+    // result holds only in its ready cycle: a pipelined unit keeps computing
+    // on whatever its inputs show next, and a shared one switches to its
+    // next user (who may be reading this very result: a combinational loop
+    // through the instance). So it is captured in that cycle and read from
+    // the register after it, as lowerFrameBody does.
+    auto instanceLatency = [&](Value atResult) -> std::optional<unsigned> {
+      auto at = cast<LoopScheduleAtOp>(atResult.getDefiningOp());
+      std::optional<unsigned> latency;
+      SmallVector<Value> stack{at.getYieldOp().getOperand(
+          cast<OpResult>(atResult).getResultNumber())};
+      DenseSet<Value> seen;
+      while (!stack.empty()) {
+        Value v = stack.pop_back_val();
+        Operation *def = v.getDefiningOp();
+        if (!seen.insert(v).second || !def || !at->isAncestor(def) ||
+            isa<LoadInterface, StoreInterface, LoopScheduleLoadOp,
+                LoopScheduleStoreOp>(def))
+          continue;
+        unsigned opLatency = computeOpCycleLatency(def, operatorLibrary);
+        if (def->hasAttr("loopschedule.operator") &&
+            (opLatency > 0 || def->hasAttr("loopschedule.binding"))) {
+          latency = std::max(latency.value_or(0), opLatency);
+          continue;
+        }
+        stack.append(def->operand_begin(), def->operand_end());
+      }
+      return latency;
+    };
     auto resultNeedsCapture = [&](Value atResult, unsigned myOffset) {
+      if (readAfterFrame(atResult))
+        return true;
+      // The last cycle a consumer may read the value combinationally.
+      unsigned lastLive = myOffset + 1;
+      if (std::optional<unsigned> latency = instanceLatency(atResult))
+        lastLive = myOffset + *latency;
       for (auto *user : atResult.getUsers()) {
         Operation *anc = frameBody.findAncestorOpInBlock(*user);
         if (!anc)
@@ -5338,7 +5574,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
         auto otherAt = dyn_cast<LoopScheduleAtOp>(anc);
         if (!otherAt)
           continue;
-        if ((unsigned)otherAt.getOffset() > myOffset + 1)
+        if ((unsigned)otherAt.getOffset() > lastLive)
           return true;
         for (auto &op : otherAt.getBodyBlock())
           if (isa<LoopScheduleLaunchOp>(&op) &&
@@ -5400,11 +5636,31 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
           hasCycleGates && atOffset < fsmFrameCycleGates[frameIdx].size()
               ? fsmFrameCycleGates[frameIdx][atOffset]
               : preGate;
-      for (auto &op : atBody) {
+      // Ops nested in a `loopschedule.if` issue under the AND of their
+      // conditions, as in lowerAtBody (`pred` carries the conjunction).
+      std::function<LogicalResult(Operation *, Value, Value)> processOp =
+          [&](Operation *op, Value gate, Value pred) -> LogicalResult {
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp,
-                LoopScheduleLaunchOp>(&op))
-          continue;
-        if (isSeqDynAccess(&op)) {
+                LoopScheduleLaunchOp>(op))
+          return success();
+        if (auto ifOp = dyn_cast<LoopScheduleIfOp>(op)) {
+          Value cond = localMapping.lookup(ifOp.getCond());
+          Value innerGate = comb::AndOp::create(hw, loc, gate, cond);
+          Value innerPred =
+              pred ? (Value)comb::AndOp::create(hw, loc, pred, cond) : cond;
+          for (auto &nested : ifOp.getBody().front()) {
+            if (auto yieldOp = dyn_cast<LoopScheduleYieldOp>(&nested)) {
+              for (auto [res, val] :
+                   llvm::zip(ifOp.getResults(), yieldOp.getOperands()))
+                localMapping.map(res, localMapping.lookup(val));
+              continue;
+            }
+            if (failed(processOp(&nested, innerGate, innerPred)))
+              return failure();
+          }
+          return success();
+        }
+        if (isSeqDynAccess(op)) {
           SeqDynCtx seqDyn{clk,
                            rst,
                            hwBody,
@@ -5416,33 +5672,32 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                            &seqDynCounter,
                            iterAdvanceEdge,
                            &framePrevReadSeen};
-          if (failed(lowerSeqDynAccess(&op, hw, localMapping, framePorts,
-                                       atGate, atOffset, &seqDyn)))
+          if (failed(lowerSeqDynAccess(op, hw, localMapping, framePorts, gate,
+                                       atOffset, &seqDyn, pred)))
             return failure();
-          for (Value r : op.getResults())
+          for (Value r : op->getResults())
             frameSeqDynResults.insert(r);
-          continue;
+          return success();
         }
-        if (auto loadOp =
-                dyn_cast<loopschedule::HWLoadLoweringInterface>(&op)) {
+        if (auto loadOp = dyn_cast<loopschedule::HWLoadLoweringInterface>(op)) {
           if (seqMuxPtr)
             seqMuxPtr->cycle = atOffset;
-          if (failed(handleHWLoad(loadOp, hw, localMapping, framePorts,
-                                     atGate, seqMuxPtr)))
-            return failure();
-          continue;
+          return handleHWLoad(loadOp, hw, localMapping, framePorts, gate,
+                              seqMuxPtr);
         }
         if (auto storeOp =
-                dyn_cast<loopschedule::HWStoreLoweringInterface>(&op)) {
+                dyn_cast<loopschedule::HWStoreLoweringInterface>(op)) {
           if (seqMuxPtr)
             seqMuxPtr->cycle = atOffset;
-          if (failed(handleHWStore(storeOp, hw, localMapping, atGate,
-                                      framePorts, seqMuxPtr)))
-            return failure();
-          continue;
+          return handleHWStore(storeOp, hw, localMapping, gate, framePorts,
+                               seqMuxPtr);
         }
-        hw.clone(op, localMapping);
-      }
+        return emitComputeOp(op, hw, localMapping, moduleOp, clk, rst,
+                             notStallSeq, gate);
+      };
+      for (auto &op : atBody)
+        if (failed(processOp(&op, atGate, Value())))
+          return failure();
       // Map this at-op's external results from its yield operands *now*,
       // so subsequent at-ops in the same frame (which are processed in
       // order) can use those results. Without this, a later at-op that
@@ -5468,22 +5723,43 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
       // gate exists), and a launched child then reads the held register in
       // WAIT instead of a comb cone over rd_data that has already moved.
       // The per-result `atOffset + residual` bound below rejects exactly
-      // the captures whose enable cycle does not exist.
-      if (hasCycleGates) {
+      // the captures whose enable cycle does not exist, except for a frame
+      // result (readAfterFrame), which is latched in the cycle after the
+      // frame instead. A single-cycle frame captures only those.
+      if (hasCycleGates || llvm::any_of(atOp.getResults(), readAfterFrame)) {
         hw.setInsertionPointToEnd(hwBody);
-        // One gate per distinct enable cycle, created lazily and shared by
-        // every capture that uses it (a per-result AndOp would duplicate
-        // the common r=1 gate and churn the emitted names for nothing).
-        Value captureGateByResidual[2] = {Value(), Value()};
-        auto getCaptureGate = [&](unsigned residual) -> Value {
-          if (!captureGateByResidual[residual])
-            captureGateByResidual[residual] = comb::AndOp::create(
-                hw, loc, fsmFrameCycleGates[frameIdx][atOffset + residual],
-                notStallSeq);
-          return captureGateByResidual[residual];
+        unsigned numCycles =
+            hasCycleGates ? fsmFrameCycleGates[frameIdx].size() : 1;
+        // One gate per distinct enable cycle (numCycles: the cycle after
+        // the frame), created lazily and shared by every capture that uses
+        // it (a per-result AndOp would duplicate the common gate and churn
+        // the emitted names for nothing).
+        DenseMap<unsigned, Value> captureGates;
+        auto getCaptureGate = [&](unsigned cycle) -> Value {
+          Value &gate = captureGates[cycle];
+          if (gate)
+            return gate;
+          auto cycleGate = [&](unsigned c) {
+            return c == atOffset ? atGate : fsmFrameCycleGates[frameIdx][c];
+          };
+          if (cycle < numCycles) {
+            gate = comb::AndOp::create(hw, loc, cycleGate(cycle), notStallSeq);
+          } else {
+            Value last = comb::AndOp::create(hw, loc, cycleGate(numCycles - 1),
+                                             notStallSeq);
+            Value falseConst =
+                hw::ConstantOp::create(hw, loc, hw.getI1Type(), 0);
+            gate = seq::CompRegClockEnabledOp::create(
+                hw, loc, last, clk, notStallSeq, rst, falseConst,
+                hw.getStringAttr(node.prefix + "_f" + std::to_string(frameIdx) +
+                                 "_at" + std::to_string(atOffset) +
+                                 "_capture_gate_delayed"));
+          }
+          return gate;
         };
         for (auto res : atOp.getResults()) {
-          if (!resultNeedsCapture(res, atOffset))
+          if (hasCycleGates ? !resultNeedsCapture(res, atOffset)
+                            : !readAfterFrame(res))
             continue;
           // A dynamic access already latched its data into a stable
           // completion-clocked register; re-capturing at the fixed
@@ -5501,21 +5777,34 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
           // value's cone only settles in during the NEXT cycle (a load's
           // rd_data — the historical timing), 0 for a pure-comb
           // load-indirection result that is already settled during the
-          // at's own cycle (see atResultResidualLatency). The same
-          // residual feeds minLegalLaunchStart, so a launch never samples
-          // a capture before its enable has fired.
-          unsigned residual = atResultResidualLatency(
-              atOp, res.getResultNumber(), operatorLibrary);
-          if (atOffset + residual >= fsmFrameCycleGates[frameIdx].size())
+          // at's own cycle (see atResultResidualLatency), and an
+          // operator's latency for its result. The same residual feeds
+          // minLegalLaunchStart, so a launch never samples a capture before
+          // its enable has fired.
+          std::optional<unsigned> latency = instanceLatency(res);
+          unsigned residual =
+              latency ? *latency
+                      : atResultResidualLatency(atOp, res.getResultNumber(),
+                                                operatorLibrary);
+          // Past the frame's last cycle, a frame result is latched in the
+          // cycle after it (WAIT_i's first, or the next frame's when the
+          // child is skipped), when the port still shows the frame's read.
+          // A consumer may run in that very cycle, so it bypasses the
+          // register while it loads.
+          unsigned enableCycle = atOffset + residual;
+          bool afterFrame = enableCycle >= numCycles;
+          if (afterFrame && (enableCycle > numCycles || !readAfterFrame(res)))
             continue;
+          Value enable = getCaptureGate(enableCycle);
           Value resetVal = createZeroConstant(hw, loc, mapped.getType());
           auto regName = hw.getStringAttr(
               node.prefix + "_f" + std::to_string(frameIdx) + "_at" +
               std::to_string(atOffset) + "_r" +
               std::to_string(res.getResultNumber()) + "_latched");
           Value latched = seq::CompRegClockEnabledOp::create(
-              hw, loc, mapped, clk, getCaptureGate(residual), rst, resetVal,
-              regName);
+              hw, loc, mapped, clk, enable, rst, resetVal, regName);
+          if (afterFrame)
+            latched = comb::MuxOp::create(hw, loc, enable, mapped, latched);
           // Readable the cycle after the enable.
           pendingCaptures.push_back({atOffset + residual + 1, res, latched});
         }
@@ -5720,6 +6009,12 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                   portRef(perFramePorts[frameIdx][memInfo.originalArg], port);
               if (portsR.addrs->size() != widths.size())
                 portsR.addrs->assign(widths.size(), Value());
+              Value sel = childPortSelect(
+                  hw, loc, slotChildActive,
+                  {memInfo.requiresRdEn ? *childR.rdEn : Value(),
+                   emitWrite ? *childR.wrEn : Value()},
+                  {memInfo.requiresRdEn ? *portsR.rdEn : Value(),
+                   emitWrite ? *portsR.wrEn : Value()});
               for (auto [d, w] : llvm::enumerate(widths)) {
                 Type addrType = IntegerType::get(ctx, w);
                 Value childAddr =
@@ -5730,8 +6025,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                                    ? (*portsR.addrs)[d]
                                    : hw::ConstantOp::create(hw, loc,
                                                             addrType, 0);
-                (*portsR.addrs)[d] = comb::MuxOp::create(
-                    hw, loc, slotChildActive, childAddr, myAddr);
+                (*portsR.addrs)[d] =
+                    comb::MuxOp::create(hw, loc, sel, childAddr, myAddr);
               }
               if (memInfo.requiresRdEn) {
                 Value childRdEn = *childR.rdEn
@@ -5740,8 +6035,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                 Value myRdEn = *portsR.rdEn
                                    ? *portsR.rdEn
                                    : hw::ConstantOp::create(hw, loc, i1, 0);
-                *portsR.rdEn = comb::MuxOp::create(hw, loc, slotChildActive,
-                                                   childRdEn, myRdEn);
+                *portsR.rdEn =
+                    comb::MuxOp::create(hw, loc, sel, childRdEn, myRdEn);
               }
               if (emitWrite) {
                 Value childWrData =
@@ -5758,10 +6053,10 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                 Value myWrEn = *portsR.wrEn
                                    ? *portsR.wrEn
                                    : hw::ConstantOp::create(hw, loc, i1, 0);
-                *portsR.wrData = comb::MuxOp::create(
-                    hw, loc, slotChildActive, childWrData, myWrData);
-                *portsR.wrEn = comb::MuxOp::create(hw, loc, slotChildActive,
-                                                   childWrEn, myWrEn);
+                *portsR.wrData =
+                    comb::MuxOp::create(hw, loc, sel, childWrData, myWrData);
+                *portsR.wrEn =
+                    comb::MuxOp::create(hw, loc, sel, childWrEn, myWrEn);
               }
             }
           }
@@ -5931,20 +6226,24 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                   portRef(perFramePorts[frameIdx][memInfo.originalArg], port);
               if (portsR.addrs->size() != widths.size())
                 portsR.addrs->assign(widths.size(), Value());
+              Value sel = childPortSelect(
+                  hw, loc, slotChildActive, {childRdEn, childWrEn},
+                  {memInfo.requiresRdEn ? *portsR.rdEn : Value(),
+                   emitWrite ? *portsR.wrEn : Value()});
               for (auto [d, w] : llvm::enumerate(widths)) {
                 Type addrType = IntegerType::get(ctx, w);
                 Value myAddr = (*portsR.addrs)[d]
                     ? (*portsR.addrs)[d]
                     : hw::ConstantOp::create(hw, loc, addrType, 0);
-                (*portsR.addrs)[d] = comb::MuxOp::create(
-                    hw, loc, slotChildActive, childAddrs[d], myAddr);
+                (*portsR.addrs)[d] =
+                    comb::MuxOp::create(hw, loc, sel, childAddrs[d], myAddr);
               }
               if (memInfo.requiresRdEn) {
                 Value myRdEn = *portsR.rdEn ? *portsR.rdEn
                                             : hw::ConstantOp::create(
                                                   hw, loc, i1, 0);
-                *portsR.rdEn = comb::MuxOp::create(
-                    hw, loc, slotChildActive, childRdEn, myRdEn);
+                *portsR.rdEn =
+                    comb::MuxOp::create(hw, loc, sel, childRdEn, myRdEn);
               }
               if (emitWrite) {
                 Value myWrData = *portsR.wrData
@@ -5953,10 +6252,10 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                 Value myWrEn = *portsR.wrEn ? *portsR.wrEn
                                             : hw::ConstantOp::create(
                                                   hw, loc, i1, 0);
-                *portsR.wrData = comb::MuxOp::create(
-                    hw, loc, slotChildActive, childWrData, myWrData);
-                *portsR.wrEn = comb::MuxOp::create(
-                    hw, loc, slotChildActive, childWrEn, myWrEn);
+                *portsR.wrData =
+                    comb::MuxOp::create(hw, loc, sel, childWrData, myWrData);
+                *portsR.wrEn =
+                    comb::MuxOp::create(hw, loc, sel, childWrEn, myWrEn);
               }
             }
           }
@@ -10254,14 +10553,20 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       // NEXT FSM state, so their results are captured one state later.
       DenseSet<Value> localLoadResults;
       DenseSet<Value> externalLoadResults;
-      topFrames[frameIdx]->walk([&](LoopScheduleLoadOp loadOp) {
-        bool isLocal = false;
-        for (auto &memInfo : memrefArgs)
-          if (memInfo.originalArg == loadOp.getMemRef() &&
-              memInfo.isLocalMem)
-            isLocal = true;
-        (isLocal ? localLoadResults : externalLoadResults)
-            .insert(loadOp.getResult());
+      topFrames[frameIdx]->walk([&](Operation *op) {
+        if (auto loadOp = dyn_cast<LoopScheduleLoadOp>(op)) {
+          bool isLocal = false;
+          for (auto &memInfo : memrefArgs)
+            if (memInfo.originalArg == loadOp.getMemRef() && memInfo.isLocalMem)
+              isLocal = true;
+          (isLocal ? localLoadResults : externalLoadResults)
+              .insert(loadOp.getResult());
+        } else if (isa<loopschedule::HWLoadLoweringInterface>(op) &&
+                   !isSeqDynAccess(op)) {
+          // A memory port (an AMC port) reads like an external BRAM port.
+          for (Value result : op->getResults())
+            externalLoadResults.insert(result);
+        }
       });
 
       // Forward each at's external results from its yield operands so the
@@ -10315,6 +10620,10 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         // results computed in later `at` offsets are latched, not the
         // cycle-0 values.
         Value captureGate = entryCycleGates[ei].back();
+        // A result that is ready only after the frame's last cycle is
+        // latched in the cycle it is ready, which the next frame may
+        // already read it in: it bypasses the register then.
+        bool afterFrame = false;
         if (externalLoadResults.count(yOperand)) {
           // External BRAM read: the data arrives the state after the
           // address was presented, so delay the capture gate one cycle.
@@ -10328,14 +10637,38 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
                                       "_capture_gate_delayed"));
           }
           captureGate = delayedEntryGate;
+          afterFrame = true;
+        } else if (auto at = yOperand.getDefiningOp<LoopScheduleAtOp>()) {
+          // An operator result: ready at its issue cycle plus latency.
+          Value inner = at.getYieldOp().getOperand(
+              cast<OpResult>(yOperand).getResultNumber());
+          Operation *producer = valueProducer(inner);
+          unsigned lastCycle = entryCycleGates[ei].size() - 1;
+          unsigned ready =
+              producer && at->isAncestor(producer)
+                  ? (unsigned)at.getOffset() +
+                        computeOpCycleLatency(producer, operatorLibrary)
+                  : 0;
+          for (unsigned c = lastCycle; c < ready; ++c) {
+            Value falseVal =
+                hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0);
+            captureGate = seq::CompRegOp::create(
+                builder, loc, captureGate, clk, rst, falseVal,
+                builder.getStringAttr(
+                    funcName + "_frame" + std::to_string(frameIdx) +
+                    "_result_" + std::to_string(frameResult.getResultNumber()) +
+                    "_ready_d" + std::to_string(c + 1 - lastCycle)));
+            afterFrame = true;
+          }
         }
         auto regName = builder.getStringAttr(
             funcName + "_frame" + std::to_string(frameIdx) + "_result_" +
             std::to_string(frameResult.getResultNumber()));
         Value resetVal = createZeroConstant(builder, loc, val.getType());
-        auto reg = seq::CompRegClockEnabledOp::create(
-            builder, loc, val, clk, captureGate, rst, resetVal,
-            regName);
+        Value reg = seq::CompRegClockEnabledOp::create(
+            builder, loc, val, clk, captureGate, rst, resetVal, regName);
+        if (afterFrame)
+          reg = comb::MuxOp::create(builder, loc, captureGate, val, reg);
         mapping.map(frameResult, reg);
       }
     }

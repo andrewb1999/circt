@@ -92,6 +92,16 @@ static Block *getCommonBlockInAffineScope(Operation *opA, Operation *opB) {
   return commonBlock;
 }
 
+/// Whether `a` executes before `b` in program order (within one iteration
+/// of the loops around both).
+static bool appearsBefore(Operation *a, Operation *b) {
+  for (Operation *x = a; x; x = x->getParentOp())
+    for (Operation *y = b; y; y = y->getParentOp())
+      if (x->getBlock() == y->getBlock())
+        return x != y && x->isBeforeInBlock(y);
+  return false;
+}
+
 namespace {
 struct MemoryDependence {
   MemoryDependence(StringRef source, unsigned int distance)
@@ -264,6 +274,16 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
   DependenceResult result = checkMemrefAccessDependence(
       src, dst, depth, &dependenceConstraints, &depComps, false);
 
+  // An analysis failure (an access under an `scf.if`, which affine analysis
+  // does not model) proves nothing: assume the dependence, at distance 1
+  // across iterations, or within one when the source comes first.
+  if (result.value == DependenceResult::Failure) {
+    if (isIntraIteration && !appearsBefore(source, destination))
+      return;
+    results[nameAnalysis.getOperationName(destination)].emplace(
+        nameAnalysis.getOperationName(source), isIntraIteration ? 0 : 1);
+    return;
+  }
   if (hasDependence(result)) {
     if (!isIntraIteration) {
       assert(!depComps.empty());
