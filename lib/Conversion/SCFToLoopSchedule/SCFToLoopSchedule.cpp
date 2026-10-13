@@ -1636,17 +1636,10 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
             uniqueId = storeOp.getUniqueId();
             incomingDelay = storeOp.getIncomingDelay();
           }
-          // Prefer characterized delays from the per-memory operator when
-          // OperatorAllocation stamped one; the interface methods are the
-          // uncalibrated fallback. Latency stays with the port type (it is
-          // authoritative for the FSM lowering), and the operator-type key
-          // stays the per-port uniqueId so port/resource semantics are
-          // unchanged.
-          if (auto timing = memAccessTiming(op)) {
-            incomingDelay = timing->incomingDelay;
-            if (isa<loopschedule::LoadInterface>(*op))
-              outgoingDelay = timing->outgoingDelay;
-          }
+          // The access reports its port's timing itself (AMC's accesses
+          // read their memory's characterized timing, recorded by operator
+          // allocation). The operator-type key is the per-port uniqueId, so
+          // port/resource semantics follow the port.
           // A DECLARED-ZERO-LATENCY dynamic load is an FWFT stream pop
           // (`amc.burst_pop`): the beat is combinationally valid on the pop
           // cycle, and a PIPELINE forwards that raw port data straight to a
