@@ -24,6 +24,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "circt/Dialect/OpLib/OpLibDialect.h"
+#include "circt/Dialect/OpLib/OpLibInterfaces.h"
 
 #define GET_OP_CLASSES
 #include "circt/Dialect/OpLib/OpLib.h.inc"

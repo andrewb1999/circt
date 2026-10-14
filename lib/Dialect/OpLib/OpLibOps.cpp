@@ -21,6 +21,8 @@
 #include "mlir/Interfaces/FunctionImplementation.h"
 #include "llvm/Support/LogicalResult.h"
 
+#include "circt/Dialect/OpLib/OpLibInterfaces.cpp.inc"
+
 using namespace mlir;
 using namespace circt;
 using namespace circt::oplib;
@@ -31,8 +33,10 @@ using namespace circt::oplib;
 
 LogicalResult LibraryOp::verify() {
   for (auto &op : this->getBodyRegion().getOps()) {
-    if (!isa<OperatorOp>(op))
-      return emitOpError("can only contain OperatorOps");
+    if (!isa<LibraryEntryOpInterface>(op))
+      return emitOpError("can only contain library entries "
+                         "(LibraryEntryOpInterface), not ")
+             << op.getName();
   }
 
   return success();
@@ -41,6 +45,65 @@ LogicalResult LibraryOp::verify() {
 //===----------------------------------------------------------------------===//
 // OperatorOp
 //===----------------------------------------------------------------------===//
+
+unsigned OperatorOp::getEntryLatency() { return getLatency(); }
+
+std::optional<double> OperatorOp::getIncomingDelay() {
+  if (auto delay = getIncDelay())
+    return delay->convertToDouble();
+  return std::nullopt;
+}
+
+std::optional<double> OperatorOp::getOutgoingDelay() {
+  if (auto delay = getOutDelay())
+    return delay->convertToDouble();
+  return std::nullopt;
+}
+
+std::optional<unsigned> OperatorOp::getEntryLimit() {
+  if (auto limit = getLimit())
+    return static_cast<unsigned>(*limit);
+  return std::nullopt;
+}
+
+/// The `oplib.operation` an operator's target matches ops against, if it
+/// has one.
+static OperationOp patternOf(OperatorOp op) {
+  auto targets = op.getBodyBlock()->getOps<TargetOp>();
+  if (targets.empty() || (*targets.begin()).getBodyBlock()->empty())
+    return {};
+  return dyn_cast<OperationOp>((*targets.begin()).getBodyBlock()->front());
+}
+
+std::optional<StringRef> OperatorOp::getMatchedOperationName() {
+  if (auto pattern = patternOf(*this))
+    return pattern.getOpName();
+  return std::nullopt;
+}
+
+/// An op matches an operator's pattern when it is the same operation, with
+/// the pattern's attributes and its operand and result types. An operator
+/// without a pattern matches whatever is assigned to it.
+bool OperatorOp::matches(Operation *op) {
+  OperationOp pattern = patternOf(*this);
+  if (!pattern)
+    return true;
+  if (op->getName().getStringRef() != pattern.getOpName())
+    return false;
+  if (auto dict = pattern.getOpDict())
+    for (NamedAttribute attr : *dict)
+      if (op->getAttr(attr.getName()) != attr.getValue())
+        return false;
+  return TypeRange(op->getOperandTypes()) ==
+             TypeRange(pattern->getOperandTypes()) &&
+         TypeRange(op->getResultTypes()) ==
+             TypeRange(pattern->getResultTypes());
+}
+
+Operation *OperatorOp::getHwMatch() {
+  auto matches = getBodyBlock()->getOps<HwMatchOp>();
+  return matches.empty() ? nullptr : (*matches.begin()).getOperation();
+}
 
 LogicalResult OperatorOp::verify() {
   unsigned numMatches = 0;

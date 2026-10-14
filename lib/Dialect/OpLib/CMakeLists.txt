@@ -14,4 +14,5 @@ add_circt_dialect_library(CIRCTOpLib
   CIRCTSupport
   MLIROpLibIncGen
   CIRCTOpLibAttributesIncGen
+  CIRCTOpLibInterfacesIncGen
 )

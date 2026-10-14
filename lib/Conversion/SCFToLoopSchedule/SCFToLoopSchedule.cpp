@@ -1423,9 +1423,10 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
     problem.setOutgoingDelay(opr, std::min(out, cycleTime));
   };
 
-  // Resolve a memory access's scheduling timing from the per-memory
-  // `oplib.operator` stamped by OperatorAllocation, when present. Returns
-  // {operator name, latency, incoming delay, outgoing delay}; the delay
+  // Resolve a memory access's scheduling timing from the library entry its
+  // `loopschedule.operator` references, when present (a memref's
+  // `oplib.operator`, an AMC memory port's `amc.port_timing`). Returns
+  // {entry name, latency, incoming delay, outgoing delay}; the delay
   // defaults match the historical hardcoded memory constants.
   struct MemTiming {
     StringRef name;
@@ -1636,10 +1637,21 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
             uniqueId = storeOp.getUniqueId();
             incomingDelay = storeOp.getIncomingDelay();
           }
-          // The access reports its port's timing itself (AMC's accesses
-          // read their memory's characterized timing, recorded by operator
-          // allocation). The operator-type key is the per-port uniqueId, so
-          // port/resource semantics follow the port.
+          // An access with a library entry (`loopschedule.operator`, an
+          // AMC memory port's `amc.port_timing`) takes its delays from it;
+          // its latency and the resource it uses (the operator-type key,
+          // the per-port uniqueId) stay the port's.
+          if (auto timing = memAccessTiming(op)) {
+            if (!operatorLibraryAnalysis->operatorMatches(timing->name, op)) {
+              op->emitOpError("is not one the library entry @")
+                  << timing->name << " it references may time";
+              unsupported = op;
+              return WalkResult::interrupt();
+            }
+            incomingDelay = timing->incomingDelay;
+            if (isa<loopschedule::LoadInterface>(*op))
+              outgoingDelay = timing->outgoingDelay;
+          }
           // A DECLARED-ZERO-LATENCY dynamic load is an FWFT stream pop
           // (`amc.burst_pop`): the beat is combinationally valid on the pop
           // cycle, and a PIPELINE forwards that raw port data straight to a

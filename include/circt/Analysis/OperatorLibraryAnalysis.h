@@ -34,14 +34,13 @@ struct Operator {
   std::optional<llvm::APFloat> outDelay;
 
   /// Declared cap on the number of physical instances of this operator
-  /// the downstream binder should create. Sourced from the
-  /// `oplib.operator`'s `limit` attribute; unset means unlimited (the
+  /// the downstream binder should create (the entry's limit, e.g. an
+  /// `oplib.operator`'s `limit` attribute); unset means unlimited (the
   /// binder will create as many instances as the schedule demands).
   std::optional<unsigned> limit;
 
-  Operation *opToMatch;
-
-  SmallVector<mlir::NamedAttribute> attrs;
+  /// The library entry this describes; it decides which ops may use it.
+  oplib::LibraryEntryOpInterface entry;
 
   // Optional `oplib.hw_match` body for this operator. Null when the
   // operator has no hw_match. The FSM lowering pass reads this op's
@@ -62,6 +61,9 @@ struct OperatorLibraryAnalysis {
   SmallVector<StringRef> getPotentialOperators(Operation *);
 
   StringRef getOperatorBySymbol(mlir::SymbolRefAttr);
+
+  /// Whether `op` may use the operator (its library entry matches it).
+  bool operatorMatches(StringRef operatorName, Operation *op);
 
   /// True when an operator with this symbol name exists in the library.
   /// The per-operator getters below assert on unknown names; callers

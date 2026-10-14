@@ -15,7 +15,7 @@ oplib.library @lib0 {
 
 // -----
 
-// expected-error @+1 {{can only contain OperatorOps}}
+// expected-error @+1 {{can only contain library entries (LibraryEntryOpInterface), not func.func}}
 oplib.library @lib0 {
   func.func @main() {
     func.return

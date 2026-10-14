@@ -18,6 +18,7 @@ include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/IR/SymbolInterfaces.td"
+include "circt/Dialect/OpLib/OpLibInterfaces.td"
 
 class OpLibOp<string mnemonic, list<Trait> traits = []> :
   Op<OpLib_Dialect, mnemonic, traits>;
@@ -30,8 +31,8 @@ def LibraryOp : OpLibOp<"library", [IsolatedFromAbove, SingleBlock,
   let description = [{
     The `oplib.library` operation represents an operator library to be
     used by passes that lower to one of a few hardware design dialects. 
-    A library is made up of a single block and contains only
-    `oplib.operator` ops.
+    A library is made up of a single block of entries: ops implementing
+    LibraryEntryOpInterface, such as `oplib.operator`.
   }];
 
   let arguments = (ins SymbolNameAttr:$sym_name);
@@ -66,11 +67,16 @@ def OperatorOp : OpLibOp<"operator", [IsolatedFromAbove,
                                          SingleBlock, NoTerminator,
                                          NoRegionArguments,
                                          Symbol, SymbolTable,
-                                         HasParent<"LibraryOp">]> {
+                                         HasParent<"LibraryOp">,
+    DeclareOpInterfaceMethods<LibraryEntryOpInterface,
+                              ["getMatchedOperationName", "getHwMatch"]>]> {
   let summary = "OpLib dialect Operator operation";
   let description = [{
     The `oplib.operator` operation represents an operator in the
-    operator library.
+    operator library: a library entry (LibraryEntryOpInterface) that
+    matches ops by the pattern of its `oplib.target` and builds them with
+    its `oplib.hw_match`. An operator without a target matches whatever op
+    is assigned to it (by a `loopschedule.operator` reference).
   }];
 
   let arguments = (ins SymbolNameAttr:$sym_name,
