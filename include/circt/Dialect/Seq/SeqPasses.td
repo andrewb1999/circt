@@ -35,7 +35,11 @@ def LowerSeqFIFO : Pass<"lower-seq-fifo", "hw::HWModuleOp"> {
 
 def LowerSeqHLMem: Pass<"lower-seq-hlmem", "hw::HWModuleOp"> {
   let summary = "Lowers seq.hlmem operations.";
-  let dependentDialects = ["circt::sv::SVDialect"];
+  let dependentDialects = [
+    "circt::sv::SVDialect",
+    "circt::comb::CombDialect",
+    "circt::verif::VerifDialect"
+  ];
 }
 
 def ExternalizeClockGate: Pass<"externalize-clock-gate", "mlir::ModuleOp"> {
