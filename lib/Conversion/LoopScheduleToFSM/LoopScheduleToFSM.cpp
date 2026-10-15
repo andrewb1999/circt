@@ -639,9 +639,7 @@ computeOpCycleLatency(Operation *def,
 /// epilogues, e.g. gesummv's `y[i] = alpha*accA + beta*accB`; a
 /// floating-point operator's result always comes out of a bitcast, see
 /// AMC's LegalizeFloatTypes).
-static unsigned
-computeValueCycleLatency(Value v,
-                         analysis::OperatorLibraryAnalysis *operatorLibrary) {
+static Operation *producingOp(Value v) {
   Operation *def = v.getDefiningOp();
   while (def) {
     if (auto bitcast = dyn_cast<arith::BitcastOp>(def)) {
@@ -655,14 +653,20 @@ computeValueCycleLatency(Value v,
     auto yieldOp =
         dyn_cast<LoopScheduleYieldOp>(ifOp.getBody().front().getTerminator());
     if (!yieldOp)
-      return 0;
+      return nullptr;
     unsigned idx = cast<OpResult>(v).getResultNumber();
     if (idx >= yieldOp.getNumOperands())
-      return 0;
+      return nullptr;
     v = yieldOp.getOperand(idx);
     def = v.getDefiningOp();
   }
-  return computeOpCycleLatency(def, operatorLibrary);
+  return def;
+}
+
+static unsigned
+computeValueCycleLatency(Value v,
+                         analysis::OperatorLibraryAnalysis *operatorLibrary) {
+  return computeOpCycleLatency(producingOp(v), operatorLibrary);
 }
 
 /// Materializes the cross-stage delay registers needed when a value
@@ -7472,6 +7476,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // condEffective resolves here: launches are gated by a decided-false
   // only, never by the idle cone (pipeline fill reads garbage stage regs).
   SmallVector<Value> effectGate(gatedStageCE.begin(), gatedStageCE.end());
+  // The kill bit beside each stage's iteration (null: nothing to kill).
+  SmallVector<Value> killAtStage(stages.size());
   if (condStageIdx > 0) {
     Value condStageOccupied = stageCE[condStageIdx];
     Value notOccupied =
@@ -7486,6 +7492,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     effectGate[condStageIdx] =
         comb::AndOp::create(hwBuilder, loc, gatedStageCE[condStageIdx],
                             killAt);
+    killAtStage[condStageIdx] = killAt;
     for (unsigned s = condStageIdx + 1; s < stages.size(); ++s) {
       killAt = seq::CompRegClockEnabledOp::create(
           hwBuilder, loc, killAt, clk, notStall, rst, falseConst,
@@ -7493,6 +7500,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
               (namePrefix + "_kill_s" + std::to_string(s)).str()));
       effectGate[s] =
           comb::AndOp::create(hwBuilder, loc, gatedStageCE[s], killAt);
+      killAtStage[s] = killAt;
     }
   }
 
@@ -8377,10 +8385,93 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // captures the final value on the very edge the feedback register
   // reloads, and stays stable until the next invocation's drain. Unused
   // holds die in canonicalization (no inner sym).
+  //
+  // A result a multi-cycle operator produces is that operator's output,
+  // valid on the one cycle its iteration reaches J + L (the stages read it
+  // there, see CrossStageValueResolver). The operator keeps running after
+  // the drain (its CE is the stall gate) on whatever its inputs hold — an
+  // accumulator adds its last operand again every cycle — so latch the
+  // result whenever a live iteration reaches that cycle; the last one's
+  // stays. `live[t]`: a live iteration is at stage t, which past the last
+  // stage the stage-CE chain and its kill bit continue in lockstep.
+  SmallVector<Value> live;
+  auto liveAt = [&](unsigned t) {
+    while (live.size() <= t) {
+      unsigned s = live.size();
+      if (s >= stages.size())
+        live.push_back(seq::CompRegClockEnabledOp::create(
+            hwBuilder, loc, live.back(), clk, notStall, rst, falseConst,
+            hwBuilder.getStringAttr(
+                (namePrefix + "_live_s" + std::to_string(s)).str())));
+      else if (killAtStage[s])
+        live.push_back(comb::AndOp::create(hwBuilder, loc, stageCE[s],
+                                           killAtStage[s]));
+      else
+        live.push_back(stageCE[s]);
+    }
+    return live[t];
+  };
+  // A runtime trip count can be zero, and the loop then returns its
+  // iter-args' inits, while the values above are whatever an earlier
+  // invocation left in the stage registers and latches. `ran`: a live
+  // iteration got past the condition in this invocation; without one, a
+  // result is its init, sampled when the iter-arg preload samples it (the
+  // init is only guaranteed readable from there).
+  // (Results stand for the iter-args position by position, as
+  // SCFToLoopSchedule builds them.)
+  Value ran;
+  if (!pipOp.getTripCount() && pipOp.getNumResults() == numIterArgs &&
+      llvm::equal(pipOp.getResultTypes(), pipOp.getInits().getTypes())) {
+    Backedge ranBE = bb.get(hwBuilder.getI1Type());
+    Value passed = comb::AndOp::create(hwBuilder, loc,
+                                       liveAt(condStageIdx), notStall);
+    Value kept = comb::AndOp::create(
+        hwBuilder, loc, Value(ranBE),
+        comb::createOrFoldNot(hwBuilder, loc, startSignal));
+    ran = seq::CompRegOp::create(
+        hwBuilder, loc, comb::OrOp::create(hwBuilder, loc, passed, kept),
+        clk, rst, falseConst,
+        hwBuilder.getStringAttr((namePrefix + "_ran").str()));
+    ranBE.setValue(ran);
+  }
+  unsigned resultLatchIdx = 0;
   unsigned resultHoldIdx = 0;
-  for (auto [result, termResult] :
-       llvm::zip(pipOp.getResults(), terminatorOp.getResults())) {
+  for (auto [idx, result, termResult] : llvm::enumerate(
+           pipOp.getResults(), terminatorOp.getResults())) {
     Value mapped = mapping.lookup(termResult);
+    if (auto stageResult = dyn_cast<OpResult>(termResult)) {
+      auto stageOp = dyn_cast<LoopScheduleAtOp>(stageResult.getOwner());
+      Operation *def =
+          stageOp ? producingOp(stageOp.getYieldOp().getOperand(
+                        stageResult.getResultNumber()))
+                  : nullptr;
+      unsigned latency =
+          def && !isa<LoadInterface, LoopScheduleLoadOp>(def)
+              ? computeOpCycleLatency(def, operatorLibrary)
+              : 0;
+      if (latency > 0) {
+        unsigned stage = llvm::find(stages, stageOp) - stages.begin();
+        Value latch = comb::AndOp::create(
+            hwBuilder, loc, liveAt(stage + latency), notStall);
+        mapped = seq::CompRegClockEnabledOp::create(
+            hwBuilder, loc, mapped, clk, latch, rst,
+            createZeroConstant(hwBuilder, loc, mapped.getType()),
+            hwBuilder.getStringAttr((namePrefix + "_result_r" +
+                                     std::to_string(resultLatchIdx++))
+                                        .str()));
+      }
+    }
+    if (ran) {
+      Value init = argInfos[idx].init;
+      Operation *initDef = pipOp.getInits()[idx].getDefiningOp();
+      if (!initDef || !initDef->hasTrait<mlir::OpTrait::ConstantLike>())
+        init = seq::CompRegClockEnabledOp::create(
+            hwBuilder, loc, init, clk, getStartDelayed(argInfos[idx].d), rst,
+            createZeroConstant(hwBuilder, loc, init.getType()),
+            hwBuilder.getStringAttr(
+                (namePrefix + "_init_r" + std::to_string(idx)).str()));
+      mapped = comb::MuxOp::create(hwBuilder, loc, ran, mapped, init);
+    }
     if (preArmPulseBE) {
       Value zero = createZeroConstant(hwBuilder, loc, mapped.getType());
       mapped = seq::CompRegClockEnabledOp::create(

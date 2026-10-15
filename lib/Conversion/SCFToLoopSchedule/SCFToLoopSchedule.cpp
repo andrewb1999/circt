@@ -2393,9 +2393,28 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
        llvm::enumerate(loop.getAfterBody()->getTerminator()->getOperands())) {
     unsigned i = it.index();
     Value value = it.value();
-    unsigned lookupTime =
-        std::min((unsigned)(stageValueMaps.size() - 1),
-                 (unsigned)(pipeTimes[value].first + ii.getInt()));
+    // The iter-arg is a register the next iteration reads II cycles after
+    // this one did: it takes this iteration's version of the new value at
+    // (first read + II), so the update goes in the stage before. Readers
+    // past the value's definition read a copy captured there instead
+    // (pipeTimes[iterArg] above), which makes the definition the first
+    // read. (The scheduler keeps that time at least a cycle past the
+    // definition.) An accumulator reads and defines at the same time; a
+    // value defined after the read, such as a flattened nest's reset select
+    // behind a multi-cycle add, must not wait until definition + II, a
+    // read the next iteration has already made.
+    unsigned firstRead = pipeTimes[value].first;
+    for (BlockArgument arg :
+         {loop.getBeforeArguments()[i], loop.getAfterArguments()[i]}) {
+      Block *block = arg.getOwner();
+      for (Operation *user : arg.getUsers()) {
+        Operation *op = block->findAncestorOpInBlock(*user);
+        if (auto t = op ? problem.getStartTime(op) : std::nullopt)
+          firstRead = std::min(firstRead, *t);
+      }
+    }
+    unsigned lookupTime = std::min((unsigned)(stageValueMaps.size() - 1),
+                                   (unsigned)(firstRead + ii.getInt()));
 
     Value newValue = stageValueMaps[lookupTime].lookup(value);
     termIterArgs.push_back(newValue);

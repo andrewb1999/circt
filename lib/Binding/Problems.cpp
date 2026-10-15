@@ -87,6 +87,10 @@ static uint64_t gcd64(uint64_t a, uint64_t b) {
   return a;
 }
 
+/// Above this many activations on both sides, the scan below gives way to
+/// the unbounded test.
+static constexpr uint64_t kUnboundedScan = 1u << 16;
+
 /// Does AP-of-intervals {s + i*p : i ∈ [0, c)} × [0, L) intersect
 /// {t + j*q : j ∈ [0, d)} × [0, M)?
 /// Equivalently, exist i ∈ [0, c), j ∈ [0, d) with
@@ -114,6 +118,37 @@ static bool apIntersects(uint64_t s, uint64_t L, uint64_t p, uint64_t c,
     return (uint64_t)(-diff) < lat;
   }
 
+  int64_t delta = (int64_t)t - (int64_t)s;
+  int64_t tolLo = -(int64_t)(lat - 1);
+  int64_t tolHi = (int64_t)(mat - 1);
+
+  // One period (two stages of one pipeline): i*p - j*p == target needs
+  // target = m*p with i - j = m, i.e. -(d - 1) <= m <= c - 1. Closed form,
+  // so a runtime trip count (an unbounded count) costs nothing.
+  if (p == q) {
+    for (int64_t k = tolLo; k <= tolHi; ++k) {
+      int64_t target = delta + k;
+      if (target % (int64_t)p != 0)
+        continue;
+      int64_t m = target / (int64_t)p;
+      if (m >= -((int64_t)std::min<uint64_t>(d, INT64_MAX) - 1) &&
+          m <= (int64_t)std::min<uint64_t>(c, INT64_MAX) - 1)
+        return true;
+    }
+    return false;
+  }
+
+  // Unbounded (or merely huge) counts: every multiple of g = gcd(p, q) is
+  // some i*p - j*q with i, j >= 0 in range, so overlap is the window test
+  // below without the bounds (conservative for large finite counts).
+  if (std::min(c, d) > kUnboundedScan) {
+    uint64_t g = gcd64(p, q);
+    for (int64_t k = tolLo; k <= tolHi; ++k)
+      if ((delta + k) % (int64_t)g == 0)
+        return true;
+    return false;
+  }
+
   // Each activation of A holds cycles [s + i*p, s + i*p + L - 1].
   // Each activation of B holds cycles [t + j*q, t + j*q + M - 1].
   // They overlap iff there exist i ∈ [0,c), j ∈ [0,d),
@@ -133,13 +168,10 @@ static bool apIntersects(uint64_t s, uint64_t L, uint64_t p, uint64_t c,
   // the smallest non-negative `j` that works for each candidate offset in
   // the overlap window and check if both `i` and `j` are in-range.
   uint64_t g = gcd64(p, q);
-  int64_t delta = (int64_t)t - (int64_t)s;
 
   // Scan every offset in the tolerance window around delta that is aligned
   // on g. The window size is (lat + mat - 1), which is small (~single
   // digits) even for multi-cycle latencies, so this loop is tight.
-  int64_t tolLo = -(int64_t)(lat - 1);
-  int64_t tolHi = (int64_t)(mat - 1);
   for (int64_t k = tolLo; k <= tolHi; ++k) {
     int64_t target = delta + k;
     // Need i*p - j*q == target for some i ∈ [0,c), j ∈ [0,d).

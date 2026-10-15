@@ -51,3 +51,50 @@ loopschedule.func_sequential @share_muls(%x: i32, %y: i32) -> i32
   }
   loopschedule.return %x : i32
 }
+
+// A pipeline with a runtime trip count (no trip_count) runs any number of
+// iterations: at II=1 its stage-1 and stage-2 muls are busy on the same
+// cycles, one iteration apart, and need their own instances. (Counting the
+// unknown trip as one iteration put both on instance 0.)
+
+// CHECK-LABEL: loopschedule.func_sequential @runtime_trip_pipeline
+// OFF-LABEL: loopschedule.func_sequential @runtime_trip_pipeline
+loopschedule.func_sequential @runtime_trip_pipeline(%x: i32, %n: i7)
+    attributes {oplib.library = @lib} {
+  %c0 = arith.constant 0 : i7
+  %c1 = arith.constant 1 : i7
+  %h = loopschedule.frame -> (!loopschedule.handle) {
+    %s = loopschedule.at 0 -> !loopschedule.handle {
+      %l = loopschedule.launch : !loopschedule.handle {
+        %p = loopschedule.pipeline II = 1 iter_args(%i = %c0) : (i7) -> i7 {
+          %r:2 = loopschedule.at 0 -> (i7, i1) {
+            %next = arith.addi %i, %c1 : i7
+            loopschedule.iter_arg_update %i = %next : i7
+            %cond = arith.cmpi slt, %next, %n : i7
+            loopschedule.yield %next, %cond : i7, i1
+          }
+          %s1 = loopschedule.at 1 -> i32 {
+            // CHECK: arith.muli
+            // CHECK-SAME: loopschedule.binding = 0
+            %a = arith.muli %x, %x {loopschedule.operator = @mul_i32_l4} : i32
+            loopschedule.yield %a : i32
+          }
+          loopschedule.at 2 {
+            // CHECK: arith.muli
+            // CHECK-SAME: loopschedule.binding = 1
+            %b = arith.muli %x, %x {loopschedule.operator = @mul_i32_l4} : i32
+            loopschedule.yield
+          }
+          loopschedule.terminator condition(%r#1), results(%r#0) : i7
+        }
+        loopschedule.yield %p : i7
+      }
+      loopschedule.yield %l : !loopschedule.handle
+    }
+    loopschedule.yield %s : !loopschedule.handle
+  }
+  loopschedule.frame await {
+    loopschedule.await %h
+  }
+  loopschedule.return
+}

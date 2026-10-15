@@ -16,7 +16,8 @@
 // For an op inside a pipeline P launched at `at K` within frame F, the
 // pipeline is inline (same hw.module as F) and its stage offsets fold into
 // F's timebase. For stage S, occupancy is
-//   (startTime = K + S, period = P.II, count = P.tripCount)
+//   (startTime = K + S, period = P.II, count = P.tripCount, unbounded when
+// the trip count is a runtime value)
 // and group = F — so the pipeline's ops compete in the same concurrency
 // group as F's static at-ops, which is what the inline lowering requires
 // for correct binding.
@@ -37,6 +38,8 @@
 
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Visitors.h"
+
+#include <limits>
 
 using namespace circt;
 using namespace circt::analysis;
@@ -104,7 +107,11 @@ static std::optional<Occ> computeOccupancy(Operation *op) {
       // its trip count is the count. We continue climbing to find the
       // enclosing frame (which is the concurrency group — pipelines lower
       // inline).
+      // A runtime trip count has no bound: as many activations as any
+      // overlap needs (one, the old default, let two stages of an II=1
+      // pipeline share a combinational unit).
       period = static_cast<unsigned>(pipe.getII());
+      count = std::numeric_limits<unsigned>::max();
       if (auto tc = pipe.getTripCount())
         count = static_cast<unsigned>(*tc);
       continue;
