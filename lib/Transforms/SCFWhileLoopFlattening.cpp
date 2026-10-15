@@ -19,8 +19,9 @@
 //     flattened iteration, which is safe because they are pure.
 //   - CARRIED CHAINS: the inner loops may carry extra iter-args (e.g. a
 //     reduction accumulator) initialized at some origin boundary from a
-//     constant, a nest-invariant value, or a LOAD-SHAPED pre-op (an
-//     accumulator resuming from an indexed buffer, sum[p]); threaded
+//     constant, a nest-invariant value, or a LOAD-SHAPED pre-op, possibly
+//     under pure ops (an accumulator resuming from an indexed buffer,
+//     sum[p], or from a scaled one, D[i][j] * beta); threaded
 //     unchanged through intermediate levels, and updated only in the
 //     innermost body. In the flattened loop each chain becomes one
 //     iter-arg that RESETS to its init whenever the levels below its
@@ -31,6 +32,20 @@
 //     "the levels below just wrapped", i.e. they execute exactly on the
 //     iterations where the original epilogue ran. Downstream scheduling
 //     (ifOpConversion) turns the scf.if into predicated operations.
+//
+// MEMORY DEPENDENCES. The function's dependence table (loopschedule.
+// dependencies) was built on the separate loops, where a pipeline over the
+// inner one never overlapped two outer iterations. Flattening merges them,
+// so each entry between two accesses of the nest is re-expressed in the
+// flattened loop's iterations: one carried by an outer level (tagged
+// `outer<depth, [...]>` by construct-memory-dependencies) becomes a
+// distance of that level's stride (gemm's k-carried C[i][j] update, NJ
+// iterations apart), and one with an access in a prologue or epilogue
+// moves with it (a re-load runs as the previous pass ends, an epilogue on
+// the pass's last iteration). A nest whose entry has no such distance stays
+// unflattened: one that needs a runtime trip count (syrk's
+// `for k: for j < i + 1`, whose k-carried update is i + 1 iterations
+// apart), or whose flattened order could run the destination first.
 //
 // Bounds may be CONSTANT or RUNTIME. A runtime (SSA) upper bound is
 // accepted for PERFECT nests only, under: the bound dominates the whole
@@ -71,12 +86,18 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/Support/CheckedArithmetic.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
+#include <limits>
 
 namespace circt {
 #define GEN_PASS_DEF_SCFWHILELOOPFLATTENING
@@ -92,7 +113,8 @@ namespace {
 struct NestLevel {
   WhileOp loop;
   unsigned ivIdx;          // Iter-arg / result index of the IV.
-  APInt lb;                // Constant lower bound (initial value).
+  APInt lb;                // Constant lower bound (initial value);
+                           // meaningless when lbValue is set.
   APInt ubNormalized;      // Exclusive upper bound after predicate
                            // normalization (sle→slt+1, ule→ult+1).
                            // Meaningless when ubValue is set.
@@ -105,7 +127,12 @@ struct NestLevel {
   /// SSA value collectNest verifies dominates the whole nest. Only
   /// slt/ult levels may carry one (the bound is already exclusive).
   Value ubValue = nullptr;
-  bool isRuntime() const { return static_cast<bool>(ubValue); }
+  /// Non-null for a RUNTIME lower bound: the loop's IV init, an SSA value.
+  /// Only the outermost level may carry one (collectNest): it never wraps,
+  /// so the bound is just its start, and the inner levels restart from
+  /// their constant lower bounds.
+  Value lbValue = nullptr;
+  bool isRuntime() const { return ubValue || lbValue; }
 };
 
 /// Returns true if `pred` is one of the supported comparison kinds.
@@ -185,14 +212,20 @@ static std::optional<NestLevel> matchLevel(WhileOp whileOp) {
     ubValue = cmp.getRhs();
   }
 
-  APInt lb;
-  if (!matchPattern(whileOp.getInits()[idx], m_ConstantInt(&lb)))
-    return std::nullopt;
-
   auto ivType = dyn_cast<IntegerType>(ivBefore.getType());
   if (!ivType)
     return std::nullopt;
   unsigned bw = ivType.getWidth();
+
+  APInt lb(bw, 0);
+  Value lbValue = nullptr;
+  if (!matchPattern(whileOp.getInits()[idx], m_ConstantInt(&lb))) {
+    // Runtime lower bound (e.g. a triangular `for j in i+1..M`): not with
+    // `ne`, whose bound must be known to be ahead of the IV.
+    if (cmp.getPredicate() == arith::CmpIPredicate::ne)
+      return std::nullopt;
+    lbValue = whileOp.getInits()[idx];
+  }
   if (lb.getBitWidth() != bw || (constantUb && ubConst.getBitWidth() != bw))
     return std::nullopt;
 
@@ -236,7 +269,8 @@ static std::optional<NestLevel> matchLevel(WhileOp whileOp) {
   // is slt/ult by construction — already exclusive, nothing to compute.
   if (!constantUb)
     return NestLevel{whileOp, idx,  lb,     APInt::getZero(bw), step,
-                     cmp.getPredicate(), addOp, ivAfter, ivType, ubValue};
+                     cmp.getPredicate(), addOp, ivAfter, ivType, ubValue,
+                     lbValue};
   APInt ub = ubConst;
   bool isSigned = isSignedPredicate(cmp.getPredicate());
   switch (cmp.getPredicate()) {
@@ -258,7 +292,8 @@ static std::optional<NestLevel> matchLevel(WhileOp whileOp) {
     break;
   }
   case arith::CmpIPredicate::ne: {
-    // Require lb < ub so the loop actually walks toward the bound.
+    // Require lb < ub so the loop actually walks toward the bound (a
+    // runtime lb was refused above).
     bool lbLtUb = isSigned ? lb.slt(ub) : lb.ult(ub);
     if (!lbLtUb)
       return std::nullopt;
@@ -269,7 +304,8 @@ static std::optional<NestLevel> matchLevel(WhileOp whileOp) {
   }
 
   return NestLevel{whileOp, idx,  lb,     ub,     step,
-                   cmp.getPredicate(), addOp, ivAfter, ivType, nullptr};
+                   cmp.getPredicate(), addOp, ivAfter, ivType, nullptr,
+                   lbValue};
 }
 
 /// A scalar value carried through the nest's inner levels: initialized at an
@@ -291,6 +327,11 @@ struct CarriedChain {
   /// unpredicated clone before the loop for the first pass, and a clone
   /// inside the wrap-predicated scf.if (with next-pass IVs) for the rest.
   Operation *initLoad = nullptr;
+  /// The pure pre-ops computing the init from initLoad's result, in program
+  /// order (an accumulator resuming from a scaled element: D[i][j] * beta);
+  /// empty when the init is the load itself. They run with the load, never
+  /// in the flattened body.
+  SmallVector<Operation *> initOps;
   /// Iter-arg index of this chain at each level it threads through
   /// (levels originLevel+1 .. N-1); index into `argIdx` is the level.
   SmallVector<int> argIdx; // size N; -1 where the chain is absent.
@@ -313,6 +354,16 @@ struct NestInfo {
   /// Epilogue ops following the inner while in level k's after region
   /// (pure ops and memref.stores, in program order).
   SmallVector<SmallVector<Operation *>> postOps; // size N (innermost empty)
+  /// Dependence-table entries between accesses of the nest, with their
+  /// distance in the flattened loop's iterations (0: the same iteration,
+  /// the source first). Applied once the nest is flattened.
+  SmallVector<std::pair<circt::loopschedule::LoopScheduleAccessOp, int64_t>>
+      flatDeps;
+  /// Entries between accesses of the nest carried by a loop above it, with
+  /// their inner distances once the nest is one loop.
+  SmallVector<std::pair<circt::loopschedule::LoopScheduleAccessOp,
+                        SmallVector<int64_t>>>
+      aboveDeps;
 };
 
 /// True if `v` is safe to reference from the flattened loop's init AND from
@@ -330,6 +381,251 @@ static bool isDefinedAboveNest(Value v, WhileOp outer) {
 static bool isConstantValue(Value v) {
   Operation *def = v.getDefiningOp();
   return def && def->hasTrait<OpTrait::ConstantLike>();
+}
+
+/// Match a chain init computed at a boundary from exactly one load-shaped
+/// pre-op in `preOps`: the load itself, or pure pre-ops over its result.
+/// Sets `load`, and `ops` to the pure pre-ops between the load and the
+/// init, in program order. (Pure pre-ops the init needs that do not depend
+/// on the load, e.g. the load's address, stay ordinary pre-ops.)
+static bool matchInitLoad(Value init, ArrayRef<Operation *> preOps,
+                          Operation *&load, SmallVector<Operation *> &ops) {
+  Operation *def = init.getDefiningOp();
+  if (!def || !llvm::is_contained(preOps, def))
+    return false;
+  if (!isPure(def)) {
+    load = def;
+    return true;
+  }
+  llvm::SetVector<Operation *> slice;
+  SmallVector<Operation *> worklist{def};
+  while (!worklist.empty()) {
+    Operation *op = worklist.pop_back_val();
+    if (!slice.insert(op))
+      continue;
+    for (Value operand : op->getOperands())
+      if (Operation *d = operand.getDefiningOp();
+          d && llvm::is_contained(preOps, d))
+        worklist.push_back(d);
+  }
+  for (Operation *op : slice) {
+    if (isPure(op))
+      continue;
+    if (load)
+      return false; // more than one load
+    load = op;
+  }
+  if (!load)
+    return false; // a pure function of the IVs: not handled
+  llvm::SmallPtrSet<Operation *, 8> fromLoad{load};
+  for (Operation *op : preOps) {
+    if (op == load || !slice.contains(op))
+      continue;
+    if (llvm::any_of(op->getOperands(), [&](Value v) {
+          return fromLoad.contains(v.getDefiningOp());
+        })) {
+      fromLoad.insert(op);
+      ops.push_back(op);
+    }
+  }
+  return !ops.empty() && ops.back() == def;
+}
+
+/// A level's trip count, when its bounds are constants.
+static std::optional<int64_t> constantTrips(const NestLevel &lvl) {
+  if (lvl.isRuntime())
+    return std::nullopt;
+  APInt range = lvl.ubNormalized - lvl.lb;
+  APInt step = lvl.step;
+  return (range.zext(64) + (step.zext(64) - 1))
+      .udiv(step.zext(64))
+      .getZExtValue();
+}
+
+/// The depth of `op` among every loop around it, itself included (1 =
+/// outermost), as the dependence table's `outer<depth, ...>` counts.
+static unsigned loopDepth(Operation *op) {
+  unsigned depth = 0;
+  for (Operation *p = op; p; p = p->getParentOp())
+    depth += isa<LoopLikeOpInterface>(p);
+  return depth;
+}
+
+/// Re-express the dependence-table entries between accesses of the nest in
+/// the flattened loop's iterations (`info.flatDeps`, `info.aboveDeps`). The
+/// table was built on the separate loops, where a pipeline over the inner
+/// one never overlapped two outer iterations: a dependence carried by an
+/// outer level (`outer<...>`), or one with an access in a boundary's
+/// prologue or epilogue, reaches the flattened pipeline only through this.
+/// Fails when an entry has no such distance: it needs a runtime trip count
+/// (syrk's `for k: for j < i + 1: C[i][j] += ...`, whose k-carried
+/// dependence is i + 1 flattened iterations apart), or the flattened order
+/// could run the destination first.
+static bool planDependences(NestInfo &info) {
+  using namespace circt::loopschedule;
+  ArrayRef<NestLevel> nest = info.levels;
+  WhileOp outer = nest.front().loop;
+  auto func = outer->getParentOfType<func::FuncOp>();
+  auto depsRef =
+      func ? func->getAttrOfType<SymbolRefAttr>("loopschedule.dependencies")
+           : nullptr;
+  auto depsOp = depsRef ? dyn_cast_or_null<LoopScheduleDependenciesOp>(
+                              SymbolTable::lookupNearestSymbolFrom(func, depsRef))
+                        : nullptr;
+  if (!depsOp)
+    return true;
+  unsigned N = nest.size();
+
+  // Where each access of the nest runs once flattened: the deepest level
+  // around it, and its place in the flattened body (the innermost body,
+  // then the boundaries' epilogues innermost first, then the chains'
+  // re-loads).
+  enum Kind { Body, Epilogue, Reload };
+  struct Position {
+    Kind kind;
+    unsigned level;
+    std::pair<unsigned, unsigned> order;
+  };
+  llvm::StringMap<std::optional<Position>> positions;
+  unsigned walkIndex = 0;
+  outer->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    ++walkIndex;
+    auto name = op->getAttrOfType<StringAttr>("loopschedule.name");
+    if (!name)
+      return;
+    std::optional<Position> &pos = positions[name.getValue()];
+    if (nest.back().loop->isProperAncestor(op)) {
+      pos = Position{Body, N - 1, {0, walkIndex}};
+      return;
+    }
+    for (auto [c, chain] : llvm::enumerate(info.chains))
+      if (chain.initLoad == op)
+        pos = Position{Reload, unsigned(chain.originLevel), {N, unsigned(c)}};
+    for (unsigned k = 0; k + 1 < N; ++k)
+      if (llvm::is_contained(info.postOps[k], op))
+        pos = Position{Epilogue, k, {N - 1 - k, walkIndex}};
+  });
+
+  SmallVector<std::optional<int64_t>> trips;
+  for (const NestLevel &lvl : nest)
+    trips.push_back(constantTrips(lvl));
+  // Flattened iterations per iteration of level x.
+  auto stride = [&](unsigned x) -> std::optional<int64_t> {
+    std::optional<int64_t> p = 1;
+    for (unsigned y = x + 1; y < N && p; ++y)
+      p = trips[y] ? llvm::checkedMul(*p, *trips[y]) : std::nullopt;
+    return p;
+  };
+  auto mulAdd = [](std::optional<int64_t> acc, std::optional<int64_t> a,
+                   std::optional<int64_t> b) -> std::optional<int64_t> {
+    if (!acc || !a || !b)
+      return std::nullopt;
+    return llvm::checkedMulAdd(*a, *b, *acc);
+  };
+  // Table distances are in IV units.
+  auto iterations = [&](int64_t ivDist, unsigned x) {
+    return llvm::divideCeilSigned(ivDist, nest[x].step.getSExtValue());
+  };
+  constexpr int64_t unknown = std::numeric_limits<int64_t>::min();
+  unsigned base = loopDepth(outer);
+
+  for (auto dependsOn : depsOp.getBody().getOps<LoopScheduleDependsOnOp>()) {
+    auto dstIt = positions.find(dependsOn.getAccessName());
+    if (dstIt == positions.end())
+      continue;
+    for (auto access : dependsOn.getBody().getOps<LoopScheduleAccessOp>()) {
+      auto srcIt = positions.find(access.getAccessName());
+      if (srcIt == positions.end())
+        continue;
+      // An access of the nest flattening has no place for.
+      if (!srcIt->second || !dstIt->second)
+        return false;
+      const Position &src = *srcIt->second, &dst = *dstIt->second;
+      unsigned c0 = std::min(src.level, dst.level);
+      int64_t dist = access.getDist().value_or(0);
+      ArrayRef<int64_t> inner =
+          access.getInnerDist().value_or(ArrayRef<int64_t>{});
+
+      // Carried by a loop above the nest: the bounds below it now end at
+      // the flattened loop, whose own one is unknown.
+      std::optional<int64_t> carrier;
+      if (auto depth = access.getOuterDepth()) {
+        carrier = int64_t(*depth) - int64_t(base);
+        if (*carrier < 0) {
+          SmallVector<int64_t> above(inner.take_front(
+              std::min<size_t>(inner.size(), base - *depth - 1)));
+          above.push_back(unknown);
+          info.aboveDeps.push_back({access, std::move(above)});
+          continue;
+        }
+        if (*carrier > int64_t(c0))
+          return false;
+      }
+
+      // Lower bound of the distance from the levels around both:
+      // sum over x of (iterations apart in level x) * stride(x).
+      std::optional<int64_t> distance = 0;
+      if (carrier) {
+        distance = mulAdd(distance, iterations(dist, *carrier),
+                          stride(*carrier));
+        for (unsigned x = *carrier + 1; x <= c0; ++x) {
+          size_t i = x - *carrier - 1;
+          std::optional<int64_t> apart;
+          if (i < inner.size() && inner[i] != unknown)
+            apart = iterations(inner[i], x);
+          if (trips[x])
+            apart = std::max(apart.value_or(unknown), 1 - *trips[x]);
+          distance = mulAdd(distance, apart, stride(x));
+        }
+      } else if (dist > 0) {
+        distance = mulAdd(distance, iterations(dist, c0), stride(c0));
+      }
+      // ... plus where in their iteration of levels 0..c0 the two run:
+      // anywhere in the body; on the levels' last iteration in an epilogue;
+      // the iteration before a pass begins for a re-load.
+      auto offsets = [&](const Position &p)
+          -> std::optional<std::pair<int64_t, int64_t>> {
+        std::optional<int64_t> all = stride(c0), own = stride(p.level);
+        if (!all || !own)
+          return std::nullopt;
+        switch (p.kind) {
+        case Body:
+          return std::make_pair(int64_t(0), *all - 1);
+        case Epilogue:
+          return std::make_pair(*own - 1, *all - 1);
+        case Reload:
+          return std::make_pair(int64_t(-1), *all - *own - 1);
+        }
+        llvm_unreachable("unknown position");
+      };
+      auto srcOffsets = offsets(src), dstOffsets = offsets(dst);
+      if (!distance || !srcOffsets || !dstOffsets)
+        return false;
+      int64_t flat = *distance + dstOffsets->first - srcOffsets->second;
+      bool srcFirst = src.order < dst.order;
+      if (flat < 0 || (flat == 0 && !srcFirst))
+        return false;
+      // A source earlier in the body only takes a same-iteration edge,
+      // which orders every later iteration too.
+      info.flatDeps.push_back({access, srcFirst ? 0 : flat});
+    }
+  }
+  return true;
+}
+
+/// Rewrite the dependence-table entries `planDependences` placed.
+static void applyDependences(NestInfo &info) {
+  for (auto [access, dist] : info.flatDeps) {
+    Builder b(access);
+    access.removeOuterDepthAttr();
+    access.removeInnerDistAttr();
+    if (dist > 0)
+      access.setDistAttr(b.getI64IntegerAttr(dist));
+    else
+      access.removeDistAttr();
+  }
+  for (auto &[access, inner] : info.aboveDeps)
+    access.setInnerDistAttr(Builder(access).getDenseI64ArrayAttr(inner));
 }
 
 /// Walk down from `outer`, collecting a maximal chain of nested canonical
@@ -352,7 +648,12 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
       // nest. (spmv's per-row `rowptr[i]` bound is defined inside it and
       // lands here.) Zero-trip degeneracy is handled dynamically by the
       // ANDed entry condition instead of a static trip-count check.
-      if (!isDefinedAboveNest(level->ubValue, outer))
+      if (level->ubValue && !isDefinedAboveNest(level->ubValue, outer))
+        return std::nullopt;
+      // A runtime lower bound only on the outermost level, whose init is
+      // the nest's own operand: an inner level restarts from its lower
+      // bound every pass, which the odometer's constant reset cannot do.
+      if (level->lbValue && !nest.empty())
         return std::nullopt;
     } else {
       // Require a non-zero constant trip count so the flattened loop isn't
@@ -453,17 +754,23 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
   info.preOps.back().clear();
   info.postOps.back().clear();
 
-  // Runtime-bound nests must be PERFECT: the wrap-predicated form skips a
-  // boundary epilogue whenever the levels below zero-trip, but the
-  // original ran it — so any pre-op, post-op, or carried chain refuses
-  // (Vitis draws the same line: it flattens the perfect scatter nest and
-  // leaves every reduction-epilogue nest alone). They must also be free
-  // of dynamic-latency accesses: the flatten changes the loop structure
-  // an AXI kernel's descriptor planning and posted-write overlap were
-  // measured on (Vitis likewise disables flattening on its m_axi
-  // variant), and this pass's byte-diff discipline keeps AXI netlists
-  // frozen.
-  if (llvm::any_of(nest, [](const NestLevel &l) { return l.isRuntime(); })) {
+  // Nests with a runtime INNER bound must be PERFECT: the wrap-predicated
+  // form skips a boundary epilogue whenever the levels below zero-trip,
+  // but the original ran it — so any pre-op, post-op, or carried chain
+  // refuses (Vitis draws the same line: it flattens the perfect scatter
+  // nest and leaves every reduction-epilogue nest alone). A runtime bound
+  // on the outermost level alone is no such case: the inner levels' trips
+  // are constant and non-zero, and the outermost level's own zero trip is
+  // the flattened loop's entry condition, as in the original (Vitis
+  // flattens correlation's triangular `j` nest, epilogue and all). All
+  // runtime nests must also be free of dynamic-latency accesses: the
+  // flatten changes the loop structure an AXI kernel's descriptor
+  // planning and posted-write overlap were measured on (Vitis likewise
+  // disables flattening on its m_axi variant), and this pass's byte-diff
+  // discipline keeps AXI netlists frozen.
+  bool runtimeInner = llvm::any_of(
+      llvm::drop_begin(nest), [](const NestLevel &l) { return l.isRuntime(); });
+  if (runtimeInner) {
     for (NestLevel lvl : nest)
       if (lvl.loop.getInits().size() != 1)
         return std::nullopt;
@@ -473,6 +780,8 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
     for (auto &ops : info.postOps)
       if (!ops.empty())
         return std::nullopt;
+  }
+  if (llvm::any_of(nest, [](const NestLevel &l) { return l.isRuntime(); })) {
     bool hasDynAccess = false;
     nest.back().loop->walk([&](Operation *op) {
       bool dyn = false;
@@ -540,22 +849,20 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
         }
         // New chain anchored at boundary k-1. Its init must be reset-safe:
         // a constant, a nest-invariant value, or a load-shaped pre-op of
-        // the origin boundary (re-executed once per pass).
+        // the origin boundary, possibly under pure ops (re-executed once
+        // per pass).
         Operation *initLoad = nullptr;
-        if (!isConstantValue(init) && !isDefinedAboveNest(init, outer)) {
-          Operation *def = init.getDefiningOp();
-          if (def && !isPure(def) &&
-              llvm::is_contained(info.preOps[k - 1], def))
-            initLoad = def;
-          else
-            return std::nullopt;
-        }
+        SmallVector<Operation *> initOps;
+        if (!isConstantValue(init) && !isDefinedAboveNest(init, outer) &&
+            !matchInitLoad(init, info.preOps[k - 1], initLoad, initOps))
+          return std::nullopt;
         origin = int(k) - 1;
 
         CarriedChain chain;
         chain.originLevel = origin;
         chain.init = init;
         chain.initLoad = initLoad;
+        chain.initOps = std::move(initOps);
         chain.argIdx.assign(N, -1);
         chain.argIdx[k] = a;
         chainAt[k][a] = info.chains.size();
@@ -653,21 +960,32 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
   }
 
   // --- Validate load-shaped pre-op uses. ---
-  // A non-pure pre-op's single result may only be a chain init (its
-  // re-execution schedule is defined by the chain's pass structure).
+  // A non-pure pre-op's single result may only compute ONE chain's init
+  // (its re-execution schedule is defined by that chain's pass
+  // structure): it and the pure ops over it feed only each other and the
+  // next level's init.
   for (unsigned k = 0; k + 1 < N; ++k) {
     for (Operation *op : info.preOps[k]) {
       if (isPure(op))
         continue;
-      bool isChainInit = false;
-      for (const CarriedChain &chain : info.chains)
-        if (chain.initLoad == op)
-          isChainInit = true;
-      if (!isChainInit)
+      const CarriedChain *owner = nullptr;
+      for (const CarriedChain &chain : info.chains) {
+        if (chain.initLoad != op)
+          continue;
+        if (owner)
+          return std::nullopt; // one load, two chains
+        owner = &chain;
+      }
+      if (!owner)
         return std::nullopt;
-      for (OpOperand &use : op->getResult(0).getUses())
-        if (use.getOwner() != nest[k + 1].loop.getOperation())
-          return std::nullopt;
+      llvm::SmallPtrSet<Operation *, 8> initSet(owner->initOps.begin(),
+                                                owner->initOps.end());
+      initSet.insert(op);
+      for (Operation *initOp : initSet)
+        for (OpOperand &use : initOp->getUses())
+          if (use.getOwner() != nest[k + 1].loop.getOperation() &&
+              !initSet.contains(use.getOwner()))
+            return std::nullopt;
     }
   }
 
@@ -723,6 +1041,8 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
   // result); chain results with origin -1 are rewired too. Other extras
   // were rejected during chain construction.
 
+  if (!planDependences(info))
+    return std::nullopt;
   return info;
 }
 
@@ -918,9 +1238,11 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
   inits.reserve(N + M + C);
   ivTypes.reserve(N + M + C);
   for (NestLevel lvl : nest) {
-    auto cst = builder.create<arith::ConstantOp>(
-        loc, lvl.ivType, IntegerAttr::get(lvl.ivType, lvl.lb));
-    inits.push_back(cst);
+    inits.push_back(lvl.lbValue
+                        ? lvl.lbValue
+                        : builder.create<arith::ConstantOp>(
+                              loc, lvl.ivType,
+                              IntegerAttr::get(lvl.ivType, lvl.lb)));
     ivTypes.push_back(lvl.ivType);
   }
   for (const AddrCandidate &cand : candidates) {
@@ -940,10 +1262,21 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
   // loop just as the original program did.
   IRMapping lbMap;
   for (unsigned k = 0; k < N; ++k) {
-    auto lbCst = builder.create<arith::ConstantOp>(
-        loc, nest[k].ivType, IntegerAttr::get(nest[k].ivType, nest[k].lb));
-    lbMap.map(nest[k].ivAfter, lbCst);
+    Value lb = nest[k].lbValue;
+    if (!lb)
+      lb = builder.create<arith::ConstantOp>(
+          loc, nest[k].ivType, IntegerAttr::get(nest[k].ivType, nest[k].lb));
+    lbMap.map(nest[k].ivAfter, lb);
   }
+  // The pure pre-ops that compute a chain init from its load: they run
+  // with the load, never with the other pre-ops.
+  llvm::SmallPtrSet<Operation *, 8> initOps;
+  for (const CarriedChain &chain : info.chains)
+    initOps.insert(chain.initOps.begin(), chain.initOps.end());
+  auto isBodyPreOp = [&](Operation *op) {
+    return isPure(op) && !initOps.contains(op);
+  };
+
   bool clonedLbPreOps = false;
   SmallVector<Value> chainInits;
   for (const CarriedChain &chain : info.chains) {
@@ -954,7 +1287,7 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
         // order, at lower-bound IVs (dead ones fall to later CSE/DCE).
         for (unsigned k = 0; k + 1 < N; ++k)
           for (Operation *op : info.preOps[k])
-            if (isPure(op))
+            if (isBodyPreOp(op))
               builder.clone(*op, lbMap);
         clonedLbPreOps = true;
       }
@@ -963,7 +1296,9 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
               "loopschedule.name"))
         cloned->setAttr("loopschedule.name",
                         StringAttr::get(ctx, nameAttr.getValue() + ".init"));
-      init = cloned->getResult(0);
+      for (Operation *op : chain.initOps)
+        builder.clone(*op, lbMap);
+      init = lbMap.lookupOrDefault(chain.init);
     } else if (!isDefinedAboveNest(init, outer)) {
       Operation *cloned = builder.clone(*init.getDefiningOp());
       init = cloned->getResult(cast<OpResult>(chain.init).getResultNumber());
@@ -987,14 +1322,8 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
   // (none of the unflattened runtime loops carried the attribute either).
   if (!anyRuntime) {
     uint64_t total = 1;
-    for (const NestLevel &lvl : nest) {
-      APInt range = lvl.ubNormalized - lvl.lb;
-      APInt step = lvl.step;
-      uint64_t trips =
-          (range.zext(64) + (step.zext(64) - 1)).udiv(step.zext(64))
-              .getZExtValue();
-      total *= trips;
-    }
+    for (const NestLevel &lvl : nest)
+      total *= *constantTrips(lvl);
     flat->setAttr("loopschedule.trip_count",
                   IntegerAttr::get(IntegerType::get(ctx, 64), total));
   }
@@ -1011,7 +1340,7 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
     // the ORIGINAL (pre-normalization) ub and predicate.
     const NestLevel &outerLvl = nest.front();
     Value outerUb;
-    if (outerLvl.isRuntime()) {
+    if (outerLvl.ubValue) {
       outerUb = outerLvl.ubValue;
     } else {
       auto ubAttr = IntegerAttr::get(
@@ -1037,7 +1366,7 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
     // non-zero-trip guarantee and need no term.
     for (unsigned k = 1; k < N; ++k) {
       const NestLevel &lvl = nest[k];
-      if (!lvl.isRuntime())
+      if (!lvl.ubValue)
         continue;
       Value term = builder.create<arith::CmpIOp>(
           loc, lvl.origPred, beforeBlock->getArgument(k), lvl.ubValue);
@@ -1074,7 +1403,7 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
     // once per pass.
     for (unsigned k = 0; k + 1 < N; ++k)
       for (Operation *op : info.preOps[k])
-        if (isPure(op))
+        if (isBodyPreOp(op))
           builder.clone(*op, mapping);
 
     // Clone the innermost body, skipping the IV update addi and the yield.
@@ -1220,7 +1549,7 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
       // for a runtime bound (it dominates the nest, so it dominates the
       // flattened loop).
       Value ubVal;
-      if (lvl.isRuntime()) {
+      if (lvl.ubValue) {
         ubVal = lvl.ubValue;
       } else {
         ubVal = builder.create<arith::ConstantOp>(
@@ -1293,13 +1622,15 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
         builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
         for (unsigned k = 0; k + 1 < N; ++k)
           for (Operation *op : info.preOps[k])
-            if (isPure(op))
+            if (isBodyPreOp(op))
               builder.clone(*op, nextMap);
         // This clone KEEPS the original loopschedule.name: it is the one
         // inside the pipelined loop, so the memory-dependence records that
         // reference the original load by name must resolve to it.
-        Operation *cloned = builder.clone(*chain.initLoad, nextMap);
-        builder.create<scf::YieldOp>(loc, cloned->getResult(0));
+        builder.clone(*chain.initLoad, nextMap);
+        for (Operation *op : chain.initOps)
+          builder.clone(*op, nextMap);
+        builder.create<scf::YieldOp>(loc, nextMap.lookupOrDefault(chain.init));
       }
       {
         OpBuilder::InsertionGuard g2(builder);
@@ -1365,6 +1696,7 @@ void SCFWhileLoopFlatteningPass::runOnOperation() {
     for (NestLevel &lvl : nest->levels)
       consumed.insert(lvl.loop.getOperation());
     emitFlattenedNest(builder, *nest);
+    applyDependences(*nest);
   }
 }
 

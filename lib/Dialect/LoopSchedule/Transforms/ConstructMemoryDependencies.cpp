@@ -27,10 +27,12 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Visitors.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Casting.h"
+#include <limits>
 #include <set>
 
 namespace circt {
@@ -104,15 +106,22 @@ static bool appearsBefore(Operation *a, Operation *b) {
 
 namespace {
 struct MemoryDependence {
-  MemoryDependence(StringRef source, unsigned int distance)
-      : source(source), distance(distance) {}
+  MemoryDependence(StringRef source, unsigned int distance,
+                   unsigned outerDepth = 0, ArrayRef<int64_t> innerDist = {})
+      : source(source), distance(distance), outerDepth(outerDepth),
+        innerDist(innerDist) {}
   StringRef source;
   unsigned int distance;
+  /// Non-zero for a dependence carried by an outer loop: that loop's depth,
+  /// and the distance lower bounds in the loops below it (see
+  /// LoopScheduleAccessOp).
+  unsigned outerDepth;
+  SmallVector<int64_t> innerDist;
 
   friend bool operator<(const MemoryDependence &lhs,
                         const MemoryDependence &rhs) {
-    return std::tie(lhs.source, lhs.distance) <
-           std::tie(rhs.source, rhs.distance);
+    return std::tie(lhs.source, lhs.distance, lhs.outerDepth, lhs.innerDist) <
+           std::tie(rhs.source, rhs.distance, rhs.outerDepth, rhs.innerDist);
   }
 };
 } // namespace
@@ -197,6 +206,20 @@ getConstantAccessIndices(Operation *op, ConstantIndexCache &cache) {
   if (allConstant)
     indices = std::move(constants);
   return cache.try_emplace(op, std::move(indices)).first->second;
+}
+
+/// The closest loop around `op`, or null.
+static Operation *parentLoop(Operation *op) {
+  auto loop = op->getParentOfType<LoopLikeOpInterface>();
+  return loop ? loop.getOperation() : nullptr;
+}
+
+/// The depth of `loop` among every loop around it (1 = outermost).
+static unsigned loopDepth(Operation *loop) {
+  unsigned depth = 1;
+  while ((loop = parentLoop(loop)))
+    ++depth;
+  return depth;
 }
 
 static void checkAffineAccessPair(Operation *source, Operation *destination,
@@ -293,6 +316,41 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
       results[nameAnalysis.getOperationName(destination)].emplace(
           nameAnalysis.getOperationName(source), 0);
     }
+  }
+  if (isIntraIteration)
+    return;
+
+  // Dependences carried by an outer common loop. A pipeline over the inner
+  // loop never sees them (it drains before the outer loop moves on), but
+  // flattening the nest into one pipeline does: record each with the
+  // distance bounds the flattener needs to place it in the merged loop.
+  for (unsigned outer = 1; outer < numCommonLoops; ++outer) {
+    FlatAffineValueConstraints outerConstraints;
+    SmallVector<DependenceComponent, 2> outerComps;
+    DependenceResult outerResult = checkMemrefAccessDependence(
+        src, dst, outer, &outerConstraints, &outerComps, false);
+    if (!hasDependence(outerResult))
+      continue;
+    // Depths count every loop, as the flattener (on scf.while) does; a
+    // non-affine loop in between gets an unknown bound.
+    Operation *carrier = outerComps[outer - 1].op;
+    SmallVector<Operation *> below;
+    for (Operation *loop = outerComps.back().op; loop && loop != carrier;
+         loop = parentLoop(loop))
+      below.push_back(loop);
+    SmallVector<int64_t> inner;
+    for (Operation *loop : llvm::reverse(below)) {
+      const auto *comp = llvm::find_if(
+          outerComps, [&](const DependenceComponent &c) { return c.op == loop; });
+      // Unbounded below (or unknown): INT64_MIN.
+      inner.push_back(comp != outerComps.end() && comp->lb
+                          ? *comp->lb
+                          : std::numeric_limits<int64_t>::min());
+    }
+    results[nameAnalysis.getOperationName(destination)].emplace(
+        nameAnalysis.getOperationName(source),
+        std::max<int64_t>(outerComps[outer - 1].lb.value_or(1), 1),
+        loopDepth(carrier), inner);
   }
 }
 
@@ -436,7 +494,14 @@ static void insertDependencies(const MemoryDependenceResult &results,
       auto sourceName = builder.getStringAttr(sourceNameRef);
       auto dist =
           dep.distance > 0 ? builder.getI64IntegerAttr(dep.distance) : nullptr;
-      LoopScheduleAccessOp::create(builder, sourceName, dist);
+      IntegerAttr outerDepth;
+      DenseI64ArrayAttr innerDist;
+      if (dep.outerDepth) {
+        outerDepth = builder.getI64IntegerAttr(dep.outerDepth);
+        innerDist = builder.getDenseI64ArrayAttr(dep.innerDist);
+      }
+      LoopScheduleAccessOp::create(builder, sourceName, dist, outerDepth,
+                                   innerDist);
     }
   }
 }

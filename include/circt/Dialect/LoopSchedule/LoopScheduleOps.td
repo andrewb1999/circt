@@ -501,10 +501,27 @@ def LoopScheduleAccessOp : LoopScheduleOp<"access",
     ]> {
   let summary = "Defines an access that another op depends on";
   let description = [{
+    A dependence of the enclosing `depends_on`'s access on this one. Without
+    `dist`, the two run in the same iteration of every loop around both and
+    this one comes first. With `dist<d>`, the dependence is carried by the
+    innermost loop around both, at least `d` iterations apart: the only kind
+    a pipeline over that loop has to schedule.
+
+    `outer<L, [d_1, ..., d_m]>` marks a dependence carried by an outer loop
+    instead: the loop at depth L (1 = outermost; every loop around it
+    counts, affine or not), at least
+    `dist` iterations apart there, and at least `d_i` iterations apart (a
+    lower bound, possibly negative) in each of the m loops below it around
+    both accesses at the time the table was built. The scheduler ignores
+    these, since an inner loop finishes before the outer one moves on.
+    SCFWhileLoopFlattening, which merges such loops into one pipeline, turns
+    them into distances in the merged loop's iterations.
   }];
 
   let arguments = (ins StrAttr:$accessName,
-                       OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<1>]>>:$dist);
+                       OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<1>]>>:$dist,
+                       OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<1>]>>:$outerDepth,
+                       OptionalAttr<DenseI64ArrayAttr>:$innerDist);
   let hasCustomAssemblyFormat = 1;
 }
 

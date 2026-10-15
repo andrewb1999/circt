@@ -376,6 +376,83 @@ func.func @runtime_bound_sle(%ubDyn: i32) {
 
 // -----
 
+// Positive (runtime bounds): a runtime lower bound at the OUTERMOST level
+// (a triangular nest's `for j = i + 1 ...` inside an unflattened `i`) is the
+// flattened loop's initial value; the outer condition is unchanged, so a
+// lower bound past the upper still runs nothing.
+
+// CHECK-LABEL: func.func @runtime_outer_lb
+// CHECK-SAME:      %{{.+}}: memref<64xi32>, %[[LB:.+]]: i32
+// CHECK:         scf.while (%[[I:.+]] = %[[LB]], %{{.+}} = %{{.+}}) : (i32, i32) -> (i32, i32)
+// CHECK:           arith.cmpi slt, %[[I]], %{{.+}} : i32
+// CHECK:         do {
+// CHECK-NOT:       scf.while
+// CHECK:           memref.store
+// CHECK:         } attributes {hls.pipeline}
+func.func @runtime_outer_lb(%A: memref<64xi32>, %lb: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %ri = scf.while (%i = %lb) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c8 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c8 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %s = arith.addi %i, %j : i32
+      %si = arith.index_cast %s : i32 to index
+      memref.store %c0, %A[%si] : memref<64xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    } attributes {hls.pipeline}
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Negative (runtime bounds): a runtime lower bound at an INNER level would
+// be the reset value of the odometer; not supported.
+
+// CHECK-LABEL: func.func @neg_runtime_inner_lb
+// CHECK:         scf.while
+// CHECK:         do {
+// CHECK:           scf.while
+// CHECK:         }
+func.func @neg_runtime_inner_lb(%A: memref<64xi32>, %lb: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %ri = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c8 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %rj = scf.while (%j = %lb) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c8 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %s = arith.addi %i, %j : i32
+      %si = arith.index_cast %s : i32 to index
+      memref.store %c0, %A[%si] : memref<64xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    } attributes {hls.pipeline}
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
 // Positive (since almost-perfect support): a stray PURE op after a
 // PIPELINED inner loop is a legal post-op; it is predicated on the inner
 // wrap and the nest still flattens.
@@ -1201,6 +1278,60 @@ func.func @gemv_acc(%A: memref<64xi32>, %y: memref<8xi32>) {
 
 // -----
 
+// Positive (almost-perfect): the accumulator starts from a LOAD under pure
+// ops (`D[i] * beta`). The load and the multiply run together: once at the
+// lower-bound IVs before the loop, and again under the wrap predicate with
+// the next pass's IVs.
+
+// CHECK-LABEL: func.func @load_init_scaled
+// CHECK-SAME:      %[[D:[^:]+]]: memref<8xi32>, %{{.+}}: memref<8xi32>, %[[BETA:.+]]: i32
+// CHECK:         %[[D0:.+]] = memref.load %[[D]][%{{.+}}] : memref<8xi32>
+// CHECK:         %[[INIT:.+]] = arith.muli %[[D0]], %[[BETA]] : i32
+// CHECK:         scf.while (%{{.+}} = %{{.+}}, %{{.+}} = %{{.+}}, %{{.+}} = %[[INIT]]) : (i32, i32, i32) -> (i32, i32, i32)
+// CHECK:         do {
+// CHECK:           %[[SUM:.+]] = arith.addi
+// CHECK:           %[[WRAP:.+]] = arith.cmpi sge
+// CHECK:           scf.if %[[WRAP]] {
+// CHECK-NEXT:        memref.store %[[SUM]]
+// CHECK:           scf.if %[[WRAP]] -> (i32) {
+// CHECK:             %[[DN:.+]] = memref.load %[[D]][%{{.+}}] : memref<8xi32>
+// CHECK-NEXT:        %[[NEXT:.+]] = arith.muli %[[DN]], %[[BETA]] : i32
+// CHECK-NEXT:        scf.yield %[[NEXT]] : i32
+// CHECK-NEXT:      } else {
+// CHECK-NEXT:        scf.yield %[[SUM]] : i32
+// CHECK-NOT:     scf.while (
+func.func @load_init_scaled(%A: memref<64xi32>, %D: memref<8xi32>, %y: memref<8xi32>, %beta: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %ri = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c8 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %ii = arith.index_cast %i : i32 to index
+    %d = memref.load %D[%ii] : memref<8xi32>
+    %init = arith.muli %d, %beta : i32
+    %rj:2 = scf.while (%j = %c0, %acc = %init) : (i32, i32) -> (i32, i32) {
+      %cj = arith.cmpi slt, %j, %c8 : i32
+      scf.condition(%cj) %j, %acc : i32, i32
+    } do {
+    ^bb0(%j: i32, %acc: i32):
+      %ji = arith.index_cast %j : i32 to index
+      %a = memref.load %A[%ji] : memref<64xi32>
+      %s = arith.addi %acc, %a : i32
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn, %s : i32, i32
+    } attributes {hls.pipeline}
+    memref.store %rj#1, %y[%ii] : memref<8xi32>
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
 // Positive (almost-perfect): conv-style THREADING. The accumulator is
 // initialized at the outermost boundary, threads untouched through the
 // middle level's iter-args, and is updated only in the innermost body.
@@ -1394,6 +1525,157 @@ func.func @neg_sequential_almost_perfect(%y: memref<8xi32>) {
     }
     %ii = arith.index_cast %i : i32 to index
     memref.store %rj#1, %y[%ii] : memref<8xi32>
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
+// Memory dependences: the table was built on the separate loops, where a
+// pipeline over j never overlapped two k iterations, so the k-carried
+// read-modify-write of C[j] is tagged outer<1, [0]> (carried by the depth-1
+// loop, 0 apart in j). Flattened, it is 16 iterations apart (j's trip
+// count): a distance the merged pipeline schedules. The write-after-read the
+// other way runs its source first in the body, so it becomes same-iteration.
+
+// CHECK-LABEL: loopschedule.dependencies @rmw_deps
+// CHECK:         loopschedule.depends_on "load0" {
+// CHECK-NEXT:      loopschedule.access "store0" dist<16>{{$}}
+// CHECK:         loopschedule.depends_on "store0" {
+// CHECK-NEXT:      loopschedule.access "load0"{{$}}
+// CHECK-NEXT:      loopschedule.access "load0"{{$}}
+// CHECK-LABEL: func.func @rmw
+// CHECK:         scf.while
+// CHECK-NOT:     scf.while (
+loopschedule.dependencies @rmw_deps {
+  loopschedule.depends_on "load0" {
+    loopschedule.access "store0" dist<1> outer<1, [0]>
+  }
+  loopschedule.depends_on "store0" {
+    loopschedule.access "load0"
+    loopschedule.access "load0" dist<1> outer<1, [0]>
+  }
+}
+func.func @rmw(%A: memref<128xi32>, %C: memref<16xi32>) attributes {loopschedule.dependencies = @rmw_deps} {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %c16 = arith.constant 16 : i32
+  %rk = scf.while (%k = %c0) : (i32) -> i32 {
+    %ck = arith.cmpi slt, %k, %c8 : i32
+    scf.condition(%ck) %k : i32
+  } do {
+  ^bb0(%k: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %c16 : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %ji = arith.index_cast %j : i32 to index
+      %c = memref.load %C[%ji] {loopschedule.name = "load0"} : memref<16xi32>
+      %s = arith.addi %c, %k : i32
+      memref.store %s, %C[%ji] {loopschedule.name = "store0"} : memref<16xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    } attributes {hls.pipeline}
+    %kn = arith.addi %k, %c1 : i32
+    scf.yield %kn : i32
+  }
+  return
+}
+
+// -----
+
+// Negative: the same dependence under a runtime inner bound (syrk's
+// `for k: for j < i + 1: C[i][j] += ...`) is `n` flattened iterations
+// apart, as few as one: no distance to give it, so the nest stays.
+
+// CHECK-LABEL: func.func @neg_rmw_runtime_inner
+// CHECK:         scf.while
+// CHECK:         do {
+// CHECK:           scf.while
+// CHECK:         }
+loopschedule.dependencies @neg_rmw_runtime_inner_deps {
+  loopschedule.depends_on "load0" {
+    loopschedule.access "store0" dist<1> outer<1, [0]>
+  }
+}
+func.func @neg_rmw_runtime_inner(%C: memref<16xi32>, %n: i32) attributes {loopschedule.dependencies = @neg_rmw_runtime_inner_deps} {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %rk = scf.while (%k = %c0) : (i32) -> i32 {
+    %ck = arith.cmpi slt, %k, %c8 : i32
+    scf.condition(%ck) %k : i32
+  } do {
+  ^bb0(%k: i32):
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %n : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %ji = arith.index_cast %j : i32 to index
+      %c = memref.load %C[%ji] {loopschedule.name = "load0"} : memref<16xi32>
+      %s = arith.addi %c, %k : i32
+      memref.store %s, %C[%ji] {loopschedule.name = "store0"} : memref<16xi32>
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    } attributes {hls.pipeline}
+    %kn = arith.addi %k, %c1 : i32
+    scf.yield %kn : i32
+  }
+  return
+}
+
+// -----
+
+// A chain's re-load and a boundary's epilogue: `y[i] = y[i] * beta + sum_j`
+// reads y[i] before the row and writes it after. Flattened, the read for row
+// i runs as row i - 1 ends, after that row's write: the same-iteration
+// write-after-read becomes a whole row (8 iterations) apart.
+
+// CHECK-LABEL: loopschedule.dependencies @reload_deps
+// CHECK:         loopschedule.depends_on "store0" {
+// CHECK-NEXT:      loopschedule.access "load0" dist<8>{{$}}
+// CHECK-LABEL: func.func @reload
+// CHECK:         memref.load {{.*}}loopschedule.name = "load0.init"
+// CHECK:         scf.while
+// CHECK:           scf.if
+// CHECK-NEXT:        memref.store {{.*}}loopschedule.name = "store0"
+// CHECK:           scf.if
+// CHECK-NEXT:        arith.index_cast
+// CHECK-NEXT:        memref.load {{.*}}loopschedule.name = "load0"
+loopschedule.dependencies @reload_deps {
+  loopschedule.depends_on "store0" {
+    loopschedule.access "load0"
+  }
+}
+func.func @reload(%A: memref<64xi32>, %y: memref<8xi32>, %beta: i32) attributes {loopschedule.dependencies = @reload_deps} {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c8 = arith.constant 8 : i32
+  %ri = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c8 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %ii = arith.index_cast %i : i32 to index
+    %y0 = memref.load %y[%ii] {loopschedule.name = "load0"} : memref<8xi32>
+    %init = arith.muli %y0, %beta : i32
+    %rj:2 = scf.while (%j = %c0, %acc = %init) : (i32, i32) -> (i32, i32) {
+      %cj = arith.cmpi slt, %j, %c8 : i32
+      scf.condition(%cj) %j, %acc : i32, i32
+    } do {
+    ^bb0(%j: i32, %acc: i32):
+      %ji = arith.index_cast %j : i32 to index
+      %a = memref.load %A[%ji] : memref<64xi32>
+      %s = arith.addi %acc, %a : i32
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn, %s : i32, i32
+    } attributes {hls.pipeline}
+    memref.store %rj#1, %y[%ii] {loopschedule.name = "store0"} : memref<8xi32>
     %in = arith.addi %i, %c1 : i32
     scf.yield %in : i32
   }

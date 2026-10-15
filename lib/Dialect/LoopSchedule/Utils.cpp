@@ -94,6 +94,16 @@ bool oneIsStore(Operation *op, Operation *otherOp) {
   return firstIsStore || secondIsStore;
 }
 
+/// Record a memory dependence's distance. Several table entries can name
+/// the same pair of operations (one carried by the inner loop, another by
+/// an outer loop SCFWhileLoopFlattening merged into it), and the problem
+/// keeps one distance per pair: the closest binds.
+static void setMemoryDistance(scheduling::CyclicProblem &problem,
+                              Problem::Dependence dep, unsigned distance) {
+  std::optional<unsigned> old = problem.getDistance(dep);
+  problem.setDistance(dep, old ? std::min(*old, distance) : distance);
+}
+
 bool hasLoopScheduleDependence(Operation *op, Operation *otherOp) {
   if (isa<LoadInterface, StoreInterface>(op)) {
     if (!isa<LoadInterface, StoreInterface>(otherOp)) {
@@ -158,7 +168,7 @@ getModuloProblem(scf::WhileOp whileOp,
       // proper analysis and lowerings, this can be relaxed.
       // unsigned distance = memoryDep.distance;
       if (distance > 0)
-        problem.setDistance(dep, distance);
+        setMemoryDistance(problem, dep, distance);
     }
   });
 
@@ -242,7 +252,7 @@ getChainingModuloProblem(scf::WhileOp whileOp,
       // proper analysis and lowerings, this can be relaxed.
       // unsigned distance = memoryDep.distance;
       if (distance > 0)
-        problem.setDistance(dep, distance);
+        setMemoryDistance(problem, dep, distance);
     }
   });
 
@@ -646,7 +656,7 @@ getChainingModuloProblem(
       // in the modulo problem (ChainingModulo's whole point — bound II by
       // both resource overlap and any real cyclic edges).
       if (memoryDep.distance > 0)
-        problem.setDistance(dep, memoryDep.distance);
+        setMemoryDistance(problem, dep, memoryDep.distance);
     }
   });
 

@@ -90,6 +90,10 @@ circt::analysis::LoopScheduleDependenceAnalysis::LoopScheduleDependenceAnalysis(
         accessNameAnalysis.getOperationFromName(destinationName);
     assert(destination != nullptr);
     for (auto access : dependsOn.getBody().getOps<LoopScheduleAccessOp>()) {
+      // Carried by an outer loop, which a pipeline over the inner one never
+      // overlaps (see LoopScheduleAccessOp).
+      if (access.getOuterDepth())
+        continue;
       auto sourceName = access.getAccessName();
       auto *source = accessNameAnalysis.getOperationFromName(sourceName);
       assert(source != nullptr);

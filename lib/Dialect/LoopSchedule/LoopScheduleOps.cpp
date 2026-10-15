@@ -742,6 +742,22 @@ ParseResult LoopScheduleAccessOp::parse(OpAsmParser &p,
     result.addAttribute("dist", dist);
   }
 
+  // outer<depth, [inner distances]>
+  if (succeeded(p.parseOptionalKeyword("outer"))) {
+    int64_t depth;
+    SmallVector<int64_t> inner;
+    if (p.parseLess() || p.parseInteger(depth) || p.parseComma() ||
+        p.parseCommaSeparatedList(OpAsmParser::Delimiter::Square,
+                                  [&]() -> ParseResult {
+                                    return p.parseInteger(inner.emplace_back());
+                                  }) ||
+        p.parseGreater())
+      return failure();
+    Builder b(p.getContext());
+    result.addAttribute("outerDepth", b.getI64IntegerAttr(depth));
+    result.addAttribute("innerDist", b.getDenseI64ArrayAttr(inner));
+  }
+
   if (p.parseOptionalAttrDict(result.attributes))
     return failure();
 
@@ -757,6 +773,13 @@ void LoopScheduleAccessOp::print(::mlir::OpAsmPrinter &p) {
   SmallVector<StringRef> elidedAttrs = {
       this->getAccessNameAttrName().getValue(),
       this->getDistAttrName().getValue()};
+  if (auto depth = getOuterDepth()) {
+    p << " outer<" << *depth << ", [";
+    llvm::interleaveComma(getInnerDist().value_or(ArrayRef<int64_t>{}), p);
+    p << "]>";
+    elidedAttrs.push_back(getOuterDepthAttrName().getValue());
+    elidedAttrs.push_back(getInnerDistAttrName().getValue());
+  }
   p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
 }
 
