@@ -73,12 +73,15 @@ public:
     auto rst = mem.getRst();
     auto memName = mem.getName();
 
-    // Create the SV memory.
+    // Create the SV memory. It carries the memory's SV attributes, such as
+    // the RAM style a synthesis tool should implement it in.
     hw::UnpackedArrayType memArrType =
         hw::UnpackedArrayType::get(memType.getElementType(), size);
-    auto svMem =
-        sv::RegOp::create(rewriter, mem.getLoc(), memArrType, mem.getNameAttr())
-            .getResult();
+    auto svReg = sv::RegOp::create(rewriter, mem.getLoc(), memArrType,
+                                   mem.getNameAttr());
+    if (auto attrs = sv::getSVAttributes(mem))
+      sv::setSVAttributes(svReg, attrs);
+    Value svMem = svReg.getResult();
 
     // Create write ports, each in its own always ff block. Synthesis tools
     // infer a multi-port RAM only from one write port per process: Vivado

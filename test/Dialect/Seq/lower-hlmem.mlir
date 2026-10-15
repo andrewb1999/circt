@@ -83,3 +83,12 @@ hw.module @three_writes(in %clk : !seq.clock, in %rst : i1, in %a0 : i3, in %a1 
   seq.write %mem3[%a2] %d wren %en { latency = 1 } : !seq.hlmem<8xi16>
   hw.output
 }
+
+// The memory's SV attributes (here, its RAM style) go to the array.
+// CHECK-LABEL:   hw.module @ram_style(
+// CHECK:           %styled = sv.reg {sv.attributes = [#sv.attribute<"ram_style" = "\22block\22">]} : !hw.inout<uarray<8xi16>>
+hw.module @ram_style(in %clk : !seq.clock, in %rst : i1, in %a : i3, in %d : i16, in %en : i1) {
+  %styled = seq.hlmem @styled %clk, %rst {sv.attributes = [#sv.attribute<"ram_style" = "\"block\"">]} : <8xi16>
+  seq.write %styled[%a] %d wren %en { latency = 1 } : !seq.hlmem<8xi16>
+  hw.output
+}
