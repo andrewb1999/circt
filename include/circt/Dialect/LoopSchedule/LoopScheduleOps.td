@@ -75,9 +75,19 @@ def LoopSchedulePipelineOp : LoopScheduleOp<"pipeline", [LoopOpInterface]> {
     whose condition is computed from ghost-corrupted iter_args, so it
     cannot be trusted to squash anything.
 
-    None of this is a structural property, so it is not verified here — it
-    is checked by the pass that solves the schedule (SCFToLoopSchedule),
-    which is the only place the start times exist.
+    The verifier checks that the condition is ready by cycle II; the rest
+    is not a structural property, so it is checked by the pass that solves
+    the schedule (SCFToLoopSchedule), which is the only place the start
+    times exist.
+
+    The verifiers of a pipeline, a frame and a pipelined function also
+    check the schedule against its ops' latencies (a memory access's port
+    latency, an operator's from the function's `oplib.library`; an
+    `arith.bitcast` takes its operand's): every op's operands ready by the
+    cycle its phase issues in, an iter-arg's update visible by the next
+    iteration's read of it, at most one op per operator instance
+    (`loopschedule.binding`) in a cycle, or in a slot (offset modulo II) of
+    a pipeline, and no more static accesses to a port there than its limit.
 
     The single-block `stages` region wraps `loopschedule.pipeline.stage`
     operations. It has a `loopschedule.terminator` terminator, which can

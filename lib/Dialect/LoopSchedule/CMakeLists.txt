@@ -9,6 +9,7 @@ add_circt_dialect_library(CIRCTLoopSchedule
   ${PROJECT_BINARY_DIR}/include
 
   LINK_LIBS PUBLIC
+  CIRCTOpLib
   MLIRArithDialect
   MLIRFuncDialect
   MLIRIR
@@ -19,6 +20,7 @@ add_circt_dialect_library(CIRCTLoopSchedule
   CIRCTLoopScheduleAttributesIncGen
   CIRCTLoopScheduleInterfacesIncGen
   CIRCTLoopScheduleLoweringInterfacesIncGen
+  CIRCTOpLibInterfacesIncGen
 )
 
 add_subdirectory(Transforms)

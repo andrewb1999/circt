@@ -13,6 +13,7 @@
 #include "circt/Dialect/LoopSchedule/LoopScheduleOps.h"
 #include "circt/Dialect/ESI/ESITypes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleAttributes.h"
+#include "circt/Dialect/OpLib/OpLibInterfaces.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -25,7 +26,10 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/STLExtras.h"
+
+#include <functional>
 #include <iterator>
+#include <map>
 
 using namespace mlir;
 using namespace circt;
@@ -234,6 +238,177 @@ void LoopSchedulePipelineOp::print(OpAsmPrinter &p) {
   p.printRegion(getStages(), /*printEntryBlockArgs=*/false);
 }
 
+//===----------------------------------------------------------------------===//
+// Schedule checks
+//===----------------------------------------------------------------------===//
+//
+// Cheap checks of a schedule against its ops' latencies, for the bugs that
+// otherwise miscompile silently: a value read before its producer delivers
+// it, a loop-carried value updated where an iteration misses it, two ops on
+// one operator instance or more accesses on a port than it has in one
+// cycle, and a pipeline condition decided too late. They read the
+// `loopschedule.at` phases of one pipeline or frame, each phase's ops
+// issuing at its offset; a launch's body runs on its own time and is left
+// out.
+
+namespace {
+/// The cycles from an op's issue to its results: a memory access's port
+/// latency, an operator's (`loopschedule.operator`) from the operator
+/// library of the enclosing function (`oplib.library`), none for anything
+/// else.
+class OpLatencies {
+public:
+  explicit OpLatencies(Operation *scope) {
+    for (Operation *op = scope; op; op = op->getParentOp())
+      if (auto name = op->getAttrOfType<SymbolRefAttr>("oplib.library")) {
+        library = SymbolTable::lookupNearestSymbolFrom(op, name);
+        break;
+      }
+  }
+
+  unsigned operator()(Operation *op) {
+    if (auto load = dyn_cast<LoadInterface>(op))
+      return load.getLatency();
+    auto sym = op->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+    if (!sym || !library)
+      return 0;
+    auto [it, inserted] = cache.try_emplace(sym.getLeafReference(), 0);
+    if (inserted)
+      if (auto entry = dyn_cast_or_null<oplib::LibraryEntryOpInterface>(
+              SymbolTable::lookupSymbolIn(library, sym.getLeafReference())))
+        it->second = entry.getEntryLatency();
+    return it->second;
+  }
+
+private:
+  Operation *library = nullptr;
+  DenseMap<StringAttr, unsigned> cache;
+};
+
+/// What the phase checks leave for a pipeline's own: the cycle each value
+/// its phases compute is ready in, and its iter-arg updates with the cycle
+/// of their phase.
+struct PhaseTiming {
+  DenseMap<Value, int64_t> ready;
+  SmallVector<std::pair<LoopScheduleIterArgUpdateOp, int64_t>> updates;
+
+  std::optional<int64_t> readyOf(Value v) const {
+    auto it = ready.find(v);
+    if (it == ready.end())
+      return std::nullopt;
+    return it->second;
+  }
+};
+} // namespace
+
+/// Check the `loopschedule.at` phases of `body`, a pipeline's (`ii` folds
+/// their offsets into its slots) or a frame's: every op's operands ready by
+/// the cycle it issues in, at most one op per operator instance
+/// (`loopschedule.binding`) in a slot, and no more static accesses to a
+/// port in a slot than its limit.
+static FailureOr<PhaseTiming>
+verifyPhases(Operation *parent, Block &body, std::optional<int64_t> ii) {
+  OpLatencies latencyOf(parent);
+  PhaseTiming timing;
+  DenseMap<std::tuple<Attribute, int64_t, int64_t>, Operation *> units;
+  std::map<std::pair<std::string, int64_t>, unsigned> portAccesses;
+
+  auto slotText = [&](int64_t slot) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    if (ii)
+      os << "slot " << slot << " of II " << *ii;
+    else
+      os << "cycle " << slot;
+    return text;
+  };
+
+  for (auto at : body.getOps<LoopScheduleAtOp>()) {
+    int64_t issue = at.getOffset();
+    int64_t slot = ii ? issue % *ii : issue;
+    std::function<LogicalResult(Block &)> visit =
+        [&](Block &block) -> LogicalResult {
+      for (Operation &op : block) {
+        if (isa<LoopScheduleLaunchOp>(op))
+          continue;
+        if (auto update = dyn_cast<LoopScheduleIterArgUpdateOp>(op)) {
+          timing.updates.push_back({update, issue});
+          continue;
+        }
+        // A bitcast relabels its operand's bits: its result is ready when
+        // they are (as the scheduler and the FSM lowering treat it).
+        if (auto bitcast = dyn_cast<arith::BitcastOp>(op)) {
+          if (auto ready = timing.readyOf(bitcast.getIn()))
+            timing.ready[bitcast.getResult()] = *ready;
+          continue;
+        }
+        // A terminator passes its operands on, to its parent's results.
+        if (!op.hasTrait<OpTrait::IsTerminator>())
+          for (auto [i, operand] : llvm::enumerate(op.getOperands()))
+            if (auto ready = timing.readyOf(operand); ready && *ready > issue)
+              return op.emitOpError("operand #")
+                     << i << " is ready in cycle " << *ready
+                     << ", after the op issues in cycle " << issue;
+
+        if (auto ifOp = dyn_cast<LoopScheduleIfOp>(op)) {
+          Block &branch = ifOp.getBody().front();
+          if (failed(visit(branch)))
+            return failure();
+          for (auto [result, yielded] :
+               llvm::zip(ifOp.getResults(), branch.getTerminator()->getOperands()))
+            timing.ready[result] =
+                std::max(issue, timing.readyOf(yielded).value_or(issue));
+          continue;
+        }
+        for (Region &region : op.getRegions())
+          for (Block &nested : region)
+            if (failed(visit(nested)))
+              return failure();
+        unsigned latency = latencyOf(&op);
+        for (Value result : op.getResults())
+          timing.ready[result] = issue + latency;
+
+        auto binding = op.getAttrOfType<IntegerAttr>("loopschedule.binding");
+        auto unit = op.getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+        if (binding && unit) {
+          auto [it, inserted] = units.try_emplace(
+              {unit.getLeafReference(), binding.getInt(), slot}, &op);
+          if (!inserted) {
+            auto diag = op.emitOpError("shares operator instance ")
+                        << unit << " #" << binding.getInt()
+                        << " with another op in " << slotText(slot);
+            diag.attachNote(it->second->getLoc()) << "the other op";
+            return diag;
+          }
+        }
+
+        std::string port;
+        std::optional<unsigned> limit;
+        if (auto load = dyn_cast<LoadInterface>(op); load && !load.isDynamic()) {
+          port = load.getUniqueId();
+          limit = load.getLimit();
+        } else if (auto store = dyn_cast<StoreInterface>(op);
+                   store && !store.isDynamic()) {
+          port = store.getUniqueId();
+          limit = store.getLimit();
+        }
+        if (limit && ++portAccesses[{port, slot}] > *limit)
+          return op.emitOpError("is access ")
+                 << portAccesses[{port, slot}] << " to port '" << port
+                 << "' in " << slotText(slot) << ", which takes " << *limit;
+      }
+      return success();
+    };
+    if (failed(visit(at.getBodyBlock())))
+      return failure();
+    for (auto [result, yielded] :
+         llvm::zip(at.getResults(), at.getYieldOp().getOperands()))
+      if (auto ready = timing.readyOf(yielded))
+        timing.ready[result] = *ready;
+  }
+  return timing;
+}
+
 LogicalResult LoopSchedulePipelineOp::verify() {
   // Verify the stages block contains at least one stage and a terminator.
   Block &stagesBlock = getStages().front();
@@ -264,6 +439,47 @@ LogicalResult LoopSchedulePipelineOp::verify() {
       lastStartTime = *startTime;
     }
   }
+
+  auto timing = verifyPhases(*this, stagesBlock, getII());
+  if (failed(timing))
+    return failure();
+  int64_t ii = getII();
+
+  // An iter-arg's update becomes visible in the cycle after its phase, or
+  // when its value is ready if later (an operator's result goes to the next
+  // iteration from the operator's output register). The next iteration's
+  // read of it, II cycles after this one's, must come at or after that.
+  // (That reads come no later than the update's phase is the loop
+  // interface's check.)
+  for (auto [update, issue] : timing->updates) {
+    int64_t visible = std::max(
+        issue + 1, timing->readyOf(update.getValue()).value_or(issue));
+    for (OpOperand &use : update.getIterArg().getUses()) {
+      Operation *user = use.getOwner();
+      if (user == update.getOperation() && use.getOperandNumber() == 0)
+        continue;
+      auto at = dyn_cast_or_null<LoopScheduleAtOp>(
+          stagesBlock.findAncestorOpInBlock(*user));
+      if (!at || visible <= at.getOffset() + ii)
+        continue;
+      auto diag = user->emitOpError("reads an iter-arg in cycle ")
+                  << at.getOffset() << "; the next iteration reads it in cycle "
+                  << at.getOffset() + ii
+                  << ", before its update becomes visible in cycle "
+                  << visible;
+      diag.attachNote(update.getLoc()) << "the update";
+      return diag;
+    }
+  }
+
+  // The condition is decided within the first II (see the op's
+  // description).
+  auto terminator = cast<LoopScheduleTerminatorOp>(stagesBlock.getTerminator());
+  if (auto decided = timing->readyOf(terminator.getCondition());
+      decided && *decided > ii)
+    return terminator.emitOpError("condition is ready in cycle ")
+           << *decided << ", past the first initiation interval (" << ii
+           << ")";
 
   // When the iteration latency is declared, it must cover every static-port
   // store's commit (issue stage + store latency) — lowerings size the
@@ -1167,6 +1383,8 @@ LogicalResult LoopScheduleFrameOp::verify() {
              << *lastOffset << ")";
     lastOffset = offset;
   }
+  if (failed(verifyPhases(*this, getBodyBlock(), std::nullopt)))
+    return failure();
 
   // Terminator presence is guaranteed by SizedRegion + the yield ops' parent
   // trait, but double-check here so we can give a clean error.
@@ -1838,7 +2056,12 @@ void LoopScheduleFuncPipelineOp::print(OpAsmPrinter &p) {
 LogicalResult LoopScheduleFuncPipelineOp::verify() {
   if (getII() < 1)
     return emitOpError("II must be >= 1");
-  return verifyFuncLikeBody(*this);
+  if (failed(verifyFuncLikeBody(*this)))
+    return failure();
+  if (!isExternal() &&
+      failed(verifyPhases(*this, getBody().front(), (int64_t)getII())))
+    return failure();
+  return success();
 }
 void LoopScheduleFuncPipelineOp::build(OpBuilder &builder,
                                         OperationState &state, StringRef name,

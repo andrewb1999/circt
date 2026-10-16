@@ -152,10 +152,10 @@ func.func @test5(%arg0: memref<?xi32>) {
   %c2 = arith.constant 2 : index
   %c10 = arith.constant 10 : index
   // CHECK: loopschedule.pipeline
-  // CHECK-SAME: II = 1
+  // CHECK-SAME: II = 2
   // CHECK-SAME: iter_args(%arg1 = %c2)
   // CHECK-SAME: (index) -> ()
-  loopschedule.pipeline II = 1 iter_args(%arg1 = %c2) : (index) -> () {
+  loopschedule.pipeline II = 2 iter_args(%arg1 = %c2) : (index) -> () {
     %0:2 = loopschedule.at 0 -> (i32, i1) {
       %cond = arith.cmpi ult, %arg1, %c10 : index
       %2 = arith.subi %arg1, %c2 : index
