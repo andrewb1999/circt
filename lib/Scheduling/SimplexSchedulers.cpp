@@ -23,6 +23,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <algorithm>
 #include <limits>
@@ -1462,7 +1463,8 @@ unsigned ModuloSimplexScheduler::computeResMinII() {
 
   for (auto pair : uses) {
     resMinII = std::max(
-        resMinII, (unsigned)ceil(pair.second / *prob.getLimit(pair.first)));
+        resMinII,
+        (unsigned)llvm::divideCeil(pair.second, *prob.getLimit(pair.first)));
   }
 
   // llvm::errs() << "resMinII = " << resMinII << "\n";
@@ -2022,7 +2024,8 @@ unsigned ChainingModuloSimplexScheduler::computeResMinII() {
 
   for (auto pair : uses) {
     resMinII = std::max(
-        resMinII, (unsigned)ceil(pair.second / *prob.getLimit(pair.first)));
+        resMinII,
+        (unsigned)llvm::divideCeil(pair.second, *prob.getLimit(pair.first)));
   }
 
   // llvm::errs() << "resMinII = " << resMinII << "\n";

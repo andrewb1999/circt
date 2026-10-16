@@ -91,3 +91,27 @@ ssp.instance @four_read_pipeline of "ModuloProblem" [II<4>] {
     operation<@_1> @last(%8) [t<8>]
   }
 }
+
+// Five uses of a resource with two units need three time steps: the
+// resource bound on the II rounds up. (Rounded down, the scheduler started
+// at II 2 and grew it to 3 while placing, a step later.)
+// CHECK-LABEL: five_on_two
+// SIMPLEX-SAME: [II<3>]
+ssp.instance @five_on_two of "ModuloProblem" [II<3>] {
+  library {
+    operator_type @_1 [latency<1>]
+    operator_type @L1_1 [latency<1>]
+  }
+  resource {
+    resource_type @L2_rsrc [limit<2>]
+  }
+  graph {
+    %0 = operation<@L1_1>() uses[@L2_rsrc] [t<0>]
+    %1 = operation<@L1_1>(%0) uses[@L2_rsrc] [t<1>]
+    %2 = operation<@L1_1>() uses[@L2_rsrc] [t<0>]
+    %3 = operation<@L1_1>(%2) uses[@L2_rsrc] [t<1>]
+    %4 = operation<@L1_1>(%1, %3) uses[@L2_rsrc] [t<2>]
+    // SIMPLEX: @last(%{{.*}}) [t<3>]
+    operation<@_1> @last(%4) [t<3>]
+  }
+}
