@@ -229,8 +229,10 @@ def HwMatchOp : OpLibOp<"hw_match",
     result order.
 
     Each body block argument carries a role from `argRoles`: `"clk"`,
-    `"reset"`, `"ce"`, `"in"`, or `"attr"` (a constant the lowering takes
-    from one of the op's attributes, e.g. a compare predicate). The custom
+    `"reset"`, `"ce"`, `"valid"` (high in the cycles the op issues, for an
+    operator with state that must see each execution once, e.g. an
+    accumulator), `"in"`, or `"attr"` (a constant the lowering takes from
+    one of the op's attributes, e.g. a compare predicate). The custom
     printer uses these to label each argument (e.g. `clk %arg0: i1, in
     %arg3: i32`).
   }];

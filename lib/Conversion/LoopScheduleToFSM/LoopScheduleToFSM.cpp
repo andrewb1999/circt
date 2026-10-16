@@ -1953,6 +1953,9 @@ static FailureOr<Value> attrPortConstant(Operation *origOp, OpBuilder &builder,
 /// `OperatorLibraryLoader::makePortAttrDict`. A port tagged
 /// `oplib.attr = "<name>"` is a constant from the op's attribute `<name>`
 /// (attrPortConstant), e.g. the predicate a compare core's wrapper decodes.
+/// A port tagged `oplib.valid` is the op's gate (`shareGate`, high in the
+/// cycles it issues, stalls excluded): an operator with state takes one
+/// step per execution of its op, e.g. an accumulator one beat.
 static LogicalResult
 emitHwInstanceFromOperator(
     Operation *origOp, OpBuilder &builder, IRMapping &mapping,
@@ -2071,6 +2074,12 @@ emitHwInstanceFromOperator(
       driver = clkValue;
     } else if (portAttrs && portAttrs.get("oplib.reset")) {
       driver = rst;
+    } else if (portAttrs && portAttrs.get("oplib.valid")) {
+      if (!shareGate)
+        return origOp->emitOpError("operator '")
+               << opName << "' needs the cycles its op issues (a valid "
+               << "port), which are not known here";
+      driver = shareGate;
     } else if (portAttrs && portAttrs.get("oplib.enable")) {
       // Pipelined operators (e.g. int_mul_pipe_*) shift internally every
       // enabled cycle. In a context that can stall (a pipeline waiting on

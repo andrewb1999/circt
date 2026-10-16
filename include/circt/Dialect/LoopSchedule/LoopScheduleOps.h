@@ -19,6 +19,7 @@
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "circt/Dialect/LoopSchedule/LoopScheduleAttributes.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
@@ -28,6 +29,13 @@ namespace circt {
 namespace loopschedule {
 
 LogicalResult verifyLoop(Operation *op);
+
+/// The running value of a `loopschedule.fmacc`, held in its operator:
+/// what every execution of one reads and writes.
+struct AccumulatorResource
+    : public mlir::SideEffects::Resource::Base<AccumulatorResource> {
+  StringRef getName() const final { return "loopschedule.accumulator"; }
+};
 
 /// Forward declaration; defined in HWMemoryLoweringState.h. Consumers of
 /// the HWMemoryInstanceLoweringInterface::lowerToHW method include that

@@ -591,6 +591,64 @@ def LoopScheduleBufferOp : LoopScheduleOp<"buffer", [Pure, SameOperandsAndResult
       [{  $input attr-dict `:` type($output) }];
 }
 
+def LoopScheduleFMaddOp : LoopScheduleOp<"fmadd", [
+    Pure, AllTypesMatch<["a", "b", "addend", "result"]>]> {
+  let summary = "Floating-point multiply-add, unfused";
+  let description = [{
+    `a * b + addend`, unfused: the product is rounded, then the sum, exactly
+    as an `arith.mulf` followed by an `arith.addf`. It is one operator
+    where the target has one for the pair (Versal's DSPFP32, its multiplier
+    feeding its adder: Vitis HLS's `fmadd`), which saves the product's
+    register and a DSP.
+
+    ```mlir
+    %r = loopschedule.fmadd %a, %b, %c : f32
+    ```
+  }];
+
+  let arguments = (ins AnyFloat:$a, AnyFloat:$b, AnyFloat:$addend);
+  let results = (outs AnyFloat:$result);
+  let assemblyFormat = [{
+    $a `,` $b `,` $addend attr-dict `:` type($result)
+  }];
+}
+
+// The running value of a `loopschedule.fmacc`, held in its operator.
+def AccumulatorState : Resource<"::circt::loopschedule::AccumulatorResource">;
+
+def LoopScheduleFMaccOp : LoopScheduleOp<"fmacc", [
+    MemoryEffects<[MemRead<AccumulatorState>, MemWrite<AccumulatorState>]>,
+    AllTypesMatch<["a", "b", "result"]>]> {
+  let summary = "Floating-point multiply-accumulate across executions";
+  let description = [{
+    Sums products across its executions. Each execution returns
+    `acc + a * b`, unfused (the product is rounded, then the sum, as an
+    `arith.mulf` followed by an `arith.addf`), where `acc` is the op's
+    result from its previous execution, or +0 for its first execution and
+    for one following an execution with `last` set.
+
+    ```mlir
+    %s = loopschedule.fmacc %a, %b, %last : f32
+    ```
+
+    Each execution is a beat of the operator, which holds the running value
+    (Versal's DSPFP32 multiply-accumulator: Vitis HLS's `fmacc`), so a loop
+    that accumulates this way carries no register and no recurrence for it.
+    The operator learns the cycles its op issues on a `valid` port (the
+    hw_match role of that name).
+
+    The running value is state, read and written by every execution: the
+    op is never speculated, duplicated, merged, moved across another, or
+    given an operator another op also uses.
+  }];
+
+  let arguments = (ins AnyFloat:$a, AnyFloat:$b, I1:$last);
+  let results = (outs AnyFloat:$result);
+  let assemblyFormat = [{
+    $a `,` $b `,` $last attr-dict `:` type($result)
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // Frames + handles (new sequential-loop surface).
 //

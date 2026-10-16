@@ -52,6 +52,7 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 namespace circt {
 namespace loopschedule {
@@ -126,6 +127,10 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
       // Memory accesses only bind against a declared port cap.
       if (!bindMemories || !limit)
         continue;
+    } else if (!isMemoryEffectFree(op)) {
+      // An operator with state (an accumulator) is its op's alone: another
+      // op's executions would step it too.
+      continue;
     } else if (!limit) {
       // No cap declared: bind in share mode when the operator is backed
       // by a physical instance; leave comb-lowered operators alone.

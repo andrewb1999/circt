@@ -347,12 +347,12 @@ HwMatchOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
 //   `(` ( role `%name` `:` type (`,` ...)* )? `)`
 //   attr-dict-with-keyword $body
 //
-// Valid roles: `clk`, `reset`, `ce`, `in`, `attr`. They're stored in
-// `argRoles` as a StrArrayAttr in block-arg order, and labelled block args
-// are printed in the same order.
+// Valid roles: `clk`, `reset`, `ce`, `valid`, `in`, `attr`. They're stored
+// in `argRoles` as a StrArrayAttr in block-arg order, and labelled block
+// args are printed in the same order.
 static bool isHwMatchArgRole(StringRef role) {
-  return role == "clk" || role == "reset" || role == "ce" || role == "in" ||
-         role == "attr";
+  return role == "clk" || role == "reset" || role == "ce" ||
+         role == "valid" || role == "in" || role == "attr";
 }
 
 ParseResult HwMatchOp::parse(OpAsmParser &parser, OperationState &result) {
