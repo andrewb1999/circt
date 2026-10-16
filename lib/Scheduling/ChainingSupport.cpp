@@ -22,8 +22,8 @@ using namespace circt::scheduling;
 using Dependence = Problem::Dependence;
 
 LogicalResult scheduling::computeChainBreakingDependences(
-    ChainingProblem &prob, float cycleTime,
-    SmallVectorImpl<Dependence> &result) {
+    ChainingProblem &prob, float cycleTime, SmallVectorImpl<Dependence> &result,
+    llvm::function_ref<bool(Operation *, Operation *)> keepChained) {
   // Sanity check: This approach treats the given `cycleTime` as a hard
   // constraint, so all individual delays must be shorter.
   for (auto opr : prob.getOperatorTypes())
@@ -78,6 +78,8 @@ LogicalResult scheduling::computeChainBreakingDependences(
     for (auto incomingChain : chains[op]) {
       Operation *origin = incomingChain.first;
       float delay = incomingChain.second;
+      if (keepChained && keepChained(origin, op))
+        continue;
       // Check whether `op` could be appended to the incoming chain without
       // violating the cycle time constraint.
       if (delay + *prob.getIncomingDelay(opr) > cycleTime) {

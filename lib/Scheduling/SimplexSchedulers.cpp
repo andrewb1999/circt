@@ -20,6 +20,7 @@
 #include "mlir/IR/Operation.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
 
@@ -425,8 +426,14 @@ protected:
 public:
   /// Added on top of the resource-derived minimum II for this attempt; the
   /// driver bumps it when an attempt fails (budget exhausted or genuinely
-  /// infeasible), mirroring Rau's ModuloSchedule outer loop.
+  /// infeasible), mirroring Rau's ModuloSchedule outer loop. A requested II
+  /// is the attempt's II instead.
   unsigned iiIncrement = 0;
+
+  /// The II the recurrences need with every chain longer than the cycle
+  /// time broken. An attempt below it leaves the chains on recurrences
+  /// whole: the II takes precedence over the cycle time.
+  unsigned recurrenceChainsII = 0;
 
   ChainingModuloSimplexScheduler(ChainingModuloProblem &prob, Operation *lastOp,
                                  float cycleTime,
@@ -2022,22 +2029,102 @@ unsigned ChainingModuloSimplexScheduler::computeResMinII() {
   return resMinII;
 }
 
+/// The recurrences of `prob`: each operation on a cycle of its dependence
+/// graph (a cycle closes through an inter-iteration dependence), mapped to
+/// the strongly connected component it lies in.
+static DenseMap<Operation *, unsigned> recurrenceComponents(Problem &prob) {
+  DenseMap<Operation *, SmallVector<Operation *, 4>> succs;
+  DenseSet<Operation *> selfLoops;
+  for (auto *op : prob.getOperations())
+    for (auto dep : prob.getDependences(op)) {
+      if (dep.getSource() == op)
+        selfLoops.insert(op);
+      else
+        succs[dep.getSource()].push_back(op);
+    }
+
+  // Tarjan's algorithm.
+  DenseMap<Operation *, unsigned> index, lowlink, component;
+  SmallVector<Operation *> stack;
+  DenseSet<Operation *> onStack;
+  unsigned nextIndex = 0, nextComponent = 0;
+  std::function<void(Operation *)> visit = [&](Operation *v) {
+    index[v] = lowlink[v] = nextIndex++;
+    stack.push_back(v);
+    onStack.insert(v);
+    for (Operation *w : succs.lookup(v)) {
+      if (!index.count(w)) {
+        visit(w);
+        unsigned low = lowlink.lookup(w);
+        lowlink[v] = std::min(lowlink[v], low);
+      } else if (onStack.contains(w)) {
+        unsigned low = index.lookup(w);
+        lowlink[v] = std::min(lowlink[v], low);
+      }
+    }
+    if (lowlink.lookup(v) != index.lookup(v))
+      return;
+    SmallVector<Operation *> members;
+    Operation *w;
+    do {
+      w = stack.pop_back_val();
+      onStack.erase(w);
+      members.push_back(w);
+    } while (w != v);
+    if (members.size() < 2 && !selfLoops.contains(v))
+      return;
+    for (Operation *member : members)
+      component[member] = nextComponent;
+    ++nextComponent;
+  };
+  for (auto *op : prob.getOperations())
+    if (!index.count(op))
+      visit(op);
+  return component;
+}
+
 LogicalResult ChainingModuloSimplexScheduler::schedule() {
-  if (failed(checkLastOp()) || failed(computeChainBreakingDependences(
-                                   prob, cycleTime, additionalConstraints)))
+  unsigned resMinII = computeResMinII();
+  if (ii && *ii < (int32_t)resMinII) {
+    LLVM_DEBUG(dbgs() << "Requested II = " << *ii
+                      << " is below the resource bound " << resMinII << "\n");
+    return failure();
+  }
+  parameterS = 0;
+  parameterT = ii ? std::max<int32_t>(*ii, 1)
+                  : std::max(resMinII + iiIncrement, 1u);
+
+  // Below the II its recurrences need with every chain longer than the
+  // cycle time broken, the II takes precedence (Vitis HLS's rule): a chain
+  // on a recurrence stays whole and misses the cycle time instead.
+  DenseMap<Operation *, unsigned> recurrence;
+  if (parameterT < (int)recurrenceChainsII)
+    recurrence = recurrenceComponents(prob);
+  auto onOneRecurrence = [&](Operation *origin, Operation *op) {
+    auto o = recurrence.find(origin), d = recurrence.find(op);
+    return o != recurrence.end() && d != recurrence.end() &&
+           o->second == d->second;
+  };
+  llvm::function_ref<bool(Operation *, Operation *)> keepChained;
+  if (!recurrence.empty())
+    keepChained = onOneRecurrence;
+
+  if (failed(checkLastOp()) ||
+      failed(computeChainBreakingDependences(prob, cycleTime,
+                                             additionalConstraints,
+                                             keepChained)))
     return failure();
 
-  parameterS = 0;
-  parameterT = std::max(computeResMinII() + iiIncrement, 1u);
-
   LLVM_DEBUG(dbgs() << "Attempting to schedule with II = " << parameterT
+                    << (keepChained ? ", recurrence chains whole" : "")
                     << "\n");
   buildTableau();
 
   LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
 
+  // The driver reports the failure of its last attempt.
   if (failed(solveTableau())) {
-    prob.getContainingOp()->emitError() << "problem is infeasible";
+    LLVM_DEBUG(dbgs() << "Infeasible at II = " << parameterT << "\n");
     return failure();
   }
 
@@ -2148,6 +2235,17 @@ LogicalResult scheduling::scheduleSimplex(ChainingCyclicProblem &prob,
 LogicalResult scheduling::scheduleSimplex(ChainingModuloProblem &prob,
                                           Operation *lastOp, float cycleTime,
                                           std::optional<int32_t> ii) {
+  // The II the recurrences need with every chain longer than the cycle time
+  // broken: the cyclic problem's optimum, resources aside. Timing does not
+  // raise the II past what the recurrences' latencies need; resources and
+  // those latencies do (see ChainingModuloSimplexScheduler::schedule).
+  unsigned recurrenceChainsII = 0;
+  {
+    ChainingCyclicSimplexScheduler cyclic(prob, lastOp, cycleTime);
+    if (succeeded(cyclic.schedule()))
+      recurrenceChainsII = *prob.getInitiationInterval();
+  }
+
   // Rau's ModuloSchedule outer loop: attempt successively larger IIs, each
   // with a fresh scheduler whose backtracking placement is bounded by the
   // budget. The attempt cap only guards against pathological inputs; a
@@ -2156,11 +2254,13 @@ LogicalResult scheduling::scheduleSimplex(ChainingModuloProblem &prob,
   for (unsigned attempt = 0; attempt < kMaxAttempts; ++attempt) {
     ChainingModuloSimplexScheduler simplex(prob, lastOp, cycleTime, ii);
     simplex.iiIncrement = attempt;
+    simplex.recurrenceChainsII = recurrenceChainsII;
     if (succeeded(simplex.schedule()))
       return success();
     // A user-requested exact II leaves no room to retry.
     if (ii.has_value())
-      return failure();
+      return prob.getContainingOp()->emitError()
+             << "cannot schedule at the requested II = " << *ii;
   }
   return prob.getContainingOp()->emitError()
          << "modulo scheduling failed to find a feasible II after "

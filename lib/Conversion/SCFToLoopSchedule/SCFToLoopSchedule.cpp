@@ -52,6 +52,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
 #include <cassert>
@@ -973,6 +974,8 @@ static LogicalResult checkSequentialCondition(scf::WhileOp loop, Value cond) {
 
 } // namespace
 
+static void warnPastCycleTime(ChainingModuloProblem &problem, float cycleTime);
+
 void SCFToLoopSchedulePass::runOnOperation() {
   // Now a ModuleOp pass: walk each top-level func.func and lower it. The
   // pass replaces each func.func with a `loopschedule.func_sequential`, so
@@ -1299,6 +1302,7 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
           std::to_string(*requestedII) + ", minimum II is " +
           std::to_string(problem.getInitiationInterval().value()));
     }
+    warnPastCycleTime(problem, cycleTime);
 
     // Pre-cleanup (same as sequential path) before we replace funcOp.
     if (funcOp->hasAttrOfType<SymbolRefAttr>("loopschedule.dependencies")) {
@@ -1753,6 +1757,41 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
   return success();
 }
 
+/// Warn where a pipelined schedule misses the clock: at the operation that
+/// ends furthest past `cycleTime` into its time step. Its II takes
+/// precedence over the clock, so the scheduler keeps a recurrence's chain
+/// whole past the cycle time rather than raise the II. (An operator slower
+/// than the cycle on its own is clamped to it, with a warning, where its
+/// delays are set.)
+static void warnPastCycleTime(ChainingModuloProblem &problem, float cycleTime) {
+  Operation *worst = nullptr;
+  float worstEnd = cycleTime + 1e-3f;
+  for (auto *op : problem.getOperations()) {
+    auto opr = problem.getLinkedOperatorType(op);
+    auto start = problem.getStartTimeInCycle(op);
+    if (!opr || !start)
+      continue;
+    // A combinational operator ends in its own time step; a multi-cycle one
+    // ends that step at its first register.
+    float end = *start + (*problem.getLatency(*opr) == 0
+                              ? *problem.getOutgoingDelay(*opr)
+                              : *problem.getIncomingDelay(*opr));
+    if (end > worstEnd) {
+      worstEnd = end;
+      worst = op;
+    }
+  }
+  if (!worst)
+    return;
+  std::string msg;
+  llvm::raw_string_ostream(msg)
+      << "the pipelined schedule (II = " << *problem.getInitiationInterval()
+      << ") misses the clock here: this ends "
+      << llvm::format("%.3f", worstEnd) << " ns into its cycle, past the "
+      << llvm::format("%.3f", cycleTime) << " ns budget";
+  worst->emitWarning(msg);
+}
+
 /// Solve the pre-computed scheduling problem.
 LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
     scf::WhileOp &loop, ChainingModuloProblem &problem, float cycleTime) {
@@ -1805,6 +1844,7 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
         ", minimum II is " +
         std::to_string(problem.getInitiationInterval().value()));
   }
+  warnPastCycleTime(problem, cycleTime);
 
   // Optionally debug problem outputs.
   LLVM_DEBUG({

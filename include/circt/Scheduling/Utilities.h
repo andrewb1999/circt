@@ -15,6 +15,7 @@
 
 #include "circt/Scheduling/Problems.h"
 
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <functional>
@@ -37,11 +38,17 @@ LogicalResult handleOperationsInTopologicalOrder(Problem &prob, HandleOpFn fun);
 /// The dependences in the \p result vector require special handling in the
 /// concrete scheduling algorithm.
 ///
+/// \p keepChained, when given, names the chains to leave whole whatever
+/// their delay: no dependence is added from a chain's origin to an
+/// operation for which it returns true.
+///
 /// Fails if \p prob contains operator types with incoming/outgoing delays
 /// greater than \p cycleTime, or if the dependence graph contains cycles.
-LogicalResult
-computeChainBreakingDependences(ChainingProblem &prob, float cycleTime,
-                                SmallVectorImpl<Problem::Dependence> &result);
+LogicalResult computeChainBreakingDependences(
+    ChainingProblem &prob, float cycleTime,
+    SmallVectorImpl<Problem::Dependence> &result,
+    llvm::function_ref<bool(Operation *origin, Operation *op)> keepChained =
+        nullptr);
 
 /// Assuming \p prob is scheduled and contains (integer) start times, this
 /// method fills in the start times in cycle in an ASAP fashion.
