@@ -4319,6 +4319,37 @@ static unsigned firstIterArgUseOffset(loopschedule::LoopSchedulePipelineOp pipOp
   return firstUse;
 }
 
+/// The latency of the operator instances an `at` result is computed from
+/// (the deepest, through comb ops of the same `at`), or none when it comes
+/// from no instance: such a result is only valid that many cycles after the
+/// `at`, from the instance's output, and its launch-consumer capture latches
+/// it then.
+static std::optional<unsigned>
+atResultInstanceLatency(Value atResult,
+                        analysis::OperatorLibraryAnalysis *operatorLibrary) {
+  auto at = cast<loopschedule::LoopScheduleAtOp>(atResult.getDefiningOp());
+  std::optional<unsigned> latency;
+  SmallVector<Value> stack{
+      at.getYieldOp().getOperand(cast<OpResult>(atResult).getResultNumber())};
+  DenseSet<Value> seen;
+  while (!stack.empty()) {
+    Value v = stack.pop_back_val();
+    Operation *def = v.getDefiningOp();
+    if (!seen.insert(v).second || !def || !at->isAncestor(def) ||
+        isa<LoadInterface, StoreInterface, LoopScheduleLoadOp,
+            LoopScheduleStoreOp>(def))
+      continue;
+    unsigned opLatency = computeOpCycleLatency(def, operatorLibrary);
+    if (def->hasAttr("loopschedule.operator") &&
+        (opLatency > 0 || def->hasAttr("loopschedule.binding"))) {
+      latency = std::max(latency.value_or(0), opLatency);
+      continue;
+    }
+    stack.append(def->operand_begin(), def->operand_end());
+  }
+  return latency;
+}
+
 /// Residual in-at latency of at result `resIdx`: how many cycles past the
 /// at's own offset O the value still needs before a capture register may
 /// latch it. 1 — the historical floor (capture enable at O+1, readable
@@ -4509,12 +4540,12 @@ minLegalLaunchStart(loopschedule::LoopSchedulePipelineOp pipOp,
     // end of cycle O + residual (residual 1 = the historical O+2; 0 for a
     // pure-comb load-indirection result, whose capture latches a cycle
     // earlier — see atResultResidualLatency).
-    unsigned residual =
-        def == defAt.getOperation()
-            ? atResultResidualLatency(
-                  defAt, cast<OpResult>(init).getResultNumber(),
-                  operatorLibrary)
-            : 1;
+    unsigned residual = 1;
+    if (def == defAt.getOperation())
+      residual = atResultInstanceLatency(init, operatorLibrary)
+                     .value_or(atResultResidualLatency(
+                         defAt, cast<OpResult>(init).getResultNumber(),
+                         operatorLibrary));
     unsigned ready = (unsigned)defAt.getOffset() + residual + 1;
     minStart = std::max(minStart, ready > firstUse ? ready - firstUse : 0u);
   }
@@ -4803,12 +4834,17 @@ LoopScheduleToFSMPass::analyzeLoopNode(const LoopNode &node,
         // capture is register-readable from cycle O + residual + 1, so
         // start >= O + residual - S. Under PRE-ARM the stage runs one
         // cycle earlier (start+S), so its bound is one cycle tighter.
-        unsigned residual =
-            def == defAt.getOperation()
-                ? atResultResidualLatency(
-                      defAt, cast<OpResult>(operand).getResultNumber(),
-                      operatorLibrary)
-                : 1;
+        // An operator's result is captured when the operator delivers it,
+        // its latency after the `at` (atResultInstanceLatency, as the
+        // capture itself is gated); gramschmidt's `Q = A / sqrt(nrm)` read
+        // the divisor's capture four cycles before the square root filled
+        // it.
+        unsigned residual = 1;
+        if (def == defAt.getOperation())
+          residual = atResultInstanceLatency(operand, operatorLibrary)
+                         .value_or(atResultResidualLatency(
+                             defAt, cast<OpResult>(operand).getResultNumber(),
+                             operatorLibrary));
         unsigned readable = (unsigned)defAt.getOffset() + residual;
         minStart = std::max(minStart, readable > stage ? readable - stage : 0);
         minStartPreArm = std::max(
@@ -5541,28 +5577,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
     // next user (who may be reading this very result: a combinational loop
     // through the instance). So it is captured in that cycle and read from
     // the register after it, as lowerFrameBody does.
-    auto instanceLatency = [&](Value atResult) -> std::optional<unsigned> {
-      auto at = cast<LoopScheduleAtOp>(atResult.getDefiningOp());
-      std::optional<unsigned> latency;
-      SmallVector<Value> stack{at.getYieldOp().getOperand(
-          cast<OpResult>(atResult).getResultNumber())};
-      DenseSet<Value> seen;
-      while (!stack.empty()) {
-        Value v = stack.pop_back_val();
-        Operation *def = v.getDefiningOp();
-        if (!seen.insert(v).second || !def || !at->isAncestor(def) ||
-            isa<LoadInterface, StoreInterface, LoopScheduleLoadOp,
-                LoopScheduleStoreOp>(def))
-          continue;
-        unsigned opLatency = computeOpCycleLatency(def, operatorLibrary);
-        if (def->hasAttr("loopschedule.operator") &&
-            (opLatency > 0 || def->hasAttr("loopschedule.binding"))) {
-          latency = std::max(latency.value_or(0), opLatency);
-          continue;
-        }
-        stack.append(def->operand_begin(), def->operand_end());
-      }
-      return latency;
+    auto instanceLatency = [&](Value atResult) {
+      return atResultInstanceLatency(atResult, operatorLibrary);
     };
     auto resultNeedsCapture = [&](Value atResult, unsigned myOffset) {
       if (readAfterFrame(atResult))
