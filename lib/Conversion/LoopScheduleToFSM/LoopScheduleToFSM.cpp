@@ -10036,20 +10036,43 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
           staticDrives.emplace_back(target, std::move(localPorts[target]));
           continue;
         }
+        // The op's issue gate: an op bound to a shared operator instance
+        // (`loopschedule.binding`) joins it, its operands muxed in under
+        // the gate, rather than getting an instance of its own. The frame
+        // fires each `at` once, so the op needs no clock enable.
         if (failed(emitComputeOp(&op, builder, mapping, enclosingModule, clk,
-                                  rst)))
+                                  rst, /*opCE=*/{}, /*shareGate=*/atGate)))
           return failure();
       }
       // Eagerly map this at-op's external results so later at-ops in the
       // same frame (e.g. a pipeline-launch-holder at a later offset)
-      // can resolve any operands that reference them.
+      // can resolve any operands that reference them. A result an operator
+      // instance computes is held from the cycle it is ready, read directly
+      // in that cycle: a pipelined instance moves on, and a shared one goes
+      // to its other users (as lowerFrameBody's frame_hold).
       auto atYield = atOp.getYieldOp();
       for (auto [res, val] :
            llvm::zip(atOp.getResults(), atYield.getOperands())) {
         if (mapping.lookupOrNull(res))
           continue;
-        if (auto mapped = mapping.lookupOrNull(val))
+        Value mapped = mapping.lookupOrNull(val);
+        if (!mapped)
+          continue;
+        std::optional<unsigned> latency =
+            atResultInstanceLatency(res, operatorLibrary);
+        if (!latency || !isa<IntegerType>(mapped.getType())) {
           mapping.map(res, mapped);
+          continue;
+        }
+        Value readyGate = gateAt((unsigned)atOp.getOffset() + *latency);
+        auto holdName = builder.getStringAttr(
+            "frame" + std::to_string(frameId) + "_hold_" +
+            std::to_string(staticCapCounter++));
+        Value held = seq::CompRegClockEnabledOp::create(
+            builder, loc, mapped, clk, readyGate, rst,
+            createZeroConstant(builder, loc, mapped.getType()), holdName);
+        mapping.map(res,
+                    comb::MuxOp::create(builder, loc, readyGate, mapped, held));
       }
     }
     return success();
