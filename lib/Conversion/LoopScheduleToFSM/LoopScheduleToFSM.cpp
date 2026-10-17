@@ -24,6 +24,7 @@
 #include "circt/Dialect/OpLib/OpLibOps.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "circt/Dialect/Verif/VerifOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -352,6 +353,124 @@ inline PortDrivesRef portRef(MemPortMapping &mp, unsigned k) {
   ref.wrEn = &p.wrEn;
   ref.rdEn = &p.rdEn;
   return ref;
+}
+
+/// A memory port's address or write data: `value` where `sel` holds, else
+/// `rest`. Either may be null, an accessor that does not drive it. They only
+/// matter in a cycle an access enables the port, and no two of its accessors
+/// enable it in one cycle (`assertOneAccessor`), so nothing defaults to zero:
+/// the last accessor's value is the port's outside the others' selects, and a
+/// lone accessor's is the port's outright. Only the enables are gated.
+static Value selectPortDrive(OpBuilder &b, Location loc, Value sel, Value value,
+                             Value rest) {
+  // A drive that passes through is kept in the port maps, which resolving a
+  // backedge does not rewrite, past the backedge builder that erases its
+  // placeholder: hold a placeholder with an IR use (which the canonicalizer
+  // removes) so that resolving it updates the drive.
+  auto hold = [&](Value v) -> Value {
+    auto cast = v ? v.getDefiningOp<UnrealizedConversionCastOp>()
+                  : UnrealizedConversionCastOp();
+    if (!cast || cast->getNumOperands() != 0)
+      return v;
+    return hw::WireOp::create(b, loc, v);
+  };
+  if (!value || value == rest)
+    return hold(rest);
+  if (!rest)
+    return hold(value);
+  return comb::MuxOp::create(b, loc, sel, value, rest);
+}
+
+/// Whether `v` is the constant false.
+static bool isConstantFalse(Value v) {
+  auto c = v.getDefiningOp<hw::ConstantOp>();
+  return c && c.getValue().isZero();
+}
+
+/// An accessor's enables of one port (read, write; either may be null or
+/// tied off) as one: null if it has neither.
+static Value anyEnable(OpBuilder &b, Location loc, Value rdEn, Value wrEn) {
+  if (rdEn && isConstantFalse(rdEn))
+    rdEn = Value();
+  if (wrEn && isConstantFalse(wrEn))
+    wrEn = Value();
+  if (!rdEn || !wrEn)
+    return rdEn ? rdEn : wrEn;
+  return comb::OrOp::create(b, loc, rdEn, wrEn, false);
+}
+
+/// Checks in simulation that two accessors of one memory port, enabling it
+/// on `en` (where `qualifier` holds, if given) and `otherEn`, never do in
+/// the same cycle: `selectPortDrive` selects its address and data on that.
+/// Off in reset.
+static void assertOneAccessor(OpBuilder &b, Location loc, Value clk, Value rst,
+                              Value en, Value otherEn, Value qualifier = {}) {
+  if (!en || !otherEn || isConstantFalse(en) || isConstantFalse(otherEn))
+    return;
+  Value both = comb::AndOp::create(b, loc, en, otherEn, false);
+  if (qualifier)
+    both = comb::AndOp::create(b, loc, both, qualifier, false);
+  Value hwClk = isa<seq::ClockType>(clk.getType())
+                    ? (Value)seq::FromClockOp::create(b, loc, clk)
+                    : clk;
+  verif::ClockedAssertOp::create(b, loc, comb::createOrFoldNot(b, loc, both),
+                                 verif::ClockEdge::Pos, hwClk,
+                                 comb::createOrFoldNot(b, loc, rst),
+                                 b.getStringAttr("mem_port_one_accessor"));
+}
+
+/// Whether the module `inst` runs never accesses one of its memory ports,
+/// whose enables are its results `rdEn` and `wrEn` (either may be null): it
+/// ties them off. Only conclusive where every access announces itself on
+/// an enable (`announcesReads`: the port has a read enable, or no reads),
+/// which a local memory's reads do not.
+static bool instanceNeverAccesses(hw::InstanceOp inst, hw::HWModuleOp module,
+                                  Value rdEn, Value wrEn, bool announcesReads) {
+  if (!module || !announcesReads || (!rdEn && !wrEn))
+    return false;
+  auto out = cast<hw::OutputOp>(module.getBodyBlock()->getTerminator());
+  for (Value en : {rdEn, wrEn}) {
+    if (!en)
+      continue;
+    auto result = dyn_cast<OpResult>(en);
+    if (!result || result.getOwner() != inst ||
+        !isConstantFalse(out.getOperand(result.getResultNumber())))
+      return false;
+  }
+  return true;
+}
+
+/// Merges one port's drives of a launched child (a loop, in its own module
+/// or inline, or a pipeline) into the frame's (`into`): the child's where
+/// `sel` holds. The child's addresses and data are null where it does not
+/// drive them; `into`'s addresses are sized to the memory's rank.
+/// `childActive` qualifies the child's enables for the one-accessor check.
+static void mergeChildPortDrives(OpBuilder &b, Location loc, Value clk,
+                                 Value rst, Value sel, Value childActive,
+                                 ArrayRef<Value> childAddrs, Value childRdEn,
+                                 Value childWrData, Value childWrEn,
+                                 PortDrivesRef into, bool hasRdEn,
+                                 bool hasWrite) {
+  auto orFalse = [&](Value v) {
+    return v ? v : (Value)hw::ConstantOp::create(b, loc, b.getI1Type(), 0);
+  };
+  assertOneAccessor(b, loc, clk, rst,
+                    anyEnable(b, loc, hasRdEn ? childRdEn : Value(),
+                              hasWrite ? childWrEn : Value()),
+                    anyEnable(b, loc, hasRdEn ? *into.rdEn : Value(),
+                              hasWrite ? *into.wrEn : Value()),
+                    childActive);
+  for (auto [d, addr] : llvm::enumerate(*into.addrs))
+    addr = selectPortDrive(
+        b, loc, sel, d < childAddrs.size() ? childAddrs[d] : Value(), addr);
+  if (hasRdEn)
+    *into.rdEn = comb::MuxOp::create(b, loc, sel, orFalse(childRdEn),
+                                     orFalse(*into.rdEn));
+  if (hasWrite) {
+    *into.wrData = selectPortDrive(b, loc, sel, childWrData, *into.wrData);
+    *into.wrEn = comb::MuxOp::create(b, loc, sel, orFalse(childWrEn),
+                                     orFalse(*into.wrEn));
+  }
 }
 
 /// Build a PortArgInfo for a memref-backed value (function argument or
@@ -1454,15 +1573,14 @@ handleHWLoad(loopschedule::HWLoadLoweringInterface loadOp, OpBuilder &builder,
   assert((!contended || rdEnGate) &&
          "contended-port load lowering requires the issue-cycle gate");
   pref.addrs->resize(widths.size());
+  if (contended)
+    assertOneAccessor(builder, loc, seqMux->clk, seqMux->rst, rdEnGate,
+                      anyEnable(builder, loc, *pref.rdEn, *pref.wrEn));
   for (auto [d, idx] : llvm::enumerate(loadOp.getIndices())) {
     Value addr = mapping.lookup(idx);
     addr = resizeIntTo(builder, loc, addr, widths[d]);
-    if (contended) {
-      Value prev = (*pref.addrs)[d];
-      if (!prev)
-        prev = hw::ConstantOp::create(builder, loc, addr.getType(), 0);
-      addr = comb::MuxOp::create(builder, loc, rdEnGate, addr, prev);
-    }
+    if (contended)
+      addr = selectPortDrive(builder, loc, rdEnGate, addr, (*pref.addrs)[d]);
     (*pref.addrs)[d] = addr;
   }
   // Drive the port's read enable with this load's issue gate. AMC ports
@@ -1549,20 +1667,19 @@ handleHWStore(loopschedule::HWStoreLoweringInterface storeOp,
   bool contended =
       seqMux && seqMux->multi.contains({storeOp.getMemoryValue(), port});
   pref.addrs->resize(widths.size());
+  if (contended)
+    assertOneAccessor(builder, loc, seqMux->clk, seqMux->rst, wrEnGate,
+                      anyEnable(builder, loc, *pref.rdEn, *pref.wrEn));
   for (auto [d, idx] : llvm::enumerate(storeOp.getIndices())) {
     Value addr = mapping.lookup(idx);
     addr = resizeIntTo(builder, loc, addr, widths[d]);
-    if (contended) {
-      Value prev = (*pref.addrs)[d];
-      if (!prev)
-        prev = hw::ConstantOp::create(builder, loc, addr.getType(), 0);
-      addr = comb::MuxOp::create(builder, loc, wrEnGate, addr, prev);
-    }
+    if (contended)
+      addr = selectPortDrive(builder, loc, wrEnGate, addr, (*pref.addrs)[d]);
     (*pref.addrs)[d] = addr;
   }
   Value wrData = mapping.lookup(storeOp.getValueToStore());
-  if (contended && *pref.wrData)
-    wrData = comb::MuxOp::create(builder, loc, wrEnGate, wrData, *pref.wrData);
+  if (contended)
+    wrData = selectPortDrive(builder, loc, wrEnGate, wrData, *pref.wrData);
   *pref.wrData = wrData;
   // NB: no WAR fence here. Unlike the sequential path (lowerSeqDynAccess),
   // gating a store's wr_en on rd_idle in a PIPELINE deadlocks an rw port: the
@@ -4122,32 +4239,29 @@ static void buildLoopModuleOutput(
 /// raw-gate selection. Enables always merge as OR of gate-qualified
 /// terms, which is equivalent to the historical mux under exclusive
 /// gates and correct under concurrency.
-static void mergeStepMemPorts(
-    OpBuilder &builder, Location loc,
-    ArrayRef<DenseMap<Value, MemPortMapping>> perStepPorts,
-    ArrayRef<Value> stepRunningSignals,
-    ArrayRef<PortArgInfo> memrefArgs,
-    DenseMap<Value, MemPortMapping> &mergedPorts,
-    ArrayRef<unsigned> stepGroups = {}) {
+static void
+mergeStepMemPorts(OpBuilder &builder, Location loc, Value clk, Value rst,
+                  ArrayRef<DenseMap<Value, MemPortMapping>> perStepPorts,
+                  ArrayRef<Value> stepRunningSignals,
+                  ArrayRef<PortArgInfo> memrefArgs,
+                  DenseMap<Value, MemPortMapping> &mergedPorts,
+                  ArrayRef<unsigned> stepGroups = {}) {
 
-  auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
 
   for (auto &memInfo : memrefArgs) {
-    Type dataType = memInfo.elementType;
     auto &merged = mergedPorts[memInfo.originalArg];
 
     for (unsigned port = 0; port < memInfo.numPorts; ++port) {
-      SmallVector<Value> addrs;
-      for (unsigned w : memInfo.addrWidths) {
-        Type addrType = IntegerType::get(ctx, w);
-        addrs.push_back(hw::ConstantOp::create(builder, loc, addrType, 0));
-      }
-      Value wrData = hw::ConstantOp::create(builder, loc, dataType, 0);
+      // Addresses and data no step drives stay null (see selectPortDrive).
+      SmallVector<Value> addrs(memInfo.addrWidths.size());
+      Value wrData;
       Value wrEn = hw::ConstantOp::create(builder, loc, i1, 0);
       Value rdEn = memInfo.requiresRdEn
                        ? hw::ConstantOp::create(builder, loc, i1, 0)
                        : Value();
+      // The steps so far that access the port, for the one-accessor check.
+      Value accessed;
 
       for (int i = perStepPorts.size() - 1; i >= 0; --i) {
         auto it = perStepPorts[i].find(memInfo.originalArg);
@@ -4193,17 +4307,19 @@ static void mergeStepMemPorts(
           if (gatedRdEn)
             sel = comb::OrOp::create(builder, loc, sel, gatedRdEn);
         }
-        for (auto [d, w] : llvm::enumerate(memInfo.addrWidths)) {
-          Type addrType = IntegerType::get(ctx, w);
-          Value stepAddr = (pv.addrs && d < pv.addrs->size() && (*pv.addrs)[d])
-              ? (*pv.addrs)[d]
-              : hw::ConstantOp::create(builder, loc, addrType, 0);
-          addrs[d] = comb::MuxOp::create(builder, loc, sel, stepAddr,
-                                          addrs[d]);
+        if (Value stepEn = anyEnable(builder, loc, pv.rdEn, pv.wrEn)) {
+          stepEn = comb::AndOp::create(builder, loc, gate, stepEn, false);
+          assertOneAccessor(builder, loc, clk, rst, stepEn, accessed);
+          accessed = accessed ? (Value)comb::OrOp::create(
+                                    builder, loc, accessed, stepEn, false)
+                              : stepEn;
         }
-        Value stepWrData = pv.wrData ? pv.wrData
-            : hw::ConstantOp::create(builder, loc, dataType, 0);
-        wrData = comb::MuxOp::create(builder, loc, sel, stepWrData, wrData);
+        for (auto [d, w] : llvm::enumerate(memInfo.addrWidths)) {
+          Value stepAddr =
+              (pv.addrs && d < pv.addrs->size()) ? (*pv.addrs)[d] : Value();
+          addrs[d] = selectPortDrive(builder, loc, sel, stepAddr, addrs[d]);
+        }
+        wrData = selectPortDrive(builder, loc, sel, pv.wrData, wrData);
         wrEn = comb::OrOp::create(builder, loc, gatedWrEn, wrEn);
         if (memInfo.requiresRdEn)
           rdEn = comb::OrOp::create(builder, loc, gatedRdEn, rdEn);
@@ -4225,13 +4341,12 @@ static void mergeStepMemPorts(
 /// window, so the selectors are mutually exclusive and a priority mux suffices.
 /// `outPorts` keeps the caller-provided `rdData` unchanged and only overwrites
 /// the addrs/wrData/wrEn fields with the muxed values.
-static void muxStageMemPorts(
-    OpBuilder &builder, Location loc,
-    ArrayRef<DenseMap<Value, MemPortMapping>> perStagePorts,
-    ArrayRef<Value> stageCE,
-    DenseMap<Value, MemPortMapping> &outPorts) {
+static void
+muxStageMemPorts(OpBuilder &builder, Location loc, Value clk, Value rst,
+                 ArrayRef<DenseMap<Value, MemPortMapping>> perStagePorts,
+                 ArrayRef<Value> stageCE,
+                 DenseMap<Value, MemPortMapping> &outPorts) {
 
-  auto *ctx = builder.getContext();
   auto i1 = builder.getI1Type();
 
   // Collect every memref that is accessed by any stage.
@@ -4245,11 +4360,10 @@ static void muxStageMemPorts(
   }
 
   for (Value memref : memrefs) {
-    // Derive per-dim addr widths, element type, and read-enable need from
-    // the stage ports themselves rather than the memref type — the latter
-    // does not exist for amc port-typed values.
+    // Derive per-dim addr widths and read-enable need from the stage ports
+    // themselves rather than the memref type — the latter does not exist
+    // for amc port-typed values.
     SmallVector<unsigned> widths;
-    Type dataType;
     bool needsRdEn = false;
     for (auto &stagePorts : perStagePorts) {
       auto it = stagePorts.find(memref);
@@ -4260,12 +4374,6 @@ static void muxStageMemPorts(
         for (Value a : ports.addrs)
           if (a)
             widths.push_back(cast<IntegerType>(a.getType()).getWidth());
-      }
-      if (!dataType) {
-        if (ports.wrData)
-          dataType = ports.wrData.getType();
-        else if (ports.rdData)
-          dataType = ports.rdData.getType();
       }
       if (ports.rdEn)
         needsRdEn = true;
@@ -4294,19 +4402,11 @@ static void muxStageMemPorts(
     // frame has its address wiped the moment the pipeline runs
     // muxStageMemPorts on the same memref.
     auto &existing = outPorts[memref];
-    SmallVector<Value> addrs;
-    for (auto [d, w] : llvm::enumerate(widths)) {
-      Type addrType = IntegerType::get(ctx, w);
-      Value fallback = (d < existing.addrs.size() && existing.addrs[d])
-                            ? existing.addrs[d]
-                            : hw::ConstantOp::create(builder, loc, addrType, 0);
-      addrs.push_back(fallback);
-    }
-    // A read-only zero-address port (a pop-only stream face) has no data
-    // type to mux — leave wrData untouched.
+    // Addresses and data nothing drives stay null (see selectPortDrive).
+    SmallVector<Value> addrs(widths.size());
+    for (unsigned d = 0; d < widths.size() && d < existing.addrs.size(); ++d)
+      addrs[d] = existing.addrs[d];
     Value wrData = existing.wrData;
-    if (!wrData && dataType)
-      wrData = hw::ConstantOp::create(builder, loc, dataType, 0);
     Value wrEn = existing.wrEn
                       ? existing.wrEn
                       : hw::ConstantOp::create(builder, loc, i1, 0);
@@ -4314,6 +4414,8 @@ static void muxStageMemPorts(
     if (needsRdEn)
       rdEn = existing.rdEn ? existing.rdEn
                            : hw::ConstantOp::create(builder, loc, i1, 0);
+    // What accesses the port so far, for the one-accessor check.
+    Value accessed = anyEnable(builder, loc, existing.rdEn, existing.wrEn);
 
     // Priority mux chain — last stage has lowest priority. Stages that did
     // not actually touch this memref (no address, no write) contribute
@@ -4330,16 +4432,17 @@ static void muxStageMemPorts(
       if (!hasAddr && !ports.wrData && !ports.wrEn && !ports.rdEn)
         continue;
       Value gate = stageCE[s];
-      for (auto [d, w] : llvm::enumerate(widths)) {
-        Type addrType = IntegerType::get(ctx, w);
-        Value stageAddr = (d < ports.addrs.size() && ports.addrs[d])
-            ? ports.addrs[d]
-            : hw::ConstantOp::create(builder, loc, addrType, 0);
-        addrs[d] =
-            comb::MuxOp::create(builder, loc, gate, stageAddr, addrs[d]);
+      if (Value stageEn = anyEnable(builder, loc, ports.rdEn, ports.wrEn)) {
+        assertOneAccessor(builder, loc, clk, rst, stageEn, accessed);
+        accessed = accessed ? (Value)comb::OrOp::create(builder, loc, accessed,
+                                                        stageEn, false)
+                            : stageEn;
       }
-      if (ports.wrData)
-        wrData = comb::MuxOp::create(builder, loc, gate, ports.wrData, wrData);
+      for (unsigned d = 0; d < widths.size(); ++d) {
+        Value stageAddr = d < ports.addrs.size() ? ports.addrs[d] : Value();
+        addrs[d] = selectPortDrive(builder, loc, gate, stageAddr, addrs[d]);
+      }
+      wrData = selectPortDrive(builder, loc, gate, ports.wrData, wrData);
       if (ports.wrEn)
         wrEn = comb::MuxOp::create(builder, loc, gate, ports.wrEn, wrEn);
       if (needsRdEn && ports.rdEn)
@@ -5355,7 +5458,6 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
     Value &iterAdvanceEdgeOut) {
   OpBuilder &hw = env.hw;
   OpBuilder &builder = env.builder;
-  auto *ctx = env.ctx;
   Type i1 = env.i1;
   Location loc = env.loc;
   Block *hwBody = env.hwBody;
@@ -6091,7 +6193,6 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
           for (auto &memInfo : memrefArgs) {
             auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
             bool emitWrite = memInfo.isAmcPort ? memInfo.isWrite : true;
-            Type dataType = memInfo.elementType;
             auto &childMp = childPorts[memInfo.originalArg];
             for (unsigned port = 0; port < memInfo.numPorts; ++port) {
               PortDrivesRef childR = portRef(childMp, port);
@@ -6105,49 +6206,10 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                    emitWrite ? *childR.wrEn : Value()},
                   {memInfo.requiresRdEn ? *portsR.rdEn : Value(),
                    emitWrite ? *portsR.wrEn : Value()});
-              for (auto [d, w] : llvm::enumerate(widths)) {
-                Type addrType = IntegerType::get(ctx, w);
-                Value childAddr =
-                    (d < childR.addrs->size() && (*childR.addrs)[d])
-                        ? (*childR.addrs)[d]
-                        : hw::ConstantOp::create(hw, loc, addrType, 0);
-                Value myAddr = (*portsR.addrs)[d]
-                                   ? (*portsR.addrs)[d]
-                                   : hw::ConstantOp::create(hw, loc,
-                                                            addrType, 0);
-                (*portsR.addrs)[d] =
-                    comb::MuxOp::create(hw, loc, sel, childAddr, myAddr);
-              }
-              if (memInfo.requiresRdEn) {
-                Value childRdEn = *childR.rdEn
-                                      ? *childR.rdEn
-                                      : hw::ConstantOp::create(hw, loc, i1, 0);
-                Value myRdEn = *portsR.rdEn
-                                   ? *portsR.rdEn
-                                   : hw::ConstantOp::create(hw, loc, i1, 0);
-                *portsR.rdEn =
-                    comb::MuxOp::create(hw, loc, sel, childRdEn, myRdEn);
-              }
-              if (emitWrite) {
-                Value childWrData =
-                    *childR.wrData
-                        ? *childR.wrData
-                        : hw::ConstantOp::create(hw, loc, dataType, 0);
-                Value childWrEn = *childR.wrEn
-                                      ? *childR.wrEn
-                                      : hw::ConstantOp::create(hw, loc, i1, 0);
-                Value myWrData =
-                    *portsR.wrData
-                        ? *portsR.wrData
-                        : hw::ConstantOp::create(hw, loc, dataType, 0);
-                Value myWrEn = *portsR.wrEn
-                                   ? *portsR.wrEn
-                                   : hw::ConstantOp::create(hw, loc, i1, 0);
-                *portsR.wrData =
-                    comb::MuxOp::create(hw, loc, sel, childWrData, myWrData);
-                *portsR.wrEn =
-                    comb::MuxOp::create(hw, loc, sel, childWrEn, myWrEn);
-              }
+              mergeChildPortDrives(hw, loc, clk, rst, sel, slotChildActive,
+                                   *childR.addrs, *childR.rdEn, *childR.wrData,
+                                   *childR.wrEn, portsR, memInfo.requiresRdEn,
+                                   emitWrite);
             }
           }
         } else if (slot.childIdx >= 0) {
@@ -6297,9 +6359,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
           // signal.
           for (auto &memInfo : memrefArgs) {
             auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
-            bool emitWrite =
-                memInfo.isAmcPort ? memInfo.isWrite : true;
-            Type dataType = memInfo.elementType;
+            bool emitWrite = memInfo.isAmcPort ? memInfo.isWrite : true;
             for (unsigned port = 0; port < memInfo.numPorts; ++port) {
               SmallVector<Value> childAddrs;
               for (unsigned d = 0; d < widths.size(); ++d)
@@ -6320,33 +6380,19 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                   hw, loc, slotChildActive, {childRdEn, childWrEn},
                   {memInfo.requiresRdEn ? *portsR.rdEn : Value(),
                    emitWrite ? *portsR.wrEn : Value()});
-              for (auto [d, w] : llvm::enumerate(widths)) {
-                Type addrType = IntegerType::get(ctx, w);
-                Value myAddr = (*portsR.addrs)[d]
-                    ? (*portsR.addrs)[d]
-                    : hw::ConstantOp::create(hw, loc, addrType, 0);
-                (*portsR.addrs)[d] =
-                    comb::MuxOp::create(hw, loc, sel, childAddrs[d], myAddr);
+              // A child whose module ties the port's enables off never
+              // accesses it: its address and data outputs are don't-cares.
+              if (instanceNeverAccesses(
+                      childInst, childModule, childRdEn, childWrEn,
+                      memInfo.requiresRdEn ||
+                          (memInfo.isAmcPort && !memInfo.isRead))) {
+                childAddrs.clear();
+                childWrData = Value();
               }
-              if (memInfo.requiresRdEn) {
-                Value myRdEn = *portsR.rdEn ? *portsR.rdEn
-                                            : hw::ConstantOp::create(
-                                                  hw, loc, i1, 0);
-                *portsR.rdEn =
-                    comb::MuxOp::create(hw, loc, sel, childRdEn, myRdEn);
-              }
-              if (emitWrite) {
-                Value myWrData = *portsR.wrData
-                    ? *portsR.wrData
-                    : hw::ConstantOp::create(hw, loc, dataType, 0);
-                Value myWrEn = *portsR.wrEn ? *portsR.wrEn
-                                            : hw::ConstantOp::create(
-                                                  hw, loc, i1, 0);
-                *portsR.wrData =
-                    comb::MuxOp::create(hw, loc, sel, childWrData, myWrData);
-                *portsR.wrEn =
-                    comb::MuxOp::create(hw, loc, sel, childWrEn, myWrEn);
-              }
+              mergeChildPortDrives(hw, loc, clk, rst, sel, slotChildActive,
+                                   childAddrs, childRdEn, childWrData,
+                                   childWrEn, portsR, memInfo.requiresRdEn,
+                                   emitWrite);
             }
           }
         } else if (slot.pipIdx >= 0) {
@@ -6397,51 +6443,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
               auto &outP = perFramePorts[frameIdx][memInfo.originalArg];
               if (outP.addrs.size() != widths.size())
                 outP.addrs.assign(widths.size(), Value());
-              Type dataType = memInfo.elementType;
-              for (auto [d, w] : llvm::enumerate(widths)) {
-                Type addrType = IntegerType::get(ctx, w);
-                Value slotAddr =
-                    (d < slotP.addrs.size() && slotP.addrs[d])
-                        ? slotP.addrs[d]
-                        : hw::ConstantOp::create(hw, loc, addrType, 0);
-                Value myAddr =
-                    outP.addrs[d]
-                        ? outP.addrs[d]
-                        : hw::ConstantOp::create(hw, loc, addrType, 0);
-                outP.addrs[d] = comb::MuxOp::create(hw, loc, slotChildActive,
-                                                      slotAddr, myAddr);
-              }
-              if (memInfo.requiresRdEn) {
-                Value slotRdEn =
-                    slotP.rdEn ? slotP.rdEn
-                               : hw::ConstantOp::create(hw, loc, i1, 0);
-                Value myRdEn =
-                    outP.rdEn ? outP.rdEn
-                              : hw::ConstantOp::create(hw, loc, i1, 0);
-                outP.rdEn = comb::MuxOp::create(hw, loc, slotChildActive,
-                                                  slotRdEn, myRdEn);
-              }
-              bool emitWrite = memInfo.isAmcPort ? memInfo.isWrite : true;
-              if (emitWrite) {
-                Value slotWrData =
-                    slotP.wrData
-                        ? slotP.wrData
-                        : hw::ConstantOp::create(hw, loc, dataType, 0);
-                Value slotWrEn =
-                    slotP.wrEn ? slotP.wrEn
-                               : hw::ConstantOp::create(hw, loc, i1, 0);
-                Value myWrData =
-                    outP.wrData
-                        ? outP.wrData
-                        : hw::ConstantOp::create(hw, loc, dataType, 0);
-                Value myWrEn =
-                    outP.wrEn ? outP.wrEn
-                              : hw::ConstantOp::create(hw, loc, i1, 0);
-                outP.wrData = comb::MuxOp::create(hw, loc, slotChildActive,
-                                                    slotWrData, myWrData);
-                outP.wrEn = comb::MuxOp::create(hw, loc, slotChildActive,
-                                                  slotWrEn, myWrEn);
-              }
+              mergeChildPortDrives(hw, loc, clk, rst, slotChildActive,
+                                   slotChildActive, slotP.addrs, slotP.rdEn,
+                                   slotP.wrData, slotP.wrEn, portRef(outP, 0),
+                                   memInfo.requiresRdEn,
+                                   memInfo.isAmcPort ? memInfo.isWrite : true);
             }
           }
           // Latch only when this frame runs multiple launches
@@ -7034,8 +7040,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
   for (auto &memInfo : memrefArgs)
     mergedMemPorts[memInfo.originalArg].rdData =
         localMemPorts[memInfo.originalArg].rdData;
-  mergeStepMemPorts(hw, loc, perFramePorts, frameMergeSignals, memrefArgs,
-                    mergedMemPorts);
+  mergeStepMemPorts(hw, loc, clk, rst, perFramePorts, frameMergeSignals,
+                    memrefArgs, mergedMemPorts);
 
   // Copy merged ports back into localMemPorts for output construction.
   // For amc ports we also copy `rdEn` so the stall-aware gate built in
@@ -8310,7 +8316,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     }
   }
 
-  muxStageMemPorts(hwBuilder, loc, perStagePorts, stageCE, memPorts);
+  muxStageMemPorts(hwBuilder, loc, clk, rst, perStagePorts, stageCE, memPorts);
 
   // Iter-arg init delivery. Historically each iter_arg's value was a
   // combinational mux `first_iter_s<fs> ? init : feedback` driving the
@@ -10479,6 +10485,15 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
             *portsR.wrData = childInst.getResult(outIdx++);
             *portsR.wrEn = childInst.getResult(outIdx++);
           }
+          // A child that ties the port's enables off never accesses it: its
+          // address and data outputs are don't-cares.
+          if (instanceNeverAccesses(
+                  childInst, childModule, *portsR.rdEn, *portsR.wrEn,
+                  memInfo.requiresRdEn ||
+                      (memInfo.isAmcPort && !memInfo.isRead))) {
+            portsR.addrs->assign(widths.size(), Value());
+            *portsR.wrData = Value();
+          }
         }
       }
 
@@ -10584,6 +10599,14 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         if (emitWrite) {
           mp.wrData = childInst.getResult(outIdx++);
           mp.wrEn = childInst.getResult(outIdx++);
+        }
+        // A callee that ties the port's enables off never accesses it: its
+        // address and data outputs are don't-cares.
+        if (instanceNeverAccesses(childInst, calleeMod, mp.rdEn, mp.wrEn,
+                                  info.requiresRdEn ||
+                                      (info.isAmcPort && !info.isRead))) {
+          mp.addrs.assign(widths.size(), Value());
+          mp.wrData = Value();
         }
       }
       // ready — unused by the caller FSM today; skip.
@@ -10978,7 +11001,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   for (auto &memInfo : memrefArgs)
     mergedMemPorts[memInfo.originalArg].rdData =
         memPortMap[memInfo.originalArg].rdData;
-  mergeStepMemPorts(builder, loc, perEntryPorts, entryRunningSignals,
+  mergeStepMemPorts(builder, loc, clk, rst, perEntryPorts, entryRunningSignals,
                     memrefArgs, mergedMemPorts, entryGroups);
 
   // Priority-compose the static at-body access drives (collected by
@@ -10991,6 +11014,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
     Value sGate = staticMp.wrEn ? staticMp.wrEn : staticMp.rdEn;
     if (!sGate)
       continue;
+    assertOneAccessor(builder, loc, clk, rst, sGate,
+                      anyEnable(builder, loc, merged.rdEn, merged.wrEn));
     if (staticMp.wrEn) {
       if (merged.wrEn)
         merged.wrEn = comb::OrOp::create(builder, loc, sGate, merged.wrEn);
@@ -11329,7 +11354,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
 
   builder.setInsertionPointToEnd(hwBody);
 
-  muxStageMemPorts(builder, loc, perStagePorts, stageCE, memPortMap);
+  muxStageMemPorts(builder, loc, clk, rst, perStagePorts, stageCE, memPortMap);
 
   // Done. The last stage's CE pulses on the same cycle as the last store
   // commits (writes are non-blocking and only visible the following cycle),

@@ -49,14 +49,13 @@ module {
 // CHECK: hw.module @fill_local3d
 // CHECK: seq.hlmem @local_mem0 {{.*}} <2x3x4xi8>
 // CHECK: seq.read %local_mem0[{{%.+}}, {{%.+}}, {{%.+}}] rden {{.*}} : !seq.hlmem<2x3x4xi8>
-// CHECK: seq.write %local_mem0[{{%.+}}, {{%.+}}, {{%.+}}] {{%.+}} wren {{.*}} : !seq.hlmem<2x3x4xi8>
+// CHECK: seq.write %local_mem0[{{%.+}}, {{%.+}}, {{%.+}}] %c42_i8 wren {{.*}} : !seq.hlmem<2x3x4xi8>
 
-// The loop inlines into a single per-function machine (no hw.module @loop0);
-// the store data (constant 42 : i8) is muxed onto the write port under the
-// loop frame-active result in the function body.
+// The loop inlines into a single per-function machine (no hw.module @loop0).
+// The store is the port's only writer, so its data (constant 42 : i8)
+// drives the write port as is (above): only the write enable is gated.
 // CHECK: fsm.hw_instance "fill_local3d_fsm_inst" @fill_local3d_fsm
 // CHECK: %loop0_iter_arg_0 = seq.compreg.ce sym @loop0_iter_arg_0
-// CHECK: comb.mux {{%.+}}, %c42_i8, {{%.+}} : i8
 // CHECK-NOT: hw.module @loop0
 // CHECK: fsm.machine @fill_local3d_fsm
 // CHECK-SAME: argNames = ["start", "loop0_cond_entry", "loop0_cond_next", "loop0_stall"]

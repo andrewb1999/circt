@@ -67,16 +67,20 @@ module {
 // CHECK: hw.module @fib
 // CHECK: %[[FSM:.+]]:11 = fsm.hw_instance "fib_fsm_inst" @fib_fsm
 
-// Load at cycle 0 (A[i-1]): address gated in under frame_cycle_0_0. The
-// external port is a latency-1 registered BRAM read, so the data is
-// captured one cycle after issue (frame_cycle_0_1) and consumers get a
-// live-cycle bypass mux.
-// CHECK: %[[A0:.+]] = comb.mux %[[FSM]]#7,
+// Load at cycle 0 (A[i-1]): the first access, its address the port's
+// unless a later one's select picks another. The external port is a
+// latency-1 registered BRAM read, so the data is captured one cycle after
+// issue (frame_cycle_0_1) and consumers get a live-cycle bypass mux.
+// CHECK: %[[A0:.+]] = arith.addi %{{.+}}, %c1_i5 : i5
 // CHECK: %loop0_f0_ldcap_0 = seq.compreg.ce sym @loop0_f0_ldcap_0 %mem0_rd_data, %clk, %[[FSM]]#8
 // CHECK: %[[V0:.+]] = comb.mux %[[FSM]]#8, %mem0_rd_data, %loop0_f0_ldcap_0
 
 // Load at cycle 1 (A[i-2]): address chains over the cycle-0 address; data
-// captured at cycle 2.
+// captured at cycle 2. No two accesses may enable the port in one cycle,
+// which the address and data selects rely on: checked in simulation.
+// CHECK: %[[BOTH0:.+]] = comb.and %[[FSM]]#8, %[[FSM]]#7 : i1
+// CHECK: %[[ONE0:.+]] = comb.xor %[[BOTH0]], %true
+// CHECK: verif.clocked_assert %[[ONE0]] if %{{.+}}, posedge %{{.+}} label "mem_port_one_accessor"
 // CHECK: %[[A1:.+]] = comb.mux %[[FSM]]#8, %{{.+}}, %[[A0]]
 // CHECK: %loop0_f0_ldcap_1 = seq.compreg.ce sym @loop0_f0_ldcap_1 %mem0_rd_data, %clk, %[[FSM]]#9
 // CHECK: %[[V1:.+]] = comb.mux %[[FSM]]#9, %mem0_rd_data, %loop0_f0_ldcap_1
@@ -85,17 +89,17 @@ module {
 // aliases of the raw rd_data wire.
 // CHECK: %[[SUM:.+]] = arith.addi %[[V0]], %[[V1]]
 
-// Store at cycle 3: its address has lowest priority in the mux chain,
-// and wr_en fires only in its own cycle. Enables merge as gate-qualified
-// OR terms (concurrent-sibling-safe), addr/data keep the gate-keyed mux
-// (this port is a passive-read memref).
+// Store at cycle 3: its select over the loads' addresses, and wr_en fires
+// only in its own cycle. Enables merge as gate-qualified OR terms
+// (concurrent-sibling-safe). The loop is the port's only accessor at the
+// loop and function levels, so its address and data reach the port as
+// they are: only the enables are gated there.
+// CHECK: verif.clocked_assert
 // CHECK: %[[ADDR:.+]] = comb.mux %[[FSM]]#10, %{{.+}}, %[[A1]]
 // CHECK: %[[GWREN:.+]] = comb.and %[[FSM]]#6, %[[FSM]]#10
-// CHECK: comb.mux %[[FSM]]#6, %[[ADDR]],
-// CHECK: comb.mux %[[FSM]]#6, %[[SUM]],
 // CHECK: %[[WREN0:.+]] = comb.or %[[GWREN]], %false
 // The loop-level enable then merges up through the function-level frame
 // gate (frame_running_0, result #2) before reaching the port.
 // CHECK: %[[WRENF:.+]] = comb.and %[[FSM]]#2, %[[WREN0]]
 // CHECK: %[[WREN:.+]] = comb.or %[[WRENF]],
-// CHECK: hw.output %{{.+}}, %{{.+}}, %{{.+}}, %[[WREN]]
+// CHECK: hw.output %[[ADDR]], %{{.+}}, %[[SUM]], %[[WREN]]

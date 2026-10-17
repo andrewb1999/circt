@@ -191,7 +191,7 @@ def LoopScheduleToFSM : Pass<"lower-loopschedule-to-fsm", "mlir::ModuleOp"> {
   let dependentDialects = [
     "fsm::FSMDialect", "loopschedule::LoopScheduleDialect",
     "hw::HWDialect", "comb::CombDialect", "seq::SeqDialect",
-    "mlir::arith::ArithDialect"
+    "mlir::arith::ArithDialect", "verif::VerifDialect"
   ];
   let options = [
     Option<"disableFlattenMemrefs", "disable-flatten-memrefs", "bool", "false",

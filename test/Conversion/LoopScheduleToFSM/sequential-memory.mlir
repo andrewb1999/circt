@@ -47,12 +47,12 @@ module {
 // CHECK-SAME: out mem0_wr_data : i32
 // CHECK-SAME: out mem0_wr_en : i1
 
-// The loop inlines into a single per-function machine (no hw.module @loop0);
-// the store data (constant 42) is muxed onto the write port under the loop
-// frame-active result in the function body.
+// The loop inlines into a single per-function machine (no hw.module @loop0).
+// The store is the port's only writer, so its data (constant 42) drives the
+// write port as is: only the write enable is gated.
 // CHECK: fsm.hw_instance "fill_fsm_inst" @fill_fsm
 // CHECK: %loop0_iter_arg_0 = seq.compreg.ce sym @loop0_iter_arg_0
-// CHECK: comb.mux {{%.+}}, %c42_i32, {{%.+}} : i32
+// CHECK: hw.output %{{.+}}, %{{.+}}, %c42_i32, %{{.+}},
 // CHECK-NOT: hw.module @loop0
 // CHECK: fsm.machine @fill_fsm
 // CHECK-SAME: argNames = ["start", "loop0_cond_entry", "loop0_cond_next", "loop0_stall"]

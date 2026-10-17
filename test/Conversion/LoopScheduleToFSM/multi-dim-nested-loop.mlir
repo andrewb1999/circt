@@ -78,9 +78,10 @@ module {
 // CHECK: fsm.hw_instance "nested2d_fsm_inst" @nested2d_fsm
 // CHECK-DAG: %loop0_iter_arg_0 = seq.compreg.ce sym @loop0_iter_arg_0
 // CHECK-DAG: %loop0_loop1_iter_arg_0 = seq.compreg.ce sym @loop0_loop1_iter_arg_0
-// The inner store's dim-0 address comes from the outer loop's frame register,
-// muxed under the inner-loop frame-active result.
-// CHECK: comb.mux {{%.+}}, %loop0_frame0_r1, {{%.+}} : i3
+// The inner store's dim-0 address comes from the outer loop's frame
+// register. The store is the port's only accessor, so that drives the
+// port's address as is: only its enables are gated.
+// CHECK: hw.output %loop0_frame0_r1,
 // CHECK-NOT: hw.module @loop0
 
 // One machine carries both loop levels as prefixed states with per-level

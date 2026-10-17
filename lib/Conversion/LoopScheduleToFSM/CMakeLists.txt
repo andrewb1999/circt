@@ -12,6 +12,7 @@ add_circt_conversion_library(CIRCTLoopScheduleToFSM
   CIRCTFSM
   CIRCTHW
   CIRCTSeq
+  CIRCTVerif
   CIRCTComb
   CIRCTLoopSchedule
   CIRCTSupport
