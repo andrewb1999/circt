@@ -877,18 +877,17 @@ public:
         J = s;
         break;
       }
-    // Effective "ready stage" for this value accounts for any internal
-    // operator latency: the result is only logically valid at `J+L`.
-    unsigned L = getYieldLatency(origVal);
-    unsigned readyStage = J + L;
     // The value is readable from the stage after readyStage, for `hold`
     // cycles: a held stage register keeps it for II, anything else (an
     // operator's output, a read port's data, a register the next cycle
     // overwrites) for one. Copy k of the chain takes it over in the last
     // of those cycles and holds it for `step` more.
+    if (J == stages.size())
+      return Value();
+    unsigned readyStage = J + firstReadable(origVal) - 1;
     unsigned step = shiftEnables.empty() ? 1 : shiftEnables.size();
     unsigned hold = stageRegisters.lookup(origVal) ? step : 1;
-    if (J == stages.size() || consumerStage <= readyStage + hold)
+    if (consumerStage <= readyStage + hold)
       return Value();
     unsigned copy = llvm::divideCeil(consumerStage - readyStage - hold, step);
     auto &chain = delayChain[origVal];
@@ -918,19 +917,24 @@ public:
   }
 
 private:
-  /// Latency of the op that produces the at-op's yielded value `origVal`.
-  unsigned getYieldLatency(Value origVal) const {
+  /// The first stage after its own that the at-op result `origVal` can be
+  /// read in. A multi-cycle operator's result is its output, valid in the
+  /// one cycle its latency L after issue (L stages on); a stage register,
+  /// a read port's data or a dynamic load's queue head (whose latency is
+  /// reported one short, see computeOpCycleLatency) the stage after its
+  /// latency.
+  unsigned firstReadable(Value origVal) const {
     auto result = dyn_cast<OpResult>(origVal);
-    if (!result)
-      return 0;
-    auto atOp = dyn_cast<LoopScheduleAtOp>(result.getOwner());
-    if (!atOp)
-      return 0;
-    auto yieldOp = atOp.getYieldOp();
-    unsigned idx = result.getResultNumber();
-    if (idx >= yieldOp.getNumOperands())
-      return 0;
-    return computeValueCycleLatency(yieldOp.getOperand(idx), operatorLibrary);
+    auto atOp = result ? dyn_cast<LoopScheduleAtOp>(result.getOwner())
+                       : LoopScheduleAtOp();
+    if (!atOp || result.getResultNumber() >= atOp.getYieldOp().getNumOperands())
+      return 1;
+    Value yielded = atOp.getYieldOp().getOperand(result.getResultNumber());
+    unsigned latency = computeValueCycleLatency(yielded, operatorLibrary);
+    Operation *def = producingOp(yielded);
+    bool operatorOutput =
+        latency > 0 && def && !isa<LoadInterface, LoopScheduleLoadOp>(def);
+    return operatorOutput ? latency : latency + 1;
   }
 
   OpBuilder &builder;
@@ -8240,9 +8244,9 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // result of inputs dispatched at cycle T-L. Capturing that output
       // at stage-J's cycle J would latch the wrapper output for a
       // cycle-(J-L) input (undefined for iter 0). Skip the stage
-      // register here; `resolveForStage` uses `readyStage = J+L` so
-      // stage-J+L consumers read the wrapper output directly and
-      // further stages pick it up via delay registers.
+      // register here: stage-J+L consumers read the wrapper output
+      // directly, and later ones a delay register that captures it in
+      // stage J+L (`resolveForStage`, `firstReadable`).
       if (computeValueCycleLatency(val, operatorLibrary) > 0) {
         mapping.map(stageOp.getResult(regIdx), mappedVal);
         continue;
