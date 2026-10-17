@@ -1279,26 +1279,29 @@ func.func @gemv_acc(%A: memref<64xi32>, %y: memref<8xi32>) {
 // -----
 
 // Positive (almost-perfect): the accumulator starts from a LOAD under pure
-// ops (`D[i] * beta`). The load and the multiply run together: once at the
-// lower-bound IVs before the loop, and again under the wrap predicate with
-// the next pass's IVs.
+// ops (`D[i] * beta`). The load and the multiply run together on each pass's
+// first iteration (j at its lower bound), as Vitis HLS's flattened loops do,
+// in place of the carried value; nothing runs before the loop, and the sum
+// is carried on unreset.
 
 // CHECK-LABEL: func.func @load_init_scaled
 // CHECK-SAME:      %[[D:[^:]+]]: memref<8xi32>, %{{.+}}: memref<8xi32>, %[[BETA:.+]]: i32
-// CHECK:         %[[D0:.+]] = memref.load %[[D]][%{{.+}}] : memref<8xi32>
-// CHECK:         %[[INIT:.+]] = arith.muli %[[D0]], %[[BETA]] : i32
-// CHECK:         scf.while (%{{.+}} = %{{.+}}, %{{.+}} = %{{.+}}, %{{.+}} = %[[INIT]]) : (i32, i32, i32) -> (i32, i32, i32)
+// CHECK-NOT:     memref.load
+// CHECK:         scf.while (%{{.+}} = %{{.+}}, %{{.+}} = %{{.+}}, %{{.+}} = %{{.+}}) : (i32, i32, i32) -> (i32, i32, i32)
 // CHECK:         do {
-// CHECK:           %[[SUM:.+]] = arith.addi
+// CHECK-NEXT:    ^bb0(%{{.+}}: i32, %[[J:.+]]: i32, %[[ACC:.+]]: i32):
+// CHECK:           %[[FIRST:.+]] = arith.cmpi eq, %[[J]], %{{.+}} : i32
+// CHECK-NEXT:      %[[START:.+]] = scf.if %[[FIRST]] -> (i32) {
+// CHECK-NEXT:        %[[D0:.+]] = memref.load %[[D]][%{{.+}}] : memref<8xi32>
+// CHECK-NEXT:        %[[INIT:.+]] = arith.muli %[[D0]], %[[BETA]] : i32
+// CHECK-NEXT:        scf.yield %[[INIT]] : i32
+// CHECK-NEXT:      } else {
+// CHECK-NEXT:        scf.yield %[[ACC]] : i32
+// CHECK:           %[[SUM:.+]] = arith.addi %[[START]], %{{.+}} : i32
 // CHECK:           %[[WRAP:.+]] = arith.cmpi sge
 // CHECK:           scf.if %[[WRAP]] {
 // CHECK-NEXT:        memref.store %[[SUM]]
-// CHECK:           scf.if %[[WRAP]] -> (i32) {
-// CHECK:             %[[DN:.+]] = memref.load %[[D]][%{{.+}}] : memref<8xi32>
-// CHECK-NEXT:        %[[NEXT:.+]] = arith.muli %[[DN]], %[[BETA]] : i32
-// CHECK-NEXT:        scf.yield %[[NEXT]] : i32
-// CHECK-NEXT:      } else {
-// CHECK-NEXT:        scf.yield %[[SUM]] : i32
+// CHECK:           scf.yield %{{.+}}, %{{.+}}, %[[SUM]] : i32, i32, i32
 // CHECK-NOT:     scf.while (
 func.func @load_init_scaled(%A: memref<64xi32>, %D: memref<8xi32>, %y: memref<8xi32>, %beta: i32) {
   %c0 = arith.constant 0 : i32
@@ -1633,20 +1636,20 @@ func.func @neg_rmw_runtime_inner(%C: memref<16xi32>, %n: i32) attributes {loopsc
 
 // A chain's re-load and a boundary's epilogue: `y[i] = y[i] * beta + sum_j`
 // reads y[i] before the row and writes it after. Flattened, the read for row
-// i runs as row i - 1 ends, after that row's write: the same-iteration
-// write-after-read becomes a whole row (8 iterations) apart.
+// i runs on the row's first iteration, ahead of the body, and the write on
+// its last: the same-iteration write-after-read stays a same-iteration edge
+// (the read first), which orders the write 7 iterations later too.
 
 // CHECK-LABEL: loopschedule.dependencies @reload_deps
 // CHECK:         loopschedule.depends_on "store0" {
-// CHECK-NEXT:      loopschedule.access "load0" dist<8>{{$}}
+// CHECK-NEXT:      loopschedule.access "load0"{{$}}
 // CHECK-LABEL: func.func @reload
-// CHECK:         memref.load {{.*}}loopschedule.name = "load0.init"
+// CHECK-NOT:     memref.load
 // CHECK:         scf.while
 // CHECK:           scf.if
-// CHECK-NEXT:        memref.store {{.*}}loopschedule.name = "store0"
-// CHECK:           scf.if
-// CHECK-NEXT:        arith.index_cast
 // CHECK-NEXT:        memref.load {{.*}}loopschedule.name = "load0"
+// CHECK:           scf.if
+// CHECK-NEXT:        memref.store {{.*}}loopschedule.name = "store0"
 loopschedule.dependencies @reload_deps {
   loopschedule.depends_on "store0" {
     loopschedule.access "load0"

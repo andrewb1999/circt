@@ -24,9 +24,11 @@
 //     sum[p], or from a scaled one, D[i][j] * beta); threaded
 //     unchanged through intermediate levels, and updated only in the
 //     innermost body. In the flattened loop each chain becomes one
-//     iter-arg that RESETS to its init whenever the levels below its
-//     origin wrap (via arith.select, or a predicated re-load with the
-//     next pass's IVs for load-initialized chains).
+//     iter-arg that RESETS to its init on every pass: a constant or
+//     invariant init via arith.select when the levels below its origin
+//     wrap; a load-initialized one by re-loading it (and its pure ops) on
+//     the pass's first iteration, under an scf.if, in place of the carried
+//     value, as Vitis HLS's flattened loops do.
 //   - POST-ops: pure ops and memref.stores after the inner loop (e.g. the
 //     reduction's store to memory). These become an scf.if predicated on
 //     "the levels below just wrapped", i.e. they execute exactly on the
@@ -41,8 +43,8 @@
 // `outer<depth, [...]>` by construct-memory-dependencies) becomes a
 // distance of that level's stride (gemm's k-carried C[i][j] update, NJ
 // iterations apart), and one with an access in a prologue or epilogue
-// moves with it (a re-load runs as the previous pass ends, an epilogue on
-// the pass's last iteration). A nest whose entry has no such distance stays
+// moves with it (a re-load runs on its pass's first iteration, an epilogue
+// on the pass's last iteration). A nest whose entry has no such distance stays
 // unflattened: one that needs a runtime trip count (syrk's
 // `for k: for j < i + 1`, whose k-carried update is i + 1 iterations
 // apart), or whose flattened order could run the destination first.
@@ -323,9 +325,8 @@ struct CarriedChain {
   Value init;
   /// Non-null when the init is produced by a load-shaped pre-op (e.g. a
   /// reduction accumulating into an indexed buffer: acc starts from
-  /// sum[p]). The flattened loop re-executes it once per pass: an
-  /// unpredicated clone before the loop for the first pass, and a clone
-  /// inside the wrap-predicated scf.if (with next-pass IVs) for the rest.
+  /// sum[p]). The flattened loop re-executes it once per pass, on the
+  /// pass's first iteration, under an scf.if.
   Operation *initLoad = nullptr;
   /// The pure pre-ops computing the init from initLoad's result, in program
   /// order (an accumulator resuming from a scaled element: D[i][j] * beta);
@@ -477,9 +478,9 @@ static bool planDependences(NestInfo &info) {
   unsigned N = nest.size();
 
   // Where each access of the nest runs once flattened: the deepest level
-  // around it, and its place in the flattened body (the innermost body,
-  // then the boundaries' epilogues innermost first, then the chains'
-  // re-loads).
+  // around it, and its place in the flattened body (the chains' re-loads,
+  // then the innermost body, then the boundaries' epilogues innermost
+  // first).
   enum Kind { Body, Epilogue, Reload };
   struct Position {
     Kind kind;
@@ -495,15 +496,15 @@ static bool planDependences(NestInfo &info) {
       return;
     std::optional<Position> &pos = positions[name.getValue()];
     if (nest.back().loop->isProperAncestor(op)) {
-      pos = Position{Body, N - 1, {0, walkIndex}};
+      pos = Position{Body, N - 1, {1, walkIndex}};
       return;
     }
     for (auto [c, chain] : llvm::enumerate(info.chains))
       if (chain.initLoad == op)
-        pos = Position{Reload, unsigned(chain.originLevel), {N, unsigned(c)}};
+        pos = Position{Reload, unsigned(chain.originLevel), {0, unsigned(c)}};
     for (unsigned k = 0; k + 1 < N; ++k)
       if (llvm::is_contained(info.postOps[k], op))
-        pos = Position{Epilogue, k, {N - 1 - k, walkIndex}};
+        pos = Position{Epilogue, k, {N - k, walkIndex}};
   });
 
   SmallVector<std::optional<int64_t>> trips;
@@ -582,7 +583,7 @@ static bool planDependences(NestInfo &info) {
       }
       // ... plus where in their iteration of levels 0..c0 the two run:
       // anywhere in the body; on the levels' last iteration in an epilogue;
-      // the iteration before a pass begins for a re-load.
+      // on a pass's first iteration for a re-load.
       auto offsets = [&](const Position &p)
           -> std::optional<std::pair<int64_t, int64_t>> {
         std::optional<int64_t> all = stride(c0), own = stride(p.level);
@@ -594,7 +595,7 @@ static bool planDependences(NestInfo &info) {
         case Epilogue:
           return std::make_pair(*own - 1, *all - 1);
         case Reload:
-          return std::make_pair(int64_t(-1), *all - *own - 1);
+          return std::make_pair(int64_t(0), *all - *own);
         }
         llvm_unreachable("unknown position");
       };
@@ -1256,18 +1257,9 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
   }
   // Chain inits: values above the nest are used directly; constants that
   // live inside the nest (e.g. the zero right before the reduction loop)
-  // are rematerialized here so dominance holds. Load-initialized chains
-  // clone their pure index pre-ops and the load itself with every IV at
-  // its lower bound — the first pass's init, executed once before the
-  // loop just as the original program did.
-  IRMapping lbMap;
-  for (unsigned k = 0; k < N; ++k) {
-    Value lb = nest[k].lbValue;
-    if (!lb)
-      lb = builder.create<arith::ConstantOp>(
-          loc, nest[k].ivType, IntegerAttr::get(nest[k].ivType, nest[k].lb));
-    lbMap.map(nest[k].ivAfter, lb);
-  }
+  // are rematerialized here so dominance holds. A load-initialized chain
+  // loads its init on every pass's first iteration, the first included
+  // (see the body): its carried value starts as a zero no iteration reads.
   // The pure pre-ops that compute a chain init from its load: they run
   // with the load, never with the other pre-ops.
   llvm::SmallPtrSet<Operation *, 8> initOps;
@@ -1277,28 +1269,13 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
     return isPure(op) && !initOps.contains(op);
   };
 
-  bool clonedLbPreOps = false;
   SmallVector<Value> chainInits;
   for (const CarriedChain &chain : info.chains) {
     Value init = chain.init;
     if (chain.initLoad) {
-      if (!clonedLbPreOps) {
-        // Clone the pure pre-ops of every boundary once, in program
-        // order, at lower-bound IVs (dead ones fall to later CSE/DCE).
-        for (unsigned k = 0; k + 1 < N; ++k)
-          for (Operation *op : info.preOps[k])
-            if (isBodyPreOp(op))
-              builder.clone(*op, lbMap);
-        clonedLbPreOps = true;
-      }
-      Operation *cloned = builder.clone(*chain.initLoad, lbMap);
-      if (auto nameAttr = cloned->getAttrOfType<StringAttr>(
-              "loopschedule.name"))
-        cloned->setAttr("loopschedule.name",
-                        StringAttr::get(ctx, nameAttr.getValue() + ".init"));
-      for (Operation *op : chain.initOps)
-        builder.clone(*op, lbMap);
-      init = lbMap.lookupOrDefault(chain.init);
+      Type type = chain.init.getType();
+      init = builder.create<arith::ConstantOp>(loc, type,
+                                               builder.getZeroAttr(type));
     } else if (!isDefinedAboveNest(init, outer)) {
       Operation *cloned = builder.clone(*init.getDefiningOp());
       init = cloned->getResult(cast<OpResult>(chain.init).getResultNumber());
@@ -1405,6 +1382,48 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
       for (Operation *op : info.preOps[k])
         if (isBodyPreOp(op))
           builder.clone(*op, mapping);
+
+    // A load-initialized chain starts each pass from its init, re-loaded
+    // (with its pure ops) on the pass's first iteration, every level below
+    // the origin at its lower bound; the other iterations read the carried
+    // value. The load KEEPS its loopschedule.name: the memory-dependence
+    // records that reference it must resolve to it.
+    for (unsigned c = 0; c < C; ++c) {
+      const CarriedChain &chain = info.chains[c];
+      if (!chain.initLoad)
+        continue;
+      Value fresh;
+      for (unsigned k = chain.originLevel + 1; k < N; ++k) {
+        Value lb = nest[k].lbValue;
+        if (!lb)
+          lb = builder.create<arith::ConstantOp>(
+              loc, nest[k].ivType,
+              IntegerAttr::get(nest[k].ivType, nest[k].lb));
+        Value atLb = builder.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::eq, afterBlock->getArgument(k), lb);
+        fresh = fresh ? builder.create<arith::AndIOp>(loc, fresh, atLb)
+                      : atLb;
+      }
+      auto ifOp = builder.create<scf::IfOp>(
+          loc, TypeRange{chain.init.getType()}, fresh,
+          /*withElseRegion=*/true);
+      {
+        OpBuilder::InsertionGuard g2(builder);
+        builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+        builder.clone(*chain.initLoad, mapping);
+        for (Operation *op : chain.initOps)
+          builder.clone(*op, mapping);
+        builder.create<scf::YieldOp>(loc,
+                                     mapping.lookupOrDefault(chain.init));
+      }
+      {
+        OpBuilder::InsertionGuard g2(builder);
+        builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+        builder.create<scf::YieldOp>(loc,
+                                     afterBlock->getArgument(N + M + c));
+      }
+      mapping.map(chain.innerAfterArg, ifOp.getResult(0));
+    }
 
     // Clone the innermost body, skipping the IV update addi and the yield.
     Block *innerAfter = inner.getAfterBody();
@@ -1593,51 +1612,20 @@ static void emitFlattenedNest(OpBuilder &builder, NestInfo &info) {
         builder.clone(*op, mapping);
     }
 
-    // --- Chain yields: reset to the init when the levels below the origin
-    // wrapped (the next iteration starts a fresh pass); origin -1 chains
-    // never reset. Constant/invariant inits reset via arith.select;
-    // load-initialized chains re-load under the wrap predicate with the
-    // NEXT pass's IVs (the odometer's ivOut values). ---
-    IRMapping nextMap;
-    for (unsigned k = 0; k < N; ++k)
-      nextMap.map(nest[k].ivAfter, ivOut[k]);
+    // --- Chain yields: a constant/invariant-init chain resets to its init
+    // when the levels below the origin wrapped (the next iteration starts a
+    // fresh pass); a load-initialized one carries its value on (the next
+    // pass re-loads its init, above); origin -1 chains never reset. ---
     SmallVector<Value> chainOut(C);
     for (unsigned c = 0; c < C; ++c) {
       const CarriedChain &chain = info.chains[c];
-      if (chain.originLevel < 0) {
+      if (chain.originLevel < 0 || chain.initLoad) {
         chainOut[c] = chainNext[c];
         continue;
       }
       Value reset = doneAtLevel[chain.originLevel + 1];
-      if (!chain.initLoad) {
-        chainOut[c] = builder.create<arith::SelectOp>(
-            loc, reset, chainInits[c], chainNext[c]);
-        continue;
-      }
-      auto ifOp = builder.create<scf::IfOp>(
-          loc, TypeRange{chain.init.getType()}, reset,
-          /*withElseRegion=*/true);
-      {
-        OpBuilder::InsertionGuard g2(builder);
-        builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-        for (unsigned k = 0; k + 1 < N; ++k)
-          for (Operation *op : info.preOps[k])
-            if (isBodyPreOp(op))
-              builder.clone(*op, nextMap);
-        // This clone KEEPS the original loopschedule.name: it is the one
-        // inside the pipelined loop, so the memory-dependence records that
-        // reference the original load by name must resolve to it.
-        builder.clone(*chain.initLoad, nextMap);
-        for (Operation *op : chain.initOps)
-          builder.clone(*op, nextMap);
-        builder.create<scf::YieldOp>(loc, nextMap.lookupOrDefault(chain.init));
-      }
-      {
-        OpBuilder::InsertionGuard g2(builder);
-        builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
-        builder.create<scf::YieldOp>(loc, chainNext[c]);
-      }
-      chainOut[c] = ifOp.getResult(0);
+      chainOut[c] = builder.create<arith::SelectOp>(loc, reset, chainInits[c],
+                                                    chainNext[c]);
     }
 
     SmallVector<Value> yieldOperands(ivOut.begin(), ivOut.end());
