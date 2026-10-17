@@ -679,6 +679,10 @@ computeValueCycleLatency(Value v,
 /// they encounter an operand that crosses stage boundaries; the only
 /// per-site differences are the register-name prefix and which
 /// `OpBuilder` to wire ops onto.
+///
+/// With a `shiftEnable` (a loop pipeline's stall gate), the delay registers
+/// shift on it alone and have no reset: a delay line, which synthesis can
+/// put in shift-register LUTs. Without one, each clocks on its stage's CE.
 class CrossStageValueResolver {
 public:
   CrossStageValueResolver(OpBuilder &builder, Location loc, Block *hwBody,
@@ -686,11 +690,11 @@ public:
                           ArrayRef<LoopScheduleAtOp> stages,
                           ArrayRef<Value> stageCE, IRMapping &mapping,
                           analysis::OperatorLibraryAnalysis *operatorLibrary,
-                          StringRef regNamePrefix)
+                          StringRef regNamePrefix, Value shiftEnable = {})
       : builder(builder), loc(loc), hwBody(hwBody), clk(clk), rst(rst),
         stages(stages), stageCE(stageCE), mapping(mapping),
-        operatorLibrary(operatorLibrary),
-        regNamePrefix(regNamePrefix.str()) {}
+        operatorLibrary(operatorLibrary), regNamePrefix(regNamePrefix.str()),
+        shiftEnable(shiftEnable) {}
 
   /// Returns the delayed copy of `origVal` to feed into `consumerStage`,
   /// or null if the consumer can read the existing stage register / op
@@ -725,15 +729,19 @@ public:
       if (ceStage >= stages.size())
         break;
       Value prev = chain.back();
-      Value resetVal = createZeroConstant(builder, loc, prev.getType());
-      auto regName = builder.getStringAttr(
-          regNamePrefix + "_s" + std::to_string(ceStage) + "_dly_r" +
-          std::to_string(result.getResultNumber()) + "_from_s" +
-          std::to_string(J));
+      std::string regName = regNamePrefix + "_s" + std::to_string(ceStage) +
+                            "_dly_r" + std::to_string(result.getResultNumber()) +
+                            "_from_s" + std::to_string(J);
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPointToEnd(hwBody);
-      Value reg = seq::CompRegClockEnabledOp::create(
-          builder, loc, prev, clk, stageCE[ceStage], rst, resetVal, regName);
+      Value reg =
+          shiftEnable
+              ? seq::CompRegClockEnabledOp::create(builder, loc, prev, clk,
+                                                   shiftEnable, regName)
+              : seq::CompRegClockEnabledOp::create(
+                    builder, loc, prev, clk, stageCE[ceStage], rst,
+                    createZeroConstant(builder, loc, prev.getType()),
+                    regName);
       chain.push_back(reg);
     }
     unsigned idx = consumerStage - readyStage - 1;
@@ -768,6 +776,7 @@ private:
   IRMapping &mapping;
   analysis::OperatorLibraryAnalysis *operatorLibrary;
   std::string regNamePrefix;
+  Value shiftEnable;
   DenseMap<Value, SmallVector<Value>> delayChain;
 };
 
@@ -7907,7 +7916,18 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // axi_copy end-to-end test as dst[i] = src[i+1]).
   CrossStageValueResolver delayResolver(
       hwBuilder, loc, hwBody, clk, rst, stages, gatedStageCE, mapping,
-      operatorLibrary, namePrefix.str());
+      operatorLibrary, namePrefix.str(), /*shiftEnable=*/notStall);
+
+  // The stage results read outside the cycle after their stage: the
+  // loop's results, after the drain, from the registers of the last live
+  // iteration; and each iter-arg's updated value, which the next iteration
+  // reads up to II cycles on (and the preload loads with the init).
+  DenseSet<Value> holdingStageValues(terminatorOp.getResults().begin(),
+                                     terminatorOp.getResults().end());
+  for (LoopScheduleIterArgUpdateOp update :
+       loopschedule::getIterArgUpdatesInOrder(pipOp))
+    if (update)
+      holdingStageValues.insert(loopschedule::getIterArgPhaseResult(update));
 
   for (auto [stageIdx, stageOp] : llvm::enumerate(stages)) {
     Block &body = stageOp.getBodyBlock();
@@ -8099,22 +8119,32 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
         continue;
       }
 
-      Value resetVal = createZeroConstant(hwBuilder, loc, mappedVal.getType());
-      auto regName = hwBuilder.getStringAttr(
-          (namePrefix + "_s" + std::to_string(stageIdx) + "_r" +
-           std::to_string(regIdx))
-              .str());
+      std::string regName = (namePrefix + "_s" + std::to_string(stageIdx) +
+                             "_r" + std::to_string(regIdx))
+                                .str();
 
-      // Stall-gated CE so iter_args / inter-stage values don't advance
+      // Stall-gated so iter_args / inter-stage values don't advance
       // during a multi-bank arbiter stall. The arbiter's address latch
       // (in `--amc-to-hw`'s arbiter lowering) keeps the in-flight
       // requests pointing at iter K's addresses across the stall;
       // gating the iter_arg register here keeps the live-address path
       // pointing at the same iter so a fresh issue at consume cycle
       // sees iter K+1's addresses instead of iter K+S.
-      Value reg = seq::CompRegClockEnabledOp::create(
-          hwBuilder, loc, mappedVal, clk, gatedStageCE[stageIdx], rst,
-          resetVal, regName);
+      //
+      // A stage register carries its value into the next stage, which
+      // reads it the next cycle the pipeline moves: a delay, shifting on
+      // the stall gate alone with no reset, like the rest of its chain, so
+      // synthesis can put a long chain in shift-register LUTs. Only one
+      // read later (a loop result, an iter-arg's update) holds its value
+      // between its stage's firings, on its stage's CE.
+      Value reg;
+      if (holdingStageValues.contains(stageOp.getResult(regIdx)))
+        reg = seq::CompRegClockEnabledOp::create(
+            hwBuilder, loc, mappedVal, clk, gatedStageCE[stageIdx], rst,
+            createZeroConstant(hwBuilder, loc, mappedVal.getType()), regName);
+      else
+        reg = seq::CompRegClockEnabledOp::create(hwBuilder, loc, mappedVal,
+                                                 clk, notStall, regName);
       mapping.map(stageOp.getResult(regIdx), reg);
     }
   }
