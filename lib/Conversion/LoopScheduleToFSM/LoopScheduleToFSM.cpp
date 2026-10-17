@@ -680,9 +680,25 @@ computeValueCycleLatency(Value v,
 /// per-site differences are the register-name prefix and which
 /// `OpBuilder` to wire ops onto.
 ///
-/// With a `shiftEnable` (a loop pipeline's stall gate), the delay registers
-/// shift on it alone and have no reset: a delay line, which synthesis can
-/// put in shift-register LUTs. Without one, each clocks on its stage's CE.
+/// With `shiftEnables` (a loop pipeline), the delay registers shift with
+/// the pipeline and have no reset: a delay line, which synthesis can put in
+/// shift-register LUTs. Without them, each clocks on its stage's CE.
+///
+/// At II 1 the pipeline moves every cycle (the stall gate), and a value
+/// read L cycles after its stage takes L registers. At II > 1 a register
+/// only has to keep a value until the next iteration's overwrites it, II
+/// cycles on: a register written in its stage's phase of the II
+/// (`shiftEnables[s % II]`, the stall gate in the cycles some iteration is
+/// in a stage of that phase) holds the value for the II cycles after it,
+/// and each copy takes the value one II further. A value read L cycles
+/// after its stage register takes ceil(L / II) registers, all on one
+/// enable (Vitis's `x_reg`, `x_pp0_iter1_reg`, ... of a pipeline stage).
+///
+/// Only a value read past the next cycle is held, though: the registers
+/// that shift every cycle and capture one wire (a memory port's read data,
+/// a shared operator's output, in the stages that use it in turn) are one
+/// register to synthesis, which then drops the operator's input muxes
+/// between them (jacobi_2d's: +225 FFs and +101 LUTs held).
 class CrossStageValueResolver {
 public:
   CrossStageValueResolver(OpBuilder &builder, Location loc, Block *hwBody,
@@ -690,16 +706,46 @@ public:
                           ArrayRef<LoopScheduleAtOp> stages,
                           ArrayRef<Value> stageCE, IRMapping &mapping,
                           analysis::OperatorLibraryAnalysis *operatorLibrary,
-                          StringRef regNamePrefix, Value shiftEnable = {})
+                          StringRef regNamePrefix,
+                          ArrayRef<Value> shiftEnables = {})
       : builder(builder), loc(loc), hwBody(hwBody), clk(clk), rst(rst),
         stages(stages), stageCE(stageCE), mapping(mapping),
         operatorLibrary(operatorLibrary), regNamePrefix(regNamePrefix.str()),
-        shiftEnable(shiftEnable) {}
+        shiftEnables(shiftEnables) {}
+
+  /// The enable a delay register written in cycle `stage` shifts on.
+  Value shiftEnable(unsigned stage) const {
+    return shiftEnables[stage % shiftEnables.size()];
+  }
+
+  /// `stageResult` is a register its stage writes: `held` until the stage
+  /// writes it again, II cycles on (on `shiftEnable` or the stage's CE), or
+  /// else read the next cycle.
+  void noteStageRegister(Value stageResult, bool held) {
+    stageRegisters[stageResult] = held;
+  }
+
+  /// If `stageResult` only passes on `yielded`, a stage register of an
+  /// earlier stage or a value passed on from one, it is that register's
+  /// value: records it, and returns the register's stage result, which its
+  /// consumers read through (SCFToLoopSchedule forwards a value through
+  /// every stage up to its last use, which at II > 1 would take a register
+  /// per cycle).
+  Value forward(Value stageResult, Value yielded) {
+    if (shiftEnables.empty())
+      return Value();
+    Value root = forwarded.lookup_or(yielded, yielded);
+    if (!stageRegisters.count(root))
+      return Value();
+    forwarded[stageResult] = root;
+    return root;
+  }
 
   /// Returns the delayed copy of `origVal` to feed into `consumerStage`,
   /// or null if the consumer can read the existing stage register / op
   /// wrapper output directly. Lazily grows the per-value chain.
   Value resolveForStage(Value origVal, unsigned consumerStage) {
+    origVal = forwarded.lookup_or(origVal, origVal);
     auto result = dyn_cast<OpResult>(origVal);
     if (!result)
       return Value();
@@ -716,16 +762,21 @@ public:
     // operator latency: the result is only logically valid at `J+L`.
     unsigned L = getYieldLatency(origVal);
     unsigned readyStage = J + L;
-    // Only delay values whose consumer is strictly later than the
-    // stage immediately after the ready point. Consumers at or one
-    // past readyStage read the wrapper / stage register directly.
-    if (J == stages.size() || consumerStage <= readyStage + 1)
+    // The value is readable from the stage after readyStage, for `hold`
+    // cycles: a held stage register keeps it for II, anything else (an
+    // operator's output, a read port's data, a register the next cycle
+    // overwrites) for one. Copy k of the chain takes it over in the last
+    // of those cycles and holds it for `step` more.
+    unsigned step = shiftEnables.empty() ? 1 : shiftEnables.size();
+    unsigned hold = stageRegisters.lookup(origVal) ? step : 1;
+    if (J == stages.size() || consumerStage <= readyStage + hold)
       return Value();
+    unsigned copy = llvm::divideCeil(consumerStage - readyStage - hold, step);
     auto &chain = delayChain[origVal];
     if (chain.empty())
       chain.push_back(mapping.lookup(origVal));
-    while (chain.size() < consumerStage - readyStage) {
-      unsigned ceStage = readyStage + chain.size();
+    while (chain.size() <= copy) {
+      unsigned ceStage = readyStage + hold + (chain.size() - 1) * step;
       if (ceStage >= stages.size())
         break;
       Value prev = chain.back();
@@ -735,19 +786,16 @@ public:
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPointToEnd(hwBody);
       Value reg =
-          shiftEnable
-              ? seq::CompRegClockEnabledOp::create(builder, loc, prev, clk,
-                                                   shiftEnable, regName)
+          !shiftEnables.empty()
+              ? seq::CompRegClockEnabledOp::create(
+                    builder, loc, prev, clk, shiftEnable(ceStage), regName)
               : seq::CompRegClockEnabledOp::create(
                     builder, loc, prev, clk, stageCE[ceStage], rst,
                     createZeroConstant(builder, loc, prev.getType()),
                     regName);
       chain.push_back(reg);
     }
-    unsigned idx = consumerStage - readyStage - 1;
-    if (idx >= chain.size())
-      idx = chain.size() - 1;
-    return chain[idx];
+    return chain[std::min<size_t>(copy, chain.size() - 1)];
   }
 
 private:
@@ -776,7 +824,11 @@ private:
   IRMapping &mapping;
   analysis::OperatorLibraryAnalysis *operatorLibrary;
   std::string regNamePrefix;
-  Value shiftEnable;
+  ArrayRef<Value> shiftEnables;
+  /// Stage results that are registers -> whether held.
+  DenseMap<Value, bool> stageRegisters;
+  /// Stage results that pass a stage register's value on -> its result.
+  DenseMap<Value, Value> forwarded;
   DenseMap<Value, SmallVector<Value>> delayChain;
 };
 
@@ -7914,9 +7966,35 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // a raw-CE chain would keep shifting, sliding values across iterations
   // (each consumer would read a LATER iteration's value — caught by the
   // axi_copy end-to-end test as dst[i] = src[i+1]).
+  //
+  // At II > 1 the registers of the stages in phase p of the II shift in
+  // the cycles of that phase: when some iteration is in one of those
+  // stages. Every live iteration is in a stage of the phase the cycle is
+  // in (they issue II cycles apart), so this is each phase-p cycle from the
+  // first issue to the last drain, and nothing else. Stage 0 counts from
+  // the issue slot, before the loop condition admits the iteration: a
+  // refused one only rewrites registers at the time the next would.
+  SmallVector<Value> shiftEnables;
+  if (II == 1) {
+    shiftEnables.push_back(notStall);
+  } else {
+    // (A phase no stage is in, past a pipeline shorter than its II, stays
+    // null: nothing is written in it.)
+    shiftEnables.resize(II);
+    for (unsigned phase = 0; phase < II && phase < stages.size(); ++phase) {
+      SmallVector<Value> occupied;
+      for (unsigned s = phase; s < stages.size(); s += II)
+        occupied.push_back(s == 0 ? ceGen : stageCE[s]);
+      Value any = occupied.size() == 1
+                      ? occupied.front()
+                      : comb::OrOp::create(hwBuilder, loc, occupied, false);
+      shiftEnables[phase] =
+          comb::AndOp::create(hwBuilder, loc, any, notStall, false);
+    }
+  }
   CrossStageValueResolver delayResolver(
       hwBuilder, loc, hwBody, clk, rst, stages, gatedStageCE, mapping,
-      operatorLibrary, namePrefix.str(), /*shiftEnable=*/notStall);
+      operatorLibrary, namePrefix.str(), shiftEnables);
 
   // The stage results read outside the cycle after their stage: the
   // loop's results, after the drain, from the registers of the last live
@@ -7928,6 +8006,33 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
        loopschedule::getIterArgUpdatesInOrder(pipOp))
     if (update)
       holdingStageValues.insert(loopschedule::getIterArgPhaseResult(update));
+
+  // The last stage that reads each stage result, through the stages that
+  // pass it on (whose registers fold into its delay line, see below).
+  DenseMap<Value, unsigned> lastRead;
+  DenseMap<Operation *, unsigned> stageIndex;
+  for (auto [idx, stageOp] : llvm::enumerate(stages))
+    stageIndex[stageOp] = idx;
+  for (unsigned s = stages.size(); s-- > 0;) {
+    for (Value result : stages[s].getResults()) {
+      unsigned last = s;
+      for (OpOperand &use : result.getUses()) {
+        Operation *user = use.getOwner();
+        auto userStage = user->getParentOfType<LoopScheduleAtOp>();
+        auto it = stageIndex.find(userStage);
+        if (it == stageIndex.end())
+          continue;
+        last = std::max(last, it->second);
+        if (isa<LoopScheduleYieldOp>(user) &&
+            user->getParentOp() == userStage) {
+          Value passedOn = userStage.getResult(use.getOperandNumber());
+          if (!holdingStageValues.contains(passedOn))
+            last = std::max(last, lastRead.lookup(passedOn));
+        }
+      }
+      lastRead[result] = last;
+    }
+  }
 
   for (auto [stageIdx, stageOp] : llvm::enumerate(stages)) {
     Block &body = stageOp.getBodyBlock();
@@ -7943,20 +8048,22 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
         continue;
 
       // Temporarily override the mapping entries for any operands that come
-      // from earlier stages so the clone sees the correctly-delayed version.
-      // Restore the original mappings after lowering this op so later uses
-      // aren't affected.
+      // from earlier stages so the clone sees the correctly-delayed version,
+      // the operands of the ops in an `if` included. Restore the original
+      // mappings after lowering this op so later uses aren't affected.
       SmallVector<std::pair<Value, Value>> savedMappings;
-      for (Value operand : op.getOperands()) {
-        Value delayed = delayResolver.resolveForStage(operand, stageIdx);
-        if (!delayed)
-          continue;
-        Value current = mapping.lookup(operand);
-        if (delayed != current) {
-          savedMappings.emplace_back(operand, current);
-          mapping.map(operand, delayed);
+      op.walk([&](Operation *user) {
+        for (Value operand : user->getOperands()) {
+          Value delayed = delayResolver.resolveForStage(operand, stageIdx);
+          if (!delayed)
+            continue;
+          Value current = mapping.lookup(operand);
+          if (delayed != current) {
+            savedMappings.emplace_back(operand, current);
+            mapping.map(operand, delayed);
+          }
         }
-      }
+      });
 
       LogicalResult opResult = success();
       // Recursive body-processor: handles ops inside the current pipeline
@@ -8054,7 +8161,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // The raw stageCE rides along for loop-free stall terms.
       opResult = processOp(&op, effectGate[stageIdx], stageCE[stageIdx]);
 
-      for (auto &sm : savedMappings)
+      for (auto &sm : llvm::reverse(savedMappings))
         mapping.map(sm.first, sm.second);
 
       if (failed(opResult))
@@ -8062,6 +8169,12 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     }
 
     auto regOp = cast<LoopScheduleYieldOp>(body.getTerminator());
+    // What this stage reads for `val`: the copy of an earlier stage's value
+    // for this cycle.
+    auto readInStage = [&](Value val) {
+      Value delayed = delayResolver.resolveForStage(val, stageIdx);
+      return delayed ? delayed : mapping.lookup(val);
+    };
 
     // Resolve the condition backedge from the producing stage's *unregistered*
     // condition value: the loop's combinational gate should not be delayed by
@@ -8070,7 +8183,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     if (stageIdx == condStageIdx) {
       auto condResult = cast<OpResult>(condTermVal);
       Value condResolved =
-          mapping.lookup(regOp.getOperand(condResult.getResultNumber()));
+          readInStage(regOp.getOperand(condResult.getResultNumber()));
       // The pipeline's exit compare can carry a launch-invariant bound
       // cone (matmul's 64-bit sign-guarded `n` select — 8 LOOKAHEAD8 of
       // it, the synthesis worst path) combinationally into pip_done and
@@ -8093,11 +8206,21 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     }
 
     for (auto [regIdx, val] : llvm::enumerate(regOp.getOperands())) {
+      Value result = stageOp.getResult(regIdx);
+      // A result that only passes an earlier stage's register on is that
+      // register's value, which its consumers read through the copies the
+      // resolver keeps (one per II cycles), not a register per stage.
+      // A holding value keeps a register of its own, written by its stage.
+      if (!holdingStageValues.contains(result))
+        if (Value root = delayResolver.forward(result, val)) {
+          mapping.map(result, mapping.lookup(root));
+          continue;
+        }
+
       // The register's D input should see the delayed view for this stage
       // as well, in case the register is a direct pass-through of an
       // earlier stage's value.
-      Value delayed = delayResolver.resolveForStage(val, stageIdx);
-      Value mappedVal = delayed ? delayed : mapping.lookup(val);
+      Value mappedVal = readInStage(val);
 
       if (localLoadResults.count(val)) {
         // Local hlmem read (latency=1) already provides the 1-cycle delay.
@@ -8131,21 +8254,27 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // pointing at the same iter so a fresh issue at consume cycle
       // sees iter K+1's addresses instead of iter K+S.
       //
-      // A stage register carries its value into the next stage, which
-      // reads it the next cycle the pipeline moves: a delay, shifting on
-      // the stall gate alone with no reset, like the rest of its chain, so
-      // synthesis can put a long chain in shift-register LUTs. Only one
-      // read later (a loop result, an iter-arg's update) holds its value
-      // between its stage's firings, on its stage's CE.
+      // A stage register carries its value into the next stages: the first
+      // register of its delay line, shifting with the rest of it with no
+      // reset, so synthesis can put a long chain in shift-register LUTs.
+      // At II > 1 one read past the next cycle holds its value through the
+      // II, written in its stage's phase (see CrossStageValueResolver).
+      // Only one read after the loop or its iteration (a loop result, an
+      // iter-arg's update) holds its value between its stage's firings, on
+      // its stage's CE.
+      bool holding = holdingStageValues.contains(result);
+      bool held = holding || lastRead.lookup(result) > stageIdx + 1;
       Value reg;
-      if (holdingStageValues.contains(stageOp.getResult(regIdx)))
+      if (holding)
         reg = seq::CompRegClockEnabledOp::create(
             hwBuilder, loc, mappedVal, clk, gatedStageCE[stageIdx], rst,
             createZeroConstant(hwBuilder, loc, mappedVal.getType()), regName);
       else
-        reg = seq::CompRegClockEnabledOp::create(hwBuilder, loc, mappedVal,
-                                                 clk, notStall, regName);
-      mapping.map(stageOp.getResult(regIdx), reg);
+        reg = seq::CompRegClockEnabledOp::create(
+            hwBuilder, loc, mappedVal, clk,
+            held ? delayResolver.shiftEnable(stageIdx) : notStall, regName);
+      mapping.map(result, reg);
+      delayResolver.noteStageRegister(result, held);
     }
   }
 
