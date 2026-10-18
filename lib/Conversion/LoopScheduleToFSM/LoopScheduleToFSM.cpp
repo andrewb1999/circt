@@ -8533,7 +8533,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     preArm = preArm && info.canPreload && info.constantInit;
 
   // --- Apply. Pre-arm mode: ONE shared drain-level pulse (resolved after
-  // the epilogue/store-tail chain below) selects the init into every
+  // the drain/store-tail logic below) selects the init into every
   // feedback register through the idle window, and the register's RESET
   // value becomes the init so the first-ever invocation is pre-armed
   // too. The historical mode is byte-identical to before.
@@ -8698,11 +8698,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     mapping.map(result, mapped);
   }
 
-  // LegUp-style epilogue done signal. Latch the loop-exit event into an
-  // epilogue register, then shift it through a delay chain matching the
-  // pipeline depth. Done fires when the delayed epilogue reaches the end —
-  // exactly when the last valid bit has drained from the tail stage.
-  // Combinational depth: O(1) (single AND of two register outputs).
+  // Done: the loop has exited (`epilogue`, latched on the exit event and
+  // held until the next start) and the pipeline has drained (`busy` low).
   // condEffective was refreshed post-resolution only on the late-condition
   // path; the stage loop's refresh covers condValue for the classic path.
   Value notCondValue = comb::createOrFoldNot(
@@ -8710,15 +8707,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   Value epilogueTrigger =
       comb::AndOp::create(hwBuilder, loc, active, notCondValue);
 
-  // The epilogue chain shifts in LOCKSTEP with the stage-CE chain
-  // (CE = notStall): a stalled pipeline freezes its in-flight iterations,
-  // and an epilogue that kept shifting would race ahead of them and fire
-  // `done` while a mid-stage iteration is still frozen (the tail-CE guard
-  // below only covers the LAST stage). II=1 pipelines masked this — dense
-  // occupancy keeps the tail stage busy through the drain — but sparse
-  // II>1 schedules with a mid-stage ready/expect stall drop accesses of
-  // still-in-flight iterations when the enclosing frame consumes the
-  // early done.
+  // The epilogue register holds in LOCKSTEP with the stage-CE chain
+  // (CE = notStall), like everything `done` is derived from.
   Value notStart = comb::createOrFoldNot(hwBuilder, loc, startSignal);
   Backedge epilogueBE = bb.get(hwBuilder.getI1Type());
   Value epilogueHold =
@@ -8730,7 +8720,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       hwBuilder.getStringAttr(namePrefix + "_epilogue"));
   epilogueBE.setValue(epilogueReg);
 
-  // Depth of the epilogue: prefer the schedule's declared iteration latency
+  // Depth of the pipeline: prefer the schedule's declared iteration latency
   // (which covers result-less tails like static store commits even if no
   // stage spans them); fall back to the stage count for IR without the
   // attribute. Take the max so extra stages (e.g. expect destinations
@@ -8739,31 +8729,44 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   if (auto latency = pipOp.getLatency())
     pipelineDepth = std::max<unsigned>(pipelineDepth, *latency);
 
-  Value delayedEpilogue = Value(epilogueReg);
-  for (unsigned i = 0; i + 2 < pipelineDepth; ++i) {
-    Value delayInput =
-        comb::MuxOp::create(hwBuilder, loc, startSignal, falseConst,
-                            delayedEpilogue);
-    delayedEpilogue = seq::CompRegClockEnabledOp::create(
-        hwBuilder, loc, delayInput, clk, notStall, rst, falseConst,
-        hwBuilder.getStringAttr(
-            (namePrefix + "_epilogue_delay_" + std::to_string(i)).str()));
+  // Drained: no iteration at any stage 1 .. depth - 1, by the stage-CE
+  // chain (raw, so a squashed launch past the exit drains too) continued
+  // past the last stage by `live`, and no iter-arg init capture pending
+  // (the start-delay chain past its first register; a zero-trip loop's
+  // results are those inits). Done thus rises as the last iteration
+  // reaches its cycle `depth`, where a result its last operator produces
+  // latches (on that edge, read after done). These are all shift
+  // registers, so `busy` takes the OR of what each shifts in, one edge
+  // early: it holds their OR in the cycle they hold it, and done is one
+  // AND of two registers, as the delay chain it replaces (a register per
+  // stage) made it. Stage 0 is left out: from the exit on nothing issues
+  // (`active` drops on the exit event), so while `epilogue` is high stage
+  // 1 shifts in nothing.
+  liveAt(pipelineDepth - 1);
+  SmallVector<Value> ahead;
+  for (unsigned s = 1; s + 1 < pipelineDepth; ++s)
+    ahead.push_back(s + 1 < stages.size() ? stageCE[s] : live[s]);
+  for (unsigned d = 1; d + 1 < startDelayChain.size(); ++d)
+    ahead.push_back(startDelayChain[d]);
+  Value doneComb = Value(epilogueReg);
+  if (!ahead.empty()) {
+    Value busy = seq::CompRegClockEnabledOp::create(
+        hwBuilder, loc, comb::OrOp::create(hwBuilder, loc, ahead, false), clk,
+        notStall, rst, falseConst,
+        hwBuilder.getStringAttr(namePrefix + "_busy"));
+    doneComb = comb::AndOp::create(hwBuilder, loc, doneComb,
+                                   comb::createOrFoldNot(hwBuilder, loc, busy));
   }
 
-  Value notTailCE = comb::createOrFoldNot(hwBuilder, loc, stageCE.back());
-  Value doneComb =
-      comb::AndOp::create(hwBuilder, loc, delayedEpilogue, notTailCE);
-
   // A static-port store commits its write `latency` cycles after issue, but
-  // the epilogue chain above only counts stages — stages exist at op START
-  // times, so a tail store's commit window extends past the last stage and
-  // `done` would fire before the write lands (inter-loop RAW hazard: the
-  // next loop reads stale data). Count the worst store-commit overhang and
-  // hold `done` that many extra cycles. The count starts from `doneComb`
-  // (actual tail-stage drain, II-robust) rather than from the epilogue
-  // chain. Dynamic-port stores are excluded: no static count is sufficient
-  // for them (they are handled by launch/expect wrapping or, eventually,
-  // explicit fences).
+  // the drain above only covers the pipeline's depth — stages exist at op
+  // START times, so without a latency that covers it a tail store's commit
+  // window extends past the last stage and `done` would fire before the
+  // write lands (inter-loop RAW hazard: the next loop reads stale data).
+  // Count the worst store-commit overhang and hold `done` that many extra
+  // cycles, from the drain. Dynamic-port stores are excluded: no static
+  // count is sufficient for them (they are handled by launch/expect
+  // wrapping or, eventually, explicit fences).
   unsigned pipeEnd =
       std::max(pipelineDepth, (unsigned)stages.back().getOffset() + 1);
   unsigned maxStoreEnd = 0;
@@ -8785,7 +8788,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   }
 
   // Done cuts through combinationally. doneComb is already exact (the
-  // tail stage has drained) and level-held: the epilogue chain holds
+  // pipeline has drained) and level-held: the epilogue register holds
   // until the next start clears it at the start edge, so like the old
   // registered done it reads 0 from one cycle after child_start — the
   // first cycle any WAIT state can sample it. Registering it here only
@@ -9969,7 +9972,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   // instead of waiting for the Moore DONE state. ~child_start excludes
   // the launch cycle, where a stale done from the previous invocation
   // may still be high. Per kind:
-  //  - kind 1 (pipeline): its done carries the epilogue/store-tail
+  //  - kind 1 (pipeline): its done carries the drain/store-tail
   //    margin (asserts at least one cycle after the final store issues).
   //  - kind 0 (sequential): its advance-edge done coincides with the
   //    final store cycle, so the module boundary observes done on the
