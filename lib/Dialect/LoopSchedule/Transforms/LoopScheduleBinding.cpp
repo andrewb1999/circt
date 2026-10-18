@@ -34,11 +34,12 @@
 // user's operands in under its activation gate — see
 // `emitHwInstanceFromOperator` in LoopScheduleToFSM.
 //
-// Occupancy latency is 1 for compute operators: every extern operator in
-// the current library is fully pipelined (accepts new operands every
-// enabled cycle), so only ISSUE-cycle collisions matter — in-flight
-// computations coexist in the unit's internal pipe. A future non-pipelined
-// operator (e.g. a sequential divider) must pass its full occupancy here.
+// Occupancy latency is 1 for compute operators: every shared extern
+// operator is fully pipelined (accepts new operands every enabled cycle),
+// so only ISSUE-cycle collisions matter — in-flight computations coexist
+// in the unit's internal pipe. An operator that has to see the cycles its
+// op issues (a `valid` hw_match argument: one with state, or one that takes
+// an operand only every so many cycles) is its op's alone and never bound.
 //
 //===----------------------------------------------------------------------===//
 
@@ -101,6 +102,20 @@ bool isExternInstanceOperator(analysis::OperatorLibraryAnalysis &ola,
       return true;
   return false;
 }
+
+/// Does \p oprAttr's hw_match take the cycles its op issues (a `valid`
+/// argument)? Such an operator takes one step per execution of its op
+/// (an accumulator a beat; a core that takes an operand only every so many
+/// cycles, an operation): another op's executions would step it too, and
+/// the FSM lowering drives `valid` from one op's gate.
+bool takesIssueCycles(analysis::OperatorLibraryAnalysis &ola,
+                      SymbolRefAttr oprAttr) {
+  StringRef opName = ola.getOperatorBySymbol(oprAttr);
+  oplib::HwMatchOp hwMatch = ola.getHwMatchOp(opName);
+  return hwMatch && llvm::any_of(hwMatch.getArgRoles(), [](Attribute role) {
+           return cast<StringAttr>(role).getValue() == "valid";
+         });
+}
 } // namespace
 
 LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
@@ -127,9 +142,11 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
       // Memory accesses only bind against a declared port cap.
       if (!bindMemories || !limit)
         continue;
-    } else if (!isMemoryEffectFree(op)) {
-      // An operator with state (an accumulator) is its op's alone: another
-      // op's executions would step it too.
+    } else if (!isMemoryEffectFree(op) ||
+               takesIssueCycles(opLibAnalysis, oprAttr)) {
+      // An operator with state (an accumulator), or one that takes an
+      // operand only every so many cycles, is its op's alone: another op's
+      // executions would step it too.
       continue;
     } else if (!limit) {
       // No cap declared: bind in share mode when the operator is backed

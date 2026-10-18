@@ -117,8 +117,10 @@ static unsigned getOpCycleLatency(Operation *op) {
 }
 
 /// Compute the latency contribution of an `at` body: the max cycle_latency
-/// of any op in the body (nested loops and launches are not expected here).
-/// Returns at least 1.
+/// of any op in the body (nested loops and launches are not expected here),
+/// the ops a `loopschedule.if` predicates included: the frame lasts until
+/// each has its result, consumed in the frame or not, and so the op's next
+/// execution comes no sooner. Returns at least 1.
 static unsigned computeAtBodyLatency(Block &block) {
   unsigned maxLat = 0;
   for (Operation &op : block) {
@@ -126,6 +128,12 @@ static unsigned computeAtBodyLatency(Block &block) {
       continue;
     if (isa<LoopScheduleSequentialOp, LoopSchedulePipelineOp>(op))
       continue;
+    if (auto ifOp = dyn_cast<LoopScheduleIfOp>(op)) {
+      for (Region &region : ifOp->getRegions())
+        for (Block &body : region)
+          maxLat = std::max(maxLat, computeAtBodyLatency(body));
+      continue;
+    }
     maxLat = std::max(maxLat, getOpCycleLatency(&op));
   }
   return std::max(maxLat, 1u);
@@ -6834,6 +6842,19 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
               isa<arith::ArithDialect>(def->getDialect()) ||
               def->hasTrait<mlir::OpTrait::ConstantLike>()))
           return false;
+        // An operator that takes the cycles its op issues (a rate core)
+        // serves that op alone: it cannot be built again for the slice.
+        if (auto operatorAttr =
+                def->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+            operatorAttr && operatorLibrary) {
+          oplib::HwMatchOp hwMatch = operatorLibrary->getHwMatchOp(
+              operatorLibrary->getOperatorBySymbol(operatorAttr));
+          if (hwMatch &&
+              llvm::any_of(hwMatch.getArgRoles(), [](Attribute role) {
+                return cast<StringAttr>(role).getValue() == "valid";
+              }))
+            return false;
+        }
         for (Value o : def->getOperands())
           stack.push_back(o);
       }
