@@ -1,4 +1,7 @@
-// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80},func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule,lower-loopschedule-to-fsm)" %s | FileCheck %s
+// RUN: amc-opt --pass-pipeline="builtin.module(operator-allocation{target-device=xcv80 target-clock-period=1.5},func.func(mark-memory-accesses,construct-memory-dependencies,convert-memref-to-loopschedule,index-removal),convert-scf-to-loopschedule,lower-loopschedule-to-fsm)" %s | FileCheck %s
+
+// At 1.5 ns a 32-bit multiply is the 4-cycle pipelined one these
+// structures are built around (at a slower clock it takes fewer cycles).
 
 
 // End-to-end 1-D convolution: inner reduction awaited by outer loop's store.
