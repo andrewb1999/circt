@@ -39,6 +39,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Value.h"
@@ -1487,6 +1488,16 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
       return WalkResult::advance();
     }
 
+    // A shift by a constant amount is wiring: free, whatever the library
+    // charges for a shifter. The op keeps the operator allocation gave it
+    // (the FSM lowering builds it from that entry); the problem times it
+    // as free.
+    if (isa<ShLIOp, ShRSIOp, ShRUIOp>(op) &&
+        matchPattern(op->getOperand(1), m_Constant())) {
+      problem.setLinkedOperatorType(op, freeOpr);
+      return WalkResult::advance();
+    }
+
     auto potentialOperators =
         operatorLibraryAnalysis->getPotentialOperators(op);
     if (!potentialOperators.empty()) {
@@ -1544,23 +1555,8 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
           problem.setLinkedOperatorType(callOp, opr);
           return WalkResult::advance();
         })
-        .Case<ShLIOp, ShRSIOp, ShRUIOp>([&](Operation *shOp) {
-          bool constant =
-              llvm::any_of(shOp->getOpOperands(), [](auto &operand) {
-                if (isa<BlockArgument>(operand.get())) {
-                  return false;
-                }
-                return isa<arith::ConstantOp>(operand.get().getDefiningOp());
-              });
-          // Constant shifts are free
-          if (constant) {
-            problem.setLinkedOperatorType(shOp, freeOpr);
-          } else {
-            problem.setLinkedOperatorType(shOp, combOpr);
-          }
-          return WalkResult::advance();
-        })
-        .Case<CmpIOp, arith::SelectOp, AddIOp, SubIOp, AndIOp, XOrIOp>(
+        .Case<CmpIOp, arith::SelectOp, AddIOp, SubIOp, AndIOp, XOrIOp, ShLIOp,
+              ShRSIOp, ShRUIOp>(
             [&](Operation *combOp) {
               // Some known combinational ops.
               problem.setLinkedOperatorType(combOp, combOpr);
