@@ -8457,13 +8457,18 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // constant? Pre-arm (loading inits at the previous invocation's DRAIN
   // edge instead of the launch edge, so stage 0 can issue in the launch
   // cycle) is ALL-OR-NOTHING: a single launch-edge-armed argument under
-  // issue-at-launch would be read one cycle before its init lands.
+  // issue-at-launch would be read one cycle before its init lands. An
+  // argument nothing reads (its only use names it in its own update, e.g.
+  // a multiply-accumulate's running value, which lives in the core and is
+  // carried only to leave the loop) has no init to deliver and takes no
+  // part.
   struct IterArgPreloadInfo {
     Value init;
     Value feedback;
     seq::CompRegClockEnabledOp feedbackReg;
     unsigned feedbackStage = 0;
     unsigned d = 0;
+    bool unread = false;
     bool canPreload = false;
     bool constantInit = false;
   };
@@ -8475,6 +8480,13 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     for (unsigned i = 0; i < numIterArgs; ++i) {
       IterArgPreloadInfo &info = argInfos[i];
       info.init = mapping.lookup(pipOp.getInits()[i]);
+      info.unread = llvm::all_of(
+          pipOp.getStagesBlock().getArgument(i).getUses(), [](OpOperand &use) {
+            auto update = dyn_cast<LoopScheduleIterArgUpdateOp>(use.getOwner());
+            return update && &use == &update.getIterArgMutable();
+          });
+      if (info.unread)
+        continue;
       Value termVal =
           pipIterArgUpdates[i]
               ? loopschedule::getIterArgPhaseResult(pipIterArgUpdates[i])
@@ -8530,7 +8542,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // --- Decision.
   bool preArm = allowPreArm;
   for (IterArgPreloadInfo &info : argInfos)
-    preArm = preArm && info.canPreload && info.constantInit;
+    preArm = preArm && (info.unread || (info.canPreload && info.constantInit));
 
   // --- Apply. Pre-arm mode: ONE shared drain-level pulse (resolved after
   // the drain/store-tail logic below) selects the init into every
@@ -8546,6 +8558,10 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   DenseMap<Operation *, std::pair<Value, unsigned>> preloadedRegs;
   for (unsigned i = 0; i < numIterArgs; ++i) {
     IterArgPreloadInfo &info = argInfos[i];
+    if (info.unread) {
+      iterArgBackedges[i].setValue(info.init);
+      continue;
+    }
     if (info.canPreload) {
       auto feedbackReg = info.feedbackReg;
       if (!preloadedRegs.count(feedbackReg)) {
@@ -8608,7 +8624,10 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // accumulator adds its last operand again every cycle — so latch the
   // result whenever a live iteration reaches that cycle; the last one's
   // stays. `live[t]`: a live iteration is at stage t, which past the last
-  // stage the stage-CE chain and its kill bit continue in lockstep.
+  // stage the stage-CE chain and its kill bit continue in lockstep. Such a
+  // latch is a register of its own, which pre-arm does not reload, so it
+  // takes no hold (it captures on the drain edge, where a hold would
+  // sample its previous value).
   SmallVector<Value> live;
   auto liveAt = [&](unsigned t) {
     while (live.size() <= t) {
@@ -8654,6 +8673,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   for (auto [idx, result, termResult] : llvm::enumerate(
            pipOp.getResults(), terminatorOp.getResults())) {
     Value mapped = mapping.lookup(termResult);
+    bool latched = false;
     if (auto stageResult = dyn_cast<OpResult>(termResult)) {
       auto stageOp = dyn_cast<LoopScheduleAtOp>(stageResult.getOwner());
       Operation *def =
@@ -8674,6 +8694,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
             hwBuilder.getStringAttr((namePrefix + "_result_r" +
                                      std::to_string(resultLatchIdx++))
                                         .str()));
+        latched = true;
       }
     }
     if (ran) {
@@ -8687,7 +8708,10 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
                 (namePrefix + "_init_r" + std::to_string(idx)).str()));
       mapped = comb::MuxOp::create(hwBuilder, loc, ran, mapped, init);
     }
-    if (preArmPulseBE) {
+    // A latched result is no feedback register (pre-arm does not reload
+    // it), and it captures on the drain edge itself: a hold sampling it
+    // there would take the previous invocation's value.
+    if (preArmPulseBE && !latched) {
       Value zero = createZeroConstant(hwBuilder, loc, mapped.getType());
       mapped = seq::CompRegClockEnabledOp::create(
           hwBuilder, loc, mapped, clk, Value(*preArmPulseBE), rst, zero,
