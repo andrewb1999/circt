@@ -10157,6 +10157,20 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       return offsetGates[offset];
     };
 
+    // A result an operator instance computes is held from the cycle it is
+    // ready (as lowerFrameBody's frame_hold): the frame's own ops read it
+    // directly in that cycle, chained there, and from its capture after.
+    struct Held {
+      Value result;
+      unsigned ready;
+      Value direct, captured;
+    };
+    SmallVector<Held> held;
+    auto readFrom = [&](unsigned cycle) {
+      for (auto &h : held)
+        mapping.map(h.result, cycle > h.ready ? h.captured : h.direct);
+    };
+
     for (auto atOp : frame.getBodyBlock().getOps<LoopScheduleAtOp>()) {
       bool isLaunchHolder = false;
       for (auto &op : atOp.getBodyBlock()) {
@@ -10167,6 +10181,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       }
       if (isLaunchHolder)
         continue;
+      readFrom((unsigned)atOp.getOffset());
       Value atGate = gateAt((unsigned)atOp.getOffset());
       for (auto &op : atOp.getBodyBlock()) {
         if (isa<LoopScheduleYieldOp, LoopScheduleIterArgUpdateOp,
@@ -10264,9 +10279,8 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       // Eagerly map this at-op's external results so later at-ops in the
       // same frame (e.g. a pipeline-launch-holder at a later offset)
       // can resolve any operands that reference them. A result an operator
-      // instance computes is held from the cycle it is ready, read directly
-      // in that cycle: a pipelined instance moves on, and a shared one goes
-      // to its other users (as lowerFrameBody's frame_hold).
+      // instance computes is held: a pipelined instance moves on, and a
+      // shared one goes to its other users.
       auto atYield = atOp.getYieldOp();
       for (auto [res, val] :
            llvm::zip(atOp.getResults(), atYield.getOperands())) {
@@ -10281,17 +10295,31 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
           mapping.map(res, mapped);
           continue;
         }
-        Value readyGate = gateAt((unsigned)atOp.getOffset() + *latency);
+        unsigned ready = (unsigned)atOp.getOffset() + *latency;
         auto holdName = builder.getStringAttr(
             "frame" + std::to_string(frameId) + "_hold_" +
             std::to_string(staticCapCounter++));
-        Value held = seq::CompRegClockEnabledOp::create(
-            builder, loc, mapped, clk, readyGate, rst,
+        Value captured = seq::CompRegClockEnabledOp::create(
+            builder, loc, mapped, clk, gateAt(ready), rst,
             createZeroConstant(builder, loc, mapped.getType()), holdName);
-        mapping.map(res,
-                    comb::MuxOp::create(builder, loc, readyGate, mapped, held));
+        held.push_back({res, ready, mapped, captured});
+        mapping.map(res, mapped);
       }
     }
+    // What the frame launches starts the cycle after its header (the
+    // child_start pulse), and later frames later still: they read a result
+    // ready in the header cycle from its capture. Read through a bypass,
+    // the instance's output would sit on their paths for nothing, and fed
+    // back into a shared combinational instance's own operands it is a
+    // combinational loop (deriche: 75 ns through one multiply, 32 times).
+    // A result ready later may be read by a running child in that very
+    // cycle, so it keeps the bypass.
+    for (auto &h : held)
+      mapping.map(h.result,
+                  h.ready == 0 ? h.captured
+                               : comb::MuxOp::create(builder, loc,
+                                                     gateAt(h.ready), h.direct,
+                                                     h.captured));
     return success();
   };
 

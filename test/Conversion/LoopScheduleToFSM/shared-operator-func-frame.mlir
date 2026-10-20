@@ -10,7 +10,8 @@
 //
 // The frame reads the product again five cycles in, while the child has
 // the shared multiplier: the result is held from the cycle it is ready
-// (offset 0 + latency 4), and read from the hold after.
+// (offset 0 + latency 4), and read from the hold after, not through a
+// bypass of the multiplier's output.
 
 oplib.library @lib {
   oplib.operator @mul_i32_l4 latency<4>, incDelay<5.000000e-01>, outDelay<5.000000e-01> {
@@ -29,10 +30,9 @@ hw.module.extern @int_mul_pipe_i32_l4(in %clk : i1 {oplib.clock}, in %reset : i1
 
 // CHECK-LABEL: hw.module @frame_shared
 // CHECK:       hw.instance "mul_pipe_i32_hw_inst_0" @int_mul_pipe_i32_l4({{.*}}lhs: %[[LHS:[0-9]+]]: i32, rhs: %[[RHS:[0-9]+]]: i32)
-// The frame's product, held from cycle 4, read through the hold after.
-// CHECK:       %[[HOLD:frame[0-9]+_hold_[0-9]+]] = seq.compreg.ce sym @{{[a-z0-9_]+}} %mul_pipe_i32_hw_inst_0.out, %clk, %[[READY:[a-z0-9_]+]]
-// CHECK:       %[[HELD:[0-9]+]] = comb.mux %[[READY]], %mul_pipe_i32_hw_inst_0.out, %[[HOLD]] : i32
-// CHECK:       arith.addi %[[HELD]], %{{.*}} : i32
+// The frame's product, held from cycle 4, read from the hold in cycle 5.
+// CHECK:       %[[HOLD:frame[0-9]+_hold_[0-9]+]] = seq.compreg.ce sym @{{[a-z0-9_]+}} %mul_pipe_i32_hw_inst_0.out, %clk, %{{[a-z0-9_]+}}
+// CHECK:       arith.addi %[[HOLD]], %{{.*}} : i32
 // CHECK-DAG:   %[[LHS]] = comb.mux
 // CHECK-DAG:   %[[RHS]] = comb.mux
 loopschedule.func_sequential @frame_shared(%x: i32, %n: i32) -> i32
