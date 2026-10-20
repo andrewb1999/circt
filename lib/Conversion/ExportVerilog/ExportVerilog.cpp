@@ -2548,8 +2548,13 @@ SubExprInfo ExprEmitter::emitBinary(Operation *op, VerilogPrecedence prec,
   // top operation of the tree, the rhs needs parens.  When processing
   // known-reassociative operators like +, ^, etc we don't need parens.
   // TODO: MLIR should have general "Associative" trait.
+  // An add or multiply kept as a tree (`comb.keep_tree`: a scheduler timed it
+  // op by op) keeps its parens too: `a + (b + c)` written `a + b + c` is
+  // grouped from the left, a chain of adders to a synthesis tool that does
+  // not rebalance it.
   auto rhsPrec = prec;
-  if (!isa<AddOp, MulOp, AndOp, OrOp, XorOp>(op))
+  if (!isa<AddOp, MulOp, AndOp, OrOp, XorOp>(op) ||
+      (isa<AddOp, MulOp>(op) && op->hasAttr("comb.keep_tree")))
     rhsPrec = VerilogPrecedence(prec - 1);
 
   // If the RHS operand has self-determined width and always treated as

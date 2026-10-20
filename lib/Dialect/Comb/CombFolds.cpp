@@ -86,14 +86,25 @@ static inline ComplementMatcher<SubType> m_Complement(const SubType &subExpr) {
   return ComplementMatcher<SubType>(subExpr);
 }
 
+/// Whether `op` stays the node of its expression tree it was written as: a
+/// `comb.keep_tree` op is neither merged into a user of its kind nor merges
+/// its operands, and an add does not become a multiply. A scheduler that
+/// timed the tree op by op (an adder tree balanced to fit a cycle, a
+/// shift-and-add) keeps that shape through to the Verilog, where
+/// `a + b + c + d` is a chain of adders to a synthesis tool that does not
+/// rebalance it, and `x * 17` a multiplier where it timed `x + (x << 4)`.
+static bool keepsTree(Operation *op) { return op->hasAttr("comb.keep_tree"); }
+
 /// Return true if the op will be flattened afterwards. Op will be flattend if
 /// it has a single user which has a same op type.  User must be in same block.
 static bool shouldBeFlattened(Operation *op) {
   assert((isa<AndOp, OrOp, XorOp, AddOp, MulOp>(op) &&
           "must be commutative operations"));
+  if (keepsTree(op))
+    return false;
   if (op->hasOneUse()) {
     auto *user = *op->getUsers().begin();
-    return user->getName() == op->getName() &&
+    return !keepsTree(user) && user->getName() == op->getName() &&
            op->getAttrOfType<UnitAttr>("twoState") ==
                user->getAttrOfType<UnitAttr>("twoState") &&
            op->getBlock() == user->getBlock();
@@ -108,7 +119,7 @@ static bool shouldBeFlattened(Operation *op) {
 ///
 static bool tryFlatteningOperands(Operation *op, PatternRewriter &rewriter) {
   // Skip if the operation should be flattened by another operation.
-  if (shouldBeFlattened(op))
+  if (keepsTree(op) || shouldBeFlattened(op))
     return false;
 
   auto inputs = op->getOperands();
@@ -139,7 +150,7 @@ static bool tryFlatteningOperands(Operation *op, PatternRewriter &rewriter) {
     // from the same block, keep this as-is.
     if (!flattenOp || flattenOp->getName() != op->getName() ||
         flattenOp == op || binFlag != op->hasAttrOfType<UnitAttr>("twoState") ||
-        flattenOp->getBlock() != op->getBlock()) {
+        flattenOp->getBlock() != op->getBlock() || keepsTree(flattenOp)) {
       newOperands.push_back(value);
       continue;
     }
@@ -1573,7 +1584,7 @@ LogicalResult AddOp::canonicalize(AddOp op, PatternRewriter &rewriter) {
 
   auto shlOp = inputs[size - 1].getDefiningOp<comb::ShlOp>();
   // add(..., x, shl(x, c)) -> add(..., mul(x, (1 << c) + 1))
-  if (shlOp && shlOp.getLhs() == inputs[size - 2] &&
+  if (shlOp && !keepsTree(op) && shlOp.getLhs() == inputs[size - 2] &&
       matchPattern(shlOp.getRhs(), m_ConstantInt(&value))) {
 
     APInt one(/*numBits=*/value.getBitWidth(), 1, /*isSigned=*/false);
@@ -1592,7 +1603,7 @@ LogicalResult AddOp::canonicalize(AddOp op, PatternRewriter &rewriter) {
 
   auto mulOp = inputs[size - 1].getDefiningOp<comb::MulOp>();
   // add(..., x, mul(x, c)) -> add(..., mul(x, c + 1))
-  if (mulOp && mulOp.getInputs().size() == 2 &&
+  if (mulOp && !keepsTree(op) && mulOp.getInputs().size() == 2 &&
       mulOp.getInputs()[0] == inputs[size - 2] &&
       matchPattern(mulOp.getInputs()[1], m_ConstantInt(&value))) {
 
