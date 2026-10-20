@@ -53,6 +53,14 @@ scheduling::ModuloProblem
 getModuloProblem(mlir::scf::WhileOp whileOp,
                  analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);
 
+/// The op computing iter_arg `i` of `whileOp`: its yield operand's definer,
+/// or, where that operand is another iter_arg (a filter's delay line,
+/// `ym2 = ym1`), the definer of that one's, and so on. Pipelining writes
+/// such an iter_arg in the stage that writes the one it copies, so its
+/// readers wait on that op as the copied one's do, an iteration on. Null
+/// for a value from outside the loop.
+mlir::Operation *getIterArgDefiner(mlir::scf::WhileOp whileOp, unsigned i);
+
 scheduling::ChainingModuloProblem getChainingModuloProblem(
     mlir::scf::WhileOp whileOp,
     analysis::LoopScheduleDependenceAnalysis &dependenceAnalysis);

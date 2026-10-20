@@ -2325,11 +2325,11 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
 
     unsigned startPipeTime = 0;
 
-    auto *term = loop.getAfterBody()->getTerminator();
-    auto &termOperand = term->getOpOperand(it.index());
-    auto *definingOp = termOperand.get().getDefiningOp();
-    assert(definingOp != nullptr);
-    startPipeTime = *problem.getStartTime(definingOp);
+    // The cycle the iter-arg is written in: its definer's. One passed along
+    // from another iter_arg (a filter's `ym2 = ym1`) is written with that
+    // one; one set from outside the loop, from the start.
+    if (Operation *definingOp = getIterArgDefiner(loop, it.index()))
+      startPipeTime = *problem.getStartTime(definingOp);
 
     unsigned pipeEndTime = 0;
     for (auto *user : iterArg.getUsers()) {
@@ -2403,11 +2403,13 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
   Value pipelineCondResult;
 
   // Create stages along with maps
+  DenseMap<unsigned, LoopScheduleAtOp> stageAtTime;
   for (auto startTime : startTimes) {
     builder.setInsertionPointToEnd(&stagesBlock);
     auto stage = emitOnePipelineStage(
         builder, startTime, startGroups[startTime], registerValues[startTime],
         registerTypes[startTime], stageValueMaps, problem, dom);
+    stageAtTime[startTime] = stage;
 
     // If this stage contains the condition value, record its stage result
     // for the terminator built after the stages loop completes.
@@ -2424,6 +2426,17 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
   // mapped values that were originally yielded.
   SmallVector<Value> termIterArgs;
   SmallVector<Value> termResults;
+  // The stage holding each iter_arg's update, and the iter_args updated to
+  // another one's value (a filter's delay line, `ym2 = ym1`), placed after.
+  DenseMap<unsigned, LoopScheduleAtOp> updateStage;
+  SmallVector<std::pair<unsigned, unsigned>> passedAlong;
+  auto emitUpdate = [&](LoopScheduleAtOp stage, unsigned i, Value inside) {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(stage.getYieldOp());
+    builder.create<LoopScheduleIterArgUpdateOp>(
+        stage.getLoc(), pipeline.getStagesBlock().getArgument(i), inside);
+    updateStage[i] = stage;
+  };
 
   for (auto it :
        llvm::enumerate(loop.getAfterBody()->getTerminator()->getOperands())) {
@@ -2463,12 +2476,36 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
     if (auto stage = newValue.getDefiningOp<LoopScheduleAtOp>()) {
       auto yieldOp = stage.getYieldOp();
       unsigned resultIdx = cast<OpResult>(newValue).getResultNumber();
-      Value inside = yieldOp->getOperand(resultIdx);
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPoint(yieldOp);
-      builder.create<LoopScheduleIterArgUpdateOp>(
-          stage.getLoc(), pipeline.getStagesBlock().getArgument(i), inside);
+      emitUpdate(stage, i, yieldOp->getOperand(resultIdx));
+    } else if (auto arg = dyn_cast<BlockArgument>(value);
+               arg && arg.getOwner() == loop.getAfterBody()) {
+      passedAlong.push_back({i, arg.getArgNumber()});
+    } else if (auto stage = stageAtTime.lookup(firstRead)) {
+      // A value from outside the loop: set at the first read.
+      emitUpdate(stage, i, stageValueMaps[firstRead].lookupOrDefault(value));
     }
+  }
+
+  // An iter_arg updated to another's value takes it in the stage that
+  // updates that one, which still reads this iteration's value there (an
+  // update is visible a cycle on), so both are visible together and the
+  // scheduler kept their readers alike (getIterArgDefiner). A chain
+  // (`ym3 = ym2 = ym1`) settles one link a pass.
+  for (unsigned pass = 0; !passedAlong.empty() && pass <= iterArgs.size();
+       ++pass) {
+    SmallVector<std::pair<unsigned, unsigned>> pending;
+    for (auto [i, j] : passedAlong) {
+      auto stage = updateStage.lookup(j);
+      if (!stage) {
+        pending.push_back({i, j});
+        continue;
+      }
+      unsigned time = (unsigned)stage.getOffset();
+      emitUpdate(stage, i,
+                 stageValueMaps[time].lookupOrDefault(
+                     loop.getAfterArguments()[j]));
+    }
+    passedAlong = std::move(pending);
   }
 
   // Build the loopschedule.terminator with the condition and results.

@@ -52,6 +52,22 @@ namespace circt {
 
 namespace loopschedule {
 
+Operation *getIterArgDefiner(scf::WhileOp whileOp, unsigned i) {
+  Operation *yield = whileOp.getAfterBody()->getTerminator();
+  Value value = yield->getOperand(i);
+  for (unsigned step = 0; step <= yield->getNumOperands(); ++step) {
+    auto arg = dyn_cast<BlockArgument>(value);
+    if (!arg || arg.getOwner() != whileOp.getAfterBody()) {
+      Operation *def = value.getDefiningOp();
+      if (def && !whileOp.getAfter().isAncestor(def->getParentRegion()))
+        return nullptr;
+      return def;
+    }
+    value = yield->getOperand(arg.getArgNumber());
+  }
+  return nullptr; // iter_args passed around in a circle
+}
+
 SmallVector<LoopScheduleAtOp> getAtOpsInOrder(Region &region) {
   SmallVector<LoopScheduleAtOp> result;
   if (region.empty())
@@ -191,8 +207,8 @@ getModuloProblem(scf::WhileOp whileOp,
   if (unsigned nIterArgs = anchor->getNumOperands(); nIterArgs > 0) {
     auto iterArgs = whileOp.getRegionIterArgs();
     for (unsigned i = 0; i < nIterArgs; ++i) {
-      Operation *iterArgDefiner = anchor->getOperand(i).getDefiningOp();
-      // If it's not an operation, we don't need to model the dependence.
+      Operation *iterArgDefiner = getIterArgDefiner(whileOp, i);
+      // A value from outside the loop: nothing to model.
       if (!iterArgDefiner)
         continue;
 
@@ -275,8 +291,8 @@ getChainingModuloProblem(scf::WhileOp whileOp,
   if (unsigned nIterArgs = anchor->getNumOperands(); nIterArgs > 0) {
     auto iterArgs = whileOp.getAfterArguments();
     for (unsigned i = 0; i < nIterArgs; ++i) {
-      Operation *iterArgDefiner = anchor->getOperand(i).getDefiningOp();
-      // If it's not an operation, we don't need to model the dependence.
+      Operation *iterArgDefiner = getIterArgDefiner(whileOp, i);
+      // A value from outside the loop: nothing to model.
       if (!iterArgDefiner)
         continue;
 
