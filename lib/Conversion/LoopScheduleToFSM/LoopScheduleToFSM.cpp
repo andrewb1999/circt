@@ -5995,8 +5995,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
           // completion-clocked register; re-capturing at the fixed
           // atOffset+1 cycle would read it before the access completes.
           // The consumer already maps to that register, so leave it be.
+          // Likewise through the `loopschedule.if` wrapping a conditional
+          // access (nussinov's `seq[i]`, latched 16 cycles early) and a
+          // bitcast, both identities on the register.
           Value yielded = atYield.getOperands()[res.getResultNumber()];
-          if (frameSeqDynResults.contains(yielded))
+          Operation *producer = valueProducer(yielded);
+          if (producer && llvm::any_of(producer->getResults(), [&](Value r) {
+                return frameSeqDynResults.contains(r);
+              }))
             continue;
           Value mapped = localMapping.lookupOrNull(res);
           if (!mapped)
