@@ -143,6 +143,17 @@ bool hasLoopScheduleDependence(Operation *op, Operation *otherOp) {
   return memref == otherMemref && oneIsStore(op, otherOp);
 }
 
+/// An iter_arg defined by a dynamic-latency load (an AXI read) is written
+/// in the cycle its expect delivers the data, `latency` past the issue, and
+/// reads as that update's register: from a cycle later. Its readers in the
+/// next iteration wait for both.
+static void setIterArgDependenceLatency(Problem &problem,
+                                        Problem::Dependence dep,
+                                        Operation *definer) {
+  if (auto load = dyn_cast<LoadInterface>(definer); load && load.isDynamic())
+    problem.setDependenceLatency(dep, load.getLatency() + 1);
+}
+
 ModuloProblem
 getModuloProblem(scf::WhileOp whileOp,
                  LoopScheduleDependenceAnalysis &dependenceAnalysis) {
@@ -220,6 +231,7 @@ getModuloProblem(scf::WhileOp whileOp,
 
         // Values always flow between subsequent iterations.
         problem.setDistance(dep, 1);
+        setIterArgDependenceLatency(problem, dep, iterArgDefiner);
       }
     }
   }
@@ -304,6 +316,7 @@ getChainingModuloProblem(scf::WhileOp whileOp,
 
         // Values always flow between subsequent iterations.
         problem.setDistance(dep, 1);
+        setIterArgDependenceLatency(problem, dep, iterArgDefiner);
       }
     }
   }

@@ -2322,6 +2322,24 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
                                  /*funcReturnSentinel=*/nullptr,
                                  registerValues, pipeTimes);
 
+  // An iter_arg's new value exists `latency` cycles past its definer's
+  // start; a dynamic-latency load's (an AXI read's), whose update waits for
+  // its expect, reads a cycle after that. A definer slower than the II
+  // delivers it after the next iteration would read it at the definer's
+  // start, so the iter_arg is read (captured), and its update looked up,
+  // that much later: at start + latency - II, where the scheduler's
+  // distance-1 edge keeps every reader anyway (getIterArgDefiner's users).
+  unsigned pipelineII = problem.getInitiationInterval().value_or(1);
+  auto latencyOf = [&](Operation *op) -> unsigned {
+    auto opr = problem.getLinkedOperatorType(op);
+    return opr ? problem.getLatency(*opr).value_or(0) : 0;
+  };
+  auto lateBy = [&](Operation *definer) -> unsigned {
+    unsigned latency =
+        latencyOf(definer) + (isDynamicLatencyOp(*definer) ? 1 : 0);
+    return latency > pipelineII ? latency - pipelineII : 0;
+  };
+
   for (auto it : enumerate(loop.getAfter().getArguments())) {
     auto iterArg = it.value();
     if (iterArg.getUsers().empty())
@@ -2333,7 +2351,7 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
     // from another iter_arg (a filter's `ym2 = ym1`) is written with that
     // one; one set from outside the loop, from the start.
     if (Operation *definingOp = getIterArgDefiner(loop, it.index()))
-      startPipeTime = *problem.getStartTime(definingOp);
+      startPipeTime = *problem.getStartTime(definingOp) + lateBy(definingOp);
 
     unsigned pipeEndTime = 0;
     for (auto *user : iterArg.getUsers()) {
@@ -2457,6 +2475,9 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
     // behind a multi-cycle add, must not wait until definition + II, a
     // read the next iteration has already made.
     unsigned firstRead = pipeTimes[value].first;
+    if (Operation *definer = value.getDefiningOp();
+        definer && problem.hasOperation(definer))
+      firstRead += lateBy(definer);
     for (BlockArgument arg :
          {loop.getBeforeArguments()[i], loop.getAfterArguments()[i]}) {
       Block *block = arg.getOwner();
@@ -2472,6 +2493,21 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
     Value newValue = stageValueMaps[lookupTime].lookup(value);
     termIterArgs.push_back(newValue);
     termResults.push_back(newValue);
+
+    // A dynamic-latency load's value arrives through its expect, `latency`
+    // past its issue stage: the update goes there, reading the issue
+    // stage's slot for the load, which wrapping (below) rewires to that
+    // stage's expect. In the issue stage the load is still in flight.
+    Operation *definer = value.getDefiningOp();
+    if (definer && problem.hasOperation(definer) &&
+        isDynamicLatencyOp(*definer)) {
+      unsigned arrival = *problem.getStartTime(definer) + latencyOf(definer);
+      auto stage = stageAtTime.lookup(arrival);
+      if (stage && stageValueMaps[arrival].contains(value)) {
+        emitUpdate(stage, i, stageValueMaps[arrival].lookup(value));
+        continue;
+      }
+    }
 
     // Emit an iter_arg_update inside the stage that produced the new value.
     // The LHS is the pipeline's iter-arg block argument for position `i`; the

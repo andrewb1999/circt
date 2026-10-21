@@ -44,6 +44,41 @@ static bool hasTrivialYield(Block &block) {
   return yield && yield.getOperands().empty();
 }
 
+namespace {
+/// The cycles from an op's issue to its results: a memory access's port
+/// latency, an operator's (`loopschedule.operator`) from the operator
+/// library of the enclosing function (`oplib.library`), none for anything
+/// else.
+class OpLatencies {
+public:
+  explicit OpLatencies(Operation *scope) {
+    for (Operation *op = scope; op; op = op->getParentOp())
+      if (auto name = op->getAttrOfType<SymbolRefAttr>("oplib.library")) {
+        library = SymbolTable::lookupNearestSymbolFrom(op, name);
+        break;
+      }
+  }
+
+  unsigned operator()(Operation *op) {
+    if (auto load = dyn_cast<LoadInterface>(op))
+      return load.getLatency();
+    auto sym = op->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+    if (!sym || !library)
+      return 0;
+    auto [it, inserted] = cache.try_emplace(sym.getLeafReference(), 0);
+    if (inserted)
+      if (auto entry = dyn_cast_or_null<oplib::LibraryEntryOpInterface>(
+              SymbolTable::lookupSymbolIn(library, sym.getLeafReference())))
+        it->second = entry.getEntryLatency();
+    return it->second;
+  }
+
+private:
+  Operation *library = nullptr;
+  DenseMap<StringAttr, unsigned> cache;
+};
+} // namespace
+
 //===----------------------------------------------------------------------===//
 // LoopInterface
 //===----------------------------------------------------------------------===//
@@ -74,6 +109,7 @@ LogicalResult loopschedule::verifyLoop(Operation *op) {
         "loop condition must be produced by a phase in the body");
 
   // Verify exactly one iter_arg_update exists per iter-arg block argument.
+  OpLatencies latencyOf(op);
   DenseMap<Value, LoopScheduleIterArgUpdateOp> updates;
   WalkResult wr = loop.getBodyBlock()->walk(
       [&](LoopScheduleIterArgUpdateOp u) {
@@ -109,10 +145,24 @@ LogicalResult loopschedule::verifyLoop(Operation *op) {
     if (!updParent)
       continue;
     auto updPhase = cast<PhaseInterface>(updParent);
+    // A pipeline's update of a multi-cycle op's result, in the phase that
+    // issues it, names that op's output register, which takes the new value
+    // only `latency` cycles on: the phases before then still read the old.
+    int64_t producedAt = -1;
+    if (auto updAt = dyn_cast<LoopScheduleAtOp>(updPhase.getOperation());
+        updAt && isa<LoopSchedulePipelineOp>(loop.getOperation()))
+      if (Operation *def = upd.getValue().getDefiningOp();
+          def && updAt->isProperAncestor(def))
+        if (unsigned latency = latencyOf(def); latency > 1)
+          producedAt = updAt.getOffset() + latency - 1;
     SmallVector<PhaseInterface> validPhases;
     auto phases = loop.getBodyBlock()->getOps<PhaseInterface>();
     llvm::copy_if(phases, std::back_inserter(validPhases),
                   [&](PhaseInterface phase) {
+                    if (auto at = dyn_cast<LoopScheduleAtOp>(
+                            phase.getOperation());
+                        at && producedAt >= 0)
+                      return int64_t(at.getOffset()) <= producedAt;
                     return phase == updPhase ||
                            phase->isBeforeInBlock(updPhase);
                   });
@@ -252,38 +302,6 @@ void LoopSchedulePipelineOp::print(OpAsmPrinter &p) {
 // out.
 
 namespace {
-/// The cycles from an op's issue to its results: a memory access's port
-/// latency, an operator's (`loopschedule.operator`) from the operator
-/// library of the enclosing function (`oplib.library`), none for anything
-/// else.
-class OpLatencies {
-public:
-  explicit OpLatencies(Operation *scope) {
-    for (Operation *op = scope; op; op = op->getParentOp())
-      if (auto name = op->getAttrOfType<SymbolRefAttr>("oplib.library")) {
-        library = SymbolTable::lookupNearestSymbolFrom(op, name);
-        break;
-      }
-  }
-
-  unsigned operator()(Operation *op) {
-    if (auto load = dyn_cast<LoadInterface>(op))
-      return load.getLatency();
-    auto sym = op->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
-    if (!sym || !library)
-      return 0;
-    auto [it, inserted] = cache.try_emplace(sym.getLeafReference(), 0);
-    if (inserted)
-      if (auto entry = dyn_cast_or_null<oplib::LibraryEntryOpInterface>(
-              SymbolTable::lookupSymbolIn(library, sym.getLeafReference())))
-        it->second = entry.getEntryLatency();
-    return it->second;
-  }
-
-private:
-  Operation *library = nullptr;
-  DenseMap<StringAttr, unsigned> cache;
-};
 
 /// What the phase checks leave for a pipeline's own: the cycle each value
 /// its phases compute is ready in, and its iter-arg updates with the cycle
