@@ -6462,10 +6462,27 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                                            &launchStableRoots)))
               return failure();
           } else {
+            // The private map starts with the memory-driven signals only:
+            // read data, completions, the acceptance `ready` and the
+            // drains. Without `ready` and the drains, a dynamic access
+            // would issue unstalled and unfenced, so a posted request the
+            // port can't take would be dropped.
             DenseMap<Value, MemPortMapping> slotPorts;
-            for (auto &memInfo : memrefArgs)
-              slotPorts[memInfo.originalArg].rdData =
-                  perFramePorts[frameIdx][memInfo.originalArg].rdData;
+            for (auto &memInfo : memrefArgs) {
+              auto &src = perFramePorts[frameIdx][memInfo.originalArg];
+              auto &dst = slotPorts[memInfo.originalArg];
+              dst.rdData = src.rdData;
+              dst.done = src.done;
+              dst.wrDone = src.wrDone;
+              dst.ready = src.ready;
+              dst.rdIdle = src.rdIdle;
+              dst.wrIdle = src.wrIdle;
+              for (auto &ep : src.extraPorts) {
+                PortDrives d;
+                d.rdData = ep.rdData;
+                dst.extraPorts.push_back(d);
+              }
+            }
             // Multi-launch frames are never pre-arm-eligible (guard a),
             // so this passes false by construction.
             if (failed(lowerPipelineChild(pipOp, hw, loc, hwBody, localMapping,
@@ -6475,17 +6492,26 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                                            launchPreArm[(unsigned)waitIdx],
                                            Value(), &launchStableRoots)))
               return failure();
+            // Selected as any launched child's drives are: a port this
+            // pipeline doesn't access stays with the slots that do, which
+            // run alongside it.
             for (auto &memInfo : memrefArgs) {
               auto widths = ArrayRef<unsigned>(memInfo.addrWidths);
+              bool emitWrite = memInfo.isAmcPort ? memInfo.isWrite : true;
               auto &slotP = slotPorts[memInfo.originalArg];
               auto &outP = perFramePorts[frameIdx][memInfo.originalArg];
               if (outP.addrs.size() != widths.size())
                 outP.addrs.assign(widths.size(), Value());
-              mergeChildPortDrives(hw, loc, clk, rst, slotChildActive,
-                                   slotChildActive, slotP.addrs, slotP.rdEn,
-                                   slotP.wrData, slotP.wrEn, portRef(outP, 0),
-                                   memInfo.requiresRdEn,
-                                   memInfo.isAmcPort ? memInfo.isWrite : true);
+              Value sel = childPortSelect(
+                  hw, loc, slotChildActive,
+                  {memInfo.requiresRdEn ? slotP.rdEn : Value(),
+                   emitWrite ? slotP.wrEn : Value()},
+                  {memInfo.requiresRdEn ? outP.rdEn : Value(),
+                   emitWrite ? outP.wrEn : Value()});
+              mergeChildPortDrives(hw, loc, clk, rst, sel, slotChildActive,
+                                   slotP.addrs, slotP.rdEn, slotP.wrData,
+                                   slotP.wrEn, portRef(outP, 0),
+                                   memInfo.requiresRdEn, emitWrite);
             }
           }
           // Latch only when this frame runs multiple launches
