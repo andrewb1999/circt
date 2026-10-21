@@ -217,10 +217,20 @@ static Value clampTo(OpBuilder &b, Location loc, Value x, uint64_t limit) {
   return SelectOp::create(b, loc, over, c, x);
 }
 
+/// `v` with sign extensions stripped: the same signed value, so the same
+/// loop bound.
+static Value stripExtensions(Value v) {
+  while (auto ext = v.getDefiningOp<ExtSIOp>())
+    v = ext.getIn();
+  return v;
+}
+
 /// Strip this pass's own bound rewrite: `select(ub < 0, 0, trunci(ub))`,
 /// the truncated `ub` saturated at the license past step 1, roots at `ub`.
 /// Lets an already-narrowed sibling loop's bound be compared against another
-/// loop's still-wide bound by identity.
+/// loop's still-wide bound by identity. The truncation may read `ub`
+/// through fewer extensions than the guard: folding `trunci(extsi(x))`
+/// rewrites it to truncate `x` itself (an int32 size widened to i64).
 static Value rootBound(Value v) {
   auto sel = v.getDefiningOp<SelectOp>();
   if (!sel)
@@ -231,51 +241,198 @@ static Value rootBound(Value v) {
   if (cmp && tr && cmp.getPredicate() == CmpIPredicate::slt &&
       matchPattern(cmp.getRhs(), m_ConstantInt(&zero)) && zero.isZero() &&
       matchPattern(sel.getTrueValue(), m_ConstantInt(&zeroT)) &&
-      zeroT.isZero() && cmp.getLhs() == peelClamp(tr.getIn()))
+      zeroT.isZero() &&
+      stripExtensions(cmp.getLhs()) == stripExtensions(peelClamp(tr.getIn())))
     return cmp.getLhs();
   return v;
 }
 
-/// Collect the blocks guaranteed to execute at least once per iteration of
-/// the loop owning `block`: the body block itself plus, recursively, the
-/// bodies of nested `scf.for` that provably run at least one iteration —
-/// constant bounds with a positive trip count, or a runtime bound that is
-/// the SAME value as the licensing loop's own bound with a lower bound no
-/// later than its (then `lb_outer < ub` at entry implies `lb <= lb_outer <
-/// ub`, so the nested loop enters whenever the outer one did). Anything
-/// else (`scf.if`, unrelated runtime bounds, `scf.while`) is deliberately
-/// not entered: an access that may not execute licenses nothing.
-static void collectGuaranteedBlocks(Block *block, const APInt &outerLb,
-                                    Value outerUbRoot,
-                                    SmallVectorImpl<Block *> &out) {
-  out.push_back(block);
-  for (Operation &op : *block) {
-    if (auto nested = dyn_cast<scf::ForOp>(&op)) {
-      APInt lb, ub, step;
-      if (!matchPattern(nested.getLowerBound(), m_ConstantInt(&lb)) ||
-          !matchPattern(nested.getStep(), m_ConstantInt(&step)) ||
-          !step.isStrictlyPositive())
-        continue;
-      if (matchPattern(nested.getUpperBound(), m_ConstantInt(&ub))) {
-        if (lb.slt(ub))
-          collectGuaranteedBlocks(nested.getBody(), outerLb, outerUbRoot, out);
+/// A nested loop's entry condition, `lb < x`: a constant lower bound and the
+/// root of its upper bound (entryCond). A loop entering under (lb', x),
+/// lb' >= lb, implies one under (lb, x) entering too.
+using EntryCond = std::pair<int64_t, Value>;
+
+/// The value a loop bound is a lossless view of: this pass's own bound
+/// rewrite stripped (rootBound), then sign extensions, and a truncation
+/// undoing one (an int32 size widened to i64 and narrowed back).
+static Value entryRoot(Value v) {
+  v = rootBound(v);
+  while (true) {
+    v = stripExtensions(v);
+    if (auto tr = v.getDefiningOp<TruncIOp>()) {
+      Value in = tr.getIn();
+      auto *def = in.getDefiningOp();
+      if (def && isa<ExtSIOp>(def) &&
+          def->getOperand(0).getType().getIntOrFloatBitWidth() <=
+              tr.getType().getIntOrFloatBitWidth()) {
+        v = def->getOperand(0);
         continue;
       }
-      if (rootBound(nested.getUpperBound()) == outerUbRoot &&
-          lb.getSExtValue() <= outerLb.getSExtValue())
-        collectGuaranteedBlocks(nested.getBody(), lb, outerUbRoot, out);
+    }
+    return v;
+  }
+}
+
+/// The entry condition of a loop from constant `lb` to `ub`, with a constant
+/// subtracted from the bound moved onto the lower bound: `j < NY - 1` from 0
+/// enters as `1 < NY`. Only where the subtraction cannot wrap: from a value
+/// sign-extended from at least two bits narrower, by at most 2^32.
+static EntryCond entryCond(int64_t lb, Value ub) {
+  Value root = entryRoot(ub);
+  for (unsigned i = 0; i < 4; ++i) {
+    APInt c;
+    Value x;
+    if (auto add = root.getDefiningOp<AddIOp>();
+        add && matchPattern(add.getRhs(), m_ConstantInt(&c))) {
+      x = add.getLhs();
+      c.negate();
+    } else if (auto sub = root.getDefiningOp<SubIOp>();
+               sub && matchPattern(sub.getRhs(), m_ConstantInt(&c))) {
+      x = sub.getLhs();
+    } else {
+      break;
+    }
+    Value narrow = stripExtensions(x);
+    if (c.isNegative() || c.getActiveBits() > 32 || narrow == x ||
+        narrow.getType().getIntOrFloatBitWidth() + 2 >
+            x.getType().getIntOrFloatBitWidth())
+      break;
+    lb += c.getSExtValue();
+    root = entryRoot(x);
+  }
+  return {lb, root};
+}
+
+/// Match a loop bound as `iv + c`, c >= 0 a constant, through this pass's
+/// own bound rewrite and sign extensions (`iv` itself, or a narrowed copy of
+/// it). Returns c.
+static std::optional<int64_t> matchIVOffset(Value v, Value iv) {
+  v = stripExtensions(rootBound(v));
+  if (v == iv)
+    return 0;
+  auto add = v.getDefiningOp<AddIOp>();
+  if (!add)
+    return std::nullopt;
+  APInt c;
+  Value other;
+  if (matchPattern(add.getRhs(), m_ConstantInt(&c)))
+    other = add.getLhs();
+  else if (matchPattern(add.getLhs(), m_ConstantInt(&c)))
+    other = add.getRhs();
+  else
+    return std::nullopt;
+  if (stripExtensions(other) != iv || c.isNegative() || c.getActiveBits() > 32)
+    return std::nullopt;
+  return c.getSExtValue();
+}
+
+/// Whether `v` has the same value on every iteration of `loop`: defined
+/// outside it, or computed by pure ops from such values (`NY - 1`, the
+/// affine lowering's bound, emitted inside the body).
+static bool isLoopInvariant(Value v, scf::ForOp loop, unsigned depth = 0) {
+  if (loop.isDefinedOutsideOfLoop(v))
+    return true;
+  Operation *def = v.getDefiningOp();
+  if (!def || depth > 8 || def->getNumRegions() != 0 ||
+      !isMemoryEffectFree(def))
+    return false;
+  return llvm::all_of(def->getOperands(), [&](Value operand) {
+    return isLoopInvariant(operand, loop, depth + 1);
+  });
+}
+
+/// Collect the blocks whose accesses can license the IV of `licensing`, the
+/// loop owning `block`, each with the entry conditions under which it
+/// executes on EVERY iteration of that loop: the body block itself,
+/// unconditionally, plus, recursively, the bodies of nested `scf.for` with
+/// a constant lower bound and positive constant step that
+/// - provably run at least one iteration, under their parent's conditions:
+///   constant bounds with a positive trip count, or a runtime bound that is
+///   the SAME value as the licensing loop's own bound with a lower bound no
+///   later than its (then `lb_outer < ub` at entry implies
+///   `lb <= lb_outer < ub`, so the nested loop enters whenever the outer
+///   one did), or a triangular bound `iv + c` from a lower bound L <= c
+///   (syrk's `j <= i`: entered on every iteration from iv = L - c + 1 <= 1
+///   on, so on the first one past any license, which is at least 1); or
+/// - have a loop-INVARIANT runtime upper bound (isLoopInvariant, gemm's
+///   `j < NJ` inside `i`): such a loop runs on every iteration or on
+///   none, so its body executes on every iteration under the added
+///   condition that it enters (see licensedIVBound for what an access there
+///   licenses).
+/// Anything else (`scf.if`, IV-dependent bounds, `scf.while`) is
+/// deliberately not entered: an access that may not execute licenses
+/// nothing.
+static void collectLicensingBlocks(
+    Block *block, const APInt &outerLb, Value outerUbRoot, scf::ForOp licensing,
+    const SmallVector<EntryCond> &conds,
+    SmallVectorImpl<std::pair<Block *, SmallVector<EntryCond>>> &out) {
+  out.push_back({block, conds});
+  for (Operation &op : *block) {
+    auto nested = dyn_cast<scf::ForOp>(&op);
+    if (!nested)
+      continue;
+    APInt lb, ub, step;
+    if (!matchPattern(nested.getLowerBound(), m_ConstantInt(&lb)) ||
+        !matchPattern(nested.getStep(), m_ConstantInt(&step)) ||
+        !step.isStrictlyPositive())
+      continue;
+    if (matchPattern(nested.getUpperBound(), m_ConstantInt(&ub))) {
+      if (lb.slt(ub))
+        collectLicensingBlocks(nested.getBody(), outerLb, outerUbRoot,
+                               licensing, conds, out);
+      continue;
+    }
+    if (rootBound(nested.getUpperBound()) == outerUbRoot &&
+        lb.getSExtValue() <= outerLb.getSExtValue()) {
+      collectLicensingBlocks(nested.getBody(), lb, outerUbRoot, licensing,
+                             conds, out);
+      continue;
+    }
+    if (auto c =
+            matchIVOffset(nested.getUpperBound(), licensing.getInductionVar());
+        c && lb.getSExtValue() <= *c) {
+      collectLicensingBlocks(nested.getBody(), outerLb, outerUbRoot, licensing,
+                             conds, out);
+      continue;
+    }
+    if (isLoopInvariant(nested.getUpperBound(), licensing)) {
+      SmallVector<EntryCond> inner = conds;
+      EntryCond c = entryCond(lb.getSExtValue(), nested.getUpperBound());
+      if (!llvm::is_contained(inner, c))
+        inner.push_back(c);
+      collectLicensingBlocks(nested.getBody(), outerLb, outerUbRoot, licensing,
+                             inner, out);
     }
   }
+}
+
+/// Whether `op` may have an effect beyond reading memory (a write, or
+/// effects it does not declare). Ops with recursive effects answer for
+/// their nested ops, which are visited on their own.
+static bool mayWrite(Operation *op) {
+  if (op->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
+    return false;
+  if (isa<LoadInterface, LoopScheduleLoadOp>(op))
+    return false;
+  if (auto iface = dyn_cast<MemoryEffectOpInterface>(op)) {
+    SmallVector<MemoryEffects::EffectInstance> effects;
+    iface.getEffects(effects);
+    return llvm::any_of(effects, [](const MemoryEffects::EffectInstance &e) {
+      return !isa<MemoryEffects::Read>(e.getEffect());
+    });
+  }
+  return true;
 }
 
 /// Infer an exclusive upper bound on the values the IV of `loop` takes in any
 /// well-defined execution, from the loop's own memory accesses: an access
 /// indexed by the IV (or by IV + a non-negative value) that is guaranteed to
-/// execute on every iteration is out of bounds — undefined behavior — for any
-/// iterate at or past its dimension size, so every well-defined execution
-/// keeps the IV below that dimension. This is the same license the
-/// address-narrowing patterns below already rely on when they truncate
-/// indices to the dimension width.
+/// execute on every iteration (or on every iteration of a loop whose other
+/// iterations are unobservable, see collectLicensingBlocks) is out of
+/// bounds — undefined behavior — for any iterate at or past its dimension
+/// size, so every well-defined execution keeps the IV below that dimension.
+/// This is the same license the address-narrowing patterns below already
+/// rely on when they truncate indices to the dimension width.
 /// Invoke `fn(index, dim)` for every index operand of a memory access `op`
 /// whose dimension has a known static extent — memref dims for the
 /// loopschedule ops, `1 << getDimBitwidth` for interface ops (Log2Ceil of the
@@ -332,18 +489,61 @@ static std::optional<uint64_t> licensedIVBound(scf::ForOp loop,
     if (!allowRuntimeLb)
       return std::nullopt;
     // RUNTIME lower bound: the bound math above never used lb, but the
-    // guaranteed-block analysis keys on it — restrict to the loop's own
+    // licensing-block analysis keys on it — restrict to the loop's own
     // top-level block, which executes on every iteration by definition.
     for (Operation &op : *loop.getBody())
       forEachAccessIndex(&op, considerIdx);
     return bound;
   }
-  SmallVector<Block *> blocks;
-  collectGuaranteedBlocks(loop.getBody(), outerLb,
-                          rootBound(loop.getUpperBound()), blocks);
-  for (Block *block : blocks)
+  SmallVector<std::pair<Block *, SmallVector<EntryCond>>> blocks;
+  collectLicensingBlocks(loop.getBody(), outerLb,
+                         rootBound(loop.getUpperBound()), loop, {}, blocks);
+
+  // An access in a block entered only under conditions (nested loops with
+  // invariant bounds that run on every iteration or on none) licenses the
+  // IV only where nothing observable happens without it. Then, when the
+  // conditions hold, an iterate past the bound executes the access out of
+  // bounds, undefined behavior, as for an unconditional access; when they
+  // fail, the loop has no effect, so how often it counts is unobservable
+  // (the narrowed loop still ends). So every op that may write must run
+  // only under the access's conditions: inside loops whose entry implies its
+  // own loops' (the same bound, from a lower bound at least theirs). And no
+  // loop results: they would carry the iterations out.
+  SmallVector<SmallVector<EntryCond>> writeConds;
+  bool unconditionalWrite = loop.getNumResults() != 0;
+  loop.getBody()->walk([&](Operation *op) {
+    if (!mayWrite(op))
+      return;
+    SmallVector<EntryCond> conds;
+    for (Operation *p = op->getParentOp(); p != loop; p = p->getParentOp())
+      if (auto anc = dyn_cast<scf::ForOp>(p)) {
+        APInt lb;
+        if (matchPattern(anc.getLowerBound(), m_ConstantInt(&lb)))
+          conds.push_back(entryCond(lb.getSExtValue(), anc.getUpperBound()));
+      }
+    if (conds.empty())
+      unconditionalWrite = true;
+    writeConds.push_back(std::move(conds));
+  });
+  auto coversWrites = [&](ArrayRef<EntryCond> conds) {
+    if (conds.empty())
+      return true;
+    if (unconditionalWrite)
+      return false;
+    return llvm::all_of(writeConds, [&](ArrayRef<EntryCond> w) {
+      return llvm::all_of(conds, [&](const EntryCond &c) {
+        return llvm::any_of(w, [&](const EntryCond &wc) {
+          return wc.second == c.second && wc.first >= c.first;
+        });
+      });
+    });
+  };
+  for (auto &[block, conds] : blocks) {
+    if (!coversWrites(conds))
+      continue;
     for (Operation &op : *block)
       forEachAccessIndex(&op, considerIdx);
+  }
   return bound;
 }
 

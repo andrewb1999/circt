@@ -263,19 +263,207 @@ func.func @nonconst_lb_unlicensed_refused(%mem: memref<1024xi32>, %v: i32,
   return
 }
 
-// A runtime-bound INNER loop is not guaranteed to execute (it may be
-// zero-trip), so its accesses do not license the outer loop — the outer IV
-// stays wide. The inner loop licenses itself and narrows.
+// A runtime-bound INNER loop may be zero-trip, but its bound is invariant in
+// the outer loop, so it runs on every outer iteration or on none. Its
+// accesses license the outer IV where every write is inside it too: when it
+// runs, an outer iterate past the 128 rows stores out of bounds (undefined
+// behavior); when it does not, the outer loop has no effect, and how often
+// it counts is unobservable. Both narrow to the rows' 9 bits.
 
-// CHECK-LABEL: func.func @runtime_inner_not_credited
-// CHECK:         scf.for %{{.+}} = %{{.+}} to %arg2 step %{{.+}} : i64
+// CHECK-LABEL: func.func @runtime_inner_credited
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i9
 // CHECK:           scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i9
-func.func @runtime_inner_not_credited(%A: memref<128x128xi32>, %v: i32,
-                                      %rows: i64, %cols: i64) {
+func.func @runtime_inner_credited(%A: memref<128x128xi32>, %v: i32,
+                                  %rows: i64, %cols: i64) {
   %c0 = arith.constant 0 : i64
   %c1 = arith.constant 1 : i64
   scf.for %i = %c0 to %rows step %c1 : i64 {
     scf.for %j = %c0 to %cols step %c1 : i64 {
+      loopschedule.store %v, %A[%i, %j : i64, i64] : memref<128x128xi32>
+    }
+  }
+  return
+}
+
+// gemm with runtime sizes: each loop reaches memory only inside inner loops
+// with invariant runtime bounds, and every write (C's) is inside the j loops.
+// i is licensed by C's rows in either j loop (60 -> 7 bits), k by B's rows
+// (80 -> 8 bits), the j loops by the flattened arrays (14 bits). The
+// narrowed j bounds still root at %nj, so a write under the narrowed j1 and
+// k loops keeps the entry conditions of the j0 access that licenses i.
+
+// CHECK-LABEL: func.func @gemm_runtime_nest
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i7
+// CHECK:           scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i14
+// CHECK:           scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i8
+// CHECK:             scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i14
+func.func @gemm_runtime_nest(%C: memref<4200xf32>, %A: memref<4800xf32>,
+                      %B: memref<5600xf32>, %ni32: i32, %nj32: i32,
+                      %nk32: i32) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  %c70 = arith.constant 70 : i64
+  %c80 = arith.constant 80 : i64
+  %nk = arith.extsi %nk32 : i32 to i64
+  %nj = arith.extsi %nj32 : i32 to i64
+  %ni = arith.extsi %ni32 : i32 to i64
+  scf.for %i = %c0 to %ni step %c1 : i64 {
+    scf.for %j0 = %c0 to %nj step %c1 : i64 {
+      %r = arith.muli %i, %c70 overflow<nsw> : i64
+      %x = arith.addi %r, %j0 : i64
+      %c = loopschedule.load %C[%x : i64] : memref<4200xf32>
+      loopschedule.store %c, %C[%x : i64] : memref<4200xf32>
+    }
+    scf.for %k = %c0 to %nk step %c1 : i64 {
+      scf.for %j1 = %c0 to %nj step %c1 : i64 {
+        %r = arith.muli %i, %c70 overflow<nsw> : i64
+        %x = arith.addi %r, %j1 : i64
+        %c = loopschedule.load %C[%x : i64] : memref<4200xf32>
+        %ra = arith.muli %i, %c80 overflow<nsw> : i64
+        %xa = arith.addi %ra, %k : i64
+        %a = loopschedule.load %A[%xa : i64] : memref<4800xf32>
+        %rb = arith.muli %k, %c70 overflow<nsw> : i64
+        %xb = arith.addi %rb, %j1 : i64
+        %b = loopschedule.load %B[%xb : i64] : memref<5600xf32>
+        %p = arith.mulf %a, %b : f32
+        %s = arith.addf %c, %p : f32
+        loopschedule.store %s, %C[%x : i64] : memref<4200xf32>
+      }
+    }
+  }
+  return
+}
+
+// An inner bound computed inside the outer body from invariant values
+// (`cols - 1`, as the affine lowering emits fdtd_2d's `range(NY - 1)`) is
+// invariant too: the outer IV narrows to the rows' 9 bits.
+
+// CHECK-LABEL: func.func @runtime_inner_computed_bound
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i9
+func.func @runtime_inner_computed_bound(%A: memref<128x128xi32>, %v: i32,
+                                        %rows: i64, %cols: i64) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  scf.for %i = %c0 to %rows step %c1 : i64 {
+    %m = arith.subi %cols, %c1 : i64
+    scf.for %j = %c0 to %m step %c1 : i64 {
+      loopschedule.store %v, %A[%i, %j : i64, i64] : memref<128x128xi32>
+    }
+  }
+  return
+}
+
+// fdtd_2d's time loop: t indexes only fict[t], read in a `j0 < ny` loop,
+// while the writes sit in loops from 1 or to `ny - 1` (entering as `1 < ny`),
+// which can only run when the j0 loop does. So t is licensed by fict's 40
+// entries: 7 bits.
+
+// CHECK-LABEL: func.func @time_loop_licensed_by_sibling
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i7
+func.func @time_loop_licensed_by_sibling(%fict: memref<40xi32>,
+                                         %ey: memref<64xi32>,
+                                         %ex: memref<64x64xi32>, %v: i32,
+                                         %tmax: i64, %nx32: i32,
+                                         %ny32: i32) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  %cm1 = arith.constant -1 : i64
+  %nx = arith.extsi %nx32 : i32 to i64
+  %ny = arith.extsi %ny32 : i32 to i64
+  scf.for %t = %c0 to %tmax step %c1 : i64 {
+    scf.for %j0 = %c0 to %ny step %c1 : i64 {
+      %f = loopschedule.load %fict[%t : i64] : memref<40xi32>
+      loopschedule.store %f, %ey[%j0 : i64] : memref<64xi32>
+    }
+    scf.for %i = %c0 to %nx step %c1 : i64 {
+      %m = arith.addi %ny, %cm1 : i64
+      scf.for %j = %c0 to %m step %c1 : i64 {
+        loopschedule.store %v, %ex[%i, %j : i64, i64] : memref<64x64xi32>
+      }
+    }
+  }
+  return
+}
+
+// REFUSED: a write outside the inner loop happens on every outer iteration
+// whether or not the inner loop runs, and nothing licenses the outer IV
+// there, so an outer loop past the rows with an empty inner loop is a
+// well-defined execution. The outer IV stays wide.
+
+// CHECK-LABEL: func.func @runtime_inner_write_outside_refused
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %arg3 step %{{.+}} : i64
+// CHECK:           scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i9
+func.func @runtime_inner_write_outside_refused(%A: memref<128x128xi32>,
+                                               %acc: memref<8xi32>, %v: i32,
+                                               %rows: i64, %cols: i64) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  scf.for %i = %c0 to %rows step %c1 : i64 {
+    loopschedule.store %v, %acc[%c0 : i64] : memref<8xi32>
+    scf.for %j = %c0 to %cols step %c1 : i64 {
+      loopschedule.store %v, %A[%i, %j : i64, i64] : memref<128x128xi32>
+    }
+  }
+  return
+}
+
+// REFUSED: the write in the second inner loop runs when IT enters, which
+// the first one's (licensing) entry does not imply: with %cols empty and
+// %n not, the outer loop writes on every iteration past the rows,
+// well-defined. The second loop's own access does not mention the outer IV.
+
+// CHECK-LABEL: func.func @runtime_inner_other_write_refused
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %arg3 step %{{.+}} : i64
+func.func @runtime_inner_other_write_refused(%A: memref<128x128xi32>,
+                                             %B: memref<64xi32>, %v: i32,
+                                             %rows: i64, %cols: i64,
+                                             %n: i64) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  scf.for %i = %c0 to %rows step %c1 : i64 {
+    scf.for %j = %c0 to %cols step %c1 : i64 {
+      loopschedule.store %v, %A[%i, %j : i64, i64] : memref<128x128xi32>
+    }
+    scf.for %k = %c0 to %n step %c1 : i64 {
+      loopschedule.store %v, %B[%k : i64] : memref<64xi32>
+    }
+  }
+  return
+}
+
+// A triangular inner loop, `j < i` (or `j <= i`), is entered on every outer
+// iteration from i = 1 on, so on the first one past the rows: its access
+// licenses the outer IV like an unconditional one. 9 bits.
+
+// CHECK-LABEL: func.func @runtime_inner_triangular_credited
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i9
+// CHECK:           scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i9
+func.func @runtime_inner_triangular_credited(%A: memref<128x128xi32>,
+                                             %v: i32, %rows: i64) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  scf.for %i = %c0 to %rows step %c1 : i64 {
+    scf.for %j = %c0 to %i step %c1 : i64 {
+      loopschedule.store %v, %A[%i, %j : i64, i64] : memref<128x128xi32>
+    }
+  }
+  return
+}
+
+// REFUSED: an inner bound that shrinks as the outer IV grows (`j < n - i`)
+// is not entered on the iterations past the rows, so its access licenses
+// nothing outside it: the outer loop may count past the rows, well-defined.
+
+// CHECK-LABEL: func.func @runtime_inner_variant_bound_refused
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %arg2 step %{{.+}} : i64
+func.func @runtime_inner_variant_bound_refused(%A: memref<128x128xi32>,
+                                               %v: i32, %rows: i64,
+                                               %n: i64) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  scf.for %i = %c0 to %rows step %c1 : i64 {
+    %m = arith.subi %n, %i : i64
+    scf.for %j = %c0 to %m step %c1 : i64 {
       loopschedule.store %v, %A[%i, %j : i64, i64] : memref<128x128xi32>
     }
   }
@@ -300,12 +488,12 @@ func.func @int32_size_exact(%acc: memref<8xi32>, %v: i32, %n32: i32) {
 }
 
 // gemm's shape with runtime sizes: the outer IV reaches memory only inside
-// an inner loop with its own runtime bound (which may be zero-trip, so it
-// licenses nothing outside itself). The outer loop takes its bound's range,
-// 32 bits; the inner one its license, the 128-entry row: 9 bits.
+// an inner loop with its own invariant runtime bound, which holds every
+// write. The license (the 128 rows, 9 bits) is narrower than the bound's
+// range (32 bits), so both loops take it.
 
 // CHECK-LABEL: func.func @int32_sizes_nest
-// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i32
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i9
 // CHECK:           scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i9
 func.func @int32_sizes_nest(%A: memref<128x128xi32>, %v: i32, %rows32: i32,
                             %cols32: i32) {
