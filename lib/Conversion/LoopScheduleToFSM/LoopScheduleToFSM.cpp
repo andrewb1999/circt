@@ -796,6 +796,22 @@ computeValueCycleLatency(Value v,
   return computeOpCycleLatency(producingOp(v), operatorLibrary);
 }
 
+/// computeValueCycleLatency for a value the pipeline stage `stage` yields:
+/// a producer's latency counts only where it issues in that stage. One in
+/// an earlier stage already delivered its value here: a dynamic load,
+/// which inlining the launch/expect pairs leaves in its issue stage, read
+/// at its expect's stage (floyd_warshall over AXI bitcast it there, and the
+/// copy, taken for a 16-cycle load's issue, got no register and was read a
+/// cycle late, off the next queue entry).
+static unsigned
+stageValueCycleLatency(Value v, Operation *stage,
+                       analysis::OperatorLibraryAnalysis *operatorLibrary) {
+  Operation *def = producingOp(v);
+  if (!def || !stage->isAncestor(def))
+    return 0;
+  return computeOpCycleLatency(def, operatorLibrary);
+}
+
 /// Materializes the cross-stage delay registers needed when a value
 /// produced at stage J is consumed at stage K with K > J + L + 1
 /// (where L is the producing op's cycle latency). Owns the per-value
@@ -938,7 +954,7 @@ private:
     if (!atOp || result.getResultNumber() >= atOp.getYieldOp().getNumOperands())
       return 1;
     Value yielded = atOp.getYieldOp().getOperand(result.getResultNumber());
-    unsigned latency = computeValueCycleLatency(yielded, operatorLibrary);
+    unsigned latency = stageValueCycleLatency(yielded, atOp, operatorLibrary);
     Operation *def = producingOp(yielded);
     bool operatorOutput =
         latency > 0 && def && !isa<LoadInterface, LoopScheduleLoadOp>(def);
@@ -8278,7 +8294,7 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // register here: stage-J+L consumers read the wrapper output
       // directly, and later ones a delay register that captures it in
       // stage J+L (`resolveForStage`, `firstReadable`).
-      if (computeValueCycleLatency(val, operatorLibrary) > 0) {
+      if (stageValueCycleLatency(val, stageOp, operatorLibrary) > 0) {
         mapping.map(stageOp.getResult(regIdx), mappedVal);
         continue;
       }
@@ -11426,7 +11442,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(
         mapping.map(stageOp.getResult(regIdx), mappedVal);
         continue;
       }
-      if (computeValueCycleLatency(val, operatorLibrary) > 0) {
+      if (stageValueCycleLatency(val, stageOp, operatorLibrary) > 0) {
         mapping.map(stageOp.getResult(regIdx), mappedVal);
         continue;
       }
