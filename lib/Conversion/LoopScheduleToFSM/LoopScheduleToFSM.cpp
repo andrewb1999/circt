@@ -1976,13 +1976,18 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
     // issueHandshake is gated on the port's beat-valid `ready`, so the
     // captured datum is exactly the popped beat. Acceptance is completion:
     // the ready-stall above already holds the state until the beat lands.
+    // A consumer the schedule chained into the pop's own cycle (it has
+    // latency 0: gemm's `alpha * A[i][k]` beside its pop) reads the beat
+    // itself; the register holds the previous one until the cycle ends.
     if (loadOp.requiresReadEnable() && loadOp.getReadLatency() == 0 &&
         pref.rdData && *pref.rdData) {
       auto capReg = seq::CompRegClockEnabledOp::create(
           hb, loc, *pref.rdData, seqDyn->clk, issueHandshake, seqDyn->rst,
           hw::ConstantOp::create(hb, loc, (*pref.rdData).getType(), 0),
           hb.getStringAttr(base + "_cap"));
-      mapping.map(loadOp.getResult(), capReg);
+      mapping.map(
+          loadOp.getResult(),
+          comb::MuxOp::create(hb, loc, issueHandshake, *pref.rdData, capReg));
       return success();
     }
     // Map the result to a capture register: data is valid ON the completion
@@ -5929,8 +5934,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
       // The per-result `atOffset + residual` bound below rejects exactly
       // the captures whose enable cycle does not exist, except for a frame
       // result (readAfterFrame), which is latched in the cycle after the
-      // frame instead. A single-cycle frame captures only those.
-      if (hasCycleGates || llvm::any_of(atOp.getResults(), readAfterFrame)) {
+      // frame instead. A single-cycle frame captures those, and a result its
+      // launched child reads that settles in the frame's one cycle: an
+      // operator instance's output (gemm's `alpha * A[i][k]` on the
+      // multiplier a sibling pipeline shares), which the child would
+      // otherwise read live for its whole run.
+      if (hasCycleGates || llvm::any_of(atOp.getResults(), [&](Value res) {
+            return resultNeedsCapture(res, atOffset);
+          })) {
         hw.setInsertionPointToEnd(hwBody);
         unsigned numCycles =
             hasCycleGates ? fsmFrameCycleGates[frameIdx].size() : 1;
@@ -5962,8 +5973,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
           return gate;
         };
         for (auto res : atOp.getResults()) {
-          if (hasCycleGates ? !resultNeedsCapture(res, atOffset)
-                            : !readAfterFrame(res))
+          if (!resultNeedsCapture(res, atOffset))
             continue;
           // A dynamic access already latched its data into a stable
           // completion-clocked register; re-capturing at the fixed
