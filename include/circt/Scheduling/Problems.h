@@ -187,6 +187,9 @@ private:
   // Operator type properties
   OperatorTypeProperty<unsigned> latency;
 
+  // Dependence properties
+  DependenceProperty<unsigned> dependenceLatency;
+
   //===--------------------------------------------------------------------===//
   // Problem construction
   //===--------------------------------------------------------------------===//
@@ -287,6 +290,21 @@ public:
     return latency.lookup(opr);
   }
   void setLatency(OperatorType opr, unsigned val) { latency[opr] = val; }
+
+  /// The latency a dependence imposes: the destination starts at least this
+  /// many time steps after the source. By default the source's latency (its
+  /// result is then available); a set value overrides it, for an auxiliary
+  /// ordering edge whose destination needs only the source to have started.
+  std::optional<unsigned> getDependenceLatency(Dependence dep) {
+    if (auto lat = dependenceLatency.lookup(dep))
+      return lat;
+    if (auto opr = getLinkedOperatorType(dep.getSource()))
+      return getLatency(*opr);
+    return std::nullopt;
+  }
+  void setDependenceLatency(Dependence dep, unsigned val) {
+    dependenceLatency[dep] = val;
+  }
 
   /// Return the start time for \p op, as computed by the scheduler.
   /// These start times comprise the basic problem's solution, i.e. the

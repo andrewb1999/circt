@@ -547,6 +547,13 @@ ChainingSharedOperatorsProblem getChainingSharedOperatorsProblem(
               auto depInserted = problem.insertDependence(dep);
               assert(succeeded(depInserted));
               (void)depInserted;
+              // An op reads its operands in its start cycle (an access its
+              // address, a pipelined operator its inputs), and the iter arg
+              // register holds until the iteration advances, so the
+              // producer need only not start before it, not wait out its
+              // latency: a store of `x[i]` that waited would add a cycle to
+              // every iteration that ends with it (gesummv's outer loop).
+              problem.setDependenceLatency(dep, 0);
               break;
             }
           }

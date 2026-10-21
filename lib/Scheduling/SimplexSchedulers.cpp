@@ -475,7 +475,7 @@ void SimplexSchedulerBase::fillConstraintRow(SmallVector<int> &row,
   auto &prob = getProblem();
   Operation *src = dep.getSource();
   Operation *dst = dep.getDestination();
-  unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
+  unsigned latency = *prob.getDependenceLatency(dep);
   row[parameter1Column] = -latency; // note the negation
   if (src != dst) { // note that these coefficients just zero out in self-arcs.
     row[startTimeLocations[startTimeVariables[src]]] = 1;
@@ -1028,7 +1028,7 @@ void CyclicSimplexScheduler::fillConstraintRow(SmallVector<int> &row,
                                                Problem::Dependence dep) {
   Operation *src = dep.getSource();
   Operation *dst = dep.getDestination();
-  unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
+  unsigned latency = *prob.getDependenceLatency(dep);
   // llvm::errs() << "source: ";
   // dep.getSource()->dump();
   // llvm::errs() << "dest: ";
@@ -1697,7 +1697,7 @@ void ChainingCyclicSimplexScheduler::fillConstraintRow(
 
   Operation *src = dep.getSource();
   Operation *dst = dep.getDestination();
-  unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
+  unsigned latency = *prob.getDependenceLatency(dep);
   if (auto dist = prob.getDistance(dep)) {
     // the latency of the last op in a recurrence must be at least 1
     if (latency == 0) {

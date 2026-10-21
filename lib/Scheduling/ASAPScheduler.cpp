@@ -35,8 +35,8 @@ LogicalResult scheduling::scheduleASAP(Problem &prob) {
         return failure();
 
       // pred is already scheduled
-      auto predOpr = *prob.getLinkedOperatorType(pred);
-      startTime = std::max(startTime, *predStart + *prob.getLatency(predOpr));
+      startTime =
+          std::max(startTime, *predStart + *prob.getDependenceLatency(dep));
     }
 
     prob.setStartTime(op, startTime);

@@ -131,7 +131,7 @@ LogicalResult Problem::verifyPrecedence(Dependence dep) {
   Operation *j = dep.getDestination();
 
   unsigned stI = *getStartTime(i);
-  unsigned latI = *getLatency(*getLinkedOperatorType(i));
+  unsigned latI = *getDependenceLatency(dep);
   unsigned stJ = *getStartTime(j);
 
   // check if i's result is available before j starts
@@ -188,7 +188,7 @@ LogicalResult CyclicProblem::verifyPrecedence(Dependence dep) {
   Operation *j = dep.getDestination();
 
   unsigned stI = *getStartTime(i);
-  unsigned latI = *getLatency(*getLinkedOperatorType(i));
+  unsigned latI = *getDependenceLatency(dep);
   unsigned stJ = *getStartTime(j);
   unsigned dist = getDistance(dep).value_or(0); // optional property
   unsigned ii = *getInitiationInterval();

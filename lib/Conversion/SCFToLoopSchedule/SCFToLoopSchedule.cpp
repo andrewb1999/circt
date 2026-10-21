@@ -673,7 +673,8 @@ static void applySecondaryScheduleObjectives(
       auto srcOpr = problem.getLinkedOperatorType(src);
       if (!srcStart || !srcOpr)
         return std::nullopt;
-      asap = std::max(asap, *srcStart + problem.getLatency(*srcOpr).value_or(0));
+      asap = std::max(asap, *srcStart +
+                                problem.getDependenceLatency(dep).value_or(0));
     }
     return asap;
   };
@@ -691,6 +692,9 @@ static void applySecondaryScheduleObjectives(
       if (!srcOpr || !srcStart)
         continue;
       unsigned srcLat = problem.getLatency(*srcOpr).value_or(0);
+      // An ordering edge shorter than its source's latency carries no value.
+      if (problem.getDependenceLatency(dep).value_or(0) != srcLat)
+        continue;
       if (*srcStart + srcLat != cycle)
         continue;
       float srcOut = problem.getOutgoingDelay(*srcOpr).value_or(0.0f);
