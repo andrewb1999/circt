@@ -377,6 +377,46 @@ static bool isDefinedAboveNest(Value v, WhileOp outer) {
   return def && !outer->isAncestor(def);
 }
 
+/// Hoist out of every loop the pure ops between the loops of the
+/// single-child while chain rooted at `outer` that depend on no value
+/// defined in a loop: an inner level's runtime bound the affine lowering
+/// computed per outer iteration (fdtd_2d's `range(1, NY)`, normalized to
+/// `NY - 1` inside the `i` loop). Left there, it is a pre-op and a bound
+/// not defined above the nest, either of which keeps a runtime nest
+/// unflattened. Only all the way out: an op invariant in `outer` alone,
+/// moved into an enclosing loop's body, would break that loop's nest.
+static void hoistInvariantPreOps(WhileOp outer) {
+  Operation *top = outer;
+  while (isa_and_nonnull<WhileOp, scf::ForOp>(top->getParentOp()))
+    top = top->getParentOp();
+  if (top->getParentOp() != outer->getParentOfType<func::FuncOp>())
+    return;
+  for (WhileOp current = outer; current;) {
+    WhileOp inner = nullptr;
+    for (Operation &op : current.getAfterBody()->without_terminator())
+      if (auto w = dyn_cast<WhileOp>(op)) {
+        if (inner)
+          return;
+        inner = w;
+      }
+    if (!inner)
+      return;
+    for (Operation &op : llvm::make_early_inc_range(
+             current.getAfterBody()->without_terminator())) {
+      if (&op == inner.getOperation())
+        break;
+      if (isPure(&op) && op.getNumRegions() == 0 &&
+          llvm::all_of(op.getOperands(), [&](Value v) {
+            if (auto arg = dyn_cast<BlockArgument>(v))
+              return !top->isAncestor(arg.getOwner()->getParentOp());
+            return !top->isAncestor(v.getDefiningOp());
+          }))
+        op.moveBefore(top);
+    }
+    current = inner;
+  }
+}
+
 /// True if `v` is produced by a ConstantLike op (rematerializable anywhere;
 /// covers integer and float accumulator inits).
 static bool isConstantValue(Value v) {
@@ -1678,6 +1718,7 @@ void SCFWhileLoopFlatteningPass::runOnOperation() {
   for (WhileOp op : roots) {
     if (consumed.contains(op.getOperation()))
       continue;
+    hoistInvariantPreOps(op);
     auto nest = collectNest(op);
     if (!nest)
       continue;

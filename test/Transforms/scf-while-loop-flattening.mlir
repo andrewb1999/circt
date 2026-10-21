@@ -272,6 +272,44 @@ func.func @runtime_inner_bound(%ubDyn: i32) {
 
 // -----
 
+// Positive (runtime bounds): the inner bound computed inside the outer body
+// from values above the nest (`ubDyn - 1`, fdtd_2d's `range(1, NY)` after
+// normalization) is hoisted above it first; the nest is then perfect, with
+// a nest-invariant bound, and flattens.
+
+// CHECK-LABEL: func.func @runtime_inner_bound_computed
+// CHECK:         %[[UB:.+]] = arith.addi %arg0, %c-1_i32 : i32
+// CHECK:         scf.while
+// CHECK:         arith.cmpi slt, %{{.+}}, %[[UB]]
+// CHECK:         do {
+// CHECK-NOT:       scf.while
+func.func @runtime_inner_bound_computed(%ubDyn: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %cm1 = arith.constant -1 : i32
+  %c4 = arith.constant 4 : i32
+  %r = scf.while (%i = %c0) : (i32) -> i32 {
+    %ci = arith.cmpi slt, %i, %c4 : i32
+    scf.condition(%ci) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    %ub = arith.addi %ubDyn, %cm1 : i32
+    %rj = scf.while (%j = %c0) : (i32) -> i32 {
+      %cj = arith.cmpi slt, %j, %ub : i32
+      scf.condition(%cj) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %jn = arith.addi %j, %c1 : i32
+      scf.yield %jn : i32
+    }
+    %in = arith.addi %i, %c1 : i32
+    scf.yield %in : i32
+  }
+  return
+}
+
+// -----
+
 // Negative (runtime bounds): an inner bound that depends on the OUTER IV
 // is not nest-invariant (spmv's `rowptr[i]` shape) — stays nested.
 
