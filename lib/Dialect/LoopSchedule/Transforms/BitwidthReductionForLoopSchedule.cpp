@@ -146,9 +146,81 @@ static std::optional<uint64_t> matchScaledIV(Value idx, Value iv) {
   return std::nullopt;
 }
 
-/// Strip this pass's own bound rewrite: `select(ub < 0, 0, trunci(ub))`
-/// roots at `ub`. Lets an already-narrowed sibling loop's bound be compared
-/// against another loop's still-wide bound by identity.
+/// Strip this pass's clamp of a licensed value to its maximum,
+/// `select(x > c, c, x)`, or its saturation, `select((x >> k) != 0, c, x)`,
+/// down to `x`.
+static Value peelClamp(Value v) {
+  auto sel = v.getDefiningOp<SelectOp>();
+  if (!sel)
+    return v;
+  auto cmp = sel.getCondition().getDefiningOp<CmpIOp>();
+  APInt limit, limitT;
+  if (!cmp || !matchPattern(sel.getTrueValue(), m_ConstantInt(&limitT)))
+    return v;
+  if (cmp.getPredicate() == CmpIPredicate::sgt &&
+      cmp.getLhs() == sel.getFalseValue() &&
+      matchPattern(cmp.getRhs(), m_ConstantInt(&limit)) && limit == limitT)
+    return sel.getFalseValue();
+  // The high bits may have been narrowed to their own width since.
+  Value high = cmp.getLhs();
+  if (auto tr = high.getDefiningOp<TruncIOp>())
+    high = tr.getIn();
+  auto shr = high.getDefiningOp<ShRUIOp>();
+  APInt k, zero;
+  if (cmp.getPredicate() == CmpIPredicate::ne && shr &&
+      shr.getLhs() == sel.getFalseValue() &&
+      matchPattern(cmp.getRhs(), m_ConstantInt(&zero)) && zero.isZero() &&
+      matchPattern(shr.getRhs(), m_ConstantInt(&k)) &&
+      k.getZExtValue() == llvm::Log2_64_Ceil(limitT.getZExtValue()))
+    return sel.getFalseValue();
+  return v;
+}
+
+/// The largest value `saturateTo(x, limit)` leaves: `limit`, or below it
+/// the most a value under 2^k takes.
+static uint64_t saturatedMax(uint64_t limit) {
+  return std::max(limit,
+                  llvm::maskTrailingOnes<uint64_t>(llvm::Log2_64_Ceil(limit)));
+}
+
+/// A licensed value saturated at its licensed maximum: `x` below 2^k, the
+/// least power of 2 at or past `limit`, and `limit` where any higher bit is
+/// set (an out-of-range size, undefined behavior in the source, or a
+/// negative one, which the caller's sign guard pins to zero). Narrowed, the
+/// value then saturates where truncation would wrap it. Unlike `clampTo`
+/// there is no comparator, the test being the OR of x's high bits; a value
+/// in [limit, 2^k) passes, so the result reaches `saturatedMax(limit)`.
+static Value saturateTo(OpBuilder &b, Location loc, Value x, uint64_t limit) {
+  auto ty = cast<IntegerType>(x.getType());
+  unsigned k = llvm::Log2_64_Ceil(limit);
+  Value high = ShRUIOp::create(b, loc, x,
+                               ConstantOp::create(b, loc,
+                                                  b.getIntegerAttr(ty, k)));
+  Value over = CmpIOp::create(
+      b, loc, CmpIPredicate::ne, high,
+      ConstantOp::create(b, loc, b.getIntegerAttr(ty, 0)));
+  Value c = ConstantOp::create(b, loc, b.getIntegerAttr(ty, limit));
+  return SelectOp::create(b, loc, over, c, x);
+}
+
+/// A licensed value clamped to its licensed maximum: `min(x, limit)`, at
+/// x's width. A value past the license (an out-of-range size, undefined
+/// behavior in the source) then saturates where truncation would wrap it:
+/// a loop stops at the licensed bound instead of counting forever. A
+/// ceil-div chain's dividend takes this exact form over `saturateTo`: the
+/// quotient narrows to the license's own width, which a dividend in
+/// [limit, 2^k) would overflow.
+static Value clampTo(OpBuilder &b, Location loc, Value x, uint64_t limit) {
+  auto ty = cast<IntegerType>(x.getType());
+  Value c = ConstantOp::create(b, loc, b.getIntegerAttr(ty, limit));
+  Value over = CmpIOp::create(b, loc, CmpIPredicate::sgt, x, c);
+  return SelectOp::create(b, loc, over, c, x);
+}
+
+/// Strip this pass's own bound rewrite: `select(ub < 0, 0, trunci(ub))`,
+/// the truncated `ub` saturated at the license past step 1, roots at `ub`.
+/// Lets an already-narrowed sibling loop's bound be compared against another
+/// loop's still-wide bound by identity.
 static Value rootBound(Value v) {
   auto sel = v.getDefiningOp<SelectOp>();
   if (!sel)
@@ -159,8 +231,8 @@ static Value rootBound(Value v) {
   if (cmp && tr && cmp.getPredicate() == CmpIPredicate::slt &&
       matchPattern(cmp.getRhs(), m_ConstantInt(&zero)) && zero.isZero() &&
       matchPattern(sel.getTrueValue(), m_ConstantInt(&zeroT)) &&
-      zeroT.isZero() && cmp.getLhs() == tr.getIn())
-    return tr.getIn();
+      zeroT.isZero() && cmp.getLhs() == peelClamp(tr.getIn()))
+    return cmp.getLhs();
   return v;
 }
 
@@ -365,7 +437,7 @@ static std::optional<std::pair<Value, unsigned>> matchCeilDivChain(Value ub) {
             if (auto dec = shr.getLhs().getDefiningOp<SubIOp>()) {
               Value lhs = dec.getLhs();
               if (auto tr = lhs.getDefiningOp<TruncIOp>())
-                lhs = tr.getIn();
+                lhs = peelClamp(tr.getIn());
               if (lhs == x && isOneC(dec.getRhs()))
                 return std::make_pair(x, (unsigned)sh.getZExtValue());
             }
@@ -437,8 +509,101 @@ static std::optional<uint64_t> licensedUbBound(scf::ForOp loop) {
   return std::nullopt;
 }
 
+/// Give `op`'s IV `newType`, its uses reading it sign-extended to the old
+/// type.
+static void retypeIV(scf::ForOp op, IntegerType newType,
+                     PatternRewriter &rewriter) {
+  auto induction = op.getInductionVar();
+  Type wideTy = induction.getType();
+  induction.setType(newType);
+  rewriter.setInsertionPointToStart(&op.getRegion().front());
+  auto newExt = arith::ExtSIOp::create(rewriter, op.getLoc(), wideTy, induction);
+  rewriter.replaceAllUsesExcept(induction, newExt.getOut(), newExt);
+}
+
+/// The signed range [lo, hi] of `v`, at 128 bits: the solver's, or, for a
+/// value it never saw (one this pass created: the extension of an IV it
+/// already narrowed), its operand's through an extension, or the operand
+/// type's full range.
+static std::optional<std::pair<APInt, APInt>>
+signedRange(DataFlowSolver *solver, Value v) {
+  constexpr unsigned kWidth = 128;
+  if (solver) {
+    auto *lattice = solver->lookupState<dataflow::IntegerValueRangeLattice>(v);
+    if (lattice && !lattice->getValue().isUninitialized()) {
+      const ConstantIntRanges &r = lattice->getValue().getValue();
+      return std::make_pair(r.smin().sext(kWidth), r.smax().sext(kWidth));
+    }
+  }
+  APInt c;
+  if (matchPattern(v, m_ConstantInt(&c)))
+    return std::make_pair(c.sext(kWidth), c.sext(kWidth));
+  if (auto ext = v.getDefiningOp<ExtSIOp>()) {
+    if (auto r = signedRange(solver, ext.getIn()))
+      return r;
+    unsigned w = ext.getIn().getType().getIntOrFloatBitWidth();
+    return std::make_pair(APInt::getSignedMinValue(w).sext(kWidth),
+                          APInt::getSignedMaxValue(w).sext(kWidth));
+  }
+  if (auto ext = v.getDefiningOp<ExtUIOp>()) {
+    unsigned w = ext.getIn().getType().getIntOrFloatBitWidth();
+    return std::make_pair(APInt(kWidth, 0),
+                          APInt::getMaxValue(w).zext(kWidth));
+  }
+  return std::nullopt;
+}
+
+/// The signed width every value of `loop`'s IV and bounds fits in, from the
+/// ranges of the bounds alone, or none where one is unknown. No license is
+/// needed: a bound that is an int32 size sign-extended to i64 keeps the IV
+/// below 2^31, so 32 bits hold the loop exactly.
+static std::optional<unsigned> rangeWidth(DataFlowSolver *solver,
+                                          scf::ForOp loop, uint64_t step) {
+  auto lb = signedRange(solver, loop.getLowerBound());
+  auto ub = signedRange(solver, loop.getUpperBound());
+  if (!lb || !ub)
+    return std::nullopt;
+  // The last IV update reaches at most ub - 1 + step.
+  APInt last = ub->second - 1 + step;
+  return std::max({lb->first.getSignificantBits(),
+                   lb->second.getSignificantBits(),
+                   ub->first.getSignificantBits(),
+                   ub->second.getSignificantBits(),
+                   last.getSignificantBits()});
+}
+
+/// Narrow `op` to `newType`, every bound truncated: each fits it (see
+/// rangeWidth), so the loop runs exactly as before.
+static void narrowExactly(scf::ForOp op, IntegerType newType,
+                          PatternRewriter &rewriter) {
+  auto narrow = [&](Value v) -> Value {
+    APInt c;
+    if (matchPattern(v, m_ConstantInt(&c))) {
+      rewriter.setInsertionPoint(op);
+      return ConstantOp::create(
+          rewriter, op.getLoc(),
+          rewriter.getIntegerAttr(newType, c.trunc(newType.getWidth())));
+    }
+    // At the operand's definition (the entry block for a kernel argument),
+    // so it is truncated once rather than per entry of an enclosing loop.
+    if (auto arg = dyn_cast<BlockArgument>(v))
+      rewriter.setInsertionPointToStart(arg.getOwner());
+    else
+      rewriter.setInsertionPointAfter(v.getDefiningOp());
+    return TruncIOp::create(rewriter, op.getLoc(), newType, v);
+  };
+  Value lb = narrow(op.getLowerBound());
+  Value ub = narrow(op.getUpperBound());
+  Value step = narrow(op.getStep());
+  op.setLowerBound(lb);
+  op.setUpperBound(ub);
+  op.setStep(step);
+  retypeIV(op, newType, rewriter);
+}
+
 struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
-  using OpRewritePattern<scf::ForOp>::OpRewritePattern;
+  SCFForIterationReduction(MLIRContext *context, DataFlowSolver *solver)
+      : OpRewritePattern<scf::ForOp>(context), solver(solver) {}
 
   LogicalResult matchAndRewrite(scf::ForOp op,
                                 PatternRewriter &rewriter) const override {
@@ -447,28 +612,93 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
     auto constantStep = op.getStep().getDefiningOp<ConstantOp>();
     if (constantLB == nullptr || constantUB == nullptr ||
         constantStep == nullptr) {
-      // A loop with a RUNTIME upper bound. The IV's width is inferred from
-      // the loop's own accesses (see licensedIVBound); the bound operand is
-      // narrowed under a sign guard:
+      // A loop with a RUNTIME bound, narrowed to the narrower of two
+      // widths:
       //
-      //   ub' = (ub < 0) ? 0 : trunc(ub)
+      // - its bounds' own ranges (rangeWidth): an int32 size widened to
+      //   i64 keeps the IV below 2^31. Exact: the bounds are truncated and
+      //   the loop runs as before.
+      // - a license from the loop's accesses (licensedIVBound,
+      //   licensedUbBound): an iterate at or past a dimension executes an
+      //   out-of-bounds access, undefined behavior, so every well-defined
+      //   execution keeps the IV below it. The bound is narrowed under a
+      //   sign guard,
       //
-      // A negative bound is a well-defined zero-trip loop truncation would
-      // break, so it is forced to zero (lb >= 0 makes that zero-trip). Any
-      // non-negative bound the truncation changes implies an iterate at or
-      // past the licensed dimension executes its access, so the original
-      // execution is undefined and the narrowed behavior is legal.
+      //     ub' = (ub < 0) ? 0 : trunc(ub),
+      //
+      //   a negative bound staying the zero-trip loop truncation would
+      //   break. Any non-negative bound the truncation changes implies an
+      //   iterate at or past the license executes its access, so the
+      //   original execution is undefined and the narrowed behavior is
+      //   legal; at step 1 the narrowed loop still stops, its IV climbing
+      //   to at most ub', which the narrow type holds. A larger step could
+      //   carry the IV past the narrow type's maximum and wrap it, counting
+      //   forever, so there the bound is first saturated at the license,
+      //   2^k being the least power of 2 at or past `bound`:
+      //
+      //     ub' = (ub < 0) ? 0 : trunc((ub >> k) != 0 ? bound : ub).
+      //
+      //   A well-defined ub at or past `bound` only bounds iterates already
+      //   below it, so saturating it leaves the trip count. No upper guard
+      //   at step 1: one on a size argument (min(ub, bound), or this
+      //   saturation) cost 15-50 LUTs a kernel, the loop's compares no
+      //   longer absorbing the bound's mux.
       auto wideTy = dyn_cast<IntegerType>(op.getInductionVar().getType());
       if (!wideTy)
         return failure();
       APInt lbCst, stepCst;
       bool runtimeLb =
           !matchPattern(op.getLowerBound(), m_ConstantInt(&lbCst));
-      if (!runtimeLb && (lbCst.isNegative() || lbCst.getActiveBits() > 32))
-        return failure();
       if (!matchPattern(op.getStep(), m_ConstantInt(&stepCst)) ||
           !stepCst.isStrictlyPositive() || stepCst.getActiveBits() > 32)
         return failure();
+      uint64_t step = stepCst.getZExtValue();
+
+      std::optional<unsigned> exactWidth = rangeWidth(solver, op, step);
+      if (exactWidth && *exactWidth >= wideTy.getWidth())
+        exactWidth.reset();
+
+      std::optional<uint64_t> bound;
+      if (runtimeLb) {
+        bound = licensedIVBound(op, /*allowRuntimeLb=*/true);
+      } else if (!lbCst.isNegative() && lbCst.getActiveBits() <= 32) {
+        bound = licensedIVBound(op);
+        if (auto ubBound = licensedUbBound(op))
+          bound = bound ? std::min(*bound, *ubBound) : ubBound;
+        // A lower bound at or past the license makes zero-trip the only
+        // well-defined behavior.
+        if (bound && lbCst.getZExtValue() >= *bound)
+          bound.reset();
+      }
+      std::optional<unsigned> licensedWidth;
+      if (bound) {
+        // Signed width holding every well-defined value: iterates stay
+        // below `bound`, so a well-defined upper bound is at most
+        // bound + step - 1 and the final IV update reaches at most
+        // bound - 1 + step. Past step 1, every value the narrowed loop
+        // takes: its upper bound is at most saturatedMax(bound), and the
+        // final IV update reaches at most that - 1 + step (a bit more
+        // only where the bound is short of a power of 2).
+        uint64_t maxVal =
+            (step == 1 ? *bound : saturatedMax(*bound)) + step - 1;
+        unsigned w = llvm::Log2_64_Ceil(maxVal + 1) + 1;
+        if (w < wideTy.getWidth())
+          licensedWidth = w;
+      }
+
+      if (!licensedWidth && !exactWidth)
+        return failure();
+      if (!licensedWidth || (exactWidth && *exactWidth <= *licensedWidth)) {
+        narrowExactly(op, rewriter.getIntegerType(*exactWidth), rewriter);
+        return success();
+      }
+      unsigned bitwidth = *licensedWidth;
+      auto newType = rewriter.getIntegerType(bitwidth);
+      auto licensedUb = [&](Value ub, uint64_t limit) {
+        return step == 1 ? ub
+                         : saturateTo(rewriter, op.getLoc(), ub, limit);
+      };
+
       if (runtimeLb) {
         // BOTH bounds runtime (spmv's inner loop: k = rowptr[i] to
         // rowptr[i+1]). The iterate is licensed by the loop's OWN
@@ -489,15 +719,6 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
         // Nonempty executions have exact truncations (licensed range),
         // so the per-iteration narrow guard replicates the wide one;
         // empty executions get lb' == ub' regardless of the garbage.
-        uint64_t step = stepCst.getZExtValue();
-        auto bound = licensedIVBound(op, /*allowRuntimeLb=*/true);
-        if (!bound)
-          return failure();
-        uint64_t maxVal = *bound + step - 1;
-        unsigned bitwidth = llvm::Log2_64_Ceil(maxVal + 1) + 1;
-        if (bitwidth >= wideTy.getWidth())
-          return failure();
-        auto newType = rewriter.getIntegerType(bitwidth);
         auto loc = op.getLoc();
         rewriter.setInsertionPoint(op);
         Value lb = op.getLowerBound();
@@ -505,39 +726,17 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
         Value nonempty =
             CmpIOp::create(rewriter, loc, CmpIPredicate::slt, lb, ub);
         Value lbN = TruncIOp::create(rewriter, loc, newType, lb);
-        Value ubT = TruncIOp::create(rewriter, loc, newType, ub);
+        Value ubT = TruncIOp::create(rewriter, loc, newType,
+                                     licensedUb(ub, *bound));
         Value ubN = SelectOp::create(rewriter, loc, nonempty, ubT, lbN);
         op.setLowerBound(lbN);
         op.setUpperBound(ubN);
         op.setStep(ConstantOp::create(
             rewriter, loc, rewriter.getIntegerAttr(newType, (int64_t)step)));
-        auto induction = op.getInductionVar();
-        induction.setType(newType);
-        rewriter.setInsertionPointToStart(&op.getRegion().front());
-        auto newExt =
-            arith::ExtSIOp::create(rewriter, loc, wideTy, induction);
-        rewriter.replaceAllUsesExcept(induction, newExt.getOut(), newExt);
+        retypeIV(op, newType, rewriter);
         return success();
       }
-      auto bound = licensedIVBound(op);
-      if (auto ubBound = licensedUbBound(op))
-        bound = bound ? std::min(*bound, *ubBound) : ubBound;
-      if (!bound)
-        return failure();
       uint64_t lb = lbCst.getZExtValue();
-      uint64_t step = stepCst.getZExtValue();
-      // A lower bound at or past the dimension makes zero-trip the only
-      // well-defined behavior, which truncation cannot preserve.
-      if (lb >= *bound)
-        return failure();
-      // Signed width holding every well-defined value: iterates stay below
-      // `bound`, so a well-defined upper bound is at most bound + step - 1
-      // and the final IV update reaches at most bound - 1 + step.
-      uint64_t maxVal = *bound + step - 1;
-      unsigned bitwidth = llvm::Log2_64_Ceil(maxVal + 1) + 1;
-      if (bitwidth >= wideTy.getWidth())
-        return failure();
-      auto newType = rewriter.getIntegerType(bitwidth);
 
       // Place the narrowed bound at its operand's definition point (the
       // function entry block for a kernel argument), so it is evaluated
@@ -561,8 +760,9 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
         //   ub' = x <= 0 ? 0 : ((trunc(x) - 1) >> s) + 1
         // For 1 <= x <= B the truncation is exact and this equals
         // ceil(x/2^s); x <= 0 pins zero-trip (matching the wide chain's
-        // non-positive result); x > B is UB-licensed. The sle guard reads
-        // only x's sign-extended high cone, not a carry chain.
+        // non-positive result); x > B is UB-licensed (past step 1, x is
+        // clamped to B first, so the narrow IV cannot wrap). The sle guard
+        // reads only x's sign-extended high cone, not a carry chain.
         Value x = chain->first;
         unsigned s = chain->second;
         unsigned kx = std::max(
@@ -573,7 +773,9 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
                                          rewriter.getIntegerAttr(wideTy, 0));
         Value nonPos = CmpIOp::create(rewriter, loc, CmpIPredicate::sle, x,
                                       zeroX);
-        Value xT = TruncIOp::create(rewriter, loc, xTy, x);
+        Value xT = TruncIOp::create(
+            rewriter, loc, xTy,
+            step == 1 ? x : clampTo(rewriter, loc, x, *chainRootBound));
         Value oneX = ConstantOp::create(rewriter, loc,
                                         rewriter.getIntegerAttr(xTy, 1));
         Value dec = SubIOp::create(rewriter, loc, xT, oneX);
@@ -596,7 +798,8 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
                                     zeroWide);
         auto zeroNarrow = ConstantOp::create(
             rewriter, loc, rewriter.getIntegerAttr(newType, 0));
-        auto ubTrunc = TruncIOp::create(rewriter, loc, newType, ub);
+        auto ubTrunc =
+            TruncIOp::create(rewriter, loc, newType, licensedUb(ub, *bound));
         ubNarrow = SelectOp::create(rewriter, loc, isNeg, zeroNarrow, ubTrunc);
       }
 
@@ -606,13 +809,7 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
           rewriter, loc, rewriter.getIntegerAttr(newType, lb)));
       op.setStep(ConstantOp::create(rewriter, loc,
                                     rewriter.getIntegerAttr(newType, step)));
-
-      auto induction = op.getInductionVar();
-      induction.setType(newType);
-      rewriter.setInsertionPointToStart(&op.getRegion().front());
-      auto newExt =
-          arith::ExtSIOp::create(rewriter, op.getLoc(), wideTy, induction);
-      rewriter.replaceAllUsesExcept(induction, newExt.getOut(), newExt);
+      retypeIV(op, newType, rewriter);
       return success();
     }
 
@@ -649,6 +846,8 @@ struct SCFForIterationReduction : OpRewritePattern<scf::ForOp> {
     rewriter.replaceAllUsesExcept(induction, newExt.getOut(), newExt);
     return success();
   }
+
+  DataFlowSolver *solver;
 };
 
 struct SCFForCleanupPattern : OpRewritePattern<scf::ForOp> {
@@ -1086,7 +1285,7 @@ protected:
 /// wide chain's value is NON-POSITIVE and every licensed consumer (a
 /// clamped request count, a loop bound guarded by slt) treats it as
 /// zero-trip, which 0 preserves; x > B is UB-licensed — the same
-/// argument the loop-bound rebuild already stands on.
+/// argument the loop-bound rebuild already stands on — and saturates at B.
 static void narrowLicensedCeilDivChains(Operation *funcOp) {
   SmallVector<SelectOp> candidates;
   funcOp->walk([&](SelectOp sel) { candidates.push_back(sel); });
@@ -1182,15 +1381,29 @@ void BitwidthReductionForLoopSchedule::runOnOperation() {
   narrowLicensedCeilDivChains(op);
 
   // Minimize SCFFor iteration argument bitwidth to enable further bitwidth
-  // reduction
-  RewritePatternSet patterns(&context);
-  patterns.add<SCFForIterationReduction>(&context);
-
-  GreedyRewriteConfig config;
-  if (failed(applyPatternsGreedily(op, std::move(patterns), config))) {
-    op->emitOpError("Failed to perform bitwidth minimization conversions");
-    signalPassFailure();
+  // reduction. A runtime-bounded loop reads its bounds' ranges (an int32
+  // size sign-extended to i64), so the integer range analysis runs first;
+  // the listener drops the state of what the rewrite erases, so a new value
+  // never reads a stale range.
+  {
+    DataFlowSolver boundSolver;
+    boundSolver.load<dataflow::DeadCodeAnalysis>();
+    boundSolver.load<dataflow::SparseConstantPropagation>();
+    boundSolver.load<dataflow::IntegerRangeAnalysis>();
+    if (failed(boundSolver.initializeAndRun(op)))
+      return signalPassFailure();
+    DataFlowListener boundListener(boundSolver);
+    RewritePatternSet loopPatterns(&context);
+    loopPatterns.add<SCFForIterationReduction>(&context, &boundSolver);
+    GreedyRewriteConfig loopConfig;
+    loopConfig.setListener(&boundListener);
+    if (failed(applyPatternsGreedily(op, std::move(loopPatterns), loopConfig))) {
+      op->emitOpError("Failed to perform bitwidth minimization conversions");
+      signalPassFailure();
+    }
   }
+  RewritePatternSet patterns(&context);
+  GreedyRewriteConfig config;
 
   // Apply the core integer narrowing pass
   patterns.clear();

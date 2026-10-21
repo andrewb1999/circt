@@ -22,6 +22,32 @@ func.func @runtime_ub_direct(%mem: memref<1024xi32>, %v: i32, %n: i64) {
   return
 }
 
+// Past step 1 the bound is also saturated at the license: truncating an
+// out-of-range size could leave the narrow IV stepping past its type's
+// maximum and wrapping, counting forever. Any of bits 63..7 set (2^7 being
+// the least power of 2 at or past 100) saturates it at 100; the test is the
+// OR of those bits. The bound reaches 127 unsaturated, and the final update
+// 126 + 4 = 130 -> 9 bits.
+
+// CHECK-LABEL: func.func @runtime_ub_step4_saturated
+// CHECK-DAG:     %[[NEG:.+]] = arith.cmpi slt, %arg2, %{{.+}} : i64
+// CHECK-DAG:     %[[HI:.+]] = arith.shrui %arg2, %c7_i64 : i64
+// CHECK-DAG:     %[[HIT:.+]] = arith.trunci %[[HI]] : i64 to i57
+// CHECK-DAG:     %[[OVER:.+]] = arith.cmpi ne, %[[HIT]], %{{.+}} : i57
+// CHECK-DAG:     %[[SAT:.+]] = arith.select %[[OVER]], %c100_i64, %arg2 : i64
+// CHECK-DAG:     %[[TR:.+]] = arith.trunci %[[SAT]] : i64 to i9
+// CHECK:         %[[UB:.+]] = arith.select %[[NEG]], %{{.+}}, %[[TR]] : i9
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %[[UB]] step %{{.+}} : i9
+func.func @runtime_ub_step4_saturated(%mem: memref<100xi32>, %v: i32,
+                                      %n: i64) {
+  %c0 = arith.constant 0 : i64
+  %c4 = arith.constant 4 : i64
+  scf.for %i = %c0 to %n step %c4 : i64 {
+    loopschedule.store %v, %mem[%i : i64] : memref<100xi32>
+  }
+  return
+}
+
 // A tiled shape: the outer IV reaches memory only as `i0 + i1` under a
 // constant-trip inner loop. `i1` is provably non-negative, so the access
 // licenses the OUTER loop too. dim 128, step 16 -> holds 143 -> 9 bits.
@@ -152,10 +178,12 @@ func.func @ceildiv_licensed(%mem: memref<1024xi32>, %acc: memref<8xi32>,
 }
 
 // REFUSED: the two selects carry DIFFERENT guards, so the chain is not the
-// ceil-div shape and the root's license must not transfer.
+// ceil-div shape and the root's license must not transfer. The loop narrows
+// only as far as its bound's own range allows, exactly: a quotient of a
+// shift by 4 is at most 2^60 -> 62 bits (not the root's 1024).
 
 // CHECK-LABEL: func.func @ceildiv_mismatched_guard
-// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i64
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i62
 func.func @ceildiv_mismatched_guard(%mem: memref<1024xi32>, %acc: memref<8xi32>,
                                     %v: i32, %n: i64, %m: i64) {
   %c0 = arith.constant 0 : i64
@@ -249,6 +277,63 @@ func.func @runtime_inner_not_credited(%A: memref<128x128xi32>, %v: i32,
   scf.for %i = %c0 to %rows step %c1 : i64 {
     scf.for %j = %c0 to %cols step %c1 : i64 {
       loopschedule.store %v, %A[%i, %j : i64, i64] : memref<128x128xi32>
+    }
+  }
+  return
+}
+
+// A runtime bound with a known range narrows the loop EXACTLY, with no
+// license: an int32 size sign-extended to i64 keeps the IV below 2^31, so 32
+// bits hold the loop (the store's constant index licenses nothing). The
+// bounds are truncated and the loop runs as before.
+
+// CHECK-LABEL: func.func @int32_size_exact
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %arg2 step %{{.+}} : i32
+func.func @int32_size_exact(%acc: memref<8xi32>, %v: i32, %n32: i32) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  %n = arith.extsi %n32 : i32 to i64
+  scf.for %i = %c0 to %n step %c1 : i64 {
+    loopschedule.store %v, %acc[%c0 : i64] : memref<8xi32>
+  }
+  return
+}
+
+// gemm's shape with runtime sizes: the outer IV reaches memory only inside
+// an inner loop with its own runtime bound (which may be zero-trip, so it
+// licenses nothing outside itself). The outer loop takes its bound's range,
+// 32 bits; the inner one its license, the 128-entry row: 9 bits.
+
+// CHECK-LABEL: func.func @int32_sizes_nest
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i32
+// CHECK:           scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} : i9
+func.func @int32_sizes_nest(%A: memref<128x128xi32>, %v: i32, %rows32: i32,
+                            %cols32: i32) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  %rows = arith.extsi %rows32 : i32 to i64
+  %cols = arith.extsi %cols32 : i32 to i64
+  scf.for %i = %c0 to %rows step %c1 : i64 {
+    scf.for %j = %c0 to %cols step %c1 : i64 {
+      loopschedule.store %v, %A[%i, %j : i64, i64] : memref<128x128xi32>
+    }
+  }
+  return
+}
+
+// A runtime LOWER bound narrows by range too (ludcmp's `range(i, n)`): the
+// outer IV and an int32 size bound it, 32 bits, where nothing licenses it.
+
+// CHECK-LABEL: func.func @int32_runtime_lb
+// CHECK:         scf.for %[[I:.+]] = %{{.+}} to %arg2 step %{{.+}} : i32
+// CHECK:           scf.for %{{.+}} = %[[I]] to %arg2 step %{{.+}} : i32
+func.func @int32_runtime_lb(%acc: memref<8xi32>, %v: i32, %n32: i32) {
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  %n = arith.extsi %n32 : i32 to i64
+  scf.for %i = %c0 to %n step %c1 : i64 {
+    scf.for %j = %i to %n step %c1 : i64 {
+      loopschedule.store %v, %acc[%c0 : i64] : memref<8xi32>
     }
   }
   return
