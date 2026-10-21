@@ -222,11 +222,109 @@ static unsigned loopDepth(Operation *loop) {
   return depth;
 }
 
+/// The access an op makes in its LOGICAL shape, where allocation recorded
+/// one: a multi-dimensional memref linearized onto a 1-D port keeps its
+/// original map (`loopschedule.logical_map`, over the op's own map
+/// operands) and shape (`loopschedule.logical_shape`). Under memref
+/// semantics every subscript is in bounds on its own, so two accesses touch
+/// one element exactly when each subscript agrees; the linearized map
+/// cannot say so for a runtime-bounded minor dimension (fdtd_2d's
+/// `ey[i][j]`, `i*80 + j` with j below a runtime NY, would let row i reach
+/// row i+1). The logical access is a stand-in `affine.load`/`affine.store`
+/// of a placeholder memref of that shape, placed just before the op, so the
+/// loops around and the order in its block are the op's own; null where
+/// the op has no logical form, or one no longer matching its map (a later
+/// rewrite of the access).
+struct LogicalAccesses {
+  llvm::DenseMap<Operation *, Operation *> standIns;
+  llvm::DenseMap<std::pair<Value, Type>, Value> placeholders;
+  SmallVector<Operation *> created;
+
+  Operation *get(Operation *op) {
+    auto [it, inserted] = standIns.try_emplace(op, nullptr);
+    if (inserted)
+      it->second = build(op);
+    return it->second;
+  }
+
+  ~LogicalAccesses() {
+    for (Operation *op : llvm::reverse(created))
+      op->erase();
+  }
+
+private:
+  Operation *build(Operation *op) {
+    auto mapAttr = op->getAttrOfType<AffineMapAttr>("loopschedule.logical_map");
+    auto shapeAttr =
+        op->getAttrOfType<DenseI64ArrayAttr>("loopschedule.logical_shape");
+    if (!mapAttr || !shapeAttr)
+      return nullptr;
+    AffineMap logical = mapAttr.getValue();
+    ArrayRef<int64_t> shape = shapeAttr.asArrayRef();
+    AffineMap actual;
+    Value memref, stored;
+    ValueRange operands;
+    if (auto read = dyn_cast<AffineReadOpInterface>(op)) {
+      actual = read.getAffineMap();
+      memref = read.getMemRef();
+      operands = read.getMapOperands();
+    } else if (auto write = dyn_cast<AffineWriteOpInterface>(op)) {
+      actual = write.getAffineMap();
+      memref = write.getMemRef();
+      operands = write.getMapOperands();
+      stored = write.getValueToStore();
+    } else {
+      return nullptr;
+    }
+    // The logical map, linearized row-major, must still be the op's map.
+    MLIRContext *ctx = op->getContext();
+    if (shape.empty() || logical.getNumResults() != shape.size() ||
+        actual.getNumResults() != 1 ||
+        logical.getNumDims() != actual.getNumDims() ||
+        logical.getNumSymbols() != actual.getNumSymbols() ||
+        llvm::any_of(shape, [](int64_t d) { return d <= 0; }))
+      return nullptr;
+    AffineMap flatten = AffineMap::get(
+        shape.size(), 0, makeCanonicalStridedLayoutExpr(shape, ctx));
+    AffineExpr diff =
+        flatten.compose(logical).getResult(0) - actual.getResult(0);
+    diff =
+        simplifyAffineExpr(diff, actual.getNumDims(), actual.getNumSymbols());
+    auto zero = dyn_cast<AffineConstantExpr>(diff);
+    if (!zero || zero.getValue() != 0)
+      return nullptr;
+
+    Type elemTy = stored ? stored.getType()
+                         : cast<AffineReadOpInterface>(op).getValue().getType();
+    auto memTy = MemRefType::get(shape, elemTy);
+    Value &placeholder = placeholders[{memref, memTy}];
+    if (!placeholder) {
+      OpBuilder b(ctx);
+      b.setInsertionPointAfterValue(memref);
+      auto cast =
+          UnrealizedConversionCastOp::create(b, op->getLoc(), memTy, memref);
+      created.push_back(cast);
+      placeholder = cast.getResult(0);
+    }
+    OpBuilder b(op);
+    Operation *standIn =
+        stored ? AffineStoreOp::create(b, op->getLoc(), stored, placeholder,
+                                       logical, operands)
+                     .getOperation()
+               : AffineLoadOp::create(b, op->getLoc(), placeholder, logical,
+                                      operands)
+                     .getOperation();
+    created.push_back(standIn);
+    return standIn;
+  }
+};
+
 static void checkAffineAccessPair(Operation *source, Operation *destination,
                                   MemoryDependenceResult &results,
                                   NameAnalysis &nameAnalysis,
                                   bool isIntraIteration,
-                                  ConstantIndexCache &constIndexCache) {
+                                  ConstantIndexCache &constIndexCache,
+                                  LogicalAccesses &logical) {
   if (source == destination)
     return;
 
@@ -276,6 +374,16 @@ static void checkAffineAccessPair(Operation *source, Operation *destination,
     auto dstIdx = getConstantAccessIndices(destination, constIndexCache);
     if (dstIdx && *srcIdx != *dstIdx)
       return;
+  }
+
+  // Both linearized from one logical shape: compare subscript by subscript.
+  if (Operation *srcLogical = logical.get(source)) {
+    Operation *dstLogical = logical.get(destination);
+    if (dstLogical && source->getAttr("loopschedule.logical_shape") ==
+                          destination->getAttr("loopschedule.logical_shape")) {
+      src = MemRefAccess(srcLogical);
+      dst = MemRefAccess(dstLogical);
+    }
   }
 
   // Hack to avoid having to copy the checkMemrefAccessDependence function
@@ -525,12 +633,15 @@ void ConstructMemoryDependenciesPass::runOnOperation() {
 
   // For each depth, check memref accesses.
   ConstantIndexCache constIndexCache;
-  for (auto *source : affineOps) {
-    for (auto *destination : affineOps) {
-      checkAffineAccessPair(source, destination, results, nameAnalysis, false,
-                            constIndexCache);
-      checkAffineAccessPair(source, destination, results, nameAnalysis, true,
-                            constIndexCache);
+  {
+    LogicalAccesses logical;
+    for (auto *source : affineOps) {
+      for (auto *destination : affineOps) {
+        checkAffineAccessPair(source, destination, results, nameAnalysis, false,
+                              constIndexCache, logical);
+        checkAffineAccessPair(source, destination, results, nameAnalysis, true,
+                              constIndexCache, logical);
+      }
     }
   }
 
