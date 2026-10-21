@@ -7418,6 +7418,10 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     Value portValue;
   };
   SmallVector<ExpectInfo> expectInfos;
+  // Each dynamic load's expect stage. Inlining keeps the load (in its issue
+  // stage) and drops the expect, whose stage is the one cycle the load's
+  // value, its expect FIFO's head, is that load's own response.
+  DenseMap<Operation *, unsigned> dynLoadExpectStage;
   pipOp.walk([&](LoopScheduleExpectOp expectOp) {
     auto dest = expectOp->getParentOfType<LoopScheduleAtOp>();
     if (!dest)
@@ -7452,6 +7456,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     }
     expectInfos.push_back({(unsigned)dest.getOffset(),
                            (unsigned)issue.getOffset(), isLoad, memVal});
+    if (isLoad)
+      dynLoadExpectStage[payload] = dest.getOffset();
   });
 
   inlineLaunchExpectPairs(pipOp);
@@ -8508,6 +8514,30 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     }
   }
 
+  // A dynamic load's value read past its expect's stage, where it is the
+  // load's own response only: an iter-arg's update, which the next
+  // iteration reads later (deriche's `xm1 = imgIn[i][j]`, every iteration
+  // of which read its own `x` off the FIFO), or a loop result, read after
+  // the drain. Inlining left it the load's result, or a slot of its issue
+  // stage. Returns the load's (live) value and its expect stage, if `v`
+  // is one, through bitcasts and `if`s.
+  auto dynLoadValue =
+      [&](Value v) -> std::optional<std::pair<Value, unsigned>> {
+    Value inner = v;
+    if (auto res = dyn_cast<OpResult>(v))
+      if (auto at = dyn_cast<LoopScheduleAtOp>(res.getOwner()))
+        inner = at.getYieldOp().getOperand(res.getResultNumber());
+    Operation *load = producingOp(inner);
+    auto it =
+        load ? dynLoadExpectStage.find(load) : dynLoadExpectStage.end();
+    if (it == dynLoadExpectStage.end() || it->second >= stages.size())
+      return std::nullopt;
+    return std::make_pair(mapping.lookup(v), it->second);
+  };
+  // The iter-args' captures, written in the expect's stage as a stage
+  // register is in its own.
+  DenseMap<Value, Value> dynLoadHolds;
+
   auto pipIterArgUpdates = loopschedule::getIterArgUpdatesInOrder(pipOp);
 
   // --- Analysis (no mutation): per iter-arg, can it take the
@@ -8562,6 +8592,19 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
               break;
             }
         }
+      }
+      if (auto held = dynLoadValue(termVal)) {
+        auto [live, stage] = *held;
+        Value &hold = dynLoadHolds[termVal];
+        if (!hold)
+          hold = seq::CompRegClockEnabledOp::create(
+              hwBuilder, loc, live, clk, gatedStageCE[stage], rst,
+              createZeroConstant(hwBuilder, loc, live.getType()),
+              hwBuilder.getStringAttr((namePrefix + "_dynload_hold_" +
+                                       std::to_string(dynLoadHolds.size() - 1))
+                                          .str()));
+        info.feedback = hold;
+        info.feedbackStage = stage;
       }
 
       unsigned firstUse = firstIterArgUseOffset(pipOp, i);
@@ -8742,10 +8785,16 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
           def && !isa<LoadInterface, LoopScheduleLoadOp>(def)
               ? computeOpCycleLatency(def, operatorLibrary)
               : 0;
-      if (latency > 0) {
-        unsigned stage = llvm::find(stages, stageOp) - stages.begin();
-        Value latch = comb::AndOp::create(
-            hwBuilder, loc, liveAt(stage + latency), notStall);
+      // The cycle the value is the live iteration's: its producer's
+      // latency past its stage, or a dynamic load's expect stage.
+      std::optional<unsigned> readyAt;
+      if (latency > 0)
+        readyAt = (llvm::find(stages, stageOp) - stages.begin()) + latency;
+      else if (auto held = dynLoadValue(termResult))
+        readyAt = held->second;
+      if (readyAt) {
+        Value latch = comb::AndOp::create(hwBuilder, loc, liveAt(*readyAt),
+                                          notStall);
         mapped = seq::CompRegClockEnabledOp::create(
             hwBuilder, loc, mapped, clk, latch, rst,
             createZeroConstant(hwBuilder, loc, mapped.getType()),
