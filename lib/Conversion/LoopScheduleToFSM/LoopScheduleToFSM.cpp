@@ -1429,7 +1429,7 @@ private:
   LogicalResult emitComputeOp(Operation *op, OpBuilder &builder,
                               IRMapping &mapping, ModuleOp moduleOp,
                               Value clk, Value rst, Value opCE = {},
-                              Value shareGate = {});
+                              Value shareGate = {}, Value selectGate = {});
 
   /// `lowerAtBody` is a method (not a free function) so it can access
   /// `operatorLibrary` and `instanceUniquer` directly.
@@ -2167,6 +2167,13 @@ static FailureOr<Value> attrPortConstant(Operation *origOp, OpBuilder &builder,
 /// A port tagged `oplib.valid` is the op's gate (`shareGate`, high in the
 /// cycles it issues, stalls excluded): an operator with state takes one
 /// step per execution of its op, e.g. an accumulator one beat.
+///
+/// A shared instance's operands are muxed in under `selectGate` where the
+/// caller has one, else `shareGate`: high in the cycles the op issues, but
+/// stalled ones included. In a stalled cycle nothing takes the operator's
+/// result (its CE and the registers past it hold), so the select can leave
+/// the stall out, and with it the pipeline's whole handshake cone (fdtd_2d
+/// over AXI ran its ready/done logic into a shared multiplier's operands).
 static LogicalResult
 emitHwInstanceFromOperator(
     Operation *origOp, OpBuilder &builder, IRMapping &mapping,
@@ -2174,7 +2181,8 @@ emitHwInstanceFromOperator(
     llvm::StringMap<unsigned> &uniquer, StringRef opName, Value opCE = {},
     Value shareGate = {},
     llvm::DenseMap<std::pair<mlir::StringAttr, int64_t>,
-                   SharedOperatorInstance> *sharedOps = nullptr) {
+                   SharedOperatorInstance> *sharedOps = nullptr,
+    Value selectGate = {}) {
   auto externOp = moduleOp.lookupSymbol<hw::HWModuleExternOp>(
       templateInst.getModuleNameAttr().getValue());
   if (!externOp)
@@ -2223,6 +2231,7 @@ emitHwInstanceFromOperator(
     auto it = sharedOps->find(shareKey);
     if (it != sharedOps->end()) {
       SharedOperatorInstance &shared = it->second;
+      Value select = selectGate ? selectGate : shareGate;
       for (auto [j, idx] : llvm::enumerate(shared.operandPortForIdx)) {
         if (idx < 0)
           continue;
@@ -2231,8 +2240,8 @@ emitHwInstanceFromOperator(
                  << opName << "' shared instance expects operand " << j;
         Value mine = mapping.lookup(origOp->getOperand(j));
         Value cur = shared.instOp->getOperand(idx);
-        Value muxed = comb::MuxOp::create(builder, origOp->getLoc(),
-                                          shareGate, mine, cur);
+        Value muxed =
+            comb::MuxOp::create(builder, origOp->getLoc(), select, mine, cur);
         shared.instOp->setOperand(idx, muxed);
       }
       for (auto [attrName, idx] : shared.attrPorts) {
@@ -2245,7 +2254,7 @@ emitHwInstanceFromOperator(
           continue;
         shared.instOp->setOperand(idx,
                                   comb::MuxOp::create(builder, origOp->getLoc(),
-                                                      shareGate, *mine, cur));
+                                                      select, *mine, cur));
       }
       if (shared.ceInputIdx >= 0) {
         Value oneI1Local = hw::ConstantOp::create(
@@ -2360,7 +2369,8 @@ emitOpFromOperatorLibrary(Operation *origOp, OpBuilder &builder,
                           Value opCE = {}, Value shareGate = {},
                           llvm::DenseMap<std::pair<mlir::StringAttr, int64_t>,
                                          SharedOperatorInstance> *sharedOps =
-                              nullptr) {
+                              nullptr,
+                          Value selectGate = {}) {
   auto operatorAttr =
       origOp->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
   if (!operatorAttr)
@@ -2381,7 +2391,8 @@ emitOpFromOperatorLibrary(Operation *origOp, OpBuilder &builder,
     if (auto inst = dyn_cast<oplib::HwInstanceOp>(op))
       return emitHwInstanceFromOperator(origOp, builder, mapping, moduleOp,
                                         inst, clk, rst, uniquer, opName,
-                                        opCE, shareGate, sharedOps);
+                                        opCE, shareGate, sharedOps,
+                                        selectGate);
   }
   return emitCombOpFromOperator(origOp, builder, mapping, hwMatch);
 }
@@ -2461,7 +2472,7 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
 
 LogicalResult LoopScheduleToFSMPass::emitComputeOp(
     Operation *op, OpBuilder &builder, IRMapping &mapping, ModuleOp moduleOp,
-    Value clk, Value rst, Value opCE, Value shareGate) {
+    Value clk, Value rst, Value opCE, Value shareGate, Value selectGate) {
   // `arith.bitcast` is how AMC's legalize-float-types carries a float
   // through the integer-only HW layer: an fp operator's float operands and
   // results are bitcast to/from same-width integers, and on a wire those
@@ -2497,7 +2508,7 @@ LogicalResult LoopScheduleToFSMPass::emitComputeOp(
   }
   return emitOpFromOperatorLibrary(op, builder, mapping, moduleOp, clk, rst,
                                     instanceUniquer, *operatorLibrary, opCE,
-                                    shareGate, &sharedOperators);
+                                    shareGate, &sharedOperators, selectGate);
 }
 
 /// The op `v` comes from, looking through the `arith.bitcast`s and
@@ -8303,10 +8314,13 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
           return handleHWLoad(loadOp, hwBuilder, mapping,
                                  perStagePorts[stageIdx], loadGate);
         }
+        // A shared operator's operands are selected by the stage's own
+        // enable, stalls included: the stall cone (the dynamic ports'
+        // handshakes) stays out of the operator's input path.
         return emitComputeOp(
             inner, hwBuilder, mapping,
             hwBody->getParentOp()->getParentOfType<ModuleOp>(), clk, rst,
-            /*opCE=*/notStall, /*shareGate=*/gate);
+            /*opCE=*/notStall, /*shareGate=*/gate, /*selectGate=*/rawGate);
       };
       // Use the stall-gated stage CE as the write-/read-enable gate so
       // memory requests don't re-fire when the pipeline idles on !done.
