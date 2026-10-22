@@ -7939,11 +7939,15 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     for (auto [rank, eIdx] : llvm::enumerate(eIdxs)) {
       auto &ei = expectInfos[eIdx];
       Value doneE = doneFor[rank];
-      // The pipeline holds at most dest-issue iterations between issue
-      // and consume, bounding both the counter and the data FIFO.
-      unsigned depth = ei.destStageOffset > ei.issueStageOffset
+      // Responses waiting for their consume belong to iterations past the
+      // issue stage and not past the dest stage, and the pipeline's live
+      // iterations sit II stages apart (a stall freezes them together):
+      // at most ceil((dest - issue) / II), bounding both the counter and
+      // the data FIFO.
+      unsigned reach = ei.destStageOffset > ei.issueStageOffset
                            ? ei.destStageOffset - ei.issueStageOffset
                            : 1;
+      unsigned depth = llvm::divideCeil(reach, std::max<uint64_t>(1, II));
       auto cntTy =
           IntegerType::get(ctx, std::max(1u, llvm::Log2_64_Ceil(depth + 1)));
       Value cntZero = hw::ConstantOp::create(hwBuilder, loc, cntTy, 0);
@@ -7951,8 +7955,13 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       Value cntMax = hw::ConstantOp::create(hwBuilder, loc, cntTy, depth);
       Backedge cntBE = bb.get(cntTy);
       Value count = Value(cntBE);
-      Value isEmpty = comb::ICmpOp::create(
-          hwBuilder, loc, comb::ICmpPredicate::eq, count, cntZero);
+      // Empty is a register of its own (`count == 0`, from the next count):
+      // it selects the consumer's data between the live response and the
+      // head, so it comes straight from a flop rather than through a
+      // compare on the counter, whose fanout keeps synthesis from retiming
+      // the compare into it (gemm's multiply-add operand).
+      Backedge emptyBE = bb.get(hwBuilder.getI1Type());
+      Value isEmpty = Value(emptyBE);
       Value notEmpty = comb::createOrFoldNot(hwBuilder, loc, isEmpty);
       Value consumeEff = comb::AndOp::create(
           hwBuilder, loc, stageCE[ei.destStageOffset], notStall, false);
@@ -7983,48 +7992,96 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       Value cntReg = seq::CompRegOp::create(hwBuilder, loc, cntNext, clk, rst,
                                             cntZero, cntName);
       cntBE.setValue(cntReg);
+      Value trueBit = hw::ConstantOp::create(hwBuilder, loc,
+                                             hwBuilder.getI1Type(), 1);
+      Value emptyReg = seq::CompRegOp::create(
+          hwBuilder, loc,
+          comb::ICmpOp::create(hwBuilder, loc, comb::ICmpPredicate::eq,
+                               cntNext, cntZero),
+          clk, rst, trueBit,
+          hwBuilder.getStringAttr(
+              (namePrefix + "_expect_empty_" + std::to_string(eIdx)).str()));
+      emptyBE.setValue(emptyReg);
+      // Setting the backedge rewrote the uses so far; the FIFO below reads
+      // the register itself.
+      isEmpty = emptyReg;
       expectValid[eIdx] =
           comb::OrOp::create(hwBuilder, loc, doneE, notEmpty, false);
 
       // Load-data FIFO: push the live rdData on each done pulse, pop on
       // consume; the consumer reads the head (or the live wire through
-      // the empty bypass). Shift-register FIFO, head at entry[0].
+      // the empty bypass). The oldest response is in a head register, so
+      // the consumer reads a flop; the rest are in a shift register with
+      // one enable and no reset, which synthesis maps to SRLs (one LUT a
+      // bit for up to 32 entries, where entries written in place took a
+      // flop and a mux each: fdtd_2d's 11 FIFOs, 5632 flops), read at its
+      // oldest entry, `count - 2`, when the head pops.
       Value liveRdData =
           ei.isLoad ? memPorts.find(portValue)->second.rdData : Value();
       if (!liveRdData)
         continue;
-      Type dataTy = liveRdData.getType();
-      Value zeroData = hw::ConstantOp::create(hwBuilder, loc, dataTy, 0);
-      SmallVector<Value> entries;
-      SmallVector<Backedge> entryBEs;
-      for (unsigned i = 0; i < depth; ++i) {
-        entryBEs.push_back(bb.get(dataTy));
-        auto eName = hwBuilder.getStringAttr(
-            (namePrefix + "_expect_fifo_" + std::to_string(eIdx) + "_" +
-             std::to_string(i))
-                .str());
-        entries.push_back(seq::CompRegOp::create(hwBuilder, loc,
-                                                 Value(entryBEs.back()), clk,
-                                                 rst, zeroData, eName));
+      std::string fifoName =
+          (namePrefix + "_expect_fifo_" + std::to_string(eIdx)).str();
+      Value holdsOne = comb::ICmpOp::create(
+          hwBuilder, loc, comb::ICmpPredicate::eq, cntReg, cntOne);
+      Value popsLast =
+          comb::AndOp::create(hwBuilder, loc, pop, holdsOne, false);
+      // Two or more held: a pop moves the body's oldest into the head.
+      Value fromBody = comb::createOrFoldNot(
+          hwBuilder, loc,
+          comb::OrOp::create(hwBuilder, loc, isEmpty, holdsOne));
+      SmallVector<Value> body;
+      Value bodyOldest;
+      if (depth > 1) {
+        // A response goes to the body unless the head takes it: when the
+        // FIFO is empty, or it pops its only entry as this one arrives.
+        Value bodyPush = comb::AndOp::create(
+            hwBuilder, loc, push,
+            comb::createOrFoldNot(
+                hwBuilder, loc,
+                comb::OrOp::create(hwBuilder, loc, isEmpty, popsLast)),
+            false);
+        for (unsigned i = 0; i + 1 < depth; ++i)
+          body.push_back(seq::CompRegClockEnabledOp::create(
+              hwBuilder, loc, i == 0 ? liveRdData : body.back(), clk,
+              bodyPush,
+              hwBuilder.getStringAttr(fifoName + "_" + std::to_string(i))));
+        if (body.size() == 1) {
+          bodyOldest = body.front();
+        } else {
+          auto idxTy = IntegerType::get(ctx, llvm::Log2_64_Ceil(body.size()));
+          Value idx = comb::ExtractOp::create(
+              hwBuilder, loc, idxTy,
+              comb::SubOp::create(hwBuilder, loc, cntReg,
+                                  hw::ConstantOp::create(hwBuilder, loc,
+                                                         cntTy, 2),
+                                  false),
+              0);
+          // hw.array_create lists the highest index first.
+          SmallVector<Value> elems(body.rbegin(), body.rend());
+          bodyOldest = hw::ArrayGetOp::create(
+              hwBuilder, loc, hw::ArrayCreateOp::create(hwBuilder, loc, elems),
+              idx);
+        }
       }
-      // The shift consumes the head first, so a simultaneous push lands
-      // at count-1; otherwise at count.
-      Value writeIndex = comb::MuxOp::create(
-          hwBuilder, loc, pop,
-          comb::SubOp::create(hwBuilder, loc, cntReg, cntOne, false), cntReg);
-      for (unsigned i = 0; i < depth; ++i) {
-        Value upper = (i + 1 < depth) ? entries[i + 1] : zeroData;
-        Value shifted =
-            comb::MuxOp::create(hwBuilder, loc, pop, upper, entries[i]);
-        Value wsel = comb::ICmpOp::create(
-            hwBuilder, loc, comb::ICmpPredicate::eq, writeIndex,
-            hw::ConstantOp::create(hwBuilder, loc, cntTy, i));
-        Value writeI = comb::AndOp::create(hwBuilder, loc, push, wsel, false);
-        entryBEs[i].setValue(comb::MuxOp::create(hwBuilder, loc, writeI,
-                                                 liveRdData, shifted));
+      // The head takes the arriving response when the FIFO is empty or
+      // pops its only entry, and the body's oldest on any other pop.
+      Value headLoad = comb::AndOp::create(
+          hwBuilder, loc, push,
+          comb::OrOp::create(hwBuilder, loc, isEmpty, popsLast), false);
+      Value headIn = liveRdData;
+      if (bodyOldest) {
+        headLoad = comb::OrOp::create(
+            hwBuilder, loc, headLoad,
+            comb::AndOp::create(hwBuilder, loc, pop, fromBody, false), false);
+        headIn = comb::MuxOp::create(hwBuilder, loc, fromBody, bodyOldest,
+                                     liveRdData);
       }
-      Value outData = comb::MuxOp::create(hwBuilder, loc, isEmpty, liveRdData,
-                                          entries[0]);
+      Value head = seq::CompRegClockEnabledOp::create(
+          hwBuilder, loc, headIn, clk, headLoad,
+          hwBuilder.getStringAttr(fifoName + "_head"));
+      Value outData =
+          comb::MuxOp::create(hwBuilder, loc, isEmpty, liveRdData, head);
       dataSplices.push_back({ei.issueStageOffset, portValue, outData});
     }
   }
