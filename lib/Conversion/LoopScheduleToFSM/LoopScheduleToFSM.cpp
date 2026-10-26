@@ -1760,6 +1760,12 @@ struct SeqDynCtx {
   // previous read on its port has been seen. Keyed by the port value; reset
   // per frame because the `seen` latches reset when the frame deactivates.
   llvm::DenseMap<mlir::Value, mlir::Value> *prevReadSeen = nullptr;
+  // Each FWFT stream pop's capture register, by the pop's result (null ⇒
+  // not collected). The pop's result is the live beat in its own cycle
+  // (`issue ? rd_data : cap`); a consumer in a later cycle reads the
+  // register itself, which the frame lowering hands it from the cycle after
+  // the pop, as it does any at-result's capture.
+  llvm::DenseMap<mlir::Value, mlir::Value> *fwftCaps = nullptr;
 };
 
 /// Lower one bare dynamic load/store in a sequential frame with a full
@@ -1993,8 +1999,12 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
     // captured datum is exactly the popped beat. Acceptance is completion:
     // the ready-stall above already holds the state until the beat lands.
     // A consumer the schedule chained into the pop's own cycle (it has
-    // latency 0: gemm's `alpha * A[i][k]` beside its pop) reads the beat
-    // itself; the register holds the previous one until the cycle ends.
+    // latency 0: an `a * x` beside its pop) reads the beat itself; the
+    // register holds the previous one until the cycle ends. A consumer in a
+    // later cycle reads the register (`fwftCaps`): through the select it
+    // would sit behind the handshake's cone (state, ready, the one-shot
+    // latch) in a cycle the schedule gave it whole — gemm's `alpha *
+    // A[i][k]`, a cycle after its pop, missed timing by that.
     if (loadOp.requiresReadEnable() && loadOp.getReadLatency() == 0 &&
         pref.rdData && *pref.rdData) {
       auto capReg = seq::CompRegClockEnabledOp::create(
@@ -2004,6 +2014,8 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
       mapping.map(
           loadOp.getResult(),
           comb::MuxOp::create(hb, loc, issueHandshake, *pref.rdData, capReg));
+      if (seqDyn->fwftCaps)
+        (*seqDyn->fwftCaps)[loadOp.getResult()] = capReg;
       return success();
     }
     // Map the result to a capture register: data is valid ON the completion
@@ -2620,6 +2632,16 @@ LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
            llvm::zip(atOp.getResults(), yieldOp.getOperands())) {
         Value direct = mapping.lookup(val);
         mapping.map(res, direct);
+        // An FWFT stream pop's result is the live beat only in its own
+        // cycle; from the next one its readers take the pop's capture
+        // register (see SeqDynCtx::fwftCaps), never the select.
+        if (Operation *producer = valueProducer(val);
+            producer && producer->getNumResults() == 1 && seqDyn &&
+            seqDyn->fwftCaps)
+          if (Value cap = seqDyn->fwftCaps->lookup(producer->getResult(0))) {
+            held.push_back({res, offset, direct, cap});
+            continue;
+          }
         std::optional<unsigned> ready = readyCycle(val, atOp, offset);
         if (!ready || !isa<IntegerType>(direct.getType()))
           continue;
@@ -5743,6 +5765,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
 
     // Per-port read-completion chain for this frame (see SeqDynCtx).
     DenseMap<Value, Value> framePrevReadSeen;
+    DenseMap<Value, Value> frameFwftCaps;
 
     // Contended-port handling for the static accesses lowered below (see
     // SeqPortMuxCtx). Launched children are excluded by the collector —
@@ -5907,7 +5930,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                            node.prefix,
                            &seqDynCounter,
                            iterAdvanceEdge,
-                           &framePrevReadSeen};
+                           &framePrevReadSeen,
+                           &frameFwftCaps};
           if (failed(lowerSeqDynAccess(op, hw, localMapping, framePorts, gate,
                                        atOffset, &seqDyn, pred)))
             return failure();
@@ -5946,6 +5970,17 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
           continue;
         if (auto mapped = localMapping.lookupOrNull(val))
           localMapping.map(res, mapped);
+      }
+      // An FWFT stream pop's result is the live beat only in its own cycle:
+      // every reader after it, the next cycle's included, takes the pop's
+      // capture register (see SeqDynCtx::fwftCaps), never the select.
+      for (auto [res, val] :
+           llvm::zip(atOp.getResults(), atYield.getOperands())) {
+        Operation *producer = valueProducer(val);
+        if (!producer || producer->getNumResults() != 1)
+          continue;
+        if (Value cap = frameFwftCaps.lookup(producer->getResult(0)))
+          pendingCaptures.push_back({atOffset + 1, res, cap});
       }
       // Latch any at-op result that a later at-op or a launched
       // child reads. The combinational mapping for a load is the
@@ -6563,6 +6598,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
       // Regular frame (no child/pipeline launches). Gate stores per issue
       // cycle: ops in each `at K` body get cycleGates[K].
       DenseMap<Value, Value> framePrevReadSeen;
+      DenseMap<Value, Value> frameFwftCaps;
       SeqDynCtx seqDyn{clk,
                        rst,
                        hwBody,
@@ -6573,7 +6609,8 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
                        node.prefix,
                        &seqDynCounter,
                        iterAdvanceEdge,
-                       &framePrevReadSeen};
+                       &framePrevReadSeen,
+                       &frameFwftCaps};
       SeqPortMuxCtx seqMux;
       seqMux.multi = bodyMultiAccess;
       for (auto &memInfo : memrefArgs)
