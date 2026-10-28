@@ -1827,9 +1827,14 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
   // direction's drain is idle (a load waits for wr_idle, a store for
   // rd_idle). Folding the drain into `ready` reuses the one-shot-issue /
   // ready-stall machinery below, so completion accounting stays exact. Null
-  // drain (non-posted port) leaves it a no-op.
-  if (op->hasAttr("fence")) {
+  // drain (non-posted port) leaves it a no-op. A fence may NAME its drain
+  // (`fence = "wr_idle"`) for an op whose data moves the other way than its
+  // port protocol: a stream read REQUEST is a posted store on its request
+  // channel, and the reads it starts wait for the write drain.
+  if (Attribute fence = op->getAttr("fence")) {
     Value drain = loadOp ? mp.wrIdle : mp.rdIdle;
+    if (auto named = dyn_cast<StringAttr>(fence))
+      drain = named.getValue() == "wr_idle" ? mp.wrIdle : mp.rdIdle;
     if (drain)
       ready = ready ? (Value)comb::AndOp::create(hb, loc, ready, drain, false)
                     : drain;
