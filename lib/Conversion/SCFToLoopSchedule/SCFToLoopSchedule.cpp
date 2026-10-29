@@ -925,6 +925,34 @@ static Value inlineBeforeBodyOps(scf::WhileOp loop) {
   return mapping.lookup(scfCond.getCondition());
 }
 
+/// Whether a reader of the iter arg that `loop`'s yield operand `idx` updates
+/// consumes `producer`'s result, directly or through other ops of the body.
+static bool readsItsUpdate(scf::WhileOp loop, unsigned idx,
+                           Operation *producer) {
+  Block *body = loop.getAfterBody();
+  Operation *terminator = body->getTerminator();
+  llvm::SmallPtrSet<Operation *, 8> readers;
+  for (Operation *user : loop.getAfterArguments()[idx].getUsers())
+    if (Operation *top = body->findAncestorOpInBlock(*user))
+      if (top != terminator)
+        readers.insert(top);
+
+  llvm::SmallPtrSet<Operation *, 16> seen;
+  SmallVector<Value> worklist(producer->getResults());
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    for (Operation *user : v.getUsers()) {
+      Operation *top = body->findAncestorOpInBlock(*user);
+      if (!top || top == terminator || !seen.insert(top).second)
+        continue;
+      if (readers.contains(top))
+        return true;
+      llvm::append_range(worklist, top->getResults());
+    }
+  }
+  return false;
+}
+
 /// Check that a sequential loop's continuation is something the loop FSM can
 /// actually evaluate when it has to.
 ///
@@ -1184,21 +1212,42 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
     // of any pure producer with other in-loop users separates the two roles
     // (this is the shape the IR had before upstream CSE learned to merge
     // them).
+    //
+    // A producer with effects (a load) is not duplicated. Its conflict is
+    // when a reader of the iter arg it updates consumes its result: the
+    // reader precedes the update (WAR) yet follows the producer by its
+    // latency, a cycle, as when two loads of one cell merge (deriche's
+    // `xm1 = imgIn[i][j]` beside the `a2 * xm1` it replaces). The yield then
+    // takes a same-type bitcast of it, a free wire, whose update goes after
+    // the reader, the value held in a register meanwhile.
     {
       Operation *terminator = loop.getAfterBody()->getTerminator();
       OpBuilder cloneBuilder(terminator);
       for (OpOperand &yielded : terminator->getOpOperands()) {
         Operation *def = yielded.get().getDefiningOp();
         if (!def || def->getBlock() != terminator->getBlock() ||
-            !isMemoryEffectFree(def) || def->getNumResults() != 1)
+            def->getNumResults() != 1)
           continue;
         bool hasOtherUsers = llvm::any_of(
             def->getResult(0).getUsers(),
             [&](Operation *user) { return user != terminator; });
         if (!hasOtherUsers)
           continue;
-        Operation *clone = cloneBuilder.clone(*def);
-        yielded.set(clone->getResult(0));
+        if (isMemoryEffectFree(def)) {
+          Operation *clone = cloneBuilder.clone(*def);
+          yielded.set(clone->getResult(0));
+          continue;
+        }
+        // A same-cycle value (a FWFT stream pop) is read and updated in one
+        // cycle already.
+        if (auto load = dyn_cast<LoadInterface>(def);
+            load && load.getLatency() == 0)
+          continue;
+        Type type = yielded.get().getType();
+        if (isa<IntegerType, FloatType>(type) &&
+            readsItsUpdate(loop, yielded.getOperandNumber(), def))
+          yielded.set(arith::BitcastOp::create(cloneBuilder, def->getLoc(),
+                                               type, yielded.get()));
       }
     }
 
