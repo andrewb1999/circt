@@ -28,7 +28,10 @@
 //     invariant init via arith.select when the levels below its origin
 //     wrap; a load-initialized one by re-loading it (and its pure ops) on
 //     the pass's first iteration, under an scf.if, in place of the carried
-//     value, as Vitis HLS's flattened loops do.
+//     value, as Vitis HLS's flattened loops do. Not from a dynamic-latency
+//     load (an AXI word read) whose port another load of the nest reads:
+//     under the if it gets no launch/expect pair, and its value is the
+//     port's read data.
 //   - POST-ops: pure ops and memref.stores after the inner loop (e.g. the
 //     reduction's store to memory). These become an scf.if predicated on
 //     "the levels below just wrapped", i.e. they execute exactly on the
@@ -895,6 +898,30 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
         if (!isConstantValue(init) && !isDefinedAboveNest(init, outer) &&
             !matchInitLoad(init, info.preOps[k - 1], initLoad, initOps))
           return std::nullopt;
+        // A dynamic-latency load (an AXI word read) re-loaded under the
+        // pass's first-iteration `scf.if` is a conditional dynamic access
+        // in the pipeline, which gets no launch/expect pair (that is built
+        // only for an access every iteration makes): its value is the
+        // port's read data when its consumer reads it. That is its own
+        // response only if no other load of the nest reads the same port
+        // (mvt's `x1[i]`, gemver's `x[i]`); seidel's `A[i][0]`, beside the
+        // row's eight reads of `A`, read theirs. Such a nest stays apart. A
+        // zero-latency one, a stream pop, needs no such pair.
+        if (auto load =
+                dyn_cast_or_null<circt::loopschedule::LoadInterface>(initLoad);
+            load && load.isDynamic() && load.getLatency() != 0) {
+          Value port = load.getMemoryValue();
+          bool shared = nest.back()
+                            .loop
+                            ->walk([&](circt::loopschedule::LoadInterface other) {
+                              return other.getMemoryValue() == port
+                                         ? WalkResult::interrupt()
+                                         : WalkResult::advance();
+                            })
+                            .wasInterrupted();
+          if (shared)
+            return std::nullopt;
+        }
         origin = int(k) - 1;
 
         CarriedChain chain;
