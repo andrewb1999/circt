@@ -49,21 +49,22 @@
 // `for k: for j < i + 1`, whose k-carried update is i + 1 iterations
 // apart), or whose flattened order could run the destination first.
 //
-// Bounds may be CONSTANT or RUNTIME. A runtime (SSA) upper bound is
-// accepted for PERFECT nests only, under: the bound dominates the whole
-// nest (nest-invariance — a bound loaded per outer iteration, spmv's
-// rowptr, is structurally excluded), the predicate is slt/ult (already
-// exclusive, nothing to normalize), lb and step still constant, and no
-// dynamic-latency access in the nest (matching Vitis, which flattens the
-// on-chip scatter nest and disables flattening for its m_axi variant —
-// and keeping AXI netlists byte-identical here). The odometer's wrap
-// compare then reads the held SSA value, and the flattened entry
-// condition ANDs every runtime level's compare so a zero-trip inner
-// level (cols == 0) exits before executing anything — exactly the
-// original perfect nest's behavior. Almost-perfect structure with
-// runtime bounds is REFUSED: the original per-pass epilogue runs even
-// when the levels below zero-trip, but the wrap-predicated form would
-// skip it.
+// Bounds may be CONSTANT or RUNTIME. A runtime (SSA) upper bound must
+// dominate the whole nest (nest-invariance — a bound loaded per outer
+// iteration, spmv's rowptr, is structurally excluded), with an slt/ult
+// predicate (already exclusive, nothing to normalize) and a constant step.
+// The odometer's wrap compare then reads the held SSA value, and the
+// flattened entry condition ANDs every runtime level's compare so a
+// zero-trip inner level (cols == 0) exits before executing anything —
+// exactly the original perfect nest's behavior. A runtime bound on an
+// INNER level takes a PERFECT nest with no dynamic-latency access
+// (matching Vitis, which flattens the on-chip scatter nest and disables
+// flattening for its m_axi variant): the original per-pass epilogue runs
+// even when the levels below zero-trip, but the wrap-predicated form
+// would skip it. A runtime bound on the OUTERMOST level alone (a
+// triangular `for j < M - i` inside an unflattened `i`) is no such case
+// and takes any nest the constant path does, AXI accesses included, as
+// Vitis flattens covariance's and correlation's m_axi `j`/`k` nests.
 //
 // LOADS used in the inner body are NOT absorbed here — a load pre-op still
 // rejects the nest. AmcLoopReperfection (which runs immediately before this
@@ -799,16 +800,15 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
   // form skips a boundary epilogue whenever the levels below zero-trip,
   // but the original ran it — so any pre-op, post-op, or carried chain
   // refuses (Vitis draws the same line: it flattens the perfect scatter
-  // nest and leaves every reduction-epilogue nest alone). A runtime bound
-  // on the outermost level alone is no such case: the inner levels' trips
-  // are constant and non-zero, and the outermost level's own zero trip is
-  // the flattened loop's entry condition, as in the original (Vitis
-  // flattens correlation's triangular `j` nest, epilogue and all). All
-  // runtime nests must also be free of dynamic-latency accesses: the
-  // flatten changes the loop structure an AXI kernel's descriptor
-  // planning and posted-write overlap were measured on (Vitis likewise
-  // disables flattening on its m_axi variant), and this pass's byte-diff
-  // discipline keeps AXI netlists frozen.
+  // nest and leaves every reduction-epilogue nest alone). They must also
+  // be free of dynamic-latency accesses (Vitis disables flattening on the
+  // scatter's m_axi variant). A runtime bound on the outermost level alone
+  // is neither case: the inner levels' trips are constant and non-zero,
+  // and the outermost level's own zero trip is the flattened loop's entry
+  // condition, as in the original. Vitis flattens such nests, epilogue,
+  // AXI accesses and all: covariance's and correlation's triangular `j`
+  // around the `k` reduction, one II 2 pipeline where an unflattened `k`
+  // drains and restarts on every `j`.
   bool runtimeInner = llvm::any_of(
       llvm::drop_begin(nest), [](const NestLevel &l) { return l.isRuntime(); });
   if (runtimeInner) {
@@ -821,8 +821,6 @@ static std::optional<NestInfo> collectNest(WhileOp outer) {
     for (auto &ops : info.postOps)
       if (!ops.empty())
         return std::nullopt;
-  }
-  if (llvm::any_of(nest, [](const NestLevel &l) { return l.isRuntime(); })) {
     bool hasDynAccess = false;
     nest.back().loop->walk([&](Operation *op) {
       bool dyn = false;
