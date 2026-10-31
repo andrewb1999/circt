@@ -47,7 +47,15 @@ SmallVector<LoopScheduleLaunchOp> getLaunchOpsInOrder(LoopScheduleFrameOp frame)
 // and semantically equivalent to the pre-wrap IR (dynamic stall info is
 // discarded). Lowerings that don't yet implement pipeline stalling (FSM,
 // transitionally) call this at the start.
-void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp);
+//
+// A predicated pair leaves two `loopschedule.if`s on its conditions: one
+// around the payload, in the issue stage, and an empty one in the expect's
+// stage. `predicated`, when given, maps each such payload to the two, whose
+// conditions are the values those stages read once the stages are rebuilt.
+void inlineLaunchExpectPairs(
+    LoopSchedulePipelineOp pipOp,
+    DenseMap<Operation *, std::pair<LoopScheduleIfOp, LoopScheduleIfOp>>
+        *predicated = nullptr);
 
 scheduling::ModuloProblem
 getModuloProblem(mlir::scf::WhileOp whileOp,

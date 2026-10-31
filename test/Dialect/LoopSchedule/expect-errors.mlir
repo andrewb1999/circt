@@ -100,3 +100,31 @@ func.func @handle_not_from_launch(%h: !loopschedule.handle) -> i32 {
   }
   return %out : i32
 }
+
+// -----
+
+// A predicated launch's expect must carry a predicate too.
+func.func @predicate_mismatch(%A: memref<16xi32>, %idx: index, %c: i1) -> i32 {
+  %c0 = arith.constant 0 : i4
+  %c15 = arith.constant 15 : i4
+  %c1 = arith.constant 1 : i4
+  %out = loopschedule.pipeline II = 1 trip_count = 1 iter_args(%iv = %c0) : (i4) -> i32 {
+    %h = loopschedule.at 0 -> !loopschedule.handle {
+      %launched = loopschedule.launch if %c : !loopschedule.handle {
+        %ld = memref.load %A[%idx] : memref<16xi32>
+        loopschedule.yield %ld : i32
+      }
+      loopschedule.yield %launched : !loopschedule.handle
+    }
+    %v, %done = loopschedule.at 1 -> (i32, i1) {
+      // expected-error @+1 {{must carry a predicate exactly when its launch does}}
+      %val = loopschedule.expect %h : i32
+      %cond = arith.cmpi slt, %iv, %c15 : i4
+      %n = arith.addi %iv, %c1 : i4
+      loopschedule.iter_arg_update %iv = %n : i4
+      loopschedule.yield %val, %cond : i32, i1
+    }
+    loopschedule.terminator condition(%done), results(%v) : i32
+  }
+  return %out : i32
+}

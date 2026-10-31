@@ -1118,7 +1118,10 @@ void addPredicateDependencies(Operation *op, Region &body,
   }
 }
 
-void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp) {
+void inlineLaunchExpectPairs(
+    LoopSchedulePipelineOp pipOp,
+    DenseMap<Operation *, std::pair<LoopScheduleIfOp, LoopScheduleIfOp>>
+        *predicated) {
   SmallVector<LoopScheduleExpectOp> expects;
   pipOp.walk([&](LoopScheduleExpectOp e) { expects.push_back(e); });
 
@@ -1187,6 +1190,27 @@ void inlineLaunchExpectPairs(LoopSchedulePipelineOp pipOp) {
   // result types.
   for (auto &pe : per) {
     pe.payload->moveBefore(pe.launch);
+    // A predicated pair keeps its conditions: the payload goes under an
+    // `if` on the launch's (its request is issued only there), and the
+    // expect's stage keeps an `if` on the expect's, whose use carries the
+    // condition to that stage, where the lowering reads it to wait for and
+    // consume a response only where a request went out. The payload's
+    // result stays the issue stage's slot value, as unpredicated.
+    if (Value predicate = pe.launch.getPredicate()) {
+      OpBuilder b(pe.payload);
+      auto issueIf = b.create<LoopScheduleIfOp>(pe.payload->getLoc(),
+                                                TypeRange(), predicate);
+      Block *body = &issueIf.getBody().front();
+      pe.payload->moveBefore(body, body->begin());
+      LoopScheduleIfOp destIf;
+      if (Value destPredicate = pe.expect.getPredicate()) {
+        OpBuilder d(pe.expect);
+        destIf = d.create<LoopScheduleIfOp>(pe.expect.getLoc(), TypeRange(),
+                                            destPredicate);
+      }
+      if (predicated)
+        (*predicated)[pe.payload] = {issueIf, destIf};
+    }
     if (pe.hasResult) {
       pe.expect.getResult(0).replaceAllUsesWith(pe.payload->getResult(0));
       if (pe.issueSlot != ~0u)

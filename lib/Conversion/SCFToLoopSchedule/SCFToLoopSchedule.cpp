@@ -178,14 +178,103 @@ static bool isDynamicLatencyOp(Operation &op) {
   return false;
 }
 
+/// The latency a dynamic-latency op's launch/expect pair spans: its
+/// operator's in `problem`, or the load/store interface's for an op the
+/// problem does not know (a clone made by stage emission).
+static unsigned dynamicOpLatency(Operation &op, scheduling::Problem &problem) {
+  if (auto opr = problem.getLinkedOperatorType(&op))
+    return problem.getLatency(*opr).value_or(1);
+  if (auto load = dyn_cast<LoadInterface>(&op))
+    return load.getLatency();
+  if (auto store = dyn_cast<StoreInterface>(&op))
+    return store.getLatency();
+  return 1;
+}
+
 /// Replace each dynamic-latency op inside `pipeline` with a
 /// `loopschedule.launch` in its issue stage + a `loopschedule.expect` in
 /// the stage `latency` cycles later. Only handles single-result ops for
 /// now; multi-result dynamic ops emit a warning and are left alone.
-static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
-                                      scheduling::Problem &problem) {
+///
+/// A dynamic LOAD under a `loopschedule.if` of its stage (`if (c) x = A[i]`,
+/// a flattened pass's re-load on its first iteration) is issued only where
+/// the condition holds: it is hoisted to the stage and wrapped like the
+/// others, with the condition as its launch's predicate, and the condition
+/// carried to the expect's stage as the expect's. Left under the `if`, it
+/// would get no pair, and its consumer would read whatever response is at
+/// the head of its port (the next iteration's, or another load's); a
+/// conditional dynamic load this cannot hoist is an error.
+static LogicalResult wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
+                                              scheduling::Problem &problem) {
   MLIRContext *ctx = pipeline.getContext();
   auto handleTy = HandleType::get(ctx);
+
+  // Hoist the conditional dynamic loads: operands defined outside their
+  // `if` (so they read the same values at the stage), the result only
+  // yielded by it (so its consumers are the stage's), a latency to span.
+  // Each hoisted load's condition, held as the operand of an empty `if`
+  // beside it: a stage rebuilt before the load is wrapped replaces its
+  // results, which updates operands but not a Value kept on the side.
+  DenseMap<Operation *, LoopScheduleIfOp> predicateOf;
+  SmallVector<LoopScheduleIfOp> ifs;
+  pipeline.walk([&](LoopScheduleAtOp atOp) {
+    for (auto ifOp : atOp.getBodyBlock().getOps<LoopScheduleIfOp>())
+      ifs.push_back(ifOp);
+  });
+  for (LoopScheduleIfOp ifOp : ifs) {
+    Operation *yield = ifOp.getBody().front().getTerminator();
+    // The `if` results the hoisted loads produced, now the loads' own.
+    llvm::SmallSetVector<unsigned, 2> hoisted;
+    for (Operation &op : llvm::make_early_inc_range(ifOp.getBody().front())) {
+      if (!isa<LoadInterface>(op) || !isDynamicLatencyOp(op) ||
+          op.getNumResults() != 1 || dynamicOpLatency(op, problem) == 0)
+        continue;
+      if (llvm::any_of(op.getOperands(), [&](Value v) {
+            Operation *def = v.getDefiningOp();
+            return def && ifOp->isProperAncestor(def);
+          }))
+        continue;
+      if (!llvm::all_of(op.getUsers(),
+                        [&](Operation *user) { return user == yield; }))
+        continue;
+      // (Collected first: the replacement adds uses to the list it reads.)
+      SmallVector<unsigned> slots = llvm::map_to_vector(
+          op.getResult(0).getUses(),
+          [](OpOperand &use) { return use.getOperandNumber(); });
+      for (unsigned slot : slots) {
+        ifOp.getResult(slot).replaceAllUsesWith(op.getResult(0));
+        hoisted.insert(slot);
+      }
+      op.moveBefore(ifOp);
+      OpBuilder marker(&op);
+      predicateOf[&op] = marker.create<LoopScheduleIfOp>(
+          op.getLoc(), TypeRange(), ifOp.getCond());
+    }
+    if (hoisted.empty())
+      continue;
+    // Rebuild the `if` without those results (its yield cannot name a value
+    // that now lives outside it).
+    SmallVector<unsigned> drops(hoisted.begin(), hoisted.end());
+    llvm::sort(drops, std::greater<unsigned>());
+    for (unsigned idx : drops)
+      yield->eraseOperand(idx);
+    SmallVector<Type> types;
+    SmallVector<Value> kept;
+    for (auto [i, result] : llvm::enumerate(ifOp.getResults()))
+      if (!hoisted.contains(i)) {
+        types.push_back(result.getType());
+        kept.push_back(result);
+      }
+    OpBuilder b(ifOp);
+    auto rebuilt = b.create<LoopScheduleIfOp>(ifOp.getLoc(), types,
+                                              ifOp.getCond());
+    rebuilt.getBody().takeBody(ifOp.getBody());
+    for (auto [oldResult, newResult] : llvm::zip(kept, rebuilt.getResults()))
+      oldResult.replaceAllUsesWith(newResult);
+    ifOp.erase();
+    if (types.empty() && rebuilt.getBody().front().getOperations().size() == 1)
+      rebuilt.erase();
+  }
 
   // Collect dynamic ops grouped by issue stage. The stage op is rebuilt
   // at most once per stage (with the union of handle-typed result slots),
@@ -193,6 +282,7 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
   struct Wrapping {
     Operation *dynOp;
     unsigned latency;
+    LoopScheduleIfOp predicate; // the launch's (null: every iteration)
   };
   // Keyed by stage OFFSET, not the `at`-op handle: planting an expect rebuilds
   // (and erases) a destination stage at-op, and that stage may itself be a
@@ -232,13 +322,7 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
       // walk sees CLONES (stage emission), which the problem does not
       // know, so fall back to the load/store interface latency when the
       // operator-type lookup fails.
-      unsigned lat = 1;
-      if (auto opr = problem.getLinkedOperatorType(&op))
-        lat = problem.getLatency(*opr).value_or(1);
-      else if (auto load = dyn_cast<LoadInterface>(&op))
-        lat = load.getLatency();
-      else if (auto store = dyn_cast<StoreInterface>(&op))
-        lat = store.getLatency();
+      unsigned lat = dynamicOpLatency(op, problem);
       if (lat == 0) {
         // A DECLARED-zero-latency dynamic load with a read-enable is an
         // FWFT stream pop: data is combinational, issue is stall-gated on
@@ -269,7 +353,7 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
       }
       if (!byStage.count(offset))
         stagesInOrder.push_back(offset);
-      byStage[offset].push_back({&op, lat});
+      byStage[offset].push_back({&op, lat, predicateOf.lookup(&op)});
     }
   });
 
@@ -297,7 +381,8 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
       Operation *dynOp;
       LoopScheduleLaunchOp launch;
       unsigned latency;
-      unsigned slot = ~0u; // at-yield slot holding the handle
+      unsigned slot = ~0u;          // at-yield slot holding the handle
+      unsigned predicateSlot = ~0u; // at-yield slot carrying the predicate
     };
     SmallVector<LaunchInfo> infos;
     infos.reserve(wrappings.size());
@@ -305,7 +390,13 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
       Operation *dynOp = w.dynOp;
       Location loc = dynOp->getLoc();
       OpBuilder b(dynOp);
-      auto launch = b.create<LoopScheduleLaunchOp>(loc, handleTy);
+      Value predicate;
+      if (w.predicate) {
+        predicate = w.predicate.getCond();
+        w.predicate.erase();
+        predicateOf.erase(dynOp);
+      }
+      auto launch = b.create<LoopScheduleLaunchOp>(loc, handleTy, predicate);
       Block &launchBlock = launch.getBody().emplaceBlock();
       dynOp->moveBefore(&launchBlock, launchBlock.begin());
       b.setInsertionPointToEnd(&launchBlock);
@@ -338,6 +429,13 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
         stageYield->insertOperands(stageYield->getNumOperands(),
                                    info.launch.getHandle());
       }
+      // A predicated launch's condition rides to the expect's stage on the
+      // stage registers like any value.
+      if (Value predicate = info.launch.getPredicate()) {
+        info.predicateSlot = newStageResultTypes.size();
+        newStageResultTypes.push_back(predicate.getType());
+        stageYield->insertOperands(stageYield->getNumOperands(), predicate);
+      }
     }
 
     // Rebuild the issue stage once with the updated result types.
@@ -361,7 +459,8 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
     // at most once even when multiple dynamic ops converge on it.
     struct DestWrap {
       Operation *dynOp;
-      unsigned issueSlot; // index into newStage's results
+      unsigned issueSlot;     // index into newStage's results
+      unsigned predicateSlot; // likewise, ~0u for none
     };
     llvm::SmallDenseMap<LoopScheduleAtOp, SmallVector<DestWrap>, 4> byDest;
     SmallVector<LoopScheduleAtOp> destsInOrder;
@@ -384,7 +483,7 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
       }
       if (!byDest.count(destStage))
         destsInOrder.push_back(destStage);
-      byDest[destStage].push_back({info.dynOp, info.slot});
+      byDest[destStage].push_back({info.dynOp, info.slot, info.predicateSlot});
     }
 
     for (LoopScheduleAtOp destStage : destsInOrder) {
@@ -400,9 +499,12 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
       planted.reserve(dests.size());
       OpBuilder b(&destStage.getBodyBlock(), destStage.getBodyBlock().begin());
       for (auto &d : dests) {
+        Value predicate = d.predicateSlot == ~0u
+                              ? Value()
+                              : newStage.getResult(d.predicateSlot);
         auto expect = b.create<LoopScheduleExpectOp>(
             d.dynOp->getLoc(), d.dynOp->getResultTypes(),
-            newStage.getResult(d.issueSlot));
+            newStage.getResult(d.issueSlot), predicate);
         planted.push_back({d.dynOp, d.issueSlot, expect});
       }
 
@@ -476,6 +578,25 @@ static void wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
       }
     }
   }
+
+  for (auto &entry : predicateOf)
+    entry.second.erase();
+
+  // A conditional dynamic load the hoist could not take (an `if` nested in
+  // an `if`, an address computed under the condition) would read its
+  // port's head with no pair to wait for its own response.
+  WalkResult unwrapped = pipeline.walk([&](Operation *op) {
+    if (isa<LoadInterface>(op) && isDynamicLatencyOp(*op) &&
+        op->getParentOfType<LoopScheduleIfOp>() &&
+        dynamicOpLatency(*op, problem) != 0) {
+      op->emitError("conditional dynamic-latency load in a pipeline is not "
+                    "supported in this form (the load must be directly "
+                    "under one `if`, with its address computed outside it)");
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return failure(unwrapped.wasInterrupted());
 }
 
 // === Shared types/state for the merged sequential+func lowering ===
@@ -2608,7 +2729,8 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
   // sits `latency(op)` cycles later. The dynamic marker tells downstream
   // FSM lowering to stall the pipeline on that expect's handle if the
   // op's completion signal isn't asserted by the expected cycle.
-  wrapDynamicOpsInPipeline(pipeline, problem);
+  if (failed(wrapDynamicOpsInPipeline(pipeline, problem)))
+    return failure();
 
   // Replace loop results with pipeline results.
   for (size_t i = 0; i < loop.getNumResults(); ++i)

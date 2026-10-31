@@ -1611,9 +1611,25 @@ LogicalResult LoopScheduleAtOp::verify() {
 // LoopScheduleLaunchOp
 //===----------------------------------------------------------------------===//
 
+void LoopScheduleLaunchOp::build(OpBuilder &builder, OperationState &result,
+                                 Type handle, Value predicate) {
+  if (predicate)
+    result.addOperands(predicate);
+  result.addTypes(handle);
+  Region *body = result.addRegion();
+  (void)body;
+}
+
 ParseResult LoopScheduleLaunchOp::parse(OpAsmParser &parser,
                                         OperationState &result) {
-  // `: !loopschedule.handle`
+  // `[if %pred] : !loopschedule.handle`
+  if (succeeded(parser.parseOptionalKeyword("if"))) {
+    OpAsmParser::UnresolvedOperand predicate;
+    if (parser.parseOperand(predicate) ||
+        parser.resolveOperand(predicate, parser.getBuilder().getI1Type(),
+                              result.operands))
+      return failure();
+  }
   Type handleTy;
   if (parser.parseColon() || parser.parseType(handleTy))
     return failure();
@@ -1632,6 +1648,8 @@ ParseResult LoopScheduleLaunchOp::parse(OpAsmParser &parser,
 }
 
 void LoopScheduleLaunchOp::print(OpAsmPrinter &p) {
+  if (Value predicate = getPredicate())
+    p << " if " << predicate;
   p << " : ";
   p.printType(getHandle().getType());
   p << ' ';
@@ -1776,6 +1794,11 @@ LogicalResult LoopScheduleExpectOp::verify() {
            << expectAt.getOffset()
            << ") must be strictly greater than the launch's `at` offset ("
            << launchAt.getOffset() << ")";
+
+  // A predicated launch issues only where its predicate holds, and its
+  // expect waits and consumes only there: both carry one, or neither does.
+  if (bool(launch.getPredicate()) != bool(getPredicate()))
+    return emitOpError("must carry a predicate exactly when its launch does");
 
   // Result types must match the launch's body-level yield operand types
   // one-for-one.

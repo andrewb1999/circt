@@ -792,11 +792,23 @@ def LoopScheduleLaunchOp : LoopScheduleOp<"launch",
 
     `loopschedule.launch` may appear only inside a `loopschedule.at` body.
     Multiple launches may share an `at`; they all start at the at's offset.
+
+    A pipeline-level launch may carry a PREDICATE (`loopschedule.launch if
+    %p`): the op is issued only on the iterations where `%p` holds (a load
+    under an `if`), and its `loopschedule.expect` carries the same
+    condition, delayed to the expect's stage, so the pipeline waits for,
+    and consumes, a response only where a request went out.
   }];
 
+  let arguments = (ins Optional<I1>:$predicate);
   let results = (outs HandleType:$handle);
 
   let regions = (region SizedRegion<1>:$body);
+
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins "Type":$handle, CArg<"Value", "{}">:$predicate)>
+  ];
 
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
@@ -830,13 +842,24 @@ def LoopScheduleExpectOp : LoopScheduleOp<"expect",
     launch's stage, where `latency(op)` is the nominal latency the
     scheduler assigned to the wrapped op. (Enforced structurally by the
     scheduler; not checked here.)
+
+    The expect of a predicated launch carries its predicate (`if %p`), the
+    launch's condition as it reaches the expect's stage: on an iteration
+    where it is false no request was issued, so the expect neither waits
+    nor consumes, and its results are undefined.
   }];
 
-  let arguments = (ins HandleType:$handle);
+  let arguments = (ins HandleType:$handle, Optional<I1>:$predicate);
   let results = (outs Variadic<AnyType>:$results);
 
+  let builders = [
+    OpBuilder<(ins "TypeRange":$results, "Value":$handle), [{
+      build($_builder, $_state, results, handle, Value());
+    }]>
+  ];
+
   let assemblyFormat = [{
-    $handle attr-dict (`:` type($results)^)?
+    $handle (`if` $predicate^)? attr-dict (`:` type($results)^)?
   }];
 
   let hasVerifier = 1;

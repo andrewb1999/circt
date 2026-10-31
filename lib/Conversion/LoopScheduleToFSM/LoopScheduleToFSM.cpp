@@ -7469,6 +7469,13 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     unsigned issueStageOffset;
     bool isLoad;
     Value portValue;
+    // The wrapped op, and for a predicated pair (a load under an `if`) the
+    // launch's condition, in its issue stage, and the expect's, the same
+    // carried to its stage (read from the `if`s inlining leaves, after it
+    // has rebuilt the stages). Null for one every iteration makes.
+    Operation *payload = nullptr;
+    Value issuePredicate = nullptr;
+    Value destPredicate = nullptr;
   };
   SmallVector<ExpectInfo> expectInfos;
   // Each dynamic load's expect stage. Inlining keeps the load (in its issue
@@ -7508,12 +7515,23 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       return;
     }
     expectInfos.push_back({(unsigned)dest.getOffset(),
-                           (unsigned)issue.getOffset(), isLoad, memVal});
+                           (unsigned)issue.getOffset(), isLoad, memVal,
+                           payload});
     if (isLoad)
       dynLoadExpectStage[payload] = dest.getOffset();
   });
 
-  inlineLaunchExpectPairs(pipOp);
+  DenseMap<Operation *, std::pair<LoopScheduleIfOp, LoopScheduleIfOp>>
+      predicatedPayloads;
+  inlineLaunchExpectPairs(pipOp, &predicatedPayloads);
+  for (ExpectInfo &ei : expectInfos) {
+    auto it = predicatedPayloads.find(ei.payload);
+    if (it == predicatedPayloads.end())
+      continue;
+    ei.issuePredicate = it->second.first.getCond();
+    if (it->second.second)
+      ei.destPredicate = it->second.second.getCond();
+  }
 
   auto *ctx = builder.getContext();
 
@@ -7758,9 +7776,12 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // several expects share one port we must additionally know WHICH expect
   // issued the k-th request; see the issue-window analysis below (a
   // rotation for a window narrower than II, an issue-order tag FIFO
-  // otherwise). One done per expect per iteration either way —
-  // if-predicated accesses on a shared port would break the count and are
-  // not supported.
+  // otherwise). A PREDICATED pair (a load under an `if`) issues only where
+  // its launch's condition holds, so a rotation, which assumes one request
+  // per expect per iteration, cannot attribute its port's dones: a group
+  // with one takes the tag FIFO, pushed on the predicated issue, and the
+  // expect consumes and stalls only where its condition, carried to its
+  // stage, holds.
   //
   // Posted (no_wait) accesses on ports with acceptance backpressure: each
   // entry is (un-stall-gated issue gate, port ready). The Phase 3B stall
@@ -7770,6 +7791,32 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // Per-expect combinational "may consume this cycle" levels, indexed
   // like expectInfos; null when the expect has no done to wait on.
   SmallVector<Value> expectValid(expectInfos.size());
+  // The predicated pairs' conditions as their issue and expect stages see
+  // them, indexed like expectInfos (null where unpredicated): values of
+  // those stages, so resolved once the stages are lowered.
+  SmallVector<Value> issuePred(expectInfos.size());
+  SmallVector<Value> destPred(expectInfos.size());
+  struct PendingPredicate {
+    Backedge hw;
+    Value value;
+    unsigned stage;
+    Value *slot; // its issuePred / destPred entry, which uses after resolve
+  };
+  SmallVector<PendingPredicate> pendingPredicates;
+  for (auto [eIdx, ei] : llvm::enumerate(expectInfos)) {
+    if (ei.issuePredicate) {
+      Backedge be = bb.get(hwBuilder.getI1Type());
+      issuePred[eIdx] = be;
+      pendingPredicates.push_back(
+          {be, ei.issuePredicate, ei.issueStageOffset, &issuePred[eIdx]});
+    }
+    if (ei.destPredicate) {
+      Backedge be = bb.get(hwBuilder.getI1Type());
+      destPred[eIdx] = be;
+      pendingPredicates.push_back(
+          {be, ei.destPredicate, ei.destStageOffset, &destPred[eIdx]});
+    }
+  }
   // Load-data splices to apply to the issue stage's per-stage port copy
   // once `perStagePorts` is initialized below.
   struct DataSplice {
@@ -7852,7 +7899,9 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     if (eIdxs.size() > 1) {
       unsigned issueWindow = expectInfos[eIdxs.back()].issueStageOffset -
                              expectInfos[eIdxs.front()].issueStageOffset;
-      if (issueWindow < II) {
+      bool predicated = llvm::any_of(
+          eIdxs, [&](unsigned e) { return bool(issuePred[e]); });
+      if (issueWindow < II && !predicated) {
         unsigned k = eIdxs.size();
         auto rrTy = IntegerType::get(ctx, llvm::Log2_64_Ceil(k));
         Value rrZero = hw::ConstantOp::create(hwBuilder, loc, rrTy, 0);
@@ -7922,6 +7971,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
         for (unsigned rank = k; rank-- > 0;) {
           Value issue =
               gatedStageCE[expectInfos[eIdxs[rank]].issueStageOffset];
+          if (Value pred = issuePred[eIdxs[rank]])
+            issue = comb::AndOp::create(hwBuilder, loc, issue, pred, false);
           tagPush = comb::OrOp::create(hwBuilder, loc, tagPush, issue, false);
           tagIn = comb::MuxOp::create(
               hwBuilder, loc, issue,
@@ -8018,6 +8069,9 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       Value notEmpty = comb::createOrFoldNot(hwBuilder, loc, isEmpty);
       Value consumeEff = comb::AndOp::create(
           hwBuilder, loc, stageCE[ei.destStageOffset], notStall, false);
+      if (Value pred = destPred[eIdx])
+        consumeEff = comb::AndOp::create(hwBuilder, loc, consumeEff, pred,
+                                         false);
       // A done arriving on the consume cycle of an empty FIFO is consumed
       // live (bypass): no push, zero stall overhead for on-time dones.
       Value bypass =
@@ -9068,6 +9122,17 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
   // combinational, so on-time dones pass with zero overhead). The terms
   // are built from registered signals only (stageCE, memory done, the
   // counter), so no combinational loop through `notStall`.
+  // A predicated expect's conditions, now that its stages are lowered: the
+  // value each stage reads (its delayed copy where it comes from an earlier
+  // stage).
+  for (PendingPredicate &pending : pendingPredicates) {
+    Value hw = delayResolver.resolveForStage(pending.value, pending.stage);
+    if (!hw)
+      hw = mapping.lookup(pending.value);
+    pending.hw.setValue(hw);
+    *pending.slot = hw;
+  }
+
   SmallVector<Value> stallBits;
   for (auto [eIdx, ei] : llvm::enumerate(expectInfos)) {
     if (!expectValid[eIdx])
@@ -9077,6 +9142,8 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
     Value stallI = comb::AndOp::create(hwBuilder, loc,
                                          stageCE[ei.destStageOffset],
                                          notValid);
+    if (Value pred = destPred[eIdx])
+      stallI = comb::AndOp::create(hwBuilder, loc, stallI, pred);
     stallBits.push_back(stallI);
   }
   // Posted-issue backpressure: hold the pipeline while a posted (no_wait)
