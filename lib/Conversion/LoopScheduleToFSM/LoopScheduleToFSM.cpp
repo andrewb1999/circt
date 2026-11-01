@@ -5307,6 +5307,13 @@ LogicalResult LoopScheduleToFSMPass::lowerInlineLoopLevel(
       dst.extraPorts.push_back(d);
     }
   }
+  // Control channels (a `done` level, nothing to drive) are not port
+  // arguments; a drain wait in this level's frames (a bare barrier between
+  // sibling loops) reads the caller's level, as the function's barrier
+  // entries do.
+  for (auto &[value, src] : callerMemPorts)
+    if (!localMemPorts.count(value) && src.done && !src.rdData && !src.wrDone)
+      localMemPorts[value].done = src.done;
 
   // Level-internal backedges (latches, dyn-access plumbing) resolve in
   // the function module's own region.
@@ -5740,6 +5747,11 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
       perFramePorts[i][memInfo.originalArg].wrIdle =
           localMemPorts[memInfo.originalArg].wrIdle;
     }
+    // The control channels the level carries (see lowerInlineLoopLevel).
+    for (auto &[value, mp] : localMemPorts)
+      if (!perFramePorts[i].count(value) && mp.done && !mp.rdData &&
+          !mp.wrDone)
+        perFramePorts[i][value].done = mp.done;
   }
 
   // Determine which frame produces the loop condition so we can resolve the

@@ -3155,7 +3155,18 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
     startTimes.push_back(group.first);
   llvm::sort(startTimes);
 
+  // A barrier store (amc.control) is a launch in a FUNCTION's frames, whose
+  // lowering waits on it as an entry of its own. In a LOOP's frames it is a
+  // bare dynamic store, issued once with the frame held until its completion
+  // level (the sequential dynamic-access path, as for a data-less
+  // burst_copy): there a drain wait sits between sibling loops (one before a
+  // pipelined loop that reads what a write stream left in flight, see
+  // amc-insert-control-waits), and launches there are child loops.
+  bool barriersLaunch = isa<func::FuncOp>(S.root);
   auto isLaunchLike = [&](Operation *op) {
+    if (auto store = dyn_cast<StoreInterface>(op);
+        store && store.isBarrier() && !barriersLaunch)
+      return false;
     return isLaunchLikeOp(op) ||
            (S.dynAccessesAsLaunches && isDynamicLatencyOp(*op));
   };
