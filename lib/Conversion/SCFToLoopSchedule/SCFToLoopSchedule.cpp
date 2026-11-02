@@ -759,11 +759,17 @@ static bool isLaunchLikeOp(Operation *op) {
 ///     already took any state they pinned; ASAP just makes the placement
 ///     a stated rule instead of a pivot-order accident.
 ///
-/// Every move is bounded by the op's own dependences on both sides, and
-/// `verify()` is the backstop: on any violation the saved solution is
-/// restored verbatim and the schedule is exactly what phase 1 produced.
+/// Every move is bounded by the op's own dependences on both sides and by
+/// the cycle time: an op moves into a cycle only if the chain it ends there
+/// (its in-cycle start, from the sources that land in that cycle, plus its
+/// delay) fits `cycleTime`, and a later cycle only if none of its consumers
+/// but the anchor is already in it. `verify()` is the backstop: on any
+/// violation the saved solution is restored verbatim and the schedule is
+/// exactly what phase 1 produced (the problem knows no cycle time, so it
+/// cannot catch a chain that runs past one).
 static void applySecondaryScheduleObjectives(
-    ChainingSharedOperatorsProblem &problem, Operation *anchor) {
+    ChainingSharedOperatorsProblem &problem, Operation *anchor,
+    float cycleTime) {
   // Save the solution for the revert path.
   DenseMap<Operation *, unsigned> savedStart;
   DenseMap<Operation *, float> savedInCycle;
@@ -833,6 +839,14 @@ static void applySecondaryScheduleObjectives(
     problem.setStartTimeInCycle(op, inCycleAt(op, cycle));
   };
 
+  // Does the chain `op` ends in `cycle` fit the cycle time? (Movable ops
+  // are combinational: their incoming and outgoing delays are equal.)
+  auto fitsAt = [&](Operation *op, unsigned cycle) {
+    auto opr = problem.getLinkedOperatorType(op);
+    float delay = opr ? problem.getOutgoingDelay(*opr).value_or(0.0f) : 0.0f;
+    return inCycleAt(op, cycle) + delay <= cycleTime + 1e-4f;
+  };
+
   // Auxiliary OUTGOING dependences (op as source) are not enumerable from
   // the op itself; build the reverse index once.
   DenseMap<Operation *, SmallVector<Operation *>> auxOut;
@@ -886,7 +900,7 @@ static void applySecondaryScheduleObjectives(
     bool allMove = true;
     for (Operation *op : occupants) {
       auto asap = movable(op) ? asapOf(op) : std::nullopt;
-      if (!asap || *asap >= maxBucket) {
+      if (!asap || *asap >= maxBucket || !fitsAt(op, *asap)) {
         allMove = false;
         break;
       }
@@ -947,7 +961,12 @@ static void applySecondaryScheduleObjectives(
     // combinationally valid in the consumer's read window without a
     // capture); clamp to the hard upper bound.
     unsigned target = std::min(upper, nearestReal > 0 ? nearestReal - 1 : 0u);
-    if (target > *curOpt) {
+    // Moving later into a cycle a consumer is already in would lengthen
+    // that consumer's chain there.
+    bool userInTarget = llvm::any_of(op->getUsers(), [&](Operation *user) {
+      return user != anchor && problem.getStartTime(user) == target;
+    });
+    if (target > *curOpt && !userInTarget && fitsAt(op, target)) {
       moveTo(op, target);
       changed = true;
     }
@@ -962,7 +981,7 @@ static void applySecondaryScheduleObjectives(
       continue;
     auto cur = problem.getStartTime(op);
     auto asap = asapOf(op);
-    if (!cur || !asap || *asap >= *cur)
+    if (!cur || !asap || *asap >= *cur || !fitsAt(op, *asap))
       continue;
     moveTo(op, *asap);
     changed = true;
@@ -2131,7 +2150,7 @@ LogicalResult SCFToLoopSchedulePass::solveChainingSharedOperatorsProblem(
   // lowering-aware secondary objectives (states, then registers, then
   // determinism) so the rest of the schedule is chosen by stated criteria
   // rather than by the final simplex basis.
-  applySecondaryScheduleObjectives(problem, anchor);
+  applySecondaryScheduleObjectives(problem, anchor, cycleTime);
 
   // Verify the solution.
   if (failed(problem.verify()))
