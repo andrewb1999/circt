@@ -19,8 +19,12 @@
 //    genuinely needs more instances than the cap.
 //
 //  * SHARED operators — ops whose operator is backed by an extern
-//    hw.instance (a physical unit, e.g. a pipelined multiplier) but
-//    declares no limit. These bind in "share mode": the pool is sized to
+//    hw.instance (a physical unit, e.g. a pipelined multiplier). One that
+//    declares a limit had the scheduler hold each region to it, and its
+//    delays price the mux sharing puts on its operands (resource-constrained
+//    sharing, AMC's operator allocation): it binds in share mode too, never
+//    to fewer instances than the schedule runs at once (two regions that
+//    each use the limit and overlap get more), with no slack check. These bind in "share mode": the pool is sized to
 //    the op count, so the greedy binder simply assigns the MINIMAL number
 //    of instances consistent with the schedule — ops whose occupancy
 //    windows can never overlap (disjoint concurrency groups, or disjoint
@@ -139,6 +143,8 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
     Operation *op;
     StringRef oprName;
     std::optional<unsigned> declaredLimit;
+    // The operator's delays already include its sharing mux.
+    bool muxPriced = false;
   };
   SmallVector<Candidate> candidates;
   llvm::StringMap<unsigned> oprOpCount;
@@ -164,6 +170,14 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
       if (!shareOperators ||
           !isExternInstanceOperator(opLibAnalysis, oprAttr))
         continue;
+    } else if (isExternInstanceOperator(opLibAnalysis, oprAttr)) {
+      // A physical unit with a declared limit: the schedule keeps each
+      // region within it and its delays price the mux. Share mode.
+      if (!shareOperators)
+        continue;
+      candidates.push_back({op, oprName, std::nullopt, /*muxPriced=*/true});
+      ++oprOpCount[oprName];
+      continue;
     }
     candidates.push_back({op, oprName, limit});
     ++oprOpCount[oprName];
@@ -253,7 +267,7 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
           ++users[{cand.oprName.str(), it->second}];
     std::map<InstanceKey, std::pair<double, Operation *>> tightest;
     for (auto &cand : candidates) {
-      if (cand.declaredLimit)
+      if (cand.declaredLimit || cand.muxPriced)
         continue;
       auto it = instanceOf.find(cand.op);
       auto slack =
