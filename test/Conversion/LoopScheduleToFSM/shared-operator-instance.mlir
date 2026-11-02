@@ -70,10 +70,20 @@ loopschedule.func_sequential @shared(%m: memref<8xi32>)
   }
 
 // One shared instance, now living in the single function module (loops no
-// longer get their own hw.module): the operand ports are muxes selected by
-// the users' frame gates, and only ONE multiplier is instantiated.
+// longer get their own hw.module): each operand port is the one-hot AND-OR
+// of the users' operands under their frame gates, the first user's standing
+// while no other gate is high, `(~g1 & a0) | (g1 & a1)`, with a simulation
+// assertion that the gates are one-hot, and only ONE multiplier is
+// instantiated.
 // CHECK: hw.module @shared
 // CHECK: hw.instance "mul_pipe_i32_hw_inst_0" @int_mul_pipe_i32_l4({{.*}}lhs: %[[LHS:[0-9]+]]: i32, rhs: %[[RHS:[0-9]+]]: i32)
-// CHECK-DAG: %[[LHS]] = comb.mux
-// CHECK-DAG: %[[RHS]] = comb.mux
+// CHECK-DAG: %[[A1:.+]] = comb.and %[[G1:.+]], %loop0_frame0_r1 : i32
+// CHECK-DAG: %[[G1]] = comb.replicate %[[S1:.+]] : (i1) -> i32
+// CHECK-DAG: %[[LATER:.+]] = comb.or %[[S1]] : i1
+// CHECK-DAG: %[[NOT1:.+]] = comb.xor %[[LATER]], %true{{.*}} : i1
+// CHECK-DAG: %[[G0:.+]] = comb.replicate %[[NOT1]] : (i1) -> i32
+// CHECK-DAG: %[[A0:.+]] = comb.and %[[G0]], %{{.+}} : i32
+// CHECK-DAG: %[[LHS]] = comb.or %[[A0]], %[[A1]] : i32
+// CHECK-DAG: %[[RHS]] = comb.or %{{.+}}, %{{.+}} : i32
+// CHECK-DAG: verif.clocked_assert {{.+}} label "shared_operator_one_user"
 // CHECK-NOT: hw.instance "mul_pipe_i32_hw_inst

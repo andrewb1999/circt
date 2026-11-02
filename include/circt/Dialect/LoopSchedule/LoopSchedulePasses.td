@@ -70,7 +70,14 @@ def LoopScheduleBinding : Pass<"loopschedule-binding", "mlir::ModuleOp"> {
            "(e.g. AMC port-group binding) should disable this.">,
     Option<"shareOperators", "share-operators", "bool", "true",
            "Bind extern-instance compute operators in share mode "
-           "(minimal instances, zero schedule impact).">
+           "(minimal instances, zero schedule impact).">,
+    ListOption<"shareMuxDelays", "share-mux-delays", "double",
+           "Chain delay (ns) of the one-hot mux a shared instance puts on "
+           "each user's operands, at 1, 2, 3, ... levels of AND-OR "
+           "(2-3 users, 4-18, 19-108, ...; past the last given, "
+           "extrapolated). Given, a share-mode op stays off a shared "
+           "instance whose mux its `loopschedule.chain_slack` (recorded by "
+           "the scheduler) does not take. Empty: no check.">
   ];
 }
 

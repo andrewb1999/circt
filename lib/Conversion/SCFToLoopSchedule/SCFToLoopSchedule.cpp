@@ -1129,6 +1129,9 @@ static LogicalResult checkSequentialCondition(scf::WhileOp loop, Value cond) {
 } // namespace
 
 static void warnPastCycleTime(ChainingModuloProblem &problem, float cycleTime);
+template <typename ProblemT, typename DistanceFn>
+static void stampChainSlack(ProblemT &problem, float cycleTime,
+                            DistanceFn distance);
 
 void SCFToLoopSchedulePass::runOnOperation() {
   // Now a ModuleOp pass: walk each top-level func.func and lower it. The
@@ -1478,6 +1481,10 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
           std::to_string(problem.getInitiationInterval().value()));
     }
     warnPastCycleTime(problem, cycleTime);
+    if (recordChainSlack)
+      stampChainSlack(problem, cycleTime, [&](const auto &dep) {
+        return problem.getDistance(dep).value_or(0);
+      });
 
     // Pre-cleanup (same as sequential path) before we replace funcOp.
     if (funcOp->hasAttrOfType<SymbolRefAttr>("loopschedule.dependencies")) {
@@ -1927,6 +1934,57 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
   return success();
 }
 
+/// Record on each operator-backed operation of a solved problem its chain
+/// slack (`loopschedule.chain_slack`, ns): the cycle time less the latest
+/// end of a combinational chain through it, as the schedule places it. A
+/// combinational operator's chain continues through the consumers that
+/// start in its cycle (def-use edges; an edge to a later iteration goes
+/// through a register); a pipelined operator's ends at its first register,
+/// its incoming delay into the cycle. Whatever is put on the operation's
+/// inputs (a shared operator's operand mux) delays that whole chain, so it
+/// fits within the slack. `distance` gives a dependence's iteration
+/// distance (0 outside a modulo problem).
+template <typename ProblemT, typename DistanceFn>
+static void stampChainSlack(ProblemT &problem, float cycleTime,
+                             DistanceFn distance) {
+  DenseMap<Operation *, SmallVector<Operation *, 2>> sameCycleUsers;
+  for (auto *op : problem.getOperations())
+    for (auto dep : problem.getDependences(op)) {
+      if (dep.isAuxiliary() || distance(dep) != 0)
+        continue;
+      Operation *src = dep.getSource();
+      auto srcStart = problem.getStartTime(src);
+      auto dstStart = problem.getStartTime(op);
+      if (srcStart && dstStart && *srcStart == *dstStart)
+        sameCycleUsers[src].push_back(op);
+    }
+  DenseMap<Operation *, float> chainEnd;
+  std::function<float(Operation *)> endOf = [&](Operation *op) -> float {
+    if (auto it = chainEnd.find(op); it != chainEnd.end())
+      return it->second;
+    auto opr = problem.getLinkedOperatorType(op);
+    auto start = problem.getStartTimeInCycle(op);
+    if (!opr || !start)
+      return chainEnd[op] = 0.0f;
+    bool combinational = *problem.getLatency(*opr) == 0;
+    float end = *start + (combinational ? *problem.getOutgoingDelay(*opr)
+                                        : *problem.getIncomingDelay(*opr));
+    chainEnd[op] = end;
+    if (combinational)
+      for (Operation *user : sameCycleUsers.lookup(op))
+        end = std::max(end, endOf(user));
+    return chainEnd[op] = end;
+  };
+  for (auto *op : problem.getOperations()) {
+    if (!op->hasAttr("loopschedule.operator") ||
+        !problem.getStartTimeInCycle(op))
+      continue;
+    op->setAttr("loopschedule.chain_slack",
+                FloatAttr::get(Float32Type::get(op->getContext()),
+                               cycleTime - endOf(op)));
+  }
+}
+
 /// Warn where a pipelined schedule misses the clock: at the operation that
 /// ends furthest past `cycleTime` into its time step. Its II takes
 /// precedence over the clock, so the scheduler keeps a recurrence's chain
@@ -2015,6 +2073,10 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
         std::to_string(problem.getInitiationInterval().value()));
   }
   warnPastCycleTime(problem, cycleTime);
+  if (recordChainSlack)
+    stampChainSlack(problem, cycleTime, [&](const auto &dep) {
+      return problem.getDistance(dep).value_or(0);
+    });
 
   // Optionally debug problem outputs.
   LLVM_DEBUG({
@@ -2074,6 +2136,8 @@ LogicalResult SCFToLoopSchedulePass::solveChainingSharedOperatorsProblem(
   // Verify the solution.
   if (failed(problem.verify()))
     return failure();
+  if (recordChainSlack)
+    stampChainSlack(problem, cycleTime, [](const auto &) { return 0u; });
 
   // Optionally debug problem outputs.
   LLVM_DEBUG({

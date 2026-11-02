@@ -999,6 +999,19 @@ struct SharedOperatorInstance {
   int ceInputIdx = -1;
   /// Current CE drive (ANDed as users join).
   Value ce;
+  /// Per operand index (as `operandPortForIdx`), the `comb.or` driving the
+  /// port once a second user joins (null before): its first input is the
+  /// first user's term, `~laterSelect & operand_0`, the others the later
+  /// users' `select & operand`. State lives in ops this lowering creates and
+  /// is read back through their operands, never as stored values: the
+  /// lowering may still replace a gate or an operand (a backedge), which
+  /// updates uses only.
+  SmallVector<Operation *> operandOr;
+  /// `comb.or`s of the later users' selects (null before a second user)
+  /// and of all the users' (for the exclusivity check).
+  Operation *laterSelect = nullptr;
+  Operation *anySelect = nullptr;
+  Value clk, rst;
 };
 
 /// Main pass converting LoopSchedule ops to FSM + HW.
@@ -2236,6 +2249,20 @@ emitHwInstanceFromOperator(
   // ops never issue in the same cycle, so a later user joins the first
   // user's instance — operands muxed in under this user's activation gate,
   // CE narrowed to the AND of the users' CEs (see SharedOperatorInstance).
+  // The users' selects are therefore one-hot (at most one is high), and
+  // each operand is their AND-OR, `|(select_i & operand_i)`: a balanced
+  // tree, two LUT levels up to 18 users, where a chain of 2:1 muxes would
+  // keep a priority among them that is never needed, a level per two
+  // users. The first user's operands stay on the instance while no other
+  // user's select is high, `operand_0 & ~|(select_i, i > 0)`, as they did
+  // at the bottom of that chain: a value computed from the instance's
+  // result and read in a later cycle than the op's (an iter-arg update a
+  // frame samples at its end, which nothing captures) reads it from the
+  // first user's operands (nussinov's max). The operator need not be
+  // pipelined, its operands registered: a combinational one takes the mux
+  // on the path the schedule chained it on, which operator binding sizes
+  // the sharing to (its slack). A simulation assertion checks the selects
+  // are one-hot.
   auto bindingAttr =
       origOp->getAttrOfType<IntegerAttr>("loopschedule.binding");
   // Debug escape hatch: LOOPSCHEDULE_NO_SHARED_OPERATORS=1 gives every
@@ -2249,6 +2276,23 @@ emitHwInstanceFromOperator(
     if (it != sharedOps->end()) {
       SharedOperatorInstance &shared = it->second;
       Value select = selectGate ? selectGate : shareGate;
+      Location loc = origOp->getLoc();
+      auto term = [&](Value sel, Value v) -> Value {
+        int64_t width = hw::getBitWidth(v.getType());
+        Value mask = width == 1 ? sel
+                                : (Value)comb::ReplicateOp::create(
+                                      builder, loc, sel, (int32_t)width);
+        return comb::AndOp::create(builder, loc, mask, v, false);
+      };
+      shared.operandOr.resize(shared.operandPortForIdx.size(), nullptr);
+      SmallVector<Value> laterSelects{select};
+      if (shared.laterSelect)
+        laterSelects.append(shared.laterSelect->operand_begin(),
+                            shared.laterSelect->operand_end());
+      Operation *laterSelect =
+          comb::OrOp::create(builder, loc, laterSelects, false);
+      Value noLater =
+          comb::createOrFoldNot(builder, loc, laterSelect->getResult(0));
       for (auto [j, idx] : llvm::enumerate(shared.operandPortForIdx)) {
         if (idx < 0)
           continue;
@@ -2257,9 +2301,53 @@ emitHwInstanceFromOperator(
                  << opName << "' shared instance expects operand " << j;
         Value mine = mapping.lookup(origOp->getOperand(j));
         Value cur = shared.instOp->getOperand(idx);
-        Value muxed =
-            comb::MuxOp::create(builder, origOp->getLoc(), select, mine, cur);
-        shared.instOp->setOperand(idx, muxed);
+        if (!isa<IntegerType>(mine.getType()) ||
+            mine.getType() != cur.getType()) {
+          shared.instOp->setOperand(
+              idx, comb::MuxOp::create(builder, loc, select, mine, cur));
+          continue;
+        }
+        Operation *oldOr = shared.operandOr[j];
+        // The first user's operand, read back from its term's AND.
+        Value first =
+            oldOr ? oldOr->getOperand(0).getDefiningOp()->getOperand(1) : cur;
+        SmallVector<Value> terms{term(noLater, first)};
+        if (oldOr)
+          terms.append(std::next(oldOr->operand_begin()),
+                       oldOr->operand_end());
+        terms.push_back(term(select, mine));
+        auto newOr = comb::OrOp::create(builder, loc, terms, false);
+        shared.instOp->setOperand(idx, newOr);
+        shared.operandOr[j] = newOr;
+        if (oldOr && oldOr->use_empty()) {
+          Operation *oldFirst = oldOr->getOperand(0).getDefiningOp();
+          oldOr->erase();
+          if (oldFirst && oldFirst->use_empty())
+            oldFirst->erase();
+        }
+      }
+      if (shared.laterSelect && shared.laterSelect->use_empty())
+        shared.laterSelect->erase();
+      shared.laterSelect = laterSelect;
+      // Check in simulation that no two users issue in one cycle (off in
+      // reset), which the AND-OR, like any mux of them, relies on.
+      {
+        Value both = comb::AndOp::create(
+            builder, loc, select, shared.anySelect->getResult(0), false);
+        Value hwClk = isa<seq::ClockType>(shared.clk.getType())
+                          ? (Value)seq::FromClockOp::create(builder, loc,
+                                                            shared.clk)
+                          : shared.clk;
+        verif::ClockedAssertOp::create(
+            builder, loc, comb::createOrFoldNot(builder, loc, both),
+            verif::ClockEdge::Pos, hwClk,
+            comb::createOrFoldNot(builder, loc, shared.rst),
+            builder.getStringAttr("shared_operator_one_user"));
+        SmallVector<Value> anySelects(shared.anySelect->operand_begin(),
+                                      shared.anySelect->operand_end());
+        anySelects.push_back(select);
+        shared.anySelect =
+            comb::OrOp::create(builder, loc, anySelects, false);
       }
       for (auto [attrName, idx] : shared.attrPorts) {
         Value cur = shared.instOp->getOperand(idx);
@@ -2369,6 +2457,11 @@ emitHwInstanceFromOperator(
 
   if (shareable) {
     sharedEntry.instOp = instOp;
+    sharedEntry.anySelect = comb::OrOp::create(
+        builder, origOp->getLoc(),
+        ValueRange{selectGate ? selectGate : shareGate}, false);
+    sharedEntry.clk = clk;
+    sharedEntry.rst = rst;
     (*sharedOps)[shareKey] = sharedEntry;
   }
 

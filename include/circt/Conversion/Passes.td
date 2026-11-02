@@ -41,7 +41,15 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
     Option<"cycleTimeNs", "cycle-time-ns", "float", "1.0",
             "Combinational delay budget per cycle (ns) for chaining-aware "
             "scheduling; typically the target clock period minus clock "
-            "uncertainty. Operator delays are expressed in the same unit.">
+            "uncertainty. Operator delays are expressed in the same unit.">,
+    Option<"recordChainSlack", "record-chain-slack", "bool", "false",
+            "Record on each operator-backed op `loopschedule.chain_slack`: "
+            "the cycle time less the latest end of a combinational chain "
+            "through the op (to its first register for a pipelined "
+            "operator), as the schedule places it, in ns. Operator binding "
+            "shares an operator only among users whose slack takes the "
+            "mux the sharing puts on their inputs (and removes the "
+            "attribute).">
   ];
 }
 

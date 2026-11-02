@@ -33,8 +33,8 @@ hw.module.extern @int_mul_pipe_i32_l4(in %clk : i1 {oplib.clock}, in %reset : i1
 // The frame's product, held from cycle 4, read from the hold in cycle 5.
 // CHECK:       %[[HOLD:frame[0-9]+_hold_[0-9]+]] = seq.compreg.ce sym @{{[a-z0-9_]+}} %mul_pipe_i32_hw_inst_0.out, %clk, %{{[a-z0-9_]+}}
 // CHECK:       arith.addi %[[HOLD]], %{{.*}} : i32
-// CHECK-DAG:   %[[LHS]] = comb.mux
-// CHECK-DAG:   %[[RHS]] = comb.mux
+// CHECK-DAG:   %[[LHS]] = comb.or
+// CHECK-DAG:   %[[RHS]] = comb.or
 loopschedule.func_sequential @frame_shared(%x: i32, %n: i32) -> i32
       attributes {oplib.library = @lib, top} {
   %c0 = arith.constant 0 : i32

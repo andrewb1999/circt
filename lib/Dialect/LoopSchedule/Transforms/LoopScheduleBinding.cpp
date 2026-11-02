@@ -37,7 +37,16 @@
 // Occupancy latency is 1 for compute operators: every shared extern
 // operator is fully pipelined (accepts new operands every enabled cycle),
 // so only ISSUE-cycle collisions matter — in-flight computations coexist
-// in the unit's internal pipe. An operator that has to see the cycles its
+// in the unit's internal pipe.
+//
+// Sharing puts a mux on each user's operands (a one-hot AND-OR of the
+// users' operands, LoopScheduleToFSM), on the chain the scheduler placed
+// the op on: the whole path for a combinational operator, the input path
+// for a pipelined one. With `share-mux-delays`, an op shares an instance
+// only if its `loopschedule.chain_slack` takes the mux that instance's
+// user count needs; the users that do not are given instances of their own
+// (ids past the shared ones) and the rest are bound again, until every
+// shared user's slack holds. An operator that has to see the cycles its
 // op issues (a `valid` hw_match argument: one with state, or one that takes
 // an operand only every so many cycles) is its op's alone and never bound.
 //
@@ -54,6 +63,8 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+
+#include <map>
 
 namespace circt {
 namespace loopschedule {
@@ -121,7 +132,6 @@ bool takesIssueCycles(analysis::OperatorLibraryAnalysis &ola,
 LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
   analysis::LoopScheduleStartTimeAnalysis stAnalysis(funcOp);
   analysis::OperatorLibraryAnalysis opLibAnalysis(funcOp);
-  binding::BindingProblem prob(funcOp);
 
   // Phase 1 — collect candidates. Share-mode resources size their pool to
   // the op count, so counts must be known before limits are set.
@@ -162,46 +172,128 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
   if (candidates.empty())
     return success();
 
-  // Phase 2 — populate the problem.
-  DenseMap<StringRef, binding::BindingProblem::ResourceType> oprRsrc;
-  auto getOprRsrc = [&](StringRef oprName, unsigned limit)
-      -> binding::BindingProblem::ResourceType {
-    auto it = oprRsrc.find(oprName);
-    if (it != oprRsrc.end())
-      return it->second;
-    auto rsrc = prob.getOrInsertResourceType(oprName);
-    prob.setInstanceLimit(rsrc, limit);
-    oprRsrc[oprName] = rsrc;
-    return rsrc;
+  // The delay of the mux an instance shared by `users` ops puts on their
+  // operands: AND-OR levels of 6-input LUTs, 3 users to a LUT, then ORs
+  // of 6.
+  auto muxDelay = [&](unsigned users) -> double {
+    unsigned levels = 1;
+    for (unsigned luts = (users + 2) / 3; luts > 1; luts = (luts + 5) / 6)
+      ++levels;
+    size_t given = shareMuxDelays.size();
+    if (levels <= given)
+      return shareMuxDelays[levels - 1];
+    double step = given > 1 ? shareMuxDelays[given - 1] -
+                                  shareMuxDelays[given - 2]
+                            : shareMuxDelays[given - 1];
+    return shareMuxDelays[given - 1] + step * (levels - given);
   };
 
-  for (auto &cand : candidates) {
-    Operation *op = cand.op;
-    unsigned limit =
-        cand.declaredLimit ? *cand.declaredLimit : oprOpCount[cand.oprName];
-    prob.insertOperation(op);
-    prob.setStartTime(op, *stAnalysis.getStartTime(op));
-    // Fully-pipelined units: only the issue cycle occupies the instance
-    // (see the file header). Non-pipelined multi-cycle operators would
-    // need their real occupancy here.
-    prob.setLatency(op, 1);
-    if (auto period = stAnalysis.getPeriod(op); period && *period > 0)
-      prob.setPeriod(op, *period);
-    if (auto count = stAnalysis.getCount(op); count && *count > 1)
-      prob.setCount(op, *count);
-    if (auto *group = stAnalysis.getConcurrencyGroup(op))
-      prob.setConcurrencyGroup(op, group);
-    prob.setLinkedResourceType(op, getOprRsrc(cand.oprName, limit));
+  // Share-mode ops whose chain slack does not take their instance's mux:
+  // each keeps an instance of its own.
+  DenseSet<Operation *> alone;
+  DenseMap<Operation *, int64_t> instanceOf;
+  while (true) {
+    // Phase 2 — populate the problem.
+    binding::BindingProblem prob(funcOp);
+    llvm::StringMap<unsigned> shareCount;
+    for (auto &cand : candidates)
+      if (!alone.contains(cand.op))
+        ++shareCount[cand.oprName];
+    DenseMap<StringRef, binding::BindingProblem::ResourceType> oprRsrc;
+    auto getOprRsrc = [&](StringRef oprName, unsigned limit)
+        -> binding::BindingProblem::ResourceType {
+      auto it = oprRsrc.find(oprName);
+      if (it != oprRsrc.end())
+        return it->second;
+      auto rsrc = prob.getOrInsertResourceType(oprName);
+      prob.setInstanceLimit(rsrc, limit);
+      oprRsrc[oprName] = rsrc;
+      return rsrc;
+    };
+
+    for (auto &cand : candidates) {
+      Operation *op = cand.op;
+      if (alone.contains(op))
+        continue;
+      unsigned limit =
+          cand.declaredLimit ? *cand.declaredLimit : shareCount[cand.oprName];
+      prob.insertOperation(op);
+      prob.setStartTime(op, *stAnalysis.getStartTime(op));
+      // Fully-pipelined units: only the issue cycle occupies the instance
+      // (see the file header). Non-pipelined multi-cycle operators would
+      // need their real occupancy here.
+      prob.setLatency(op, 1);
+      if (auto period = stAnalysis.getPeriod(op); period && *period > 0)
+        prob.setPeriod(op, *period);
+      if (auto count = stAnalysis.getCount(op); count && *count > 1)
+        prob.setCount(op, *count);
+      if (auto *group = stAnalysis.getConcurrencyGroup(op))
+        prob.setConcurrencyGroup(op, group);
+      prob.setLinkedResourceType(op, getOprRsrc(cand.oprName, limit));
+    }
+
+    if (failed(binding::bindGreedy(prob)))
+      return failure();
+
+    instanceOf.clear();
+    for (Operation *op : prob.getOperations())
+      if (auto inst = prob.getInstance(op))
+        instanceOf[op] = *inst;
+    if (shareMuxDelays.empty())
+      break;
+
+    // The users of each shared instance; of those whose slack does not
+    // take its mux, the one with the least leaves it, one an instance a
+    // round (a smaller mux may then fit the rest).
+    using InstanceKey = std::pair<std::string, int64_t>;
+    std::map<InstanceKey, unsigned> users;
+    for (auto &cand : candidates)
+      if (!cand.declaredLimit)
+        if (auto it = instanceOf.find(cand.op); it != instanceOf.end())
+          ++users[{cand.oprName.str(), it->second}];
+    std::map<InstanceKey, std::pair<double, Operation *>> tightest;
+    for (auto &cand : candidates) {
+      if (cand.declaredLimit)
+        continue;
+      auto it = instanceOf.find(cand.op);
+      auto slack =
+          cand.op->getAttrOfType<FloatAttr>("loopschedule.chain_slack");
+      if (it == instanceOf.end() || !slack)
+        continue;
+      InstanceKey key{cand.oprName.str(), it->second};
+      unsigned n = users[key];
+      double s = slack.getValueAsDouble();
+      if (n < 2 || s >= muxDelay(n))
+        continue;
+      auto [t, inserted] = tightest.try_emplace(key, s, cand.op);
+      if (!inserted && s < t->second.first)
+        t->second = {s, cand.op};
+    }
+    if (tightest.empty())
+      break;
+    for (auto &[key, worst] : tightest)
+      alone.insert(worst.second);
   }
 
-  if (failed(binding::bindGreedy(prob)))
-    return failure();
+  // An op that stays off a shared instance gets an instance id of its own,
+  // past the operator's shared ones: every share-mode op is bound, alone or
+  // not, which the FSM lowering keys its instances and its result captures
+  // on (a bound combinational instance's result is captured in its cycle,
+  // not read live by the next one's ops, as the schedule has it).
+  llvm::StringMap<int64_t> nextInstance;
+  for (auto &cand : candidates)
+    if (auto it = instanceOf.find(cand.op); it != instanceOf.end()) {
+      int64_t &next = nextInstance[cand.oprName];
+      next = std::max(next, it->second + 1);
+    }
+  for (auto &cand : candidates)
+    if (alone.contains(cand.op))
+      instanceOf[cand.op] = nextInstance[cand.oprName]++;
 
   auto *ctx = funcOp->getContext();
   auto i64 = IntegerType::get(ctx, 64);
-  for (Operation *op : prob.getOperations())
-    if (auto inst = prob.getInstance(op))
-      op->setAttr("loopschedule.binding", IntegerAttr::get(i64, *inst));
+  for (auto [op, inst] : instanceOf)
+    op->setAttr("loopschedule.binding", IntegerAttr::get(i64, inst));
   return success();
 }
 
@@ -219,6 +311,9 @@ void LoopScheduleBindingPass::runOnOperation() {
       signalPassFailure();
       return;
     }
+  // The scheduler's chain slack is for this pass alone.
+  moduleOp.walk(
+      [](Operation *op) { op->removeAttr("loopschedule.chain_slack"); });
 }
 
 std::unique_ptr<Pass>

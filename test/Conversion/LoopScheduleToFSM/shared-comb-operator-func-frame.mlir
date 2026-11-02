@@ -28,9 +28,12 @@ hw.module.extern @int_mul_i32_l0(in %clk : i1 {oplib.clock}, in %reset : i1 {opl
 // CHECK-LABEL: hw.module @frame_shared_comb
 // CHECK:       hw.instance "mul_i32_hw_inst_0" @int_mul_i32_l0({{.*}}lhs: %[[LHS:[0-9]+]]: i32, rhs: %[[RHS:[0-9]+]]: i32)
 // CHECK:       %[[HOLD:frame[0-9]+_hold_[0-9]+]] = seq.compreg.ce sym @{{[a-z0-9_]+}} %mul_i32_hw_inst_0.out, %clk
-// CHECK-NOT:   comb.mux {{.*}}%mul_i32_hw_inst_0.out
-// The pipeline's multiply takes the product from the hold.
-// CHECK:       %[[LHS]] = comb.mux %{{.+}}, %[[HOLD]], %{{.+}} : i32
+// CHECK-NOT:   comb.{{.*}}%mul_i32_hw_inst_0.out
+// The pipeline's multiply takes the product from the hold, its term of the
+// operands' one-hot AND-OR.
+// CHECK:       %[[MASK:.+]] = comb.replicate %loop0_ce_stage_1 : (i1) -> i32
+// CHECK:       %[[MINE:.+]] = comb.and %[[MASK]], %[[HOLD]] : i32
+// CHECK:       %[[LHS]] = comb.or %{{.+}}, %[[MINE]] : i32
 loopschedule.func_sequential @frame_shared_comb(%x: i32, %n: i32) -> i32
       attributes {oplib.library = @lib, top} {
   %c0 = arith.constant 0 : i32
