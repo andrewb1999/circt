@@ -64,6 +64,7 @@
 #include "circt/Dialect/LoopSchedule/LoopSchedulePasses.h"
 #include "circt/Dialect/OpLib/OpLibOps.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -130,6 +131,35 @@ bool takesIssueCycles(analysis::OperatorLibraryAnalysis &ola,
   return hwMatch && llvm::any_of(hwMatch.getArgRoles(), [](Attribute role) {
            return cast<StringAttr>(role).getValue() == "valid";
          });
+}
+
+/// Does a result of `op`, inside a pipeline, update an iter-arg (through
+/// bitcasts and the yields of `at`s and `if`s)? The next iteration reads
+/// it then, after the op's ready stage: a multi-cycle instance's output
+/// holds it there only while its operands do (a stage register's), not
+/// when the instance has other users, whose operands it takes in between.
+bool carriedInPipeline(Operation *op) {
+  if (!op->getParentOfType<LoopSchedulePipelineOp>())
+    return false;
+  SmallVector<Value> worklist(op->result_begin(), op->result_end());
+  DenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    for (OpOperand &use : v.getUses()) {
+      Operation *user = use.getOwner();
+      if (isa<LoopScheduleIterArgUpdateOp>(user))
+        return true;
+      if (isa<arith::BitcastOp>(user))
+        worklist.append(user->result_begin(), user->result_end());
+      else if (isa<LoopScheduleYieldOp>(user) &&
+               isa<LoopScheduleAtOp, LoopScheduleIfOp>(user->getParentOp()))
+        worklist.push_back(
+            user->getParentOp()->getResult(use.getOperandNumber()));
+    }
+  }
+  return false;
 }
 } // namespace
 
@@ -202,9 +232,15 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
     return shareMuxDelays[given - 1] + step * (levels - given);
   };
 
-  // Share-mode ops whose chain slack does not take their instance's mux:
-  // each keeps an instance of its own.
+  // Share-mode ops whose chain slack does not take their instance's mux,
+  // and multi-cycle ones whose result a pipeline carries to its next
+  // iteration (carriedInPipeline): each keeps an instance of its own.
   DenseSet<Operation *> alone;
+  for (auto &cand : candidates)
+    if (!cand.declaredLimit &&
+        opLibAnalysis.getOperatorLatency(cand.oprName) > 0 &&
+        carriedInPipeline(cand.op))
+      alone.insert(cand.op);
   DenseMap<Operation *, int64_t> instanceOf;
   while (true) {
     // Phase 2 — populate the problem.
