@@ -2638,6 +2638,15 @@ LogicalResult LoopScheduleToFSMPass::emitComputeOp(
                                     shareGate, &sharedOperators, selectGate);
 }
 
+/// The value result `idx` of `ifOp` takes: the one its body yields (null if
+/// it has none).
+static Value ifYielded(LoopScheduleIfOp ifOp, unsigned idx) {
+  auto yield =
+      dyn_cast<LoopScheduleYieldOp>(ifOp.getBody().front().getTerminator());
+  return yield && idx < yield.getNumOperands() ? yield.getOperand(idx)
+                                               : Value();
+}
+
 /// The op `v` comes from, looking through the `arith.bitcast`s and
 /// `loopschedule.if` wrappers that add no cycles (as computeValueCycleLatency
 /// does).
@@ -2714,6 +2723,11 @@ LogicalResult LoopScheduleToFSMPass::lowerFrameBody(
       if (def->hasAttr("loopschedule.binding") ||
           computeOpCycleLatency(def, operatorLibrary) > 0)
         return true;
+      // An `if`'s result is what its body yields.
+      if (auto ifOp = dyn_cast<LoopScheduleIfOp>(def))
+        if (Value yielded =
+                ifYielded(ifOp, cast<OpResult>(x).getResultNumber()))
+          worklist.push_back(yielded);
       worklist.append(def->operand_begin(), def->operand_end());
     }
     return false;
@@ -4699,9 +4713,61 @@ atResultInstanceLatency(Value atResult,
       latency = std::max(latency.value_or(0), opLatency);
       continue;
     }
+    // An `if`'s result is what its body yields.
+    if (auto ifOp = dyn_cast<LoopScheduleIfOp>(def))
+      if (Value yielded = ifYielded(ifOp, cast<OpResult>(v).getResultNumber()))
+        stack.push_back(yielded);
     stack.append(def->operand_begin(), def->operand_end());
   }
   return latency;
+}
+
+/// Whether at result `atResult`, yielded in its at's cycle O, is computed
+/// from an earlier at's operator result read in the cycle it becomes ready
+/// (issue + latency = O): read there from the instance's output, which
+/// holds it only in that cycle (a shared instance takes the next user's
+/// operands, a pipelined one moves on). The value is the op's only in cycle
+/// O, and a reader in a later one takes a capture made then. nussinov's
+/// max, `max(x, a + b)` on a 1-cycle add, was read a cycle late from the
+/// add's output, which held it only because the add was its shared
+/// instance's first user, whose operands stand while no other's issues.
+static bool
+readsInstanceResultAtReady(Value atResult,
+                           analysis::OperatorLibraryAnalysis *operatorLibrary) {
+  auto at = cast<loopschedule::LoopScheduleAtOp>(atResult.getDefiningOp());
+  unsigned offset = at.getOffset();
+  SmallVector<Value> stack{
+      at.getYieldOp().getOperand(cast<OpResult>(atResult).getResultNumber())};
+  DenseSet<Value> seen;
+  while (!stack.empty()) {
+    Value v = stack.pop_back_val();
+    Operation *def = v.getDefiningOp();
+    if (!seen.insert(v).second || !def)
+      continue;
+    if (auto src = dyn_cast<loopschedule::LoopScheduleAtOp>(def)) {
+      if (src != at && src->getBlock() == at->getBlock())
+        if (std::optional<unsigned> latency =
+                atResultInstanceLatency(v, operatorLibrary))
+          if ((unsigned)src.getOffset() + *latency == offset)
+            return true;
+      continue;
+    }
+    if (!at->isAncestor(def) ||
+        isa<LoadInterface, StoreInterface, LoopScheduleLoadOp,
+            LoopScheduleStoreOp>(def))
+      continue;
+    // An operator instance in this at: its own latency governs the value
+    // (atResultInstanceLatency).
+    if (def->hasAttr("loopschedule.operator") &&
+        (computeOpCycleLatency(def, operatorLibrary) > 0 ||
+         def->hasAttr("loopschedule.binding")))
+      continue;
+    if (auto ifOp = dyn_cast<LoopScheduleIfOp>(def))
+      if (Value yielded = ifYielded(ifOp, cast<OpResult>(v).getResultNumber()))
+        stack.push_back(yielded);
+    stack.append(def->operand_begin(), def->operand_end());
+  }
+  return false;
 }
 
 /// Residual in-at latency of at result `resIdx`: how many cycles past the
@@ -4771,6 +4837,24 @@ atResultResidualLatency(loopschedule::LoopScheduleAtOp atOp, unsigned resIdx,
       stack.push_back(operand);
   }
   return sawLiveLoadLeaf ? 0 : 1;
+}
+
+/// The cycles past at result `atResult`'s offset its capture latches in:
+/// an operator's result's latency (atResultInstanceLatency); 0 for a value
+/// computed from an earlier operator result in the cycle that is ready
+/// (readsInstanceResultAtReady), the op's only then; else
+/// atResultResidualLatency.
+static unsigned
+atResultCaptureResidual(Value atResult,
+                        analysis::OperatorLibraryAnalysis *operatorLibrary) {
+  if (std::optional<unsigned> latency =
+          atResultInstanceLatency(atResult, operatorLibrary))
+    return *latency;
+  if (readsInstanceResultAtReady(atResult, operatorLibrary))
+    return 0;
+  return atResultResidualLatency(
+      cast<loopschedule::LoopScheduleAtOp>(atResult.getDefiningOp()),
+      cast<OpResult>(atResult).getResultNumber(), operatorLibrary);
 }
 
 /// True if `v` is a pure zero-latency combinational function of values
@@ -4896,10 +4980,7 @@ minLegalLaunchStart(loopschedule::LoopSchedulePipelineOp pipOp,
     // earlier — see atResultResidualLatency).
     unsigned residual = 1;
     if (def == defAt.getOperation())
-      residual = atResultInstanceLatency(init, operatorLibrary)
-                     .value_or(atResultResidualLatency(
-                         defAt, cast<OpResult>(init).getResultNumber(),
-                         operatorLibrary));
+      residual = atResultCaptureResidual(init, operatorLibrary);
     unsigned ready = (unsigned)defAt.getOffset() + residual + 1;
     minStart = std::max(minStart, ready > firstUse ? ready - firstUse : 0u);
   }
@@ -5195,10 +5276,7 @@ LoopScheduleToFSMPass::analyzeLoopNode(const LoopNode &node,
         // it.
         unsigned residual = 1;
         if (def == defAt.getOperation())
-          residual = atResultInstanceLatency(operand, operatorLibrary)
-                         .value_or(atResultResidualLatency(
-                             defAt, cast<OpResult>(operand).getResultNumber(),
-                             operatorLibrary));
+          residual = atResultCaptureResidual(operand, operatorLibrary);
         unsigned readable = (unsigned)defAt.getOffset() + residual;
         minStart = std::max(minStart, readable > stage ? readable - stage : 0);
         minStartPreArm = std::max(
@@ -5949,10 +6027,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
     auto resultNeedsCapture = [&](Value atResult, unsigned myOffset) {
       if (readAfterFrame(atResult))
         return true;
-      // The last cycle a consumer may read the value combinationally.
+      // The last cycle a consumer may read the value combinationally: an
+      // operator's result in the cycle it is ready, a value computed from
+      // one read as it became ready only in its own.
       unsigned lastLive = myOffset + 1;
       if (std::optional<unsigned> latency = instanceLatency(atResult))
         lastLive = myOffset + *latency;
+      else if (readsInstanceResultAtReady(atResult, operatorLibrary))
+        lastLive = myOffset;
       for (auto *user : atResult.getUsers()) {
         Operation *anc = frameBody.findAncestorOpInBlock(*user);
         if (!anc)
@@ -6190,11 +6272,7 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
           // operator's latency for its result. The same residual feeds
           // minLegalLaunchStart, so a launch never samples a capture before
           // its enable has fired.
-          std::optional<unsigned> latency = instanceLatency(res);
-          unsigned residual =
-              latency ? *latency
-                      : atResultResidualLatency(atOp, res.getResultNumber(),
-                                                operatorLibrary);
+          unsigned residual = atResultCaptureResidual(res, operatorLibrary);
           // Past the frame's last cycle, a frame result is latched in the
           // cycle after it (WAIT_i's first, or the next frame's when the
           // child is skipped), when the port still shows the frame's read.
