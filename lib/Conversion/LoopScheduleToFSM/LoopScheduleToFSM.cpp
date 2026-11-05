@@ -992,9 +992,10 @@ struct SharedOperatorInstance {
   /// Instance input index for the extern port carrying `oplib.operand j`
   /// (index j into this vector), -1 when the operator has no such port.
   SmallVector<int> operandPortForIdx;
-  /// Instance input index of each `oplib.attr` port, with the name of the
-  /// attribute whose value drives it; muxed between users like operands.
-  SmallVector<std::pair<StringAttr, int>> attrPorts;
+  /// Instance input index of each `oplib.attr` or `oplib.opcode` port,
+  /// with what drives it (the attribute's name, or the opcode of each op
+  /// name; attrPortConstant); muxed between users like operands.
+  SmallVector<std::pair<Attribute, int>> attrPorts;
   /// Instance input index of the `oplib.enable` port, -1 if none.
   int ceInputIdx = -1;
   /// Current CE drive (ANDed as users join).
@@ -2166,19 +2167,29 @@ emitCombOpFromOperator(Operation *origOp, OpBuilder &builder,
   return success();
 }
 
-/// The constant an `oplib.attr = "<name>"` extern port is driven with for
-/// `origOp`: the integer value of `origOp`'s attribute `<name>` (an integer
-/// or integer-backed enum attribute, e.g. a cmpf predicate), at the port's
-/// width.
+/// The constant an extern port is driven with for `origOp`, at the port's
+/// width. An `oplib.attr = "<name>"` port: the integer value of `origOp`'s
+/// attribute `<name>` (an integer or integer-backed enum attribute, e.g. a
+/// cmpf predicate). An `oplib.opcode = {<op name> = <n>, ...}` port: the
+/// opcode of `origOp`'s operation, e.g. a core's add or subtract.
 static FailureOr<Value> attrPortConstant(Operation *origOp, OpBuilder &builder,
-                                         StringAttr attrName, Type portType,
+                                         Attribute drive, Type portType,
                                          StringRef opName) {
-  auto value = dyn_cast_or_null<IntegerAttr>(origOp->getAttr(attrName));
-  if (!value)
-    return origOp->emitOpError("operator '")
-           << opName << "' drives a port from attribute '"
-           << attrName.getValue()
-           << "', which the op does not carry as an integer";
+  IntegerAttr value;
+  if (auto attrName = dyn_cast<StringAttr>(drive)) {
+    value = dyn_cast_or_null<IntegerAttr>(origOp->getAttr(attrName));
+    if (!value)
+      return origOp->emitOpError("operator '")
+             << opName << "' drives a port from attribute '"
+             << attrName.getValue()
+             << "', which the op does not carry as an integer";
+  } else {
+    auto opcodes = cast<DictionaryAttr>(drive);
+    value = opcodes.getAs<IntegerAttr>(origOp->getName().getStringRef());
+    if (!value)
+      return origOp->emitOpError("operator '")
+             << opName << "' has no opcode for this operation";
+  }
   return Value(hw::ConstantOp::create(
       builder, origOp->getLoc(),
       APInt(portType.getIntOrFloatBitWidth(), value.getInt())));
@@ -2193,7 +2204,9 @@ static FailureOr<Value> attrPortConstant(Operation *origOp, OpBuilder &builder,
 /// `oplib.operand = N` / `oplib.result = N` per-port attrs stamped by
 /// `OperatorLibraryLoader::makePortAttrDict`. A port tagged
 /// `oplib.attr = "<name>"` is a constant from the op's attribute `<name>`
-/// (attrPortConstant), e.g. the predicate a compare core's wrapper decodes.
+/// (attrPortConstant), e.g. the predicate a compare core's wrapper decodes;
+/// one tagged `oplib.opcode` the opcode of the op's operation, e.g. an add
+/// or a subtract on one core.
 /// A port tagged `oplib.valid` is the op's gate (`shareGate`, high in the
 /// cycles it issues, stalls excluded): an operator with state takes one
 /// step per execution of its op, e.g. an accumulator one beat.
@@ -2258,7 +2271,8 @@ emitHwInstanceFromOperator(
   // at the bottom of that chain: a value computed from the instance's
   // result and read in a later cycle than the op's (an iter-arg update a
   // frame samples at its end, which nothing captures) reads it from the
-  // first user's operands (nussinov's max). The operator need not be
+  // first user's operands (nussinov's max; in f64 over the 1-cycle add's
+  // result). The operator need not be
   // pipelined, its operands registered: a combinational one takes the mux
   // on the path the schedule chained it on, which operator binding sizes
   // the sharing to (its slack). A simulation assertion checks the selects
@@ -2349,10 +2363,10 @@ emitHwInstanceFromOperator(
         shared.anySelect =
             comb::OrOp::create(builder, loc, anySelects, false);
       }
-      for (auto [attrName, idx] : shared.attrPorts) {
+      for (auto [drive, idx] : shared.attrPorts) {
         Value cur = shared.instOp->getOperand(idx);
         auto mine =
-            attrPortConstant(origOp, builder, attrName, cur.getType(), opName);
+            attrPortConstant(origOp, builder, drive, cur.getType(), opName);
         if (failed(mine))
           return failure();
         if (*mine == cur)
@@ -2427,14 +2441,17 @@ emitHwInstanceFromOperator(
         if (sharedEntry.operandPortForIdx.size() <= j)
           sharedEntry.operandPortForIdx.resize(j + 1, -1);
         sharedEntry.operandPortForIdx[j] = (int)instanceOperands.size();
-      } else if (auto attrName = dyn_cast_or_null<StringAttr>(
-                     portAttrs.get("oplib.attr"))) {
+      } else if (Attribute drive =
+                     isa_and_nonnull<StringAttr>(portAttrs.get("oplib.attr"))
+                         ? portAttrs.get("oplib.attr")
+                         : dyn_cast_or_null<DictionaryAttr>(
+                               portAttrs.get("oplib.opcode"))) {
         auto constant =
-            attrPortConstant(origOp, builder, attrName, port.type, opName);
+            attrPortConstant(origOp, builder, drive, port.type, opName);
         if (failed(constant))
           return failure();
         driver = *constant;
-        sharedEntry.attrPorts.emplace_back(attrName,
+        sharedEntry.attrPorts.emplace_back(drive,
                                            (int)instanceOperands.size());
       }
     }

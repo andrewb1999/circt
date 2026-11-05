@@ -74,9 +74,11 @@ def OperatorOp : OpLibOp<"operator", [IsolatedFromAbove,
   let description = [{
     The `oplib.operator` operation represents an operator in the
     operator library: a library entry (LibraryEntryOpInterface) that
-    matches ops by the pattern of its `oplib.target` and builds them with
-    its `oplib.hw_match`. An operator without a target matches whatever op
-    is assigned to it (by a `loopschedule.operator` reference).
+    matches ops by the patterns of its `oplib.target`s (an op matches when
+    any target's does: a core serving an add and a subtract has one of
+    each) and builds them with its `oplib.hw_match`. An operator without a
+    target matches whatever op is assigned to it (by a
+    `loopschedule.operator` reference).
   }];
 
   let arguments = (ins SymbolNameAttr:$sym_name,
@@ -121,6 +123,11 @@ def OperatorOp : OpLibOp<"operator", [IsolatedFromAbove,
     ::mlir::Block *getBodyBlock() {
       return &getBody().getBlocks().front();
     }
+
+    /// The operations the operator's targets match: one per target (a core
+    /// that serves several ops, e.g. an add and a subtract, has a target
+    /// for each).
+    ::llvm::SmallVector<::llvm::StringRef> getMatchedOperationNames();
   }];
 
   let hasVerifier = 1;

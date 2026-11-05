@@ -63,8 +63,13 @@ OperatorLibraryAnalysis::OperatorLibraryAnalysis(Operation *op) {
         dyn_cast_or_null<oplib::HwMatchOp>(entry.getHwMatch());
 
     StringRef operatorName = entry.getEntryName();
-    if (auto matched = entry.getMatchedOperationName())
-      potentialOperatorsMap[OperationName(*matched, context).getStringRef()]
+    SmallVector<StringRef> matched;
+    if (auto op = dyn_cast<oplib::OperatorOp>(entry.getOperation()))
+      matched = op.getMatchedOperationNames();
+    else if (auto name = entry.getMatchedOperationName())
+      matched.push_back(*name);
+    for (StringRef name : matched)
+      potentialOperatorsMap[OperationName(name, context).getStringRef()]
           .push_back(operatorName);
     operatorMap.insert(std::pair(operatorName, operatorStruct));
   }

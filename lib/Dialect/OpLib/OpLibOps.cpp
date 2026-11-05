@@ -66,28 +66,33 @@ std::optional<unsigned> OperatorOp::getEntryLimit() {
   return std::nullopt;
 }
 
-/// The `oplib.operation` an operator's target matches ops against, if it
-/// has one.
-static OperationOp patternOf(OperatorOp op) {
-  auto targets = op.getBodyBlock()->getOps<TargetOp>();
-  if (targets.empty() || (*targets.begin()).getBodyBlock()->empty())
-    return {};
-  return dyn_cast<OperationOp>((*targets.begin()).getBodyBlock()->front());
+/// The `oplib.operation` each of an operator's targets matches ops against.
+static SmallVector<OperationOp> patternsOf(OperatorOp op) {
+  SmallVector<OperationOp> patterns;
+  for (TargetOp target : op.getBodyBlock()->getOps<TargetOp>())
+    if (!target.getBodyBlock()->empty())
+      if (auto pattern = dyn_cast<OperationOp>(target.getBodyBlock()->front()))
+        patterns.push_back(pattern);
+  return patterns;
 }
 
 std::optional<StringRef> OperatorOp::getMatchedOperationName() {
-  if (auto pattern = patternOf(*this))
-    return pattern.getOpName();
-  return std::nullopt;
+  SmallVector<OperationOp> patterns = patternsOf(*this);
+  if (patterns.empty())
+    return std::nullopt;
+  return patterns.front().getOpName();
 }
 
-/// An op matches an operator's pattern when it is the same operation, with
-/// the pattern's attributes and its operand and result types. An operator
-/// without a pattern matches whatever is assigned to it.
-bool OperatorOp::matches(Operation *op) {
-  OperationOp pattern = patternOf(*this);
-  if (!pattern)
-    return true;
+SmallVector<StringRef> OperatorOp::getMatchedOperationNames() {
+  SmallVector<StringRef> names;
+  for (OperationOp pattern : patternsOf(*this))
+    names.push_back(pattern.getOpName());
+  return names;
+}
+
+/// An op matches a pattern when it is the same operation, with the
+/// pattern's attributes and its operand and result types.
+static bool matchesPattern(OperationOp pattern, Operation *op) {
   if (op->getName().getStringRef() != pattern.getOpName())
     return false;
   if (auto dict = pattern.getOpDict())
@@ -98,6 +103,15 @@ bool OperatorOp::matches(Operation *op) {
              TypeRange(pattern->getOperandTypes()) &&
          TypeRange(op->getResultTypes()) ==
              TypeRange(pattern->getResultTypes());
+}
+
+/// An op matches an operator when it matches any of its targets' patterns.
+/// An operator without a pattern matches whatever is assigned to it.
+bool OperatorOp::matches(Operation *op) {
+  SmallVector<OperationOp> patterns = patternsOf(*this);
+  return patterns.empty() || llvm::any_of(patterns, [&](OperationOp pattern) {
+           return matchesPattern(pattern, op);
+         });
 }
 
 Operation *OperatorOp::getHwMatch() {
