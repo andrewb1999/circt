@@ -1000,6 +1000,20 @@ struct SharedOperatorInstance {
   int ceInputIdx = -1;
   /// Current CE drive (ANDed as users join).
   Value ce;
+  /// The operator's latency.
+  unsigned latency = 0;
+  /// Whether a user's result is ready after its frame's last cycle.
+  bool outlivesFrame = false;
+  /// Once a second user joins, a `comb.and` of the users' CEs, one operand
+  /// per user in the order of `anySelect`'s (a container read through its
+  /// operands). Users in one stall domain (one CE) AND theirs; across
+  /// domains a user's stall freezes the instance only while it has an
+  /// operation in it: `inFlight[i]`, its select and that delayed through
+  /// `latency` registers advancing with the instance (on `ceTap`, a
+  /// one-operand `comb.and` of its final CE).
+  Operation *userCEs = nullptr;
+  Operation *ceTap = nullptr;
+  SmallVector<Value> inFlight;
   /// Per operand index (as `operandPortForIdx`), the `comb.or` driving the
   /// port once a second user joins (null before): its first input is the
   /// first user's term, `~laterSelect & operand_0`, the others the later
@@ -1440,10 +1454,14 @@ private:
   /// `builder.clone(op, mapping)` for arith ops. `op` is the original op
   /// (not yet cloned). On success, populates `mapping` for the original
   /// op's results.
+  /// `outlivesFrame`: `op` is in a frame and its result is ready after the
+  /// frame's last cycle (in flight while later frames, or the children it
+  /// launched, run).
   LogicalResult emitComputeOp(Operation *op, OpBuilder &builder,
                               IRMapping &mapping, ModuleOp moduleOp,
                               Value clk, Value rst, Value opCE = {},
-                              Value shareGate = {}, Value selectGate = {});
+                              Value shareGate = {}, Value selectGate = {},
+                              bool outlivesFrame = false);
 
   /// `lowerAtBody` is a method (not a free function) so it can access
   /// `operatorLibrary` and `instanceUniquer` directly.
@@ -2225,7 +2243,7 @@ emitHwInstanceFromOperator(
     Value shareGate = {},
     llvm::DenseMap<std::pair<mlir::StringAttr, int64_t>,
                    SharedOperatorInstance> *sharedOps = nullptr,
-    Value selectGate = {}) {
+    Value selectGate = {}, unsigned latency = 0, bool outlivesFrame = false) {
   auto externOp = moduleOp.lookupSymbol<hw::HWModuleExternOp>(
       templateInst.getModuleNameAttr().getValue());
   if (!externOp)
@@ -2379,12 +2397,107 @@ emitHwInstanceFromOperator(
         Value oneI1Local = hw::ConstantOp::create(
             builder, origOp->getLoc(), builder.getI1Type(), (int64_t)1);
         Value myCE = opCE ? opCE : oneI1Local;
-        if (myCE != shared.ce) {
-          Value newCE = comb::AndOp::create(builder, origOp->getLoc(),
-                                            shared.ce, myCE);
-          shared.instOp->setOperand(shared.ceInputIdx, newCE);
-          shared.ce = newCE;
+        // The users' CEs, the first user's being the instance's CE until a
+        // second joins.
+        SmallVector<Value> ces;
+        if (shared.userCEs)
+          ces.append(shared.userCEs->operand_begin(),
+                     shared.userCEs->operand_end());
+        else
+          ces.push_back(shared.ce);
+        ces.push_back(myCE);
+        if (shared.userCEs)
+          shared.userCEs->erase();
+        shared.userCEs = comb::AndOp::create(builder, loc, ces, false);
+        auto isTrue = [](Value v) {
+          auto c = v.getDefiningOp<hw::ConstantOp>();
+          return c && c.getValue().isAllOnes();
+        };
+        shared.outlivesFrame |= outlivesFrame;
+        Value newCE;
+        if (shared.latency == 0 || !shared.outlivesFrame ||
+            llvm::all_of(ces, [&](Value c) {
+              return c == ces.front() || (isTrue(c) && isTrue(ces.front()));
+            })) {
+          // One stall domain, a combinational instance, or users whose
+          // results all land in their contexts (a pipeline's, a frame's
+          // that ends after them), which run one at a time: their CEs.
+          newCE = myCE == shared.ce ? shared.ce
+                                    : (Value)comb::AndOp::create(
+                                          builder, loc, shared.ce, myCE);
+        } else {
+          // Across stall domains, with a result in flight past its frame
+          // (while later frames, or the children the frame launched, run),
+          // a user's stall freezes the instance only while it has an
+          // operation in it, from its issue through the cycle its result
+          // is ready (read there, or captured). A context that does not
+          // stall, or has nothing in flight, would otherwise be frozen by
+          // another's: correlation's
+          // `sqrt(float_n)`, in flight from a one-cycle function frame,
+          // froze while the loop the frame launched waited on a load, and
+          // the frame's capture, counting plain cycles, took the output
+          // before the result.
+          if (!shared.ceTap)
+            shared.ceTap =
+                comb::AndOp::create(builder, loc, ValueRange{oneI1Local},
+                                    false);
+          Value tap = shared.ceTap->getResult(0);
+          Value clock = isa<seq::ClockType>(shared.clk.getType())
+                            ? shared.clk
+                            : (Value)seq::ToClockOp::create(builder, loc,
+                                                            shared.clk);
+          Value hwClk = isa<seq::ClockType>(shared.clk.getType())
+                            ? (Value)seq::FromClockOp::create(builder, loc,
+                                                              shared.clk)
+                            : shared.clk;
+          Value falseI1 =
+              hw::ConstantOp::create(builder, loc, builder.getI1Type(), 0);
+          SmallVector<Value> selects(shared.anySelect->operand_begin(),
+                                     shared.anySelect->operand_end());
+          shared.inFlight.resize(ces.size());
+          SmallVector<Value> terms;
+          for (auto [i, ce] : llvm::enumerate(ces)) {
+            if (!shared.inFlight[i]) {
+              SmallVector<Value> bits{selects[i]};
+              for (unsigned k = 1; k <= shared.latency; ++k)
+                bits.push_back(seq::CompRegClockEnabledOp::create(
+                    builder, loc, bits.back(), clock, tap, shared.rst,
+                    falseI1,
+                    builder.getStringAttr(
+                        (shared.instOp.getInstanceName() + "_user" +
+                         Twine(i) + "_in_flight_d" + Twine(k))
+                            .str())));
+              shared.inFlight[i] =
+                  comb::OrOp::create(builder, loc, bits, false);
+              // Two users in flight at once whose contexts stall apart
+              // would need the instance to run for one and freeze for the
+              // other: check in simulation that it never happens.
+              Value frozen = comb::AndOp::create(
+                  builder, loc,
+                  ValueRange{shared.inFlight[i], ce,
+                             comb::createOrFoldNot(builder, loc, tap)},
+                  false);
+              verif::ClockedAssertOp::create(
+                  builder, loc, comb::createOrFoldNot(builder, loc, frozen),
+                  verif::ClockEdge::Pos, hwClk,
+                  comb::createOrFoldNot(builder, loc, shared.rst),
+                  builder.getStringAttr("shared_operator_stall_domain"));
+            }
+            if (!isTrue(ce))
+              terms.push_back(comb::OrOp::create(
+                  builder, loc,
+                  comb::createOrFoldNot(builder, loc, shared.inFlight[i]),
+                  ce, false));
+          }
+          newCE = terms.empty() ? oneI1Local
+                  : terms.size() == 1
+                      ? terms.front()
+                      : (Value)comb::AndOp::create(builder, loc, terms,
+                                                   false);
+          shared.ceTap->setOperand(0, newCE);
         }
+        shared.instOp->setOperand(shared.ceInputIdx, newCE);
+        shared.ce = newCE;
       }
       mapResults(shared.instOp);
       return success();
@@ -2429,6 +2542,8 @@ emitHwInstanceFromOperator(
       driver = opCE ? opCE : oneI1;
       sharedEntry.ceInputIdx = (int)instanceOperands.size();
       sharedEntry.ce = driver;
+      sharedEntry.latency = latency;
+      sharedEntry.outlivesFrame = outlivesFrame;
     } else if (portAttrs) {
       if (auto opIdxAttr =
               dyn_cast_or_null<IntegerAttr>(portAttrs.get("oplib.operand"))) {
@@ -2497,7 +2612,7 @@ emitOpFromOperatorLibrary(Operation *origOp, OpBuilder &builder,
                           llvm::DenseMap<std::pair<mlir::StringAttr, int64_t>,
                                          SharedOperatorInstance> *sharedOps =
                               nullptr,
-                          Value selectGate = {}) {
+                          Value selectGate = {}, bool outlivesFrame = false) {
   auto operatorAttr =
       origOp->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
   if (!operatorAttr)
@@ -2516,10 +2631,10 @@ emitOpFromOperatorLibrary(Operation *origOp, OpBuilder &builder,
   // cloned as-is via `emitCombOpFromOperator`.
   for (auto &op : *hwMatch.getBodyBlock()) {
     if (auto inst = dyn_cast<oplib::HwInstanceOp>(op))
-      return emitHwInstanceFromOperator(origOp, builder, mapping, moduleOp,
-                                        inst, clk, rst, uniquer, opName,
-                                        opCE, shareGate, sharedOps,
-                                        selectGate);
+      return emitHwInstanceFromOperator(
+          origOp, builder, mapping, moduleOp, inst, clk, rst, uniquer, opName,
+          opCE, shareGate, sharedOps, selectGate,
+          ola.getOperatorLatency(opName), outlivesFrame);
   }
   return emitCombOpFromOperator(origOp, builder, mapping, hwMatch);
 }
@@ -2587,8 +2702,12 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
       return handleHWStore(storeOp, builder, mapping, gate, memPorts, seqMux);
     if (auto loadOp = dyn_cast<HWLoadLoweringInterface>(inner))
       return handleHWLoad(loadOp, builder, mapping, memPorts, gate, seqMux);
-    return emitComputeOp(inner, builder, mapping, moduleOp, clk, rst, opCE,
-                         /*shareGate=*/gate);
+    return emitComputeOp(
+        inner, builder, mapping, moduleOp, clk, rst, opCE,
+        /*shareGate=*/gate, /*selectGate=*/{},
+        /*outlivesFrame=*/baseCycle +
+                computeOpCycleLatency(inner, operatorLibrary) >=
+            cycleGates.size());
   };
   for (auto &op : *body) {
     if (failed(processOp(&op, pickGate(baseCycle), /*pred=*/Value())))
@@ -2599,7 +2718,8 @@ LogicalResult LoopScheduleToFSMPass::lowerAtBody(
 
 LogicalResult LoopScheduleToFSMPass::emitComputeOp(
     Operation *op, OpBuilder &builder, IRMapping &mapping, ModuleOp moduleOp,
-    Value clk, Value rst, Value opCE, Value shareGate, Value selectGate) {
+    Value clk, Value rst, Value opCE, Value shareGate, Value selectGate,
+    bool outlivesFrame) {
   // `arith.bitcast` is how AMC's legalize-float-types carries a float
   // through the integer-only HW layer: an fp operator's float operands and
   // results are bitcast to/from same-width integers, and on a wire those
@@ -2635,7 +2755,8 @@ LogicalResult LoopScheduleToFSMPass::emitComputeOp(
   }
   return emitOpFromOperatorLibrary(op, builder, mapping, moduleOp, clk, rst,
                                     instanceUniquer, *operatorLibrary, opCE,
-                                    shareGate, &sharedOperators, selectGate);
+                                    shareGate, &sharedOperators, selectGate,
+                                    outlivesFrame);
 }
 
 /// The value result `idx` of `ifOp` takes: the one its body yields (null if
@@ -6161,8 +6282,14 @@ LogicalResult LoopScheduleToFSMPass::lowerLoopLevelBody(
           return handleHWStore(storeOp, hw, localMapping, gate, framePorts,
                                seqMuxPtr);
         }
-        return emitComputeOp(op, hw, localMapping, moduleOp, clk, rst,
-                             notStallSeq, gate);
+        unsigned frameCycles =
+            hasCycleGates ? fsmFrameCycleGates[frameIdx].size() : 1;
+        return emitComputeOp(
+            op, hw, localMapping, moduleOp, clk, rst, notStallSeq, gate,
+            /*selectGate=*/{},
+            /*outlivesFrame=*/atOffset +
+                    computeOpCycleLatency(op, operatorLibrary) >=
+                frameCycles);
       };
       for (auto &op : atBody)
         if (failed(processOp(&op, atGate, Value())))
@@ -10758,9 +10885,14 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
         // The op's issue gate: an op bound to a shared operator instance
         // (`loopschedule.binding`) joins it, its operands muxed in under
         // the gate, rather than getting an instance of its own. The frame
-        // fires each `at` once, so the op needs no clock enable.
-        if (failed(emitComputeOp(&op, builder, mapping, enclosingModule, clk,
-                                  rst, /*opCE=*/{}, /*shareGate=*/atGate)))
+        // fires each `at` once, so the op needs no clock enable. A
+        // multi-cycle op is in flight while the children run, its result
+        // held on a delay counting plain cycles (gateAt).
+        if (failed(emitComputeOp(
+                &op, builder, mapping, enclosingModule, clk, rst,
+                /*opCE=*/{}, /*shareGate=*/atGate, /*selectGate=*/{},
+                /*outlivesFrame=*/computeOpCycleLatency(
+                    &op, operatorLibrary) > 0)))
           return failure();
       }
       // Eagerly map this at-op's external results so later at-ops in the
