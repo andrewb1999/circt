@@ -1,14 +1,14 @@
-// RUN: circt-opt --loopschedule-binding="share-mux-delays=0.3,0.6" %s | FileCheck %s
+// RUN: circt-opt --loopschedule-binding="share-mux-delays=0.3,0.3,0.6" %s | FileCheck %s
 // RUN: circt-opt --loopschedule-binding %s | FileCheck %s --check-prefix=ANY
 
 // Sharing an instance puts a one-hot mux on each user's operands, on the
-// chain the scheduler placed the op on. With share-mux-delays (here 0.3 ns
-// for 2-3 users, one level of AND-OR, and 0.6 for 4-18, two), an op shares
-// an instance only if its chain slack (`loopschedule.chain_slack`, ns, from
-// the scheduler) takes the mux the instance's users need; the tightest
-// user that does not leaves, and the rest are bound again. The slack is
-// consumed: no op keeps it. Without share-mux-delays every op that can
-// share does.
+// chain the scheduler placed the op on. With share-mux-delays (by users,
+// from 2: here 0.3 ns for 2 and 3 users, one level of AND-OR, and 0.6 for
+// 4, two), an op shares an instance only if its chain slack
+// (`loopschedule.chain_slack`, ns, from the scheduler) takes the mux the
+// instance's users need; the tightest user that does not leaves, and the
+// rest are bound again. The slack is consumed: no op keeps it. Without
+// share-mux-delays every op that can share does.
 
 oplib.library @lib {
   oplib.operator @fadd_l0 latency<0>, incDelay<2.0>, outDelay<2.0> {
@@ -59,7 +59,7 @@ loopschedule.func_sequential @three(%x: i32, %y: i32) -> i32
   loopschedule.return %x : i32
 }
 
-// Four adds with 0.5 ns each: four users need two levels (0.6 ns), so one
+// Four adds with 0.5 ns each: four users need 0.6 ns, so one
 // leaves and the other three share an instance behind one level.
 // CHECK-LABEL: loopschedule.func_sequential @four
 // CHECK:         arith.addi %{{.*}} {loopschedule.binding = 1 : i64, loopschedule.operator = @fadd_l0}

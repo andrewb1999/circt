@@ -133,14 +133,40 @@ bool takesIssueCycles(analysis::OperatorLibraryAnalysis &ola,
          });
 }
 
-/// Does a result of `op`, inside a pipeline, update an iter-arg (through
-/// bitcasts and the yields of `at`s and `if`s)? The next iteration reads
-/// it then, after the op's ready stage: a multi-cycle instance's output
-/// holds it there only while its operands do (a stage register's), not
-/// when the instance has other users, whose operands it takes in between.
-bool carriedInPipeline(Operation *op) {
-  if (!op->getParentOfType<LoopSchedulePipelineOp>())
+/// The cycle of `op` in an iteration of `pipeline`: its stage's offset,
+/// through `if`s; none for an op in any other nesting.
+std::optional<uint64_t> cycleInPipeline(Operation *op,
+                                        LoopSchedulePipelineOp pipeline) {
+  for (Operation *p = op; p; p = p->getParentOp()) {
+    if (auto at = dyn_cast<LoopScheduleAtOp>(p)) {
+      if (at->getParentOp() != pipeline.getOperation())
+        return std::nullopt;
+      return at.getOffset();
+    }
+    if (p != op && !isa<LoopScheduleIfOp>(p))
+      return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+/// Does the next iteration of a pipeline read a result of `op`, a
+/// multi-cycle operator of `latency` cycles, after the cycle it is ready?
+/// A result the pipeline carries (an iter_arg_update's value, through
+/// bitcasts and the yields of `at`s and `if`s) is read there from the
+/// instance's output, which holds it only while the op's operands do (a
+/// stage register's); a shared instance takes another user's operands in
+/// between. In the ready cycle the output is the op's, whatever the other
+/// users do: an accumulator at II = latency (`acc = acc + x`, read by the
+/// next iteration's add as it issues) shares. A read after it (deriche's
+/// filter at II 2 read `y1` two cycles late), the iter-arg's value after
+/// the loop (a terminator result), or one passed along to another iter-arg
+/// (`ym2 = ym1`) keeps the op on an instance of its own.
+bool readsCarriedPastReady(Operation *op, unsigned latency) {
+  auto pipeline = op->getParentOfType<LoopSchedulePipelineOp>();
+  if (!pipeline)
     return false;
+  Operation *terminator = pipeline.getStagesBlock().getTerminator();
+  std::optional<uint64_t> issue = cycleInPipeline(op, pipeline);
   SmallVector<Value> worklist(op->result_begin(), op->result_end());
   DenseSet<Value> seen;
   while (!worklist.empty()) {
@@ -149,8 +175,25 @@ bool carriedInPipeline(Operation *op) {
       continue;
     for (OpOperand &use : v.getUses()) {
       Operation *user = use.getOwner();
-      if (isa<LoopScheduleIterArgUpdateOp>(user))
-        return true;
+      if (auto update = dyn_cast<LoopScheduleIterArgUpdateOp>(user)) {
+        if (!issue)
+          return true;
+        uint64_t ready = *issue + latency;
+        for (OpOperand &read : update.getIterArg().getUses()) {
+          Operation *reader = read.getOwner();
+          if (auto other = dyn_cast<LoopScheduleIterArgUpdateOp>(reader)) {
+            if (&read == &other.getIterArgMutable())
+              continue;
+            return true;
+          }
+          if (reader == terminator)
+            return true;
+          std::optional<uint64_t> cycle = cycleInPipeline(reader, pipeline);
+          if (!cycle || *cycle + pipeline.getII() != ready)
+            return true;
+        }
+        continue;
+      }
       if (isa<arith::BitcastOp>(user))
         worklist.append(user->result_begin(), user->result_end());
       else if (isa<LoopScheduleYieldOp>(user) &&
@@ -217,30 +260,30 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
     return success();
 
   // The delay of the mux an instance shared by `users` ops puts on their
-  // operands: AND-OR levels of 6-input LUTs, 3 users to a LUT, then ORs
-  // of 6.
+  // operands: shareMuxDelays[users - 2], past the last given extrapolated by
+  // its last step.
   auto muxDelay = [&](unsigned users) -> double {
-    unsigned levels = 1;
-    for (unsigned luts = (users + 2) / 3; luts > 1; luts = (luts + 5) / 6)
-      ++levels;
-    size_t given = shareMuxDelays.size();
-    if (levels <= given)
-      return shareMuxDelays[levels - 1];
+    if (users < 2)
+      return 0.0;
+    size_t i = users - 2, given = shareMuxDelays.size();
+    if (i < given)
+      return shareMuxDelays[i];
     double step = given > 1 ? shareMuxDelays[given - 1] -
                                   shareMuxDelays[given - 2]
-                            : shareMuxDelays[given - 1];
-    return shareMuxDelays[given - 1] + step * (levels - given);
+                            : 0.0;
+    return shareMuxDelays[given - 1] + step * (i - (given - 1));
   };
 
   // Share-mode ops whose chain slack does not take their instance's mux,
-  // and multi-cycle ones whose result a pipeline carries to its next
-  // iteration (carriedInPipeline): each keeps an instance of its own.
+  // and multi-cycle ones whose result a pipeline's next iteration reads
+  // after its ready cycle (readsCarriedPastReady): each keeps an instance
+  // of its own.
   DenseSet<Operation *> alone;
   for (auto &cand : candidates)
-    if (!cand.declaredLimit &&
-        opLibAnalysis.getOperatorLatency(cand.oprName) > 0 &&
-        carriedInPipeline(cand.op))
-      alone.insert(cand.op);
+    if (!cand.declaredLimit)
+      if (unsigned latency = opLibAnalysis.getOperatorLatency(cand.oprName))
+        if (readsCarriedPastReady(cand.op, latency))
+          alone.insert(cand.op);
   DenseMap<Operation *, int64_t> instanceOf;
   while (true) {
     // Phase 2 — populate the problem.
