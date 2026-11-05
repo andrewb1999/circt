@@ -24,6 +24,7 @@ class OpLibOp<string mnemonic, list<Trait> traits = []> :
   Op<OpLib_Dialect, mnemonic, traits>;
 
 def LibraryOp : OpLibOp<"library", [IsolatedFromAbove, SingleBlock,
+                                    SymbolName, SymbolVisibility,
                                     Symbol, SymbolTable, NoTerminator,
                                     NoRegionArguments,
                                     HasParent<"mlir::ModuleOp">]> {
@@ -35,7 +36,8 @@ def LibraryOp : OpLibOp<"library", [IsolatedFromAbove, SingleBlock,
     LibraryEntryOpInterface, such as `oplib.operator`.
   }];
 
-  let arguments = (ins SymbolNameAttr:$sym_name);
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       OptionalAttr<StrAttr>:$sym_visibility);
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
@@ -66,6 +68,7 @@ def LibraryOp : OpLibOp<"library", [IsolatedFromAbove, SingleBlock,
 def OperatorOp : OpLibOp<"operator", [IsolatedFromAbove,
                                          SingleBlock, NoTerminator,
                                          NoRegionArguments,
+                                         SymbolName, SymbolVisibility,
                                          Symbol, SymbolTable,
                                          HasParent<"LibraryOp">,
     DeclareOpInterfaceMethods<LibraryEntryOpInterface,
@@ -85,7 +88,8 @@ def OperatorOp : OpLibOp<"operator", [IsolatedFromAbove,
                        I32Attr:$latency,
                        OptionalAttr<F64Attr>:$incDelay,
                        OptionalAttr<F64Attr>:$outDelay,
-                       OptionalAttr<I64Attr>:$limit);
+                       OptionalAttr<I64Attr>:$limit,
+                       OptionalAttr<StrAttr>:$sym_visibility);
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);
   // Custom parser/printer so `latency`, `incDelay`, `outDelay`, and `limit`
@@ -133,7 +137,7 @@ def OperatorOp : OpLibOp<"operator", [IsolatedFromAbove,
   let hasVerifier = 1;
 }
 
-def TargetOp : OpLibOp<"target", [Symbol, 
+def TargetOp : OpLibOp<"target", [SymbolName, SymbolVisibility, Symbol,
                                   FunctionOpInterface,
                                   SingleBlockImplicitTerminator<"OutputOp">,
                                   HasParent<"OperatorOp">]> {
@@ -144,7 +148,8 @@ def TargetOp : OpLibOp<"target", [Symbol,
   let arguments = (ins SymbolNameAttr:$sym_name,
                        TypeAttrOf<FunctionType>:$function_type,
                        OptionalAttr<DictArrayAttr>:$arg_attrs,
-                       OptionalAttr<DictArrayAttr>:$res_attrs);
+                       OptionalAttr<DictArrayAttr>:$res_attrs,
+                       OptionalAttr<StrAttr>:$sym_visibility);
 
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);

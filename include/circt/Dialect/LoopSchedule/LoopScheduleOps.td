@@ -442,12 +442,14 @@ def LoopScheduleStoreOp : LoopScheduleOp<"store",
 }
 
 def LoopScheduleDependenciesOp : LoopScheduleOp<"dependencies",
-     [NoRegionArguments, SingleBlock, NoTerminator, Symbol]> {
+     [NoRegionArguments, SingleBlock, NoTerminator, SymbolName,
+      SymbolVisibility, Symbol]> {
   let summary = "Memory Dependencies operation";
   let description = [{
   }];
 
-  let arguments = (ins SymbolNameAttr:$sym_name);
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       OptionalAttr<StrAttr>:$sym_visibility);
   let assemblyFormat = "$sym_name $body attr-dict";
   let regions = (region SizedRegion<1>:$body);
 
@@ -934,6 +936,8 @@ def LoopScheduleIterArgUpdateOp : LoopScheduleOp<"iter_arg_update",
 class LoopScheduleFuncOpBase<string mnemonic, list<Trait> traits = []> :
     LoopScheduleOp<mnemonic, !listconcat(traits, [
       AutomaticAllocationScope,
+      SymbolName,
+      SymbolVisibility,
       FunctionOpInterface,
       IsolatedFromAbove,
       Symbol,

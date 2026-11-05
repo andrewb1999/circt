@@ -14,6 +14,7 @@
 #define CIRCT_DIALECT_LOOPSCHEDULE_LOOPSCHEDULEATTRIBUTES_TD
 
 include "mlir/IR/AttrTypeBase.td"
+include "circt/Dialect/LoopSchedule/LoopScheduleDialect.td"
 include "mlir/IR/BuiltinAttributeInterfaces.td"
 
 //===----------------------------------------------------------------------===//
