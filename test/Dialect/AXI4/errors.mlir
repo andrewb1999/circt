@@ -85,6 +85,11 @@
 
 // -----
 
+// expected-error @below {{port window #axi4.window<base = 0xfffff000, last = 0x100000fff, burst_specs = <<fixed, len = 4>>> does not fit in an 'addr_width' of 32}}
+"test.port"() : () -> !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0xfffff000, last = 0x100000fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+// -----
+
 // expected-error @below {{port 'outstanding_writes' must be at most 4 for a 'write_id_width' of 2, got 5}}
 "test.port"() : () -> !axi4.port<addr_width = 32, data_width = 64, write_id_width = 2, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 5, outstanding_reads = 4>
 
@@ -92,3 +97,165 @@
 
 // expected-error @below {{port 'outstanding_reads' must be at most 4 for a 'read_id_width' of 2, got 5}}
 "test.port"() : () -> !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 2, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 5>
+
+// -----
+
+!port = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+hw.module @Fanout(in %clk : !seq.clock, in %rst_ni : i1) {
+  // expected-error @below {{'axi4.abstract_manager' op port result must have at most one use; route through an 'axi4.xbar' to fan out to multiple endpoints}}
+  %mgr = axi4.abstract_manager %clk, %rst_ni : !port
+  axi4.abstract_subordinate %clk, %rst_ni, %mgr concurrent_writes 4 concurrent_reads 4 : !port
+  axi4.abstract_subordinate %clk, %rst_ni, %mgr concurrent_writes 4 concurrent_reads 4 : !port
+}
+
+// -----
+
+hw.module @NotAPort(in %clk : !seq.clock, in %rst_ni : i1,
+                    in %s : !hw.struct<a: i4>, in %v : i1) {
+  // expected-error @below {{'port' must be an AXI4 port interface, but got 'i32'}}
+  %port, %aw_ready, %w_ready, %b, %b_valid, %ar_ready, %r, %r_valid = axi4.channel_structs_to_port %clk, %rst_ni aw %s, %v w %s, %v b %v ar %s, %v r %v : i32
+  hw.output
+}
+
+// -----
+
+!port = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!bad_aw = !hw.struct<id: i4, addr: i16, len: i8, size: i3, burst: i2, lock: i1, cache: i4, prot: i3, qos: i4, region: i4, user: i0>
+!w = !hw.struct<data: i64, strb: i8, last: i1, user: i0>
+!b = !hw.struct<id: i4, resp: i2, user: i0>
+!r = !hw.struct<id: i4, data: i64, resp: i2, last: i1, user: i0>
+
+hw.module @BadPayload(in %clk : !seq.clock, in %rst_ni : i1,
+                      in %aw : !bad_aw, in %w : !w, in %v : i1) {
+  // expected-error @below {{'axi4.channel_structs_to_port' op failed to verify that AW payload matches the port type}}
+  %port, %aw_ready, %w_ready, %b, %b_valid, %ar_ready, %r, %r_valid = "axi4.channel_structs_to_port"(%clk, %rst_ni, %aw, %v, %w, %v, %v, %aw, %v, %v) : (!seq.clock, i1, !bad_aw, i1, !w, i1, i1, !bad_aw, i1, i1) -> (!port, i1, i1, !b, i1, i1, !r, i1)
+  hw.output
+}
+
+// -----
+
+!mgr = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+hw.module @NoManagers(in %clk : !seq.clock, in %rst_ni : i1) {
+  // expected-error @below {{'axi4.xbar' op must have at least one upstream port}}
+  %sub = axi4.xbar %clk, %rst_ni mgrs : () -> !mgr
+}
+
+// -----
+
+!mgr = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+hw.module @NoSubordinates(in %clk : !seq.clock, in %rst_ni : i1) {
+  %mgr = axi4.abstract_manager %clk, %rst_ni : !mgr
+  // expected-error @below {{'axi4.xbar' op must have at least one downstream port}}
+  axi4.xbar %clk, %rst_ni mgrs %mgr : (!mgr) -> ()
+}
+
+// -----
+
+!mgr = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!narrow_mgr = !axi4.port<addr_width = 32, data_width = 32, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!sub = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 5, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 8, outstanding_reads = 8>
+
+hw.module @MismatchedManagers(in %clk : !seq.clock, in %rst_ni : i1) {
+  %a = axi4.abstract_manager %clk, %rst_ni : !mgr
+  %b = axi4.abstract_manager %clk, %rst_ni : !narrow_mgr
+  // expected-error @below {{'axi4.xbar' op upstream port #1's 'data_width' (32) must match upstream port #0's (64)}}
+  %sub = axi4.xbar %clk, %rst_ni mgrs %a, %b : (!mgr, !narrow_mgr) -> !sub
+}
+
+// -----
+
+!mgr = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!wide_sub = !axi4.port<addr_width = 32, data_width = 128, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+hw.module @ConvertingXbar(in %clk : !seq.clock, in %rst_ni : i1) {
+  %mgr = axi4.abstract_manager %clk, %rst_ni : !mgr
+  // expected-error @below {{'axi4.xbar' op downstream port #0's 'data_width' (128) must match upstream port #0's (64)}}
+  %sub = axi4.xbar %clk, %rst_ni mgrs %mgr : (!mgr) -> !wide_sub
+}
+
+// -----
+
+!mgr = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!sub = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 5, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 8, outstanding_reads = 8>
+
+hw.module @NarrowIds(in %clk : !seq.clock, in %rst_ni : i1) {
+  %a = axi4.abstract_manager %clk, %rst_ni : !mgr
+  %b = axi4.abstract_manager %clk, %rst_ni : !mgr
+  // expected-error @below {{'axi4.xbar' op downstream port #0's 'write_id_width' must be at least 5 to tag transactions from 2 managers, got 4}}
+  %sub = axi4.xbar %clk, %rst_ni mgrs %a, %b : (!mgr, !mgr) -> !sub
+}
+
+// -----
+
+!mgr = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0x1fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!sub = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0x1fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!other_sub = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x1000, last = 0x2fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+hw.module @OverlappingSubordinates(in %clk : !seq.clock, in %rst_ni : i1) {
+  %mgr = axi4.abstract_manager %clk, %rst_ni : !mgr
+  // expected-error @below {{'axi4.xbar' op downstream ports #0 and #1 have overlapping windows}}
+  %a, %b = axi4.xbar %clk, %rst_ni mgrs %mgr : (!mgr) -> (!sub, !other_sub)
+}
+
+// -----
+
+!mgr = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0x1fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!sub = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+hw.module @UnroutedWindow(in %clk : !seq.clock, in %rst_ni : i1) {
+  %mgr = axi4.abstract_manager %clk, %rst_ni : !mgr
+  // expected-error @below {{'axi4.xbar' op address 0x1000, in upstream port #0's windows, is not covered by any downstream port}}
+  %sub = axi4.xbar %clk, %rst_ni mgrs %mgr : (!mgr) -> !sub
+}
+
+// -----
+
+// Check a window strictly inside a downstream one still has its bursts checked
+!mgr = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xff, burst_specs = <<fixed, len = 4>, <incr, len = 8>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!sub = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+hw.module @UnsupportedBurst(in %clk : !seq.clock, in %rst_ni : i1) {
+  %mgr = axi4.abstract_manager %clk, %rst_ni : !mgr
+  // expected-error @below {{'axi4.xbar' op downstream port #0 does not support all the bursts upstream port #0 issues at address 0x0; upstream requires #axi4.burst_set<<fixed, len = 4>, <incr, len = 8>>, downstream supports #axi4.burst_set<<fixed, len = 4>>}}
+  %sub = axi4.xbar %clk, %rst_ni mgrs %mgr : (!mgr) -> !sub
+}
+
+// -----
+
+// A downstream port should have the total number of concurrent requests that
+// could be sent by all the managers that can reach it
+!mgr = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!sub = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 5, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 8>
+
+hw.module @UndersizedXbarPort(in %clk : !seq.clock, in %rst_ni : i1) {
+  %a = axi4.abstract_manager %clk, %rst_ni : !mgr
+  %b = axi4.abstract_manager %clk, %rst_ni : !mgr
+  // expected-error @below {{'axi4.xbar' op downstream port #0's 'outstanding_writes' (4) must be the 8 writes the managers reaching it can issue}}
+  %sub = axi4.xbar %clk, %rst_ni mgrs %a, %b : (!mgr, !mgr) -> !sub
+}
+
+// -----
+
+!port = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!narrow = !axi4.port<addr_width = 32, data_width = 32, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+hw.module @ConvertingCut(in %clk : !seq.clock, in %rst_ni : i1,
+                         in %upstream : !port) {
+  // expected-error @below {{'axi4.cut' op failed to verify that downstream port matches the upstream port}}
+  %cut = "axi4.cut"(%clk, %rst_ni, %upstream) : (!seq.clock, i1, !port) -> !narrow
+}
+
+// -----
+
+!port = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!narrow = !axi4.port<addr_width = 32, data_width = 32, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+hw.module @ConvertingCdc(in %upstream_clk : !seq.clock,
+                         in %downstream_clk : !seq.clock, in %rst_ni : i1,
+                         in %upstream : !port) {
+  // expected-error @below {{'axi4.cdc' op failed to verify that downstream port matches the upstream port}}
+  %cdc = "axi4.cdc"(%upstream_clk, %downstream_clk, %rst_ni, %upstream) : (!seq.clock, !seq.clock, i1, !port) -> !narrow
+}

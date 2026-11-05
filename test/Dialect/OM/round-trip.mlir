@@ -179,6 +179,23 @@ om.class @ListConcat() {
   om.class.fields
 }
 
+// CHECK-LABEL: @ListContains
+om.class @ListContains() {
+  %0 = om.constant "member" : !om.string
+  %1 = om.list_create %0 : !om.string
+  // CHECK: %2 = om.list_contains %1, %0 : <!om.string> loc(
+  %2 = om.list_contains %1, %0 : !om.list<!om.string>
+  %3 = om.constant #om.integer<1 : si2> : !om.integer
+  %4 = om.list_create %3 : !om.integer
+  // CHECK: %5 = om.list_contains %4, %3 : <!om.integer> loc(
+  %5 = om.list_contains %4, %3 : !om.list<!om.integer>
+  %6 = om.constant true
+  %7 = om.list_create %6 : i1
+  // CHECK: %8 = om.list_contains %7, %6 : <i1> loc(
+  %8 = om.list_contains %7, %6 : !om.list<i1>
+  om.class.fields
+}
+
 // CHECK-LABEL: @Integer
 // CHECK-SAME: -> (int: !om.integer)
 om.class @IntegerConstant() -> (int: !om.integer) {
@@ -326,6 +343,15 @@ om.class @IntegerArithmetic() {
 
   // CHECK: om.integer.shl %0, %1 : !om.integer
   %5 = om.integer.shl %0, %1 : !om.integer
+
+  // CHECK: om.integer.bitand %0, %1 : !om.integer
+  %6 = om.integer.bitand %0, %1 : !om.integer
+
+  // CHECK: om.integer.bitor %0, %1 : !om.integer
+  %7 = om.integer.bitor %0, %1 : !om.integer
+
+  // CHECK: om.integer.bitnot %0 : !om.integer
+  %8 = om.integer.bitnot %0 : !om.integer
 
   om.class.fields
 }

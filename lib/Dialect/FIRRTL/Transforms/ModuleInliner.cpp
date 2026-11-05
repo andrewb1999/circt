@@ -402,7 +402,9 @@ InliningFacts::compute(CircuitOp circuit, InstanceGraph &instanceGraph,
       });
       bool hasOpaqueUse = opaqueRecIt != instantiators.end();
 
-      if (!module.canDiscardOnUseEmpty() || hasOpaqueUse) {
+      if (!cast<mlir::SymbolOpInterface>(module.getOperation())
+               .canDiscardOnUseEmpty() ||
+          hasOpaqueUse) {
         info.isLive = true;
         info.hasUnflattenedPath = true;
       }
@@ -2015,11 +2017,10 @@ LogicalResult Inliner::processInto(StringRef prefix, InliningLevel &il,
 }
 
 LogicalResult Inliner::processInstances(FModuleOp module, bool flatten) {
-  auto moduleName = module.getNameAttr();
   ModuleInliningContext mic(module);
 
-  LLVM_DEBUG(llvm::dbgs() << "inlining instances within " << moduleName
-                          << "...\n");
+  LLVM_DEBUG(llvm::dbgs() << "inlining instances within "
+                          << module.getNameAttr() << "...\n");
   auto visit = [&](FInstanceLike instanceLike) {
     auto instance = getInlinableInstance(instanceLike.getOperation());
     if (!instance)
@@ -2419,8 +2420,9 @@ void Inliner::writebackHierPaths() {
 
     // Forked into a fresh symbol: reuse the original op's location so the fork
     // keeps its provenance for diagnostics.
-    auto hp = hw::HierPathOp::create(b, origIt->second.getLoc(),
-                                     vnla->realizedSym, arrayAttr);
+    auto hp =
+        hw::HierPathOp::create(b, origIt->second.getLoc(), vnla->realizedSym,
+                               /*sym_visibility=*/{}, arrayAttr);
     hp.setPrivate();
     ++stats.hierPathsForked;
   }

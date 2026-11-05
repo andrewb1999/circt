@@ -20,6 +20,7 @@
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Types.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 namespace circt {
@@ -60,6 +61,7 @@ class StringType;
 class FIntegerType;
 class DomainFieldAttr;
 class ListType;
+class RegistryType;
 class PathType;
 class BoolType;
 class DoubleType;
@@ -331,7 +333,7 @@ public:
   /// Support method to enable LLVM-style type casting.
   static bool classof(Type type) {
     return llvm::isa<AnyRefType, ClassType, StringType, FIntegerType, ListType,
-                     PathType, BoolType, DoubleType>(type);
+                     RegistryType, PathType, BoolType, DoubleType>(type);
   }
 
 protected:

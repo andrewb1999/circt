@@ -36,12 +36,15 @@ class OMOp<string mnemonic, list<Trait> traits = []> :
 
 class OMClassLike<string mnemonic, list<Trait> traits = []> :
   OMOp<mnemonic, traits # [
-    Symbol, RegionKindInterface, IsolatedFromAbove,
+    SymbolName, SymbolVisibility, Symbol,
+    RegionKindInterface,
+    IsolatedFromAbove,
     DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmBlockArgumentNames"]>,
     DeclareOpInterfaceMethods<ClassLike>]> {
 
   let arguments = (ins
     SymbolNameAttr:$sym_name,
+    OptionalAttr<StrAttr>:$sym_visibility,
     StrArrayAttr:$formalParamNames,
     ArrayAttr:$fieldNames,
     DictionaryAttr:$fieldTypes
@@ -56,37 +59,39 @@ class OMClassLike<string mnemonic, list<Trait> traits = []> :
                    "::mlir::ArrayRef<::mlir::StringRef>":$formalParamNames,
                    "::mlir::ArrayRef<::mlir::Attribute>":$fieldNames,
                    "::mlir::ArrayRef<::mlir::NamedAttribute>":$fieldTypes), [{
-      build(odsBuilder, odsState, odsBuilder.getStringAttr(name),
+      build(odsBuilder, odsState, odsBuilder.getStringAttr(name), {},
             odsBuilder.getStrArrayAttr(formalParamNames),
             odsBuilder.getArrayAttr(fieldNames),
             odsBuilder.getDictionaryAttr(fieldTypes));
     }]>,
     OpBuilder<(ins "::mlir::Twine":$name,
                    "::mlir::ArrayRef<::mlir::StringRef>":$formalParamNames), [{
-      build(odsBuilder, odsState, odsBuilder.getStringAttr(name),
-            odsBuilder.getStrArrayAttr(formalParamNames));
+      build(odsBuilder, odsState, odsBuilder.getStringAttr(name), {},
+            odsBuilder.getStrArrayAttr(formalParamNames),
+            odsBuilder.getArrayAttr({}), odsBuilder.getDictionaryAttr({}));
     }]>,
     OpBuilder<(ins "::mlir::Twine":$name), [{
-      build(odsBuilder, odsState, odsBuilder.getStringAttr(name),
-            odsBuilder.getStrArrayAttr({}));
+      build(odsBuilder, odsState, odsBuilder.getStringAttr(name), {},
+            odsBuilder.getStrArrayAttr({}), odsBuilder.getArrayAttr({}),
+            odsBuilder.getDictionaryAttr({}));
     }]>,
     OpBuilder<(ins "::mlir::Twine":$name,
                    "::mlir::ArrayAttr":$fieldNames,
                    "::mlir::DictionaryAttr":$fieldTypes), [{
-      build(odsBuilder, odsState, odsBuilder.getStringAttr(name),
+      build(odsBuilder, odsState, odsBuilder.getStringAttr(name), {},
             odsBuilder.getStrArrayAttr({}), fieldNames, fieldTypes);
     }]>,
     OpBuilder<(ins "::mlir::Twine":$name,
                    "::mlir::ArrayRef<::mlir::StringRef>":$formalParamNames,
                    "::mlir::ArrayAttr":$fieldNames,
                    "::mlir::DictionaryAttr":$fieldTypes), [{
-      build(odsBuilder, odsState, odsBuilder.getStringAttr(name),
+      build(odsBuilder, odsState, odsBuilder.getStringAttr(name), {},
             odsBuilder.getStrArrayAttr(formalParamNames), fieldNames,
             fieldTypes);
     }]>,
     OpBuilder<(ins "::mlir::StringAttr":$name,
                    "::mlir::ArrayAttr":$formalParamNames), [{
-      build(odsBuilder, odsState, name, formalParamNames,
+      build(odsBuilder, odsState, name, {}, formalParamNames,
             odsBuilder.getArrayAttr({}), odsBuilder.getDictionaryAttr({}));
 
     }]>
@@ -299,6 +304,7 @@ def ListCreateOp : OMOp<"list_create", [Pure, SameTypeOperands]> {
   );
 
   let hasCustomAssemblyFormat = 1;
+  let hasFolder = 1;
 }
 
 def ListConcatOp : OMOp<"list_concat", [Pure, SameOperandsAndResultType]> {
@@ -316,6 +322,19 @@ def ListConcatOp : OMOp<"list_concat", [Pure, SameOperandsAndResultType]> {
   let results = (outs ListType:$result);
 
   let assemblyFormat = "$subLists attr-dict `:` type($result)";
+  let hasFolder = 1;
+}
+
+def ListContainsOp : OMOp<"list_contains", [Pure,
+    TypesMatchWith<"list element type should match search element type",
+                   "list", "element",
+                   "cast<ListType>($_self).getElementType()">]> {
+  let summary = "Check if a list contains a value";
+  let arguments = (ins ListType:$list,
+                       AnyTypeOf<[StringType, OMIntegerType, I1]>:$element);
+  let results = (outs I1:$result);
+  let assemblyFormat = "$list `,` $element attr-dict `:` type($list)";
+  let hasFolder = 1;
 }
 
 def BasePathCreateOp : OMOp<"basepath_create", [Pure,
@@ -551,6 +570,52 @@ def IntegerShlOp : IntegerBinaryOp<"integer.shl"> {
     %2 = om.integer.shl %0, %1 : !om.integer
     ```
   }];
+}
+
+def IntegerBitAndOp : IntegerBinaryOp<"integer.bitand", [Commutative]> {
+  let summary = "Compute the bitwise AND of two OMIntegerType values";
+  let description = [{
+    Perform arbitrary precision signed integer bitwise AND of two OMIntegerType
+    values.
+
+    Example:
+    ```mlir
+    %2 = om.integer.bitand %0, %1 : !om.integer
+    ```
+  }];
+}
+
+def IntegerBitOrOp : IntegerBinaryOp<"integer.bitor", [Commutative]> {
+  let summary = "Compute the bitwise OR of two OMIntegerType values";
+  let description = [{
+    Perform arbitrary precision signed integer bitwise OR of two OMIntegerType
+    values.
+
+    Example:
+    ```mlir
+    %2 = om.integer.bitor %0, %1 : !om.integer
+    ```
+  }];
+}
+
+def IntegerBitNotOp : OMOp<"integer.bitnot", [Pure]> {
+  let summary = "Compute the bitwise NOT of an OMIntegerType value";
+  let description = [{
+    Perform arbitrary precision signed integer bitwise NOT of an OMIntegerType
+    value.
+
+    Example:
+    ```mlir
+    %1 = om.integer.bitnot %0 : !om.integer
+    ```
+  }];
+
+  let arguments = (ins OMIntegerType:$input);
+
+  let results = (outs OMIntegerType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($result)";
+  let hasFolder = 1;
 }
 
 def StringConcatOp : OMOp<"string.concat", [Pure, SameOperandsAndResultType]> {

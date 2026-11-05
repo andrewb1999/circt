@@ -25,7 +25,11 @@
 "test.attrs"() {a = #axi4.burst_set<<incr, len = 8>, <fixed, len = 4>>} : () -> ()
 // CHECK: #axi4.burst_set<<incr, len = 8>>
 "test.attrs"() {a = #axi4.burst_set<<incr, len = 8>, <incr, len = 8>>} : () -> ()
-// CHECK: #axi4.burst_set<<fixed, len = 16>, <incr, len = 1>, <incr, len = 256>, <wrap, len = 2>>
+
+// Check a len subsumes the shorter ones of its kind, and only of its kind
+// CHECK: #axi4.burst_set<<incr, len = 8>>
+"test.attrs"() {a = #axi4.burst_set<<incr, len = 8>, <incr, len = 4>>} : () -> ()
+// CHECK: #axi4.burst_set<<fixed, len = 16>, <incr, len = 256>, <wrap, len = 2>>
 "test.attrs"() {a = #axi4.burst_set<<wrap, len = 2>, <incr, len = 256>, <incr, len = 1>, <fixed, len = 16>>} : () -> ()
 
 // CHECK: #axi4.window<base = 0x4000, last = 0x40ff, burst_specs = <<fixed, len = 4>>>
@@ -77,3 +81,124 @@
 // Check fields may be given in any order, and are printed in a canonical one
 // CHECK: !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
 "test.port"() : () -> !axi4.port<outstanding_reads = 4, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, data_width = 64, user_width = 0, addr_width = 32, outstanding_writes = 4, read_id_width = 4, write_id_width = 4>
+
+//===----------------------------------------------------------------------===//
+// Operations
+//===----------------------------------------------------------------------===//
+
+!port = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 3, user_width = 4, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+// Typedefs for port channel structs
+!aw = !hw.struct<id: i5, addr: i32, len: i8, size: i3, burst: i2, lock: i1, cache: i4, prot: i3, qos: i4, region: i4, user: i4>
+!w = !hw.struct<data: i64, strb: i8, last: i1, user: i4>
+!ar = !hw.struct<id: i3, addr: i32, len: i8, size: i3, burst: i2, lock: i1, cache: i4, prot: i3, qos: i4, region: i4, user: i4>
+!b = !hw.struct<id: i5, resp: i2, user: i4>
+!r = !hw.struct<id: i3, data: i64, resp: i2, last: i1, user: i4>
+
+// CHECK-LABEL: hw.module @AbstractEndpoints
+hw.module @AbstractEndpoints(in %clk : !seq.clock, in %rst_ni : i1) {
+  // CHECK: %[[MGR:.+]] = axi4.abstract_manager %clk, %rst_ni {a} : !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 3, user_width = 4, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+  %mgr = axi4.abstract_manager %clk, %rst_ni {a} : !port
+  // CHECK: axi4.abstract_subordinate %clk, %rst_ni, %[[MGR]] concurrent_writes 2 concurrent_reads 3 {b} : !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 3, user_width = 4, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+  axi4.abstract_subordinate %clk, %rst_ni, %mgr concurrent_writes 2 concurrent_reads 3 {b} : !port
+}
+
+// CHECK-LABEL: hw.module @Subordinate
+hw.module @Subordinate(in %clk : !seq.clock, in %rst_ni : i1,
+                       in %aw : !aw, in %aw_valid : i1,
+                       in %w : !w, in %w_valid : i1,
+                       in %b_ready : i1,
+                       in %ar : !ar, in %ar_valid : i1,
+                       in %r_ready : i1) {
+  // CHECK: %port, %aw_ready, %w_ready, %b, %b_valid, %ar_ready, %r, %r_valid = axi4.channel_structs_to_port %clk, %rst_ni aw %aw, %aw_valid w %w, %w_valid b %b_ready ar %ar, %ar_valid r %r_ready : !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 3, user_width = 4, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+  %port, %aw_ready, %w_ready, %b, %b_valid, %ar_ready, %r, %r_valid =
+    axi4.channel_structs_to_port %clk, %rst_ni
+      aw %aw, %aw_valid w %w, %w_valid b %b_ready
+      ar %ar, %ar_valid r %r_ready : !port
+}
+
+// CHECK-LABEL: hw.module @Manager
+hw.module @Manager(in %clk : !seq.clock, in %rst_ni : i1, in %port : !port,
+                   in %aw_ready : i1, in %w_ready : i1,
+                   in %b : !b, in %b_valid : i1,
+                   in %ar_ready : i1,
+                   in %r : !r, in %r_valid : i1) {
+  // CHECK: %aw, %aw_valid, %w, %w_valid, %b_ready, %ar, %ar_valid, %r_ready = axi4.port_to_channel_structs %clk, %rst_ni, %port aw %aw_ready w %w_ready b %b, %b_valid ar %ar_ready r %r, %r_valid concurrent_writes 2 concurrent_reads 3 : !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 3, user_width = 4, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+  %aw, %aw_valid, %w, %w_valid, %b_ready, %ar, %ar_valid, %r_ready =
+    axi4.port_to_channel_structs %clk, %rst_ni, %port
+      aw %aw_ready w %w_ready b %b, %b_valid
+      ar %ar_ready r %r, %r_valid
+      concurrent_writes 2 concurrent_reads 3 : !port
+}
+
+// Typedefs for two managers sharing three subordinates
+!mgr1 = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>, <base = 0x2000, last = 0x2fff, burst_specs = <<fixed, len = 4>>>, <base = 0x4000, last = 0x4fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!mgr2 = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 2, outstanding_reads = 2>
+!sub1 = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 5, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 6, outstanding_reads = 6>
+!sub2 = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 5, user_width = 0, windows = <<base = 0x2000, last = 0x2fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+!sub3 = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 5, user_width = 0, windows = <<base = 0x4000, last = 0x4fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+
+// CHECK-LABEL: hw.module @Crossbar
+hw.module @Crossbar(in %clk : !seq.clock, in %rst_ni : i1) {
+  // CHECK: %[[MGR1:.+]] = axi4.abstract_manager
+  %mgr1 = axi4.abstract_manager %clk, %rst_ni : !mgr1
+  // CHECK: %[[MGR2:.+]] = axi4.abstract_manager
+  %mgr2 = axi4.abstract_manager %clk, %rst_ni : !mgr2
+  // CHECK: %[[XBAR:.+]]:3 = axi4.xbar %clk, %rst_ni mgrs %[[MGR1]], %[[MGR2]] : (!axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>, <base = 0x2000, last = 0x2fff, burst_specs = <<fixed, len = 4>>>, <base = 0x4000, last = 0x4fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>, !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 2, outstanding_reads = 2>) -> (!axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 5, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 6, outstanding_reads = 6>, !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 5, user_width = 0, windows = <<base = 0x2000, last = 0x2fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>, !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 5, user_width = 0, windows = <<base = 0x4000, last = 0x4fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>)
+  %sub1, %sub2, %sub3 = axi4.xbar %clk, %rst_ni mgrs %mgr1, %mgr2
+    : (!mgr1, !mgr2) -> (!sub1, !sub2, !sub3)
+  // CHECK: axi4.abstract_subordinate %clk, %rst_ni, %[[XBAR]]#0 concurrent_writes 6 concurrent_reads 6 :
+  axi4.abstract_subordinate %clk, %rst_ni, %sub1 concurrent_writes 6 concurrent_reads 6 : !sub1
+  // CHECK: axi4.abstract_subordinate %clk, %rst_ni, %[[XBAR]]#1 concurrent_writes 4 concurrent_reads 4 :
+  axi4.abstract_subordinate %clk, %rst_ni, %sub2 concurrent_writes 4 concurrent_reads 4 : !sub2
+  // CHECK: axi4.abstract_subordinate %clk, %rst_ni, %[[XBAR]]#2 concurrent_writes 4 concurrent_reads 4 :
+  axi4.abstract_subordinate %clk, %rst_ni, %sub3 concurrent_writes 4 concurrent_reads 4 : !sub3
+}
+
+// Typedefs for a manager whose window is split across two subordinates
+!split_mgr = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0x1fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 2, outstanding_reads = 2>
+!split_lo = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 2, outstanding_reads = 2>
+!split_hi = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x1000, last = 0x1fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 2, outstanding_reads = 2>
+
+// Check a single manager needs no additional ID bits, and that its windows need
+// not line up with the downstream ones
+// CHECK-LABEL: hw.module @SplitWindow
+hw.module @SplitWindow(in %clk : !seq.clock, in %rst_ni : i1) {
+  // CHECK: %[[MGR:.+]] = axi4.abstract_manager
+  %mgr = axi4.abstract_manager %clk, %rst_ni : !split_mgr
+  // CHECK: %[[XBAR:.+]]:2 = axi4.xbar %clk, %rst_ni mgrs %[[MGR]] : (!axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0x1fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 2, outstanding_reads = 2>) -> (!axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 2, outstanding_reads = 2>, !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x1000, last = 0x1fff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 2, outstanding_reads = 2>)
+  %lo, %hi = axi4.xbar %clk, %rst_ni mgrs %mgr : (!split_mgr) -> (!split_lo, !split_hi)
+  // CHECK: axi4.abstract_subordinate %clk, %rst_ni, %[[XBAR]]#0 concurrent_writes 2 concurrent_reads 2 :
+  axi4.abstract_subordinate %clk, %rst_ni, %lo concurrent_writes 2 concurrent_reads 2 : !split_lo
+  // CHECK: axi4.abstract_subordinate %clk, %rst_ni, %[[XBAR]]#1 concurrent_writes 2 concurrent_reads 2 :
+  axi4.abstract_subordinate %clk, %rst_ni, %hi concurrent_writes 2 concurrent_reads 2 : !split_hi
+}
+
+// Typedefs for a manager whose subordinate takes longer bursts than it issues
+!short_mgr = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<incr, len = 4>>>>, outstanding_writes = 2, outstanding_reads = 2>
+!long_sub = !axi4.port<addr_width = 32, data_width = 64, write_id_width = 4, read_id_width = 4, user_width = 0, windows = <<base = 0x0, last = 0xfff, burst_specs = <<incr, len = 16>>>>, outstanding_writes = 2, outstanding_reads = 2>
+
+// Check a 'len' is a maximum, so a subordinate may take longer bursts than the
+// manager issues
+// CHECK-LABEL: hw.module @LongerBurstSubordinate
+hw.module @LongerBurstSubordinate(in %clk : !seq.clock, in %rst_ni : i1) {
+  // CHECK: %[[MGR:.+]] = axi4.abstract_manager
+  %mgr = axi4.abstract_manager %clk, %rst_ni : !short_mgr
+  // CHECK: %[[XBAR:.+]] = axi4.xbar %clk, %rst_ni mgrs %[[MGR]]
+  %sub = axi4.xbar %clk, %rst_ni mgrs %mgr : (!short_mgr) -> !long_sub
+  // CHECK: axi4.abstract_subordinate %clk, %rst_ni, %[[XBAR]] concurrent_writes 2 concurrent_reads 2 :
+  axi4.abstract_subordinate %clk, %rst_ni, %sub concurrent_writes 2 concurrent_reads 2 : !long_sub
+}
+
+// CHECK-LABEL: hw.module @Cut
+hw.module @Cut(in %clk : !seq.clock, in %rst_ni : i1, in %upstream : !port) {
+  // CHECK: axi4.cut %clk, %rst_ni, %upstream : !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 3, user_width = 4, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+  %cut = axi4.cut %clk, %rst_ni, %upstream : !port
+}
+
+// CHECK-LABEL: hw.module @Cdc
+hw.module @Cdc(in %upstream_clk : !seq.clock, in %downstream_clk : !seq.clock,
+               in %rst_ni : i1, in %upstream : !port) {
+  // CHECK: axi4.cdc from %upstream_clk to %downstream_clk, %rst_ni, %upstream : !axi4.port<addr_width = 32, data_width = 64, write_id_width = 5, read_id_width = 3, user_width = 4, windows = <<base = 0x0, last = 0xfff, burst_specs = <<fixed, len = 4>>>>, outstanding_writes = 4, outstanding_reads = 4>
+  %cdc = axi4.cdc from %upstream_clk to %downstream_clk, %rst_ni, %upstream : !port
+}

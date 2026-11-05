@@ -3,6 +3,7 @@ add_circt_public_c_api_library(CIRCTCAPIConversion
 
   LINK_LIBS PUBLIC
   CIRCTAffineToSCF
+  CIRCTAXI4ToHW
   CIRCTSCFToLoopSchedule
   CIRCTSynthToComb
   CIRCTArcToLLVM
@@ -35,6 +36,7 @@ add_circt_public_c_api_library(CIRCTCAPIConversion
   CIRCTLTLToCore
   CIRCTMooreToCore
   CIRCTPipelineToHW
+  CIRCTProbeToSV
   CIRCTSCFToCalyx
   CIRCTSeqToSV
   CIRCTSimToSV
