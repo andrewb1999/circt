@@ -613,6 +613,9 @@ static LogicalResult wrapDynamicOpsInPipeline(LoopSchedulePipelineOp pipeline,
 
 struct BucketContent {
   uint32_t offset;
+  // The schedule's time of the bucket (its offset counts from its phase's
+  // start, which may be shifted: see lowerSchedule).
+  uint32_t time;
   SmallVector<Operation *> staticOps;
   // Dynamic-latency ops: emitted inside a `loopschedule.launch` and
   // produce a handle (await'd by a downstream frame). Includes loop ops
@@ -3291,6 +3294,51 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
 
   SmallVector<PendingLaunch> pendingLaunches;
 
+  // A multi-cycle result issued in one phase and read in a later one: the
+  // reader's frame starts when the frames between have ended, which may be
+  // sooner than the result is ready (a frame ends at its launch, and the
+  // child it awaits can finish at once), so the reader's phase is shifted to
+  // start no earlier than the result is, counting only the frames' cycles.
+  // (A phase's offsets are otherwise from its first op, which drops the gap
+  // the schedule left after the launch.)
+  SmallVector<uint32_t> phaseShift(phases.size(), 0);
+  {
+    SmallVector<int64_t> phaseStart(phases.size(), 0);
+    int64_t elapsed = 0;
+    for (auto phaseIdx : llvm::seq<size_t>(0, phases.size())) {
+      auto &bucketTimes = phases[phaseIdx];
+      int64_t shift = 0;
+      for (auto t : bucketTimes)
+        for (auto *op : startGroups[t]) {
+          if (isLaunchLike(op))
+            continue;
+          for (Value operand : op->getOperands()) {
+            Operation *src = operand.getDefiningOp();
+            if (!src || !problem.hasOperation(src) || isLaunchLike(src))
+              continue;
+            auto srcStart = problem.getStartTime(src);
+            auto srcPhase = srcStart ? bucketTimeToPhase.find(*srcStart)
+                                     : bucketTimeToPhase.end();
+            if (srcPhase == bucketTimeToPhase.end() ||
+                srcPhase->second >= phaseIdx)
+              continue;
+            unsigned latency =
+                *problem.getLatency(*problem.getLinkedOperatorType(src));
+            if (latency == 0)
+              continue;
+            size_t a = srcPhase->second;
+            int64_t ready = phaseStart[a] + phaseShift[a] +
+                            (*srcStart - phases[a].front()) + latency;
+            int64_t read = elapsed + (t - bucketTimes.front());
+            shift = std::max(shift, ready - read);
+          }
+        }
+      phaseShift[phaseIdx] = shift;
+      phaseStart[phaseIdx] = elapsed;
+      elapsed += shift + (bucketTimes.back() - bucketTimes.front() + 1);
+    }
+  }
+
   // === Per-phase loop ===
   for (auto phaseIdx : llvm::seq<size_t>(0, phases.size())) {
     auto &bucketTimes = phases[phaseIdx];
@@ -3299,7 +3347,8 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
     SmallVector<BucketContent> buckets;
     for (auto t : bucketTimes) {
       BucketContent bc;
-      bc.offset = t - phaseBase;
+      bc.offset = t - phaseBase + phaseShift[phaseIdx];
+      bc.time = t;
       for (auto *op : startGroups[t]) {
         if (isLaunchLike(op))
           bc.dynamicOps.push_back(op);
@@ -3352,7 +3401,7 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
             auto iterArgNum = operand.getOperandNumber();
             auto iterArg = S.iterArgs->afterArgs[iterArgNum];
             if (operand.get().getDefiningOp() == op &&
-                valueHasLaterUse(iterArg, phaseBase + bc.offset)) {
+                valueHasLaterUse(iterArg, bc.time)) {
               IterArgExport iae;
               iae.bucket = &bc;
               iae.op = op;
@@ -3367,7 +3416,7 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
     }
 
     for (auto &bc : buckets) {
-      uint32_t bt = phaseBase + bc.offset;
+      uint32_t bt = bc.time;
       for (auto val : reregisterValues[bt]) {
         reregExports.emplace_back(bt, val);
         stepTypes.push_back(val.getType());
@@ -3554,7 +3603,7 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
           slots.push_back(s);
         }
       }
-      uint32_t bt = phaseBase + bc.offset;
+      uint32_t bt = bc.time;
       for (auto &re : reregExports) {
         if (re.first != bt)
           continue;
@@ -3819,7 +3868,7 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
 
     // Compute reregister values for the next bucket time.
     for (auto &bc : buckets) {
-      uint32_t bt = phaseBase + bc.offset;
+      uint32_t bt = bc.time;
       for (auto *op : bc.staticOps) {
         if (auto load = dyn_cast<LoopScheduleLoadOp>(op)) {
           if (hasLaterUse(op, bt + 1))
