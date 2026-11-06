@@ -53,11 +53,12 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
       resourcesToTaskIntervals;
 
   // First get horizon, i.e., the time taken if all operations were executed
-  // sequentially.
+  // sequentially. A task takes a time step of its resource even at latency 0
+  // (its occupancy interval below has size 1), so it counts at least one.
   unsigned horizon = 0;
   for (auto *task : tasks) {
     unsigned duration = *prob.getLatency(*prob.getLinkedOperatorType(task));
-    horizon += duration;
+    horizon += std::max(duration, 1u);
   }
 
   // Build task-interval decision variables, which effectively serve to

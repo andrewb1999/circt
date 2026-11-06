@@ -429,6 +429,8 @@ else()
   find_package(ortools CONFIG)
 
   if (ortools_FOUND)
+    # The `or-tools` lit feature (test/lit.site.cfg.py.in).
+    set(SCHEDULING_OR_TOOLS 1)
     get_filename_component(ortools_CMAKEDIR ${ortools_DIR} DIRECTORY)
     get_filename_component(ortools_LIBDIR ${ortools_CMAKEDIR} DIRECTORY)
     list(APPEND CMAKE_INSTALL_RPATH ${ortools_LIBDIR})
