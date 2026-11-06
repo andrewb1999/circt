@@ -49,7 +49,45 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
             "operator), as the schedule places it, in ns. Operator binding "
             "shares an operator only among users whose slack takes the "
             "mux the sharing puts on their inputs (and removes the "
-            "attribute).">
+            "attribute).">,
+    Option<"scheduler", "scheduler", "std::string", "\"simplex\"",
+            "The scheduler: `simplex` schedules each op on the operator "
+            "allocation chose; `cpsat` (built with OR-Tools) also chooses "
+            "each op's operator among its `loopschedule.candidates` and "
+            "binds the ops of shareable operators to instances, with the "
+            "mux sharing puts on an instance's operands in the chaining, "
+            "stamping `loopschedule.operator` and `loopschedule.binding`. "
+            "A region it finds no solution for keeps the simplex's.">,
+    Option<"cpsatTimeLimit", "cpsat-time-limit", "double", "10.0",
+            "The deterministic time limit of each of the CP-SAT scheduler's "
+            "phases (length, area, start times), per region, in seconds.">,
+    Option<"cpsatWorkers", "cpsat-workers", "int", "1",
+            "The CP-SAT solver's workers. One (the default) searches the "
+            "same way every run; more run its parallel portfolio, faster on "
+            "large regions, whose solution within the time limit may vary.">,
+    Option<"cpsatDspWeight", "cpsat-dsp-weight", "double", "200.0",
+            "The area of a DSP in LUTs, for the CP-SAT scheduler's area "
+            "objective (operators carry `amc.area_lut` and `amc.area_dsp`).">,
+    Option<"cpsatPipelineSlack", "cpsat-pipeline-slack", "int", "2",
+            "Cycles a pipeline's depth may exceed its minimum by to save "
+            "area (its II never changes); negative for no bound.">,
+    Option<"cpsatBodySlack", "cpsat-body-slack", "int", "-1",
+            "Cycles a function body's length may exceed its minimum by to "
+            "save area; negative for no bound.">,
+    Option<"cpsatLoopSlack", "cpsat-loop-slack", "int", "1",
+            "Cycles a sequential loop's body may exceed its minimum length "
+            "by to save area; negative for no bound.">,
+    Option<"cpsatCycleCost", "cpsat-cycle-cost", "double", "100.0",
+            "The area (in LUTs) a cycle of a loop's length (a sequential "
+            "body's, a pipeline's depth) is worth: within its slack a loop "
+            "takes a cycle more only to save more (half a DSP, by "
+            "default).">,
+    ListOption<"shareMuxDelays", "share-mux-delays", "float",
+            "The delay of a shared instance's operand mux for 2, 3, ... "
+            "users, in ns, for the CP-SAT scheduler.">,
+    ListOption<"shareMuxNorDelays", "share-mux-nor-delays", "float",
+            "The same for an instance with a user in a pipeline, whose "
+            "first user's standing NOR is a signal of its own.">
   ];
 }
 

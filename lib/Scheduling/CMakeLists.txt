@@ -1,6 +1,7 @@
 set(LLVM_OPTIONAL_SOURCES
   ASAPScheduler.cpp
   ChainingSupport.cpp
+  CPSATChaining.cpp
   CPSATSchedulers.cpp
   LPSchedulers.cpp
   Problems.cpp
@@ -23,7 +24,8 @@ set(SCHEDULING_LIBS
   )
 
 if(ortools_FOUND)
-  list(APPEND SCHEDULING_SOURCES LPSchedulers.cpp CPSATSchedulers.cpp)
+  list(APPEND SCHEDULING_SOURCES LPSchedulers.cpp CPSATSchedulers.cpp
+       CPSATChaining.cpp)
   list(APPEND SCHEDULING_LIBS ortools::ortools)
 endif()
 

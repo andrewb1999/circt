@@ -77,7 +77,14 @@ def LoopScheduleBinding : Pass<"loopschedule-binding", "mlir::ModuleOp"> {
            "given, extrapolated by its last step). Given, a share-mode op "
            "stays off a shared instance whose mux its "
            "`loopschedule.chain_slack` (recorded by the scheduler) does not "
-           "take. Empty: no check.">
+           "take. Empty: no check.">,
+    Option<"keepBindings", "keep-bindings", "bool", "false",
+           "Keep the `loopschedule.binding` an op already has (the CP-SAT "
+           "scheduler's, which sized each instance's mux in the schedule), "
+           "checking only that no two ops on an instance issue at once and "
+           "the carried-result rule: an op that breaks either moves to an "
+           "instance of its own. Ops without one bind as usual, past the "
+           "kept instances.">
   ];
 }
 

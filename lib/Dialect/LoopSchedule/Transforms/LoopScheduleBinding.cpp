@@ -256,6 +256,57 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
     ++oprOpCount[oprName];
   }
 
+  // Bindings the scheduler made: kept, each op off its instance where it
+  // issues with another user or its carried result needs the instance alone.
+  // The rest bind below, past them.
+  llvm::StringMap<int64_t> keptPast;
+  if (keepBindings) {
+    SmallVector<Candidate> rest;
+    std::map<std::pair<std::string, int64_t>, SmallVector<Operation *>> groups;
+    binding::BindingProblem prob(funcOp);
+    for (auto &cand : candidates) {
+      auto id = cand.op->getAttrOfType<IntegerAttr>("loopschedule.binding");
+      if (!id || cand.declaredLimit) {
+        rest.push_back(cand);
+        continue;
+      }
+      Operation *op = cand.op;
+      prob.insertOperation(op);
+      prob.setStartTime(op, *stAnalysis.getStartTime(op));
+      prob.setLatency(op, 1);
+      if (auto period = stAnalysis.getPeriod(op); period && *period > 0)
+        prob.setPeriod(op, *period);
+      if (auto count = stAnalysis.getCount(op); count && *count > 1)
+        prob.setCount(op, *count);
+      if (auto *group = stAnalysis.getConcurrencyGroup(op))
+        prob.setConcurrencyGroup(op, group);
+      groups[{cand.oprName.str(), id.getInt()}].push_back(op);
+      int64_t &past = keptPast[cand.oprName];
+      past = std::max(past, id.getInt() + 1);
+    }
+    auto *ctx = funcOp->getContext();
+    auto i64 = IntegerType::get(ctx, 64);
+    for (auto &[key, ops] : groups) {
+      SmallVector<Operation *> stay;
+      for (Operation *op : ops) {
+        unsigned latency = opLibAnalysis.getOperatorLatency(key.first);
+        bool conflict =
+            (ops.size() > 1 && latency && readsCarriedPastReady(op, latency)) ||
+            llvm::any_of(stay, [&](Operation *o) { return prob.conflicts(o, op); });
+        if (!conflict) {
+          stay.push_back(op);
+          continue;
+        }
+        op->emitRemark("moves off the instance the scheduler bound it to (")
+            << key.second << "): it would issue with another user, or its "
+            << "carried result needs the instance alone";
+        op->setAttr("loopschedule.binding",
+                    IntegerAttr::get(i64, keptPast[key.first]++));
+      }
+    }
+    candidates = std::move(rest);
+  }
+
   if (candidates.empty())
     return success();
 
@@ -385,8 +436,12 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
 
   auto *ctx = funcOp->getContext();
   auto i64 = IntegerType::get(ctx, 64);
-  for (auto [op, inst] : instanceOf)
-    op->setAttr("loopschedule.binding", IntegerAttr::get(i64, inst));
+  for (auto [op, inst] : instanceOf) {
+    auto oprAttr = op->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+    int64_t past =
+        oprAttr ? keptPast.lookup(oprAttr.getLeafReference().getValue()) : 0;
+    op->setAttr("loopschedule.binding", IntegerAttr::get(i64, inst + past));
+  }
   return success();
 }
 
