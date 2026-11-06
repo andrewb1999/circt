@@ -14,6 +14,7 @@
 #define CIRCT_DIALECT_LOOPSCHEDULE_LOOPSCHEDULETYPES_TD
 
 include "mlir/IR/AttrTypeBase.td"
+include "circt/Dialect/LoopSchedule/LoopScheduleDialect.td"
 
 class LoopScheduleType<string name, string typeMnemonic>
     : TypeDef<LoopSchedule_Dialect, name> {

@@ -530,6 +530,15 @@ def ClassImpl : PropImplType<"Class", [
     FlatSymbolRefAttr getNameAttr() const;
 
     ArrayRef<ClassElement> getElements() const;
+
+    /// Return the input elements in declaration order.
+    auto getInputElements() const {
+      return llvm::make_filter_range(getElements(),
+                                     [](const ClassElement &element) {
+                                       return element.direction == Direction::In;
+                                     });
+    }
+
     size_t getNumElements() const { return getElements().size(); }
     const ClassElement &getElement(IntegerAttr index) const;
     const ClassElement &getElement(size_t index) const;
@@ -576,6 +585,22 @@ def ListImpl : PropImplType<"List"> {
   let genStorageClass = true;
   let genAccessors = true;
   let typeName = "firrtl.propList";
+}
+
+def RegistryImpl : PropImplType<"Registry"> {
+  let summary = [{
+    An unordered mutable collection of property values for domain asset tracking.
+
+    Registry types may only appear as fields of domain definitions. Values are
+    accumulated with `firrtl.domain.insert` rather than normal property
+    assignment. Downstream consumers must treat registry contents as
+    order-independent.
+  }];
+  let parameters = (ins TypeParameter<"circt::firrtl::PropertyType",
+                                      "element type">:$elementType);
+  let genStorageClass = true;
+  let genAccessors = true;
+  let typeName = "firrtl.propRegistry";
 }
 
 def PathImpl : PropImplType<"Path"> {

@@ -17,7 +17,6 @@
 using namespace circt;
 using namespace hw;
 using namespace seq;
-using llvm::MapVector;
 
 #define DEBUG_TYPE "lower-seq-firmem"
 
@@ -156,8 +155,8 @@ FlatSymbolRefAttr FirMemLowering::getOrCreateSchema() {
           "writeClockIDs",  "initFilename",
           "initIsBinary",   "initIsInline"};
       schemaOp = hw::HWGeneratorSchemaOp::create(
-          builder, circuit.getLoc(), "FIRRTLMem", "FIRRTL_Memory",
-          builder.getStrArrayAttr(schemaFields));
+          builder, circuit.getLoc(), "FIRRTLMem", /*sym_visibility=*/{},
+          "FIRRTL_Memory", builder.getStrArrayAttr(schemaFields));
     }
   }
   return FlatSymbolRefAttr::get(schemaOp);
@@ -340,8 +339,8 @@ void FirMemLowering::lowerMemoriesInModule(
     auto it = constOneOps.try_emplace(width, Value{});
     if (it.second) {
       auto builder = OpBuilder::atBlockBegin(module.getBodyBlock());
-      it.first->second = hw::ConstantOp::create(
-          builder, module.getLoc(), builder.getIntegerType(width), 1);
+      it.first->second = hw::ConstantOp::create(builder, module.getLoc(),
+                                                APInt::getAllOnes(width));
     }
     return it.first->second;
   };

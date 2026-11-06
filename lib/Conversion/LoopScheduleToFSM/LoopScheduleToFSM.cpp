@@ -10407,7 +10407,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
   }
 
   // Create the ONE function machine (embedded levels included).
-  std::string funcName = funcOp.getName().str();
+  std::string funcName = funcOp.getSymName().str();
   std::string fsmName = funcName + "_fsm";
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   builder.setInsertionPointToEnd(moduleOp.getBody());
@@ -11402,7 +11402,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       Value active = entryRunningSignals[ei];
       Value zero1 = hw::ConstantOp::create(builder, loc, i1, 0);
       std::string base =
-          funcOp.getName().str() + "_fdyn" + std::to_string(ei);
+          funcOp.getSymName().str() + "_fdyn" + std::to_string(ei);
 
       // Request-held latch: the start pulse is one cycle, but the port may
       // not be ready that cycle. Clears when the entry deactivates, so a
@@ -11554,7 +11554,7 @@ LogicalResult LoopScheduleToFSMPass::lowerFunction(loopschedule::LoopScheduleFun
       seqMux.cycleGates = entryCycleGates[ei];
       seqMux.clk = clk;
       seqMux.rst = rst;
-      seqMux.regPrefix = funcOp.getName().str() + "_e" + std::to_string(ei);
+      seqMux.regPrefix = funcOp.getSymName().str() + "_e" + std::to_string(ei);
       SeqPortMuxCtx *seqMuxPtr = seqMux.multi.empty() ? nullptr : &seqMux;
       if (failed(lowerFrameBody(&topFrames[frameIdx].getBodyBlock(), builder,
                                 mapping, entryCycleGates[ei],

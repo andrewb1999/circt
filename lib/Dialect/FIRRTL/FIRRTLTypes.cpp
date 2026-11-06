@@ -153,6 +153,11 @@ static LogicalResult customTypePrinter(Type type, AsmPrinter &os) {
         printNestedType(listType.getElementType(), os);
         os << '>';
       })
+      .Case<RegistryType>([&](auto registryType) {
+        os << "registry<";
+        printNestedType(registryType.getElementType(), os);
+        os << '>';
+      })
       .Case<PathType>([&](auto pathType) { os << "path"; })
       .Case<BaseTypeAliasType>([&](BaseTypeAliasType alias) {
         os << "alias<" << alias.getName().getValue() << ", ";
@@ -523,6 +528,20 @@ static OptionalParseResult customTypeParser(AsmParser &parser, StringRef name,
         parser.parseGreater())
       return failure();
     result = parser.getChecked<ListType>(context, elementType);
+    if (!result)
+      return failure();
+    return success();
+  }
+  if (name == "registry") {
+    if (isConst) {
+      parser.emitError(parser.getNameLoc(), "registries cannot be const");
+      return failure();
+    }
+    PropertyType elementType;
+    if (parser.parseLess() || parseNestedPropertyType(elementType, parser) ||
+        parser.parseGreater())
+      return failure();
+    result = RegistryType::get(context, elementType);
     if (!result)
       return failure();
     return success();
@@ -1768,6 +1787,15 @@ OpenBundleType OpenBundleType::get(MLIRContext *context,
   return Base::get(context, elements, isConst);
 }
 
+OpenBundleType
+OpenBundleType::getChecked(function_ref<InFlightDiagnostic()> emitErrorFn,
+                           MLIRContext *context,
+                           ArrayRef<BundleElement> elements, bool isConst) {
+  if (failed(verify(emitErrorFn, elements, isConst)))
+    return {};
+  return get(context, elements, isConst);
+}
+
 auto OpenBundleType::getElements() const -> ArrayRef<BundleElement> {
   return getImpl()->elements;
 }
@@ -1917,6 +1945,9 @@ OpenBundleType::verify(function_ref<InFlightDiagnostic()> emitErrorFn,
     if (type_isa<LHSType>(element.type))
       return emitErrorFn() << "bundle element " << element.name
                            << " cannot have a left-hand side type";
+    if (type_isa<DomainType>(element.type))
+      return emitErrorFn() << "bundle element " << element.name
+                           << " cannot have a domain type";
   }
 
   return success();
@@ -2108,6 +2139,15 @@ OpenVectorType OpenVectorType::get(FIRRTLType elementType, size_t numElements,
   return Base::get(elementType.getContext(), elementType, numElements, isConst);
 }
 
+OpenVectorType
+OpenVectorType::getChecked(function_ref<InFlightDiagnostic()> emitErrorFn,
+                           FIRRTLType elementType, size_t numElements,
+                           bool isConst) {
+  if (failed(verify(emitErrorFn, elementType, numElements, isConst)))
+    return {};
+  return get(elementType, numElements, isConst);
+}
+
 FIRRTLType OpenVectorType::getElementType() const {
   return getImpl()->elementType;
 }
@@ -2184,6 +2224,8 @@ OpenVectorType::verify(function_ref<InFlightDiagnostic()> emitErrorFn,
     return emitErrorFn() << "vector cannot be const with references";
   if (type_isa<LHSType>(elementType))
     return emitErrorFn() << "vector cannot have a left-hand side type";
+  if (type_isa<DomainType>(elementType))
+    return emitErrorFn() << "vector cannot have a domain type";
   return success();
 }
 

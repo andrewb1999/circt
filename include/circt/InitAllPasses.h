@@ -16,6 +16,7 @@
 
 #include "circt/Conversion/ExportVerilog.h"
 #include "circt/Conversion/Passes.h"
+#include "circt/Dialect/AXI4/AXI4Passes.h"
 #include "circt/Dialect/Arc/ArcPasses.h"
 #include "circt/Dialect/Calyx/CalyxPasses.h"
 #include "circt/Dialect/Comb/CombPasses.h"
@@ -65,6 +66,7 @@ inline void registerAllPasses() {
 
   // Standard Passes
   arc::registerPasses();
+  axi4::registerPasses();
   calyx::registerPasses();
   comb::registerPasses();
   datapath::registerPasses();

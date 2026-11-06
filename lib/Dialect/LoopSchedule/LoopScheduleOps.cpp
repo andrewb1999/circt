@@ -2003,7 +2003,8 @@ void printFuncLikeOp(OpT op, OpAsmPrinter &p, bool hasII) {
   // Replicate function_interface_impl::printFunctionOp but with `II` (and
   // the control clause) added to the elided attribute list so they don't
   // get printed twice.
-  StringRef visibilityAttrName = SymbolTable::getVisibilityAttrName();
+  StringRef visibilityAttrName =
+      SymbolOpInterface::getDefaultVisibilityAttrName();
   StringRef sym = op.getSymName();
   p << ' ';
   if (auto visibility = op->template getAttrOfType<StringAttr>(visibilityAttrName))

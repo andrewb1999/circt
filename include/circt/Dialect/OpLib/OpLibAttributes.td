@@ -14,7 +14,11 @@
 // Dialect attributes
 //===----------------------------------------------------------------------===//
 
+#ifndef CIRCT_DIALECT_OPLIB_OPLIBATTRIBUTES_TD
+#define CIRCT_DIALECT_OPLIB_OPLIBATTRIBUTES_TD
+
 include "mlir/IR/AttrTypeBase.td"
+include "circt/Dialect/OpLib/OpLibDialect.td"
 
 class OperatorProperty<Dialect dialect,
                    string name, string type,
@@ -57,3 +61,5 @@ def LatencyProp : OperatorProperty<OpLib_Dialect,
   "Latency", "unsigned"> {
   let mnemonic = "latency";
 }
+
+#endif // CIRCT_DIALECT_OPLIB_OPLIBATTRIBUTES_TD
