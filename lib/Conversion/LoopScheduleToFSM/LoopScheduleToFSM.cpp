@@ -8445,11 +8445,14 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       // Load-data FIFO: push the live rdData on each done pulse, pop on
       // consume; the consumer reads the head (or the live wire through
       // the empty bypass). The oldest response is in a head register, so
-      // the consumer reads a flop; the rest are in a shift register with
-      // one enable and no reset, which synthesis maps to SRLs (one LUT a
-      // bit for up to 32 entries, where entries written in place took a
-      // flop and a mux each: fdtd_2d's 11 FIFOs, 5632 flops), read at its
-      // oldest entry, `count - 2`, when the head pops.
+      // the consumer reads a flop; the rest are in the body, read at its
+      // oldest entry, `count - 2`, when the head pops. The body is a shift
+      // register per data bit, an `!hw.array<n x i1>` with one enable and
+      // no reset, shifted in at index 0 and read at an index: the form
+      // synthesis maps to an SRL read at its address (one LUT a bit for up
+      // to 32 entries). A register per entry, or a word-wide array, it keeps
+      // in flops and a read mux (gemver's four 23-entry FIFOs: 3,328 flops
+      // and ~950 LUTs).
       Value liveRdData =
           ei.isLoad ? memPorts.find(portValue)->second.rdData : Value();
       if (!liveRdData)
@@ -8464,7 +8467,6 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
       Value fromBody = comb::createOrFoldNot(
           hwBuilder, loc,
           comb::OrOp::create(hwBuilder, loc, isEmpty, holdsOne));
-      SmallVector<Value> body;
       Value bodyOldest;
       if (depth > 1) {
         // A response goes to the body unless the head takes it: when the
@@ -8475,15 +8477,14 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
                 hwBuilder, loc,
                 comb::OrOp::create(hwBuilder, loc, isEmpty, popsLast)),
             false);
-        for (unsigned i = 0; i + 1 < depth; ++i)
-          body.push_back(seq::CompRegClockEnabledOp::create(
-              hwBuilder, loc, i == 0 ? liveRdData : body.back(), clk,
-              bodyPush,
-              hwBuilder.getStringAttr(fifoName + "_" + std::to_string(i))));
-        if (body.size() == 1) {
-          bodyOldest = body.front();
+        unsigned entries = depth - 1;
+        if (entries == 1) {
+          bodyOldest = seq::CompRegClockEnabledOp::create(
+              hwBuilder, loc, liveRdData, clk, bodyPush,
+              hwBuilder.getStringAttr(fifoName + "_0"));
         } else {
-          auto idxTy = IntegerType::get(ctx, llvm::Log2_64_Ceil(body.size()));
+          auto i1 = hwBuilder.getI1Type();
+          auto idxTy = IntegerType::get(ctx, llvm::Log2_64_Ceil(entries));
           Value idx = comb::ExtractOp::create(
               hwBuilder, loc, idxTy,
               comb::SubOp::create(hwBuilder, loc, cntReg,
@@ -8491,11 +8492,31 @@ LogicalResult LoopScheduleToFSMPass::lowerPipelineChild(
                                                          cntTy, 2),
                                   false),
               0);
-          // hw.array_create lists the highest index first.
-          SmallVector<Value> elems(body.rbegin(), body.rend());
-          bodyOldest = hw::ArrayGetOp::create(
-              hwBuilder, loc, hw::ArrayCreateOp::create(hwBuilder, loc, elems),
-              idx);
+          Value zeroIdx = hw::ConstantOp::create(hwBuilder, loc, idxTy, 0);
+          auto bitsTy = hw::ArrayType::get(i1, entries);
+          auto lowTy = hw::ArrayType::get(i1, entries - 1);
+          unsigned width = hw::getBitWidth(liveRdData.getType());
+          SmallVector<Value> oldest; // the highest bit first, for concat
+          for (unsigned b = width; b-- > 0;) {
+            Value bit = comb::ExtractOp::create(hwBuilder, loc, i1,
+                                                liveRdData, b);
+            Backedge self = bb.get(bitsTy);
+            // {sr[entries-2:0], bit}: array_concat's first operand is the
+            // high part, so the new bit lands at index 0.
+            Value next = hw::ArrayConcatOp::create(
+                hwBuilder, loc,
+                ValueRange{hw::ArraySliceOp::create(hwBuilder, loc, lowTy,
+                                                    self, zeroIdx),
+                           hw::ArrayCreateOp::create(hwBuilder, loc,
+                                                     ValueRange{bit})});
+            Value reg = seq::CompRegClockEnabledOp::create(
+                hwBuilder, loc, next, clk, bodyPush,
+                hwBuilder.getStringAttr(fifoName + "_bit" +
+                                        std::to_string(b)));
+            self.setValue(reg);
+            oldest.push_back(hw::ArrayGetOp::create(hwBuilder, loc, reg, idx));
+          }
+          bodyOldest = comb::ConcatOp::create(hwBuilder, loc, oldest);
         }
       }
       // The head takes the arriving response when the FIFO is empty or
