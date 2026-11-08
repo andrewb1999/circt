@@ -11,16 +11,20 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Scheduling/CPSATChaining.h"
-#include "circt/Scheduling/Utilities.h"
 
-#include "mlir/IR/Operation.h"
-
+#include "google/protobuf/text_format.h"
 #include "ortools/sat/cp_model.h"
 #include "ortools/sat/sat_parameters.pb.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -48,682 +52,879 @@ namespace {
 /// Nanoseconds to the model's picoseconds.
 int64_t ps(float ns) { return std::llround(double(ns) * 1000.0); }
 
-/// One operation's candidate operator, as the model sees it.
-struct Choice {
-  Problem::OperatorType opr;
-  int64_t latency;
-  int64_t inc, out; // ps, at most the cycle
-  bool shareable;
-  double area;
-  BoolVar chosen; // valid when the operation has several choices
-};
 
-/// One instance an operation may take: one of the pool's, or a slot this
-/// region may open.
-struct Slot {
-  Problem::OperatorType opr;
-  std::optional<unsigned> poolIndex; // none for a new slot
-  unsigned existingUsers = 0;
-  int64_t rawSlack = 0; // ps; the pool's
-  bool nor = false;     // the slower table
-  BoolVar used;         // a new slot: opened
-  IntVar users;
-  // Users of regions not scheduled yet the instance keeps mux capacity for.
-  std::optional<IntVar> reserve;
-  IntVar mux; // ps
-  // The operations that may take it, with their binding literals.
-  SmallVector<std::pair<Operation *, BoolVar>, 8> takers;
-  // users >= 2.
-  BoolVar shared;
-};
-
-struct OpVars {
-  IntVar c, z, mux, ready;
-  std::optional<IntVar> mod; // c mod II
-  SmallVector<Choice, 4> choices;
-};
-
-class ChainingModel {
+class FunctionModel {
 public:
-  ChainingModel(Problem &prob, ChainingProblem &chain, SharedOperatorsProblem &shr,
-          CyclicProblem *cyclic, Operation *lastOp,
-          const CPSATChainingConfig &config, const CPSATChainingInput &input)
-      : prob(prob), chain(chain), shr(shr), cyclic(cyclic), lastOp(lastOp),
-        config(config), input(input) {}
-
-  LogicalResult run(CPSATChainingResult &result);
+  FunctionModel(const CPSATFunctionModel &m, const CPSATChainingConfig &config)
+      : m(m), config(config) {}
+  LogicalResult run(CPSATFunctionSolution &solution, std::string &why);
 
 private:
-  unsigned distance(Problem::Dependence dep) {
-    return cyclic ? cyclic->getDistance(dep).value_or(0) : 0;
+  using FM = CPSATFunctionModel;
+  struct OpV {
+    IntVar c, z, mux, ready;
+    std::optional<IntVar> mod;
+    SmallVector<BoolVar, 4> chosen; // per candidate, when several
+    bool onSlot = false;
+  };
+  struct Taker {
+    unsigned region, op;
+    BoolVar b;
+  };
+  struct SlotV {
+    unsigned opr;
+    BoolVar used, nor, shared;
+    IntVar users, md;
+    SmallVector<Taker, 8> takers;
+  };
+
+  const FM::Operator &opr(unsigned k) { return m.oprs[k]; }
+  int64_t lat(unsigned k) { return m.oprs[k].latency; }
+  int64_t inc(unsigned k) { return std::min(ps(m.oprs[k].inc), K); }
+  int64_t out(unsigned k) { return std::min(ps(m.oprs[k].out), K); }
+  std::vector<BoolVar> when(unsigned r, unsigned i, unsigned j) {
+    if (m.regions[r].ops[i].oprs.size() == 1)
+      return {};
+    return {vars[r][i].chosen[j]};
   }
-  /// The operation's latency by its choice; at least 1 with `registered`
-  /// (a value carried to a later iteration goes through a register: a
-  /// combinational one is visible the cycle after it is computed).
-  LinearExpr latencyOf(OpVars &v, bool registered = false) {
-    auto of = [&](const Choice &ch) {
-      return registered ? std::max<int64_t>(ch.latency, 1) : ch.latency;
+  LinearExpr latencyOf(unsigned r, unsigned i, bool registered) {
+    auto &op = m.regions[r].ops[i];
+    auto of = [&](unsigned k) {
+      return registered ? std::max<int64_t>(lat(k), 1) : lat(k);
     };
-    if (v.choices.size() == 1)
-      return LinearExpr(of(v.choices.front()));
+    if (op.oprs.size() == 1)
+      return LinearExpr(of(op.oprs[0]));
     LinearExpr e;
-    for (auto &ch : v.choices)
-      e += of(ch) * LinearExpr(ch.chosen);
+    for (auto [j, k] : llvm::enumerate(op.oprs))
+      e += of(k) * LinearExpr(vars[r][i].chosen[j]);
     return e;
   }
-  /// The operation keeps an instance to itself on this choice.
-  bool isAlone(Operation *op, const Choice &ch) {
-    return input.alone.contains(op) ||
-           (ch.latency > 0 && input.aloneMultiCycle.contains(op));
+  bool isAlone(const FM::Op &op, unsigned k) {
+    return op.alone || (lat(k) > 0 && op.aloneMultiCycle);
+  }
+  /// A pipeline's II: a variable where the solver chooses it.
+  LinearExpr iiOf(unsigned r) {
+    if (iiVar[r])
+      return LinearExpr(*iiVar[r]);
+    return LinearExpr(int64_t(m.regions[r].ii));
+  }
+  bool fixedII1(unsigned r) {
+    return !iiVar[r] && m.regions[r].ii == 1;
+  }
+  /// The mux tables at an operand width.
+  ArrayRef<float> delays(bool nor, unsigned width) {
+    if (width > 32) {
+      auto t = nor ? config.muxNorDelays64 : config.muxDelays64;
+      if (!t.empty())
+        return t;
+    }
+    return nor && !config.muxNorDelays.empty() ? config.muxNorDelays
+                                               : config.muxDelays;
+  }
+  IntVar newInt(int64_t lo, int64_t hi) {
+    IntVar v = cp.NewIntVar(Domain(lo, hi));
+    ints.push_back(v);
+    return v;
+  }
+  BoolVar newBool() {
+    BoolVar b = cp.NewBoolVar();
+    bools.push_back(b);
+    return b;
   }
   void build();
-  LinearExpr areaExpr();
-  bool solve(const LinearExpr &objective, CpSolverResponse &response);
-  void hintFrom(const CpSolverResponse &response);
-  void extract(const CpSolverResponse &response, CPSATChainingResult &result);
+  /// The least and most \p e can be, by its variables' domains.
+  std::pair<int64_t, int64_t> bounds(const LinearExpr &e);
+  /// A variable at least `logScale * ln(x)` for x = \p e in [lo, hi] (and
+  /// minimized, equal to it at the breakpoints): piecewise linear over
+  /// geometric breakpoints, one segment chosen.
+  LinearExpr logOf(const LinearExpr &e, StringRef what);
+  bool solve(StringRef phase, const LinearExpr &objective,
+             CpSolverResponse &response, std::string &why);
+  void hint();
+  /// An instance's users in regions that run at once (a child loop, and a
+  /// sibling launched with it or its parent's op in the instance then)
+  /// kept apart.
+  void concurrency(SlotV &s);
+  void extract(const CpSolverResponse &response,
+               CPSATFunctionSolution &solution);
+  /// Add \p x times an operator's own resources.
+  void addResources(const CPSATOperatorInfo &info, const LinearExpr &x);
+  /// The area objective over the resources (`config.bottleneck`).
+  void buildArea();
 
-  Problem &prob;
-  ChainingProblem &chain;
-  SharedOperatorsProblem &shr;
-  CyclicProblem *cyclic;
-  Operation *lastOp;
+  const FM &m;
   const CPSATChainingConfig &config;
-  const CPSATChainingInput &input;
-
   CpModelBuilder cp;
-  int64_t K = 0, H = 0;
-  unsigned ii = 0;
-  llvm::MapVector<Operation *, OpVars> vars;
-  std::vector<Slot> slots;
-  // Area terms, in LUT equivalents scaled to integers.
-  LinearExpr area;
-  // Every variable, for hints between phases.
-  std::vector<IntVar> allInts;
-  std::vector<BoolVar> allBools;
+  int64_t K = 0;
+  std::vector<std::vector<OpV>> vars;
+  std::vector<std::optional<IntVar>> iiVar;
+  std::vector<IntVar> lastVar; // per region, its last cycle
+  SmallVector<int64_t> horizon;
+  std::vector<SlotV> slots;
+  // The function's resources, the area objective over them, and its cycles.
+  LinearExpr lutUse, dspUse, ffUse, area, cycles;
+  std::optional<IntVar> peak; // the bottleneck's share of the device
+  // Parts of them, for the debug output.
+  LinearExpr muxLutsTotal, registerFFs, registerSRLs, enableFFs;
+  struct Held {
+    unsigned region, op;
+    int64_t bits;
+    IntVar held;
+    LinearExpr regs;
+  };
+  std::vector<Held> heldValues;
+  std::vector<IntVar> ints;
+  std::vector<BoolVar> bools;
 };
 
-void ChainingModel::build() {
+void FunctionModel::build() {
   K = ps(config.cycleTime);
-  ii = cyclic ? cyclic->getInitiationInterval().value_or(0) : 0;
-
-  // The horizon: every operation in a cycle of its own, past its longest
-  // latency; or the hint's length, if longer.
-  H = 1;
-  int64_t maxLatAll = 0;
-  for (Operation *op : prob.getOperations()) {
-    int64_t maxLat = *prob.getLatency(*prob.getLinkedOperatorType(op));
-    if (auto it = input.candidates.find(op); it != input.candidates.end())
-      for (auto opr : it->second)
-        maxLat = std::max<int64_t>(maxLat, *prob.getLatency(opr));
-    H += maxLat + 1;
-    maxLatAll = std::max(maxLatAll, maxLat);
-  }
-  for (auto [op, start] : input.hint)
-    H = std::max<int64_t>(H, start + 1);
-
-  auto newInt = [&](int64_t lo, int64_t hi) {
-    IntVar v = cp.NewIntVar(Domain(lo, hi));
-    allInts.push_back(v);
-    return v;
-  };
-  auto newBool = [&]() {
-    BoolVar b = cp.NewBoolVar();
-    allBools.push_back(b);
-    return b;
-  };
-
-  // Operations and their choices.
   int64_t maxMux = 0;
-  for (float d : config.muxDelays)
-    maxMux = std::max(maxMux, ps(d));
-  for (float d : config.muxNorDelays)
-    maxMux = std::max(maxMux, ps(d));
+  for (auto table : {config.muxDelays, config.muxNorDelays,
+                     config.muxDelays64, config.muxNorDelays64})
+    for (float d : table)
+      maxMux = std::max(maxMux, ps(d));
   maxMux = std::min(maxMux, K);
-  for (Operation *op : prob.getOperations()) {
-    OpVars v;
-    v.c = newInt(0, H);
-    v.z = newInt(0, K);
-    v.mux = newInt(0, maxMux);
-    v.ready = newInt(0, (H + maxLatAll + 1) * K);
-    if (ii > 1) {
-      v.mod = newInt(0, ii - 1);
-      cp.AddModuloEquality(*v.mod, v.c, ii);
+
+  for (auto [r, region] : llvm::enumerate(m.regions)) {
+    // The horizon: every op after the last, on its slowest candidate or
+    // its longest dependence latency (a serial schedule, which any resource
+    // limit admits).
+    SmallVector<int64_t> depLat(region.ops.size(), 0);
+    for (auto &dep : region.deps)
+      if (dep.latency)
+        depLat[dep.src] = std::max<int64_t>(depLat[dep.src], *dep.latency);
+    int64_t H = 1, maxLat = 0;
+    for (auto [i, op] : llvm::enumerate(region.ops)) {
+      int64_t l = depLat[i];
+      for (unsigned k : op.oprs)
+        l = std::max(l, lat(k));
+      H += l + 1;
+      maxLat = std::max(maxLat, l);
+      if (op.hint)
+        H = std::max<int64_t>(H, *op.hint + 1);
     }
-    SmallVector<Problem::OperatorType, 4> oprs;
-    if (auto it = input.candidates.find(op); it != input.candidates.end())
-      oprs.assign(it->second.begin(), it->second.end());
-    else
-      oprs.push_back(*prob.getLinkedOperatorType(op));
-    for (auto opr : oprs) {
-      Choice ch;
-      ch.opr = opr;
-      ch.latency = *prob.getLatency(opr);
-      ch.inc = std::min(ps(*chain.getIncomingDelay(opr)), K);
-      ch.out = std::min(ps(*chain.getOutgoingDelay(opr)), K);
-      auto info = input.operatorInfo.lookup(opr);
-      ch.shareable = info.shareable;
-      ch.area = info.area;
-      if (oprs.size() > 1)
-        ch.chosen = newBool();
-      v.choices.push_back(ch);
+    horizon.push_back(H);
+
+    // The II, a variable from the resources' bound where the solver
+    // chooses it, up to the serial schedule's length (which closes any
+    // recurrence).
+    std::optional<IntVar> ii;
+    int64_t maxII = region.ii;
+    if (region.ii > 0 && region.searchII) {
+      int64_t lo = cpsatResourceMII(region);
+      maxII = std::max<int64_t>({int64_t(region.ii), H, lo});
+      ii = newInt(lo, maxII);
     }
-    if (oprs.size() > 1) {
-      std::vector<BoolVar> lits;
-      for (auto &ch : v.choices)
-        lits.push_back(ch.chosen);
-      cp.AddExactlyOne(lits);
+    iiVar.push_back(ii);
+    auto &rv = vars.emplace_back();
+    for (auto &op : region.ops) {
+      OpV v;
+      v.c = newInt(0, H);
+      v.z = newInt(0, K);
+      v.mux = newInt(0, maxMux);
+      v.ready = newInt(0, (H + maxLat + 1) * K);
+      if (region.ii > 0 && !fixedII1(r)) {
+        v.mod = newInt(0, maxII - 1);
+        cp.AddModuloEquality(*v.mod, v.c, iiOf(r));
+      }
+      if (op.oprs.size() > 1) {
+        std::vector<BoolVar> lits;
+        for (size_t j = 0; j < op.oprs.size(); ++j) {
+          v.chosen.push_back(newBool());
+          lits.push_back(v.chosen.back());
+        }
+        cp.AddExactlyOne(lits);
+      }
+      rv.push_back(v);
     }
     // Fit and readiness, per choice.
-    LinearExpr start = K * LinearExpr(v.c) + v.z;
-    for (auto &ch : v.choices) {
-      std::vector<BoolVar> when;
-      if (oprs.size() > 1)
-        when.push_back(ch.chosen);
-      cp.AddLessOrEqual(LinearExpr(v.z) + v.mux + ch.inc, K)
-          .OnlyEnforceIf(when);
-      if (ch.latency == 0)
-        cp.AddEquality(v.ready, start + v.mux + ch.out).OnlyEnforceIf(when);
-      else
-        cp.AddEquality(v.ready, K * LinearExpr(v.c) + K * ch.latency + ch.out)
-            .OnlyEnforceIf(when);
-    }
-    vars.insert({op, std::move(v)});
-  }
-
-  // Dependences.
-  for (Operation *op : prob.getOperations()) {
-    OpVars &dst = vars[op];
-    for (auto dep : prob.getDependences(op)) {
-      Operation *srcOp = dep.getSource();
-      if (!vars.count(srcOp))
-        continue;
-      OpVars &src = vars[srcOp];
-      int64_t d = distance(dep) * ii;
-      // In cycles: the source's latency, or the edge's own (an ordering
-      // edge that needs only the source to have started). To a later
-      // iteration, at least a cycle: through the iter arg's register.
-      LinearExpr lat = latencyOf(src, /*registered=*/d > 0);
-      if (dep.isAuxiliary()) {
-        unsigned depLat = *prob.getDependenceLatency(dep);
-        unsigned linkedLat =
-            *prob.getLatency(*prob.getLinkedOperatorType(srcOp));
-        if (depLat != linkedLat)
-          lat = LinearExpr(depLat);
+    for (auto [i, op] : llvm::enumerate(region.ops)) {
+      OpV &v = rv[i];
+      LinearExpr start = K * LinearExpr(v.c) + v.z;
+      for (auto [j, k] : llvm::enumerate(op.oprs)) {
+        auto w = when(r, i, j);
+        cp.AddLessOrEqual(LinearExpr(v.z) + v.mux + inc(k), K).OnlyEnforceIf(w);
+        if (lat(k) == 0)
+          cp.AddEquality(v.ready, start + v.mux + out(k)).OnlyEnforceIf(w);
+        else
+          cp.AddEquality(v.ready, K * LinearExpr(v.c) + K * lat(k) + out(k))
+              .OnlyEnforceIf(w);
       }
-      cp.AddGreaterOrEqual(LinearExpr(dst.c) + d, LinearExpr(src.c) + lat);
-      if (dep.isAuxiliary())
+    }
+    // Dependences (to a later iteration through the iter arg's register).
+    for (auto &dep : region.deps) {
+      OpV &src = rv[dep.src], &dst = rv[dep.dst];
+      LinearExpr later = int64_t(dep.distance) * iiOf(r);
+      LinearExpr l = latencyOf(r, dep.src, dep.distance > 0);
+      if (dep.auxiliary && dep.latency)
+        l = LinearExpr(*dep.latency);
+      cp.AddGreaterOrEqual(LinearExpr(dst.c) + later, LinearExpr(src.c) + l);
+      if (dep.auxiliary)
         continue;
-      // In time: the operands arrive by the start. A multi-cycle result
-      // carried to a later iteration is read off the core in its ready
-      // cycle, a combinational one from the register (at the cycle's start,
-      // which the cycles above already order).
-      if (d == 0) {
+      if (dep.distance == 0) {
         cp.AddGreaterOrEqual(K * LinearExpr(dst.c) + dst.z,
                              LinearExpr(src.ready));
         continue;
       }
-      for (auto &ch : src.choices) {
-        if (ch.latency == 0)
-          continue;
-        std::vector<BoolVar> when;
-        if (src.choices.size() > 1)
-          when.push_back(ch.chosen);
-        cp.AddGreaterOrEqual(K * LinearExpr(dst.c) + dst.z + d * K,
-                             LinearExpr(src.ready))
-            .OnlyEnforceIf(when);
-      }
+      for (auto [j, k] : llvm::enumerate(region.ops[dep.src].oprs))
+        if (lat(k) > 0)
+          cp.AddGreaterOrEqual(K * LinearExpr(dst.c) + dst.z + K * later,
+                               LinearExpr(src.ready))
+              .OnlyEnforceIf(when(r, dep.src, j));
     }
-  }
-
-  // Limited resources (memory ports and the like): per cycle, or per
-  // congruence class in a pipeline.
-  llvm::MapVector<Problem::ResourceType, SmallVector<Operation *>> byResource;
-  for (Operation *op : prob.getOperations())
-    if (auto rsrcs = prob.getLinkedResourceTypes(op))
-      for (auto rsrc : *rsrcs)
-        if (shr.getLimit(rsrc))
-          byResource[rsrc].push_back(op);
-  for (auto &[rsrc, ops] : byResource) {
-    int64_t limit = *shr.getLimit(rsrc);
-    if (ii == 1) {
-      if ((int64_t)ops.size() > limit)
-        cp.AddLessOrEqual(LinearExpr((int64_t)ops.size()), limit);
-      continue;
-    }
-    CumulativeConstraint cumul = cp.AddCumulative(limit);
-    for (Operation *op : ops) {
-      OpVars &v = vars[op];
-      LinearExpr at = ii > 1 ? LinearExpr(*v.mod) : LinearExpr(v.c);
-      cumul.AddDemand(cp.NewFixedSizeIntervalVar(at, 1), 1);
-    }
-  }
-
-  // Binding. The slots of each shareable operator: the pool's instances,
-  // then one new one per operation that may take the operator.
-  llvm::MapVector<Problem::OperatorType, SmallVector<Operation *>> takersOf;
-  for (auto &[op, v] : vars)
-    for (auto &ch : v.choices)
-      if (ch.shareable && !isAlone(op, ch))
-        takersOf[ch.opr].push_back(op);
-  for (auto &[opr, ops] : takersOf) {
-    unsigned first = slots.size();
-    for (auto [i, inst] : llvm::enumerate(input.pool)) {
-      if (!(inst.opr == opr) || inst.closed)
-        continue;
-      Slot s;
-      s.opr = opr;
-      s.poolIndex = i;
-      s.existingUsers = inst.users;
-      s.rawSlack = ps(inst.rawSlack);
-      s.nor = inst.pipelineUser || config.pipelined;
-      slots.push_back(s);
-    }
-    unsigned firstNew = slots.size();
-    for (size_t k = 0; k < ops.size(); ++k) {
-      Slot s;
-      s.opr = opr;
-      s.nor = config.pipelined;
-      s.used = newBool();
-      slots.push_back(s);
-    }
-    // The binding literals: operation `i` of `ops` may open only new slots
-    // up to its own index (symmetry).
-    for (auto [i, op] : llvm::enumerate(ops)) {
-      OpVars &v = vars[op];
-      BoolVar takes = cp.TrueVar();
-      for (auto &ch : v.choices)
-        if (ch.opr == opr && v.choices.size() > 1)
-          takes = ch.chosen;
-      std::vector<BoolVar> lits;
-      for (unsigned s = first; s < slots.size(); ++s) {
-        if (s >= firstNew && s - firstNew > i)
-          break;
-        BoolVar b = newBool();
-        slots[s].takers.push_back({op, b});
-        lits.push_back(b);
-        cp.AddImplication(b, takes);
-      }
-      // Taking the operator is taking one of its slots.
-      LinearExpr sum;
-      for (BoolVar b : lits)
-        sum += b;
-      cp.AddEquality(sum, takes);
-    }
-    // New slots open in order, and are open when taken.
-    for (unsigned s = firstNew; s < slots.size(); ++s) {
-      std::vector<BoolVar> takers;
-      for (auto &[op, b] : slots[s].takers) {
-        cp.AddImplication(b, slots[s].used);
-        takers.push_back(b);
-      }
-      takers.push_back(slots[s].used.Not());
-      cp.AddBoolOr(takers);
-      if (s > firstNew)
-        cp.AddImplication(slots[s].used, slots[s - 1].used);
-    }
-  }
-
-  // Each slot's users, conflicts, mux and its users' chains.
-  DenseMap<Problem::OperatorType, LinearExpr> reservedOf;
-  for (Slot &s : slots) {
-    unsigned future = input.futureUsers.lookup(s.opr);
-    unsigned maxUsers = s.existingUsers + s.takers.size() + future;
-    s.users = newInt(0, maxUsers);
-    LinearExpr users(s.existingUsers);
-    for (auto &[op, b] : s.takers)
-      users += b;
-    // The mux is sized for its users and those it reserves for; an instance
-    // reserves only while open.
-    if (future) {
-      s.reserve = newInt(0, future);
-      if (!s.poolIndex)
-        cp.AddLessOrEqual(*s.reserve, future * LinearExpr(s.used));
-      users += *s.reserve;
-      reservedOf[s.opr] += *s.reserve;
-    }
-    cp.AddEquality(s.users, users);
-    // Two of this region's users issue in different cycles.
-    if (s.takers.size() > 1) {
-      if (ii == 1) {
-        LinearExpr n;
-        for (auto &[op, b] : s.takers)
-          n += b;
-        cp.AddLessOrEqual(n, 1);
+    // The continuation, decided in time to gate the next launch.
+    if (region.cond) {
+      LinearExpr condAt(rv[*region.cond].c);
+      if (region.condFirst) {
+        cp.AddEquality(condAt, 0);
       } else {
-        std::vector<IntervalVar> issues;
-        for (auto &[op, b] : s.takers) {
-          OpVars &v = vars[op];
-          LinearExpr at = ii > 1 ? LinearExpr(*v.mod) : LinearExpr(v.c);
-          issues.push_back(cp.NewOptionalFixedSizeIntervalVar(at, 1, b));
-        }
-        cp.AddNoOverlap(issues);
+        cp.AddLessOrEqual(condAt, iiOf(r));
+        for (unsigned e : region.effects)
+          cp.AddGreaterOrEqual(rv[e].c, condAt);
       }
     }
-    // The mux: a step per user count, as the table goes.
-    ArrayRef<float> table = s.nor && !config.muxNorDelays.empty()
-                                ? config.muxNorDelays
-                                : config.muxDelays;
-    LinearExpr mux;
-    int64_t previous = 0;
+    // Limited resources, per cycle or congruence class.
+    for (auto &rsrc : region.resources) {
+      if (fixedII1(r)) {
+        if (rsrc.ops.size() > rsrc.limit)
+          cp.AddLessOrEqual(LinearExpr(int64_t(rsrc.ops.size())), rsrc.limit);
+        continue;
+      }
+      CumulativeConstraint cumul = cp.AddCumulative(rsrc.limit);
+      for (unsigned i : rsrc.ops) {
+        LinearExpr at = region.ii > 0 ? LinearExpr(*rv[i].mod)
+                                      : LinearExpr(rv[i].c);
+        cumul.AddDemand(cp.NewFixedSizeIntervalVar(at, 1), 1);
+      }
+    }
+    // Registers: a value held past the cycle it is ready, to its last
+    // reader but the terminator (an iter arg's update and a loop result
+    // have registers of their own, whatever the schedule). In a pipeline a
+    // register keeps it until the next iteration overwrites it, II cycles
+    // on, so a value held L cycles is a delay line of k = ceil(L / II) (one
+    // per cycle at II 1), which synthesis builds, per bit, as k flops up to
+    // 3 and otherwise a flop at each end and an SRL per 32 cycles between
+    // (Vivado, measured). In a sequential region a frame holds it in one.
+    SmallVector<SmallVector<unsigned, 2>> uses(region.ops.size());
+    for (auto &dep : region.deps)
+      if (!dep.auxiliary && dep.distance == 0 && dep.src != dep.dst &&
+          dep.dst != region.anchor)
+        uses[dep.src].push_back(dep.dst);
+    for (auto [i, op] : llvm::enumerate(region.ops)) {
+      if (!op.width || uses[i].empty())
+        continue;
+      int64_t bits = op.width;
+      IntVar held = newInt(0, H);
+      for (unsigned u : uses[i])
+        cp.AddGreaterOrEqual(held, LinearExpr(rv[u].c) -
+                                       (LinearExpr(rv[i].c) +
+                                        latencyOf(r, i, false)));
+      if (region.ii > 0) {
+        LinearExpr regs(held);
+        if (iiVar[r]) {
+          IntVar n = newInt(0, H), covered = newInt(0, H * maxII);
+          cp.AddMultiplicationEquality(covered, {LinearExpr(n), iiOf(r)});
+          cp.AddGreaterOrEqual(covered, held);
+          regs = LinearExpr(n);
+        } else if (region.ii > 1) {
+          IntVar n = newInt(0, H);
+          cp.AddGreaterOrEqual(int64_t(region.ii) * LinearExpr(n), held);
+          regs = LinearExpr(n);
+        }
+        // The delay line's flops and SRLs per bit.
+        BoolVar srl = newBool();
+        cp.AddGreaterOrEqual(regs, 4).OnlyEnforceIf(srl);
+        cp.AddLessOrEqual(regs, 3).OnlyEnforceIf(srl.Not());
+        IntVar flops = newInt(0, 3), srls = newInt(0, H / 32 + 2);
+        cp.AddGreaterOrEqual(LinearExpr(flops), regs)
+            .OnlyEnforceIf(srl.Not());
+        cp.AddEquality(flops, 2).OnlyEnforceIf(srl);
+        cp.AddEquality(srls, 0).OnlyEnforceIf(srl.Not());
+        cp.AddGreaterOrEqual(32 * LinearExpr(srls), regs - 2)
+            .OnlyEnforceIf(srl);
+        cp.AddGreaterOrEqual(srls, 1).OnlyEnforceIf(srl);
+        ffUse += bits * LinearExpr(flops);
+        lutUse += bits * LinearExpr(srls);
+        registerFFs += bits * LinearExpr(flops);
+        registerSRLs += bits * LinearExpr(srls);
+        heldValues.push_back({unsigned(r), unsigned(i), bits, held, regs});
+      } else {
+        BoolVar any = newBool();
+        cp.AddLessOrEqual(held, H * LinearExpr(any));
+        ffUse += bits * LinearExpr(any);
+        registerFFs += bits * LinearExpr(any);
+        heldValues.push_back(
+            {unsigned(r), unsigned(i), bits, held, LinearExpr(any)});
+      }
+    }
+    // The region's last cycle: a pipeline's depth is its anchor's start
+    // (every op precedes the anchor); a sequential region's anchor precedes
+    // only its stores, so there it is the last op's start (a multi-cycle
+    // op's last cycle), each a bound of its own.
+    IntVar last = newInt(0, H + maxLat);
+    lastVar.push_back(last);
+    if (region.ii > 0) {
+      cp.AddEquality(last, rv[region.anchor].c);
+    } else {
+      for (auto [i, op] : llvm::enumerate(region.ops)) {
+        LinearExpr end(rv[i].c);
+        for (auto [j, k] : llvm::enumerate(op.oprs))
+          if (lat(k) > 1)
+            cp.AddGreaterOrEqual(last, end + (lat(k) - 1))
+                .OnlyEnforceIf(when(r, i, j));
+        cp.AddGreaterOrEqual(last, end);
+      }
+    }
+    // An enable flop per cycle: a pipeline's stage valid bits, a sequential
+    // body's cycle states.
+    ffUse += LinearExpr(last) + 1;
+    enableFFs += LinearExpr(last) + 1;
+    // The region's cycles in a run of the function.
+    LinearExpr length = LinearExpr(last) + 1;
+    if (region.ii > 0)
+      cycles += region.runs * (length + (region.tripCount - 1) * iiOf(r));
+    else
+      cycles += region.runs * length;
+  }
+
+  // Instances of each shareable operator, across all regions: as many as
+  // twice the most a region could use at once, and two more (a mux may make
+  // a region split its users), at most one per taker.
+  for (auto [k, o] : llvm::enumerate(m.oprs)) {
+    if (!o.info.shareable)
+      continue;
+    SmallVector<std::pair<unsigned, unsigned>> takers;
+    SmallVector<unsigned> perRegion(m.regions.size(), 0);
+    for (auto [r, region] : llvm::enumerate(m.regions))
+      for (auto [i, op] : llvm::enumerate(region.ops))
+        if (llvm::is_contained(op.oprs, k) && !isAlone(op, k)) {
+          takers.push_back({r, i});
+          ++perRegion[r];
+        }
+    if (takers.empty())
+      continue;
+    unsigned most = *llvm::max_element(perRegion);
+    unsigned count = std::min<unsigned>(takers.size(), 2 * most + 2);
+    unsigned first = slots.size();
+    for (unsigned s = 0; s < count; ++s) {
+      SlotV slot;
+      slot.opr = k;
+      slot.used = newBool();
+      slots.push_back(slot);
+      if (s > 0)
+        cp.AddImplication(slots[first + s].used, slots[first + s - 1].used);
+    }
+    for (auto [t, ri] : llvm::enumerate(takers)) {
+      auto [r, i] = ri;
+      auto &op = m.regions[r].ops[i];
+      unsigned j = llvm::find(op.oprs, k) - op.oprs.begin();
+      BoolVar takes =
+          op.oprs.size() > 1 ? vars[r][i].chosen[j] : cp.TrueVar();
+      LinearExpr sum;
+      for (unsigned s = 0; s < count && s <= t; ++s) {
+        BoolVar b = newBool();
+        slots[first + s].takers.push_back({unsigned(r), unsigned(i), b});
+        cp.AddImplication(b, slots[first + s].used);
+        sum += b;
+      }
+      cp.AddEquality(sum, takes);
+      vars[r][i].onSlot = true;
+    }
+  }
+
+  for (SlotV &s : slots) {
+    const auto &info = opr(s.opr).info;
+    unsigned maxUsers = s.takers.size();
+    s.users = newInt(0, maxUsers);
+    LinearExpr users;
+    for (auto &t : s.takers)
+      users += t.b;
+    cp.AddEquality(s.users, users);
+    std::vector<BoolVar> any;
+    for (auto &t : s.takers)
+      any.push_back(t.b);
+    any.push_back(s.used.Not());
+    cp.AddBoolOr(any);
+    // A region's users of one instance issue apart.
+    DenseMap<unsigned, SmallVector<Taker *, 4>> byRegion;
+    for (auto &t : s.takers)
+      byRegion[t.region].push_back(&t);
+    bool anyPipelined = false;
+    for (auto &[r, ts] : byRegion) {
+      anyPipelined |= m.regions[r].ii > 0;
+      if (ts.size() < 2)
+        continue;
+      if (fixedII1(r)) {
+        LinearExpr n;
+        for (Taker *t : ts)
+          n += t->b;
+        cp.AddLessOrEqual(n, 1);
+        continue;
+      }
+      std::vector<IntervalVar> issues;
+      for (Taker *t : ts) {
+        OpV &v = vars[r][t->op];
+        LinearExpr at = m.regions[r].ii > 0 ? LinearExpr(*v.mod)
+                                            : LinearExpr(v.c);
+        issues.push_back(cp.NewOptionalFixedSizeIntervalVar(at, 1, t->b));
+      }
+      cp.AddNoOverlap(issues);
+    }
+    concurrency(s);
+    // The mux's delay a step per user count, from the table at the
+    // operands' width (the slower one if a pipeline uses it).
+    s.nor = newBool();
+    for (auto &t : s.takers)
+      if (m.regions[t.region].ii > 0)
+        cp.AddImplication(t.b, s.nor);
+    if (!anyPipelined)
+      cp.AddEquality(s.nor, 0);
     s.shared = newBool();
+    auto plainT = delays(false, info.width), norT = delays(true, info.width);
+    LinearExpr plain, nor;
+    int64_t plainPrev = 0, norPrev = 0;
     for (unsigned t = 2; t <= maxUsers; ++t) {
-      int64_t delay = std::min(ps(cpsatMuxDelay(table, t)), K);
       BoolVar atLeast = t == 2 ? s.shared : newBool();
       cp.AddGreaterOrEqual(s.users, t).OnlyEnforceIf(atLeast);
       cp.AddLessThan(s.users, t).OnlyEnforceIf(atLeast.Not());
-      if (delay > previous)
-        mux += (delay - previous) * LinearExpr(atLeast);
-      previous = std::max(previous, delay);
+      int64_t p = std::min(ps(cpsatMuxDelay(plainT, t)), K);
+      int64_t q = std::min(ps(cpsatMuxDelay(norT, t)), K);
+      if (p > plainPrev)
+        plain += (p - plainPrev) * LinearExpr(atLeast);
+      if (q > norPrev)
+        nor += (q - norPrev) * LinearExpr(atLeast);
+      plainPrev = std::max(plainPrev, p);
+      norPrev = std::max(norPrev, q);
     }
     if (maxUsers < 2)
       cp.AddEquality(s.shared, 0);
-    s.mux = newInt(0, K);
-    cp.AddEquality(s.mux, mux);
-    // The pool's users take it within their slack (they already take the
-    // mux of their own count).
-    if (s.poolIndex) {
-      int64_t current =
-          std::min(ps(cpsatMuxDelay(table, s.existingUsers)), K);
-      cp.AddLessOrEqual(s.mux, std::max(s.rawSlack, current));
-    }
-    for (auto &[op, b] : s.takers)
-      cp.AddEquality(vars[op].mux, s.mux).OnlyEnforceIf(b);
-    // A multi-cycle carried result on an instance with other users is read
-    // in its ready cycle (a combinational one goes into the iter arg's
-    // register in its own cycle).
-    for (auto &[op, b] : s.takers) {
-      auto it = input.carriedReaders.find(op);
-      if (it == input.carriedReaders.end())
+    s.md = newInt(0, K);
+    cp.AddGreaterOrEqual(s.md, plain);
+    if (anyPipelined)
+      cp.AddGreaterOrEqual(s.md, nor).OnlyEnforceIf(s.nor);
+    for (auto &t : s.takers) {
+      cp.AddGreaterOrEqual(vars[t.region][t.op].mux, s.md).OnlyEnforceIf(t.b);
+      auto &op = m.regions[t.region].ops[t.op];
+      if (op.carriedReaders.empty() || lat(s.opr) == 0)
         continue;
-      OpVars &v = vars[op];
-      for (auto &ch : v.choices) {
-        if (!(ch.opr == s.opr) || ch.latency == 0)
+      for (unsigned reader : op.carriedReaders)
+        cp.AddEquality(LinearExpr(vars[t.region][reader].c) +
+                           iiOf(t.region),
+                       LinearExpr(vars[t.region][t.op].c) + lat(s.opr))
+            .OnlyEnforceIf({t.b, s.shared});
+    }
+    // Resources: the instance's, and its mux's LUTs, per operand a price
+    // for each input past the first, an input per value its users put on
+    // it.
+    addResources(info, LinearExpr(s.used));
+    int64_t perInput =
+        std::llround(config.muxInputLuts * std::max(info.width, 1u) / 32.0);
+    if (perInput <= 0 || maxUsers < 2)
+      continue;
+    LinearExpr muxLuts;
+    for (unsigned p = 0; p < info.operands; ++p) {
+      LinearExpr inputs;
+      llvm::MapVector<unsigned, std::vector<BoolVar>> byValue;
+      for (auto &t : s.takers) {
+        auto &op = m.regions[t.region].ops[t.op];
+        if (p < op.inputs.size())
+          byValue[op.inputs[p]].push_back(t.b);
+        else
+          inputs += t.b;
+      }
+      for (auto &[value, takers] : byValue) {
+        if (takers.size() == 1) {
+          inputs += takers.front();
           continue;
-        for (Operation *reader : it->second) {
-          if (!vars.count(reader))
-            continue;
-          cp.AddEquality(LinearExpr(vars[reader].c) + ii,
-                         LinearExpr(v.c) + ch.latency)
-              .OnlyEnforceIf({b, s.shared});
         }
+        // The value is an input iff one of its users is on the instance.
+        BoolVar fed = newBool();
+        for (BoolVar b : takers)
+          cp.AddImplication(b, fed);
+        takers.push_back(fed.Not());
+        cp.AddBoolOr(takers);
+        inputs += fed;
+      }
+      muxLuts += perInput * (inputs - LinearExpr(s.used));
+    }
+    lutUse += muxLuts;
+    muxLutsTotal += muxLuts;
+  }
+  // An op on no instance has no mux; an unshared choice pays its own area.
+  for (auto [r, region] : llvm::enumerate(m.regions))
+    for (auto [i, op] : llvm::enumerate(region.ops)) {
+      if (!vars[r][i].onSlot)
+        cp.AddEquality(vars[r][i].mux, 0);
+      for (auto [j, k] : llvm::enumerate(op.oprs)) {
+        if (opr(k).info.shareable && !isAlone(op, k))
+          continue;
+        addResources(opr(k).info, op.oprs.size() > 1
+                                      ? LinearExpr(vars[r][i].chosen[j])
+                                      : LinearExpr(1));
       }
     }
-  }
-  // An operator's future users are reserved for once.
-  for (auto &[opr, reserved] : reservedOf)
-    cp.AddLessOrEqual(reserved, input.futureUsers.lookup(opr));
-  // An operation on no shared instance has no mux.
-  for (auto &[op, v] : vars) {
-    std::vector<BoolVar> onShared;
-    for (Slot &s : slots)
-      for (auto &[taker, b] : s.takers)
-        if (taker == op)
-          onShared.push_back(b);
-    if (onShared.empty())
-      cp.AddEquality(v.mux, 0);
-  }
+  buildArea();
+}
 
-  // Area: each opened slot, each unshared choice, each user of a mux.
-  for (auto &[op, v] : vars)
-    for (auto &ch : v.choices) {
-      bool inSlots = ch.shareable && !isAlone(op, ch);
-      if (inSlots)
-        continue; // paid per opened slot
-      int64_t a = std::llround(ch.area);
-      if (a == 0)
-        continue;
-      if (v.choices.size() > 1)
-        area += a * LinearExpr(ch.chosen);
-      else
-        area += LinearExpr(a);
+void FunctionModel::concurrency(SlotV &s) {
+  unsigned n = m.regions.size();
+  // The instance's users in each child loop, or in the loops inside it.
+  std::vector<std::vector<BoolVar>> inTree(n);
+  for (auto &t : s.takers)
+    for (std::optional<unsigned> r = t.region; r; r = m.regions[*r].parent)
+      if (m.regions[*r].parent)
+        inTree[*r].push_back(t.b);
+  std::vector<std::optional<BoolVar>> uses(n);
+  auto usesOf = [&](unsigned r) -> BoolVar {
+    if (uses[r])
+      return *uses[r];
+    if (inTree[r].size() == 1)
+      return *(uses[r] = inTree[r].front());
+    BoolVar u = newBool();
+    std::vector<BoolVar> any;
+    for (BoolVar b : inTree[r]) {
+      cp.AddImplication(b, u);
+      any.push_back(b);
     }
-  for (Slot &s : slots) {
-    auto info = input.operatorInfo.lookup(s.opr);
-    if (!s.poolIndex)
-      area += std::llround(info.area) * LinearExpr(s.used);
-    int64_t perUser = std::llround(info.muxAreaPerUser);
-    if (perUser)
-      for (auto &[op, b] : s.takers)
-        area += perUser * LinearExpr(b);
-    // A user reserved for saves a later region the instance it would open
-    // otherwise, less its mux.
-    auto saved = input.futureCredit.find(s.opr);
-    int64_t credit =
-        (saved != input.futureCredit.end() ? std::llround(saved->second) : 0) -
-        perUser;
-    if (s.reserve && credit > 0)
-      area += -credit * LinearExpr(*s.reserve);
+    any.push_back(u.Not());
+    cp.AddBoolOr(any);
+    return *(uses[r] = u);
+  };
+  int64_t latency = lat(s.opr);
+  for (unsigned r = 0; r < n; ++r) {
+    auto parent = m.regions[r].parent;
+    if (!parent || inTree[r].empty())
+      continue;
+    unsigned launch = m.regions[r].launch;
+    IntVar at = vars[*parent][launch].c;
+    // The parent's users: out of the instance by the launch (issued and
+    // ready; a combinational one issues by it in any case, the child's
+    // first stage a cycle after), or after it, in a frame that awaits it.
+    if (latency > 0)
+      for (auto &t : s.takers) {
+        if (t.region != *parent)
+          continue;
+        IntVar c = vars[t.region][t.op].c;
+        BoolVar after = newBool();
+        cp.AddLessOrEqual(LinearExpr(c) + latency, at)
+            .OnlyEnforceIf({t.b, usesOf(r), after.Not()});
+        cp.AddGreaterOrEqual(c, LinearExpr(at) + 1)
+            .OnlyEnforceIf({t.b, usesOf(r), after});
+      }
+    // A sibling launched in the same cycle runs alongside; one launched
+    // later is in a later frame, which awaits this one.
+    for (unsigned q = r + 1; q < n; ++q) {
+      if (m.regions[q].parent != parent || inTree[q].empty())
+        continue;
+      if (m.regions[q].launch == launch) {
+        cp.AddBoolOr({usesOf(r).Not(), usesOf(q).Not()});
+        continue;
+      }
+      cp.AddNotEqual(at, vars[*parent][m.regions[q].launch].c)
+          .OnlyEnforceIf({usesOf(r), usesOf(q)});
+    }
   }
 }
 
-bool ChainingModel::solve(const LinearExpr &objective, CpSolverResponse &response) {
+void FunctionModel::addResources(const CPSATOperatorInfo &info,
+                                 const LinearExpr &x) {
+  if (int64_t n = std::llround(info.lut))
+    lutUse += n * x;
+  if (int64_t n = std::llround(info.dsp))
+    dspUse += n * x;
+  if (int64_t n = std::llround(info.ff))
+    ffUse += n * x;
+}
+
+void FunctionModel::buildArea() {
+  // Each resource as a share of the device's, in billionths: their sum
+  // weighs each by its scarcity (on the xcv80 a DSP is 237 LUTs, an FF half
+  // of one); the bottleneck is the largest, the sum its tie-break.
+  auto share = [](const LinearExpr &e, double capacity) {
+    return std::llround(1e9 / std::max(capacity, 1.0)) * e;
+  };
+  LinearExpr uLut = share(lutUse, config.lutCapacity);
+  LinearExpr uDsp = share(dspUse, config.dspCapacity);
+  LinearExpr uFf = share(ffUse, config.ffCapacity);
+  LinearExpr sum = uLut + uDsp + uFf;
+  if (!config.bottleneck) {
+    area = sum;
+    return;
+  }
+  int64_t hi = 0;
+  for (const LinearExpr *u : {&uLut, &uDsp, &uFf})
+    hi = std::max(hi, bounds(*u).second);
+  peak = newInt(0, hi);
+  for (const LinearExpr *u : {&uLut, &uDsp, &uFf})
+    cp.AddGreaterOrEqual(*peak, *u);
+  area = 1000 * LinearExpr(*peak) + sum;
+}
+
+std::pair<int64_t, int64_t> FunctionModel::bounds(const LinearExpr &e) {
+  const CpModelProto &proto = cp.Proto();
+  int64_t lo = e.constant(), hi = e.constant();
+  for (auto [v, c] : llvm::zip(e.variables(), e.coefficients())) {
+    const auto &dom = proto.variables(v).domain();
+    int64_t vlo = dom[0], vhi = dom[dom.size() - 1];
+    lo += c * (c >= 0 ? vlo : vhi);
+    hi += c * (c >= 0 ? vhi : vlo);
+  }
+  return {lo, hi};
+}
+
+/// A natural log's units in the objective.
+static constexpr double logScale = 1e5;
+
+LinearExpr FunctionModel::logOf(const LinearExpr &e, StringRef what) {
+  // x = e, shifted to at least 1 where e may be 0 (an area of nothing).
+  auto [lo, hi] = bounds(e);
+  int64_t shift = lo < 1 ? 1 - lo : 0;
+  lo += shift;
+  hi += shift;
+  auto y = [](int64_t b) {
+    return std::llround(logScale * std::log(double(b)));
+  };
+  if (lo == hi)
+    return LinearExpr(y(lo));
+  IntVar x = newInt(lo, hi);
+  cp.AddEquality(x, e + shift);
+
+  // Breakpoints a ratio q apart, q the largest whose chord falls at most
+  // logError below the log (the chord over [a, q a] falls furthest, by
+  // ln((q - 1) / ln q) - 1 + ln q / (q - 1), at a (q - 1) / ln q), and at
+  // least one apart: between consecutive integers x takes no value, so
+  // there the chord is exact.
+  auto chordError = [](double q) {
+    double l = std::log(q);
+    return std::log((q - 1) / l) - 1 + l / (q - 1);
+  };
+  double qlo = 1.0001, qhi = 4.0;
+  if (chordError(qhi) <= config.logError)
+    qlo = qhi;
+  for (int it = 0; it < 60 && qlo < qhi; ++it) {
+    double mid = (qlo + qhi) / 2;
+    (chordError(mid) <= config.logError ? qlo : qhi) = mid;
+  }
+  SmallVector<int64_t> b{lo};
+  while (b.back() < hi) {
+    int64_t next = std::max<int64_t>(
+        b.back() + 1, int64_t(std::floor(double(b.back()) * qlo)));
+    b.push_back(std::min(next, hi));
+  }
+
+  // L at least the chord of the segment x is in; the secant over the whole
+  // range, below the log everywhere on it, also unconditionally (the
+  // relaxation's bound).
+  IntVar L = newInt(y(lo), y(hi));
+  auto chord = [&](int64_t b0, int64_t b1) {
+    // (b1 - b0) L >= (b1 - b0) y(b0) + (y(b1) - y(b0)) (x - b0)
+    int64_t w = b1 - b0, dy = y(b1) - y(b0);
+    return cp.AddGreaterOrEqual(w * LinearExpr(L) - dy * LinearExpr(x),
+                                w * y(b0) - dy * b0);
+  };
+  chord(lo, hi);
+  std::vector<BoolVar> segments;
+  for (size_t k = 0; k + 1 < b.size(); ++k) {
+    BoolVar in = newBool();
+    segments.push_back(in);
+    cp.AddGreaterOrEqual(x, b[k]).OnlyEnforceIf(in);
+    cp.AddLessOrEqual(x, b[k + 1]).OnlyEnforceIf(in);
+    chord(b[k], b[k + 1]).OnlyEnforceIf(in);
+  }
+  cp.AddExactlyOne(segments);
+  LLVM_DEBUG(dbgs() << "cpsat: log " << what << " over [" << lo
+                    << ", " << hi << "]" << (shift ? " (shifted)" : "")
+                    << ": " << segments.size() << " segments, ratio " << qlo
+                    << "\n");
+  return LinearExpr(L);
+}
+
+bool FunctionModel::solve(StringRef phase, const LinearExpr &objective,
+                          CpSolverResponse &response, std::string &why) {
   cp.ClearObjective();
   cp.Minimize(objective);
   Model model;
   SatParameters params;
-  // One worker searches the same way every run (the default: the same input
-  // schedules the same way); more run CP-SAT's parallel portfolio, whose
-  // solution within the limit may vary. (Its interleaved deterministic mode
-  // fails an internal check on these models in OR-Tools 9.15.) The limit is
-  // in deterministic time, with a wall-clock limit as a backstop.
+  // Interleaved: every subsolver (LNS included, with one worker too) in
+  // batches synchronized deterministically, so the same input and worker
+  // count schedule the same way.
   params.set_num_workers(std::max(1, config.numWorkers));
+  params.set_interleave_search(true);
   params.set_max_deterministic_time(config.timeLimitS);
-  params.set_max_time_in_seconds(config.timeLimitS * 4 + 1);
+  params.set_max_time_in_seconds(config.timeLimitS * 2 + 1);
   params.set_random_seed(0);
+  if (!config.solverParameters.empty()) {
+    SatParameters extra;
+    if (!google::protobuf::TextFormat::ParseFromString(
+            config.solverParameters, &extra)) {
+      why = "cannot parse the solver parameters '" +
+            config.solverParameters + "'";
+      return false;
+    }
+    params.MergeFrom(extra);
+  }
   model.Add(NewSatParameters(params));
   response = SolveCpModel(cp.Build(), &model);
-  LLVM_DEBUG(dbgs() << "cpsat: status " << response.status() << " objective "
+  LLVM_DEBUG(dbgs() << "cpsat: " << phase << ": "
+                    << CpSolverStatus_Name(response.status()) << " objective "
                     << response.objective_value() << " bound "
                     << response.best_objective_bound() << " in "
                     << response.wall_time() << " s\n");
-  return response.status() == CpSolverStatus::OPTIMAL ||
-         response.status() == CpSolverStatus::FEASIBLE;
+  if (response.status() == CpSolverStatus::OPTIMAL ||
+      response.status() == CpSolverStatus::FEASIBLE)
+    return true;
+  why = (llvm::Twine(phase) + ": " + CpSolverStatus_Name(response.status()) + " after " +
+         std::to_string(response.wall_time()) + " s")
+            .str();
+  return false;
 }
 
-void ChainingModel::hintFrom(const CpSolverResponse &response) {
-  cp.ClearHints();
-  for (IntVar v : allInts)
-    cp.AddHint(v, SolutionIntegerValue(response, v));
-  for (BoolVar b : allBools)
-    cp.AddHint(b, SolutionBooleanValue(response, b));
+void FunctionModel::hint() {
+  for (auto [r, region] : llvm::enumerate(m.regions)) {
+    if (iiVar[r] && region.hintII)
+      cp.AddHint(*iiVar[r], *region.hintII);
+    for (auto [i, op] : llvm::enumerate(region.ops)) {
+      if (!op.hint)
+        continue;
+      cp.AddHint(vars[r][i].c, *op.hint);
+      for (size_t j = 0; j < vars[r][i].chosen.size(); ++j)
+        cp.AddHint(vars[r][i].chosen[j], j == op.hintChoice);
+    }
+  }
 }
 
-void ChainingModel::extract(const CpSolverResponse &response,
-                      CPSATChainingResult &result) {
-  // Operator choices, start times and the times operands reach the core.
-  DenseMap<Operation *, unsigned> chosenOf;
-  for (auto &[op, v] : vars) {
-    unsigned k = 0;
-    if (v.choices.size() > 1)
-      for (auto [i, ch] : llvm::enumerate(v.choices))
-        if (SolutionBooleanValue(response, ch.chosen))
-          k = i;
-    chosenOf[op] = k;
-    prob.setLinkedOperatorType(op, v.choices[k].opr);
-    prob.setStartTime(op, SolutionIntegerValue(response, v.c));
-  }
-  // The arrival of each operation's operands as the solution places them
-  // (`z` may sit later than they need): the latest ready of a source in the
-  // same cycle, by the solution's choices.
-  DenseMap<Operation *, int64_t> arrival, readyAt, muxOf;
-  for (auto &[op, v] : vars)
-    muxOf[op] = SolutionIntegerValue(response, v.mux);
-  (void)handleOperationsInTopologicalOrder(prob, [&](Operation *op) {
-    OpVars &v = vars[op];
-    int64_t c = SolutionIntegerValue(response, v.c);
-    int64_t a = 0;
-    for (auto dep : prob.getDependences(op)) {
-      if (dep.isAuxiliary() || distance(dep) != 0)
-        continue;
-      Operation *src = dep.getSource();
-      auto it = readyAt.find(src);
-      if (it == readyAt.end())
-        return failure();
-      int64_t r = it->second - c * K;
-      if (r > 0)
-        a = std::max(a, r);
-    }
-    arrival[op] = a;
-    const Choice &ch = v.choices[chosenOf[op]];
-    readyAt[op] = ch.latency == 0 ? c * K + a + muxOf[op] + ch.out
-                                  : (c + ch.latency) * K + ch.out;
-    chain.setStartTimeInCycle(op, float(a + muxOf[op]) / 1000.0f);
-    return success();
-  });
-  // Each operation's slack before its mux: the cycle less the latest end of
-  // a chain through it, its own mux taken out (that is what a larger one
-  // would replace).
-  DenseMap<Operation *, SmallVector<Operation *, 2>> sameCycleUsers;
-  for (auto &[op, v] : vars)
-    for (auto dep : prob.getDependences(op)) {
-      if (dep.isAuxiliary() || distance(dep) != 0)
-        continue;
-      Operation *src = dep.getSource();
-      if (*prob.getStartTime(src) == *prob.getStartTime(op))
-        sameCycleUsers[src].push_back(op);
-    }
-  DenseMap<Operation *, int64_t> chainEnd;
-  std::function<int64_t(Operation *)> endOf = [&](Operation *op) -> int64_t {
-    if (auto it = chainEnd.find(op); it != chainEnd.end())
-      return it->second;
-    const Choice &ch = vars[op].choices[chosenOf[op]];
-    int64_t end = arrival.lookup(op) + muxOf[op] +
-                  (ch.latency == 0 ? ch.out : ch.inc);
-    chainEnd[op] = end;
-    if (ch.latency == 0)
-      for (Operation *user : sameCycleUsers.lookup(op))
-        end = std::max(end, endOf(user));
-    return chainEnd[op] = end;
-  };
-  for (auto &[op, v] : vars) {
-    result.rawSlack[op] = float(K - endOf(op) + muxOf[op]) / 1000.0f;
-    result.muxDelay[op] = float(muxOf[op]) / 1000.0f;
-  }
-  // Instances: the pool's ids, then new ones in slot order past them.
-  DenseMap<Problem::OperatorType, int64_t> nextId;
-  for (auto &inst : input.pool) {
-    int64_t &next = nextId[inst.opr];
-    next = std::max(next, inst.id + 1);
-  }
-  for (Slot &s : slots) {
-    std::optional<int64_t> id;
-    if (s.poolIndex)
-      id = input.pool[*s.poolIndex].id;
-    for (auto &[op, b] : s.takers) {
-      if (!SolutionBooleanValue(response, b))
-        continue;
-      if (!id)
-        id = nextId[s.opr]++;
-      result.instance[op] = *id;
-    }
-  }
-  // An operation alone on a shareable operator takes an instance of its own.
-  for (auto &[op, v] : vars) {
-    const Choice &ch = v.choices[chosenOf[op]];
-    if (ch.shareable && isAlone(op, ch)) {
-      result.instance[op] = nextId[ch.opr]++;
-      result.closes.insert(op);
-    }
-  }
-  // A carried result read past its ready cycle closes its instance (alone,
-  // by the model) to later regions too.
-  for (auto &[op, readers] : input.carriedReaders) {
-    if (!result.instance.count(op))
+void FunctionModel::extract(const CpSolverResponse &response,
+                            CPSATFunctionSolution &solution) {
+  DenseMap<unsigned, int64_t> nextId;
+  DenseMap<std::pair<unsigned, unsigned>, int64_t> instanceOf;
+  for (SlotV &s : slots) {
+    if (!SolutionBooleanValue(response, s.used))
       continue;
-    const Choice &ch = vars[op].choices[chosenOf[op]];
-    if (ch.latency == 0)
-      continue;
-    int64_t ready = *prob.getStartTime(op) + ch.latency;
-    for (Operation *reader : readers)
-      if (vars.count(reader) && *prob.getStartTime(reader) + ii != ready)
-        result.closes.insert(op);
+    int64_t id = nextId[s.opr]++;
+    for (auto &t : s.takers)
+      if (SolutionBooleanValue(response, t.b))
+        instanceOf[{t.region, t.op}] = id;
   }
-}
-
-LogicalResult ChainingModel::run(CPSATChainingResult &result) {
-  if (!prob.hasOperation(lastOp))
-    return prob.getContainingOp()->emitError(
-        "problem does not include last operation");
+  for (auto [r, region] : llvm::enumerate(m.regions)) {
+    auto &out = solution.regions.emplace_back();
+    auto &rv = vars[r];
+    size_t n = region.ops.size();
+    out.start.resize(n);
+    out.opr.resize(n);
+    out.inCycle.resize(n);
+    out.instance.resize(n);
+    SmallVector<int64_t> readyAt(n), mux(n);
+    SmallVector<unsigned> choice(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+      auto &op = region.ops[i];
+      if (op.oprs.size() > 1)
+        for (size_t j = 0; j < op.oprs.size(); ++j)
+          if (SolutionBooleanValue(response, rv[i].chosen[j]))
+            choice[i] = j;
+      out.start[i] = SolutionIntegerValue(response, rv[i].c);
+      out.opr[i] = op.oprs[choice[i]];
+      mux[i] = SolutionIntegerValue(response, rv[i].mux);
+      readyAt[i] = SolutionIntegerValue(response, rv[i].ready);
+      if (auto it = instanceOf.find({unsigned(r), unsigned(i)});
+          it != instanceOf.end())
+        out.instance[i] = it->second;
+      else if (opr(out.opr[i]).info.shareable && isAlone(op, out.opr[i]))
+        out.instance[i] = nextId[out.opr[i]]++;
+    }
+    SmallVector<int64_t> arrival(n, 0);
+    for (auto &dep : region.deps) {
+      if (dep.auxiliary || dep.distance)
+        continue;
+      int64_t r0 = readyAt[dep.src] - int64_t(out.start[dep.dst]) * K;
+      arrival[dep.dst] = std::max(arrival[dep.dst], r0);
+    }
+    for (size_t i = 0; i < n; ++i)
+      out.inCycle[i] = float(arrival[i] + mux[i]) / 1000.0f;
+    out.length = SolutionIntegerValue(response, lastVar[r]);
+    out.ii = iiVar[r] ? SolutionIntegerValue(response, *iiVar[r])
+                      : region.ii;
+  }
+  solution.area = double(SolutionIntegerValue(response, area));
+  solution.cycles = SolutionIntegerValue(response, cycles);
+  solution.luts = SolutionIntegerValue(response, lutUse);
+  solution.dsps = SolutionIntegerValue(response, dspUse);
+  solution.ffs = SolutionIntegerValue(response, ffUse);
   LLVM_DEBUG({
-    for (auto &inst : input.pool)
-      dbgs() << "cpsat: pool " << inst.opr.getValue() << " #" << inst.id
-             << " users " << inst.users << " slack " << inst.rawSlack
-             << (inst.closed ? " closed" : "")
-             << (inst.pipelineUser ? " pipeline" : "") << "\n";
-    for (auto &[opr, n] : input.futureUsers)
-      dbgs() << "cpsat: future " << opr.getValue() << " " << n << "\n";
+    for (const Held &h : heldValues)
+      if (int64_t n = SolutionIntegerValue(response, h.regs))
+        dbgs() << "cpsat: held: region " << h.region << " op " << h.op << " "
+               << m.regions[h.region].ops[h.op].name << " width " << h.bits
+               << " held " << SolutionIntegerValue(response, h.held)
+               << " regs " << n << " (II "
+               << (iiVar[h.region]
+                       ? SolutionIntegerValue(response, *iiVar[h.region])
+                       : int64_t(m.regions[h.region].ii))
+               << ")\n";
+    auto pct = [](int64_t n, double capacity) {
+      return 100.0 * double(n) / std::max(capacity, 1.0);
+    };
+    dbgs() << "cpsat: resources: " << solution.luts << " LUTs ("
+           << SolutionIntegerValue(response, muxLutsTotal) << " in muxes, "
+           << pct(solution.luts, config.lutCapacity) << "%), "
+           << solution.dsps << " DSPs ("
+           << pct(solution.dsps, config.dspCapacity) << "%), " << solution.ffs
+           << " FFs (" << SolutionIntegerValue(response, registerFFs)
+           << " in registers, " << SolutionIntegerValue(response, enableFFs)
+           << " in enables, " << pct(solution.ffs, config.ffCapacity)
+           << "%), " << SolutionIntegerValue(response, registerSRLs)
+           << " of the LUTs in SRLs\n";
   });
+}
+
+LogicalResult FunctionModel::run(CPSATFunctionSolution &solution,
+                                 std::string &why) {
   build();
-  LLVM_DEBUG(dbgs() << "cpsat: " << vars.size() << " operations, "
-                    << slots.size() << " slots, horizon " << H << ", II "
-                    << ii << "\n");
+  LLVM_DEBUG({
+    size_t ops = 0;
+    for (auto &r : m.regions)
+      ops += r.ops.size();
+    dbgs() << "cpsat: " << m.regions.size() << " regions, " << ops
+           << " operations, " << slots.size() << " instances\n";
+  });
+  hint();
 
-  // Start from the hint: its start times, each operation on its linked
-  // operator.
-  for (auto &[op, v] : vars) {
-    if (auto it = input.hint.find(op); it != input.hint.end())
-      cp.AddHint(v.c, it->second);
-    if (v.choices.size() > 1) {
-      auto linked = *prob.getLinkedOperatorType(op);
-      for (auto &ch : v.choices)
-        cp.AddHint(ch.chosen, ch.opr == linked);
-    }
+  // One objective: (1 - t) log(area) + t log(cycles), in permille of t; the
+  // ends keep a thousandth of the other as a tie-break.
+  LinearExpr objective;
+  StringRef phase = "cycles";
+  if (config.cyclesOnly) {
+    objective = cycles;
+  } else {
+    phase = "tradeoff";
+    int64_t permille = std::clamp<int64_t>(
+        std::llround(std::clamp(config.tradeoff, 0.0, 1.0) * 1000), 1, 999);
+    objective = (1000 - permille) * logOf(area, "area") +
+                permille * logOf(cycles, "cycles");
   }
-
-  // Phase 1: the length.
-  LinearExpr length(vars[lastOp].c);
   CpSolverResponse response;
-  if (!solve(length, response))
+  if (!solve(phase, objective, response, why))
     return failure();
-  int64_t bestLength = SolutionIntegerValue(response, length);
-  result.optimal = response.status() == CpSolverStatus::OPTIMAL;
-  CpSolverResponse best = response;
-
-  if (!config.feasibilityOnly) {
-    // Phase 2: area, within the length's slack.
-    if (config.lengthSlack)
-      cp.AddLessOrEqual(length, bestLength + *config.lengthSlack);
-    hintFrom(best);
-    LinearExpr cost = area;
-    if (int64_t perCycle = std::llround(config.cycleCost))
-      cost += perCycle * length;
-    if (solve(cost, response)) {
-      best = response;
-      result.optimal &= response.status() == CpSolverStatus::OPTIMAL;
-      // Phase 3: the earliest starts at that area.
-      cp.AddLessOrEqual(area, SolutionIntegerValue(response, area));
-      LinearExpr starts;
-      for (auto &[op, v] : vars)
-        starts += v.c;
-      hintFrom(best);
-      if (solve(starts, response))
-        best = response;
-    }
-  }
-
-  extract(best, result);
-  result.length = SolutionIntegerValue(best, length);
-  result.area = double(SolutionIntegerValue(best, area));
+  extract(response, solution);
+  solution.optimal = response.status() == CpSolverStatus::OPTIMAL;
   return success();
 }
 
 } // namespace
 
-LogicalResult scheduling::scheduleCPSATChaining(
-    ChainingSharedOperatorsProblem &prob, Operation *lastOp,
-    const CPSATChainingConfig &config, const CPSATChainingInput &input,
-    CPSATChainingResult &result) {
-  ChainingModel model(prob, prob, prob, /*cyclic=*/nullptr, lastOp, config, input);
-  return model.run(result);
+unsigned
+scheduling::cpsatResourceMII(const CPSATFunctionModel::Region &region) {
+  unsigned mii = 1;
+  for (auto &rsrc : region.resources)
+    if (rsrc.limit)
+      mii = std::max<unsigned>(mii,
+                               (rsrc.ops.size() + rsrc.limit - 1) / rsrc.limit);
+  return mii;
 }
 
-LogicalResult scheduling::scheduleCPSATChaining(
-    ChainingModuloProblem &prob, Operation *lastOp,
-    const CPSATChainingConfig &config, const CPSATChainingInput &input,
-    CPSATChainingResult &result) {
-  if (!prob.getInitiationInterval())
-    return prob.getContainingOp()->emitError(
-        "cpsat chaining: a pipeline needs its II");
-  ChainingModel model(prob, prob, prob, &prob, lastOp, config, input);
-  return model.run(result);
+LogicalResult scheduling::scheduleCPSATFunction(
+    const CPSATFunctionModel &model, const CPSATChainingConfig &config,
+    CPSATFunctionSolution &solution, std::string &why) {
+  FunctionModel fm(model, config);
+  return fm.run(solution, why);
 }

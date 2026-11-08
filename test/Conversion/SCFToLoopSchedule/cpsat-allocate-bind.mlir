@@ -4,8 +4,8 @@
 // The CP-SAT scheduler chooses each op's operator among its candidates and
 // binds the ops of a shareable operator (an extern instance) to instances,
 // the mux an instance's users put on its operands in their chains (0.3 ns
-// for two users here). A function body may take longer to save area: after
-// its shortest length, area, then the earliest starts.
+// for two users here). It trades the function's area against its cycles,
+// area^(1 - t) x cycles^t (t = 0.5 by default: their product).
 
 oplib.library @lib {
   oplib.operator @mul_l0 latency<0>, incDelay<2.5>, outDelay<2.5> attributes {amc.area_dsp = 1 : i64} {
@@ -57,7 +57,8 @@ func.func @fits(%a: i32, %b: i32, %c: i32) -> i32 attributes {oplib.library = @l
 
 // A slower combinational multiply leaves no room for the mux (2.8 + 0.3 >
 // 3.0): shared, the multiplies take the pipelined core (its input path 1.0
-// + 0.3), one instance where the combinational core needed two.
+// + 0.3), one instance where the combinational core needed two, for a cycle
+// more (half the area for a third more cycles).
 // CHECK-LABEL: loopschedule.func_sequential @slow
 // CHECK:         arith.muli {{.*}} {loopschedule.binding = 0 : i64, loopschedule.operator = @mul_l1}
 // CHECK:         arith.muli {{.*}} {loopschedule.binding = 0 : i64, loopschedule.operator = @mul_l1}
