@@ -204,6 +204,80 @@ bool readsCarriedPastReady(Operation *op, unsigned latency) {
   }
   return false;
 }
+/// Can `pipeline` stall: does it wait on a dynamic-latency access (a
+/// launched load, an expect, a dynamic port)?
+bool canStall(LoopSchedulePipelineOp pipeline) {
+  return pipeline
+      ->walk([](Operation *op) {
+        bool dynamic = isa<LoopScheduleLaunchOp, LoopScheduleExpectOp>(op);
+        if (auto load = dyn_cast<LoadInterface>(op))
+          dynamic |= load.isDynamic();
+        if (auto store = dyn_cast<StoreInterface>(op))
+          dynamic |= store.isDynamic();
+        return dynamic ? WalkResult::interrupt() : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+/// A binding problem that sees its users' stalls. An instance's clock
+/// enable is the AND of its users' not-stalls, so a user that stalls
+/// freezes the other users' operations in it, and its issues fall out of
+/// step with theirs. A frame's ops and those of a pipeline it launched
+/// share a concurrency group (the pipeline lowers inline): the frame's ops
+/// issue by the launch, and the frame counts plain cycles to their results.
+/// Against a pipeline that can stall, a frame op holds its instance from
+/// its issue to its ready cycle, its operation in the instance (`flight`
+/// cycles, its latency); two pipelines launched together share none.
+class StallAwareBindingProblem : public binding::BindingProblem {
+public:
+  using BindingProblem::BindingProblem;
+
+  /// \p op uses an operator instance, its operation in it \p cycles.
+  void setFlight(Operation *op, unsigned cycles) { flight[op] = cycles; }
+
+  bool conflicts(Operation *a, Operation *b) override {
+    if (BindingProblem::conflicts(a, b))
+      return true;
+    if (a == b || !areConcurrent(a, b) || !flight.count(a) ||
+        !flight.count(b))
+      return false; // not both operator instance users (ports have limits)
+    auto pa = a->getParentOfType<LoopSchedulePipelineOp>();
+    auto pb = b->getParentOfType<LoopSchedulePipelineOp>();
+    if (pa == pb)
+      return false; // one stall domain
+    if (pa && pb)
+      return stalls(pa) || stalls(pb);
+    Operation *frameOp = pa ? b : a, *pipeOp = pa ? a : b;
+    if (!stalls(pa ? pa : pb))
+      return false;
+    // The frame op's operation is in the instance in [s, s + flight - 1];
+    // the pipeline issues at t + j * II, j < count.
+    unsigned f = flight.lookup(frameOp);
+    if (f <= 1)
+      return false; // its issue cycle alone: the check above
+    int64_t s = getStartTime(frameOp).value_or(0);
+    int64_t t = getStartTime(pipeOp).value_or(0);
+    int64_t ii = getPeriod(pipeOp).value_or(0);
+    int64_t count = getCount(pipeOp).value_or(1);
+    int64_t last = s + f - 1;
+    if (t >= s)
+      return t <= last;
+    if (ii == 0)
+      return false;
+    int64_t j = (s - t + ii - 1) / ii; // the first issue at or after s
+    return j < count && t + j * ii <= last;
+  }
+
+private:
+  bool stalls(LoopSchedulePipelineOp pipeline) {
+    auto [it, inserted] = canStallCache.try_emplace(pipeline, false);
+    if (inserted)
+      it->second = canStall(pipeline);
+    return it->second;
+  }
+  DenseMap<Operation *, unsigned> flight;
+  DenseMap<Operation *, bool> canStallCache;
+};
 } // namespace
 
 LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
@@ -263,7 +337,7 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
   if (keepBindings) {
     SmallVector<Candidate> rest;
     std::map<std::pair<std::string, int64_t>, SmallVector<Operation *>> groups;
-    binding::BindingProblem prob(funcOp);
+    StallAwareBindingProblem prob(funcOp);
     for (auto &cand : candidates) {
       auto id = cand.op->getAttrOfType<IntegerAttr>("loopschedule.binding");
       if (!id || cand.declaredLimit) {
@@ -274,6 +348,7 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
       prob.insertOperation(op);
       prob.setStartTime(op, *stAnalysis.getStartTime(op));
       prob.setLatency(op, 1);
+      prob.setFlight(op, opLibAnalysis.getOperatorLatency(cand.oprName));
       if (auto period = stAnalysis.getPeriod(op); period && *period > 0)
         prob.setPeriod(op, *period);
       if (auto count = stAnalysis.getCount(op); count && *count > 1)
@@ -338,7 +413,7 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
   DenseMap<Operation *, int64_t> instanceOf;
   while (true) {
     // Phase 2 — populate the problem.
-    binding::BindingProblem prob(funcOp);
+    StallAwareBindingProblem prob(funcOp);
     llvm::StringMap<unsigned> shareCount;
     for (auto &cand : candidates)
       if (!alone.contains(cand.op))
@@ -367,6 +442,8 @@ LogicalResult LoopScheduleBindingPass::bindFunction(Operation *funcOp) {
       // (see the file header). Non-pipelined multi-cycle operators would
       // need their real occupancy here.
       prob.setLatency(op, 1);
+      if (!isMemoryAccess(op))
+        prob.setFlight(op, opLibAnalysis.getOperatorLatency(cand.oprName));
       if (auto period = stAnalysis.getPeriod(op); period && *period > 0)
         prob.setPeriod(op, *period);
       if (auto count = stAnalysis.getCount(op); count && *count > 1)
