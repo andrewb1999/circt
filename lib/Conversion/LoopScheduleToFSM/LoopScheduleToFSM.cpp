@@ -5407,6 +5407,44 @@ LoopScheduleToFSMPass::analyzeLoopNode(const LoopNode &node,
     if (!analyzable)
       continue;
 
+    // (e) instance disjointness: the scheduler and binding put the child
+    // after its scheduled offset, so a shared operator instance (an
+    // (operator, binding) pair; pipelines lower inline, into the frame's
+    // module) may serve both the frame's ops and the pipeline's. A frame op
+    // on one the pipeline uses must be done with it before the pipeline's
+    // first cycle (start + 1, or start under pre-arm): its operation out of
+    // the instance, issued and ready, since the pipeline's stall freezes
+    // the instance under it and the pipeline's issues would collide with
+    // its issue. Runtime adi's pipelined sweep issued its stage-1 add in
+    // the cycle of a frame op's on the same instance.
+    auto instanceOf =
+        [](Operation *op) -> std::optional<std::pair<StringAttr, int64_t>> {
+      auto opr = op->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+      auto id = op->getAttrOfType<IntegerAttr>("loopschedule.binding");
+      if (!opr || !id)
+        return std::nullopt;
+      return std::make_pair(opr.getLeafReference(), id.getInt());
+    };
+    DenseSet<std::pair<StringAttr, int64_t>> pipInstances;
+    pipBlock.walk([&](Operation *op) {
+      if (auto key = instanceOf(op))
+        pipInstances.insert(*key);
+    });
+    for (auto atOp : frameOp.getBodyBlock().getOps<LoopScheduleAtOp>()) {
+      unsigned k = (unsigned)atOp.getOffset();
+      atOp->walk<WalkOrder::PreOrder>([&](Operation *op) {
+        if (isa<LoopScheduleLaunchOp>(op))
+          return WalkResult::skip(); // a child's own ops move with it
+        auto key = instanceOf(op);
+        if (!key || !pipInstances.contains(*key))
+          return WalkResult::advance();
+        unsigned done = k + computeOpCycleLatency(op, operatorLibrary);
+        minStart = std::max(minStart, done);
+        minStartPreArm = std::max(minStartPreArm, done + 1);
+        return WalkResult::advance();
+      });
+    }
+
     // (c) port disjointness: pipeline stages that would overlap the
     // frame's cycle states must not touch any (port, binding) the
     // frame's static ops drive. Shared by the peephole (window =
