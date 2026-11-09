@@ -169,6 +169,10 @@ struct CPSATFunctionModel {
     /// function reading it (where known: a constant, a function argument, a
     /// value of the region); one past the end is a value of its own.
     SmallVector<unsigned, 3> inputs;
+    /// A dynamic-latency access (an AXI load or store): it completes with a
+    /// pulse on its port, which a child loop on the port, running then,
+    /// would count as its own.
+    bool dynamic = false;
   };
   struct Region {
     SmallVector<Op, 0> ops;
@@ -202,7 +206,12 @@ struct CPSATFunctionModel {
     /// an instance then (issued by the launch, ready after it). An instance
     /// serves this region (or one inside it) and such a sibling or op
     /// never at once: the model launches the siblings apart, and keeps the
-    /// parent's op out of the instance by the launch or after it.
+    /// parent's op out of the instance before the launch's cycle or after it
+    /// (a function's frame starts its child as the frame starts, before a
+    /// shifted frame's other ops). A dynamic access of the parent's on a
+    /// port the child uses is done by the launch (in its last budget cycle,
+    /// which the frame holds until it completes, and not the launch's) or
+    /// comes after it.
     std::optional<unsigned> parent;
     unsigned launch = 0;
   };

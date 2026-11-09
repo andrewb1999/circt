@@ -17,6 +17,7 @@
 #include "ortools/sat/sat_parameters.pb.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
@@ -388,6 +389,41 @@ void FunctionModel::build() {
       cycles += region.runs * length;
   }
 
+  // A child loop runs from its launch until its parent's next frame. A
+  // dynamic access of the parent's in flight then, on a port the child uses
+  // (an operator of its or of a loop inside it), completes with a pulse on
+  // the port the child counts as its own, and the child waits for one more
+  // than it gets: it is done by the launch (in its last budget cycle, which
+  // the frame holds until the access completes, and the launch with it) or
+  // comes after it, in a frame that awaits the child.
+  {
+    std::vector<DenseSet<unsigned>> oprsIn(m.regions.size());
+    for (auto [r, region] : llvm::enumerate(m.regions))
+      for (auto &op : region.ops)
+        for (unsigned k : op.oprs)
+          for (std::optional<unsigned> q = r; q; q = m.regions[*q].parent)
+            oprsIn[*q].insert(k);
+    for (auto [r, region] : llvm::enumerate(m.regions)) {
+      if (!region.parent)
+        continue;
+      unsigned p = *region.parent;
+      IntVar launch = vars[p][region.launch].c;
+      for (auto [a, op] : llvm::enumerate(m.regions[p].ops)) {
+        if (!op.dynamic || op.oprs.empty() || !oprsIn[r].contains(op.oprs[0]))
+          continue;
+        // Not in the launch's cycle either (a function frame's child starts
+        // with the frame, before a shifted frame's other ops).
+        int64_t budget = std::max<int64_t>(lat(op.oprs[0]) - 1, 1);
+        BoolVar after = newBool();
+        cp.AddGreaterOrEqual(LinearExpr(launch),
+                             LinearExpr(vars[p][a].c) + budget)
+            .OnlyEnforceIf(after.Not());
+        cp.AddGreaterOrEqual(vars[p][a].c, LinearExpr(launch) + 1)
+            .OnlyEnforceIf(after);
+      }
+    }
+  }
+
   // Instances of each shareable operator, across all regions: as many as
   // twice the most a region could use at once, and two more (a mux may make
   // a region split its users), at most one per taker.
@@ -598,20 +634,24 @@ void FunctionModel::concurrency(SlotV &s) {
       continue;
     unsigned launch = m.regions[r].launch;
     IntVar at = vars[*parent][launch].c;
-    // The parent's users: out of the instance by the launch (issued and
-    // ready; a combinational one issues by it in any case, the child's
-    // first stage a cycle after), or after it, in a frame that awaits it.
-    if (latency > 0)
-      for (auto &t : s.takers) {
-        if (t.region != *parent)
-          continue;
-        IntVar c = vars[t.region][t.op].c;
-        BoolVar after = newBool();
-        cp.AddLessOrEqual(LinearExpr(c) + latency, at)
-            .OnlyEnforceIf({t.b, usesOf(r), after.Not()});
-        cp.AddGreaterOrEqual(c, LinearExpr(at) + 1)
-            .OnlyEnforceIf({t.b, usesOf(r), after});
-      }
+    // The parent's users: out of the instance before the launch's cycle
+    // (issued and ready; a combinational one issued), or after it, in a
+    // frame that awaits it. Not in its cycle: a function's frame that
+    // launches a child starts the child as the frame starts, which a
+    // frame's shift (after a multi-cycle result of an earlier frame's) puts
+    // before the cycle its other ops are scheduled in (deriche's frame
+    // issued a multiply two cycles into a child's pipeline on it).
+    int64_t busy = std::max<int64_t>(latency, 1);
+    for (auto &t : s.takers) {
+      if (t.region != *parent)
+        continue;
+      IntVar c = vars[t.region][t.op].c;
+      BoolVar after = newBool();
+      cp.AddLessOrEqual(LinearExpr(c) + busy, at)
+          .OnlyEnforceIf({t.b, usesOf(r), after.Not()});
+      cp.AddGreaterOrEqual(c, LinearExpr(at) + 1)
+          .OnlyEnforceIf({t.b, usesOf(r), after});
+    }
     // A sibling launched in the same cycle runs alongside; one launched
     // later is in a later frame, which awaits this one.
     for (unsigned q = r + 1; q < n; ++q) {

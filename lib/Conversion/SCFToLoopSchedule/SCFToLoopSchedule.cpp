@@ -2385,6 +2385,7 @@ CPSATFunctionModel::Region &SCFToLoopSchedulePass::captureRegion(
           o.carriedReaders.push_back(r->second);
     for (Value result : op->getResults())
       o.width += bitWidthOf(result.getType());
+    o.dynamic = isDynamicLatencyOp(*op);
     region.ops.push_back(std::move(o));
   }
   // The values on the ops' operands: their users of one shared instance
