@@ -2214,21 +2214,38 @@ CPSATRegionInput SCFToLoopSchedulePass::buildCPSATInput(
       dsp = a.getInt();
     return lut + dsp * cpsatDeviceLuts / std::max(1.0, double(cpsatDeviceDsps));
   };
+  // An operator whose delays exceed the cycle (clamped to it in the
+  // problem): one allocation lowered for a recurrence at an II it took as
+  // given, past the clock, which this scheduler keeps.
+  auto overClock = [&](StringRef name) {
+    return operatorLibraryAnalysis->getOperatorIncomingDelay(name).value_or(
+               0.0f) > cycleTimeNs ||
+           operatorLibraryAnalysis->getOperatorOutgoingDelay(name).value_or(
+               0.0f) > cycleTimeNs;
+  };
   // Each op's candidates, but those costing over half again its cheapest
-  // (a Full_Usage core where a DSP58 primitive does): they are taken only
-  // where nothing cheaper closes the schedule, and each multiplies the
-  // instances the search weighs. Allocation's own choice stays.
+  // that fits the clock (a Full_Usage core where a DSP58 primitive does):
+  // they are taken only where nothing cheaper closes the schedule, and each
+  // multiplies the instances the search weighs; and, where one fits, those
+  // past the clock. Allocation's own choice stays (the model takes it only
+  // if it fits, or none does).
   for (auto *op : problem.getOperations()) {
     auto it = cpsatCandidates.find(op);
     if (it == cpsatCandidates.end())
       continue;
+    bool anyFits = llvm::any_of(it->second, [&](Problem::OperatorType opr) {
+      return !overClock(opr.getValue());
+    });
     std::optional<double> cheapest;
     for (auto opr : it->second)
-      if (auto a = entryArea(opr.getValue()))
-        cheapest = cheapest ? std::min(*cheapest, *a) : *a;
+      if (!anyFits || !overClock(opr.getValue()))
+        if (auto a = entryArea(opr.getValue()))
+          cheapest = cheapest ? std::min(*cheapest, *a) : *a;
     SmallVector<Problem::OperatorType, 4> kept;
     for (auto [i, opr] : llvm::enumerate(it->second)) {
       auto a = entryArea(opr.getValue());
+      if (i > 0 && anyFits && overClock(opr.getValue()))
+        continue;
       if (i == 0 || !a || !cheapest || *a <= 1.5 * *cheapest)
         kept.push_back(opr);
     }
@@ -2268,6 +2285,7 @@ CPSATRegionInput SCFToLoopSchedulePass::buildCPSATInput(
         });
     info.shareable = instance && !issueCycles &&
                      !operatorLibraryAnalysis->getOperatorLimit(name);
+    info.overClock = overClock(name);
     info.width = info.operands = 0; // from its ops, below
     input.operatorInfo[opr] = info;
   }

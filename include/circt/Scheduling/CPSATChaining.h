@@ -72,6 +72,10 @@ struct CPSATOperatorInfo {
   double lut = 0.0, dsp = 0.0, ff = 0.0;
   /// Instances may serve several operations.
   bool shareable = false;
+  /// Its delays exceed the cycle (the scheduler clamps them to it): an
+  /// operator allocation lowered a recurrence's latency to past the clock.
+  /// Taken only where none of its op's candidates fits.
+  bool overClock = false;
   /// The width (bits) of each operand its mux selects, and how many there
   /// are: the model takes the mux's delay at that width, and its LUTs.
   unsigned width = 32;

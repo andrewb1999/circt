@@ -236,6 +236,18 @@ void FunctionModel::build() {
           lits.push_back(v.chosen.back());
         }
         cp.AddExactlyOne(lits);
+        // An operator slower than the cycle, its delays clamped to it (so
+        // it would seem to fit), only where none of the op's candidates
+        // fits: allocation offers one where a pipelined loop's recurrence
+        // needs it at the II it was asked for (there the II takes
+        // precedence over the clock), but this scheduler keeps the clock
+        // and chooses the II (deriche's filters took a 3.45 ns multiply-add
+        // at II 2 beside a 2-cycle one that fits).
+        auto slow = [&](unsigned k) { return m.oprs[k].info.overClock; };
+        if (!llvm::all_of(op.oprs, slow))
+          for (auto [j, k] : llvm::enumerate(op.oprs))
+            if (slow(k))
+              cp.AddEquality(v.chosen[j], 0);
       }
       rv.push_back(v);
     }
