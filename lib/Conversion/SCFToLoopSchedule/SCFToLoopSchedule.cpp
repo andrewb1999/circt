@@ -52,6 +52,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
@@ -2441,6 +2442,21 @@ CPSATFunctionModel::Region &SCFToLoopSchedulePass::captureRegion(
       if (unsigned c = child.getInt(); c < self) {
         model.regions[c].parent = self;
         model.regions[c].launch = i;
+        // The operators of the child and the loops inside it (described
+        // already, each linked to its parent).
+        llvm::SmallSetVector<unsigned, 8> oprs;
+        for (auto [q, inner] : llvm::enumerate(model.regions)) {
+          // Up the parents (one may be this region, not described yet).
+          std::optional<unsigned> up = q;
+          while (up && *up != c && *up < self)
+            up = model.regions[*up].parent;
+          if (up && *up == c)
+            for (auto &innerOp : inner.ops)
+              oprs.insert(innerOp.oprs.begin(), innerOp.oprs.end());
+        }
+        SmallVector<unsigned> sorted(oprs.begin(), oprs.end());
+        llvm::sort(sorted);
+        region.ops[i].childOprs.append(sorted.begin(), sorted.end());
       }
       return WalkResult::skip(); // the loops inside it are its own
     });

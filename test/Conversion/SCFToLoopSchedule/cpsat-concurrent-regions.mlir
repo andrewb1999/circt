@@ -1,5 +1,6 @@
 // REQUIRES: or-tools
 // RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefix=SHARE
 
 // The CP-SAT scheduler shares an instance across a function's regions,
 // which mostly run one at a time. A child loop runs from its launch until
@@ -65,15 +66,15 @@ func.func @siblings(%a: i32, %b: i32) -> (i32, i32) attributes {oplib.library = 
 
 // The parent's multiply (2 cycles) shares the pipeline's: issued in the
 // launch's frame it would be in the instance while the child runs; it is
-// in a frame of its own, done before the launch.
+// in a frame of its own, done before the launch or after it.
 // CHECK-LABEL: loopschedule.func_sequential @overlap
-// CHECK:         loopschedule.frame -> (i32) {
-// CHECK-NEXT:      loopschedule.at 0 -> i32 {
-// CHECK-NEXT:        arith.muli %arg0, %arg1 {loopschedule.binding = 0 : i64
-// CHECK:         loopschedule.frame -> (!loopschedule.handle) {
-// CHECK-NEXT:      loopschedule.at 0 -> !loopschedule.handle {
-// CHECK-NEXT:        loopschedule.launch
+// CHECK:         loopschedule.frame -> {{.*}}!loopschedule.handle{{.*}} {
+// CHECK-NOT:       arith.muli %arg0, %arg1
+// CHECK:           loopschedule.launch
 // CHECK:               arith.muli %{{.+}}, %arg1 {loopschedule.binding = 0 : i64
+// SHARE-LABEL:   loopschedule.func_sequential @overlap
+// SHARE:           arith.muli {{.*}}{loopschedule.binding = 0 : i64
+// SHARE:           arith.muli {{.*}}{loopschedule.binding = 0 : i64
 func.func @overlap(%a: i32, %b: i32) -> (i32, i32) attributes {oplib.library = @lib} {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32

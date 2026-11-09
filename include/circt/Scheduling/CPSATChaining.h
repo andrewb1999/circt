@@ -177,6 +177,11 @@ struct CPSATFunctionModel {
     /// pulse on its port, which a child loop on the port, running then,
     /// would count as its own.
     bool dynamic = false;
+    /// An op launching a child loop: the operators the child and the loops
+    /// inside it use (sorted). A dynamic access of this region's on one of
+    /// their ports is done by the launch or comes after it; a rule within
+    /// the region, which a region scheduled alone keeps too.
+    SmallVector<unsigned> childOprs;
   };
   struct Region {
     SmallVector<Op, 0> ops;

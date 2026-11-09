@@ -17,7 +17,6 @@
 #include "ortools/sat/sat_parameters.pb.h"
 
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
@@ -142,6 +141,16 @@ private:
   bool solve(StringRef phase, const LinearExpr &objective,
              CpSolverResponse &response, std::string &why);
   void hint();
+  /// The solver's settings for a solve of \p limit (deterministic) seconds.
+  bool parameters(double limit, SatParameters &params, std::string &why);
+  /// The hint is the regions' schedules alone: their starts, operator
+  /// choices and IIs, a small part of the model's variables. Solve the
+  /// model with those fixed (the offsets in a cycle, the instances, the
+  /// registers left, which is quick), and hint its solution: complete, a
+  /// schedule the search starts from. A large function left a partial
+  /// hint found no schedule in its limit (sequential f64 deriche: 25,000
+  /// variables, a thousand hinted).
+  void completeHint(const LinearExpr &objective);
   /// An instance's users in regions that run at once (a child loop, and a
   /// sibling launched with it or its parent's op in the instance then)
   /// kept apart.
@@ -406,35 +415,29 @@ void FunctionModel::build() {
   // (an operator of its or of a loop inside it), completes with a pulse on
   // the port the child counts as its own, and the child waits for one more
   // than it gets: it is done by the launch (in its last budget cycle, which
-  // the frame holds until the access completes, and the launch with it) or
-  // comes after it, in a frame that awaits the child.
-  {
-    std::vector<DenseSet<unsigned>> oprsIn(m.regions.size());
-    for (auto [r, region] : llvm::enumerate(m.regions))
-      for (auto &op : region.ops)
-        for (unsigned k : op.oprs)
-          for (std::optional<unsigned> q = r; q; q = m.regions[*q].parent)
-            oprsIn[*q].insert(k);
-    for (auto [r, region] : llvm::enumerate(m.regions)) {
-      if (!region.parent)
+  // the frame holds until the access completes, and the launch with it;
+  // not in its own cycle, a function frame's child starting with the frame)
+  // or comes after it, in a frame that awaits the child. Within the
+  // parent's region (the launch knows its child's operators), so a region
+  // scheduled alone keeps it too.
+  for (auto [r, region] : llvm::enumerate(m.regions))
+    for (auto [l, launcher] : llvm::enumerate(region.ops)) {
+      if (launcher.childOprs.empty())
         continue;
-      unsigned p = *region.parent;
-      IntVar launch = vars[p][region.launch].c;
-      for (auto [a, op] : llvm::enumerate(m.regions[p].ops)) {
-        if (!op.dynamic || op.oprs.empty() || !oprsIn[r].contains(op.oprs[0]))
+      IntVar launch = vars[r][l].c;
+      for (auto [a, op] : llvm::enumerate(region.ops)) {
+        if (!op.dynamic || op.oprs.empty() ||
+            !llvm::binary_search(launcher.childOprs, op.oprs[0]))
           continue;
-        // Not in the launch's cycle either (a function frame's child starts
-        // with the frame, before a shifted frame's other ops).
         int64_t budget = std::max<int64_t>(lat(op.oprs[0]) - 1, 1);
         BoolVar after = newBool();
         cp.AddGreaterOrEqual(LinearExpr(launch),
-                             LinearExpr(vars[p][a].c) + budget)
+                             LinearExpr(vars[r][a].c) + budget)
             .OnlyEnforceIf(after.Not());
-        cp.AddGreaterOrEqual(vars[p][a].c, LinearExpr(launch) + 1)
+        cp.AddGreaterOrEqual(vars[r][a].c, LinearExpr(launch) + 1)
             .OnlyEnforceIf(after);
       }
     }
-  }
 
   // Instances of each shareable operator, across all regions: as many as
   // twice the most a region could use at once, and two more (a mux may make
@@ -792,19 +795,15 @@ LinearExpr FunctionModel::logOf(const LinearExpr &e, StringRef what) {
   return LinearExpr(L);
 }
 
-bool FunctionModel::solve(StringRef phase, const LinearExpr &objective,
-                          CpSolverResponse &response, std::string &why) {
-  cp.ClearObjective();
-  cp.Minimize(objective);
-  Model model;
-  SatParameters params;
+bool FunctionModel::parameters(double limit, SatParameters &params,
+                               std::string &why) {
   // Interleaved: every subsolver (LNS included, with one worker too) in
   // batches synchronized deterministically, so the same input and worker
   // count schedule the same way.
   params.set_num_workers(std::max(1, config.numWorkers));
   params.set_interleave_search(true);
-  params.set_max_deterministic_time(config.timeLimitS);
-  params.set_max_time_in_seconds(config.timeLimitS * 2 + 1);
+  params.set_max_deterministic_time(limit);
+  params.set_max_time_in_seconds(limit * 2 + 1);
   params.set_random_seed(0);
   if (!config.solverParameters.empty()) {
     SatParameters extra;
@@ -816,6 +815,61 @@ bool FunctionModel::solve(StringRef phase, const LinearExpr &objective,
     }
     params.MergeFrom(extra);
   }
+  return true;
+}
+
+void FunctionModel::completeHint(const LinearExpr &objective) {
+  cp.ClearObjective();
+  cp.Minimize(objective);
+  CpModelProto proto = cp.Build();
+  bool fixed = false;
+  auto fix = [&](int index, int64_t value) {
+    auto *var = proto.mutable_variables(index);
+    var->clear_domain();
+    var->add_domain(value);
+    var->add_domain(value);
+    fixed = true;
+  };
+  for (auto [r, region] : llvm::enumerate(m.regions)) {
+    if (iiVar[r] && region.hintII)
+      fix(iiVar[r]->index(), *region.hintII);
+    for (auto [i, op] : llvm::enumerate(region.ops)) {
+      if (!op.hint)
+        continue;
+      fix(vars[r][i].c.index(), *op.hint);
+      for (auto [j, chosen] : llvm::enumerate(vars[r][i].chosen))
+        fix(chosen.index(), j == op.hintChoice);
+    }
+  }
+  if (!fixed)
+    return;
+  Model model;
+  SatParameters params;
+  std::string why;
+  if (!parameters(config.timeLimitS / 4, params, why))
+    return;
+  model.Add(NewSatParameters(params));
+  CpSolverResponse response = SolveCpModel(proto, &model);
+  LLVM_DEBUG(dbgs() << "cpsat: complete the hint: "
+                    << CpSolverStatus_Name(response.status()) << " objective "
+                    << response.objective_value() << " in "
+                    << response.wall_time() << " s\n");
+  if (response.status() != CpSolverStatus::OPTIMAL &&
+      response.status() != CpSolverStatus::FEASIBLE)
+    return;
+  cp.ClearHints();
+  for (int i = 0; i < proto.variables_size(); ++i)
+    cp.AddHint(cp.GetIntVarFromProtoIndex(i), response.solution(i));
+}
+
+bool FunctionModel::solve(StringRef phase, const LinearExpr &objective,
+                          CpSolverResponse &response, std::string &why) {
+  cp.ClearObjective();
+  cp.Minimize(objective);
+  Model model;
+  SatParameters params;
+  if (!parameters(config.timeLimitS, params, why))
+    return false;
   model.Add(NewSatParameters(params));
   response = SolveCpModel(cp.Build(), &model);
   LLVM_DEBUG(dbgs() << "cpsat: " << phase << ": "
@@ -953,6 +1007,7 @@ LogicalResult FunctionModel::run(CPSATFunctionSolution &solution,
         std::llround(std::clamp(config.tradeoff, 0.0, 1.0) * 1000), 1, 999);
     objective = (1000 - permille) * logOf(area, "area") +
                 permille * logOf(cycles, "cycles");
+    completeHint(objective);
   }
   CpSolverResponse response;
   if (!solve(phase, objective, response, why))
