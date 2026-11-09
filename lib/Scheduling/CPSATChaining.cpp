@@ -155,6 +155,8 @@ private:
   /// sibling launched with it or its parent's op in the instance then)
   /// kept apart.
   void concurrency(SlotV &s);
+  /// Credit the cycles of child loops launched together, which overlap.
+  void overlapSiblings();
   void extract(const CpSolverResponse &response,
                CPSATFunctionSolution &solution);
   /// Add \p x times an operator's own resources.
@@ -173,6 +175,10 @@ private:
   std::vector<SlotV> slots;
   // The function's resources, the area objective over them, and its cycles.
   LinearExpr lutUse, dspUse, ffUse, area, cycles;
+  std::vector<LinearExpr> regionCycles; // each region's part of the cycles
+  LinearExpr overlapTotal;              // the siblings' overlap, credited
+  std::vector<BoolVar> overlapFollows;  // hinted off where the hint is
+  std::vector<IntVar> overlapCredits;   // not completed
   std::optional<IntVar> peak; // the bottleneck's share of the device
   // Parts of them, for the debug output.
   LinearExpr muxLutsTotal, registerFFs, registerSRLs, enableFFs;
@@ -189,6 +195,7 @@ private:
 
 void FunctionModel::build() {
   K = ps(config.cycleTime);
+  regionCycles.assign(m.regions.size(), LinearExpr());
   int64_t maxMux = 0;
   for (auto table : {config.muxDelays, config.muxNorDelays,
                      config.muxDelays64, config.muxNorDelays64})
@@ -405,10 +412,13 @@ void FunctionModel::build() {
     // The region's cycles in a run of the function.
     LinearExpr length = LinearExpr(last) + 1;
     if (region.ii > 0)
-      cycles += region.runs * (length + (region.tripCount - 1) * iiOf(r));
+      regionCycles[r] =
+          region.runs * (length + (region.tripCount - 1) * iiOf(r));
     else
-      cycles += region.runs * length;
+      regionCycles[r] = region.runs * length;
+    cycles += regionCycles[r];
   }
+  overlapSiblings();
 
   // A child loop runs from its launch until its parent's next frame. A
   // dynamic access of the parent's in flight then, on a port the child uses
@@ -682,6 +692,72 @@ void FunctionModel::concurrency(SlotV &s) {
   }
 }
 
+void FunctionModel::overlapSiblings() {
+  // Each region's cycles are summed, but the child loops a region launches
+  // in one cycle run at once, its next frame awaiting them all: they take
+  // the longest's cycles, not their sum. A child may follow an earlier
+  // sibling launched in its cycle, crediting up to that sibling's cycles
+  // (and its own): along each group, all but a root, the credit at most the
+  // group's cycles less its longest's.
+  unsigned n = m.regions.size();
+  std::vector<LinearExpr> tree(regionCycles.begin(), regionCycles.end());
+  for (unsigned r = 0; r < n; ++r) // children are described before parents
+    if (auto p = m.regions[r].parent)
+      tree[*p] += tree[r];
+  std::vector<bool> follower(n, false);
+  LinearExpr credits;
+  for (unsigned a = 0; a < n; ++a) {
+    auto parent = m.regions[a].parent;
+    if (!parent)
+      continue;
+    std::vector<BoolVar> follows;
+    IntVar credit = newInt(0, std::max<int64_t>(0, bounds(tree[a]).second));
+    cp.AddLessOrEqual(LinearExpr(credit), tree[a]);
+    for (unsigned b = 0; b < a; ++b) {
+      if (m.regions[b].parent != parent)
+        continue;
+      BoolVar f = newBool();
+      cp.AddEquality(vars[*parent][m.regions[a].launch].c,
+                     vars[*parent][m.regions[b].launch].c)
+          .OnlyEnforceIf(f);
+      cp.AddLessOrEqual(LinearExpr(credit), tree[b]).OnlyEnforceIf(f);
+      follows.push_back(f);
+      overlapFollows.push_back(f);
+    }
+    overlapCredits.push_back(credit);
+    if (follows.empty()) {
+      cp.AddEquality(credit, 0);
+      continue;
+    }
+    follower[a] = true;
+    std::vector<BoolVar> none(follows.size());
+    for (auto [j, f] : llvm::enumerate(follows))
+      none[j] = f.Not();
+    cp.AddAtMostOne(follows);
+    cp.AddEquality(credit, 0).OnlyEnforceIf(none);
+    credits += credit;
+  }
+  if (!llvm::is_contained(follower, true))
+    return;
+  // The cycles less the credits, at least those of the regions in no
+  // follower (a follower adds its own less its credit, never below 0).
+  LinearExpr fixedPart;
+  for (unsigned r = 0; r < n; ++r) {
+    bool inFollower = false;
+    for (std::optional<unsigned> q = r; q && !inFollower;
+         q = m.regions[*q].parent)
+      inFollower = follower[*q];
+    if (!inFollower)
+      fixedPart += regionCycles[r];
+  }
+  int64_t lo = std::max<int64_t>(1, bounds(fixedPart).first);
+  int64_t hi = std::max(lo, bounds(cycles).second);
+  IntVar total = newInt(lo, hi);
+  cp.AddEquality(LinearExpr(total), cycles - credits);
+  overlapTotal = credits;
+  cycles = LinearExpr(total);
+}
+
 void FunctionModel::addResources(const CPSATOperatorInfo &info,
                                  const LinearExpr &x) {
   if (int64_t n = std::llround(info.lut))
@@ -887,6 +963,12 @@ bool FunctionModel::solve(StringRef phase, const LinearExpr &objective,
 }
 
 void FunctionModel::hint() {
+  // No sibling follows another: a schedule of the regions alone overlaps
+  // nothing it is credited for (completed, the hint is replaced).
+  for (BoolVar f : overlapFollows)
+    cp.AddHint(f, false);
+  for (IntVar credit : overlapCredits)
+    cp.AddHint(credit, 0);
   for (auto [r, region] : llvm::enumerate(m.regions)) {
     if (iiVar[r] && region.hintII)
       cp.AddHint(*iiVar[r], *region.hintII);
@@ -980,6 +1062,9 @@ void FunctionModel::extract(const CpSolverResponse &response,
            << " in enables, " << pct(solution.ffs, config.ffCapacity)
            << "%), " << SolutionIntegerValue(response, registerSRLs)
            << " of the LUTs in SRLs\n";
+    if (int64_t overlap = SolutionIntegerValue(response, overlapTotal))
+      dbgs() << "cpsat: overlap: " << overlap
+             << " cycles of child loops launched together credited\n";
   });
 }
 

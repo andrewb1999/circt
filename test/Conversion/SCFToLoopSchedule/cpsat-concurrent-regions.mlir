@@ -1,5 +1,6 @@
 // REQUIRES: or-tools
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,TOGETHER
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-tradeoff=0.2 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,APART
 // RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefix=SHARE
 
 // The CP-SAT scheduler shares an instance across a function's regions,
@@ -26,17 +27,31 @@ oplib.library @lib {
 hw.module.extern @mul_l2(in %clk : i1 {oplib.clock}, in %reset : i1 {oplib.reset}, in %ce : i1 {oplib.enable}, in %lhs : i32 {oplib.operand = 0 : i32}, in %rhs : i32 {oplib.operand = 1 : i32}, out out : i32 {oplib.result = 0 : i32})
 
 
-// Two independent pipelines on one multiplier: launched together they
-// would both issue on it; they share it launched one after the other.
-// CHECK-LABEL: loopschedule.func_sequential @siblings
-// CHECK:         %[[F0:.+]] = loopschedule.frame -> (!loopschedule.handle) {
-// CHECK:           loopschedule.launch
-// CHECK:             arith.muli {{.*}}loopschedule.binding = 0 : i64
-// CHECK-NOT:       loopschedule.launch
-// CHECK:         loopschedule.frame
-// CHECK-NEXT:      loopschedule.await %[[F0]]
-// CHECK:           loopschedule.launch
-// CHECK:             arith.muli {{.*}}loopschedule.binding = 0 : i64
+// Two independent pipelines that would share one multiplier. Launched
+// together they would both issue on it; so they share it launched one
+// after the other, or launch together on two. Launched together, they
+// overlap: the function takes the longer's cycles, not their sum, which
+// the model credits. At the default tradeoff the overlap is worth the
+// second multiplier; weighted to area (t = 0.2), the multiplier is worth
+// the cycles.
+// CHECK-LABEL:     loopschedule.func_sequential @siblings
+// TOGETHER:          loopschedule.frame -> (!loopschedule.handle, !loopschedule.handle) {
+// TOGETHER:            loopschedule.launch
+// TOGETHER:              arith.muli {{.*}}loopschedule.binding = [[B:[01]]] : i64
+// TOGETHER:            loopschedule.launch
+// TOGETHER-NOT:          loopschedule.binding = [[B]] : i64
+// TOGETHER:              arith.muli {{.*}}loopschedule.binding = {{[01]}} : i64
+// TOGETHER:          loopschedule.frame
+// TOGETHER-NEXT:       loopschedule.await
+// TOGETHER-NEXT:       loopschedule.await
+// APART:             %[[F0:.+]] = loopschedule.frame -> (!loopschedule.handle) {
+// APART:               loopschedule.launch
+// APART:                 arith.muli {{.*}}loopschedule.binding = 0 : i64
+// APART-NOT:           loopschedule.launch
+// APART:             loopschedule.frame
+// APART-NEXT:          loopschedule.await %[[F0]]
+// APART:               loopschedule.launch
+// APART:                 arith.muli {{.*}}loopschedule.binding = 0 : i64
 func.func @siblings(%a: i32, %b: i32) -> (i32, i32) attributes {oplib.library = @lib} {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32
