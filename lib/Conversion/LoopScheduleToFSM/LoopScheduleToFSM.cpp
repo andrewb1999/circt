@@ -1964,16 +1964,25 @@ lowerSeqDynAccess(Operation *op, OpBuilder &builder, IRMapping &mapping,
     // stores don't capture data and the tested sequential kernels keep one
     // store per port in flight.
     if (loadOp && seqDyn->prevReadSeen) {
-      if (Value prev = seqDyn->prevReadSeen->lookup(memVal))
+      Value prev = seqDyn->prevReadSeen->lookup(memVal);
+      if (prev)
         doneMine = comb::AndOp::create(hb, loc, doneMine, prev, false);
-      // The chain tail is "this read is no longer pending". For a predicated
-      // read that never issued that is true from the start — recording a bare
-      // `seen` (which can never set) would wedge every later read on the port.
+      // The chain tail is "no read up to this one is pending". Issued, this
+      // read is seen only after the reads before it (its capture waits on
+      // them), so its `seen` says so. A predicated read that never issued
+      // passes the chain on as it found it: recording a bare `seen` (which
+      // can never set) would wedge every later read on the port, and
+      // recording "done" would let the next read take an earlier read's
+      // pulse (nussinov's table reads at cycles 98 to 101 under alternating
+      // conditions: the read at 100 took the one at 98's response past the
+      // one at 99, which had not issued).
       Value tail = seenReg;
-      if (issued)
-        tail = comb::OrOp::create(hb, loc, tail,
-                                  comb::createOrFoldNot(hb, loc, issued),
-                                  false);
+      if (issued) {
+        Value skipped = comb::createOrFoldNot(hb, loc, issued);
+        if (prev)
+          skipped = comb::AndOp::create(hb, loc, skipped, prev, false);
+        tail = comb::OrOp::create(hb, loc, tail, skipped, false);
+      }
       (*seqDyn->prevReadSeen)[memVal] = tail;
     }
     Value seenNext = comb::AndOp::create(
