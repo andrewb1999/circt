@@ -60,30 +60,35 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
             "sharing puts on an instance's operands in the chaining, "
             "stamping `loopschedule.operator` and `loopschedule.binding`. It "
             "describes the regions on a copy of the module first, each "
-            "scheduled alone in CP-SAT to lower it (`cpsat-snapshot`, that "
-            "run's scheduler). It never falls back on another scheduler: a "
-            "function it finds no schedule for is an error.">,
+            "lowered on the simplex's schedule (`cpsat-snapshot`, that run's "
+            "scheduler), which is where the function's search starts; a "
+            "region whose simplex schedule the model does not take is "
+            "scheduled alone in CP-SAT for it. A function the CP-SAT search "
+            "finds no schedule for is an error.">,
     Option<"cpsatTimeLimit", "cpsat-time-limit", "double", "60.0",
             "cpsat: the deterministic time limit of a function's solve, in "
             "seconds of its workers' work together.">,
     Option<"cpsatRegionTimeLimit", "cpsat-region-time-limit", "double",
             "2.0",
-            "cpsat: the deterministic time limit of each region's solve on "
-            "the copy (its cycles alone: a schedule to lower it with, and "
-            "the function's solve's starting point), in seconds.">,
+            "cpsat: the deterministic time limit of a region's solve on "
+            "the copy, for its cycles alone, where the model does not take "
+            "the simplex's schedule of it (the function's solve starts "
+            "from one or the other), in seconds.">,
     Option<"cpsatRegionObjective", "cpsat-region-objective", "std::string",
             "\"cycles\"",
-            "cpsat: what each region's solve on the copy minimizes: "
-            "`cycles` alone, or `tradeoff`, the region's own area and cycles "
-            "as the function's solve weighs them (a starting point weighing "
-            "area, but slower to find: a large region may find none in its "
-            "time limit, an error).">,
-    Option<"cpsatTradeoff", "cpsat-tradeoff", "double", "0.5",
-            "cpsat: the exchange rate between area and cycles, 0 (area) to 1 "
-            "(cycles): the solver minimizes (1 - t) log(area) + t "
-            "log(cycles), i.e. area^(1 - t) x cycles^t (at 0.5 the "
-            "area-cycles product). The ends keep a thousandth of the other "
-            "as a tie-break.">,
+            "cpsat: what a region's solve on the copy minimizes: `cycles` "
+            "alone, or `area`, the region's cycles and then its area as the "
+            "function's solve takes them (slower to find: a large region may "
+            "find none in its time limit, and then starts the function's "
+            "solve from nothing).">,
+    Option<"cpsatCycleSlack", "cpsat-cycle-slack", "double", "0.02",
+            "cpsat: the cycles a function's area may cost, as a fraction of "
+            "the fewest found: the solver minimizes the cycles, then the "
+            "area within (1 + slack) times them, the cycles a tie-break. "
+            "0: the fastest design at its least area (where nearly any "
+            "sharing costs a cycle, deriche's 18 DSPs for 0.09% fewer "
+            "cycles than 8); 0.02 by default; 0.1: the least area 10% more "
+            "cycles allow.">,
     Option<"cpsatDefaultTripCount", "cpsat-default-trip-count", "int", "64",
             "cpsat: the iterations assumed of a loop with no static trip "
             "count, weighting its cycles.">,
@@ -96,7 +101,7 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
             "cpsat: CP-SAT SatParameters in protobuf text format, over the "
             "pass's own (e.g. `num_workers: 8`).">,
     Option<"cpsatArea", "cpsat-area", "std::string", "\"sum\"",
-            "cpsat: the area the tradeoff weighs, from the function's LUTs, "
+            "cpsat: the area the solver minimizes, from the function's LUTs, "
             "DSPs and FFs as shares of the device: `sum` adds them (each "
             "weighed by its scarcity: an xcv80 DSP is 237 LUTs, an FF half "
             "of one); `bottleneck` takes the largest (as little of the "
@@ -121,7 +126,12 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
     Option<"cpsatMuxInputLuts", "cpsat-mux-input-luts", "double", "12",
             "cpsat: the LUTs a shared instance's operand mux takes per input "
             "past the first (a value its users put on the operand), per 32 "
-            "bits of operand: Vivado's, fitted on PolyBench over AXI.">
+            "bits of operand: Vivado's, fitted on PolyBench over AXI.">,
+    Option<"cpsatIterArgDelay", "cpsat-iter-arg-delay", "double", "0.85",
+            "cpsat: when a sequential loop's iter arg arrives in a cycle, in "
+            "ns past a register's: the lowering reads it through the loop's "
+            "first-iteration mux (`first_iter ? init : reg`, `first_iter` "
+            "decoded from the FSM's state; ludcmp's, 3 LUT levels).">
   ];
 }
 

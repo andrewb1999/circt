@@ -131,15 +131,29 @@ private:
     bools.push_back(b);
     return b;
   }
+  /// Whether op \p i of region \p r starts in cycle 0.
+  BoolVar atZero(unsigned r, unsigned i) {
+    auto [it, added] = zeroAt.try_emplace({r, i});
+    if (added) {
+      it->second = newBool();
+      cp.AddEquality(vars[r][i].c, 0).OnlyEnforceIf(it->second);
+      cp.AddGreaterOrEqual(vars[r][i].c, 1).OnlyEnforceIf(it->second.Not());
+    }
+    return it->second;
+  }
+  DenseMap<std::pair<unsigned, unsigned>, BoolVar> zeroAt;
+  /// One LUT level (a stage enable's AND, a hold's bypass): the 2-user mux.
+  int64_t gatePs = 0;
   void build();
   /// The least and most \p e can be, by its variables' domains.
   std::pair<int64_t, int64_t> bounds(const LinearExpr &e);
-  /// A variable at least `logScale * ln(x)` for x = \p e in [lo, hi] (and
-  /// minimized, equal to it at the breakpoints): piecewise linear over
-  /// geometric breakpoints, one segment chosen.
-  LinearExpr logOf(const LinearExpr &e, StringRef what);
-  bool solve(StringRef phase, const LinearExpr &objective,
+  /// Minimize \p objective within \p limit (deterministic) seconds, from
+  /// the hint.
+  bool solve(StringRef phase, const LinearExpr &objective, double limit,
              CpSolverResponse &response, std::string &why);
+  /// Hint every variable with its value in \p response (a solution of the
+  /// model as built so far).
+  void hintAll(const CpSolverResponse &response);
   void hint();
   /// The solver's settings for a solve of \p limit (deterministic) seconds.
   bool parameters(double limit, SatParameters &params, std::string &why);
@@ -195,6 +209,7 @@ private:
 
 void FunctionModel::build() {
   K = ps(config.cycleTime);
+  gatePs = std::min(ps(cpsatMuxDelay(config.muxDelays, 2)), K);
   regionCycles.assign(m.regions.size(), LinearExpr());
   int64_t maxMux = 0;
   for (auto table : {config.muxDelays, config.muxNorDelays,
@@ -271,6 +286,15 @@ void FunctionModel::build() {
     for (auto [i, op] : llvm::enumerate(region.ops)) {
       OpV &v = rv[i];
       LinearExpr start = K * LinearExpr(v.c) + v.z;
+      // Its operands from outside the region arrive late; at most as late
+      // as its fastest input path still takes (a region input has no
+      // register to put in front of it: an op none of whose candidates
+      // takes it misses the clock there, as it would without the model).
+      int64_t fastest = K;
+      for (unsigned k : op.oprs)
+        fastest = std::min(fastest, inc(k));
+      if (int64_t at = std::min(ps(op.arrival), K - fastest); at > 0)
+        cp.AddGreaterOrEqual(v.z, at);
       for (auto [j, k] : llvm::enumerate(op.oprs)) {
         auto w = when(r, i, j);
         cp.AddLessOrEqual(LinearExpr(v.z) + v.mux + inc(k), K).OnlyEnforceIf(w);
@@ -564,6 +588,23 @@ void FunctionModel::build() {
     cp.AddGreaterOrEqual(s.md, plain);
     if (anyPipelined)
       cp.AddGreaterOrEqual(s.md, nor).OnlyEnforceIf(s.nor);
+    // A pipeline's cycle-0 user selects with its stage-0 enable, `active`
+    // and the continuation decided in that cycle (the condition in it, or a
+    // later stage's in the same cycle of an earlier iteration): its mux
+    // starts once the condition is in, a LUT after it (ludcmp's multiply,
+    // shared at cycle 0 of four pipelines behind a `j < i` compare: 2.1 ns
+    // into the cycle, against the stage registers the others select with).
+    for (auto &t : s.takers) {
+      auto &region = m.regions[t.region];
+      if (region.ii == 0 || !region.cond || *region.cond == t.op)
+        continue;
+      unsigned c = *region.cond;
+      auto &cv = vars[t.region][c];
+      LinearExpr condIn = LinearExpr(cv.ready) - K * LinearExpr(cv.c) -
+                          K * latencyOf(t.region, c, /*registered=*/false);
+      cp.AddGreaterOrEqual(vars[t.region][t.op].z, condIn + gatePs)
+          .OnlyEnforceIf({t.b, s.shared, atZero(t.region, t.op)});
+    }
     for (auto &t : s.takers) {
       cp.AddGreaterOrEqual(vars[t.region][t.op].mux, s.md).OnlyEnforceIf(t.b);
       auto &op = m.regions[t.region].ops[t.op];
@@ -804,73 +845,6 @@ std::pair<int64_t, int64_t> FunctionModel::bounds(const LinearExpr &e) {
   return {lo, hi};
 }
 
-/// A natural log's units in the objective.
-static constexpr double logScale = 1e5;
-
-LinearExpr FunctionModel::logOf(const LinearExpr &e, StringRef what) {
-  // x = e, shifted to at least 1 where e may be 0 (an area of nothing).
-  auto [lo, hi] = bounds(e);
-  int64_t shift = lo < 1 ? 1 - lo : 0;
-  lo += shift;
-  hi += shift;
-  auto y = [](int64_t b) {
-    return std::llround(logScale * std::log(double(b)));
-  };
-  if (lo == hi)
-    return LinearExpr(y(lo));
-  IntVar x = newInt(lo, hi);
-  cp.AddEquality(x, e + shift);
-
-  // Breakpoints a ratio q apart, q the largest whose chord falls at most
-  // logError below the log (the chord over [a, q a] falls furthest, by
-  // ln((q - 1) / ln q) - 1 + ln q / (q - 1), at a (q - 1) / ln q), and at
-  // least one apart: between consecutive integers x takes no value, so
-  // there the chord is exact.
-  auto chordError = [](double q) {
-    double l = std::log(q);
-    return std::log((q - 1) / l) - 1 + l / (q - 1);
-  };
-  double qlo = 1.0001, qhi = 4.0;
-  if (chordError(qhi) <= config.logError)
-    qlo = qhi;
-  for (int it = 0; it < 60 && qlo < qhi; ++it) {
-    double mid = (qlo + qhi) / 2;
-    (chordError(mid) <= config.logError ? qlo : qhi) = mid;
-  }
-  SmallVector<int64_t> b{lo};
-  while (b.back() < hi) {
-    int64_t next = std::max<int64_t>(
-        b.back() + 1, int64_t(std::floor(double(b.back()) * qlo)));
-    b.push_back(std::min(next, hi));
-  }
-
-  // L at least the chord of the segment x is in; the secant over the whole
-  // range, below the log everywhere on it, also unconditionally (the
-  // relaxation's bound).
-  IntVar L = newInt(y(lo), y(hi));
-  auto chord = [&](int64_t b0, int64_t b1) {
-    // (b1 - b0) L >= (b1 - b0) y(b0) + (y(b1) - y(b0)) (x - b0)
-    int64_t w = b1 - b0, dy = y(b1) - y(b0);
-    return cp.AddGreaterOrEqual(w * LinearExpr(L) - dy * LinearExpr(x),
-                                w * y(b0) - dy * b0);
-  };
-  chord(lo, hi);
-  std::vector<BoolVar> segments;
-  for (size_t k = 0; k + 1 < b.size(); ++k) {
-    BoolVar in = newBool();
-    segments.push_back(in);
-    cp.AddGreaterOrEqual(x, b[k]).OnlyEnforceIf(in);
-    cp.AddLessOrEqual(x, b[k + 1]).OnlyEnforceIf(in);
-    chord(b[k], b[k + 1]).OnlyEnforceIf(in);
-  }
-  cp.AddExactlyOne(segments);
-  LLVM_DEBUG(dbgs() << "cpsat: log " << what << " over [" << lo
-                    << ", " << hi << "]" << (shift ? " (shifted)" : "")
-                    << ": " << segments.size() << " segments, ratio " << qlo
-                    << "\n");
-  return LinearExpr(L);
-}
-
 bool FunctionModel::parameters(double limit, SatParameters &params,
                                std::string &why) {
   // Interleaved: every subsolver (LNS included, with one worker too) in
@@ -933,18 +907,23 @@ void FunctionModel::completeHint(const LinearExpr &objective) {
   if (response.status() != CpSolverStatus::OPTIMAL &&
       response.status() != CpSolverStatus::FEASIBLE)
     return;
+  hintAll(response);
+}
+
+void FunctionModel::hintAll(const CpSolverResponse &response) {
   cp.ClearHints();
-  for (int i = 0; i < proto.variables_size(); ++i)
+  for (int i = 0; i < response.solution_size(); ++i)
     cp.AddHint(cp.GetIntVarFromProtoIndex(i), response.solution(i));
 }
 
 bool FunctionModel::solve(StringRef phase, const LinearExpr &objective,
-                          CpSolverResponse &response, std::string &why) {
+                          double limit, CpSolverResponse &response,
+                          std::string &why) {
   cp.ClearObjective();
   cp.Minimize(objective);
   Model model;
   SatParameters params;
-  if (!parameters(config.timeLimitS, params, why))
+  if (!parameters(limit, params, why))
     return false;
   model.Add(NewSatParameters(params));
   response = SolveCpModel(cp.Build(), &model);
@@ -1079,26 +1058,67 @@ LogicalResult FunctionModel::run(CPSATFunctionSolution &solution,
            << " operations, " << slots.size() << " instances\n";
   });
   hint();
+  if (config.fixHints)
+    for (auto [r, region] : llvm::enumerate(m.regions)) {
+      if (iiVar[r] && region.hintII)
+        cp.AddEquality(*iiVar[r], *region.hintII);
+      for (auto [i, op] : llvm::enumerate(region.ops)) {
+        if (!op.hint)
+          continue;
+        cp.AddEquality(vars[r][i].c, *op.hint);
+        for (auto [j, chosen] : llvm::enumerate(vars[r][i].chosen))
+          cp.AddEquality(chosen, j == op.hintChoice ? 1 : 0);
+      }
+    }
 
-  // One objective: (1 - t) log(area) + t log(cycles), in permille of t; the
-  // ends keep a thousandth of the other as a tie-break.
-  LinearExpr objective;
-  StringRef phase = "cycles";
-  if (config.cyclesOnly) {
-    objective = cycles;
-  } else {
-    phase = "tradeoff";
-    int64_t permille = std::clamp<int64_t>(
-        std::llround(std::clamp(config.tradeoff, 0.0, 1.0) * 1000), 1, 999);
-    objective = (1000 - permille) * logOf(area, "area") +
-                permille * logOf(cycles, "cycles");
-    completeHint(objective);
-  }
   CpSolverResponse response;
-  if (!solve(phase, objective, response, why))
+  if (config.cyclesOnly) {
+    if (!solve("cycles", cycles, config.timeLimitS, response, why))
+      return failure();
+    extract(response, solution);
+    solution.optimal = response.status() == CpSolverStatus::OPTIMAL;
+    return success();
+  }
+
+  // First the fewest cycles, from the complete start (the rest of the model
+  // solved for the regions' schedules, at its least area), in up to a third
+  // of the limit.
+  completeHint(area);
+  if (!solve("cycles", cycles, config.timeLimitS / 3, response, why))
     return failure();
-  extract(response, solution);
-  solution.optimal = response.status() == CpSolverStatus::OPTIMAL;
+  int64_t fewest = SolutionIntegerValue(response, cycles);
+  bool fewestProven = response.status() == CpSolverStatus::OPTIMAL;
+
+  // Then the least area within (1 + slack) times them, from that schedule,
+  // in the rest of the limit; among designs of one area the fewest cycles
+  // (the area scaled past every cycle count the cap allows, so the least
+  // share of the device outweighs them all).
+  double slack = std::max(0.0, config.cycleSlack);
+  int64_t cap = std::max<int64_t>(
+      fewest, int64_t(std::floor(double(fewest) * (1.0 + slack))));
+  cp.AddLessOrEqual(cycles, cap);
+  int64_t span = cap - std::min(bounds(cycles).first, cap) + 1;
+  LinearExpr objective = area;
+  if (int64_t areaHi = bounds(area).second;
+      areaHi <= (int64_t(1) << 61) / span)
+    objective = span * area + cycles;
+  hintAll(response);
+  double rest = std::max(config.timeLimitS - response.deterministic_time(),
+                         config.timeLimitS / 3);
+  CpSolverResponse least;
+  std::string whyNot;
+  if (!solve("area", objective, rest, least, whyNot)) {
+    // The cycles' solution stands (it was hinted, complete: the search
+    // starts from it, so this is a solver that stopped before loading it).
+    LLVM_DEBUG(dbgs() << "cpsat: " << whyNot << "; the fewest cycles' "
+                      << "schedule stands\n");
+    extract(response, solution);
+    solution.optimal = false;
+    return success();
+  }
+  extract(least, solution);
+  solution.optimal =
+      fewestProven && least.status() == CpSolverStatus::OPTIMAL;
   return success();
 }
 

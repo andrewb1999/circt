@@ -186,15 +186,27 @@ private:
   CPSATRegionInput buildCPSATInput(ProblemT &problem, Operation *anchor,
                                    scf::WhileOp pipelinedLoop);
   /// The CP-SAT scheduler's step for a region, in place of the simplex: on
-  /// the copy (`cpsat-snapshot`), describe the region and schedule it alone
-  /// to lower it; for real (`cpsat`), take the function's solution for it.
-  /// `owner` is the region's loop, or its function.
+  /// the copy (`cpsat-snapshot`), describe the region and take the
+  /// simplex's schedule for it (\p seeded: \p problem holds one) as the
+  /// function's solve's start, or, where the model does not take it,
+  /// schedule the region alone in CP-SAT; for real (`cpsat`), take the
+  /// function's solution for it. `owner` is the region's loop, or its
+  /// function.
   template <typename ProblemT>
   LogicalResult scheduleRegionCPSAT(ProblemT &problem, Operation *anchor,
                                     Operation *owner,
                                     scf::WhileOp pipelinedLoop,
-                                    float cycleTime,
+                                    float cycleTime, bool seeded,
                                     Value condValue = Value());
+  /// On the copy, the simplex's schedule of a region (\p schedule, which
+  /// solves and verifies \p problem), quietly: false where it has none.
+  bool seedSimplex(llvm::function_ref<LogicalResult()> schedule) {
+    if (scheduler != "cpsat-snapshot")
+      return false;
+    ScopedDiagnosticHandler quiet(&getContext(),
+                                  [](Diagnostic &) { return success(); });
+    return succeeded(schedule());
+  }
   /// Describe the region for the whole-function model (a pipelined loop's
   /// continuation by \p condValue).
   template <typename ProblemT>
@@ -1588,8 +1600,18 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
     if (failed(problem.check()))
       return failure();
     if (StringRef(scheduler).starts_with("cpsat")) {
+      // On the copy, the simplex's schedule first: the CP-SAT search's
+      // start.
+      bool seeded = seedSimplex([&]() -> LogicalResult {
+        if (failed(scheduling::scheduleSimplex(problem, anchor, cycleTime,
+                                               requestedII)) ||
+            failed(problem.verify()) ||
+            (requestedII && problem.getInitiationInterval() != requestedII))
+          return failure();
+        return success();
+      });
       if (failed(scheduleRegionCPSAT(problem, anchor, funcOp.getOperation(),
-                                     scf::WhileOp(), cycleTime)))
+                                     scf::WhileOp(), cycleTime, seeded)))
         return failure();
     } else {
       if (failed(scheduling::scheduleSimplex(problem, anchor, cycleTime,
@@ -2386,6 +2408,46 @@ CPSATFunctionModel::Region &SCFToLoopSchedulePass::captureRegion(
   DenseMap<Operation *, unsigned> index;
   for (auto [i, op] : llvm::enumerate(problem.getOperations()))
     index[op] = i;
+  // When an op's operands from outside the region arrive in its cycle, as
+  // the lowering reads them: a sequential loop's iter arg through the
+  // loop's first-iteration mux (`first_iter ? init : reg`), a value an
+  // enclosing frame's operator instance or port computes through its
+  // hold's bypass (`ready ? instance : capture`, statically a path from the
+  // instance's output: deriche's pipelines multiplied function-frame
+  // results so, behind a shared instance's mux, 4 LUT levels where the
+  // model saw 2 from registers).
+  float bypass = scheduling::cpsatMuxDelay(
+      SmallVector<float>(shareMuxDelays.begin(), shareMuxDelays.end()), 2);
+  auto arrivalOf = [&](Operation *op) {
+    float at = 0.0f;
+    for (Value operand : op->getOperands()) {
+      if (auto arg = dyn_cast<BlockArgument>(operand)) {
+        auto loop = dyn_cast<scf::WhileOp>(arg.getOwner()->getParentOp());
+        if (loop && arg.getOwner() == loop.getAfterBody() &&
+            !loop->hasAttr("hls.pipeline"))
+          at = std::max(at, float(cpsatIterArgDelay));
+        continue;
+      }
+      Operation *def = operand.getDefiningOp();
+      if (!def || index.count(def))
+        continue;
+      SmallVector<StringRef, 4> names;
+      if (auto offered =
+              def->getAttrOfType<ArrayAttr>("loopschedule.candidates"))
+        for (auto sym : offered.getAsRange<FlatSymbolRefAttr>())
+          names.push_back(sym.getValue());
+      if (auto own = def->getAttrOfType<SymbolRefAttr>("loopschedule.operator"))
+        names.push_back(own.getLeafReference());
+      for (StringRef name : names)
+        if (operatorLibraryAnalysis->hasOperator(name) &&
+            operatorLibraryAnalysis->getOperatorLatency(name) > 0)
+          at = std::max(
+              at, operatorLibraryAnalysis->getOperatorOutgoingDelay(name)
+                          .value_or(0.0f) +
+                      bypass);
+    }
+    return at;
+  };
   for (Operation *op : problem.getOperations()) {
     CPSATFunctionModel::Op o;
     o.name = op->getName().getStringRef().str();
@@ -2405,6 +2467,7 @@ CPSATFunctionModel::Region &SCFToLoopSchedulePass::captureRegion(
     for (Value result : op->getResults())
       o.width += bitWidthOf(result.getType());
     o.dynamic = isDynamicLatencyOp(*op);
+    o.arrival = arrivalOf(op);
     region.ops.push_back(std::move(o));
   }
   // The values on the ops' operands: their users of one shared instance
@@ -2608,7 +2671,7 @@ CPSATChainingConfig SCFToLoopSchedulePass::cpsatConfig(float cycleTime) {
   config.cycleTime = cycleTime;
   config.timeLimitS = cpsatTimeLimit;
   config.numWorkers = cpsatWorkers;
-  config.tradeoff = cpsatTradeoff;
+  config.cycleSlack = cpsatCycleSlack;
   config.lutCapacity = cpsatDeviceLuts;
   config.dspCapacity = cpsatDeviceDsps;
   config.ffCapacity = cpsatDeviceFFs;
@@ -2645,7 +2708,7 @@ LogicalResult SCFToLoopSchedulePass::solveFunctionsCPSAT() {
   opts.cpsatDeviceDsps = cpsatDeviceDsps;
   opts.cpsatDeviceFFs = cpsatDeviceFFs;
   opts.cpsatDefaultTripCount = cpsatDefaultTripCount;
-  opts.cpsatTradeoff = cpsatTradeoff;
+  opts.cpsatCycleSlack = cpsatCycleSlack;
   opts.cpsatParameters = cpsatParameters;
   auto list = [](auto &option) {
     return SmallVector<float>(option.begin(), option.end());
@@ -2655,6 +2718,7 @@ LogicalResult SCFToLoopSchedulePass::solveFunctionsCPSAT() {
   opts.shareMuxDelays64 = list(shareMuxDelays64);
   opts.shareMuxNorDelays64 = list(shareMuxNorDelays64);
   opts.cpsatMuxInputLuts = cpsatMuxInputLuts;
+  opts.cpsatIterArgDelay = cpsatIterArgDelay;
   auto pass = std::make_unique<SCFToLoopSchedulePass>(opts);
   pass->snapshotSink = &functionModels;
   PassManager pm(&getContext());
@@ -2700,7 +2764,8 @@ LogicalResult SCFToLoopSchedulePass::solveFunctionsCPSAT() {
 template <typename ProblemT>
 LogicalResult SCFToLoopSchedulePass::scheduleRegionCPSAT(
     ProblemT &problem, Operation *anchor, Operation *owner,
-    scf::WhileOp pipelinedLoop, float cycleTime, Value condValue) {
+    scf::WhileOp pipelinedLoop, float cycleTime, bool seeded,
+    Value condValue) {
 #ifndef SCHEDULING_OR_TOOLS
   return anchor->emitError("scheduler=cpsat needs CIRCT built with OR-Tools");
 #else
@@ -2710,27 +2775,68 @@ LogicalResult SCFToLoopSchedulePass::scheduleRegionCPSAT(
     return anchor->emitError("the CP-SAT scheduler has no function for this "
                              "region");
   if (scheduler == "cpsat-snapshot") {
-    // Describe the region, then schedule it alone, for its cycles, to lower
-    // it: the regions around it are described on what it lowers to, and its
-    // schedule is where the function's solve starts.
+    // Describe the region, and find the schedule the function's solve
+    // starts from: the simplex's (seeded), where the model takes it, or the
+    // region's alone in CP-SAT, for its cycles. The copy is lowered on it,
+    // and the regions around it described on what it lowers to (a child
+    // loop is a launch of a fixed latency to its parent, whatever its
+    // schedule).
     if (!snapshotSink)
       return anchor->emitError("scheduler=cpsat-snapshot is the CP-SAT "
                                "scheduler's own run on a copy");
     CPSATFunctionModel &model = (*snapshotSink)[func.getSymName()];
     CPSATFunctionModel::Region &region =
         captureRegion(problem, anchor, owner, pipelinedLoop, condValue, model);
-    CPSATFunctionModel alone;
-    alone.oprs = model.oprs;
-    alone.regions.push_back(region);
     CPSATChainingConfig config = cpsatConfig(cycleTime);
-    config.cyclesOnly = cpsatRegionObjective != "tradeoff";
+    config.cyclesOnly = cpsatRegionObjective != "area";
     config.timeLimitS = std::min<double>(cpsatTimeLimit, cpsatRegionTimeLimit);
+    auto alone = [&] {
+      CPSATFunctionModel one;
+      one.oprs = model.oprs;
+      one.regions.push_back(region);
+      return one;
+    };
+    if (seeded) {
+      // Each op on its own operator (allocation's, the first of its
+      // candidates) at the simplex's start. The model may not take it: the
+      // simplex keeps a recurrence's chain whole past the clock below an II
+      // it was given, takes an operator past the clock where one fits, and
+      // knows nothing of a child's launch beside its parent's dynamic
+      // access.
+      for (auto [i, op] : llvm::enumerate(problem.getOperations())) {
+        region.ops[i].hint = *problem.getStartTime(op);
+        region.ops[i].hintChoice = 0;
+      }
+      if constexpr (std::is_base_of_v<CyclicProblem, ProblemT>)
+        region.hintII = *problem.getInitiationInterval();
+      CPSATChainingConfig check = config;
+      check.fixHints = true;
+      CPSATFunctionSolution solution;
+      std::string why;
+      if (succeeded(scheduleCPSATFunction(alone(), check, solution, why)))
+        return success(); // the copy is lowered on the simplex's schedule
+      LLVM_DEBUG(llvm::dbgs() << "cpsat: region " << r
+                              << ": the model does not take the simplex's "
+                                 "schedule ("
+                              << why << "); solving it alone\n");
+    }
     CPSATFunctionSolution solution;
     std::string why;
-    if (failed(scheduleCPSATFunction(alone, config, solution, why)))
-      return anchor->emitError("the CP-SAT scheduler found no schedule for "
-                               "this region (")
-             << why << ")";
+    if (failed(scheduleCPSATFunction(alone(), config, solution, why))) {
+      if (!seeded)
+        return anchor->emitError("the CP-SAT scheduler found no schedule for "
+                                 "this region (")
+               << why << ")";
+      // The copy keeps the simplex's schedule, and the function's solve
+      // starts the region from nothing.
+      LLVM_DEBUG(llvm::dbgs() << "cpsat: region " << r << ": no schedule ("
+                              << why << "); the function's solve starts it "
+                                        "from nothing\n");
+      for (auto &op : region.ops)
+        op.hint.reset();
+      region.hintII.reset();
+      return success();
+    }
     auto &sol = solution.regions.front();
     for (auto [i, op] : llvm::enumerate(region.ops)) {
       op.hint = sol.start[i];
@@ -2738,7 +2844,7 @@ LogicalResult SCFToLoopSchedulePass::scheduleRegionCPSAT(
     }
     if (sol.ii)
       region.hintII = sol.ii;
-    return applyRegionSolution(problem, anchor, alone, region, sol,
+    return applyRegionSolution(problem, anchor, model, region, sol,
                                /*bind=*/false);
   }
   if (scheduler == "cpsat") {
@@ -2806,8 +2912,16 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
   // The CP-SAT scheduler takes the simplex's place (and verifies).
   auto *anchor = loop.getAfterBody()->getTerminator();
   if (StringRef(scheduler).starts_with("cpsat")) {
+    // On the copy, the simplex's schedule first: the CP-SAT search's start.
+    bool seeded = seedSimplex([&]() -> LogicalResult {
+      if (failed(scheduleSimplex(problem, anchor, cycleTime, ii)) ||
+          failed(problem.verify()) ||
+          (ii && problem.getInitiationInterval() != ii))
+        return failure();
+      return success();
+    });
     if (failed(scheduleRegionCPSAT(problem, anchor, loop.getOperation(), loop,
-                                   cycleTime, condValue)))
+                                   cycleTime, seeded, condValue)))
       return failure();
   } else {
     if (failed(scheduleSimplex(problem, anchor, cycleTime, ii)))
@@ -2877,8 +2991,15 @@ LogicalResult SCFToLoopSchedulePass::solveChainingSharedOperatorsProblem(
   // The CP-SAT scheduler takes the simplex's place (and verifies).
   auto *anchor = region.back().getTerminator();
   if (StringRef(scheduler).starts_with("cpsat")) {
+    // On the copy, the simplex's schedule first: the CP-SAT search's start.
+    bool seeded = seedSimplex([&]() -> LogicalResult {
+      if (failed(scheduleSimplex(problem, anchor, cycleTime)))
+        return failure();
+      applySecondaryScheduleObjectives(problem, anchor, cycleTime);
+      return problem.verify();
+    });
     if (failed(scheduleRegionCPSAT(problem, anchor, region.getParentOp(),
-                                   scf::WhileOp(), cycleTime)))
+                                   scf::WhileOp(), cycleTime, seeded)))
       return failure();
   } else {
     if (failed(scheduleSimplex(problem, anchor, cycleTime)))

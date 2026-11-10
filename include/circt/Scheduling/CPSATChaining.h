@@ -31,19 +31,14 @@
 // it. A pipeline's II is a variable where the solver chooses it (a unit
 // `hls.pipeline`).
 //
-// One objective over the function's area A (its LUTs, DSPs and FFs:
-// instances, muxes, registers, unshared operators, as shares of the device,
-// summed or their largest) and its cycles C (each region's length, a pipeline's
-// II and depth, weighted by how often it runs): minimize
-//
-//   (1 - t) log A + t log C,  that is,  A^(1 - t) C^t,
-//
-// for the tradeoff t in [0, 1] (0: area, 1: cycles; at 0.5 the area-cycles
-// product). It weighs relative changes, so it needs no reference: a 1%
-// change of A trades for a (1 - t) / t % change of C. The logs are
-// piecewise-linear over geometric breakpoints spanning the range the model's
-// own bounds give each, so they are exact at the breakpoints and within
-// `logError` between them.
+// Two objectives over the function's cycles C (each region's length, a
+// pipeline's II and depth, weighted by how often it runs) and its area A
+// (its LUTs, DSPs and FFs: instances, muxes, registers, unshared
+// operators, as shares of the device, summed or their largest), in order:
+// first the fewest cycles C*, then the least area within (1 + slack) C*,
+// the cycles a tie-break among designs of one area. At slack 0, the
+// fastest design at its least area; past it, the area that many more
+// cycles buy. No design the search finds is worse in both.
 //
 // A region is described by index, apart from any problem, so that a
 // function can be described while it is lowered (on a copy) and solved
@@ -107,13 +102,10 @@ struct CPSATChainingConfig {
   /// logic and the memory adapters' read paths, and an add/subtract core's
   /// operation select.
   double muxInputLuts = 12.0;
-  /// The exchange rate between area and cycles, 0 (area) to 1 (cycles): the
-  /// solver minimizes (1 - t) log(area) + t log(cycles). The ends keep a
-  /// thousandth of the other as a tie-break.
-  double tradeoff = 0.5;
-  /// The most a piecewise-linear log may fall below the log between two
-  /// breakpoints (natural-log units: 0.005 is half a percent of the value).
-  double logError = 0.005;
+  /// The cycles the area may cost, as a fraction of the fewest found: the
+  /// solver minimizes the cycles, then the area within (1 + slack) times
+  /// them.
+  double cycleSlack = 0.02;
   /// The device's resources (the xcv80's by default). The area is each
   /// resource's share of the device: summed, which weighs each by its
   /// scarcity (an xcv80 DSP is 237 LUTs, an FF half of one), or with
@@ -124,6 +116,10 @@ struct CPSATChainingConfig {
   /// Minimize the cycles alone, within `timeLimitS`: a schedule to lower a
   /// region with, where its area does not matter.
   bool cyclesOnly = false;
+  /// Hold every hinted start, operator choice and II to its hint: whether
+  /// the model takes a schedule found elsewhere (the simplex's), and the
+  /// rest of the model (offsets, instances, registers) for it.
+  bool fixHints = false;
   /// SatParameters in protobuf text format, over the settings above (e.g.
   /// "num_workers: 8 interleave_search: true").
   std::string solverParameters;
@@ -169,6 +165,12 @@ struct CPSATFunctionModel {
     unsigned hintChoice = 0;
     /// The bits of its results: a register's width where one is held.
     unsigned width = 0;
+    /// When its operands from outside the region arrive in its cycle (ns;
+    /// the others' are their producers' ready times): a sequential loop's
+    /// iter arg through the loop's first-iteration mux, a value an
+    /// enclosing frame's operator instance or port computes through its
+    /// hold's bypass.
+    float arrival = 0.0f;
     /// The value on each operand, by an id common to every op of the
     /// function reading it (where known: a constant, a function argument, a
     /// value of the region); one past the end is a value of its own.

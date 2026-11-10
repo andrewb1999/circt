@@ -1,11 +1,13 @@
 // REQUIRES: or-tools
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-cycle-slack=0 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,FAST
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 share-mux-delays=0.3,0.3,0.6 cpsat-cycle-slack=0.5})" %s | FileCheck %s --check-prefixes=SLACK
 
 // The CP-SAT scheduler chooses each op's operator among its candidates and
 // binds the ops of a shareable operator (an extern instance) to instances,
 // the mux an instance's users put on its operands in their chains (0.3 ns
-// for two users here). It trades the function's area against its cycles,
-// area^(1 - t) x cycles^t (t = 0.5 by default: their product).
+// for two users here). It minimizes the function's cycles, then its area
+// within `cpsat-cycle-slack` more cycles (0.02 by default; 0 here: the
+// fastest design at its least area).
 
 oplib.library @lib {
   oplib.operator @mul_l0 latency<0>, incDelay<2.5>, outDelay<2.5> attributes {amc.area_dsp = 1 : i64} {
@@ -57,11 +59,16 @@ func.func @fits(%a: i32, %b: i32, %c: i32) -> i32 attributes {oplib.library = @l
 
 // A slower combinational multiply leaves no room for the mux (2.8 + 0.3 >
 // 3.0): shared, the multiplies take the pipelined core (its input path 1.0
-// + 0.3), one instance where the combinational core needed two, for a cycle
-// more (half the area for a third more cycles).
+// + 0.3), one instance where the combinational core needs two, for a cycle
+// more. The fastest design keeps the combinational core on two instances;
+// half as many for a third more cycles is within a slack of a half.
 // CHECK-LABEL: loopschedule.func_sequential @slow
-// CHECK:         arith.muli {{.*}} {loopschedule.binding = 0 : i64, loopschedule.operator = @mul_l1}
-// CHECK:         arith.muli {{.*}} {loopschedule.binding = 0 : i64, loopschedule.operator = @mul_l1}
+// FAST:          arith.muli {{.*}} {loopschedule.binding = [[B:[01]]] : i64, loopschedule.operator = @mul_slow_l0}
+// FAST-NOT:      loopschedule.binding = [[B]] : i64
+// FAST:          arith.muli {{.*}} {loopschedule.binding = {{[01]}} : i64, loopschedule.operator = @mul_slow_l0}
+// SLACK-LABEL:   loopschedule.func_sequential @slow
+// SLACK:         arith.muli {{.*}} {loopschedule.binding = 0 : i64, loopschedule.operator = @mul_l1}
+// SLACK:         arith.muli {{.*}} {loopschedule.binding = 0 : i64, loopschedule.operator = @mul_l1}
 func.func @slow(%a: i32, %b: i32, %c: i32) -> i32 attributes {oplib.library = @lib} {
   %x = arith.muli %a, %b {loopschedule.operator = @mul_slow_l0, loopschedule.candidates = [@mul_slow_l0, @mul_l1]} : i32
   %y = arith.muli %x, %c {loopschedule.operator = @mul_slow_l0, loopschedule.candidates = [@mul_slow_l0, @mul_l1]} : i32

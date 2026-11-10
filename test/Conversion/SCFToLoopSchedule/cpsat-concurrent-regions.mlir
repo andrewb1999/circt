@@ -1,7 +1,6 @@
 // REQUIRES: or-tools
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,TOGETHER
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-tradeoff=0.2 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,APART
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefix=SHARE
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-cycle-slack=0 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,TOGETHER
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-cycle-slack=1 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,APART
 
 // The CP-SAT scheduler shares an instance across a function's regions,
 // which mostly run one at a time. A child loop runs from its launch until
@@ -31,9 +30,9 @@ hw.module.extern @mul_l2(in %clk : i1 {oplib.clock}, in %reset : i1 {oplib.reset
 // together they would both issue on it; so they share it launched one
 // after the other, or launch together on two. Launched together, they
 // overlap: the function takes the longer's cycles, not their sum, which
-// the model credits. At the default tradeoff the overlap is worth the
-// second multiplier; weighted to area (t = 0.2), the multiplier is worth
-// the cycles.
+// the model credits. The fastest design (slack 0) launches them together
+// on two; allowed twice the cycles (a slack of 1), one multiplier is less
+// area.
 // CHECK-LABEL:     loopschedule.func_sequential @siblings
 // TOGETHER:          loopschedule.frame -> (!loopschedule.handle, !loopschedule.handle) {
 // TOGETHER:            loopschedule.launch
@@ -79,17 +78,21 @@ func.func @siblings(%a: i32, %b: i32) -> (i32, i32) attributes {oplib.library = 
   return %r0#1, %r1#1 : i32, i32
 }
 
-// The parent's multiply (2 cycles) shares the pipeline's: issued in the
-// launch's frame it would be in the instance while the child runs; it is
-// in a frame of its own, done before the launch or after it.
+// The parent's multiply (2 cycles) shares the pipeline's only out of the
+// launch's frame: issued in it, it would be in the instance while the child
+// runs. The fastest design (slack 0) issues it there, on an instance of
+// its own; allowed the cycles, it shares, in a frame of its own after the
+// child.
 // CHECK-LABEL: loopschedule.func_sequential @overlap
 // CHECK:         loopschedule.frame -> {{.*}}!loopschedule.handle{{.*}} {
-// CHECK-NOT:       arith.muli %arg0, %arg1
-// CHECK:           loopschedule.launch
-// CHECK:               arith.muli %{{.+}}, %arg1 {loopschedule.binding = 0 : i64
-// SHARE-LABEL:   loopschedule.func_sequential @overlap
-// SHARE:           arith.muli {{.*}}{loopschedule.binding = 0 : i64
-// SHARE:           arith.muli {{.*}}{loopschedule.binding = 0 : i64
+// TOGETHER:        arith.muli %arg0, %arg1 {loopschedule.binding = [[P:[01]]] : i64
+// TOGETHER:        loopschedule.launch
+// TOGETHER-NOT:        loopschedule.binding = [[P]] : i64
+// TOGETHER:            arith.muli %{{.+}}, %arg1 {loopschedule.binding = {{[01]}} : i64
+// APART-NOT:       arith.muli %arg0, %arg1
+// APART:           loopschedule.launch
+// APART:               arith.muli %{{.+}}, %arg1 {loopschedule.binding = 0 : i64
+// APART:           arith.muli %arg0, %arg1 {loopschedule.binding = 0 : i64
 func.func @overlap(%a: i32, %b: i32) -> (i32, i32) attributes {oplib.library = @lib} {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32
