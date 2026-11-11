@@ -137,6 +137,10 @@ struct CPSATFunctionModel {
     bool auxiliary = false;
     /// An auxiliary edge's own latency, where it has one.
     std::optional<unsigned> latency;
+    /// Cycles the destination comes at least after the source's start,
+    /// besides the source's latency (whichever operator it takes): a
+    /// predicate a dynamic access stalls on is read from a register.
+    unsigned minLatency = 0;
   };
   struct Resource {
     unsigned limit = 0;
@@ -165,12 +169,13 @@ struct CPSATFunctionModel {
     unsigned hintChoice = 0;
     /// The bits of its results: a register's width where one is held.
     unsigned width = 0;
-    /// When its operands from outside the region arrive in its cycle (ns;
-    /// the others' are their producers' ready times): a sequential loop's
-    /// iter arg through the loop's first-iteration mux, a value an
-    /// enclosing frame's operator instance or port computes through its
-    /// hold's bypass.
-    float arrival = 0.0f;
+    /// The ops of enclosing regions (region, op) whose results it reads
+    /// through their hold's bypass (`ready ? instance : capture`): it starts
+    /// a LUT past the output delay of the operator each was given (a
+    /// multi-cycle one's). Where they are not in the model (a region solved
+    /// alone), `heldWorst`, their candidates' slowest, stands for them.
+    SmallVector<std::pair<unsigned, unsigned>, 2> held;
+    float heldWorst = 0.0f;
     /// The value on each operand, by an id common to every op of the
     /// function reading it (where known: a constant, a function argument, a
     /// value of the region); one past the end is a value of its own.

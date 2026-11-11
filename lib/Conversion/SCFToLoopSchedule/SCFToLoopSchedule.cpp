@@ -254,6 +254,12 @@ private:
     unsigned next = 0;
   };
   DenseMap<const CPSATFunctionModel *, CPSATValueIds> cpsatValueIds;
+  /// Where each described op is in its function's model (region, op), and
+  /// the ops reading a result of an enclosing region's op through its
+  /// hold's bypass, until that region is described (consumer region and
+  /// op, producer).
+  DenseMap<Operation *, std::pair<unsigned, unsigned>> cpsatOpAt;
+  SmallVector<std::tuple<unsigned, unsigned, Operation *>> cpsatHeldPending;
   llvm::StringMap<CPSATFunctionSolution> functionSolutions;
   unsigned regionIndex = 0;
   /// The mux tables, as the solver's config refers to them.
@@ -270,6 +276,82 @@ static bool isDynamicLatencyOp(Operation &op) {
   if (auto store = dyn_cast<StoreInterface>(&op))
     return store.isDynamic();
   return false;
+}
+
+/// Whether `v` is a register in every cycle of `body`'s schedule: a
+/// constant, a value from outside the region, or one of its block
+/// arguments (an iter arg), through ops that are wiring: casts, a bitwise
+/// op or a shift with a constant (`i & 1`, a bit of the loop counter).
+static bool isRegisterValue(Value v, Region &body) {
+  while (true) {
+    if (isa<BlockArgument>(v))
+      return true;
+    Operation *def = v.getDefiningOp();
+    if (!def || !body.isAncestor(def->getParentRegion()) ||
+        isa<arith::ConstantOp>(def))
+      return true;
+    if (isa<arith::IndexCastOp, arith::ExtSIOp, arith::ExtUIOp,
+            arith::TruncIOp>(def)) {
+      v = def->getOperand(0);
+      continue;
+    }
+    if (!isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp, arith::ShLIOp,
+             arith::ShRUIOp, arith::ShRSIOp>(def))
+      return false;
+    Value lhs = def->getOperand(0), rhs = def->getOperand(1);
+    bool rhsConst = matchPattern(rhs, m_Constant());
+    if (!rhsConst && !(matchPattern(lhs, m_Constant()) &&
+                       !isa<arith::ShLIOp, arith::ShRUIOp, arith::ShRSIOp>(
+                           def)))
+      return false;
+    v = rhsConst ? lhs : rhs;
+  }
+}
+
+/// A dynamic-latency access waits on its port, and its frame (or pipeline)
+/// stalls until it can issue: the lowering ANDs the access's predicate into
+/// the stall, which every register of the cycle waits on. As Vitis builds
+/// its block conditions, the predicate is a register there, or at most one
+/// compare of registers (a loop's exit test): a predicate computed by any
+/// more in the access's cycle is computed in an earlier one, a dependence
+/// of latency 1, and the lowering reads it from a register (nussinov: a
+/// bounds test, two adds and a compare on the loop counter, chained into a
+/// read's stall: 10 LUT levels into a 270-register enable).
+static void registerDynamicPredicates(scheduling::Problem &problem,
+                                      Region &body,
+                                      const PredicateMap &predicateMap) {
+  auto isCompareOfRegisters = [&](Operation *def) {
+    // Its negation (an `else` branch's predicate) is the same LUT.
+    if (auto xorOp = dyn_cast<arith::XOrIOp>(def)) {
+      APInt one;
+      Value other;
+      if (matchPattern(xorOp.getRhs(), m_ConstantInt(&one)))
+        other = xorOp.getLhs();
+      else if (matchPattern(xorOp.getLhs(), m_ConstantInt(&one)))
+        other = xorOp.getRhs();
+      if (!other || !one.isAllOnes() || !other.getDefiningOp())
+        return false;
+      def = other.getDefiningOp();
+    }
+    return isa<arith::CmpIOp>(def) &&
+           llvm::all_of(def->getOperands(),
+                        [&](Value v) { return isRegisterValue(v, body); });
+  };
+  for (auto [op, pred] : predicateMap) {
+    if (!problem.hasOperation(op) || !isDynamicLatencyOp(*op))
+      continue;
+    Operation *def = pred.getDefiningOp();
+    if (!def || !body.isAncestor(def->getParentRegion()) ||
+        !problem.hasOperation(def) || isRegisterValue(pred, body) ||
+        isCompareOfRegisters(def))
+      continue;
+    // A multi-cycle producer's result is a register already (and an
+    // override must never shorten its edge).
+    auto opr = problem.getLinkedOperatorType(def);
+    if (!opr || problem.getLatency(*opr).value_or(1) > 0)
+      continue;
+    problem.setDependenceLatency(scheduling::Problem::Dependence(def, op), 1);
+  }
 }
 
 /// The latency a dynamic-latency op's launch/expect pair spans: its
@@ -1305,6 +1387,8 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
   predicateMap.clear();
   predicateUse.clear();
   cpsatCandidates.clear();
+  cpsatOpAt.clear();
+  cpsatHeldPending.clear();
   regionIndex = 0;
   dependenceAnalysis.reset();
   operatorLibraryAnalysis.reset();
@@ -1412,6 +1496,7 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
 
     addPredicateDependencies(loop.getOperation(), loop.getAfter(),
                              moduloProblem, predicateMap, predicateUse);
+    registerDynamicPredicates(moduloProblem, loop.getAfter(), predicateMap);
 
     // Solve the scheduling problem computed by the analysis.
     if (failed(solveChainingModuloProblem(loop, moduloProblem, cycleTime,
@@ -1520,6 +1605,7 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
 
     addPredicateDependencies(loop.getOperation(), loop.getAfter(), problem,
                              predicateMap, predicateUse);
+    registerDynamicPredicates(problem, loop.getAfter(), predicateMap);
 
     // Solve the scheduling problem computed by the analysis.
     if (failed(solveChainingSharedOperatorsProblem(loop.getAfter(), problem,
@@ -1591,6 +1677,7 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
       return failure();
     addPredicateDependencies(funcOp.getOperation(), funcOp.getRegion(),
                              problem, predicateMap, predicateUse);
+    registerDynamicPredicates(problem, funcOp.getRegion(), predicateMap);
     // Solve the modulo problem. The anchor is the func.return op (already
     // inserted into the problem by the modulo-problem builder).
     std::optional<int32_t> requestedII;
@@ -1667,6 +1754,7 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
 
   addPredicateDependencies(funcOp.getOperation(), funcOp.getRegion(), problem,
                            predicateMap, predicateUse);
+  registerDynamicPredicates(problem, funcOp.getRegion(), predicateMap);
 
   // Solve the scheduling problem computed by the analysis.
   if (failed(solveChainingSharedOperatorsProblem(funcOp.getBody(), problem,
@@ -2410,26 +2498,31 @@ CPSATFunctionModel::Region &SCFToLoopSchedulePass::captureRegion(
     index[op] = i;
   // When an op's operands from outside the region arrive in its cycle, as
   // the lowering reads them: a sequential loop's iter arg through the
-  // loop's first-iteration mux (`first_iter ? init : reg`), a value an
-  // enclosing frame's operator instance or port computes through its
-  // hold's bypass (`ready ? instance : capture`, statically a path from the
-  // instance's output: deriche's pipelines multiplied function-frame
-  // results so, behind a shared instance's mux, 4 LUT levels where the
-  // model saw 2 from registers).
+  // loop's first-iteration mux (`first_iter ? init : reg`), and a value a
+  // function-level frame's operator instance or static port computes
+  // through its hold's bypass (`ready ? instance : capture`, statically a
+  // path from the instance's output: deriche's pipelines multiplied
+  // function-frame results so, behind a shared instance's mux, 4 LUT
+  // levels where the model saw 2 from registers). A loop's frame hands what
+  // it launches its `_latched` registers, and a dynamic access's result is
+  // the register its response is captured in: neither has a bypass
+  // (charged one, symm's multiply-adds could not share the pipeline's, and
+  // took a fourth DSP).
   float bypass = scheduling::cpsatMuxDelay(
       SmallVector<float>(shareMuxDelays.begin(), shareMuxDelays.end()), 2);
-  auto arrivalOf = [&](Operation *op) {
-    float at = 0.0f;
+  unsigned self = model.regions.size();
+  // The held results' producers (recorded, the model taking the delay of
+  // the operator each is given) and their candidates' slowest (for a solve
+  // without them). An iter arg is a register: a sequential loop's frames
+  // read the register its inits latch into as the loop is entered, a
+  // pipeline's the one they are preloaded into.
+  auto arrivalOf = [&](Operation *op, unsigned i, CPSATFunctionModel::Op &o) {
     for (Value operand : op->getOperands()) {
-      if (auto arg = dyn_cast<BlockArgument>(operand)) {
-        auto loop = dyn_cast<scf::WhileOp>(arg.getOwner()->getParentOp());
-        if (loop && arg.getOwner() == loop.getAfterBody() &&
-            !loop->hasAttr("hls.pipeline"))
-          at = std::max(at, float(cpsatIterArgDelay));
+      if (isa<BlockArgument>(operand))
         continue;
-      }
       Operation *def = operand.getDefiningOp();
-      if (!def || index.count(def))
+      if (!def || index.count(def) || isDynamicLatencyOp(*def) ||
+          def->getParentOfType<scf::WhileOp>())
         continue;
       SmallVector<StringRef, 4> names;
       if (auto offered =
@@ -2438,17 +2531,23 @@ CPSATFunctionModel::Region &SCFToLoopSchedulePass::captureRegion(
           names.push_back(sym.getValue());
       if (auto own = def->getAttrOfType<SymbolRefAttr>("loopschedule.operator"))
         names.push_back(own.getLeafReference());
+      bool held = false;
       for (StringRef name : names)
         if (operatorLibraryAnalysis->hasOperator(name) &&
-            operatorLibraryAnalysis->getOperatorLatency(name) > 0)
-          at = std::max(
-              at, operatorLibraryAnalysis->getOperatorOutgoingDelay(name)
-                          .value_or(0.0f) +
-                      bypass);
+            operatorLibraryAnalysis->getOperatorLatency(name) > 0) {
+          held = true;
+          o.heldWorst = std::max(
+              o.heldWorst,
+              operatorLibraryAnalysis->getOperatorOutgoingDelay(name)
+                      .value_or(0.0f) +
+                  bypass);
+        }
+      if (held)
+        cpsatHeldPending.push_back({self, unsigned(i), def});
     }
-    return at;
   };
-  for (Operation *op : problem.getOperations()) {
+  for (auto [i, op] : llvm::enumerate(problem.getOperations())) {
+    cpsatOpAt[op] = {self, unsigned(i)};
     CPSATFunctionModel::Op o;
     o.name = op->getName().getStringRef().str();
     auto linked = *problem.getLinkedOperatorType(op);
@@ -2467,7 +2566,7 @@ CPSATFunctionModel::Region &SCFToLoopSchedulePass::captureRegion(
     for (Value result : op->getResults())
       o.width += bitWidthOf(result.getType());
     o.dynamic = isDynamicLatencyOp(*op);
-    o.arrival = arrivalOf(op);
+    arrivalOf(op, i, o);
     region.ops.push_back(std::move(o));
   }
   // The values on the ops' operands: their users of one shared instance
@@ -2495,7 +2594,6 @@ CPSATFunctionModel::Region &SCFToLoopSchedulePass::captureRegion(
     }
   // The child loops its ops launch: lowered already (inner regions first),
   // each carrying the index of the region it was described as.
-  unsigned self = model.regions.size();
   for (auto [i, launcher] : llvm::enumerate(problem.getOperations())) {
     Operation *op = launcher;
     op->walk<WalkOrder::PreOrder>([&](Operation *nested) {
@@ -2543,7 +2641,11 @@ CPSATFunctionModel::Region &SCFToLoopSchedulePass::captureRegion(
         unsigned depLat = *problem.getDependenceLatency(dep);
         unsigned linkedLat =
             *problem.getLatency(*problem.getLinkedOperatorType(dep.getSource()));
-        if (depLat != linkedLat)
+        // Past the source's latency, a bound of its own (whichever
+        // operator the source takes); short of it, the edge's latency.
+        if (depLat > linkedLat)
+          d.minLatency = depLat;
+        else if (depLat != linkedLat)
           d.latency = depLat;
       }
       region.deps.push_back(d);
@@ -2607,6 +2709,22 @@ CPSATFunctionModel::Region &SCFToLoopSchedulePass::captureRegion(
     region.runs = 1;
   }
   model.regions.push_back(std::move(region));
+  // The held results of this region's ops, read in the regions inside it.
+  llvm::erase_if(cpsatHeldPending, [&](auto &pending) {
+    auto [r, i, def] = pending;
+    auto at = cpsatOpAt.find(def);
+    if (at == cpsatOpAt.end() || at->second.first != self)
+      return false;
+    model.regions[r].ops[i].held.push_back(at->second);
+    return true;
+  });
+  // Described last, the function leaves any producer not found in a region
+  // (outside every problem): its reader takes the slowest candidates'.
+  if (isa<FuncOp>(owner)) {
+    for (auto [r, i, def] : cpsatHeldPending)
+      model.regions[r].ops[i].held.clear();
+    cpsatHeldPending.clear();
+  }
   return model.regions.back();
 }
 
@@ -2718,7 +2836,6 @@ LogicalResult SCFToLoopSchedulePass::solveFunctionsCPSAT() {
   opts.shareMuxDelays64 = list(shareMuxDelays64);
   opts.shareMuxNorDelays64 = list(shareMuxNorDelays64);
   opts.cpsatMuxInputLuts = cpsatMuxInputLuts;
-  opts.cpsatIterArgDelay = cpsatIterArgDelay;
   auto pass = std::make_unique<SCFToLoopSchedulePass>(opts);
   pass->snapshotSink = &functionModels;
   PassManager pm(&getContext());

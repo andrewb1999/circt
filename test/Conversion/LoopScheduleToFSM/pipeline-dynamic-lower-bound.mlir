@@ -25,18 +25,19 @@
 // pre-armed in the feedback register through the idle window. The stage-0
 // issue gate stays plain `active` — no `or(active, child_start)` exists.
 // The loop now inlines into the single per-function machine, so the frame's
-// cycle states are the prefixed loop0_FRAME_0_0..2.
+// cycle states are the prefixed loop0_FRAME_0_0..2. Their loop0_first_iter
+// (result 4) is a constant: the level's variable is high only in COND.
 // CHECK-NOT: loop0_pip0_done_prev
 // CHECK-LABEL: fsm.machine @dyn_lower_bound_fsm
 // CHECK-SAME:    resNames = [{{.*}}"loop0_child_start_0", "loop0_child_active_0", "loop0_frame_cycle_0_0", "loop0_frame_cycle_0_1", "loop0_frame_cycle_0_2"]
 // CHECK:         fsm.state @loop0_FRAME_0_0 output
-// CHECK-NEXT:      fsm.output %false, %false, %true, %false, %loop0_first_iter, %false, %true, %false, %false, %false, %true, %false, %false
+// CHECK-NEXT:      fsm.output %false, %false, %true, %false, %false, %false, %true, %false, %false, %false, %true, %false, %false
 // CHECK:         fsm.state @loop0_FRAME_0_1 output
-// CHECK-NEXT:      fsm.output %false, %false, %true, %false, %loop0_first_iter, %false, %true, %false, %false, %false, %false, %true, %false
+// CHECK-NEXT:      fsm.output %false, %false, %true, %false, %false, %false, %true, %false, %false, %false, %false, %true, %false
 // loop0_child_start_0 (result 8) and loop0_child_active_0 (result 9) rise
 // here, in cycle 2 — the last of the THREE cycle states.
 // CHECK:         fsm.state @loop0_FRAME_0_2 output
-// CHECK-NEXT:      fsm.output %false, %false, %true, %false, %loop0_first_iter, %false, %true, %false, %true, %true, %false, %false, %true
+// CHECK-NEXT:      fsm.output %false, %false, %true, %false, %false, %false, %true, %false, %true, %true, %false, %false, %true
 loopschedule.func_sequential @dyn_lower_bound(%rowptr: memref<17xi64>, %n: i64) {
   %c0_i64 = arith.constant 0 : i64
   %c1_i64 = arith.constant 1 : i64
@@ -109,10 +110,10 @@ loopschedule.func_sequential @dyn_lower_bound(%rowptr: memref<17xi64>, %n: i64) 
 // CHECK-SAME:    resNames = [{{.*}}"loop0_frame_cycle_0_0", "loop0_frame_cycle_0_1"]
 // CHECK-NOT:     frame_cycle_0_2
 // CHECK:         fsm.state @loop0_FRAME_0_0 output
-// CHECK-NEXT:      fsm.output %false, %false, %true, %false, %loop0_first_iter, %false, %true, %false, %false, %false, %true, %false
+// CHECK-NEXT:      fsm.output %false, %false, %true, %false, %false, %false, %true, %false, %false, %false, %true, %false
 // loop0_child_start_0 (result 8) rises in cycle 1, its scheduled offset.
 // CHECK:         fsm.state @loop0_FRAME_0_1 output
-// CHECK-NEXT:      fsm.output %false, %false, %true, %false, %loop0_first_iter, %false, %true, %false, %true, %true, %false, %true
+// CHECK-NEXT:      fsm.output %false, %false, %true, %false, %false, %false, %true, %false, %true, %true, %false, %true
 loopschedule.func_sequential @static_lower_bound(%rowptr: memref<17xi64>, %n: i64) {
   %c0_i64 = arith.constant 0 : i64
   %c1_i64 = arith.constant 1 : i64

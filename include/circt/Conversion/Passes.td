@@ -126,12 +126,7 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
     Option<"cpsatMuxInputLuts", "cpsat-mux-input-luts", "double", "12",
             "cpsat: the LUTs a shared instance's operand mux takes per input "
             "past the first (a value its users put on the operand), per 32 "
-            "bits of operand: Vivado's, fitted on PolyBench over AXI.">,
-    Option<"cpsatIterArgDelay", "cpsat-iter-arg-delay", "double", "0.85",
-            "cpsat: when a sequential loop's iter arg arrives in a cycle, in "
-            "ns past a register's: the lowering reads it through the loop's "
-            "first-iteration mux (`first_iter ? init : reg`, `first_iter` "
-            "decoded from the FSM's state; ludcmp's, 3 LUT levels).">
+            "bits of operand: Vivado's, fitted on PolyBench over AXI.">
   ];
 }
 

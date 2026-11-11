@@ -142,6 +142,11 @@ private:
     return it->second;
   }
   DenseMap<std::pair<unsigned, unsigned>, BoolVar> zeroAt;
+  /// Per pipeline op (region, op), the dynamic loads whose values it reads
+  /// in the same iteration: in the load's expect stage, through the expect
+  /// FIFO's bypass.
+  DenseMap<std::pair<unsigned, unsigned>, SmallVector<unsigned, 1>>
+      expectReads;
   /// One LUT level (a stage enable's AND, a hold's bypass): the 2-user mux.
   int64_t gatePs = 0;
   void build();
@@ -224,8 +229,9 @@ void FunctionModel::build() {
     // limit admits).
     SmallVector<int64_t> depLat(region.ops.size(), 0);
     for (auto &dep : region.deps)
-      if (dep.latency)
-        depLat[dep.src] = std::max<int64_t>(depLat[dep.src], *dep.latency);
+      depLat[dep.src] = std::max<int64_t>(
+          depLat[dep.src],
+          std::max<int64_t>(dep.latency.value_or(0), dep.minLatency));
     int64_t H = 1, maxLat = 0;
     for (auto [i, op] : llvm::enumerate(region.ops)) {
       int64_t l = depLat[i];
@@ -293,7 +299,8 @@ void FunctionModel::build() {
       int64_t fastest = K;
       for (unsigned k : op.oprs)
         fastest = std::min(fastest, inc(k));
-      if (int64_t at = std::min(ps(op.arrival), K - fastest); at > 0)
+      float late = op.held.empty() ? op.heldWorst : 0.0f;
+      if (int64_t at = std::min(ps(late), K - fastest); at > 0)
         cp.AddGreaterOrEqual(v.z, at);
       for (auto [j, k] : llvm::enumerate(op.oprs)) {
         auto w = when(r, i, j);
@@ -313,11 +320,20 @@ void FunctionModel::build() {
       if (dep.auxiliary && dep.latency)
         l = LinearExpr(*dep.latency);
       cp.AddGreaterOrEqual(LinearExpr(dst.c) + later, LinearExpr(src.c) + l);
+      if (dep.minLatency)
+        cp.AddGreaterOrEqual(LinearExpr(dst.c) + later,
+                             LinearExpr(src.c) + int64_t(dep.minLatency));
       if (dep.auxiliary)
         continue;
       if (dep.distance == 0) {
         cp.AddGreaterOrEqual(K * LinearExpr(dst.c) + dst.z,
                              LinearExpr(src.ready));
+        // A pipeline reads a dynamic load's value in its expect stage
+        // through the expect FIFO's bypass (`empty ? response : head`), in a
+        // later stage from a stage register: a shared instance's mux takes
+        // the bypass into its terms (below).
+        if (region.ii > 0 && region.ops[dep.src].dynamic)
+          expectReads[{unsigned(r), dep.dst}].push_back(dep.src);
         continue;
       }
       for (auto [j, k] : llvm::enumerate(region.ops[dep.src].oprs))
@@ -442,6 +458,32 @@ void FunctionModel::build() {
       regionCycles[r] = region.runs * length;
     cycles += regionCycles[r];
   }
+  // An op reading an enclosing region's result through its hold's bypass
+  // starts a LUT past the output delay of the operator its producer was
+  // given (a multi-cycle one's), at most as late as its own fastest input
+  // path takes; once every region's variables exist.
+  for (auto [r, region] : llvm::enumerate(m.regions))
+    for (auto [i, op] : llvm::enumerate(region.ops)) {
+      if (op.held.empty())
+        continue;
+      int64_t fastest = K;
+      for (unsigned k : op.oprs)
+        fastest = std::min(fastest, inc(k));
+      for (auto [pr, pi] : op.held) {
+        if (pr >= m.regions.size() || pi >= m.regions[pr].ops.size())
+          continue;
+        const auto &producer = m.regions[pr].ops[pi];
+        LinearExpr at;
+        for (auto [j, k] : llvm::enumerate(producer.oprs)) {
+          int64_t d = lat(k) > 0 ? std::min(out(k) + gatePs, K - fastest) : 0;
+          if (producer.oprs.size() == 1)
+            at += d;
+          else
+            at += d * LinearExpr(vars[pr][pi].chosen[j]);
+        }
+        cp.AddGreaterOrEqual(vars[r][i].z, at);
+      }
+    }
   overlapSiblings();
 
   // A child loop runs from its launch until its parent's next frame. A
@@ -473,24 +515,24 @@ void FunctionModel::build() {
       }
     }
 
-  // Instances of each shareable operator, across all regions: as many as
-  // twice the most a region could use at once, and two more (a mux may make
-  // a region split its users), at most one per taker.
+  // Instances of each shareable operator, across all regions: one per taker,
+  // so that every op can have its own. The start is each region's schedule
+  // alone, where none of its ops shares an instance or pays a mux; held to
+  // it, an op may have to stay alone. At twice the most a region could use
+  // at once and two more, a start launching children together found too
+  // few to complete (deriche over AXI: four filter loops at II 1, its
+  // function's first step then from nothing, 52 s to 10).
   for (auto [k, o] : llvm::enumerate(m.oprs)) {
     if (!o.info.shareable)
       continue;
     SmallVector<std::pair<unsigned, unsigned>> takers;
-    SmallVector<unsigned> perRegion(m.regions.size(), 0);
     for (auto [r, region] : llvm::enumerate(m.regions))
       for (auto [i, op] : llvm::enumerate(region.ops))
-        if (llvm::is_contained(op.oprs, k) && !isAlone(op, k)) {
+        if (llvm::is_contained(op.oprs, k) && !isAlone(op, k))
           takers.push_back({r, i});
-          ++perRegion[r];
-        }
     if (takers.empty())
       continue;
-    unsigned most = *llvm::max_element(perRegion);
-    unsigned count = std::min<unsigned>(takers.size(), 2 * most + 2);
+    unsigned count = takers.size();
     unsigned first = slots.size();
     for (unsigned s = 0; s < count; ++s) {
       SlotV slot;
@@ -566,13 +608,44 @@ void FunctionModel::build() {
     if (!anyPipelined)
       cp.AddEquality(s.nor, 0);
     s.shared = newBool();
+    cp.AddGreaterOrEqual(s.users, 2).OnlyEnforceIf(s.shared);
+    cp.AddLessThan(s.users, 2).OnlyEnforceIf(s.shared.Not());
+    // Its inputs: a user reading a dynamic load's value in the load's expect
+    // stage puts the expect FIFO's bypass in its term (`sel & (empty ?
+    // response : head)`, four inputs where a register's has two): two
+    // users' worth (seidel_2d's combinational add, shared by four such
+    // users at II 20: 4 LUT levels in front of the core where the model saw
+    // 2, -0.128 ns at 3.33).
+    LinearExpr inputs = users;
+    unsigned maxInputs = maxUsers;
+    for (auto &t : s.takers) {
+      auto it = expectReads.find({t.region, t.op});
+      if (it == expectReads.end())
+        continue;
+      std::vector<BoolVar> inStage;
+      for (unsigned load : it->second) {
+        BoolVar e = newBool();
+        LinearExpr expectAt = LinearExpr(vars[t.region][load].c) +
+                              lat(m.regions[t.region].ops[load].oprs[0]);
+        cp.AddEquality(vars[t.region][t.op].c, expectAt).OnlyEnforceIf(e);
+        cp.AddNotEqual(vars[t.region][t.op].c, expectAt).OnlyEnforceIf(e.Not());
+        inStage.push_back(e);
+      }
+      BoolVar bypassed = newBool();
+      cp.AddImplication(bypassed, t.b);
+      cp.AddBoolOr(inStage).OnlyEnforceIf(bypassed);
+      for (BoolVar e : inStage)
+        cp.AddBoolOr({t.b.Not(), e.Not(), bypassed});
+      inputs += bypassed;
+      ++maxInputs;
+    }
     auto plainT = delays(false, info.width), norT = delays(true, info.width);
     LinearExpr plain, nor;
     int64_t plainPrev = 0, norPrev = 0;
-    for (unsigned t = 2; t <= maxUsers; ++t) {
-      BoolVar atLeast = t == 2 ? s.shared : newBool();
-      cp.AddGreaterOrEqual(s.users, t).OnlyEnforceIf(atLeast);
-      cp.AddLessThan(s.users, t).OnlyEnforceIf(atLeast.Not());
+    for (unsigned t = 2; t <= maxInputs; ++t) {
+      BoolVar atLeast = newBool();
+      cp.AddGreaterOrEqual(inputs, t).OnlyEnforceIf(atLeast);
+      cp.AddLessThan(inputs, t).OnlyEnforceIf(atLeast.Not());
       int64_t p = std::min(ps(cpsatMuxDelay(plainT, t)), K);
       int64_t q = std::min(ps(cpsatMuxDelay(norT, t)), K);
       if (p > plainPrev)
@@ -584,10 +657,11 @@ void FunctionModel::build() {
     }
     if (maxUsers < 2)
       cp.AddEquality(s.shared, 0);
+    // A mux only where two or more ops use the instance.
     s.md = newInt(0, K);
-    cp.AddGreaterOrEqual(s.md, plain);
+    cp.AddGreaterOrEqual(s.md, plain).OnlyEnforceIf(s.shared);
     if (anyPipelined)
-      cp.AddGreaterOrEqual(s.md, nor).OnlyEnforceIf(s.nor);
+      cp.AddGreaterOrEqual(s.md, nor).OnlyEnforceIf({s.nor, s.shared});
     // A pipeline's cycle-0 user selects with its stage-0 enable, `active`
     // and the continuation decided in that cycle (the condition in it, or a
     // later stage's in the same cycle of an earlier iteration): its mux
@@ -853,7 +927,14 @@ bool FunctionModel::parameters(double limit, SatParameters &params,
   params.set_num_workers(std::max(1, config.numWorkers));
   params.set_interleave_search(true);
   params.set_max_deterministic_time(limit);
-  params.set_max_time_in_seconds(limit * 2 + 1);
+  // A wall-clock backstop for a machine so loaded the deterministic limit
+  // would take hours; short of that, the deterministic limit stops the
+  // search, and the schedule does not depend on the load. At twice the
+  // limit and a second, the suites' load (8 jobs of 8 workers) reached it
+  // first: pipelined f64 deriche's filter regions, about 2 s of wall time
+  // to their 2 s limit, came back with nothing, and so then did its
+  // function's first step.
+  params.set_max_time_in_seconds(limit * 5 + 10);
   params.set_random_seed(0);
   if (!config.solverParameters.empty()) {
     SatParameters extra;

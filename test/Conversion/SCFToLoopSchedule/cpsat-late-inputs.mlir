@@ -1,6 +1,5 @@
 // REQUIRES: or-tools
 // RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-cycle-slack=0})" %s | FileCheck %s
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-iter-arg-delay=0})" %s | FileCheck %s --check-prefix=EARLY
 // RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-cycle-slack=0.5})" %s | FileCheck %s --check-prefix=SLACK
 
 // The CP-SAT model times what the lowering puts in front of an op, not only
@@ -32,23 +31,15 @@ oplib.library @lib {
 hw.module.extern @add_comb(in %lhs : i32 {oplib.operand = 0 : i32}, in %rhs : i32 {oplib.operand = 1 : i32}, out out : i32 {oplib.result = 0 : i32})
 hw.module.extern @mul_l1(in %clk : i1 {oplib.clock}, in %reset : i1 {oplib.reset}, in %ce : i1 {oplib.enable}, in %lhs : i32 {oplib.operand = 0 : i32}, in %rhs : i32 {oplib.operand = 1 : i32}, out out : i32 {oplib.result = 0 : i32})
 
-// A sequential loop's iter arg is read through the loop's first-iteration
-// mux, `first_iter ? init : reg`, with `first_iter` decoded from the FSM's
-// state: 0.85 ns into the cycle by default. Three 1 ns adds chained on it
-// take two cycles; from a register (cpsat-iter-arg-delay=0), one.
+// A sequential loop's iter arg is a register in its frames: the inits
+// latch as the loop is entered, and the frames read the register, not
+// `first_iter ? init : reg`. Three 1 ns adds chained on it take one cycle.
 // CHECK-LABEL: loopschedule.func_sequential @iter_arg
 // CHECK:         loopschedule.sequential
 // CHECK:           loopschedule.frame
 // CHECK:             loopschedule.at 0
-// CHECK:               arith.addi %{{.+}}, %arg0 {{.*}}@add_comb
-// CHECK:               arith.addi %{{.+}}, %arg0 {{.*}}@add_comb
-// CHECK-NOT:           arith.addi %{{.+}}, %arg0 {{.*}}@add_comb
-// CHECK:             loopschedule.at 1
-// CHECK:               arith.addi %{{.+}}, %arg0 {{.*}}@add_comb
-// EARLY-LABEL: loopschedule.func_sequential @iter_arg
-// EARLY:         loopschedule.at 0
-// EARLY-COUNT-3:   arith.addi %{{.+}}, %arg0 {{.*}}@add_comb
-// EARLY-NOT:     loopschedule.at 1
+// CHECK-COUNT-3:       arith.addi %{{.+}}, %arg0 {{.*}}@add_comb
+// CHECK-NOT:         loopschedule.at 1
 func.func @iter_arg(%x: i32) -> i32 attributes {oplib.library = @lib} {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32
@@ -76,7 +67,6 @@ func.func @iter_arg(%x: i32) -> i32 attributes {oplib.library = @lib} {
 // deeper (with
 // the condition on the counter itself, they share at cycles 0 and 1).
 // CHECK-LABEL: loopschedule.func_sequential @late_select
-// EARLY-LABEL: loopschedule.func_sequential @late_select
 // CHECK:         loopschedule.pipeline II = 2 latency = 2
 // CHECK:           loopschedule.at 0
 // CHECK:             arith.muli {{.*}}loopschedule.binding = [[B:[0-9]+]] : i64
