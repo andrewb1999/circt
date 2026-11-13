@@ -1,5 +1,5 @@
 // REQUIRES: or-tools
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1})" %s 2>&1 | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule-cpsat{cycle-time-ns=3.0 cpsat-workers=1})" %s 2>&1 | FileCheck %s
 
 // Operator allocation gives a pipelined loop's recurrence the latency its
 // II needs, past the clock if it must (the II takes precedence there), and

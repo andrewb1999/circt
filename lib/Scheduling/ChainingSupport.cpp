@@ -40,8 +40,9 @@ LogicalResult scheduling::computeChainBreakingDependences(
   // Do a simple DFA-style pass over the dependence graph to determine
   // combinational chains and their respective accumulated delays.
   return handleOperationsInTopologicalOrder(prob, [&](Operation *op) {
-    // Mark `op` to be the origin of its own chain.
-    chains[op][op] = 0.0f;
+    // Mark `op` to be the origin of its own chain, which starts no sooner
+    // than its earliest start in a cycle.
+    chains[op][op] = prob.getEarliestStartInCycle(op).value_or(0.0f);
 
     for (auto dep : prob.getDependences(op)) {
       // Skip auxiliary deps, as these don't carry values.
@@ -78,7 +79,7 @@ LogicalResult scheduling::computeChainBreakingDependences(
     for (auto incomingChain : chains[op]) {
       Operation *origin = incomingChain.first;
       float delay = incomingChain.second;
-      if (keepChained && keepChained(origin, op))
+      if (origin == op || (keepChained && keepChained(origin, op)))
         continue;
       // Check whether `op` could be appended to the incoming chain without
       // violating the cycle time constraint.
@@ -102,7 +103,7 @@ LogicalResult scheduling::computeStartTimesInCycle(ChainingProblem &prob) {
     // `op` will start within its abstract time step as soon as all operand
     // values have reached it.
     unsigned startTime = *prob.getStartTime(op);
-    float startTimeInCycle = 0.0f;
+    float startTimeInCycle = prob.getEarliestStartInCycle(op).value_or(0.0f);
 
     for (auto dep : prob.getDependences(op)) {
       // Skip auxiliary deps, as these don't carry values.

@@ -1,6 +1,6 @@
 // REQUIRES: or-tools
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-cycle-slack=0})" %s | FileCheck %s
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-cycle-slack=0.5})" %s | FileCheck %s --check-prefix=SLACK
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule-cpsat{cycle-time-ns=3.0 cpsat-workers=1 cpsat-cycle-slack=0})" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule-cpsat{cycle-time-ns=3.0 cpsat-workers=1 cpsat-cycle-slack=0.5})" %s | FileCheck %s --check-prefix=SLACK
 
 // The CP-SAT model times what the lowering puts in front of an op, not only
 // the ops before it in its region.

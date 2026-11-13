@@ -19,25 +19,8 @@ include "mlir/Pass/PassBase.td"
 // SCFToLoopSchedule
 //===----------------------------------------------------------------------===//
 
-def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
-  let summary = "Convert SCF dialect to LoopSchedule scheduled loops";
-  let description = [{
-    This pass analyzes SCF loops and control flow, creates a Scheduling
-    problem from the function's operator library, solves the problem, and lowers
-    the loops to a LoopSchedule. Memory dependencies must be maked prior to
-    calling this pass using ConstructMemoryDependencies.
-  }];
-  let constructor = "circt::createSCFToLoopSchedulePass()";
-  let dependentDialects = [
-    "circt::loopschedule::LoopScheduleDialect",
-    "mlir::arith::ArithDialect",
-    "mlir::cf::ControlFlowDialect",
-    "mlir::memref::MemRefDialect",
-    "mlir::scf::SCFDialect",
-    "mlir::func::FuncDialect",
-    "circt::oplib::OpLibDialect"
-  ];
-  let options = [
+// The options both SCF-to-LoopSchedule passes take.
+defvar SCFToLoopScheduleOptions = [
     Option<"cycleTimeNs", "cycle-time-ns", "float", "1.0",
             "Combinational delay budget per cycle (ns) for chaining-aware "
             "scheduling; typically the target clock period minus clock "
@@ -50,21 +33,68 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
             "shares an operator only among users whose slack takes the "
             "mux the sharing puts on their inputs (and removes the "
             "attribute).">,
-    Option<"scheduler", "scheduler", "std::string", "\"simplex\"",
-            "The scheduler: `simplex` schedules each region on its own, each "
-            "op on the operator allocation chose. `cpsat` (built with "
-            "OR-Tools) schedules all of a function's regions in one CP-SAT "
-            "model, which also chooses each op's operator among its "
-            "`loopschedule.candidates` and binds the ops of shareable "
-            "operators to instances shared across the regions, with the mux "
-            "sharing puts on an instance's operands in the chaining, "
-            "stamping `loopschedule.operator` and `loopschedule.binding`. It "
-            "describes the regions on a copy of the module first, each "
-            "lowered on the simplex's schedule (`cpsat-snapshot`, that run's "
-            "scheduler), which is where the function's search starts; a "
-            "region whose simplex schedule the model does not take is "
-            "scheduled alone in CP-SAT for it. A function the CP-SAT search "
-            "finds no schedule for is an error.">,
+    ListOption<"shareMuxDelays", "share-mux-delays", "float",
+            "The delay of a shared instance's operand mux for 2, 3, ... "
+            "users, in ns: the CP-SAT scheduler's, and the delay model's "
+            "one LUT level (the two-user mux), which both schedulers time.">,
+    ListOption<"shareMuxNorDelays", "share-mux-nor-delays", "float",
+            "The same for an instance with a user in a pipeline, whose "
+            "first user's standing NOR is a signal of its own.">,
+    ListOption<"shareMuxDelays64", "share-mux-delays-64", "float",
+            "share-mux-delays for operands wider than 32 bits.">,
+    ListOption<"shareMuxNorDelays64", "share-mux-nor-delays-64", "float",
+            "share-mux-nor-delays for operands wider than 32 bits.">
+];
+
+def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
+  let summary = "Convert SCF dialect to LoopSchedule scheduled loops";
+  let description = [{
+    This pass analyzes SCF loops and control flow, creates a Scheduling
+    problem from the function's operator library, solves it with the
+    simplex, each region on its own and each op on the operator allocation
+    chose, and lowers the loops to a LoopSchedule. Memory dependencies must
+    be marked prior to calling this pass using ConstructMemoryDependencies.
+  }];
+  let constructor = "circt::createSCFToLoopSchedulePass()";
+  let dependentDialects = [
+    "circt::loopschedule::LoopScheduleDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::cf::ControlFlowDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::func::FuncDialect",
+    "circt::oplib::OpLibDialect"
+  ];
+  let options = SCFToLoopScheduleOptions;
+}
+
+def SCFToLoopScheduleCPSAT
+    : Pass<"convert-scf-to-loopschedule-cpsat", "mlir::ModuleOp"> {
+  let summary = "Convert SCF dialect to LoopSchedule, scheduled in CP-SAT";
+  let description = [{
+    convert-scf-to-loopschedule with the CP-SAT scheduler (built with
+    OR-Tools): it schedules all of a function's regions in one CP-SAT model,
+    which also chooses each op's operator among its
+    `loopschedule.candidates` and binds the ops of shareable operators to
+    instances shared across the regions, with the mux sharing puts on an
+    instance's operands in the chaining, stamping `loopschedule.operator`
+    and `loopschedule.binding`. It describes the regions on a copy of the
+    module first, each lowered on the simplex's schedule, which is where the
+    function's search starts; a region whose simplex schedule the model does
+    not take is scheduled alone in CP-SAT for it. A function the CP-SAT
+    search finds no schedule for is an error.
+  }];
+  let constructor = "circt::createSCFToLoopScheduleCPSATPass()";
+  let dependentDialects = [
+    "circt::loopschedule::LoopScheduleDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::cf::ControlFlowDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::func::FuncDialect",
+    "circt::oplib::OpLibDialect"
+  ];
+  let options = !listconcat(SCFToLoopScheduleOptions, [
     Option<"cpsatTimeLimit", "cpsat-time-limit", "double", "60.0",
             "cpsat: the deterministic time limit of a function's solve, in "
             "seconds of its workers' work together.">,
@@ -113,21 +143,11 @@ def SCFToLoopSchedule : Pass<"convert-scf-to-loopschedule", "mlir::ModuleOp"> {
             "cpsat: the device's DSPs.">,
     Option<"cpsatDeviceFFs", "cpsat-device-ffs", "double", "5148416",
             "cpsat: the device's flip-flops.">,
-    ListOption<"shareMuxDelays", "share-mux-delays", "float",
-            "The delay of a shared instance's operand mux for 2, 3, ... "
-            "users, in ns, for the CP-SAT scheduler.">,
-    ListOption<"shareMuxNorDelays", "share-mux-nor-delays", "float",
-            "The same for an instance with a user in a pipeline, whose "
-            "first user's standing NOR is a signal of its own.">,
-    ListOption<"shareMuxDelays64", "share-mux-delays-64", "float",
-            "share-mux-delays for operands wider than 32 bits.">,
-    ListOption<"shareMuxNorDelays64", "share-mux-nor-delays-64", "float",
-            "share-mux-nor-delays for operands wider than 32 bits.">,
     Option<"cpsatMuxInputLuts", "cpsat-mux-input-luts", "double", "12",
             "cpsat: the LUTs a shared instance's operand mux takes per input "
             "past the first (a value its users put on the operand), per 32 "
             "bits of operand: Vivado's, fitted on PolyBench over AXI.">
-  ];
+  ]);
 }
 
 //===----------------------------------------------------------------------===//

@@ -1,5 +1,5 @@
 // REQUIRES: or-tools
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 share-mux-delays=0.3 cpsat-mux-input-luts=20})" %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule-cpsat{cycle-time-ns=3.0 cpsat-workers=1 share-mux-delays=0.3 cpsat-mux-input-luts=20})" %s | FileCheck %s
 
 // A shared instance's operand mux costs `cpsat-mux-input-luts` per input
 // past the first, per 32 bits of operand, an input being a value its users

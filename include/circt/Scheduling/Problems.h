@@ -458,9 +458,20 @@ protected:
 
 private:
   OperatorTypeProperty<float> incomingDelay, outgoingDelay;
-  OperationProperty<float> startTimeInCycle;
+  OperationProperty<float> startTimeInCycle, earliestStartInCycle;
 
 public:
+  /// The earliest \p op may start within its cycle: the logic between its
+  /// inputs and the registers they come from that the dependence graph does
+  /// not show (a hold's bypass, a select decided in the cycle). Unset: 0.
+  /// At most the cycle time less its operator's incoming delay.
+  std::optional<float> getEarliestStartInCycle(Operation *op) {
+    return earliestStartInCycle.lookup(op);
+  }
+  void setEarliestStartInCycle(Operation *op, float time) {
+    earliestStartInCycle[op] = time;
+  }
+
   /// The incoming delay denotes the propagation time from the operand inputs to
   /// either the result outputs (combinational operators) or the first internal
   /// register stage.

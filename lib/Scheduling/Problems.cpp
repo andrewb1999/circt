@@ -264,6 +264,10 @@ LogicalResult ChainingProblem::verifyStartTimeInCycle(Operation *op) {
   auto startTimeInCycle = getStartTimeInCycle(op);
   if (!startTimeInCycle || *startTimeInCycle < 0.0f)
     return op->emitError("Operation has no non-negative start time in cycle");
+  if (auto earliest = getEarliestStartInCycle(op);
+      earliest && *startTimeInCycle + 1e-4f < *earliest)
+    return op->emitError("Operation starts in its cycle at ")
+           << *startTimeInCycle << ", before its earliest, " << *earliest;
   return success();
 }
 

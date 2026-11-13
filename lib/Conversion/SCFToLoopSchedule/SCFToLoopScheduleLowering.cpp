@@ -1,12 +1,18 @@
-//===- SCFToLoopSchedule.cpp ----------------------------------------------===//
+//===- SCFToLoopScheduleLowering.cpp - SCF to LoopSchedule, shared ------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+//
+// What the simplex and CP-SAT passes share: each region's scheduling
+// problem, the simplex's schedule of it, and its lowering into LoopSchedule
+// ops (see SCFToLoopScheduleLowering.h).
+//
+//===----------------------------------------------------------------------===//
 
-#include "circt/Conversion/SCFToLoopSchedule.h"
+#include "SCFToLoopScheduleLowering.h"
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Analysis/LoopScheduleDependenceAnalysis.h"
 #include "circt/Analysis/NameAnalysis.h"
@@ -17,7 +23,6 @@
 #include "circt/Dialect/LoopSchedule/Utils.h"
 #include "circt/Dialect/SSP/SSPInterfaces.h"
 #include "circt/Scheduling/Algorithms.h"
-#include "circt/Scheduling/CPSATChaining.h"
 #include "circt/Scheduling/Problems.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
@@ -71,11 +76,6 @@
 
 #define DEBUG_TYPE "scf-to-loopschedule"
 
-namespace circt {
-#define GEN_PASS_DEF_SCFTOLOOPSCHEDULE
-#include "circt/Conversion/Passes.h.inc"
-} // namespace circt
-
 using namespace mlir;
 using namespace mlir::arith;
 using namespace mlir::affine;
@@ -87,190 +87,17 @@ using namespace circt::analysis;
 using namespace circt::scheduling;
 using namespace circt::loopschedule;
 
-namespace {
+using namespace circt::scftoloopschedule;
 
-// Forward declaration; full definition is just below the class. The class
-// signature mentions `ScheduleStrategy &` so the type must at least be
-// declared at this point.
-struct ScheduleStrategy;
+namespace circt {
+namespace scftoloopschedule {
 
-/// On the copy the CP-SAT scheduler describes its regions on, a loop's
-/// region index, carried onto the op it lowers to: its parent's region
-/// finds the loops it launches by it.
-static constexpr llvm::StringLiteral kCPSATRegionAttr = "loopschedule.cpsat_region";
-
-/// What the CP-SAT scheduler knows of a region's ops beyond the problem.
-struct CPSATRegionInput {
-  /// The operator types each operation may take, its linked one first; one
-  /// not in the map keeps its linked operator type.
-  DenseMap<Operation *, SmallVector<Problem::OperatorType, 4>> candidates;
-  DenseMap<Problem::OperatorType, CPSATOperatorInfo> operatorInfo;
-  /// CPSATFunctionModel::Op's `alone`, `aloneMultiCycle`, `carriedReaders`.
-  DenseSet<Operation *> alone;
-  DenseSet<Operation *> aloneMultiCycle;
-  DenseMap<Operation *, SmallVector<Operation *, 2>> carriedReaders;
-};
-
-struct SCFToLoopSchedulePass
-    : public circt::impl::SCFToLoopScheduleBase<SCFToLoopSchedulePass> {
-  using SCFToLoopScheduleBase::SCFToLoopScheduleBase;
-  void runOnOperation() override;
-
-private:
-  LogicalResult runOnFunc(FuncOp funcOp);
-  LogicalResult populateOperatorTypes(Operation *op, Region &body,
-                                      ChainingSharedOperatorsProblem &problem,
-                                      bool sequentialRegion);
-  LogicalResult solveChainingModuloProblem(scf::WhileOp &loop,
-                                           ChainingModuloProblem &problem,
-                                           float cycleTime, Value condValue);
-  LogicalResult solveChainingSharedOperatorsProblem(
-      Region &region, ChainingSharedOperatorsProblem &problem, float cycleTime);
-  LogicalResult createLoopSchedulePipeline(scf::WhileOp &loop,
-                                           CyclicProblem &problem,
-                                           Value condValue);
-  LogicalResult createLoopScheduleSequential(scf::WhileOp &loop,
-                                             Problem &problem,
-                                             Value condValue);
-  LogicalResult createFuncLoopSchedule(FuncOp &funcOp, Problem &problem);
-
-  /// Pipelined function-level lowering: produces a
-  /// `loopschedule.func_pipeline` op directly. Day-1 restriction: no nested
-  /// loops in the function body.
-  LogicalResult createFuncLoopSchedulePipeline(FuncOp funcOp,
-                                                ChainingModuloProblem &problem);
-
-  /// Merged driver shared by `createLoopScheduleSequential` and
-  /// `createFuncLoopSchedule`. The variant differences are encapsulated in
-  /// `strategy`.
-  LogicalResult lowerSchedule(ScheduleStrategy &strategy, Problem &problem);
-
-  /// Walk the per-stage `startGroups` and compute the per-value pipe
-  /// lifetimes (`pipeTimes`) plus the set of values that must be
-  /// registered out of each stage so consumers in later stages can read
-  /// them (`registerValues`). Shared between the loop-pipeline and
-  /// func-pipeline drivers; the optional `funcReturnSentinel` lets the
-  /// func variant treat `loopschedule.return` as an end-of-pipeline
-  /// consumer without needing a `problem.getStartTime` entry for it.
-  /// `startTimes` should be the sorted set of stage start times to walk.
-  void computePipelineStageRegisters(
-      ArrayRef<unsigned> startTimes,
-      DenseMap<unsigned, SmallVector<Operation *>> &startGroups,
-      CyclicProblem &problem, Operation *funcReturnSentinel,
-      SmallVectorImpl<SmallVector<Value>> &registerValues,
-      DenseMap<Value, std::pair<unsigned, unsigned>> &pipeTimes);
-
-  /// Emit one `loopschedule.at offset(startTime)` stage at the builder's
-  /// current insertion point. Clones each scheduled op into the stage,
-  /// honouring `predicateMap` for if-guarded ops; updates the per-stage
-  /// `valueMap` so later stages read the new values; populates the
-  /// stage's terminator with the `registerValuesAtStage` operands and
-  /// re-maps each registered value into its consumer-stage's value map.
-  /// Returns the created stage so loop-pipeline callers can record its
-  /// stage results (e.g. for the condition-result lookup).
-  ///
-  /// Shared between `createLoopSchedulePipeline` and
-  /// `createFuncLoopSchedulePipeline`; the per-driver insertion-point
-  /// difference is handled by the caller setting `builder` before the
-  /// call.
-  LoopScheduleAtOp emitOnePipelineStage(
-      ImplicitLocOpBuilder &builder, unsigned startTime,
-      ArrayRef<Operation *> group, ArrayRef<Value> registerValuesAtStage,
-      ArrayRef<Type> registerTypesAtStage,
-      MutableArrayRef<IRMapping> stageValueMaps, CyclicProblem &problem,
-      DominanceInfo &dom);
-
-  /// What the CP-SAT scheduler knows of a region: its candidates,
-  /// operators' areas and sharing, carried results.
-  template <typename ProblemT>
-  CPSATRegionInput buildCPSATInput(ProblemT &problem, Operation *anchor,
-                                   scf::WhileOp pipelinedLoop);
-  /// The CP-SAT scheduler's step for a region, in place of the simplex: on
-  /// the copy (`cpsat-snapshot`), describe the region and take the
-  /// simplex's schedule for it (\p seeded: \p problem holds one) as the
-  /// function's solve's start, or, where the model does not take it,
-  /// schedule the region alone in CP-SAT; for real (`cpsat`), take the
-  /// function's solution for it. `owner` is the region's loop, or its
-  /// function.
-  template <typename ProblemT>
-  LogicalResult scheduleRegionCPSAT(ProblemT &problem, Operation *anchor,
-                                    Operation *owner,
-                                    scf::WhileOp pipelinedLoop,
-                                    float cycleTime, bool seeded,
-                                    Value condValue = Value());
-  /// On the copy, the simplex's schedule of a region (\p schedule, which
-  /// solves and verifies \p problem), quietly: false where it has none.
-  bool seedSimplex(llvm::function_ref<LogicalResult()> schedule) {
-    if (scheduler != "cpsat-snapshot")
-      return false;
-    ScopedDiagnosticHandler quiet(&getContext(),
-                                  [](Diagnostic &) { return success(); });
-    return succeeded(schedule());
-  }
-  /// Describe the region for the whole-function model (a pipelined loop's
-  /// continuation by \p condValue).
-  template <typename ProblemT>
-  CPSATFunctionModel::Region &captureRegion(ProblemT &problem,
-                                            Operation *anchor, Operation *owner,
-                                            scf::WhileOp pipelinedLoop,
-                                            Value condValue,
-                                            CPSATFunctionModel &model);
-  /// Set the region's schedule, operators and (\p bind) instances from
-  /// \p sol, which solved \p region of \p model.
-  template <typename ProblemT>
-  LogicalResult applyRegionSolution(ProblemT &problem, Operation *anchor,
-                                    const CPSATFunctionModel &model,
-                                    const CPSATFunctionModel::Region &region,
-                                    const CPSATFunctionSolution::Region &sol,
-                                    bool bind);
-  /// The solver's settings, from the pass's options.
-  CPSATChainingConfig cpsatConfig(float cycleTime);
-  /// Describe every region on a copy of the module (each scheduled alone in
-  /// CP-SAT and lowered as usual) and solve each function's at once.
-  LogicalResult solveFunctionsCPSAT();
-
-public:
-  /// Where a `cpsat-snapshot` run describes its functions' regions.
-  llvm::StringMap<CPSATFunctionModel> *snapshotSink = nullptr;
-
-private:
-
-  std::optional<LoopScheduleDependenceAnalysis> dependenceAnalysis;
-  std::optional<OperatorLibraryAnalysis> operatorLibraryAnalysis;
-  PredicateUse predicateUse;
-  PredicateMap predicateMap;
-  /// Per op, the operator types the CP-SAT scheduler may give it (its
-  /// `loopschedule.candidates`).
-  DenseMap<Operation *, SmallVector<Problem::OperatorType, 4>> cpsatCandidates;
-  /// The whole-function model's descriptions and solutions, by function,
-  /// and the index of the next region scheduled in this function.
-  llvm::StringMap<CPSATFunctionModel> functionModels;
-  /// The ids of the values the ops of each function's model read: a
-  /// constant's by its value and a function argument's common to the
-  /// function, any other value's to its region.
-  struct CPSATValueIds {
-    DenseMap<Attribute, unsigned> constants;
-    DenseMap<Value, unsigned> arguments;
-    unsigned next = 0;
-  };
-  DenseMap<const CPSATFunctionModel *, CPSATValueIds> cpsatValueIds;
-  /// Where each described op is in its function's model (region, op), and
-  /// the ops reading a result of an enclosing region's op through its
-  /// hold's bypass, until that region is described (consumer region and
-  /// op, producer).
-  DenseMap<Operation *, std::pair<unsigned, unsigned>> cpsatOpAt;
-  SmallVector<std::tuple<unsigned, unsigned, Operation *>> cpsatHeldPending;
-  llvm::StringMap<CPSATFunctionSolution> functionSolutions;
-  unsigned regionIndex = 0;
-  /// The mux tables, as the solver's config refers to them.
-  SmallVector<float> muxTables[4];
-};
 
 /// Does `op` represent a dynamic-latency memory access? We detect via
 /// `LoadInterface::isDynamic()` / `StoreInterface::isDynamic()` — ops
 /// from downstream dialects (AMC's `amc.load`/`amc.store`) return true
 /// when operating on a dynamic port. No attribute marker required.
-static bool isDynamicLatencyOp(Operation &op) {
+bool isDynamicLatencyOp(Operation &op) {
   if (auto load = dyn_cast<LoadInterface>(&op))
     return load.isDynamic();
   if (auto store = dyn_cast<StoreInterface>(&op))
@@ -986,11 +813,12 @@ static void applySecondaryScheduleObjectives(
   };
 
   // In-cycle start at `cycle`: the latest arrival among sources whose
-  // result lands exactly there. Combinational sources chain from their own
-  // in-cycle end; latching sources deliver at their outgoing delay past the
-  // cycle edge; earlier-finishing sources impose no in-cycle bound.
+  // result lands exactly there, and no sooner than the op's earliest.
+  // Combinational sources chain from their own in-cycle end; latching
+  // sources deliver at their outgoing delay past the cycle edge;
+  // earlier-finishing sources impose no in-cycle bound.
   auto inCycleAt = [&](Operation *op, unsigned cycle) {
-    float inCycle = 0.0f;
+    float inCycle = problem.getEarliestStartInCycle(op).value_or(0.0f);
     for (auto dep : problem.getDependences(op)) {
       Operation *src = dep.getSource();
       auto srcOpr = problem.getLinkedOperatorType(src);
@@ -1324,40 +1152,29 @@ static LogicalResult checkSequentialCondition(scf::WhileOp loop, Value cond) {
   return success();
 }
 
-} // namespace
+} // namespace scftoloopschedule
+} // namespace circt
+
 
 static void warnPastCycleTime(ChainingModuloProblem &problem, float cycleTime);
-template <typename ProblemT, typename DistanceFn>
-static void stampChainSlack(ProblemT &problem, float cycleTime,
-                            DistanceFn distance);
+static void stampChainSlack(
+    ChainingProblem &problem, float cycleTime,
+    llvm::function_ref<unsigned(Problem::Dependence)> distance);
 
-void SCFToLoopSchedulePass::runOnOperation() {
-  // Now a ModuleOp pass: walk each top-level func.func and lower it. The
-  // pass replaces each func.func with a `loopschedule.func_sequential`, so
-  // it cannot run as `Pass<func::FuncOp>` (the framework requires the
-  // root op to remain valid). Collect funcs first to avoid mutating the
-  // module while iterating.
-  ModuleOp moduleOp = getOperation();
-  if (scheduler == "cpsat") {
-#ifdef SCHEDULING_OR_TOOLS
-    if (failed(solveFunctionsCPSAT())) {
-      signalPassFailure();
-      return;
-    }
-#else
-    moduleOp.emitError("scheduler=cpsat needs CIRCT built with "
-                       "OR-Tools");
-    signalPassFailure();
-    return;
-#endif
-  }
+LogicalResult SCFToLoopScheduleLowering::run(ModuleOp moduleOp) {
+  // A ModuleOp pass: walk each top-level func.func and lower it. The pass
+  // replaces each func.func with a `loopschedule.func_sequential`, so it
+  // cannot run as `Pass<func::FuncOp>` (the framework requires the root op
+  // to remain valid). Collect funcs first to avoid mutating the module while
+  // iterating.
+  module = moduleOp;
+  if (failed(prepare(moduleOp)))
+    return failure();
   SmallVector<FuncOp> funcs;
   moduleOp.walk([&](FuncOp f) { funcs.push_back(f); });
   for (auto funcOp : funcs)
-    if (failed(runOnFunc(funcOp))) {
-      signalPassFailure();
-      return;
-    }
+    if (failed(runOnFunc(funcOp)))
+      return failure();
 
   // After all funcs have been wrapped into loopschedule.func_sequential /
   // loopschedule.func_pipeline, rewrite any surviving func.call whose callee
@@ -1378,18 +1195,17 @@ void SCFToLoopSchedulePass::runOnOperation() {
     call.replaceAllUsesWith(newCall.getResults());
     call.erase();
   }
+  return success();
 }
 
-LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
-  float cycleTime = cycleTimeNs;
+LogicalResult SCFToLoopScheduleLowering::runOnFunc(FuncOp funcOp) {
+  float cycleTime = config.cycleTimeNs;
 
   // Reset per-func state so we don't leak entries from a prior func.
   predicateMap.clear();
   predicateUse.clear();
-  cpsatCandidates.clear();
-  cpsatOpAt.clear();
-  cpsatHeldPending.clear();
-  regionIndex = 0;
+  candidates.clear();
+  beginFunction();
   dependenceAnalysis.reset();
   operatorLibraryAnalysis.reset();
 
@@ -1459,8 +1275,10 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
 
   // Per-function analyses obtained via the analysis manager scoped to this
   // child func.
-  dependenceAnalysis = getChildAnalysis<LoopScheduleDependenceAnalysis>(funcOp);
-  operatorLibraryAnalysis = getChildAnalysis<OperatorLibraryAnalysis>(funcOp);
+  dependenceAnalysis =
+      analysisManager.getChildAnalysis<LoopScheduleDependenceAnalysis>(funcOp);
+  operatorLibraryAnalysis =
+      analysisManager.getChildAnalysis<OperatorLibraryAnalysis>(funcOp);
 
   // Map from while op to the cloned condition value in the after body.
   DenseMap<Operation *, Value> loopCondValues;
@@ -1686,28 +1504,11 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
     auto *anchor = funcOp.getBody().back().getTerminator();
     if (failed(problem.check()))
       return failure();
-    if (StringRef(scheduler).starts_with("cpsat")) {
-      // On the copy, the simplex's schedule first: the CP-SAT search's
-      // start.
-      bool seeded = seedSimplex([&]() -> LogicalResult {
-        if (failed(scheduling::scheduleSimplex(problem, anchor, cycleTime,
-                                               requestedII)) ||
-            failed(problem.verify()) ||
-            (requestedII && problem.getInitiationInterval() != requestedII))
-          return failure();
-        return success();
-      });
-      if (failed(scheduleRegionCPSAT(problem, anchor, funcOp.getOperation(),
-                                     scf::WhileOp(), cycleTime, seeded)))
-        return failure();
-    } else {
-      if (failed(scheduling::scheduleSimplex(problem, anchor, cycleTime,
-                                             requestedII)))
-        return funcOp.emitOpError(
-            "failed to solve ChainingModuloProblem for pipelined func");
-      if (failed(problem.verify()))
-        return failure();
-    }
+    if (failed(scheduleModulo(
+            problem, anchor, funcOp.getOperation(), scf::WhileOp(),
+            requestedII, Value(),
+            describeInputDelays(problem, /*pipelined=*/true, Value()))))
+      return failure();
     if (requestedII.has_value() &&
         problem.getInitiationInterval() != requestedII) {
       return funcOp.emitError(
@@ -1716,8 +1517,8 @@ LogicalResult SCFToLoopSchedulePass::runOnFunc(FuncOp funcOp) {
           std::to_string(problem.getInitiationInterval().value()));
     }
     warnPastCycleTime(problem, cycleTime);
-    if (recordChainSlack)
-      stampChainSlack(problem, cycleTime, [&](const auto &dep) {
+    if (config.recordChainSlack)
+      stampChainSlack(problem, cycleTime, [&](Problem::Dependence dep) {
         return problem.getDistance(dep).value_or(0);
       });
 
@@ -1824,21 +1625,20 @@ static bool feedsSameCycleAccess(Value v) {
 /// from the function's oplib library when one matches, otherwise from the
 /// generic built-in types below. Ultimately, we should move this to a
 /// dialect interface in the Scheduling dialect.
-LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
+LogicalResult SCFToLoopScheduleLowering::populateOperatorTypes(
     Operation *op, Region &loopBody, ChainingSharedOperatorsProblem &problem,
     bool sequentialRegion) {
   // Scheduling analyis only considers the innermost loop nest for now.
 
-  // The CP-SAT scheduler's candidates are this problem's: an earlier one's
-  // ops are lowered, and erased, by now (a new op may sit at an erased one's
-  // address).
-  cpsatCandidates.clear();
+  // The candidates are this problem's: an earlier one's ops are lowered, and
+  // erased, by now (a new op may sit at an erased one's address).
+  candidates.clear();
 
   // Set an operator type's delays, clamped to the cycle budget. The
   // chaining analysis hard-fails when a single operator's delay exceeds
   // the cycle time; the physically honest fallback is to give such an
   // operator a full cycle to itself, so clamp and warn instead.
-  float cycleTime = cycleTimeNs;
+  float cycleTime = config.cycleTimeNs;
   auto setDelays = [&](Problem::OperatorType opr, float inc, float out,
                        Operation *locOp) {
     if (inc > cycleTime || out > cycleTime)
@@ -1951,7 +1751,7 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
       // cycle, without the warning: unchosen, they are only offers).
       if (auto offered =
               op->getAttrOfType<ArrayAttr>("loopschedule.candidates")) {
-        if (StringRef(scheduler).starts_with("cpsat")) {
+        if (collectCandidates) {
           SmallVector<Problem::OperatorType, 4> oprs{libOpr};
           for (auto sym : offered.getAsRange<FlatSymbolRefAttr>()) {
             StringRef name = sym.getValue();
@@ -1975,7 +1775,7 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
             oprs.push_back(opr);
           }
           if (oprs.size() > 1)
-            cpsatCandidates[op] = std::move(oprs);
+            candidates[op] = std::move(oprs);
         }
         op->removeAttr("loopschedule.candidates");
       }
@@ -2208,19 +2008,9 @@ LogicalResult SCFToLoopSchedulePass::populateOperatorTypes(
   return success();
 }
 
-/// Record on each operator-backed operation of a solved problem its chain
-/// slack (`loopschedule.chain_slack`, ns): the cycle time less the latest
-/// end of a combinational chain through it, as the schedule places it. A
-/// combinational operator's chain continues through the consumers that
-/// start in its cycle (def-use edges; an edge to a later iteration goes
-/// through a register); a pipelined operator's ends at its first register,
-/// its incoming delay into the cycle. Whatever is put on the operation's
-/// inputs (a shared operator's operand mux) delays that whole chain, so it
-/// fits within the slack. `distance` gives a dependence's iteration
-/// distance (0 outside a modulo problem).
-template <typename ProblemT, typename DistanceFn>
-static void stampChainSlack(ProblemT &problem, float cycleTime,
-                             DistanceFn distance) {
+DenseMap<Operation *, float> scftoloopschedule::chainSlacks(
+    ChainingProblem &problem, float cycleTime,
+    llvm::function_ref<unsigned(Problem::Dependence)> distance) {
   DenseMap<Operation *, SmallVector<Operation *, 2>> sameCycleUsers;
   for (auto *op : problem.getOperations())
     for (auto dep : problem.getDependences(op)) {
@@ -2249,14 +2039,23 @@ static void stampChainSlack(ProblemT &problem, float cycleTime,
         end = std::max(end, endOf(user));
     return chainEnd[op] = end;
   };
-  for (auto *op : problem.getOperations()) {
-    if (!op->hasAttr("loopschedule.operator") ||
-        !problem.getStartTimeInCycle(op))
-      continue;
+  DenseMap<Operation *, float> slacks;
+  for (auto *op : problem.getOperations())
+    if (op->hasAttr("loopschedule.operator") &&
+        problem.getStartTimeInCycle(op))
+      slacks[op] = cycleTime - endOf(op);
+  return slacks;
+}
+
+/// Record on each operator-backed operation of a solved problem its chain
+/// slack (`loopschedule.chain_slack`, ns; `chainSlacks`), which binding
+/// shares an instance within.
+static void stampChainSlack(
+    ChainingProblem &problem, float cycleTime,
+    llvm::function_ref<unsigned(Problem::Dependence)> distance) {
+  for (auto [op, slack] : chainSlacks(problem, cycleTime, distance))
     op->setAttr("loopschedule.chain_slack",
-                FloatAttr::get(Float32Type::get(op->getContext()),
-                               cycleTime - endOf(op)));
-  }
+                FloatAttr::get(Float32Type::get(op->getContext()), slack));
 }
 
 /// Warn where a pipelined schedule misses the clock: at the operation that
@@ -2294,702 +2093,8 @@ static void warnPastCycleTime(ChainingModuloProblem &problem, float cycleTime) {
   worst->emitWarning(msg);
 }
 
-/// The width of a value's type in bits; 0 for one without one.
-static unsigned bitWidthOf(Type type) {
-  if (type.isIntOrFloat())
-    return type.getIntOrFloatBitWidth();
-  return 0;
-}
-
-static bool isObservableEffect(Operation &op);
-static bool isDrainableStreamPop(Operation *op, mlir::scf::WhileOp loop);
-
-#ifdef SCHEDULING_OR_TOOLS
-template <typename ProblemT>
-CPSATRegionInput SCFToLoopSchedulePass::buildCPSATInput(
-    ProblemT &problem, Operation *anchor, scf::WhileOp pipelinedLoop) {
-  CPSATRegionInput input;
-  // The area of an operator, by its library entry's measurement: its LUTs
-  // and DSPs as shares of the device, in LUTs.
-  auto entryArea = [&](StringRef name) -> std::optional<double> {
-    if (!operatorLibraryAnalysis->hasOperator(name))
-      return std::nullopt;
-    oplib::HwMatchOp hwMatch = operatorLibraryAnalysis->getHwMatchOp(name);
-    if (!hwMatch)
-      return std::nullopt;
-    Operation *entry = hwMatch->getParentOp();
-    double lut = 0, dsp = 0;
-    if (auto a = entry->getAttrOfType<IntegerAttr>("amc.area_lut"))
-      lut = a.getInt();
-    if (auto a = entry->getAttrOfType<IntegerAttr>("amc.area_dsp"))
-      dsp = a.getInt();
-    return lut + dsp * cpsatDeviceLuts / std::max(1.0, double(cpsatDeviceDsps));
-  };
-  // An operator whose delays exceed the cycle (clamped to it in the
-  // problem): one allocation lowered for a recurrence at an II it took as
-  // given, past the clock, which this scheduler keeps.
-  auto overClock = [&](StringRef name) {
-    return operatorLibraryAnalysis->getOperatorIncomingDelay(name).value_or(
-               0.0f) > cycleTimeNs ||
-           operatorLibraryAnalysis->getOperatorOutgoingDelay(name).value_or(
-               0.0f) > cycleTimeNs;
-  };
-  // Each op's candidates, but those costing over half again its cheapest
-  // that fits the clock (a Full_Usage core where a DSP58 primitive does):
-  // they are taken only where nothing cheaper closes the schedule, and each
-  // multiplies the instances the search weighs; and, where one fits, those
-  // past the clock. Allocation's own choice stays (the model takes it only
-  // if it fits, or none does).
-  for (auto *op : problem.getOperations()) {
-    auto it = cpsatCandidates.find(op);
-    if (it == cpsatCandidates.end())
-      continue;
-    bool anyFits = llvm::any_of(it->second, [&](Problem::OperatorType opr) {
-      return !overClock(opr.getValue());
-    });
-    std::optional<double> cheapest;
-    for (auto opr : it->second)
-      if (!anyFits || !overClock(opr.getValue()))
-        if (auto a = entryArea(opr.getValue()))
-          cheapest = cheapest ? std::min(*cheapest, *a) : *a;
-    SmallVector<Problem::OperatorType, 4> kept;
-    for (auto [i, opr] : llvm::enumerate(it->second)) {
-      auto a = entryArea(opr.getValue());
-      if (i > 0 && anyFits && overClock(opr.getValue()))
-        continue;
-      if (i == 0 || !a || !cheapest || *a <= 1.5 * *cheapest)
-        kept.push_back(opr);
-    }
-    if (kept.size() > 1)
-      input.candidates[op] = std::move(kept);
-  }
-
-  // What each operator costs, and whether its instances may be shared: an
-  // extern instance that sees no issue cycles (no `valid`) and declares no
-  // limit (a resource-constrained one is the simplex flow's), as binding
-  // decides.
-  for (auto opr : problem.getOperatorTypes()) {
-    StringRef name = opr.getValue();
-    if (!operatorLibraryAnalysis->hasOperator(name))
-      continue;
-    oplib::HwMatchOp hwMatch = operatorLibraryAnalysis->getHwMatchOp(name);
-    if (!hwMatch)
-      continue;
-    Operation *entry = hwMatch->getParentOp();
-    auto number = [&](StringRef attr) -> double {
-      if (auto i = entry->getAttrOfType<IntegerAttr>(attr))
-        return double(i.getInt());
-      if (auto f = entry->getAttrOfType<FloatAttr>(attr))
-        return f.getValueAsDouble();
-      return 0.0;
-    };
-    CPSATOperatorInfo info;
-    info.lut = number("amc.area_lut");
-    info.dsp = number("amc.area_dsp");
-    info.ff = number("amc.area_ff");
-    bool instance = llvm::any_of(*hwMatch.getBodyBlock(), [](Operation &op) {
-      return isa<oplib::HwInstanceOp>(op);
-    });
-    bool issueCycles =
-        llvm::any_of(hwMatch.getArgRoles(), [](Attribute role) {
-          return cast<StringAttr>(role).getValue() == "valid";
-        });
-    info.shareable = instance && !issueCycles &&
-                     !operatorLibraryAnalysis->getOperatorLimit(name);
-    info.overClock = overClock(name);
-    info.width = info.operands = 0; // from its ops, below
-    input.operatorInfo[opr] = info;
-  }
-  // An instance's operand mux: its operands' count and widest.
-  for (auto *op : problem.getOperations()) {
-    SmallVector<Problem::OperatorType, 4> oprs;
-    if (auto it = cpsatCandidates.find(op); it != cpsatCandidates.end())
-      oprs = it->second;
-    else if (auto linked = problem.getLinkedOperatorType(op))
-      oprs.push_back(*linked);
-    unsigned widest = 0;
-    for (Value operand : op->getOperands())
-      widest = std::max(widest, bitWidthOf(operand.getType()));
-    for (auto opr : oprs) {
-      auto it = input.operatorInfo.find(opr);
-      if (it != input.operatorInfo.end() && it->second.shareable) {
-        it->second.width = std::max(it->second.width, widest);
-        it->second.operands =
-            std::max(it->second.operands, op->getNumOperands());
-      }
-    }
-    // An op with memory effects is never shared (binding leaves it alone).
-    if (!isMemoryEffectFree(op))
-      input.alone.insert(op);
-  }
-
-  // A pipeline's carried results: an op whose result, through bitcasts, is
-  // the next iteration's value of an iter arg; read there by that iter
-  // arg's users. One passed along to another iter arg, or read after the
-  // loop, has no ready cycle to be read in and stays alone.
-  if (pipelinedLoop) {
-    Block *body = pipelinedLoop.getAfterBody();
-    auto yield = cast<scf::YieldOp>(body->getTerminator());
-    auto cond =
-        cast<scf::ConditionOp>(pipelinedLoop.getBeforeBody()->getTerminator());
-    auto inProblem = [&](Operation *op) -> Operation * {
-      for (; op; op = op->getParentOp())
-        if (problem.hasOperation(op))
-          return op;
-      return nullptr;
-    };
-    for (auto [k, next] : llvm::enumerate(yield.getOperands())) {
-      Operation *producer = next.getDefiningOp();
-      while (producer && isa<arith::BitcastOp>(producer))
-        producer = producer->getOperand(0).getDefiningOp();
-      if (!producer || !problem.hasOperation(producer))
-        continue;
-      BlockArgument iterArg = body->getArgument(k);
-      bool late = false;
-      SmallVector<Operation *, 2> readers;
-      for (Operation *user : iterArg.getUsers()) {
-        if (user == yield.getOperation()) {
-          late = true;
-          continue;
-        }
-        if (Operation *reader = inProblem(user))
-          readers.push_back(reader);
-      }
-      // Read after the loop: the condition forwards the iter arg to a used
-      // loop result.
-      for (auto [j, forwarded] : llvm::enumerate(cond.getArgs()))
-        if (forwarded == pipelinedLoop.getBeforeArguments()[k] &&
-            !pipelinedLoop.getResult(j).use_empty())
-          late = true;
-      if (late)
-        input.aloneMultiCycle.insert(producer);
-      else
-        input.carriedReaders[producer].append(readers);
-    }
-  }
-
-  return input;
-}
-
-template <typename ProblemT>
-CPSATFunctionModel::Region &SCFToLoopSchedulePass::captureRegion(
-    ProblemT &problem, Operation *anchor, Operation *owner,
-    scf::WhileOp pipelinedLoop, Value condValue, CPSATFunctionModel &model) {
-  CPSATRegionInput input = buildCPSATInput(problem, anchor, pipelinedLoop);
-
-  // The function's operators, by index.
-  auto oprIndex = [&](Problem::OperatorType opr) -> unsigned {
-    for (auto [k, o] : llvm::enumerate(model.oprs))
-      if (o.name == opr.getValue())
-        return k;
-    CPSATFunctionModel::Operator o;
-    o.name = opr.getValue().str();
-    o.latency = *problem.getLatency(opr);
-    o.inc = *problem.getIncomingDelay(opr);
-    o.out = *problem.getOutgoingDelay(opr);
-    o.info = input.operatorInfo.lookup(opr);
-    model.oprs.push_back(o);
-    return model.oprs.size() - 1;
-  };
-
-  CPSATFunctionModel::Region region;
-  DenseMap<Operation *, unsigned> index;
-  for (auto [i, op] : llvm::enumerate(problem.getOperations()))
-    index[op] = i;
-  // When an op's operands from outside the region arrive in its cycle, as
-  // the lowering reads them: a sequential loop's iter arg through the
-  // loop's first-iteration mux (`first_iter ? init : reg`), and a value a
-  // function-level frame's operator instance or static port computes
-  // through its hold's bypass (`ready ? instance : capture`, statically a
-  // path from the instance's output: deriche's pipelines multiplied
-  // function-frame results so, behind a shared instance's mux, 4 LUT
-  // levels where the model saw 2 from registers). A loop's frame hands what
-  // it launches its `_latched` registers, and a dynamic access's result is
-  // the register its response is captured in: neither has a bypass
-  // (charged one, symm's multiply-adds could not share the pipeline's, and
-  // took a fourth DSP).
-  float bypass = scheduling::cpsatMuxDelay(
-      SmallVector<float>(shareMuxDelays.begin(), shareMuxDelays.end()), 2);
-  unsigned self = model.regions.size();
-  // The held results' producers (recorded, the model taking the delay of
-  // the operator each is given) and their candidates' slowest (for a solve
-  // without them). An iter arg is a register: a sequential loop's frames
-  // read the register its inits latch into as the loop is entered, a
-  // pipeline's the one they are preloaded into.
-  auto arrivalOf = [&](Operation *op, unsigned i, CPSATFunctionModel::Op &o) {
-    for (Value operand : op->getOperands()) {
-      if (isa<BlockArgument>(operand))
-        continue;
-      Operation *def = operand.getDefiningOp();
-      if (!def || index.count(def) || isDynamicLatencyOp(*def) ||
-          def->getParentOfType<scf::WhileOp>())
-        continue;
-      SmallVector<StringRef, 4> names;
-      if (auto offered =
-              def->getAttrOfType<ArrayAttr>("loopschedule.candidates"))
-        for (auto sym : offered.getAsRange<FlatSymbolRefAttr>())
-          names.push_back(sym.getValue());
-      if (auto own = def->getAttrOfType<SymbolRefAttr>("loopschedule.operator"))
-        names.push_back(own.getLeafReference());
-      bool held = false;
-      for (StringRef name : names)
-        if (operatorLibraryAnalysis->hasOperator(name) &&
-            operatorLibraryAnalysis->getOperatorLatency(name) > 0) {
-          held = true;
-          o.heldWorst = std::max(
-              o.heldWorst,
-              operatorLibraryAnalysis->getOperatorOutgoingDelay(name)
-                      .value_or(0.0f) +
-                  bypass);
-        }
-      if (held)
-        cpsatHeldPending.push_back({self, unsigned(i), def});
-    }
-  };
-  for (auto [i, op] : llvm::enumerate(problem.getOperations())) {
-    cpsatOpAt[op] = {self, unsigned(i)};
-    CPSATFunctionModel::Op o;
-    o.name = op->getName().getStringRef().str();
-    auto linked = *problem.getLinkedOperatorType(op);
-    o.oprs.push_back(oprIndex(linked));
-    if (auto it = input.candidates.find(op); it != input.candidates.end())
-      for (auto opr : it->second)
-        if (!(opr == linked))
-          o.oprs.push_back(oprIndex(opr));
-    o.alone = input.alone.contains(op);
-    o.aloneMultiCycle = input.aloneMultiCycle.contains(op);
-    if (auto it = input.carriedReaders.find(op);
-        it != input.carriedReaders.end())
-      for (Operation *reader : it->second)
-        if (auto r = index.find(reader); r != index.end())
-          o.carriedReaders.push_back(r->second);
-    for (Value result : op->getResults())
-      o.width += bitWidthOf(result.getType());
-    o.dynamic = isDynamicLatencyOp(*op);
-    arrivalOf(op, i, o);
-    region.ops.push_back(std::move(o));
-  }
-  // The values on the ops' operands: their users of one shared instance
-  // put one input on its mux.
-  CPSATValueIds &ids = cpsatValueIds[&model];
-  DenseMap<Value, unsigned> local;
-  for (auto [i, op] : llvm::enumerate(problem.getOperations()))
-    for (Value operand : op->getOperands()) {
-      auto idIn = [&](auto &map, auto key) {
-        auto [it, added] = map.try_emplace(key, ids.next);
-        if (added)
-          ++ids.next;
-        return it->second;
-      };
-      Attribute constant;
-      auto arg = dyn_cast<BlockArgument>(operand);
-      unsigned id;
-      if (matchPattern(operand, m_Constant(&constant)))
-        id = idIn(ids.constants, constant);
-      else if (arg && isa<FunctionOpInterface>(arg.getOwner()->getParentOp()))
-        id = idIn(ids.arguments, operand);
-      else
-        id = idIn(local, operand);
-      region.ops[i].inputs.push_back(id);
-    }
-  // The child loops its ops launch: lowered already (inner regions first),
-  // each carrying the index of the region it was described as.
-  for (auto [i, launcher] : llvm::enumerate(problem.getOperations())) {
-    Operation *op = launcher;
-    op->walk<WalkOrder::PreOrder>([&](Operation *nested) {
-      auto child = nested->getAttrOfType<IntegerAttr>(kCPSATRegionAttr);
-      if (!child)
-        return WalkResult::advance();
-      if (unsigned c = child.getInt(); c < self) {
-        model.regions[c].parent = self;
-        model.regions[c].launch = i;
-        // The operators of the child and the loops inside it (described
-        // already, each linked to its parent).
-        llvm::SmallSetVector<unsigned, 8> oprs;
-        for (auto [q, inner] : llvm::enumerate(model.regions)) {
-          // Up the parents (one may be this region, not described yet).
-          std::optional<unsigned> up = q;
-          while (up && *up != c && *up < self)
-            up = model.regions[*up].parent;
-          if (up && *up == c)
-            for (auto &innerOp : inner.ops)
-              oprs.insert(innerOp.oprs.begin(), innerOp.oprs.end());
-        }
-        SmallVector<unsigned> sorted(oprs.begin(), oprs.end());
-        llvm::sort(sorted);
-        region.ops[i].childOprs.append(sorted.begin(), sorted.end());
-      }
-      return WalkResult::skip(); // the loops inside it are its own
-    });
-  }
-  if (isa<scf::WhileOp>(owner))
-    owner->setAttr(kCPSATRegionAttr,
-                   IntegerAttr::get(IntegerType::get(owner->getContext(), 64),
-                                    self));
-  for (Operation *op : problem.getOperations())
-    for (auto dep : problem.getDependences(op)) {
-      auto src = index.find(dep.getSource());
-      if (src == index.end())
-        continue;
-      CPSATFunctionModel::Dependence d;
-      d.src = src->second;
-      d.dst = index[op];
-      d.auxiliary = dep.isAuxiliary();
-      if constexpr (std::is_base_of_v<CyclicProblem, ProblemT>)
-        d.distance = problem.getDistance(dep).value_or(0);
-      if (d.auxiliary) {
-        unsigned depLat = *problem.getDependenceLatency(dep);
-        unsigned linkedLat =
-            *problem.getLatency(*problem.getLinkedOperatorType(dep.getSource()));
-        // Past the source's latency, a bound of its own (whichever
-        // operator the source takes); short of it, the edge's latency.
-        if (depLat > linkedLat)
-          d.minLatency = depLat;
-        else if (depLat != linkedLat)
-          d.latency = depLat;
-      }
-      region.deps.push_back(d);
-    }
-  llvm::MapVector<Problem::ResourceType, unsigned> rsrcIndex;
-  for (Operation *op : problem.getOperations())
-    if (auto rsrcs = problem.getLinkedResourceTypes(op))
-      for (auto rsrc : *rsrcs) {
-        auto limit = problem.getLimit(rsrc);
-        if (!limit)
-          continue;
-        auto [it, inserted] =
-            rsrcIndex.try_emplace(rsrc, region.resources.size());
-        if (inserted)
-          region.resources.push_back({*limit, {}});
-        region.resources[it->second].ops.push_back(index[op]);
-      }
-  region.anchor = index[anchor];
-  if constexpr (std::is_base_of_v<CyclicProblem, ProblemT>) {
-    // `hls.pipeline = N` (on the loop or the function) asks for II N; a
-    // unit one leaves the II to the solver, from the resources' bound up.
-    auto requested = owner->getAttrOfType<IntegerAttr>("hls.pipeline");
-    region.ii = requested ? unsigned(requested.getInt()) : 1;
-    region.searchII = !requested;
-  }
-  // A pipelined loop's continuation, by createLoopSchedulePipeline's rules.
-  if (Operation *condOp = condValue ? condValue.getDefiningOp() : nullptr;
-      pipelinedLoop && condOp && index.count(condOp)) {
-    region.cond = index[condOp];
-    bool dynamic = false;
-    pipelinedLoop.getAfter().walk([&](Operation *op) {
-      dynamic |= isDynamicLatencyOp(*op) &&
-                 !isDrainableStreamPop(op, pipelinedLoop);
-    });
-    region.condFirst =
-        dynamic || !llvm::all_of(pipelinedLoop.getResults(),
-                                 [](Value r) { return r.use_empty(); });
-    pipelinedLoop.getAfter().walk([&](Operation *op) {
-      if (isObservableEffect(*op) && index.count(op) &&
-          !isDrainableStreamPop(op, pipelinedLoop))
-        region.effects.push_back(index[op]);
-    });
-  }
-  // How often the region runs: its loop's iterations (a pipeline's per
-  // launch), times those of the loops around it.
-  auto tripOf = [&](Operation *loop) -> int64_t {
-    if (auto trip = loop->getAttrOfType<IntegerAttr>("loopschedule.trip_count"))
-      return std::max<int64_t>(1, trip.getInt());
-    return std::max<int64_t>(1, cpsatDefaultTripCount);
-  };
-  int64_t outer = 1;
-  for (Operation *p = owner->getParentOp(); p; p = p->getParentOp())
-    if (isa<scf::WhileOp>(p))
-      outer *= tripOf(p);
-  if (pipelinedLoop) {
-    region.runs = outer;
-    region.tripCount = tripOf(owner);
-  } else if (isa<scf::WhileOp>(owner)) {
-    region.runs = outer * tripOf(owner);
-  } else {
-    region.runs = 1;
-  }
-  model.regions.push_back(std::move(region));
-  // The held results of this region's ops, read in the regions inside it.
-  llvm::erase_if(cpsatHeldPending, [&](auto &pending) {
-    auto [r, i, def] = pending;
-    auto at = cpsatOpAt.find(def);
-    if (at == cpsatOpAt.end() || at->second.first != self)
-      return false;
-    model.regions[r].ops[i].held.push_back(at->second);
-    return true;
-  });
-  // Described last, the function leaves any producer not found in a region
-  // (outside every problem): its reader takes the slowest candidates'.
-  if (isa<FuncOp>(owner)) {
-    for (auto [r, i, def] : cpsatHeldPending)
-      model.regions[r].ops[i].held.clear();
-    cpsatHeldPending.clear();
-  }
-  return model.regions.back();
-}
-
-template <typename ProblemT>
-LogicalResult SCFToLoopSchedulePass::applyRegionSolution(
-    ProblemT &problem, Operation *anchor, const CPSATFunctionModel &model,
-    const CPSATFunctionModel::Region &region,
-    const CPSATFunctionSolution::Region &sol, bool bind) {
-  auto cannot = [&](StringRef why) -> LogicalResult {
-    return anchor->emitError("the CP-SAT schedule cannot be applied to this "
-                             "region (")
-           << why << ")";
-  };
-  auto &ops = problem.getOperations();
-  if (ops.size() != region.ops.size() || sol.start.size() != ops.size())
-    return cannot("its operations differ from the description");
-  auto *ctx = anchor->getContext();
-  SmallVector<Problem::OperatorType> chosen;
-  for (auto [i, op] : llvm::enumerate(ops)) {
-    if (op->getName().getStringRef() != region.ops[i].name)
-      return cannot("its operations differ from the description");
-    // An op with no choice keeps its own operator: one named per run (a
-    // memory port's, by its memory reference) may be named otherwise on the
-    // copy the model was described on.
-    if (region.ops[i].oprs.size() == 1) {
-      chosen.push_back(*problem.getLinkedOperatorType(op));
-      continue;
-    }
-    auto opr = Problem::OperatorType::get(ctx, model.oprs[sol.opr[i]].name);
-    if (!problem.hasOperatorType(opr))
-      return cannot("the operator it chose for " +
-                    op->getName().getStringRef().str() + ", @" +
-                    model.oprs[sol.opr[i]].name + ", is not offered here");
-    chosen.push_back(opr);
-  }
-  if constexpr (std::is_base_of_v<CyclicProblem, ProblemT>) {
-    if (!sol.ii)
-      return cannot("it has no II for a pipeline");
-    problem.setInitiationInterval(sol.ii);
-  }
-  for (auto [i, op] : llvm::enumerate(ops)) {
-    problem.setStartTime(op, sol.start[i]);
-    problem.setLinkedOperatorType(op, chosen[i]);
-    problem.setStartTimeInCycle(op, sol.inCycle[i]);
-  }
-  if (failed(problem.verify()))
-    return cannot("it does not verify");
-  auto i64 = IntegerType::get(ctx, 64);
-  for (auto [i, op] : llvm::enumerate(ops)) {
-    if (cpsatCandidates.count(op))
-      op->setAttr("loopschedule.operator",
-                  SymbolRefAttr::get(chosen[i].getAttr()));
-    if (bind && sol.instance[i])
-      op->setAttr("loopschedule.binding",
-                  IntegerAttr::get(i64, *sol.instance[i]));
-  }
-  return success();
-}
-
-CPSATChainingConfig SCFToLoopSchedulePass::cpsatConfig(float cycleTime) {
-  CPSATChainingConfig config;
-  config.cycleTime = cycleTime;
-  config.timeLimitS = cpsatTimeLimit;
-  config.numWorkers = cpsatWorkers;
-  config.cycleSlack = cpsatCycleSlack;
-  config.lutCapacity = cpsatDeviceLuts;
-  config.dspCapacity = cpsatDeviceDsps;
-  config.ffCapacity = cpsatDeviceFFs;
-  config.bottleneck = cpsatArea == "bottleneck";
-  config.solverParameters = cpsatParameters;
-  auto table = [&](unsigned i, auto &option) {
-    muxTables[i].assign(option.begin(), option.end());
-    return ArrayRef<float>(muxTables[i]);
-  };
-  config.muxDelays = table(0, shareMuxDelays);
-  config.muxNorDelays = table(1, shareMuxNorDelays);
-  config.muxDelays64 = table(2, shareMuxDelays64);
-  config.muxNorDelays64 = table(3, shareMuxNorDelays64);
-  config.muxInputLuts = cpsatMuxInputLuts;
-  return config;
-}
-
-LogicalResult SCFToLoopSchedulePass::solveFunctionsCPSAT() {
-  ModuleOp moduleOp = getOperation();
-  // Describe every region on a copy, each scheduled alone in CP-SAT and
-  // lowered as usual. Its diagnostics are the real run's too (which repeats
-  // them), but for the first error: why the copy failed.
-  OwningOpRef<ModuleOp> copy = moduleOp.clone();
-  SCFToLoopScheduleOptions opts;
-  opts.cycleTimeNs = cycleTimeNs;
-  opts.recordChainSlack = false;
-  opts.scheduler = "cpsat-snapshot";
-  opts.cpsatTimeLimit = cpsatTimeLimit;
-  opts.cpsatRegionTimeLimit = cpsatRegionTimeLimit;
-  opts.cpsatRegionObjective = cpsatRegionObjective;
-  opts.cpsatWorkers = cpsatWorkers;
-  opts.cpsatArea = cpsatArea;
-  opts.cpsatDeviceLuts = cpsatDeviceLuts;
-  opts.cpsatDeviceDsps = cpsatDeviceDsps;
-  opts.cpsatDeviceFFs = cpsatDeviceFFs;
-  opts.cpsatDefaultTripCount = cpsatDefaultTripCount;
-  opts.cpsatCycleSlack = cpsatCycleSlack;
-  opts.cpsatParameters = cpsatParameters;
-  auto list = [](auto &option) {
-    return SmallVector<float>(option.begin(), option.end());
-  };
-  opts.shareMuxDelays = list(shareMuxDelays);
-  opts.shareMuxNorDelays = list(shareMuxNorDelays);
-  opts.shareMuxDelays64 = list(shareMuxDelays64);
-  opts.shareMuxNorDelays64 = list(shareMuxNorDelays64);
-  opts.cpsatMuxInputLuts = cpsatMuxInputLuts;
-  auto pass = std::make_unique<SCFToLoopSchedulePass>(opts);
-  pass->snapshotSink = &functionModels;
-  PassManager pm(&getContext());
-  pm.addPass(std::move(pass));
-  LogicalResult described = success();
-  std::string firstError;
-  {
-    ScopedDiagnosticHandler capture(&getContext(), [&](Diagnostic &diag) {
-      if (diag.getSeverity() == DiagnosticSeverity::Error &&
-          firstError.empty()) {
-        llvm::raw_string_ostream os(firstError);
-        os << diag.getLocation() << ": " << diag;
-      }
-      return success();
-    });
-    described = pm.run(*copy);
-  }
-  if (failed(described))
-    return moduleOp.emitError("the CP-SAT scheduler could not describe the "
-                              "regions (scheduling a copy of the module "
-                              "failed")
-           << (firstError.empty() ? std::string() : ": " + firstError) << ")";
-
-  CPSATChainingConfig config = cpsatConfig(cycleTimeNs);
-  for (auto &entry : functionModels) {
-    CPSATFunctionSolution solution;
-    std::string why;
-    if (failed(scheduleCPSATFunction(entry.second, config, solution, why)))
-      return moduleOp.emitError("the CP-SAT scheduler found no schedule for "
-                                "@")
-             << entry.first() << " (" << why << ")";
-    LLVM_DEBUG(llvm::dbgs()
-               << "cpsat: @" << entry.first() << " cycles " << solution.cycles
-               << ", " << solution.luts << " LUTs, " << solution.dsps
-               << " DSPs, " << solution.ffs << " FFs"
-               << (solution.optimal ? " optimal" : "") << "\n");
-    functionSolutions[entry.first()] = std::move(solution);
-  }
-  return success();
-}
-#endif
-
-template <typename ProblemT>
-LogicalResult SCFToLoopSchedulePass::scheduleRegionCPSAT(
-    ProblemT &problem, Operation *anchor, Operation *owner,
-    scf::WhileOp pipelinedLoop, float cycleTime, bool seeded,
-    Value condValue) {
-#ifndef SCHEDULING_OR_TOOLS
-  return anchor->emitError("scheduler=cpsat needs CIRCT built with OR-Tools");
-#else
-  unsigned r = regionIndex++;
-  auto func = anchor->getParentOfType<FuncOp>();
-  if (!func)
-    return anchor->emitError("the CP-SAT scheduler has no function for this "
-                             "region");
-  if (scheduler == "cpsat-snapshot") {
-    // Describe the region, and find the schedule the function's solve
-    // starts from: the simplex's (seeded), where the model takes it, or the
-    // region's alone in CP-SAT, for its cycles. The copy is lowered on it,
-    // and the regions around it described on what it lowers to (a child
-    // loop is a launch of a fixed latency to its parent, whatever its
-    // schedule).
-    if (!snapshotSink)
-      return anchor->emitError("scheduler=cpsat-snapshot is the CP-SAT "
-                               "scheduler's own run on a copy");
-    CPSATFunctionModel &model = (*snapshotSink)[func.getSymName()];
-    CPSATFunctionModel::Region &region =
-        captureRegion(problem, anchor, owner, pipelinedLoop, condValue, model);
-    CPSATChainingConfig config = cpsatConfig(cycleTime);
-    config.cyclesOnly = cpsatRegionObjective != "area";
-    config.timeLimitS = std::min<double>(cpsatTimeLimit, cpsatRegionTimeLimit);
-    auto alone = [&] {
-      CPSATFunctionModel one;
-      one.oprs = model.oprs;
-      one.regions.push_back(region);
-      return one;
-    };
-    if (seeded) {
-      // Each op on its own operator (allocation's, the first of its
-      // candidates) at the simplex's start. The model may not take it: the
-      // simplex keeps a recurrence's chain whole past the clock below an II
-      // it was given, takes an operator past the clock where one fits, and
-      // knows nothing of a child's launch beside its parent's dynamic
-      // access.
-      for (auto [i, op] : llvm::enumerate(problem.getOperations())) {
-        region.ops[i].hint = *problem.getStartTime(op);
-        region.ops[i].hintChoice = 0;
-      }
-      if constexpr (std::is_base_of_v<CyclicProblem, ProblemT>)
-        region.hintII = *problem.getInitiationInterval();
-      CPSATChainingConfig check = config;
-      check.fixHints = true;
-      CPSATFunctionSolution solution;
-      std::string why;
-      if (succeeded(scheduleCPSATFunction(alone(), check, solution, why)))
-        return success(); // the copy is lowered on the simplex's schedule
-      LLVM_DEBUG(llvm::dbgs() << "cpsat: region " << r
-                              << ": the model does not take the simplex's "
-                                 "schedule ("
-                              << why << "); solving it alone\n");
-    }
-    CPSATFunctionSolution solution;
-    std::string why;
-    if (failed(scheduleCPSATFunction(alone(), config, solution, why))) {
-      if (!seeded)
-        return anchor->emitError("the CP-SAT scheduler found no schedule for "
-                                 "this region (")
-               << why << ")";
-      // The copy keeps the simplex's schedule, and the function's solve
-      // starts the region from nothing.
-      LLVM_DEBUG(llvm::dbgs() << "cpsat: region " << r << ": no schedule ("
-                              << why << "); the function's solve starts it "
-                                        "from nothing\n");
-      for (auto &op : region.ops)
-        op.hint.reset();
-      region.hintII.reset();
-      return success();
-    }
-    auto &sol = solution.regions.front();
-    for (auto [i, op] : llvm::enumerate(region.ops)) {
-      op.hint = sol.start[i];
-      op.hintChoice = llvm::find(op.oprs, sol.opr[i]) - op.oprs.begin();
-    }
-    if (sol.ii)
-      region.hintII = sol.ii;
-    return applyRegionSolution(problem, anchor, model, region, sol,
-                               /*bind=*/false);
-  }
-  if (scheduler == "cpsat") {
-    auto modelIt = functionModels.find(func.getSymName());
-    auto solIt = functionSolutions.find(func.getSymName());
-    if (modelIt == functionModels.end() || solIt == functionSolutions.end())
-      return anchor->emitError("the CP-SAT scheduler has no solution for this "
-                               "region's function");
-    if (r >= modelIt->second.regions.size() ||
-        r >= solIt->second.regions.size())
-      return anchor->emitError("the CP-SAT scheduler described fewer regions "
-                               "of this function");
-    auto &sol = solIt->second.regions[r];
-    if (failed(applyRegionSolution(problem, anchor, modelIt->second,
-                                   modelIt->second.regions[r], sol,
-                                   /*bind=*/true)))
-      return failure();
-    LLVM_DEBUG(llvm::dbgs() << "cpsat: region " << r << " length "
-                            << sol.length << (sol.ii ? " II " : "")
-                            << (sol.ii ? std::to_string(sol.ii) : "") << "\n");
-    return success();
-  }
-  return anchor->emitError("unknown scheduler '") << scheduler << "'";
-#endif
-}
-
 /// Solve the pre-computed scheduling problem.
-LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
+LogicalResult SCFToLoopScheduleLowering::solveChainingModuloProblem(
     scf::WhileOp &loop, ChainingModuloProblem &problem, float cycleTime,
     Value condValue) {
   // Scheduling analyis only considers the innermost loop nest for now.
@@ -3026,26 +2131,12 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
   if (failed(problem.check()))
     return failure();
 
-  // The CP-SAT scheduler takes the simplex's place (and verifies).
+  // The pass's scheduler (and verifies).
   auto *anchor = loop.getAfterBody()->getTerminator();
-  if (StringRef(scheduler).starts_with("cpsat")) {
-    // On the copy, the simplex's schedule first: the CP-SAT search's start.
-    bool seeded = seedSimplex([&]() -> LogicalResult {
-      if (failed(scheduleSimplex(problem, anchor, cycleTime, ii)) ||
-          failed(problem.verify()) ||
-          (ii && problem.getInitiationInterval() != ii))
-        return failure();
-      return success();
-    });
-    if (failed(scheduleRegionCPSAT(problem, anchor, loop.getOperation(), loop,
-                                   cycleTime, seeded, condValue)))
-      return failure();
-  } else {
-    if (failed(scheduleSimplex(problem, anchor, cycleTime, ii)))
-      return failure();
-    if (failed(problem.verify()))
-      return failure();
-  }
+  if (failed(scheduleModulo(
+          problem, anchor, loop.getOperation(), loop, ii, condValue,
+          describeInputDelays(problem, /*pipelined=*/true, condValue))))
+    return failure();
 
   // Verify II
   if (ii.has_value() && problem.getInitiationInterval() != ii) {
@@ -3055,8 +2146,8 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
         std::to_string(problem.getInitiationInterval().value()));
   }
   warnPastCycleTime(problem, cycleTime);
-  if (recordChainSlack)
-    stampChainSlack(problem, cycleTime, [&](const auto &dep) {
+  if (config.recordChainSlack)
+    stampChainSlack(problem, cycleTime, [&](Problem::Dependence dep) {
       return problem.getDistance(dep).value_or(0);
     });
 
@@ -3076,7 +2167,7 @@ LogicalResult SCFToLoopSchedulePass::solveChainingModuloProblem(
   return success();
 }
 
-LogicalResult SCFToLoopSchedulePass::solveChainingSharedOperatorsProblem(
+LogicalResult SCFToLoopScheduleLowering::solveChainingSharedOperatorsProblem(
     Region &region, ChainingSharedOperatorsProblem &problem, float cycleTime) {
 
   LLVM_DEBUG(region.getParentOp()->dump());
@@ -3105,32 +2196,15 @@ LogicalResult SCFToLoopSchedulePass::solveChainingSharedOperatorsProblem(
   if (failed(problem.check()))
     return failure();
 
-  // The CP-SAT scheduler takes the simplex's place (and verifies).
+  // The pass's scheduler (and verifies).
   auto *anchor = region.back().getTerminator();
-  if (StringRef(scheduler).starts_with("cpsat")) {
-    // On the copy, the simplex's schedule first: the CP-SAT search's start.
-    bool seeded = seedSimplex([&]() -> LogicalResult {
-      if (failed(scheduleSimplex(problem, anchor, cycleTime)))
-        return failure();
-      applySecondaryScheduleObjectives(problem, anchor, cycleTime);
-      return problem.verify();
-    });
-    if (failed(scheduleRegionCPSAT(problem, anchor, region.getParentOp(),
-                                   scf::WhileOp(), cycleTime, seeded)))
-      return failure();
-  } else {
-    if (failed(scheduleSimplex(problem, anchor, cycleTime)))
-      return failure();
-    // The simplex only optimizes the anchor; complete the solution with the
-    // lowering-aware secondary objectives (states, then registers, then
-    // determinism) so the rest of the schedule is chosen by stated criteria
-    // rather than by the final simplex basis.
-    applySecondaryScheduleObjectives(problem, anchor, cycleTime);
-    if (failed(problem.verify()))
-      return failure();
-  }
-  if (recordChainSlack)
-    stampChainSlack(problem, cycleTime, [](const auto &) { return 0u; });
+  if (failed(scheduleSequential(
+          problem, anchor, region.getParentOp(),
+          describeInputDelays(problem, /*pipelined=*/false, Value()))))
+    return failure();
+  if (config.recordChainSlack)
+    stampChainSlack(problem, cycleTime,
+                    [](Problem::Dependence) { return 0u; });
 
   // Optionally debug problem outputs.
   LLVM_DEBUG({
@@ -3147,7 +2221,7 @@ LogicalResult SCFToLoopSchedulePass::solveChainingSharedOperatorsProblem(
 }
 
 /// Create the pipeline op for a loop nest.
-void SCFToLoopSchedulePass::computePipelineStageRegisters(
+void SCFToLoopScheduleLowering::computePipelineStageRegisters(
     ArrayRef<unsigned> startTimes,
     DenseMap<unsigned, SmallVector<Operation *>> &startGroups,
     CyclicProblem &problem, Operation *funcReturnSentinel,
@@ -3228,7 +2302,7 @@ void SCFToLoopSchedulePass::computePipelineStageRegisters(
   }
 }
 
-LoopScheduleAtOp SCFToLoopSchedulePass::emitOnePipelineStage(
+LoopScheduleAtOp SCFToLoopScheduleLowering::emitOnePipelineStage(
     ImplicitLocOpBuilder &builder, unsigned startTime,
     ArrayRef<Operation *> group, ArrayRef<Value> registerValuesAtStage,
     ArrayRef<Type> registerTypesAtStage,
@@ -3313,7 +2387,7 @@ LoopScheduleAtOp SCFToLoopSchedulePass::emitOnePipelineStage(
 /// anything else touches the bundle.
 /// An op whose effect a pipeline's speculative iteration could not take
 /// back: a store, or a write.
-static bool isObservableEffect(Operation &op) {
+bool scftoloopschedule::isObservableEffect(Operation &op) {
   if (isa<StoreInterface>(&op))
     return true;
   if (isa<HWStoreLoweringInterface>(&op))
@@ -3323,7 +2397,8 @@ static bool isObservableEffect(Operation &op) {
   return false;
 }
 
-static bool isDrainableStreamPop(Operation *op, mlir::scf::WhileOp loop) {
+bool scftoloopschedule::isDrainableStreamPop(Operation *op,
+                                                mlir::scf::WhileOp loop) {
   auto load = dyn_cast<loopschedule::LoadInterface>(op);
   if (!load || !load.isDynamic() || load.getLatency() != 0 ||
       !load.readsAreOrdered())
@@ -3345,7 +2420,7 @@ static bool isDrainableStreamPop(Operation *op, mlir::scf::WhileOp loop) {
 }
 
 LogicalResult
-SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
+SCFToLoopScheduleLowering::createLoopSchedulePipeline(scf::WhileOp &loop,
                                                   CyclicProblem &problem,
                                                   Value condValue) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
@@ -3537,7 +2612,7 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
     startTimes.push_back(group.first);
   llvm::sort(startTimes);
 
-  DominanceInfo dom(getOperation());
+  DominanceInfo dom(module);
 
   // Keys for translating values in each stage
   SmallVector<SmallVector<Value>> registerValues;
@@ -3823,7 +2898,7 @@ SCFToLoopSchedulePass::createLoopSchedulePipeline(scf::WhileOp &loop,
 /// `LoopScheduleTerminatorOp`). Stages live as direct children of the
 /// `loopschedule.func_pipeline` body, between the preserved-static prelude
 /// (allocations / constants / init ops) and the `loopschedule.return`.
-LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedulePipeline(
+LogicalResult SCFToLoopScheduleLowering::createFuncLoopSchedulePipeline(
     FuncOp funcOp, ChainingModuloProblem &problem) {
   ImplicitLocOpBuilder builder(funcOp.getLoc(), funcOp);
   auto ii = builder.getI64IntegerAttr(problem.getInitiationInterval().value());
@@ -3890,7 +2965,7 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedulePipeline(
     startTimes.push_back(group.first);
   llvm::sort(startTimes);
 
-  DominanceInfo dom(getOperation());
+  DominanceInfo dom(module);
 
   SmallVector<SmallVector<Value>> registerValues;
   SmallVector<SmallVector<Type>> registerTypes;
@@ -3977,7 +3052,7 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedulePipeline(
 /// `LoopScheduleSequentialOp`, sets up the variant strategy, and delegates
 /// the body lowering to `lowerSchedule`.
 LogicalResult
-SCFToLoopSchedulePass::createLoopScheduleSequential(scf::WhileOp &loop,
+SCFToLoopScheduleLowering::createLoopScheduleSequential(scf::WhileOp &loop,
                                                     Problem &problem,
                                                     Value condValue) {
   ImplicitLocOpBuilder builder(loop.getLoc(), loop);
@@ -4081,7 +3156,7 @@ int64_t opOrParentStartTime(Problem &problem, Operation *op) {
 /// `createFuncLoopSchedule`. The structure mirrors the previous sequential
 /// implementation; variant points (terminator type, iter-arg threading, cond
 /// op tracking, op-skip filter, and tail emission) flow through `S`.
-LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
+LogicalResult SCFToLoopScheduleLowering::lowerSchedule(ScheduleStrategy &S,
                                                     Problem &problem) {
   ImplicitLocOpBuilder builder(S.root->getLoc(), S.root);
   Operation *anchor = S.anchor;
@@ -4263,7 +3338,7 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
     }
   };
 
-  DominanceInfo dom(getOperation());
+  DominanceInfo dom(module);
   DenseMap<uint32_t, SmallVector<Value>> reregisterValues =
       std::move(lateTerminatorValues);
 
@@ -4953,7 +4028,7 @@ LogicalResult SCFToLoopSchedulePass::lowerSchedule(ScheduleStrategy &S,
 /// targeting the function body and delegates to `lowerSchedule`. The tail
 /// emits a trailing barrier frame to await any pending launches and forwards
 /// return-consumed values out through that frame.
-LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
+LogicalResult SCFToLoopScheduleLowering::createFuncLoopSchedule(FuncOp &funcOp,
                                                             Problem &problem) {
   auto *funcReturn = funcOp.getBody().back().getTerminator();
 
@@ -5130,7 +4205,208 @@ LogicalResult SCFToLoopSchedulePass::createFuncLoopSchedule(FuncOp &funcOp,
   return lowerSchedule(S, problem);
 }
 
-std::unique_ptr<OperationPass<ModuleOp>>
-circt::createSCFToLoopSchedulePass(const SCFToLoopScheduleOptions &options) {
-  return std::make_unique<SCFToLoopSchedulePass>(options);
+InputDelays SCFToLoopScheduleLowering::describeInputDelays(
+    Problem &problem, bool pipelined, Value condValue) {
+  InputDelays delays;
+  // One LUT level: the two-user mux (as the CP-SAT model prices a hold's
+  // bypass and a select decided in the cycle).
+  if (!config.shareMuxDelays.empty())
+    delays.gate = config.shareMuxDelays.front();
+  DenseSet<Operation *> inRegion(problem.getOperations().begin(),
+                                 problem.getOperations().end());
+  for (Operation *op : problem.getOperations()) {
+    InputDelays::Terms terms;
+    for (Value operand : op->getOperands()) {
+      Operation *def = operand.getDefiningOp();
+      if (!def)
+        continue;
+      if (inRegion.contains(def)) {
+        if (pipelined && isDynamicLatencyOp(*def))
+          terms.expectReads.push_back(def);
+        continue;
+      }
+      // A function-level frame's result through its hold's bypass: an
+      // operator instance's (allocation's operator or a candidate of
+      // nonzero latency) or a static port's. Not a loop frame's, nor a
+      // dynamic access's.
+      if (isDynamicLatencyOp(*def) || def->getParentOfType<scf::WhileOp>())
+        continue;
+      SmallVector<StringRef, 4> names;
+      if (auto offered =
+              def->getAttrOfType<ArrayAttr>("loopschedule.candidates"))
+        for (auto sym : offered.getAsRange<FlatSymbolRefAttr>())
+          names.push_back(sym.getValue());
+      if (auto own = def->getAttrOfType<SymbolRefAttr>("loopschedule.operator"))
+        names.push_back(own.getLeafReference());
+      if (llvm::any_of(names, [&](StringRef name) {
+            return operatorLibraryAnalysis->hasOperator(name) &&
+                   operatorLibraryAnalysis->getOperatorLatency(name) > 0;
+          }))
+        terms.held.push_back(def);
+    }
+    if (!terms.held.empty() || !terms.expectReads.empty())
+      delays.ops[op] = std::move(terms);
+  }
+  if (pipelined && condValue)
+    if (Operation *cond = condValue.getDefiningOp();
+        cond && inRegion.contains(cond))
+      delays.condition = cond;
+  return delays;
+}
+
+bool SCFToLoopScheduleLowering::raiseEarliestStart(ChainingProblem &problem,
+                                                   Operation *op, float at) {
+  auto opr = problem.getLinkedOperatorType(op);
+  float cap = config.cycleTimeNs -
+              (opr ? problem.getIncomingDelay(*opr).value_or(0.0f) : 0.0f);
+  at = std::min(at, cap);
+  if (at <= problem.getEarliestStartInCycle(op).value_or(0.0f) + 1e-4f)
+    return false;
+  problem.setEarliestStartInCycle(op, at);
+  return true;
+}
+
+void SCFToLoopScheduleLowering::applyHeldDelays(ChainingProblem &problem,
+                                                const InputDelays &delays) {
+  for (auto &[op, terms] : delays.ops) {
+    float at = 0.0f;
+    for (Operation *producer : terms.held) {
+      auto sym =
+          producer->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+      if (!sym)
+        continue;
+      StringRef name = sym.getLeafReference();
+      if (!operatorLibraryAnalysis->hasOperator(name) ||
+          operatorLibraryAnalysis->getOperatorLatency(name) == 0)
+        continue;
+      float out = std::min(
+          operatorLibraryAnalysis->getOperatorOutgoingDelay(name).value_or(
+              0.0f),
+          config.cycleTimeNs);
+      at = std::max(at, out + delays.gate);
+    }
+    if (at > 0.0f)
+      raiseEarliestStart(problem, op, at);
+  }
+}
+
+bool SCFToLoopScheduleLowering::takesSharedInstance(Operation *op) {
+  if (isa<LoadInterface, StoreInterface>(op))
+    return false;
+  auto sym = op->getAttrOfType<SymbolRefAttr>("loopschedule.operator");
+  return sym && operatorLibraryAnalysis->hasOperator(sym.getLeafReference()) &&
+         operatorLibraryAnalysis->getOperatorLimit(sym.getLeafReference())
+             .has_value();
+}
+
+LogicalResult SCFToLoopScheduleLowering::simplexModulo(
+    ChainingModuloProblem &problem, Operation *anchor,
+    std::optional<int32_t> ii, const InputDelays &delays) {
+  applyHeldDelays(problem, delays);
+  if (failed(scheduleSimplex(problem, anchor, config.cycleTimeNs, ii)))
+    return failure();
+  // What depends on the schedule, by fixpoint: an op on a shared instance at
+  // cycle 0 selects after the continuation, and one reading a dynamic load
+  // in its expect stage takes the bypass, each a LUT before its mux. Raised,
+  // the schedule is solved again; a solve that fails keeps the last one. An
+  // op whose select comes too late for it to fit in cycle 0 at all leaves
+  // it, a cycle past the condition (as the CP-SAT model's constraint does),
+  // unless it feeds the condition.
+  auto earliestOf = [&]() {
+    DenseMap<Operation *, std::optional<float>> earliest;
+    for (Operation *op : problem.getOperations())
+      earliest[op] = problem.getEarliestStartInCycle(op);
+    return earliest;
+  };
+  auto feeds = [&](Operation *from, Operation *to) {
+    SmallVector<Operation *> stack{to};
+    DenseSet<Operation *> seen;
+    while (!stack.empty()) {
+      Operation *op = stack.pop_back_val();
+      if (op == from)
+        return true;
+      if (!seen.insert(op).second)
+        continue;
+      for (auto dep : problem.getDependences(op))
+        if (problem.getDistance(dep).value_or(0) == 0)
+          stack.push_back(dep.getSource());
+    }
+    return false;
+  };
+  SmallVector<Problem::Dependence> pushedOut;
+  for (unsigned round = 0; round < 4; ++round) {
+    auto before = earliestOf();
+    size_t pushedBefore = pushedOut.size();
+    bool raised = false;
+    for (Operation *op : problem.getOperations()) {
+      if (!takesSharedInstance(op))
+        continue;
+      unsigned cycle = *problem.getStartTime(op);
+      float need = 0.0f;
+      if (cycle == 0 && delays.condition && delays.condition != op) {
+        auto condOpr = *problem.getLinkedOperatorType(delays.condition);
+        float out = problem.getOutgoingDelay(condOpr).value_or(0.0f);
+        float condIn =
+            problem.getLatency(condOpr).value_or(0) == 0
+                ? problem.getStartTimeInCycle(delays.condition).value_or(0.0f) +
+                      out
+                : out;
+        float inc = problem.getIncomingDelay(
+                              *problem.getLinkedOperatorType(op))
+                        .value_or(0.0f);
+        if (condIn + delays.gate + inc > config.cycleTimeNs + 1e-4f) {
+          if (!feeds(op, delays.condition)) {
+            Problem::Dependence dep(delays.condition, op);
+            if (succeeded(problem.insertDependence(dep))) {
+              problem.setDependenceLatency(dep, 1);
+              pushedOut.push_back(dep);
+              raised = true;
+            }
+          }
+        } else {
+          need = condIn + delays.gate;
+        }
+      }
+      if (auto it = delays.ops.find(op); it != delays.ops.end())
+        for (Operation *load : it->second.expectReads)
+          if (cycle == *problem.getStartTime(load) +
+                           problem
+                               .getLatency(*problem.getLinkedOperatorType(load))
+                               .value_or(0))
+            need = std::max(need, delays.gate);
+      if (need > 0.0f)
+        raised |= raiseEarliestStart(problem, op, need);
+    }
+    if (!raised)
+      break;
+    if (succeeded(scheduleSimplex(problem, anchor, config.cycleTimeNs, ii)))
+      continue;
+    // The round's dependences cannot be removed: they take latency 0, an
+    // ordering the schedule before them kept (the condition before the op).
+    for (size_t i = pushedBefore; i < pushedOut.size(); ++i)
+      problem.setDependenceLatency(pushedOut[i], 0);
+    for (auto &[op, earliest] : before)
+      if (earliest)
+        problem.setEarliestStartInCycle(op, *earliest);
+      else
+        problem.setEarliestStartInCycle(op, 0.0f);
+    if (failed(scheduleSimplex(problem, anchor, config.cycleTimeNs, ii)))
+      return failure();
+    break;
+  }
+  return problem.verify();
+}
+
+LogicalResult SCFToLoopScheduleLowering::simplexSequential(
+    ChainingSharedOperatorsProblem &problem, Operation *anchor,
+    const InputDelays &delays) {
+  applyHeldDelays(problem, delays);
+  if (failed(scheduleSimplex(problem, anchor, config.cycleTimeNs)))
+    return failure();
+  // The simplex only optimizes the anchor; complete the solution with the
+  // lowering-aware secondary objectives (states, then registers, then
+  // determinism) so the rest of the schedule is chosen by stated criteria
+  // rather than by the final simplex basis.
+  applySecondaryScheduleObjectives(problem, anchor, config.cycleTimeNs);
+  return problem.verify();
 }

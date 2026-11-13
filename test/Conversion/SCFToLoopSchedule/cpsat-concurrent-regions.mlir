@@ -1,6 +1,6 @@
 // REQUIRES: or-tools
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-cycle-slack=0 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,TOGETHER
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-cycle-slack=1 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,APART
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule-cpsat{cycle-time-ns=3.0 cpsat-workers=1 cpsat-cycle-slack=0 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,TOGETHER
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule-cpsat{cycle-time-ns=3.0 cpsat-workers=1 cpsat-cycle-slack=1 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,APART
 
 // The CP-SAT scheduler shares an instance across a function's regions,
 // which mostly run one at a time. A child loop runs from its launch until

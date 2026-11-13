@@ -1,5 +1,7 @@
 add_circt_conversion_library(CIRCTSCFToLoopSchedule
-  SCFToLoopSchedule.cpp
+  SCFToLoopScheduleCPSAT.cpp
+  SCFToLoopScheduleLowering.cpp
+  SCFToLoopScheduleSimplex.cpp
 
   DEPENDS
   CIRCTConversionPassIncGen
@@ -17,7 +19,7 @@ add_circt_conversion_library(CIRCTSCFToLoopSchedule
   MLIRArithTransforms
 )
 
-# The CP-SAT scheduler (scheduler=cpsat) is built with OR-Tools.
+# The CP-SAT pass (convert-scf-to-loopschedule-cpsat) is built with OR-Tools.
 if(ortools_FOUND)
   target_compile_definitions(obj.CIRCTSCFToLoopSchedule PRIVATE
                              SCHEDULING_OR_TOOLS)

@@ -1,6 +1,6 @@
 // REQUIRES: or-tools
 // RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0})" %s | FileCheck %s --check-prefix=SIMPLEX
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefix=CPSAT
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule-cpsat{cycle-time-ns=3.0 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefix=CPSAT
 
 // A unit `hls.pipeline` asks for the least II. The accumulation is a
 // recurrence through its add, whose operator allocation chose takes 2

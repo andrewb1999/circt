@@ -176,6 +176,10 @@ struct CPSATFunctionModel {
     /// alone), `heldWorst`, their candidates' slowest, stands for them.
     SmallVector<std::pair<unsigned, unsigned>, 2> held;
     float heldWorst = 0.0f;
+    /// A pipeline's dynamic loads (indices) whose values it reads: in a
+    /// load's expect stage through the expect FIFO's bypass (`empty ?
+    /// response : head`), one input more on its instance's mux.
+    SmallVector<unsigned, 1> expectReads;
     /// The value on each operand, by an id common to every op of the
     /// function reading it (where known: a constant, a function argument, a
     /// value of the region); one past the end is a value of its own.
@@ -189,6 +193,12 @@ struct CPSATFunctionModel {
     /// their ports is done by the launch or comes after it; a rule within
     /// the region, which a region scheduled alone keeps too.
     SmallVector<unsigned> childOprs;
+    /// In a pinned region: the most delay a shared instance's operand mux
+    /// may put in front of the op, its chain's slack in the pinned schedule
+    /// (`chainSlacks`), less the late select of a pipeline's cycle-0 user
+    /// (the clock does not bind the region, but the schedule must not get
+    /// slower than the simplex's, whose binding shares within the slack).
+    float pinnedMuxBudget = 0.0f;
   };
   struct Region {
     SmallVector<Op, 0> ops;
@@ -197,6 +207,12 @@ struct CPSATFunctionModel {
     unsigned anchor = 0;
     /// The II of a pipeline; 0 for a sequential region.
     unsigned ii = 0;
+    /// The region keeps its hinted schedule (each op's start and operator,
+    /// and its II): a pipeline at a requested II that closes only past the
+    /// clock, which the simplex schedules as the II takes precedence over
+    /// the clock. The clock and the chaining within a cycle do not bind it;
+    /// the rest of the model (instances, registers, area) does.
+    bool pinned = false;
     /// The pipeline's II is the solver's to choose (a unit `hls.pipeline`)
     /// from the resources' bound up; otherwise it is `ii`.
     bool searchII = false;

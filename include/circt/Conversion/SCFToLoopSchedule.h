@@ -17,10 +17,17 @@
 
 namespace circt {
 #define GEN_PASS_DECL_SCFTOLOOPSCHEDULE
+#define GEN_PASS_DECL_SCFTOLOOPSCHEDULECPSAT
 #include "circt/Conversion/Passes.h.inc"
 
+/// SCF to LoopSchedule, each region scheduled by the simplex.
 std::unique_ptr<OperationPass<mlir::ModuleOp>>
 createSCFToLoopSchedulePass(const SCFToLoopScheduleOptions &options = {});
+
+/// SCF to LoopSchedule, each function scheduled in one CP-SAT model (built
+/// with OR-Tools).
+std::unique_ptr<OperationPass<mlir::ModuleOp>> createSCFToLoopScheduleCPSATPass(
+    const SCFToLoopScheduleCPSATOptions &options = {});
 
 } // namespace circt
 

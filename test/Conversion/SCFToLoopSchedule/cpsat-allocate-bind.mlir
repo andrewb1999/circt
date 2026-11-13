@@ -1,6 +1,6 @@
 // REQUIRES: or-tools
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 cpsat-cycle-slack=0 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,FAST
-// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule{cycle-time-ns=3.0 scheduler=cpsat cpsat-workers=1 share-mux-delays=0.3,0.3,0.6 cpsat-cycle-slack=0.5})" %s | FileCheck %s --check-prefixes=SLACK
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule-cpsat{cycle-time-ns=3.0 cpsat-workers=1 cpsat-cycle-slack=0 share-mux-delays=0.3,0.3,0.6})" %s | FileCheck %s --check-prefixes=CHECK,FAST
+// RUN: circt-opt --pass-pipeline="builtin.module(convert-scf-to-loopschedule-cpsat{cycle-time-ns=3.0 cpsat-workers=1 share-mux-delays=0.3,0.3,0.6 cpsat-cycle-slack=0.5})" %s | FileCheck %s --check-prefixes=SLACK
 
 // The CP-SAT scheduler chooses each op's operator among its candidates and
 // binds the ops of a shareable operator (an extern instance) to instances,

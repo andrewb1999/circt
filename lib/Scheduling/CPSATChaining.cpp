@@ -142,11 +142,6 @@ private:
     return it->second;
   }
   DenseMap<std::pair<unsigned, unsigned>, BoolVar> zeroAt;
-  /// Per pipeline op (region, op), the dynamic loads whose values it reads
-  /// in the same iteration: in the load's expect stage, through the expect
-  /// FIFO's bypass.
-  DenseMap<std::pair<unsigned, unsigned>, SmallVector<unsigned, 1>>
-      expectReads;
   /// One LUT level (a stage enable's AND, a hold's bypass): the 2-user mux.
   int64_t gatePs = 0;
   void build();
@@ -281,7 +276,7 @@ void FunctionModel::build() {
         // and chooses the II (deriche's filters took a 3.45 ns multiply-add
         // at II 2 beside a 2-cycle one that fits).
         auto slow = [&](unsigned k) { return m.oprs[k].info.overClock; };
-        if (!llvm::all_of(op.oprs, slow))
+        if (!region.pinned && !llvm::all_of(op.oprs, slow))
           for (auto [j, k] : llvm::enumerate(op.oprs))
             if (slow(k))
               cp.AddEquality(v.chosen[j], 0);
@@ -300,11 +295,19 @@ void FunctionModel::build() {
       for (unsigned k : op.oprs)
         fastest = std::min(fastest, inc(k));
       float late = op.held.empty() ? op.heldWorst : 0.0f;
-      if (int64_t at = std::min(ps(late), K - fastest); at > 0)
+      if (int64_t at = std::min(ps(late), K - fastest);
+          at > 0 && !region.pinned)
         cp.AddGreaterOrEqual(v.z, at);
+      // A pinned region's chains are the simplex's, past the clock or
+      // within it: a shared instance's mux only within their slack.
+      if (region.pinned)
+        cp.AddLessOrEqual(v.mux,
+                          std::max<int64_t>(0, ps(op.pinnedMuxBudget)));
       for (auto [j, k] : llvm::enumerate(op.oprs)) {
         auto w = when(r, i, j);
-        cp.AddLessOrEqual(LinearExpr(v.z) + v.mux + inc(k), K).OnlyEnforceIf(w);
+        if (!region.pinned)
+          cp.AddLessOrEqual(LinearExpr(v.z) + v.mux + inc(k), K)
+              .OnlyEnforceIf(w);
         if (lat(k) == 0)
           cp.AddEquality(v.ready, start + v.mux + out(k)).OnlyEnforceIf(w);
         else
@@ -323,17 +326,12 @@ void FunctionModel::build() {
       if (dep.minLatency)
         cp.AddGreaterOrEqual(LinearExpr(dst.c) + later,
                              LinearExpr(src.c) + int64_t(dep.minLatency));
-      if (dep.auxiliary)
+      // A pinned region's chains are the simplex's, past the clock.
+      if (dep.auxiliary || region.pinned)
         continue;
       if (dep.distance == 0) {
         cp.AddGreaterOrEqual(K * LinearExpr(dst.c) + dst.z,
                              LinearExpr(src.ready));
-        // A pipeline reads a dynamic load's value in its expect stage
-        // through the expect FIFO's bypass (`empty ? response : head`), in a
-        // later stage from a stage register: a shared instance's mux takes
-        // the bypass into its terms (below).
-        if (region.ii > 0 && region.ops[dep.src].dynamic)
-          expectReads[{unsigned(r), dep.dst}].push_back(dep.src);
         continue;
       }
       for (auto [j, k] : llvm::enumerate(region.ops[dep.src].oprs))
@@ -464,7 +462,7 @@ void FunctionModel::build() {
   // path takes; once every region's variables exist.
   for (auto [r, region] : llvm::enumerate(m.regions))
     for (auto [i, op] : llvm::enumerate(region.ops)) {
-      if (op.held.empty())
+      if (op.held.empty() || region.pinned)
         continue;
       int64_t fastest = K;
       for (unsigned k : op.oprs)
@@ -619,11 +617,12 @@ void FunctionModel::build() {
     LinearExpr inputs = users;
     unsigned maxInputs = maxUsers;
     for (auto &t : s.takers) {
-      auto it = expectReads.find({t.region, t.op});
-      if (it == expectReads.end())
+      // In a later stage it reads a stage register (Op::expectReads).
+      const auto &reads = m.regions[t.region].ops[t.op].expectReads;
+      if (reads.empty())
         continue;
       std::vector<BoolVar> inStage;
-      for (unsigned load : it->second) {
+      for (unsigned load : reads) {
         BoolVar e = newBool();
         LinearExpr expectAt = LinearExpr(vars[t.region][load].c) +
                               lat(m.regions[t.region].ops[load].oprs[0]);
@@ -670,7 +669,8 @@ void FunctionModel::build() {
     // into the cycle, against the stage registers the others select with).
     for (auto &t : s.takers) {
       auto &region = m.regions[t.region];
-      if (region.ii == 0 || !region.cond || *region.cond == t.op)
+      if (region.ii == 0 || !region.cond || *region.cond == t.op ||
+          region.pinned)
         continue;
       unsigned c = *region.cond;
       auto &cv = vars[t.region][c];
@@ -1139,6 +1139,18 @@ LogicalResult FunctionModel::run(CPSATFunctionSolution &solution,
            << " operations, " << slots.size() << " instances\n";
   });
   hint();
+  // A pinned region keeps its schedule whatever the config.
+  for (auto [r, region] : llvm::enumerate(m.regions)) {
+    if (config.fixHints || !region.pinned)
+      continue;
+    for (auto [i, op] : llvm::enumerate(region.ops)) {
+      if (!op.hint)
+        continue;
+      cp.AddEquality(vars[r][i].c, *op.hint);
+      for (auto [j, chosen] : llvm::enumerate(vars[r][i].chosen))
+        cp.AddEquality(chosen, j == op.hintChoice ? 1 : 0);
+    }
+  }
   if (config.fixHints)
     for (auto [r, region] : llvm::enumerate(m.regions)) {
       if (iiVar[r] && region.hintII)
